@@ -145,6 +145,8 @@ PSOutput ps_main(VSOutput pin) {
     float nearestDepth = centerDepth;
     float minDepth = centerDepth;
     float2 nearestUv = centerUv;
+    float3 centerKaris = 0.0;
+    float3 nearestKaris = 0.0;
 
     [unroll]
     for (int y = -1; y <= 1; ++y) {
@@ -152,11 +154,13 @@ PSOutput ps_main(VSOutput pin) {
         for (int x = -1; x <= 1; ++x) {
             float2 sampleUv = clamp((baseTexel + float2(x, y)) * renderResolution.zw, 0.0, 1.0);
             float4 rawSample = currentFrame.SampleLevel(pointSampler, sampleUv, 0);
+            float3 cKaris = TonemapKaris(rawSample.rgb);
             if (x == 0 && y == 0) {
                 centerAlpha = rawSample.a;
+                centerKaris = cKaris;
+                nearestKaris = cKaris;
             }
 
-            float3 cKaris = TonemapKaris(rawSample.rgb);
             float2 d = float2(x, y) - fracOffset;
             float w = exp(-dot(d, d) * kInvTwoSigmaSq);
             currentKaris += cKaris * w;
@@ -172,6 +176,7 @@ PSOutput ps_main(VSOutput pin) {
             if (z > nearestDepth) {
                 nearestDepth = z;
                 nearestUv = sampleUv;
+                nearestKaris = cKaris;
             }
             minDepth = min(minDepth, z);
         }
@@ -182,8 +187,16 @@ PSOutput ps_main(VSOutput pin) {
     float3 mean = m1 * (1.0 / 9.0);
     float3 sigma = sqrt(max(0.0, m2 * (1.0 / 9.0) - mean * mean));
 
-    // 2. Dilated motion vector evaluation (motionVectors already exclude jitter and handle cockpit depth validation)
-    float2 mvPixels = motionVectors.SampleLevel(pointSampler, nearestUv, 0).xy;
+    // 2. Edge-gated dilated motion vector evaluation:
+    //    - On smooth sloped surfaces (e.g. hangar floors/walls), use centerUv so depth gradients
+    //      do not systematically bias every floor pixel's MV by +1 px toward the camera.
+    //    - On true depth silhouettes, only dilate MV from nearestUv when centerUv shares similar
+    //      color with the foreground (anti-aliased edge); pure background pixels keep their own
+    //      MV at centerUv so they never reproject into foreground history and ghost.
+    bool isDepthSilhouette = (nearestDepth > centerDepth * 1.05 + 1e-4);
+    bool dilateMv = isDepthSilhouette && (length(centerKaris - nearestKaris) < 0.12);
+    float2 mvUv = dilateMv ? nearestUv : centerUv;
+    float2 mvPixels = motionVectors.SampleLevel(pointSampler, mvUv, 0).xy;
     float speed = length(mvPixels);
 
     // Smooth variance-clip gamma: active even at speed == 0 so un-tracked movers do not ghost.
@@ -215,8 +228,8 @@ PSOutput ps_main(VSOutput pin) {
         // Sample both centerUv (newly disoccluded background) and nearestUv (dilated silhouette)
         // so foreground dilation never masks a disoccluded pixel, and fully drop stale history.
         float reactiveCenter = motionReactive.SampleLevel(pointSampler, centerUv, 0).r;
-        float reactiveNear = motionReactive.SampleLevel(pointSampler, nearestUv, 0).r;
-        float reactive = max(reactiveCenter, reactiveNear);
+        float reactiveMv = motionReactive.SampleLevel(pointSampler, mvUv, 0).r;
+        float reactive = max(reactiveCenter, reactiveMv);
         depthConfidence = 1.0 - saturate(reactive);
     } else if (jitterHistory.w > 0.5 && nearestDepth > 0.0 && speed > 0.5) {
         float2 prevUv = clamp(priorUv + prevJitterUv, 0.0, 1.0);
