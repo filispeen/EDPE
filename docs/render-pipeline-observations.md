@@ -144,3 +144,12 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 ## Later-Present binding sample — 2026-09-23
 
 - **EXPERIMENTAL:** The first observed `Present` may occur before normal gameplay. Log the same read-only binding query at frame 1 and every 1024th observed `Present` through frame 8192. This uses the existing, game-verified swapchain hook and performs no output modification. A later bound DSV would still be only a candidate, not verified scene depth.
+- **MEASURED (game log, build `2026.09.03.332841`):** Nine samples at frames 1, 1024, 2048, 3072, 4096, 5120, 6144, 7168, and 8192 returned null RTV and DSV. The swapchain, D3D11 device, context, device vtable, and DSV method addresses were stable in all nine entries. The game process remained responsive during collection.
+- **LIMIT:** The log does not mark when the player entered the 3D world. It proves only that these sampled `Present` boundaries had no bound targets. The scene-depth resource and its earlier binding point remain unidentified.
+- **VERIFIED (user observation):** After loading from the main menu into the 3D world, pressing F5 caused the game to close with this sampling build. The log ended at frame 8192 and contains no failure reason. The earlier DLL backup also closed on F5 in the 3D menu. With both EDPE DLLs removed, F5 did not close the game. Thus the later sampling alone is not an established cause; the active EDPE overlay path is implicated.
+- **DECISION:** The sampling code was reverted, and both EDPE DLLs were moved out of the game directory pending a focused UI fix. Do not retry D3D11 state queries at later `Present` frames until the F5 failure is understood.
+
+## F5 overlay threading hypothesis — 2026-09-23
+
+- **EXPERIMENTAL:** EDPE's window procedure called the ImGui Win32 message handler while `Present` built and rendered ImGui frames. These callbacks may execute on different threads in Elite; no thread IDs have yet been measured. This is a possible race, not a verified crash cause.
+- **IMPLEMENTATION CHECK:** For the current informational menu, F5 can toggle an atomic visibility flag and the window procedure can block game input without calling ImGui. All ImGui API use then stays in the `Present` path. The WARP input test must still pass, followed by an in-game F5 check in the 3D menu.

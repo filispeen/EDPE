@@ -6,8 +6,7 @@
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
 #include <windows.h>
-
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+#include <atomic>
 
 namespace {
 struct UiState {
@@ -18,9 +17,9 @@ struct UiState {
     ImGuiContext* imgui = nullptr;
     HWND window = nullptr;
     WNDPROC original_wndproc = nullptr;
-    bool visible = false;
     bool failed = false;
 } ui;
+std::atomic<bool> menu_visible{false};
 
 bool isInputMessage(UINT message) {
     if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) return true;
@@ -31,16 +30,11 @@ bool isInputMessage(UINT message) {
 LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
         wparam == VK_F5 && !(lparam & (1LL << 30))) {
-        ui.visible = !ui.visible;
+        menu_visible.store(!menu_visible.load());
         return 0;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F5) return 0;
-    if (ui.visible && ui.imgui) {
-        ImGuiContext* previous = ImGui::GetCurrentContext();
-        ImGui::SetCurrentContext(ui.imgui);
-        const LRESULT handled = ImGui_ImplWin32_WndProcHandler(window, message, wparam, lparam);
-        ImGui::SetCurrentContext(previous);
-        if (handled) return handled;
+    if (menu_visible.load()) {
         if (message == WM_INPUT) return DefWindowProcW(window, message, wparam, lparam);
         if (isInputMessage(message)) return 1;
     }
@@ -70,6 +64,7 @@ void shutdownUi() {
     if (ui.context) ui.context->Release();
     if (ui.device) ui.device->Release();
     ui = {};
+    menu_visible.store(false);
 }
 
 bool initializeUi(IDXGISwapChain* swap_chain) {
@@ -125,7 +120,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         EdpeLog(L"EDPE: Dear ImGui unavailable; presenting original frame");
         return;
     }
-    if (!ui.visible) return;
+    if (!menu_visible.load()) return;
     if (!ui.backbuffer_rtv && !createBackbufferView(swap_chain)) {
         EdpeLog(L"EDPE: overlay backbuffer view unavailable; presenting original frame");
         return;
@@ -136,7 +131,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced", &ui.visible);
+    ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced");
     ImGui::TextUnformatted("Version: unreleased");
     ImGui::TextUnformatted("Rendering: original game output");
     ImGui::TextUnformatted("Upscaler: Native");
@@ -170,4 +165,4 @@ void UiOnRelease(IUnknown* object) {
     if (ui.swap_chain == object) shutdownUi();
 }
 
-bool UiMenuVisible() { return ui.visible; }
+bool UiMenuVisible() { return menu_visible.load(); }

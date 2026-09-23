@@ -101,7 +101,7 @@ HRESULT STDMETHODCALLTYPE observedCreateSwapChain(IDXGIFactory* factory, IUnknow
     return result;
 }
 
-void logPresentBindings(IDXGISwapChain* swap_chain, unsigned long long frame) {
+void logFirstPresent(IDXGISwapChain* swap_chain) {
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(swap_chain->GetDesc(&desc))) return;
     ID3D11Device* device = nullptr;
@@ -111,8 +111,8 @@ void logPresentBindings(IDXGISwapChain* swap_chain, unsigned long long frame) {
     }
     wchar_t message[256];
     void** device_methods = device ? *reinterpret_cast<void***>(device) : nullptr;
-    swprintf_s(message, L"EDPE: Present frame=%llu swapchain=%p %ux%u format=%u device=%p context=%p vtable=%p dsvMethod=%p",
-        frame, swap_chain, desc.BufferDesc.Width, desc.BufferDesc.Height,
+    swprintf_s(message, L"EDPE: Present swapchain=%p %ux%u format=%u device=%p context=%p vtable=%p dsvMethod=%p",
+        swap_chain, desc.BufferDesc.Width, desc.BufferDesc.Height,
         static_cast<unsigned>(desc.BufferDesc.Format), device, context,
         device_methods, device_methods ? device_methods[10] : nullptr);
     EdpeLog(message);
@@ -152,8 +152,7 @@ void logPresentBindings(IDXGISwapChain* swap_chain, unsigned long long frame) {
 }
 
 HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
-    const auto frame = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (frame == 1 || (frame <= 8192 && frame % 1024 == 0)) logPresentBindings(swap_chain, frame);
+    if (present_count.fetch_add(1, std::memory_order_relaxed) == 0) logFirstPresent(swap_chain);
     UiOnPresent(swap_chain, flags);
     const auto original = reinterpret_cast<PresentFn>(tableOf(swap_chain)->original[kPresent]);
     return original(swap_chain, sync_interval, flags);
