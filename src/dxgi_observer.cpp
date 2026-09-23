@@ -175,7 +175,7 @@ void logContextDispatch(IDXGISwapChain* swap_chain, unsigned long long frame) {
 HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
     const auto frame = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (frame == 1) logFirstPresent(swap_chain);
-    if (frame <= 8 || (frame <= 8192 && frame % 1024 == 0)) logContextDispatch(swap_chain, frame);
+    if (frame <= 8 || (frame <= 32768 && frame % 1024 == 0)) logContextDispatch(swap_chain, frame);
     ContextCensusOnPresent(swap_chain, frame);
     UiOnPresent(swap_chain, flags);
     const auto original = reinterpret_cast<PresentFn>(tableOf(swap_chain)->original[kPresent]);
