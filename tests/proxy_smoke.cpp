@@ -44,6 +44,9 @@ int wmain(int argc, wchar_t** argv) {
     const auto menu_visible = reinterpret_cast<BOOL (WINAPI*)()>(
         GetProcAddress(dxgi_proxy, "EDPE_MenuVisible"));
     if (!menu_visible) return 7;
+    const auto request_bind_sequence = reinterpret_cast<BOOL (WINAPI*)()>(
+        GetProcAddress(dxgi_proxy, "EDPE_RequestBindSequence"));
+    if (!request_bind_sequence) return 7;
     IDXGIFactory1* factory = nullptr;
     const HRESULT factory_result = create_factory(__uuidof(IDXGIFactory1),
         reinterpret_cast<void**>(&factory));
@@ -123,11 +126,16 @@ int wmain(int argc, wchar_t** argv) {
     SendMessageW(window, WM_KEYDOWN, VK_F5, 1LL << 30);
     const bool f5_repeat_ignored = menu_visible();
     const HRESULT overlay_present = swap_chain->Present(0, 0);
+    const bool sequence_requested = request_bind_sequence();
+    const HRESULT arm_present = swap_chain->Present(0, 0);
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    context->OMSetRenderTargets(0, nullptr, depth_view);
+    const HRESULT sequence_present = swap_chain->Present(0, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool visible_input_blocked = forwarded_keys == 1;
     const HRESULT resize_result = swap_chain->ResizeBuffers(0, 128, 128, DXGI_FORMAT_UNKNOWN, 0);
     const HRESULT resized_present = SUCCEEDED(resize_result) ? swap_chain->Present(0, 0) : resize_result;
-    for (int i = 5; i < 1024; ++i) swap_chain->Present(0, DXGI_PRESENT_TEST);
+    for (int i = 7; i < 1024; ++i) swap_chain->Present(0, DXGI_PRESENT_TEST);
     const bool interval_observed = present_count() == 1024;
     SendMessageW(window, WM_KEYUP, VK_F5, 0);
     SendMessageW(window, WM_KEYDOWN, VK_F5, 0);
@@ -152,12 +160,13 @@ int wmain(int argc, wchar_t** argv) {
     const HANDLE log = CreateFileW(argv[3], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (log == INVALID_HANDLE_VALUE) return 11;
-    char contents[4096]{};
+    char contents[8192]{};
     DWORD bytes_read = 0;
     const BOOL read = ReadFile(log, contents, sizeof(contents) - 1, &bytes_read, nullptr);
     CloseHandle(log);
     const bool passed = SUCCEEDED(present_result) && SUCCEEDED(second_present_result) && observed &&
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
+        SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
@@ -172,7 +181,10 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:4") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:7") &&
+        std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
+        std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
+        std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
         std::strstr(contents, "viewFormat=45 textureFormat=45 depth=64x64 bind=0x40") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&

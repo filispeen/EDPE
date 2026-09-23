@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "log.h"
+#include "context_census.h"
 
 #include <d3d11.h>
 #include <imgui.h>
@@ -186,6 +187,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::TextUnformatted("DLAA / DLSS / FSR: temporal inputs not yet verified");
     ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
     ImGui::EndDisabled();
+    const bool sequence_available = ContextCensusBindSequenceAvailable();
+    if (!sequence_available) ImGui::BeginDisabled();
+    if (ImGui::Button("Capture DSV bind order (one frame)")) ContextCensusRequestBindSequence();
+    if (!sequence_available) ImGui::EndDisabled();
+    if (!sequence_available) ImGui::TextDisabled("Waiting for DSV observer or capture completion");
     ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
     if (!window_open) menu_visible.store(false);

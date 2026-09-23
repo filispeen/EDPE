@@ -26,12 +26,32 @@ struct SeenDepthView {
 std::array<SeenDepthView, 32> seen{};
 size_t seen_count = 0;
 std::atomic<unsigned long long> dsv_binds{0};
+std::atomic<bool> sequence_requested{false};
+std::atomic<bool> sequence_active{false};
+std::array<int, 64> bind_sequence{};
+size_t sequence_stored = 0;
+unsigned sequence_transitions = 0;
+int sequence_last = -2;
+
+void recordBind(int index) {
+    if (index == sequence_last) return;
+    sequence_last = index;
+    ++sequence_transitions;
+    if (sequence_stored < bind_sequence.size()) bind_sequence[sequence_stored++] = index;
+}
 
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
     const auto forward = original.load(std::memory_order_acquire);
     forward(context, count, targets, dsv);
-    if (context != observed_context.load(std::memory_order_acquire) || !dsv) return;
+    if (context != observed_context.load(std::memory_order_acquire)) return;
+    if (!dsv) {
+        if (sequence_active.load(std::memory_order_acquire)) {
+            std::lock_guard lock(seen_mutex);
+            recordBind(-1);
+        }
+        return;
+    }
     dsv_binds.fetch_add(1, std::memory_order_relaxed);
 
     size_t index = 0;
@@ -40,12 +60,16 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     {
         std::lock_guard lock(seen_mutex);
         while (index < seen_count && seen[index].view != dsv) ++index;
-        if (index == seen.size()) return;
+        if (index == seen.size()) {
+            if (sequence_active.load(std::memory_order_acquire)) recordBind(-3);
+            return;
+        }
         if (index == seen_count) {
             seen[seen_count++].view = dsv;
             first_bind = true;
         }
         ++seen[index].interval_binds;
+        if (sequence_active.load(std::memory_order_acquire)) recordBind(static_cast<int>(index));
         if (count && targets && targets[0] && !seen[index].color_logged) {
             seen[index].color_logged = true;
             first_color = true;
@@ -109,7 +133,27 @@ bool patchSlot(void** table, void* expected, void* replacement) {
 }
 } // namespace
 
-void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame) {
+void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
+    if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
+        sequence_active.exchange(false, std::memory_order_acq_rel)) {
+        std::array<int, 64> sequence{};
+        size_t stored = 0;
+        unsigned transitions = 0;
+        {
+            std::lock_guard lock(seen_mutex);
+            sequence = bind_sequence;
+            stored = sequence_stored;
+            transitions = sequence_transitions;
+        }
+        wchar_t message[128];
+        swprintf_s(message, L"EDPE: DSV bind sequence frame=%llu transitions=%u stored=%zu",
+            frame, transitions, stored);
+        EdpeLog(message);
+        for (size_t i = 0; i < stored; ++i) {
+            swprintf_s(message, L"EDPE: DSV bind sequence %zu target=%d", i, sequence[i]);
+            EdpeLog(message);
+        }
+    }
     if (!attempted) {
         attempted = true;
         ID3D11Device* device = nullptr;
@@ -173,8 +217,38 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     }
 }
 
+void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
+    if ((flags & DXGI_PRESENT_TEST) || !patched_table || observed_swap_chain != swap_chain ||
+        !sequence_requested.exchange(false, std::memory_order_acq_rel)) return;
+    {
+        std::lock_guard lock(seen_mutex);
+        sequence_stored = 0;
+        sequence_transitions = 0;
+        sequence_last = -2;
+        sequence_active.store(true, std::memory_order_release);
+    }
+    EdpeLog(L"EDPE: one-frame DSV bind sequence armed after overlay");
+}
+
+bool ContextCensusRequestBindSequence() {
+    if (!ContextCensusBindSequenceAvailable()) return false;
+    bool expected = false;
+    return sequence_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+}
+
+bool ContextCensusBindSequenceAvailable() {
+    return patched_table && !sequence_active.load(std::memory_order_acquire) &&
+        !sequence_requested.load(std::memory_order_acquire);
+}
+
+extern "C" BOOL WINAPI EdpeRequestBindSequence() {
+    return ContextCensusRequestBindSequence();
+}
+
 void ContextCensusOnSwapChainRelease(IUnknown* object) {
     if (object != observed_swap_chain) return;
+    sequence_active.store(false, std::memory_order_release);
+    sequence_requested.store(false, std::memory_order_release);
     if (patched_table) {
         patchSlot(patched_table, reinterpret_cast<void*>(&observedOMSetRenderTargets),
             reinterpret_cast<void*>(original.load(std::memory_order_acquire)));

@@ -229,3 +229,9 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (user observation):** The game, 3D main-menu scene, HUD, and F5 menu stayed open after the button press. This run did not enter the gameplay world.
 - **LIMIT:** These clear values identify operations on three tracked DSVs, not the scene-depth target or a global standard/reversed-Z convention. The successful local tests did not predict slot-53 ownership in the game.
 - **DECISION:** Restore the previously working game DLLs and remove the experimental probe from EDPE. Do not intercept slot 53 again without a dispatch strategy that accounts for observed hook displacement.
+
+## One-frame DSV bind-order capture — 2026-09-23
+
+- **EXPERIMENTAL:** The F5 menu can request one frame of DSV bind transitions using the existing slot-33 `OMSetRenderTargets` observer. Capture starts after the menu is drawn and stops at the next real `Present`. It logs at most the first 64 transitions, including `-1` for no DSV and `-3` for an untracked DSV. No additional context method is hooked, and the original call remains unchanged.
+- **VERIFIED (Release WARP tests):** Both proxy smoke variants passed. A test frame switching from no DSV to tracked DSV `#0` logged two transitions and stopped at the next real `Present`.
+- **LIMIT:** This observes only slot-33 calls on the immediate context. A frame with more than 64 transitions is truncated in the log; the total transition count remains available. Bind order alone cannot establish draw association, depth contents, Z direction, or a safe sampling point. In-game behavior remains unverified.

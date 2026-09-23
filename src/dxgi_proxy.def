@@ -3,3 +3,4 @@ EXPORTS
     CreateDXGIFactory2=EdpeCreateDXGIFactory2
     EDPE_ObservedPresentCount=EdpeObservedPresentCount
     EDPE_MenuVisible=EdpeMenuVisible
+    EDPE_RequestBindSequence=EdpeRequestBindSequence
