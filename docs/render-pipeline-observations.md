@@ -77,3 +77,8 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 ## Menu hotkey — 2026-09-23
 
 - **VERIFIED (Release WARP test):** `F5` now opens and closes the EDPE menu. A repeated keydown while F5 is held does not toggle it. `Insert` no longer toggles the menu and reaches the original window procedure while the menu is hidden.
+
+## Local game deployment — 2026-09-23
+
+- **VERIFIED (file hashes):** The Release-stage `d3d11.dll` and `dxgi.dll` were copied beside the supplied Odyssey `EliteDangerous64.exe`. SHA-256 of each destination matched its build-stage source immediately after copying. No pre-existing active DLL with either name was overwritten.
+- **LIMIT:** Copying confirms deployment only. Game load, normal rendering, Present observation, ImGui visibility, and input handling still require an in-game test. The DLLs are experimental and their export sets remain limited.

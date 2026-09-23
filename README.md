@@ -14,6 +14,6 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The outputs are `build/EDPE.dll` and `build/dxgi.dll`. There is currently no supported game installation package. Do not place either DLL beside the game yet: each shim only implements the executable's observed static import, and compatibility with other modules is untested.
+The outputs are `build/EDPE.dll` and `build/dxgi.dll`. For the current local game test, copy `EDPE.dll` as `d3d11.dll` and copy `dxgi.dll` beside `EliteDangerous64.exe` after each successful build. The proxy exports cover the executable's observed static imports; in-game loading and compatibility with other modules remain unverified.
 
 See [renderer observations](docs/render-pipeline-observations.md) for verified findings and the next Phase 1 checks.
