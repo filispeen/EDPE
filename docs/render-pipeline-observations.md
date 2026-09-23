@@ -120,3 +120,5 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 ## Present-bound targets — 2026-09-23
 
 - **EXPERIMENTAL:** At the first observed `Present`, query `OMGetRenderTargets` and log the currently bound render-target and depth-stencil view with the depth texture's format, dimensions, bind flags, and sample count. This reads existing COM state and leaves the rendering path unchanged. A bound DSV at `Present` would be a candidate only; an unbound DSV would not prove the scene lacked depth earlier in the frame.
+- **VERIFIED (game log, build `2026.09.03.332841`):** On a 2560×1440 first `Present`, `OMGetRenderTargets` returned no RTV and no DSV. The query logged zero formats and dimensions. Neither target was bound at this frame boundary; depth identification requires observation earlier in the frame.
+- **VERIFIED (user observation):** The game and F5 menu still displayed normally with this read-only query.
