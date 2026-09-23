@@ -151,8 +151,26 @@ void logFirstPresent(IDXGISwapChain* swap_chain) {
     if (device) device->Release();
 }
 
+void logContextDispatch(IDXGISwapChain* swap_chain, unsigned long long frame) {
+    ID3D11Device* device = nullptr;
+    if (FAILED(swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device)))) return;
+    ID3D11DeviceContext* context = nullptr;
+    device->GetImmediateContext(&context);
+    if (context) {
+        void** methods = *reinterpret_cast<void***>(context);
+        wchar_t message[192];
+        swprintf_s(message, L"EDPE: context dispatch frame=%llu context=%p vtable=%p slot33=%p",
+            frame, context, methods, methods[33]);
+        EdpeLog(message);
+        context->Release();
+    }
+    device->Release();
+}
+
 HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
-    if (present_count.fetch_add(1, std::memory_order_relaxed) == 0) logFirstPresent(swap_chain);
+    const auto frame = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (frame == 1) logFirstPresent(swap_chain);
+    if (frame == 1 || (frame <= 8192 && frame % 1024 == 0)) logContextDispatch(swap_chain, frame);
     UiOnPresent(swap_chain, flags);
     const auto original = reinterpret_cast<PresentFn>(tableOf(swap_chain)->original[kPresent]);
     return original(swap_chain, sync_interval, flags);

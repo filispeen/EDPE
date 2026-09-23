@@ -146,6 +146,7 @@ int wmain(int argc, wchar_t** argv) {
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
         read && std::strstr(contents, "EDPE: Present swapchain=") &&
         std::strstr(contents, "EDPE: Present bindings") &&
+        std::strstr(contents, "EDPE: context dispatch frame=1") &&
         std::strstr(contents, "viewFormat=45 textureFormat=45 depth=64x64 bind=0x40") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&

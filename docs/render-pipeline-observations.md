@@ -158,3 +158,9 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (Release WARP tests and game log):** Both proxy smoke tests passed with queued input. The game log recorded `EDPE: queued input routed to Dear ImGui` after F5 opened the overlay.
 - **VERIFIED (user observation):** With the queued-input DLLs installed, the menu responded to the mouse and the game remained open. This confirms interactive input for the tested session; it does not identify the earlier crash mechanism or establish long-session stability.
 - **IMPLICATION:** The F5 overlay is usable again. Scene depth remains unidentified because the sampled `Present` boundaries had no bound DSV.
+
+## Read-only context dispatch timeline — 2026-09-23
+
+- **REFERENCE-CODE:** [EDVR's current README](https://github.com/characterecho-sean/edvr-unofficial-patch/blob/main/README.md#L126-L181) describes a context dispatch table that Windows may rewrite while the game runs. This is a reason to measure EDPE's context, not evidence that it behaves the same way.
+- **SDK-DOCUMENTED:** [Microsoft's D3D11 depth-stencil guide](https://learn.microsoft.com/en-us/windows/win32/direct3d11/d3d10-graphics-programming-guide-depth-stencil) binds a DSV through `OMSetRenderTargets`; [the API reference](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-omsetrendertargets) states that a null DSV unbinds it. The null DSV observed at `Present` therefore does not identify an earlier depth binding.
+- **EXPERIMENTAL:** Log the immediate-context pointer, vtable pointer, and slot-33 method pointer at frames 1 and every 1024th `Present` through 8192. This reads COM dispatch state without replacing a table or changing rendering. Compare game values before selecting a context-hook strategy; local WARP results alone cannot establish game compatibility.
