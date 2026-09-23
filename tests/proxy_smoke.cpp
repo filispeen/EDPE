@@ -196,7 +196,7 @@ int wmain(int argc, wchar_t** argv) {
     const HANDLE log = CreateFileW(argv[3], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (log == INVALID_HANDLE_VALUE) return 11;
-    char contents[8192]{};
+    char contents[32768]{};
     DWORD bytes_read = 0;
     const BOOL read = ReadFile(log, contents, sizeof(contents) - 1, &bytes_read, nullptr);
     CloseHandle(log);
@@ -229,6 +229,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "bytes=5376 usage=2 cpu=0x10000") &&
         std::strstr(contents, "EDPE: scene CB sample bind=6 projectionZ=(0,0.050000") &&
         std::strstr(contents, "EDPE: scene CB rows1=(0,1,0,0) rows2=(0,0,1,0)") &&
+        std::strstr(contents, "EDPE: scene CB hex 0000 ") &&
+        std::strstr(contents, "EDPE: scene CB hex 1312 ") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
         std::strstr(contents, "EDPE: depth snapshot image submitted to ImGui") &&
         std::strstr(contents, "EDPE: depth contrast shader active in ImGui") &&

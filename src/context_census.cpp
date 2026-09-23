@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <d3d11.h>
 #include <mutex>
 #include <windows.h>
@@ -101,6 +102,14 @@ void pollCameraSample(ID3D11DeviceContext* context) {
             values[936], values[937], values[938], values[939],
             values[940], values[941], values[942], values[943]);
         EdpeLog(message);
+        for (size_t offset = 0; offset < 5376 / sizeof(float); offset += 32) {
+            wchar_t words[320];
+            int used = swprintf_s(words, L"EDPE: scene CB hex %04zu ", offset);
+            for (size_t i = 0; i < 32; ++i)
+                used += swprintf_s(words + used, 320 - used, L"%08X",
+                    std::bit_cast<unsigned>(values[offset + i]));
+            EdpeLog(words);
+        }
         context->Unmap(camera_sample, 0);
     } else if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++camera_sample_wait < 120) {
         return;
