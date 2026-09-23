@@ -20,6 +20,8 @@ bool attempted = false;
 std::mutex seen_mutex;
 struct SeenDepthView {
     ID3D11DepthStencilView* view = nullptr; // Identity only; never dereferenced later.
+    DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN;
+    UINT samples = 0;
     bool color_logged = false;
     unsigned long long interval_binds = 0;
 };
@@ -32,6 +34,12 @@ std::array<int, 64> bind_sequence{};
 size_t sequence_stored = 0;
 unsigned sequence_transitions = 0;
 int sequence_last = -2;
+int snapshot_queued = -1;
+int snapshot_active = -1;
+int snapshot_index = -1;
+ID3D11DepthStencilView* snapshot_view = nullptr; // Retained only until the next UI Present.
+unsigned snapshot_wait_frames = 0;
+std::atomic<bool> snapshot_waiting{false};
 
 void recordBind(int index) {
     if (index == sequence_last) return;
@@ -70,6 +78,13 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         }
         ++seen[index].interval_binds;
         if (sequence_active.load(std::memory_order_acquire)) recordBind(static_cast<int>(index));
+        if (snapshot_active == static_cast<int>(index) && !snapshot_view) {
+            dsv->AddRef();
+            snapshot_view = dsv;
+            snapshot_index = snapshot_active;
+            snapshot_active = -1;
+            snapshot_waiting.store(false, std::memory_order_release);
+        }
         if (count && targets && targets[0] && !seen[index].color_logged) {
             seen[index].color_logged = true;
             first_color = true;
@@ -91,6 +106,11 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             texture->Release();
         }
         resource->Release();
+    }
+    if (first_bind) {
+        std::lock_guard lock(seen_mutex);
+        seen[index].texture_format = texture_desc.Format;
+        seen[index].samples = texture_desc.SampleDesc.Count;
     }
     D3D11_RENDER_TARGET_VIEW_DESC color_view{};
     D3D11_TEXTURE2D_DESC color_texture{};
@@ -134,6 +154,19 @@ bool patchSlot(void** table, void* expected, void* replacement) {
 } // namespace
 
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
+    if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
+        snapshot_waiting.load(std::memory_order_acquire)) {
+        bool expired = false;
+        {
+            std::lock_guard lock(seen_mutex);
+            if (snapshot_active >= 0 && snapshot_wait_frames && --snapshot_wait_frames == 0) {
+                snapshot_active = -1;
+                snapshot_waiting.store(false, std::memory_order_release);
+                expired = true;
+            }
+        }
+        if (expired) EdpeLog(L"EDPE: depth snapshot request expired without target bind");
+    }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
         sequence_active.exchange(false, std::memory_order_acq_rel)) {
         std::array<int, 64> sequence{};
@@ -218,16 +251,24 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
 }
 
 void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
-    if ((flags & DXGI_PRESENT_TEST) || !patched_table || observed_swap_chain != swap_chain ||
-        !sequence_requested.exchange(false, std::memory_order_acq_rel)) return;
+    if ((flags & DXGI_PRESENT_TEST) || !patched_table || observed_swap_chain != swap_chain) return;
+    const bool arm_sequence = sequence_requested.exchange(false, std::memory_order_acq_rel);
     {
         std::lock_guard lock(seen_mutex);
-        sequence_stored = 0;
-        sequence_transitions = 0;
-        sequence_last = -2;
-        sequence_active.store(true, std::memory_order_release);
+        if (arm_sequence) {
+            sequence_stored = 0;
+            sequence_transitions = 0;
+            sequence_last = -2;
+            sequence_active.store(true, std::memory_order_release);
+        }
+        if (snapshot_queued >= 0) {
+            snapshot_active = snapshot_queued;
+            snapshot_queued = -1;
+            snapshot_wait_frames = 120;
+            snapshot_waiting.store(true, std::memory_order_release);
+        }
     }
-    EdpeLog(L"EDPE: one-frame DSV bind sequence armed after overlay");
+    if (arm_sequence) EdpeLog(L"EDPE: one-frame DSV bind sequence armed after overlay");
 }
 
 bool ContextCensusRequestBindSequence() {
@@ -241,12 +282,58 @@ bool ContextCensusBindSequenceAvailable() {
         !sequence_requested.load(std::memory_order_acquire);
 }
 
+namespace {
+bool depthSnapshotAvailableLocked(unsigned index) {
+    if (!patched_table || index >= seen_count || snapshot_queued >= 0 ||
+        snapshot_active >= 0 || snapshot_view) return false;
+    const auto& candidate = seen[index];
+    return candidate.samples == 1 &&
+        (candidate.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+         candidate.texture_format == DXGI_FORMAT_R24G8_TYPELESS);
+}
+}
+
+bool ContextCensusRequestDepthSnapshot(unsigned index) {
+    std::lock_guard lock(seen_mutex);
+    if (!depthSnapshotAvailableLocked(index)) return false;
+    snapshot_queued = static_cast<int>(index);
+    return true;
+}
+
+bool ContextCensusDepthSnapshotAvailable(unsigned index) {
+    std::lock_guard lock(seen_mutex);
+    return depthSnapshotAvailableLocked(index);
+}
+
+ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index) {
+    std::lock_guard lock(seen_mutex);
+    ID3D11DepthStencilView* view = snapshot_view;
+    if (view && index) *index = static_cast<unsigned>(snapshot_index);
+    snapshot_view = nullptr;
+    snapshot_index = -1;
+    return view;
+}
+
+extern "C" BOOL WINAPI EdpeRequestDepthSnapshot(UINT index) {
+    return ContextCensusRequestDepthSnapshot(index);
+}
+
 extern "C" BOOL WINAPI EdpeRequestBindSequence() {
     return ContextCensusRequestBindSequence();
 }
 
 void ContextCensusOnSwapChainRelease(IUnknown* object) {
     if (object != observed_swap_chain) return;
+    {
+        std::lock_guard lock(seen_mutex);
+        snapshot_queued = -1;
+        snapshot_active = -1;
+        snapshot_wait_frames = 0;
+        snapshot_waiting.store(false, std::memory_order_release);
+        if (snapshot_view) snapshot_view->Release();
+        snapshot_view = nullptr;
+        snapshot_index = -1;
+    }
     sequence_active.store(false, std::memory_order_release);
     sequence_requested.store(false, std::memory_order_release);
     if (patched_table) {

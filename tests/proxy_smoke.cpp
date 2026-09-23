@@ -47,6 +47,9 @@ int wmain(int argc, wchar_t** argv) {
     const auto request_bind_sequence = reinterpret_cast<BOOL (WINAPI*)()>(
         GetProcAddress(dxgi_proxy, "EDPE_RequestBindSequence"));
     if (!request_bind_sequence) return 7;
+    const auto request_depth_snapshot = reinterpret_cast<BOOL (WINAPI*)(UINT)>(
+        GetProcAddress(dxgi_proxy, "EDPE_RequestDepthSnapshot"));
+    if (!request_depth_snapshot) return 7;
     IDXGIFactory1* factory = nullptr;
     const HRESULT factory_result = create_factory(__uuidof(IDXGIFactory1),
         reinterpret_cast<void**>(&factory));
@@ -89,13 +92,16 @@ int wmain(int argc, wchar_t** argv) {
     depth_desc.Height = 64;
     depth_desc.MipLevels = 1;
     depth_desc.ArraySize = 1;
-    depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depth_desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
     depth_desc.SampleDesc.Count = 1;
-    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     ID3D11Texture2D* depth_texture = nullptr;
     if (FAILED(device->CreateTexture2D(&depth_desc, nullptr, &depth_texture))) return 10;
     ID3D11DepthStencilView* depth_view = nullptr;
-    if (FAILED(device->CreateDepthStencilView(depth_texture, nullptr, &depth_view))) return 10;
+    D3D11_DEPTH_STENCIL_VIEW_DESC depth_view_desc{};
+    depth_view_desc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    depth_view_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    if (FAILED(device->CreateDepthStencilView(depth_texture, &depth_view_desc, &depth_view))) return 10;
     D3D11_TEXTURE2D_DESC color_desc = depth_desc;
     color_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     color_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -131,11 +137,17 @@ int wmain(int argc, wchar_t** argv) {
     context->OMSetRenderTargets(0, nullptr, nullptr);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     const HRESULT sequence_present = swap_chain->Present(0, 0);
+    const bool snapshot_requested = request_depth_snapshot(0);
+    const HRESULT snapshot_arm_present = swap_chain->Present(0, 0);
+    context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, 0.25f, 0);
+    context->OMSetRenderTargets(0, nullptr, depth_view);
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    const HRESULT snapshot_present = swap_chain->Present(0, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool visible_input_blocked = forwarded_keys == 1;
     const HRESULT resize_result = swap_chain->ResizeBuffers(0, 128, 128, DXGI_FORMAT_UNKNOWN, 0);
     const HRESULT resized_present = SUCCEEDED(resize_result) ? swap_chain->Present(0, 0) : resize_result;
-    for (int i = 7; i < 1024; ++i) swap_chain->Present(0, DXGI_PRESENT_TEST);
+    for (int i = 9; i < 1024; ++i) swap_chain->Present(0, DXGI_PRESENT_TEST);
     const bool interval_observed = present_count() == 1024;
     SendMessageW(window, WM_KEYUP, VK_F5, 0);
     SendMessageW(window, WM_KEYDOWN, VK_F5, 0);
@@ -167,6 +179,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool passed = SUCCEEDED(present_result) && SUCCEEDED(second_present_result) && observed &&
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
         SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
+        SUCCEEDED(snapshot_arm_present) && SUCCEEDED(snapshot_present) && snapshot_requested &&
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
@@ -181,11 +194,12 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:7") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:8") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
-        std::strstr(contents, "viewFormat=45 textureFormat=45 depth=64x64 bind=0x40") &&
+        std::strstr(contents, "viewFormat=20 textureFormat=19 depth=64x64 bind=0x48") &&
+        std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");

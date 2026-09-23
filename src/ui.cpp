@@ -26,6 +26,12 @@ struct UiState {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     ID3D11RenderTargetView* backbuffer_rtv = nullptr;
+    ID3D11Texture2D* depth_copy = nullptr;
+    ID3D11ShaderResourceView* depth_srv = nullptr;
+    UINT depth_width = 0;
+    UINT depth_height = 0;
+    int depth_candidate = 1;
+    int depth_snapshot_index = -1;
     ImGuiContext* imgui = nullptr;
     HWND window = nullptr;
     WNDPROC original_wndproc = nullptr;
@@ -74,6 +80,82 @@ void releaseBackbuffer() {
     ui.backbuffer_rtv = nullptr;
 }
 
+void releaseDepthSnapshot() {
+    if (ui.depth_srv) ui.depth_srv->Release();
+    if (ui.depth_copy) ui.depth_copy->Release();
+    ui.depth_srv = nullptr;
+    ui.depth_copy = nullptr;
+    ui.depth_snapshot_index = -1;
+}
+
+void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
+    ID3D11DepthStencilView* bound = nullptr;
+    ui.context->OMGetRenderTargets(0, nullptr, &bound);
+    if (bound) {
+        bound->Release();
+        EdpeLog(L"EDPE: depth snapshot skipped (depth still bound at Present)");
+        return;
+    }
+    ID3D11Resource* resource = nullptr;
+    view->GetResource(&resource);
+    ID3D11Texture2D* source = nullptr;
+    if (resource) {
+        resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&source));
+        resource->Release();
+    }
+    if (!source) {
+        EdpeLog(L"EDPE: depth snapshot skipped (not a Texture2D)");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    DXGI_FORMAT read_format = DXGI_FORMAT_UNKNOWN;
+    if (desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS) read_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    if (desc.Format == DXGI_FORMAT_R24G8_TYPELESS) read_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    if (!desc.Width || !desc.Height || desc.MipLevels != 1 || desc.ArraySize != 1 ||
+        desc.SampleDesc.Count != 1 || read_format == DXGI_FORMAT_UNKNOWN) {
+        source->Release();
+        EdpeLog(L"EDPE: depth snapshot skipped (unsupported texture layout or format)");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC copy_desc = desc;
+    copy_desc.Usage = D3D11_USAGE_DEFAULT;
+    copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    copy_desc.CPUAccessFlags = 0;
+    copy_desc.MiscFlags = 0;
+    ID3D11Texture2D* copy = nullptr;
+    HRESULT result = ui.device->CreateTexture2D(&copy_desc, nullptr, &copy);
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (SUCCEEDED(result)) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = read_format;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = 1;
+        result = ui.device->CreateShaderResourceView(copy, &srv_desc, &srv);
+    }
+    if (SUCCEEDED(result)) {
+        ui.context->CopyResource(copy, source);
+        releaseDepthSnapshot();
+        ui.depth_copy = copy;
+        ui.depth_srv = srv;
+        ui.depth_width = desc.Width;
+        ui.depth_height = desc.Height;
+        ui.depth_snapshot_index = static_cast<int>(index);
+        wchar_t message[160];
+        swprintf_s(message, L"EDPE: depth snapshot #%u copied %ux%u format=%u",
+            index, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
+        EdpeLog(message);
+    } else {
+        if (srv) srv->Release();
+        if (copy) copy->Release();
+        wchar_t message[128];
+        swprintf_s(message, L"EDPE: depth snapshot unavailable HRESULT=0x%08X",
+            static_cast<unsigned>(result));
+        EdpeLog(message);
+    }
+    source->Release();
+}
+
 void shutdownUi() {
     menu_visible.store(false);
     if (ui.window && ui.original_wndproc &&
@@ -89,6 +171,7 @@ void shutdownUi() {
         ImGui::SetCurrentContext(previous == ui.imgui ? nullptr : previous);
     }
     releaseBackbuffer();
+    releaseDepthSnapshot();
     if (ui.context) ui.context->Release();
     if (ui.device) ui.device->Release();
     ui = {};
@@ -152,6 +235,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         return;
     }
     if (!menu_visible.load()) {
+        unsigned ignored = 0;
+        if (auto* view = ContextCensusTakeDepthSnapshot(&ignored)) view->Release();
         std::lock_guard lock(input_mutex);
         pending_input.clear();
         return;
@@ -159,6 +244,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (!ui.backbuffer_rtv && !createBackbufferView(swap_chain)) {
         EdpeLog(L"EDPE: overlay backbuffer view unavailable; presenting original frame");
         return;
+    }
+    unsigned captured_index = 0;
+    if (auto* view = ContextCensusTakeDepthSnapshot(&captured_index)) {
+        captureDepthSnapshot(view, captured_index);
+        view->Release();
     }
 
     ImGuiContext* previous = ImGui::GetCurrentContext();
@@ -192,6 +282,24 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Capture DSV bind order (one frame)")) ContextCensusRequestBindSequence();
     if (!sequence_available) ImGui::EndDisabled();
     if (!sequence_available) ImGui::TextDisabled("Waiting for DSV observer or capture completion");
+    ImGui::InputInt("Depth candidate index", &ui.depth_candidate);
+    const bool depth_available = ui.depth_candidate >= 0 &&
+        ContextCensusDepthSnapshotAvailable(static_cast<unsigned>(ui.depth_candidate));
+    if (!depth_available) ImGui::BeginDisabled();
+    if (ImGui::Button("Capture depth candidate (one frame)"))
+        ContextCensusRequestDepthSnapshot(static_cast<unsigned>(ui.depth_candidate));
+    if (!depth_available) ImGui::EndDisabled();
+    if (!depth_available) ImGui::TextDisabled("Choose a bound R32G8X24/R24G8 single-sample DSV, or wait");
+    if (ui.depth_srv) {
+        ImGui::Text("DSV #%d: raw depth in red channel (%ux%u)",
+            ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
+        float width = ImGui::GetContentRegionAvail().x;
+        if (width > 640.0f) width = 640.0f;
+        if (width < 1.0f) width = 1.0f;
+        float height = width * static_cast<float>(ui.depth_height) / ui.depth_width;
+        if (height > 360.0f) { width *= 360.0f / height; height = 360.0f; }
+        ImGui::Image(reinterpret_cast<ImTextureID>(ui.depth_srv), ImVec2(width, height));
+    }
     ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
     if (!window_open) menu_visible.store(false);
