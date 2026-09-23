@@ -45,12 +45,72 @@ unsigned long long snapshot_armed_after = 0;
 unsigned long long snapshot_first_bind_after = 0;
 unsigned long long snapshot_last_bind_after = 0;
 unsigned snapshot_bind_count = 0;
+ID3D11Buffer* camera_sample = nullptr;
+unsigned camera_sample_bind = 0;
+unsigned camera_sample_wait = 0;
+std::atomic<bool> camera_sample_claimed{false};
+std::atomic<bool> camera_sample_ready{false};
 
 void recordBind(int index) {
     if (index == sequence_last) return;
     sequence_last = index;
     ++sequence_transitions;
     if (sequence_stored < bind_sequence.size()) bind_sequence[sequence_stored++] = index;
+}
+
+void queueCameraSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
+    const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal) {
+    bool expected = false;
+    if (!camera_sample_claimed.compare_exchange_strong(expected, true)) return;
+    ID3D11Device* device = nullptr;
+    context->GetDevice(&device);
+    D3D11_BUFFER_DESC desc = source_desc;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    ID3D11Buffer* staging = nullptr;
+    const HRESULT result = device ? device->CreateBuffer(&desc, nullptr, &staging) : E_FAIL;
+    if (device) device->Release();
+    if (FAILED(result) || !staging) {
+        camera_sample_claimed.store(false, std::memory_order_release);
+        EdpeLog(L"EDPE: scene CB sample unavailable (staging creation failed)");
+        return;
+    }
+    context->CopyResource(staging, source);
+    camera_sample = staging;
+    camera_sample_bind = bind_ordinal;
+    camera_sample_wait = 0;
+    camera_sample_ready.store(true, std::memory_order_release);
+}
+
+void pollCameraSample(ID3D11DeviceContext* context) {
+    if (!camera_sample_ready.load(std::memory_order_acquire)) return;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT result = context->Map(camera_sample, 0, D3D11_MAP_READ,
+        D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (SUCCEEDED(result) && mapped.pData) {
+        const auto* values = static_cast<const float*>(mapped.pData);
+        wchar_t message[320];
+        swprintf_s(message,
+            L"EDPE: scene CB sample bind=%u projectionZ=(%.9g,%.9g) rows0=(%.6g,%.6g,%.6g,%.6g)",
+            camera_sample_bind, values[794], values[795],
+            values[932], values[933], values[934], values[935]);
+        EdpeLog(message);
+        swprintf_s(message, L"EDPE: scene CB rows1=(%.6g,%.6g,%.6g,%.6g) rows2=(%.6g,%.6g,%.6g,%.6g)",
+            values[936], values[937], values[938], values[939],
+            values[940], values[941], values[942], values[943]);
+        EdpeLog(message);
+        context->Unmap(camera_sample, 0);
+    } else if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++camera_sample_wait < 120) {
+        return;
+    } else {
+        EdpeLog(L"EDPE: scene CB sample unavailable (nonblocking map failed or timed out)");
+    }
+    camera_sample->Release();
+    camera_sample = nullptr;
+    camera_sample_ready.store(false, std::memory_order_release);
+    camera_sample_claimed.store(false, std::memory_order_release);
 }
 
 void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index,
@@ -72,6 +132,9 @@ void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index,
                 depth_index, bind_ordinal, stage ? L"PS" : L"VS", slot, buffers[slot],
                 desc.ByteWidth, static_cast<unsigned>(desc.Usage), desc.CPUAccessFlags);
             EdpeLog(message);
+            if (stage == 0 && slot == 1 && desc.ByteWidth == 5376 &&
+                desc.Usage == D3D11_USAGE_DYNAMIC)
+                queueCameraSample(context, buffers[slot], desc, bind_ordinal);
             buffers[slot]->Release();
         }
     }
@@ -193,6 +256,9 @@ bool patchSlot(void** table, void* expected, void* replacement) {
 } // namespace
 
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
+    if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
+        camera_sample_ready.load(std::memory_order_acquire))
+        pollCameraSample(observed_context.load(std::memory_order_acquire));
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
         last_present_frame.store(frame, std::memory_order_relaxed);
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
@@ -402,6 +468,10 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     }
     sequence_active.store(false, std::memory_order_release);
     sequence_requested.store(false, std::memory_order_release);
+    if (camera_sample) camera_sample->Release();
+    camera_sample = nullptr;
+    camera_sample_ready.store(false, std::memory_order_release);
+    camera_sample_claimed.store(false, std::memory_order_release);
     if (patched_table) {
         patchSlot(patched_table, reinterpret_cast<void*>(&observedOMSetRenderTargets),
             reinterpret_cast<void*>(original.load(std::memory_order_acquire)));

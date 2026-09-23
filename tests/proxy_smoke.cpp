@@ -110,11 +110,18 @@ int wmain(int argc, wchar_t** argv) {
     ID3D11RenderTargetView* color_view = nullptr;
     if (FAILED(device->CreateRenderTargetView(color_texture, nullptr, &color_view))) return 10;
     D3D11_BUFFER_DESC probe_desc{};
-    probe_desc.ByteWidth = 4096;
+    probe_desc.ByteWidth = 5376;
+    probe_desc.Usage = D3D11_USAGE_DYNAMIC;
     probe_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    probe_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    float probe_values[5376 / sizeof(float)]{};
+    probe_values[795] = 0.025f;
+    probe_values[932] = probe_values[937] = probe_values[942] = 1.0f;
+    D3D11_SUBRESOURCE_DATA probe_initial{};
+    probe_initial.pSysMem = probe_values;
     ID3D11Buffer* probe_buffer = nullptr;
-    if (FAILED(device->CreateBuffer(&probe_desc, nullptr, &probe_buffer))) return 10;
-    context->VSSetConstantBuffers(0, 1, &probe_buffer);
+    if (FAILED(device->CreateBuffer(&probe_desc, &probe_initial, &probe_buffer))) return 10;
+    context->VSSetConstantBuffers(1, 1, &probe_buffer);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     IDXGISwapChain4* newer_swap_chain = nullptr;
     if (SUCCEEDED(swap_chain->QueryInterface(__uuidof(IDXGISwapChain4),
@@ -164,7 +171,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool hidden_input_restored = forwarded_keys == 2;
     context->OMSetRenderTargets(0, nullptr, nullptr);
     ID3D11Buffer* no_buffer = nullptr;
-    context->VSSetConstantBuffers(0, 1, &no_buffer);
+    context->VSSetConstantBuffers(1, 1, &no_buffer);
     probe_buffer->Release();
     color_view->Release();
     color_texture->Release();
@@ -210,9 +217,11 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
         std::strstr(contents, "viewFormat=20 textureFormat=19 depth=64x64 bind=0x48") &&
         std::strstr(contents, "EDPE: depth snapshot timing #0 armedAfter=7 firstBindAfter=7 lastBindAfter=7 binds=2 handedAt=8") &&
-        std::strstr(contents, "EDPE: DSV #0 bind=1 CB stage=VS slot=0 buffer=") &&
-        std::strstr(contents, "EDPE: DSV #0 bind=2 CB stage=VS slot=0 buffer=") &&
-        std::strstr(contents, "bytes=4096 usage=0 cpu=0x0") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=1 CB stage=VS slot=1 buffer=") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=2 CB stage=VS slot=1 buffer=") &&
+        std::strstr(contents, "bytes=5376 usage=2 cpu=0x10000") &&
+        std::strstr(contents, "EDPE: scene CB sample bind=1 projectionZ=(0,0.025") &&
+        std::strstr(contents, "EDPE: scene CB rows1=(0,1,0,0) rows2=(0,0,1,0)") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
         std::strstr(contents, "EDPE: depth snapshot image submitted to ImGui") &&
         std::strstr(contents, "EDPE: depth contrast shader active in ImGui") &&
