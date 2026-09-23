@@ -4,6 +4,8 @@
 #include <d3d11.h>
 #include <windows.h>
 
+void ObserveD3D11Device(ID3D11Device* device);
+
 extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
     IDXGIAdapter* adapter,
     D3D_DRIVER_TYPE driver_type,
@@ -24,6 +26,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
 
     const HRESULT result = create_device(adapter, driver_type, software, flags,
         feature_levels, feature_level_count, sdk_version, device, feature_level, context);
+    if (SUCCEEDED(result) && device && *device) ObserveD3D11Device(*device);
     EdpeLog(SUCCEEDED(result) ? L"EDPE: D3D11 device created"
                               : L"EDPE: D3D11 device creation failed");
     return result;
