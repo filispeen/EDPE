@@ -57,3 +57,8 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 
 - **VERIFIED (Release test):** The WARP harness produced `edpe.log` beside its executable with D3D11 creation, DXGI factory creation, and one first-Present line. The line contained the 64×64 swapchain, DXGI format 28 (`R8G8B8A8_UNORM`), and non-null D3D11 device/context pointers. The test reads the file and checks the Present entry.
 - **LIMIT:** The file is opened only for infrequent diagnostics; no per-frame file write was added. The game path has not been tested for log write permission. Debugger output remains available if file creation fails.
+
+## Dear ImGui dependency — 2026-09-23
+
+- **SDK-DOCUMENTED:** [Dear ImGui](https://github.com/ocornut/imgui) `v1.92.9b` is pinned as a Git submodule at `f1cc2ae`, including its [MIT license](https://github.com/ocornut/imgui/blob/v1.92.9b/LICENSE.txt). It is required for the runtime control surface specified by `PLAN.md`; the Win32 and DX11 backends are included.
+- **BUILD COST:** Six ImGui translation units add compile time. Linking the overlay will add binary size and per-visible-frame UI work; actual DXGI DLL size and GPU cost must be measured after integration. The pinned tag avoids silent SDK drift, but updates require deliberate compatibility testing.

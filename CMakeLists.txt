@@ -15,6 +15,16 @@ target_compile_features(EDPE_DXGI PRIVATE cxx_std_20)
 target_compile_definitions(EDPE_DXGI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(EDPE_DXGI PROPERTIES OUTPUT_NAME dxgi)
 
+add_library(EDPE_IMGUI STATIC
+    external/imgui/imgui.cpp
+    external/imgui/imgui_draw.cpp
+    external/imgui/imgui_tables.cpp
+    external/imgui/imgui_widgets.cpp
+    external/imgui/backends/imgui_impl_win32.cpp
+    external/imgui/backends/imgui_impl_dx11.cpp)
+target_include_directories(EDPE_IMGUI PUBLIC external/imgui external/imgui/backends)
+target_compile_definitions(EDPE_IMGUI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+
 enable_testing()
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 add_test(NAME proxy_smoke COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log)
