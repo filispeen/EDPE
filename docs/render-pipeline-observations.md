@@ -25,3 +25,14 @@ Date: 2026-09-23. Target: Elite Dangerous 2D, game build unknown.
 4. Add Dear ImGui with Win32/DX11 after the pass-through path is verified. Confirm hidden input behavior and safe resize/shutdown.
 
 The `v0.0.1` tag requires a tested in-game load, normal rendering, Present observation, device/context discovery, ImGui toggle, and logging. No current measurement meets that gate.
+
+## Installed game inspection — 2026-09-23
+
+Game build: `2026.09.03.332841` (`EliteDangerous64.exe` file version `332841`, product version `4.4.1.1`). Executable SHA-256: `E6BE8BBE04E6A7AE226D4318945AF7F367DE13DC5A007A261964D9BA8144E988`.
+
+- **VERIFIED (PE imports):** The x64 executable imports `D3D11CreateDevice` from `d3d11.dll` and `CreateDXGIFactory1` from `dxgi.dll`. It also delay-loads `openvr_api.dll`. This identifies possible observation entry points, not when or how the 2D scene presents.
+- **VERIFIED (directory inspection):** Neither an active local `d3d11.dll` nor `dxgi.dll` is present. A `d3d11.dll.disabled` file is 3Dmigoto 1.3.16, and backup folders contain both 3Dmigoto and EDVR D3D11 proxies. The existing `edvr.ini` names `d3d11_edhm.dll` as a chained real DLL, but that file is not currently beside the executable.
+- **VERIFIED (existing EDVR diagnostic):** An EDVR breadcrumb records its D3D11 proxy loading, a chained proxy call, hook arming, frames, and process exit in an earlier session. This supports the local-proxy route for that session only. It does not validate EDPE or the 2D renderer.
+- **IMPLICATION:** Build and test EDPE's proxy in isolation before installation. Never overwrite the disabled 3Dmigoto binary or EDVR backups. Recheck the live directory immediately before any installation because mod tools can change it.
+
+Still unknown: which swapchain corresponds to the 2D scene, actual `Present` timing, device/context identity, backbuffer description, and normal-rendering compatibility with EDPE.
