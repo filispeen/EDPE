@@ -2,6 +2,8 @@
 
 EDPE targets the 2D Direct3D 11 renderer of Elite Dangerous. `EDPE.dll` forwards `D3D11CreateDevice`; the experimental `dxgi.dll` shim observes factories, swapchains, and `Present`. Observation reports the first swapchain's dimensions, format, device, and immediate context through debugger output. Rendered output is unchanged.
 
+The shims also append creation and first-Present diagnostics to `edpe.log` beside the host executable. File logging failure leaves the original graphics calls intact.
+
 Build from an x64 MSVC developer PowerShell:
 
 ```powershell

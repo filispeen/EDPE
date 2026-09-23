@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstring>
@@ -97,10 +99,10 @@ void logFirstPresent(IDXGISwapChain* swap_chain) {
         device->GetImmediateContext(&context);
     }
     wchar_t message[256];
-    swprintf_s(message, L"EDPE: Present swapchain=%p %ux%u format=%u device=%p context=%p\n",
+    swprintf_s(message, L"EDPE: Present swapchain=%p %ux%u format=%u device=%p context=%p",
         swap_chain, desc.BufferDesc.Width, desc.BufferDesc.Height,
         static_cast<unsigned>(desc.BufferDesc.Format), device, context);
-    OutputDebugStringW(message);
+    EdpeLog(message);
     if (context) context->Release();
     if (device) device->Release();
 }

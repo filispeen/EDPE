@@ -1,3 +1,5 @@
+#include "log.h"
+
 #include <dxgi.h>
 #include <windows.h>
 
@@ -14,7 +16,7 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory1(REFIID iid, void** factory) {
 
     const HRESULT result = create_factory(iid, factory);
     if (SUCCEEDED(result) && factory && *factory) ObserveDxgiFactory(iid, *factory);
-    OutputDebugStringW(SUCCEEDED(result) ? L"EDPE: DXGI factory created\n"
-                                        : L"EDPE: DXGI factory creation failed\n");
+    EdpeLog(SUCCEEDED(result) ? L"EDPE: DXGI factory created"
+                              : L"EDPE: DXGI factory creation failed");
     return result;
 }

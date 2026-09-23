@@ -52,3 +52,8 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (local WARP test):** The DXGI shim observes `IDXGIFactory::CreateSwapChain` and `IDXGISwapChain::Present` through instance-local COM vtables. A 64×64 WARP swapchain was created, two `Present(DXGI_PRESENT_TEST)` calls reached the observer, and the swapchain, factory, context, device, and test window were released. The original DXGI methods returned successfully.
 - **VERIFIED (failure and correction):** The first test crashed during swapchain `Release` when the replacement vtable remained installed inside the original `Release` call. Restoring the original vtable for that call fixed the local crash. This does not establish safety under all multithreaded or mod-chained use.
 - **LIMIT:** The current path observes `CreateSwapChain` and `Present`, not `CreateSwapChainForHwnd` or `Present1`. The DLL exports only the executable's static `CreateDXGIFactory1` import. In-game loading, other module imports, concurrency, resize, fullscreen transitions, and normal 2D rendering remain unverified. Do not install this prototype yet.
+
+## Local logging check — 2026-09-23
+
+- **VERIFIED (Release test):** The WARP harness produced `edpe.log` beside its executable with D3D11 creation, DXGI factory creation, and one first-Present line. The line contained the 64×64 swapchain, DXGI format 28 (`R8G8B8A8_UNORM`), and non-null D3D11 device/context pointers. The test reads the file and checks the Present entry.
+- **LIMIT:** The file is opened only for infrequent diagnostics; no per-frame file write was added. The game path has not been tested for log write permission. Debugger output remains available if file creation fails.

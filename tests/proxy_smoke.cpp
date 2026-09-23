@@ -1,9 +1,11 @@
 #include <d3d11.h>
 #include <dxgi1_6.h>
 #include <windows.h>
+#include <cstring>
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 3) return 1;
+    if (argc != 4) return 1;
+    DeleteFileW(argv[3]);
     const HMODULE proxy = LoadLibraryW(argv[1]);
     if (!proxy) return 2;
     const auto create_device = reinterpret_cast<decltype(&D3D11CreateDevice)>(
@@ -67,5 +69,13 @@ int wmain(int argc, wchar_t** argv) {
     context->Release();
     device->Release();
     FreeLibrary(dxgi_proxy);
-    return SUCCEEDED(present_result) && SUCCEEDED(second_present_result) && observed ? 0 : 11;
+    const HANDLE log = CreateFileW(argv[3], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log == INVALID_HANDLE_VALUE) return 11;
+    char contents[4096]{};
+    DWORD bytes_read = 0;
+    const BOOL read = ReadFile(log, contents, sizeof(contents) - 1, &bytes_read, nullptr);
+    CloseHandle(log);
+    return SUCCEEDED(present_result) && SUCCEEDED(second_present_result) && observed &&
+        read && std::strstr(contents, "EDPE: Present swapchain=") ? 0 : 12;
 }
