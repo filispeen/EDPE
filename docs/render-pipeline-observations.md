@@ -102,9 +102,3 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (Release WARP test):** A device-vtable hook for `CreateDepthStencilView` recorded a 32×32 D24S8 test view and passed both proxy smoke tests.
 - **VERIFIED (game log and user observation):** With that hook installed, two game launches logged DXGI factory and D3D11 device creation but no `Present` or DSV entry. The user reported that the game closed immediately after launch.
 - **ACTION:** Commit `8f31352` reverted the hook; the earlier pass-through DLLs were rebuilt and restored to the game's relocated installation. The exact failure point inside the device hook remains unverified. No depth candidate from the game was obtained.
-
-## Revised depth-view hook — 2026-09-23
-
-- **EXPERIMENTAL (hypothesis):** Switching the device vtable around each `Release` may race other D3D11 calls. The failed game log does not prove this was the crash cause.
-- **VERIFIED (local tests):** The revised device hook leaves `Release` untouched and retains one small vtable copy per created device for the process lifetime. WARP tests and a hardware D3D11 test created a typeless depth texture and DSV, reached `Present`, resized, and released resources. All three Release tests passed. The Windows SDK interface lengths used for the vtable copy are 43, 50, 54, 65, 67, and 69 methods for `ID3D11Device` through `ID3D11Device5`.
-- **EXPERIMENTAL:** The revised hook still requires an in-game test. Its 128-entry DSV log is a creation census only; no scene depth has been identified.
