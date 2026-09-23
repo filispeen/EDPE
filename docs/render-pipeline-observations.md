@@ -36,3 +36,8 @@ Game build: `2026.09.03.332841` (`EliteDangerous64.exe` file version `332841`, p
 - **IMPLICATION:** Build and test EDPE's proxy in isolation before installation. Never overwrite the disabled 3Dmigoto binary or EDVR backups. Recheck the live directory immediately before any installation because mod tools can change it.
 
 Still unknown: which swapchain corresponds to the 2D scene, actual `Present` timing, device/context identity, backbuffer description, and normal-rendering compatibility with EDPE.
+
+## Local proxy check — 2026-09-23
+
+- **VERIFIED (local test):** `EDPE.dll` exports `D3D11CreateDevice` and forwards it to the system D3D11 DLL loaded from System32. A WARP device and immediate context were created through the export, released, and the test passed.
+- **LIMIT:** The export set currently covers only the executable's static D3D11 import. The DLL has not been placed beside the game; other modules may request additional D3D11 exports. Present observation and normal 2D rendering remain unverified.
