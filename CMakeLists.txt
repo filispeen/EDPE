@@ -10,7 +10,7 @@ target_compile_features(EDPE PRIVATE cxx_std_20)
 target_compile_definitions(EDPE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(EDPE PROPERTIES OUTPUT_NAME EDPE)
 
-add_library(EDPE_DXGI SHARED src/dllmain.cpp src/log.cpp src/dxgi_proxy.cpp src/dxgi_observer.cpp src/dxgi_proxy.def)
+add_library(EDPE_DXGI SHARED src/dllmain.cpp src/log.cpp src/dxgi_proxy.cpp src/dxgi_observer.cpp src/ui.cpp src/dxgi_proxy.def)
 target_compile_features(EDPE_DXGI PRIVATE cxx_std_20)
 target_compile_definitions(EDPE_DXGI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(EDPE_DXGI PROPERTIES OUTPUT_NAME dxgi)
@@ -24,6 +24,7 @@ add_library(EDPE_IMGUI STATIC
     external/imgui/backends/imgui_impl_dx11.cpp)
 target_include_directories(EDPE_IMGUI PUBLIC external/imgui external/imgui/backends)
 target_compile_definitions(EDPE_IMGUI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(EDPE_DXGI PRIVATE EDPE_IMGUI d3dcompiler)
 
 enable_testing()
 add_executable(proxy_smoke tests/proxy_smoke.cpp)

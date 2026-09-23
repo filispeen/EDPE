@@ -1,4 +1,5 @@
 #include "log.h"
+#include "ui.h"
 
 #include <atomic>
 #include <cstddef>
@@ -14,6 +15,7 @@ namespace {
 constexpr size_t kCreateSwapChain = 10;
 constexpr size_t kPresent = 8;
 constexpr size_t kRelease = 2;
+constexpr size_t kResizeBuffers = 13;
 constexpr size_t kMaxMethods = 41;
 
 struct HookTable {
@@ -58,15 +60,24 @@ size_t swapChainMethods(IUnknown* swap_chain) {
 using CreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(IUnknown*);
+using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 
 ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
     auto* table = tableOf(object);
+    UiOnRelease(object);
     *reinterpret_cast<void***>(object) = table->original;
     const auto original = reinterpret_cast<ReleaseFn>(table->original[kRelease]);
     const ULONG remaining = original(object);
     if (remaining) *reinterpret_cast<void***>(object) = table->methods;
     else delete table;
     return remaining;
+}
+
+HRESULT STDMETHODCALLTYPE observedResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_count,
+    UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
+    UiOnResize(swap_chain);
+    const auto original = reinterpret_cast<ResizeBuffersFn>(tableOf(swap_chain)->original[kResizeBuffers]);
+    return original(swap_chain, buffer_count, width, height, format, flags);
 }
 
 bool hookObject(IUnknown* object, size_t count, size_t method, void* replacement) {
@@ -109,6 +120,7 @@ void logFirstPresent(IDXGISwapChain* swap_chain) {
 
 HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
     if (present_count.fetch_add(1, std::memory_order_relaxed) == 0) logFirstPresent(swap_chain);
+    UiOnPresent(swap_chain, flags);
     const auto original = reinterpret_cast<PresentFn>(tableOf(swap_chain)->original[kPresent]);
     return original(swap_chain, sync_interval, flags);
 }
@@ -117,6 +129,8 @@ void observeSwapChain(IDXGISwapChain* swap_chain) {
     if (!hookObject(swap_chain, swapChainMethods(swap_chain), kPresent,
             reinterpret_cast<void*>(&observedPresent))) {
         OutputDebugStringW(L"EDPE: swapchain observation disabled (allocation failed)\n");
+    } else {
+        tableOf(swap_chain)->methods[kResizeBuffers] = reinterpret_cast<void*>(&observedResizeBuffers);
     }
 }
 } // namespace
@@ -136,3 +150,5 @@ void ObserveDxgiFactory(REFIID iid, void* factory) {
 extern "C" unsigned long long WINAPI EdpeObservedPresentCount() {
     return present_count.load(std::memory_order_relaxed);
 }
+
+extern "C" BOOL WINAPI EdpeMenuVisible() { return UiMenuVisible(); }

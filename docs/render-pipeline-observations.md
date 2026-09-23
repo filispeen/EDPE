@@ -62,3 +62,9 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 
 - **SDK-DOCUMENTED:** [Dear ImGui](https://github.com/ocornut/imgui) `v1.92.9b` is pinned as a Git submodule at `f1cc2ae`, including its [MIT license](https://github.com/ocornut/imgui/blob/v1.92.9b/LICENSE.txt). It is required for the runtime control surface specified by `PLAN.md`; the Win32 and DX11 backends are included.
 - **BUILD COST:** Six ImGui translation units add compile time. Linking the overlay will add binary size and per-visible-frame UI work; actual DXGI DLL size and GPU cost must be measured after integration. The pinned tag avoids silent SDK drift, but updates require deliberate compatibility testing.
+
+## Local ImGui overlay check — 2026-09-23
+
+- **VERIFIED (Release WARP test):** A hidden test window created a 64×64 swapchain. `Present(0, 0)` initialized Win32/DX11 ImGui and returned `DXGI_STATUS_OCCLUDED`; `Insert` opened and closed the EDPE status window. The test verified ordinary keyboard input reaches the original WndProc while hidden and is withheld while visible. `ResizeBuffers` to 128×128 succeeded with the overlay open, then another `Present` completed. The original graphics calls and resource release completed. Visible compositing was not measured.
+- **MEASURED (binary size):** The Release `dxgi.dll` grew from 17,920 to 404,992 bytes after linking the Win32/DX11 overlay, a 387,072-byte increase. GPU cost and in-game frame impact are not yet measured.
+- **LIMIT:** The test proves a local WARP path only. The game may use another swapchain-creation or Present variant, other threads, raw input handling, or graphics mods. The current DLL is still an experimental prototype and has not been installed beside Elite.

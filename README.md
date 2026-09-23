@@ -4,6 +4,8 @@ EDPE targets the 2D Direct3D 11 renderer of Elite Dangerous. `EDPE.dll` forwards
 
 The shims also append creation and first-Present diagnostics to `edpe.log` beside the host executable. File logging failure leaves the original graphics calls intact.
 
+The experimental Dear ImGui status window toggles with `Insert`. When hidden, other keyboard and mouse messages pass to the original window procedure. Temporal options are disabled until their inputs are verified.
+
 Build from an x64 MSVC developer PowerShell:
 
 ```powershell
