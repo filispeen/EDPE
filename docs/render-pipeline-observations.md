@@ -1,6 +1,6 @@
 # EDPE render-pipeline observations
 
-Date: 2026-09-23. Target: Elite Dangerous 2D, game build unknown.
+Date: 2026-09-23. Target: Elite Dangerous 2D; installed Odyssey build `2026.09.03.332841`.
 
 ## Repository state
 
@@ -88,4 +88,11 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (user report and game log):** Game startup reported missing `CreateDXGIFactory2` while loading the system `d3d11.dll`. The game-side `edpe.log` contained `EDPE: DXGI factory created`, but no Present observation.
 - **VERIFIED (PE imports):** Windows `System32\d3d11.dll` imports `CreateDXGIFactory2` from `dxgi.dll`. EDPE's installed `dxgi.dll` exported only `CreateDXGIFactory1`, which explains the loader failure.
 - **VERIFIED (Release WARP test):** The DXGI proxy now forwards `CreateDXGIFactory2` to System32 and observes the returned factory. The test loads the local DXGI proxy before D3D11, creates a WARP device, calls both factory exports, presents, resizes, and releases resources. Both normal and filename-alias tests pass.
-- **LIMIT:** This corrects the identified loader error; successful game startup and rendering have not yet been rechecked.
+- **LIMIT (at fix time):** This local test corrected the identified loader error; the subsequent in-game check is recorded below.
+
+## First in-game load — 2026-09-23
+
+- **VERIFIED (game log):** Two startup sessions after the `CreateDXGIFactory2` fix recorded DXGI factory creation, D3D11 device creation, and a first `Present` on a 2560×1440 swapchain with format 28 (`DXGI_FORMAT_R8G8B8A8_UNORM`). Both sessions recorded non-null device and immediate-context pointers and `EDPE: Dear ImGui ready; F5 toggles menu`.
+- **VERIFIED (user observation):** The missing-entry-point error is gone. The Dear ImGui overlay is visible and toggles with F5 in the game.
+- **VERIFIED (user observation):** The 3D world and HUD displayed normally with the overlay; no black screen or visible rendering fault was reported in this session.
+- **LIMIT:** The log contains only first-Present observations, not a frame count or GPU timing. Scene rendering quality, input interactions beyond F5, resize/fullscreen transitions, and long-session stability are not yet independently measured.
