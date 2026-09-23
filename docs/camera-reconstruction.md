@@ -69,11 +69,26 @@ below the HUD value. The 8×8 grid had 36 nonzero cells and a maximum of
 
 **VERIFIED (user observation):** The beacon was centered on screen but was
 **not visible in the depth snapshot**. Therefore the center-depth value
-cannot be attributed to the beacon. The numerical proximity of `415.391`
-and 444 is incidental; this capture does not test the beacon's distance,
-calibrate scene units to metres, or verify the depth equation at short range.
-Another check needs a static object visibly present at the sampled pixel
-in the depth preview.
+cannot be attributed to the beacon. A single numerical proximity between
+`415.391` and 444 did not test the beacon's distance or calibrate units.
+
+**MEASURED (second capture, same beacon centered, new game process):** The
+user approached to a HUD distance of 163 m. The main-camera candidate was
+session-local DSV `#1`, again `2560×1440` format 19, with eight binds
+between `Present` 22668 and 22669. Center raw depth was `0.00018744418`,
+giving `133.373` scene units by `0.025/depth`; projection word 1094 again
+held `0.02500000037`. The HUD distance fell by 281 m while the candidate
+view-axis distance fell by `282.018` scene units, a differential mismatch
+of `1.018`. The offsets from the HUD readings were `28.609` and `29.627`
+at 444 m and 163 m respectively.
+
+**INFERENCE / LIMIT:** This is strong differential evidence that the sampled
+depth tracks a surface near the centered target with roughly one scene unit
+per HUD metre over this range. The user still could not see the beacon in
+the depth preview, and the two captures came from separate game processes.
+The surface identity, HUD reference point, and exact scale remain unverified;
+do not treat the approximately 29-unit offset as the beacon's radius or
+feed this DSV to a temporal backend on this evidence alone.
 
 ## Required before runtime reprojection
 
