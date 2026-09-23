@@ -96,3 +96,9 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (user observation):** The missing-entry-point error is gone. The Dear ImGui overlay is visible and toggles with F5 in the game.
 - **VERIFIED (user observation):** The 3D world and HUD displayed normally with the overlay; no black screen or visible rendering fault was reported in this session.
 - **LIMIT:** The log contains only first-Present observations, not a frame count or GPU timing. Scene rendering quality, input interactions beyond F5, resize/fullscreen transitions, and long-session stability are not yet independently measured.
+
+## Rejected depth-view hook — 2026-09-23
+
+- **VERIFIED (Release WARP test):** A device-vtable hook for `CreateDepthStencilView` recorded a 32×32 D24S8 test view and passed both proxy smoke tests.
+- **VERIFIED (game log and user observation):** With that hook installed, two game launches logged DXGI factory and D3D11 device creation but no `Present` or DSV entry. The user reported that the game closed immediately after launch.
+- **ACTION:** Commit `8f31352` reverted the hook; the earlier pass-through DLLs were rebuilt and restored to the game's relocated installation. The exact failure point inside the device hook remains unverified. No depth candidate from the game was obtained.
