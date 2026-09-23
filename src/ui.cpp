@@ -32,6 +32,8 @@ struct UiState {
     UINT depth_height = 0;
     int depth_candidate = 1;
     int depth_snapshot_index = -1;
+    bool depth_window_open = true;
+    bool depth_image_logged = false;
     ImGuiContext* imgui = nullptr;
     HWND window = nullptr;
     WNDPROC original_wndproc = nullptr;
@@ -86,6 +88,7 @@ void releaseDepthSnapshot() {
     ui.depth_srv = nullptr;
     ui.depth_copy = nullptr;
     ui.depth_snapshot_index = -1;
+    ui.depth_image_logged = false;
 }
 
 void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
@@ -141,6 +144,7 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
         ui.depth_width = desc.Width;
         ui.depth_height = desc.Height;
         ui.depth_snapshot_index = static_cast<int>(index);
+        ui.depth_window_open = true;
         wchar_t message[160];
         swprintf_s(message, L"EDPE: depth snapshot #%u copied %ux%u format=%u",
             index, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
@@ -291,17 +295,33 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (!depth_available) ImGui::EndDisabled();
     if (!depth_available) ImGui::TextDisabled("Choose a bound R32G8X24/R24G8 single-sample DSV, or wait");
     if (ui.depth_srv) {
-        ImGui::Text("DSV #%d: raw depth in red channel (%ux%u)",
+        ImGui::Text("Depth snapshot: DSV #%d (%ux%u)",
             ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
-        float width = ImGui::GetContentRegionAvail().x;
-        if (width > 640.0f) width = 640.0f;
-        if (width < 1.0f) width = 1.0f;
-        float height = width * static_cast<float>(ui.depth_height) / ui.depth_width;
-        if (height > 360.0f) { width *= 360.0f / height; height = 360.0f; }
-        ImGui::Image(reinterpret_cast<ImTextureID>(ui.depth_srv), ImVec2(width, height));
+        if (!ui.depth_window_open && ImGui::Button("Show depth snapshot")) ui.depth_window_open = true;
     }
     ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
+    if (ui.depth_srv && ui.depth_window_open) {
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        ImGui::SetNextWindowPos(ImVec2(display.x > 700.0f ? (display.x - 700.0f) * 0.5f : 0.0f,
+            display.y > 500.0f ? 80.0f : 0.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
+            ImGui::Text("DSV #%d: raw depth in red channel (%ux%u)",
+                ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
+            float width = ImGui::GetContentRegionAvail().x;
+            if (width > 640.0f) width = 640.0f;
+            if (width < 1.0f) width = 1.0f;
+            float height = width * static_cast<float>(ui.depth_height) / ui.depth_width;
+            if (height > 360.0f) { width *= 360.0f / height; height = 360.0f; }
+            ImGui::Image(reinterpret_cast<ImTextureID>(ui.depth_srv), ImVec2(width, height));
+            if (!ui.depth_image_logged) {
+                EdpeLog(L"EDPE: depth snapshot image submitted to ImGui");
+                ui.depth_image_logged = true;
+            }
+        }
+        ImGui::End();
+    }
     if (!window_open) menu_visible.store(false);
     ImGui::Render();
 
