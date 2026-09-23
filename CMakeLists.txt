@@ -5,7 +5,7 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "EDPE requires 64-bit Windows")
 endif()
 
-add_library(EDPE SHARED src/dllmain.cpp src/log.cpp src/d3d11_proxy.cpp src/d3d11_observer.cpp src/d3d11_proxy.def)
+add_library(EDPE SHARED src/dllmain.cpp src/log.cpp src/d3d11_proxy.cpp src/d3d11_proxy.def)
 target_compile_features(EDPE PRIVATE cxx_std_20)
 target_compile_definitions(EDPE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(EDPE PROPERTIES OUTPUT_NAME EDPE)
