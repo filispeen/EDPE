@@ -107,6 +107,7 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     ui.imgui = ImGui::CreateContext();
     if (!ui.imgui) return false;
     ImGui::GetIO().IniFilename = nullptr;
+    ImGui::GetIO().MouseDrawCursor = true;
     const bool win32_ready = ImGui_ImplWin32_Init(ui.window);
     const bool dx11_ready = win32_ready && ImGui_ImplDX11_Init(ui.device, ui.context);
     ImGui::SetCurrentContext(previous);
