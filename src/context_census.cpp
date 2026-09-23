@@ -21,6 +21,7 @@ std::mutex seen_mutex;
 struct SeenDepthView {
     ID3D11DepthStencilView* view = nullptr; // Identity only; never dereferenced later.
     bool color_logged = false;
+    unsigned long long interval_binds = 0;
 };
 std::array<SeenDepthView, 32> seen{};
 size_t seen_count = 0;
@@ -44,6 +45,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             seen[seen_count++].view = dsv;
             first_bind = true;
         }
+        ++seen[index].interval_binds;
         if (count && targets && targets[0] && !seen[index].color_logged) {
             seen[index].color_logged = true;
             first_color = true;
@@ -138,15 +140,35 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     }
     if (frame % 1024 == 0 && observed_swap_chain == swap_chain) {
         size_t distinct = 0;
+        std::array<unsigned long long, 32> counts{};
         {
             std::lock_guard lock(seen_mutex);
             distinct = seen_count;
+            for (size_t i = 0; i < distinct; ++i) {
+                counts[i] = seen[i].interval_binds;
+                seen[i].interval_binds = 0;
+            }
         }
         wchar_t message[144];
         swprintf_s(message, L"EDPE: DSV census frame=%llu binds=%llu unique=%zu slotActive=%u",
             frame, dsv_binds.load(std::memory_order_relaxed), distinct,
             patched_table && patched_table[kOMSetRenderTargets] ==
                 reinterpret_cast<void*>(&observedOMSetRenderTargets));
+        EdpeLog(message);
+        int busiest[4]{-1, -1, -1, -1};
+        unsigned long long binds[4]{};
+        for (size_t rank = 0; rank < 4; ++rank) {
+            for (size_t i = 0; i < distinct; ++i) {
+                if (counts[i] > binds[rank]) {
+                    binds[rank] = counts[i];
+                    busiest[rank] = static_cast<int>(i);
+                }
+            }
+            if (busiest[rank] >= 0) counts[busiest[rank]] = 0;
+        }
+        swprintf_s(message, L"EDPE: DSV interval frame=%llu top=%d:%llu,%d:%llu,%d:%llu,%d:%llu",
+            frame, busiest[0], binds[0], busiest[1], binds[1],
+            busiest[2], binds[2], busiest[3], binds[3]);
         EdpeLog(message);
     }
 }

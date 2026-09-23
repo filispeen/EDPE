@@ -201,3 +201,9 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (user observation):** The game, 3D world, HUD, and F5 menu remained functional in this run. The user noticed that the mouse cursor was invisible over ImGui, which is a separate UI issue.
 - **IMPLICATION:** Matching DSV and RTV dimensions narrows the candidates but does not verify scene depth. Draw and clear association plus a depth-content view are still required before any temporal backend uses one.
 - **VERIFIED (subsequent user observation):** With `ImGuiIO::MouseDrawCursor` enabled for the EDPE menu, the cursor was visible and tracked the mouse over ImGui. The game stayed open; the user closed it normally.
+
+## DSV bind-frequency census — 2026-09-23
+
+- **EXPERIMENTAL:** Count non-null binds per tracked DSV inside the already validated slot-33 hook. At every 1024th `Present`, log the four busiest DSV indices for the preceding interval and reset those counters. This adds no hook and does not alter game rendering. Frequency is one more classification signal alongside dimensions, formats, RTV association, and eventual draw/clear evidence.
+- **VERIFIED (Release WARP test):** After four observed DSV binds, the interval record at frame 1024 reported `top=0:4`; both proxy smoke variants passed. Two of these binds come from ImGui's target restoration in the test, so counts include EDPE's overlay operations. No game interval has yet been measured with this addition.
+- **LIMIT:** Bind frequency alone does not identify scene depth or distinguish the original renderer's binds from EDPE's overlay binds. The 32-pointer table can miss later resources and pointer reuse can merge identities.
