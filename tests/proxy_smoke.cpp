@@ -166,6 +166,8 @@ int wmain(int argc, wchar_t** argv) {
         read && std::strstr(contents, "EDPE: Present swapchain=") &&
         std::strstr(contents, "EDPE: Present bindings") &&
         std::strstr(contents, "EDPE: context dispatch frame=1") &&
+        std::strstr(contents, "EDPE: context dispatch frame=8") &&
+        std::strstr(contents, "slot12=") && std::strstr(contents, "slot53=") &&
         std::strstr(contents, "EDPE: OMSetRenderTargets DSV census armed") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
