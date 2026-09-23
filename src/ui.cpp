@@ -3,6 +3,7 @@
 #include "context_census.h"
 
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
@@ -31,6 +32,10 @@ struct UiState {
     ID3D11RenderTargetView* backbuffer_rtv = nullptr;
     ID3D11Texture2D* depth_copy = nullptr;
     ID3D11ShaderResourceView* depth_srv = nullptr;
+    ID3D11PixelShader* depth_contrast_shader = nullptr;
+    bool depth_shader_failed = false;
+    bool depth_contrast = true;
+    bool depth_shader_logged = false;
     ID3D11Texture2D* depth_samples = nullptr;
     DXGI_FORMAT depth_sample_format = DXGI_FORMAT_UNKNOWN;
     unsigned depth_sample_attempts = 0;
@@ -101,6 +106,46 @@ void releaseDepthSnapshot() {
     ui.depth_range_valid = false;
     ui.depth_snapshot_index = -1;
     ui.depth_image_logged = false;
+}
+
+void bindDepthContrastShader(const ImDrawList*, const ImDrawCmd*) {
+    auto* state = static_cast<ImGui_ImplDX11_RenderState*>(
+        ImGui::GetPlatformIO().Renderer_RenderState);
+    if (!state || !ui.depth_contrast_shader) return;
+    state->DeviceContext->PSSetShader(ui.depth_contrast_shader, nullptr, 0);
+    if (!ui.depth_shader_logged) {
+        EdpeLog(L"EDPE: depth contrast shader active in ImGui");
+        ui.depth_shader_logged = true;
+    }
+}
+
+void ensureDepthContrastShader() {
+    if (ui.depth_contrast_shader || ui.depth_shader_failed) return;
+    static constexpr char source[] = R"(
+        struct PS_INPUT { float4 pos : SV_POSITION; float4 col : COLOR0; float2 uv : TEXCOORD0; };
+        Texture2D<float> texture0 : register(t0);
+        SamplerState sampler0 : register(s0);
+        float4 main(PS_INPUT input) : SV_Target {
+            float depth = texture0.Sample(sampler0, input.uv);
+            float value = saturate(depth / (depth + 0.001));
+            return float4(value, value, value, 1.0) * input.col;
+        }
+    )";
+    ID3DBlob* bytecode = nullptr;
+    HRESULT result = D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr,
+        "main", "ps_4_0", 0, 0, &bytecode, nullptr);
+    if (SUCCEEDED(result)) {
+        result = ui.device->CreatePixelShader(bytecode->GetBufferPointer(),
+            bytecode->GetBufferSize(), nullptr, &ui.depth_contrast_shader);
+    }
+    if (bytecode) bytecode->Release();
+    if (FAILED(result)) {
+        ui.depth_shader_failed = true;
+        wchar_t message[128];
+        swprintf_s(message, L"EDPE: depth contrast unavailable HRESULT=0x%08X",
+            static_cast<unsigned>(result));
+        EdpeLog(message);
+    }
 }
 
 void queueDepthSamples(const D3D11_TEXTURE2D_DESC& source_desc) {
@@ -226,6 +271,7 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
         ui.depth_height = desc.Height;
         ui.depth_snapshot_index = static_cast<int>(index);
         ui.depth_window_open = true;
+        ensureDepthContrastShader();
         queueDepthSamples(desc);
         wchar_t message[160];
         swprintf_s(message, L"EDPE: depth snapshot #%u copied %ux%u format=%u",
@@ -258,6 +304,7 @@ void shutdownUi() {
     }
     releaseBackbuffer();
     releaseDepthSnapshot();
+    if (ui.depth_contrast_shader) ui.depth_contrast_shader->Release();
     if (ui.context) ui.context->Release();
     if (ui.device) ui.device->Release();
     ui = {};
@@ -390,16 +437,22 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             display.y > 500.0f ? 80.0f : 0.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
-            ImGui::Text("DSV #%d: raw depth in red channel (%ux%u)",
+            ImGui::Text("DSV #%d (%ux%u)",
                 ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
             if (ui.depth_range_valid) ImGui::Text("8x8 sample range: %.6g .. %.6g",
                 ui.depth_min, ui.depth_max);
+            if (ui.depth_contrast_shader) ImGui::Checkbox("Contrast preview", &ui.depth_contrast);
+            else ImGui::TextDisabled("Contrast preview unavailable; showing raw red depth");
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;
             float height = width * static_cast<float>(ui.depth_height) / ui.depth_width;
             if (height > 360.0f) { width *= 360.0f / height; height = 360.0f; }
+            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+            const bool contrast = ui.depth_contrast && ui.depth_contrast_shader;
+            if (contrast) draw_list->AddCallback(bindDepthContrastShader);
             ImGui::Image(reinterpret_cast<ImTextureID>(ui.depth_srv), ImVec2(width, height));
+            if (contrast) draw_list->AddCallback(ImGui::GetPlatformIO().DrawCallback_ResetRenderState);
             if (!ui.depth_image_logged) {
                 EdpeLog(L"EDPE: depth snapshot image submitted to ImGui");
                 ui.depth_image_logged = true;
