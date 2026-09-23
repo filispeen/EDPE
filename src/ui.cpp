@@ -8,6 +8,9 @@
 #include <imgui_impl_win32.h>
 #include <windows.h>
 #include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -28,6 +31,12 @@ struct UiState {
     ID3D11RenderTargetView* backbuffer_rtv = nullptr;
     ID3D11Texture2D* depth_copy = nullptr;
     ID3D11ShaderResourceView* depth_srv = nullptr;
+    ID3D11Texture2D* depth_samples = nullptr;
+    DXGI_FORMAT depth_sample_format = DXGI_FORMAT_UNKNOWN;
+    unsigned depth_sample_attempts = 0;
+    bool depth_range_valid = false;
+    float depth_min = 0;
+    float depth_max = 0;
     UINT depth_width = 0;
     UINT depth_height = 0;
     int depth_candidate = 1;
@@ -83,12 +92,84 @@ void releaseBackbuffer() {
 }
 
 void releaseDepthSnapshot() {
+    if (ui.depth_samples) ui.depth_samples->Release();
     if (ui.depth_srv) ui.depth_srv->Release();
     if (ui.depth_copy) ui.depth_copy->Release();
     ui.depth_srv = nullptr;
     ui.depth_copy = nullptr;
+    ui.depth_samples = nullptr;
+    ui.depth_range_valid = false;
     ui.depth_snapshot_index = -1;
     ui.depth_image_logged = false;
+}
+
+void queueDepthSamples(const D3D11_TEXTURE2D_DESC& source_desc) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = desc.Height = 8;
+    desc.MipLevels = desc.ArraySize = 1;
+    desc.Format = source_desc.Format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(ui.device->CreateTexture2D(&desc, nullptr, &ui.depth_samples))) {
+        EdpeLog(L"EDPE: depth sample grid unavailable (staging creation failed)");
+        return;
+    }
+    ui.depth_sample_format = desc.Format;
+    ui.depth_sample_attempts = 0;
+    for (UINT y = 0; y < 8; ++y) {
+        for (UINT x = 0; x < 8; ++x) {
+            const UINT sx = (2 * x + 1) * source_desc.Width / 16;
+            const UINT sy = (2 * y + 1) * source_desc.Height / 16;
+            const D3D11_BOX box{sx, sy, 0, sx + 1, sy + 1, 1};
+            ui.context->CopySubresourceRegion(ui.depth_samples, 0, x, y, 0,
+                ui.depth_copy, 0, &box);
+        }
+    }
+}
+
+void pollDepthSamples() {
+    if (!ui.depth_samples) return;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT result = ui.context->Map(ui.depth_samples, 0, D3D11_MAP_READ,
+        D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++ui.depth_sample_attempts < 120) return;
+    if (FAILED(result)) {
+        EdpeLog(L"EDPE: depth sample grid unavailable (nonblocking map failed or timed out)");
+    } else {
+        float minimum = 1.0f;
+        float maximum = 0.0f;
+        unsigned valid = 0;
+        unsigned nonzero = 0;
+        for (UINT y = 0; y < 8; ++y) {
+            const auto* row = static_cast<const unsigned char*>(mapped.pData) + y * mapped.RowPitch;
+            for (UINT x = 0; x < 8; ++x) {
+                float depth = 0;
+                if (ui.depth_sample_format == DXGI_FORMAT_R32G8X24_TYPELESS) {
+                    std::memcpy(&depth, row + 8 * x, sizeof(depth));
+                } else {
+                    uint32_t packed = 0;
+                    std::memcpy(&packed, row + 4 * x, sizeof(packed));
+                    depth = static_cast<float>(packed & 0x00FFFFFFu) / 16777215.0f;
+                }
+                if (!std::isfinite(depth)) continue;
+                if (depth < minimum) minimum = depth;
+                if (depth > maximum) maximum = depth;
+                if (depth > 0.0f) ++nonzero;
+                ++valid;
+            }
+        }
+        ui.context->Unmap(ui.depth_samples, 0);
+        ui.depth_range_valid = valid != 0;
+        ui.depth_min = minimum;
+        ui.depth_max = maximum;
+        wchar_t message[180];
+        swprintf_s(message, L"EDPE: depth sample grid valid=%u nonzero=%u min=%.9g max=%.9g",
+            valid, nonzero, minimum, maximum);
+        EdpeLog(message);
+    }
+    ui.depth_samples->Release();
+    ui.depth_samples = nullptr;
 }
 
 void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
@@ -145,6 +226,7 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
         ui.depth_height = desc.Height;
         ui.depth_snapshot_index = static_cast<int>(index);
         ui.depth_window_open = true;
+        queueDepthSamples(desc);
         wchar_t message[160];
         swprintf_s(message, L"EDPE: depth snapshot #%u copied %ux%u format=%u",
             index, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
@@ -238,6 +320,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         EdpeLog(L"EDPE: Dear ImGui unavailable; presenting original frame");
         return;
     }
+    pollDepthSamples();
     if (!menu_visible.load()) {
         unsigned ignored = 0;
         if (auto* view = ContextCensusTakeDepthSnapshot(&ignored)) view->Release();
@@ -309,6 +392,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
             ImGui::Text("DSV #%d: raw depth in red channel (%ux%u)",
                 ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
+            if (ui.depth_range_valid) ImGui::Text("8x8 sample range: %.6g .. %.6g",
+                ui.depth_min, ui.depth_max);
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;

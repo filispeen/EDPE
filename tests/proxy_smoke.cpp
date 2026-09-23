@@ -201,6 +201,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "viewFormat=20 textureFormat=19 depth=64x64 bind=0x48") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
         std::strstr(contents, "EDPE: depth snapshot image submitted to ImGui") &&
+        std::strstr(contents, "EDPE: depth sample grid valid=64 nonzero=64 min=0.25 max=0.25") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");
