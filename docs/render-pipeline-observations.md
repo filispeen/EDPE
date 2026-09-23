@@ -73,3 +73,7 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 
 - **VERIFIED (local failure):** Renaming `EDPE.dll` to `d3d11.dll` in a test package caused recursive self-loading and stack overflow. Loading a short DLL name with `LOAD_LIBRARY_SEARCH_SYSTEM32` was insufficient once the proxy with the same name was already loaded.
 - **VERIFIED (local fix):** Both proxy exports now build an absolute System32 path and use `LoadLibraryExW` with `LOAD_LIBRARY_SEARCH_SYSTEM32` for dependent DLLs. The package test creates local `d3d11.dll` and `dxgi.dll` copies, then creates a WARP device, DXGI factory, swapchain, Present observations, overlay, resize, and clean release. This is still a local harness, not a game validation.
+
+## Menu hotkey — 2026-09-23
+
+- **VERIFIED (Release WARP test):** `F5` now opens and closes the EDPE menu. A repeated keydown while F5 is held does not toggle it. `Insert` no longer toggles the menu and reaches the original window procedure while the menu is hidden.

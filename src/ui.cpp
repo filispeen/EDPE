@@ -30,12 +30,11 @@ bool isInputMessage(UINT message) {
 
 LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-        (wparam == VK_INSERT || wparam == VK_F5) && !(lparam & (1LL << 30))) {
+        wparam == VK_F5 && !(lparam & (1LL << 30))) {
         ui.visible = !ui.visible;
         return 0;
     }
-    if ((message == WM_KEYUP || message == WM_SYSKEYUP) &&
-        (wparam == VK_INSERT || wparam == VK_F5)) return 0;
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F5) return 0;
     if (ui.visible && ui.imgui) {
         ImGuiContext* previous = ImGui::GetCurrentContext();
         ImGui::SetCurrentContext(ui.imgui);
@@ -102,7 +101,7 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
         SetWindowLongPtrW(ui.window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(edpeWndProc)));
     if (!ui.original_wndproc) return false;
     ui.swap_chain = swap_chain;
-    EdpeLog(L"EDPE: Dear ImGui ready; Insert or F5 toggles menu");
+    EdpeLog(L"EDPE: Dear ImGui ready; F5 toggles menu");
     return true;
 }
 
@@ -145,7 +144,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::TextUnformatted("DLAA / DLSS / FSR: temporal inputs not yet verified");
     ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
     ImGui::EndDisabled();
-    ImGui::TextUnformatted("Insert or F5: hide menu");
+    ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
     ImGui::Render();
 
