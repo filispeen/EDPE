@@ -144,7 +144,7 @@ int wmain(int argc, wchar_t** argv) {
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
-        read && std::strstr(contents, "EDPE: Present swapchain=") &&
+        read && std::strstr(contents, "EDPE: Present frame=1 swapchain=") &&
         std::strstr(contents, "EDPE: Present bindings") &&
         std::strstr(contents, "viewFormat=45 textureFormat=45 depth=64x64 bind=0x40") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&

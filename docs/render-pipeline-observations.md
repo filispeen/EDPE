@@ -134,3 +134,13 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (local tool):** The signed RenderDoc v1.46 portable ZIP was extracted under ignored `build/tools`. `renderdoccmd capture --wait-for-exit` ran the EDPE WARP smoke executable successfully (exit 0).
 - **VERIFIED (game process and user observation):** Launching `EliteDangerous64.exe` directly through RenderDoc created a process with `renderdoc.dll` and both EDPE proxies loaded, but no main window, new EDPE log entry, or frame capture. The process stayed at roughly 0.23 seconds of CPU until EDPE stopped the two processes started for this experiment. The user did not see the game open normally.
 - **LIMIT:** This does not show that RenderDoc is incompatible with the game or identify a depth resource. Direct executable launch may bypass the game's usual Steam/launcher path. `EDLaunch.exe` and `MinEdLauncher.exe` exist in the installation, but neither has been tested with RenderDoc. Determine the user's normal launch route before another capture attempt.
+
+## Steam launcher capture check — 2026-09-23
+
+- **VERIFIED (Steam configuration and user observation):** The normal launch chain is Steam → MinEdLauncher → Elite. Its launch option is `cmd /c "MinEdLauncher.exe %command% /edh4 /autorun /autoquit"`. With that option restored, the game and F5 menu work; EDPE again logs a 2560×1440 `Present`.
+- **VERIFIED (capture experiment):** A temporary Steam launch option placed RenderDoc before MinEdLauncher and enabled `--opt-hook-children`. MinEdLauncher logged an attempt to launch Elite, and an `EliteDangerous64.exe` process appeared briefly, then exited without a new EDPE log entry or frame capture. The user reported that the game did not open. The original Steam option was restored immediately afterward.
+- **LIMIT:** Neither RenderDoc experiment identified a depth resource. The reason this game launch fails under RenderDoc is unknown. Further capture attempts need a specific compatibility hypothesis; the ordinary Steam path must remain usable.
+
+## Later-Present binding sample — 2026-09-23
+
+- **EXPERIMENTAL:** The first observed `Present` may occur before normal gameplay. Log the same read-only binding query at frame 1 and every 1024th observed `Present` through frame 8192. This uses the existing, game-verified swapchain hook and performs no output modification. A later bound DSV would still be only a candidate, not verified scene depth.
