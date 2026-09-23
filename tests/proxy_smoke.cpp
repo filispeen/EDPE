@@ -95,6 +95,14 @@ int wmain(int argc, wchar_t** argv) {
     SendMessageW(window, WM_KEYUP, VK_INSERT, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool hidden_input_restored = forwarded_keys == 2;
+    SendMessageW(window, WM_KEYDOWN, VK_F5, 0);
+    const bool f5_opened = menu_visible();
+    SendMessageW(window, WM_KEYDOWN, VK_F5, 1LL << 30);
+    const bool f5_repeat_ignored = menu_visible();
+    SendMessageW(window, WM_KEYUP, VK_F5, 0);
+    SendMessageW(window, WM_KEYDOWN, VK_F5, 0);
+    const bool f5_closed = !menu_visible();
+    SendMessageW(window, WM_KEYUP, VK_F5, 0);
     swap_chain->Release();
     if (factory) factory->Release();
     DestroyWindow(window);
@@ -112,13 +120,15 @@ int wmain(int argc, wchar_t** argv) {
     const bool passed = SUCCEEDED(present_result) && SUCCEEDED(second_present_result) && observed &&
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
+        f5_opened && f5_repeat_ignored && f5_closed &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
         read && std::strstr(contents, "EDPE: Present swapchain=") &&
         std::strstr(contents, "EDPE: Dear ImGui ready");
     if (!passed) std::fprintf(stderr,
-        "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d input=%d/%d/%d read=%d\n",
+        "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d f5=%d/%d/%d input=%d/%d/%d read=%d\n",
         present_result, second_present_result, first_real_present, overlay_present,
         resize_result, resized_present, observed, opened, closed,
+        f5_opened, f5_repeat_ignored, f5_closed,
         hidden_input_passed, visible_input_blocked, hidden_input_restored, read);
     return passed ? 0 : 12;
 }
