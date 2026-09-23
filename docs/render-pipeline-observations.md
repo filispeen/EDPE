@@ -41,3 +41,8 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 
 - **VERIFIED (local test):** `EDPE.dll` exports `D3D11CreateDevice` and forwards it to the system D3D11 DLL loaded from System32. A WARP device and immediate context were created through the export, released, and the test passed.
 - **LIMIT:** The export set currently covers only the executable's static D3D11 import. The DLL has not been placed beside the game; other modules may request additional D3D11 exports. Present observation and normal 2D rendering remain unverified.
+
+## DXGI factory check — 2026-09-23
+
+- **VERIFIED (local test):** A separate `dxgi.dll` shim exports the executable's observed `CreateDXGIFactory1` import and forwards it to System32. A test created and released an `IDXGIFactory1` through the shim.
+- **LIMIT:** The factory is currently returned unchanged. Neither `CreateSwapChain` nor `Present` is intercepted. Additional DXGI exports and coexistence with other graphics mods remain untested; the shim is not ready to install.

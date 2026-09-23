@@ -1,0 +1,2 @@
+EXPORTS
+    CreateDXGIFactory1=EdpeCreateDXGIFactory1
