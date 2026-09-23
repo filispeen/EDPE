@@ -17,3 +17,5 @@ ctest --test-dir build --output-on-failure
 The outputs are `build/EDPE.dll` and `build/dxgi.dll`. For the current local game test, copy `EDPE.dll` as `d3d11.dll` and copy `dxgi.dll` beside `EliteDangerous64.exe` after each successful build. The proxy covers the executable's observed static imports and the system D3D11 dependency on `CreateDXGIFactory2`. Long-session stability and other graphics configurations remain unverified.
 
 See [renderer observations](docs/render-pipeline-observations.md) for verified findings and the next Phase 1 checks.
+
+світла пам'ять соні, моїй любій кішці яка померла 24 січня 26-го року около 1:00 AM
