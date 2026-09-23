@@ -102,3 +102,9 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (Release WARP test):** A device-vtable hook for `CreateDepthStencilView` recorded a 32×32 D24S8 test view and passed both proxy smoke tests.
 - **VERIFIED (game log and user observation):** With that hook installed, two game launches logged DXGI factory and D3D11 device creation but no `Present` or DSV entry. The user reported that the game closed immediately after launch.
 - **ACTION:** Commit `8f31352` reverted the hook; the earlier pass-through DLLs were rebuilt and restored to the game's relocated installation. The exact failure point inside the device hook remains unverified. No depth candidate from the game was obtained.
+
+## Rejected revised depth-view hook — 2026-09-23
+
+- **VERIFIED (Release local tests):** A second version left `ID3D11Device::Release` untouched and retained the replacement vtable for the device lifetime. Two WARP tests and one hardware D3D11 test created a DSV, reached `Present`, resized, and released successfully.
+- **VERIFIED (game log and user observation):** Two further game launches logged successful installation of the revised hook on 69-method `ID3D11Device5` pointers, then exited before any DSV entry or `Present`. The user confirmed that the game briefly opened and closed.
+- **VERIFIED (comparison):** The `Release` wrapper alone did not cause the failure. Instance-vtable replacement on the D3D11 device is unsafe in this game under the tested conditions; the specific mechanism is unknown. Commit `46f0598` reverted the second attempt, and the known-working DLLs were restored before rebuilding and redeploying the pass-through version. Do not retry this hook pattern without evidence that explains the early exit.
