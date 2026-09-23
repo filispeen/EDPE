@@ -1,6 +1,6 @@
 # EDPE — Elite Dangerous Performance Enhanced
 
-EDPE targets the 2D Direct3D 11 renderer of Elite Dangerous. `EDPE.dll` forwards `D3D11CreateDevice`; the experimental `dxgi.dll` shim forwards `CreateDXGIFactory1`. Both report creation through debugger output. Neither hooks `Present` or changes rendered output.
+EDPE targets the 2D Direct3D 11 renderer of Elite Dangerous. `EDPE.dll` forwards `D3D11CreateDevice`; the experimental `dxgi.dll` shim observes factories, swapchains, and `Present`. Observation reports the first swapchain's dimensions, format, device, and immediate context through debugger output. Rendered output is unchanged.
 
 Build from an x64 MSVC developer PowerShell:
 

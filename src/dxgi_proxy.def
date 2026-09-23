@@ -1,2 +1,3 @@
 EXPORTS
     CreateDXGIFactory1=EdpeCreateDXGIFactory1
+    EDPE_ObservedPresentCount=EdpeObservedPresentCount

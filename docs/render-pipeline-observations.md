@@ -45,4 +45,10 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 ## DXGI factory check — 2026-09-23
 
 - **VERIFIED (local test):** A separate `dxgi.dll` shim exports the executable's observed `CreateDXGIFactory1` import and forwards it to System32. A test created and released an `IDXGIFactory1` through the shim.
-- **LIMIT:** The factory is currently returned unchanged. Neither `CreateSwapChain` nor `Present` is intercepted. Additional DXGI exports and coexistence with other graphics mods remain untested; the shim is not ready to install.
+- **LIMIT:** Additional DXGI exports and coexistence with other graphics mods remain untested; the shim is not ready to install.
+
+## Local Present observation — 2026-09-23
+
+- **VERIFIED (local WARP test):** The DXGI shim observes `IDXGIFactory::CreateSwapChain` and `IDXGISwapChain::Present` through instance-local COM vtables. A 64×64 WARP swapchain was created, two `Present(DXGI_PRESENT_TEST)` calls reached the observer, and the swapchain, factory, context, device, and test window were released. The original DXGI methods returned successfully.
+- **VERIFIED (failure and correction):** The first test crashed during swapchain `Release` when the replacement vtable remained installed inside the original `Release` call. Restoring the original vtable for that call fixed the local crash. This does not establish safety under all multithreaded or mod-chained use.
+- **LIMIT:** The current path observes `CreateSwapChain` and `Present`, not `CreateSwapChainForHwnd` or `Present1`. The DLL exports only the executable's static `CreateDXGIFactory1` import. In-game loading, other module imports, concurrency, resize, fullscreen transitions, and normal 2D rendering remain unverified. Do not install this prototype yet.
