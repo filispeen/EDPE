@@ -14,6 +14,6 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The outputs are `build/EDPE.dll` and `build/dxgi.dll`. For the current local game test, copy `EDPE.dll` as `d3d11.dll` and copy `dxgi.dll` beside `EliteDangerous64.exe` after each successful build. The proxy exports cover the executable's observed static imports; in-game loading and compatibility with other modules remain unverified.
+The outputs are `build/EDPE.dll` and `build/dxgi.dll`. For the current local game test, copy `EDPE.dll` as `d3d11.dll` and copy `dxgi.dll` beside `EliteDangerous64.exe` after each successful build. The proxy covers the executable's observed static imports and the system D3D11 dependency on `CreateDXGIFactory2`; further in-game compatibility remains unverified.
 
 See [renderer observations](docs/render-pipeline-observations.md) for verified findings and the next Phase 1 checks.

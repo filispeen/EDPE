@@ -16,6 +16,8 @@ LRESULT CALLBACK testWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 int wmain(int argc, wchar_t** argv) {
     if (argc != 4) return 1;
     DeleteFileW(argv[3]);
+    const HMODULE dxgi_proxy = LoadLibraryW(argv[2]);
+    if (!dxgi_proxy) return 5;
     const HMODULE proxy = LoadLibraryW(argv[1]);
     if (!proxy) return 2;
     const auto create_device = reinterpret_cast<decltype(&D3D11CreateDevice)>(
@@ -29,11 +31,12 @@ int wmain(int argc, wchar_t** argv) {
     FreeLibrary(proxy);
     if (FAILED(result) || !device || !context) return 4;
 
-    const HMODULE dxgi_proxy = LoadLibraryW(argv[2]);
-    if (!dxgi_proxy) return 5;
     const auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory1)>(
         GetProcAddress(dxgi_proxy, "CreateDXGIFactory1"));
     if (!create_factory) return 6;
+    const auto create_factory2 = reinterpret_cast<decltype(&CreateDXGIFactory2)>(
+        GetProcAddress(dxgi_proxy, "CreateDXGIFactory2"));
+    if (!create_factory2) return 6;
     const auto present_count = reinterpret_cast<unsigned long long (WINAPI*)()>(
         GetProcAddress(dxgi_proxy, "EDPE_ObservedPresentCount"));
     if (!present_count) return 7;
@@ -44,6 +47,11 @@ int wmain(int argc, wchar_t** argv) {
     const HRESULT factory_result = create_factory(__uuidof(IDXGIFactory1),
         reinterpret_cast<void**>(&factory));
     if (FAILED(factory_result) || !factory) return 8;
+    IDXGIFactory2* factory2 = nullptr;
+    const HRESULT factory2_result = create_factory2(0, __uuidof(IDXGIFactory2),
+        reinterpret_cast<void**>(&factory2));
+    if (FAILED(factory2_result) || !factory2) return 8;
+    factory2->Release();
     IDXGIFactory7* newer_factory = nullptr;
     if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory7),
             reinterpret_cast<void**>(&newer_factory)))) {

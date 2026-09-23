@@ -82,3 +82,10 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 
 - **VERIFIED (file hashes):** The Release-stage `d3d11.dll` and `dxgi.dll` were copied beside the supplied Odyssey `EliteDangerous64.exe`. SHA-256 of each destination matched its build-stage source immediately after copying. No pre-existing active DLL with either name was overwritten.
 - **LIMIT:** Copying confirms deployment only. Game load, normal rendering, Present observation, ImGui visibility, and input handling still require an in-game test. The DLLs are experimental and their export sets remain limited.
+
+## In-game loader failure — 2026-09-23
+
+- **VERIFIED (user report and game log):** Game startup reported missing `CreateDXGIFactory2` while loading the system `d3d11.dll`. The game-side `edpe.log` contained `EDPE: DXGI factory created`, but no Present observation.
+- **VERIFIED (PE imports):** Windows `System32\d3d11.dll` imports `CreateDXGIFactory2` from `dxgi.dll`. EDPE's installed `dxgi.dll` exported only `CreateDXGIFactory1`, which explains the loader failure.
+- **VERIFIED (Release WARP test):** The DXGI proxy now forwards `CreateDXGIFactory2` to System32 and observes the returned factory. The test loads the local DXGI proxy before D3D11, creates a WARP device, calls both factory exports, presents, resizes, and releases resources. Both normal and filename-alias tests pass.
+- **LIMIT:** This corrects the identified loader error; successful game startup and rendering have not yet been rechecked.

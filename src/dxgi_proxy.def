@@ -1,4 +1,5 @@
 EXPORTS
     CreateDXGIFactory1=EdpeCreateDXGIFactory1
+    CreateDXGIFactory2=EdpeCreateDXGIFactory2
     EDPE_ObservedPresentCount=EdpeObservedPresentCount
     EDPE_MenuVisible=EdpeMenuVisible
