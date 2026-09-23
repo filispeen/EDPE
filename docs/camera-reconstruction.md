@@ -56,6 +56,25 @@ the visible surface hit point. The HUD station-distance change was 470 m,
 which does not establish a scene-unit-to-metre conversion because the HUD
 reference point and center-pixel surface point differ.
 
+## Navigation-beacon range attempt — 2026-09-24
+
+**MEASURED:** The user reported a navigation beacon at a HUD distance of
+444 m. In the same game run, one successful scene candidate `#2` snapshot
+used the `2560×1440` format-19 DSV, with eight binds between `Present`
+37489 and 37490. Its center raw depth was `0.0000601842221`; the scene
+buffer again contained `0.02500000037` at word 1094. The candidate
+`0.025/depth` conversion gives `415.391` scene units, numerically 28.609
+below the HUD value. The 8×8 grid had 36 nonzero cells and a maximum of
+`0.0207383949`.
+
+**VERIFIED (user observation):** The beacon was centered on screen but was
+**not visible in the depth snapshot**. Therefore the center-depth value
+cannot be attributed to the beacon. The numerical proximity of `415.391`
+and 444 is incidental; this capture does not test the beacon's distance,
+calibrate scene units to metres, or verify the depth equation at short range.
+Another check needs a static object visibly present at the sampled pixel
+in the depth preview.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
