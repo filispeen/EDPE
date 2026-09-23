@@ -155,6 +155,13 @@ int wmain(int argc, wchar_t** argv) {
     context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, 0.25f, 0);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, depth_view);
+    for (int i = 0; i < 3; ++i) context->OMSetRenderTargets(0, nullptr, depth_view);
+    D3D11_MAPPED_SUBRESOURCE updated_probe{};
+    if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &updated_probe))) return 10;
+    probe_values[795] = 0.05f;
+    std::memcpy(updated_probe.pData, probe_values, sizeof(probe_values));
+    context->Unmap(probe_buffer, 0);
+    context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     const HRESULT snapshot_present = swap_chain->Present(0, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
@@ -211,16 +218,16 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:9") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:13") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
         std::strstr(contents, "viewFormat=20 textureFormat=19 depth=64x64 bind=0x48") &&
-        std::strstr(contents, "EDPE: depth snapshot timing #0 armedAfter=7 firstBindAfter=7 lastBindAfter=7 binds=2 handedAt=8") &&
+        std::strstr(contents, "EDPE: depth snapshot timing #0 armedAfter=7 firstBindAfter=7 lastBindAfter=7 binds=6 handedAt=8") &&
         std::strstr(contents, "EDPE: DSV #0 bind=1 CB stage=VS slot=1 buffer=") &&
         std::strstr(contents, "EDPE: DSV #0 bind=2 CB stage=VS slot=1 buffer=") &&
         std::strstr(contents, "bytes=5376 usage=2 cpu=0x10000") &&
-        std::strstr(contents, "EDPE: scene CB sample bind=1 projectionZ=(0,0.025") &&
+        std::strstr(contents, "EDPE: scene CB sample bind=6 projectionZ=(0,0.050000") &&
         std::strstr(contents, "EDPE: scene CB rows1=(0,1,0,0) rows2=(0,0,1,0)") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
         std::strstr(contents, "EDPE: depth snapshot image submitted to ImGui") &&
