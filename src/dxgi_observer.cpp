@@ -110,9 +110,11 @@ void logFirstPresent(IDXGISwapChain* swap_chain) {
         device->GetImmediateContext(&context);
     }
     wchar_t message[256];
-    swprintf_s(message, L"EDPE: Present swapchain=%p %ux%u format=%u device=%p context=%p",
+    void** device_methods = device ? *reinterpret_cast<void***>(device) : nullptr;
+    swprintf_s(message, L"EDPE: Present swapchain=%p %ux%u format=%u device=%p context=%p vtable=%p dsvMethod=%p",
         swap_chain, desc.BufferDesc.Width, desc.BufferDesc.Height,
-        static_cast<unsigned>(desc.BufferDesc.Format), device, context);
+        static_cast<unsigned>(desc.BufferDesc.Format), device, context,
+        device_methods, device_methods ? device_methods[10] : nullptr);
     EdpeLog(message);
     if (context) context->Release();
     if (device) device->Release();

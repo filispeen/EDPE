@@ -129,7 +129,8 @@ int wmain(int argc, wchar_t** argv) {
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
         read && std::strstr(contents, "EDPE: Present swapchain=") &&
-        std::strstr(contents, "EDPE: Dear ImGui ready");
+        std::strstr(contents, "EDPE: Dear ImGui ready") &&
+        std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");
     if (!passed) std::fprintf(stderr,
         "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d insert=%d repeat=%d input=%d/%d/%d read=%d\n",
         present_result, second_present_result, first_real_present, overlay_present,

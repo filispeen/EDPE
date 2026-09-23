@@ -2,6 +2,7 @@
 #include "system_dll.h"
 
 #include <d3d11.h>
+#include <cwchar>
 #include <windows.h>
 
 extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
@@ -24,7 +25,15 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
 
     const HRESULT result = create_device(adapter, driver_type, software, flags,
         feature_levels, feature_level_count, sdk_version, device, feature_level, context);
-    EdpeLog(SUCCEEDED(result) ? L"EDPE: D3D11 device created"
-                              : L"EDPE: D3D11 device creation failed");
+    if (SUCCEEDED(result) && device && *device) {
+        void** methods = *reinterpret_cast<void***>(*device);
+        wchar_t message[160];
+        swprintf_s(message, L"EDPE: D3D11 device created device=%p vtable=%p dsvMethod=%p",
+            *device, methods, methods[10]);
+        EdpeLog(message);
+    } else {
+        EdpeLog(SUCCEEDED(result) ? L"EDPE: D3D11 device created without output"
+                                  : L"EDPE: D3D11 device creation failed");
+    }
     return result;
 }
