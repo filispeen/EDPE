@@ -40,6 +40,11 @@ int snapshot_index = -1;
 ID3D11DepthStencilView* snapshot_view = nullptr; // Retained only until the next UI Present.
 unsigned snapshot_wait_frames = 0;
 std::atomic<bool> snapshot_waiting{false};
+std::atomic<unsigned long long> last_present_frame{0};
+unsigned long long snapshot_armed_after = 0;
+unsigned long long snapshot_first_bind_after = 0;
+unsigned long long snapshot_last_bind_after = 0;
+unsigned snapshot_bind_count = 0;
 
 void recordBind(int index) {
     if (index == sequence_last) return;
@@ -84,6 +89,12 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             snapshot_index = snapshot_active;
             snapshot_active = -1;
             snapshot_waiting.store(false, std::memory_order_release);
+        }
+        if (snapshot_view == dsv && snapshot_index == static_cast<int>(index)) {
+            const auto after = last_present_frame.load(std::memory_order_relaxed);
+            if (!snapshot_bind_count) snapshot_first_bind_after = after;
+            snapshot_last_bind_after = after;
+            ++snapshot_bind_count;
         }
         if (count && targets && targets[0] && !seen[index].color_logged) {
             seen[index].color_logged = true;
@@ -154,6 +165,8 @@ bool patchSlot(void** table, void* expected, void* replacement) {
 } // namespace
 
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
+    if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
+        last_present_frame.store(frame, std::memory_order_relaxed);
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
         snapshot_waiting.load(std::memory_order_acquire)) {
         bool expired = false;
@@ -266,6 +279,9 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             snapshot_queued = -1;
             snapshot_wait_frames = 120;
             snapshot_waiting.store(true, std::memory_order_release);
+            snapshot_armed_after = last_present_frame.load(std::memory_order_relaxed);
+            snapshot_first_bind_after = snapshot_last_bind_after = 0;
+            snapshot_bind_count = 0;
         }
     }
     if (arm_sequence) EdpeLog(L"EDPE: one-frame DSV bind sequence armed after overlay");
@@ -306,11 +322,31 @@ bool ContextCensusDepthSnapshotAvailable(unsigned index) {
 }
 
 ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index) {
-    std::lock_guard lock(seen_mutex);
-    ID3D11DepthStencilView* view = snapshot_view;
-    if (view && index) *index = static_cast<unsigned>(snapshot_index);
-    snapshot_view = nullptr;
-    snapshot_index = -1;
+    ID3D11DepthStencilView* view = nullptr;
+    unsigned long long armed = 0, first = 0, last = 0;
+    unsigned binds = 0, selected = 0;
+    {
+        std::lock_guard lock(seen_mutex);
+        view = snapshot_view;
+        if (view) {
+            selected = static_cast<unsigned>(snapshot_index);
+            armed = snapshot_armed_after;
+            first = snapshot_first_bind_after;
+            last = snapshot_last_bind_after;
+            binds = snapshot_bind_count;
+        }
+        snapshot_view = nullptr;
+        snapshot_index = -1;
+    }
+    if (view) {
+        if (index) *index = selected;
+        wchar_t message[192];
+        swprintf_s(message,
+            L"EDPE: depth snapshot timing #%u armedAfter=%llu firstBindAfter=%llu lastBindAfter=%llu binds=%u handedAt=%llu",
+            selected, armed, first, last, binds,
+            last_present_frame.load(std::memory_order_relaxed));
+        EdpeLog(message);
+    }
     return view;
 }
 
@@ -333,6 +369,8 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         if (snapshot_view) snapshot_view->Release();
         snapshot_view = nullptr;
         snapshot_index = -1;
+        snapshot_armed_after = snapshot_first_bind_after = snapshot_last_bind_after = 0;
+        snapshot_bind_count = 0;
     }
     sequence_active.store(false, std::memory_order_release);
     sequence_requested.store(false, std::memory_order_release);
@@ -343,4 +381,5 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     observed_context.exchange(nullptr, std::memory_order_acq_rel)->Release();
     patched_table = nullptr;
     observed_swap_chain = nullptr;
+    last_present_frame.store(0, std::memory_order_relaxed);
 }
