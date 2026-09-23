@@ -122,3 +122,9 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **EXPERIMENTAL:** At the first observed `Present`, query `OMGetRenderTargets` and log the currently bound render-target and depth-stencil view with the depth texture's format, dimensions, bind flags, and sample count. This reads existing COM state and leaves the rendering path unchanged. A bound DSV at `Present` would be a candidate only; an unbound DSV would not prove the scene lacked depth earlier in the frame.
 - **VERIFIED (game log, build `2026.09.03.332841`):** On a 2560×1440 first `Present`, `OMGetRenderTargets` returned no RTV and no DSV. The query logged zero formats and dimensions. Neither target was bound at this frame boundary; depth identification requires observation earlier in the frame.
 - **VERIFIED (user observation):** The game and F5 menu still displayed normally with this read-only query.
+
+## Next depth observation — 2026-09-23
+
+- **SDK-DOCUMENTED:** [RenderDoc's capture guide](https://github.com/baldurk/renderdoc/blob/v1.x/docs/getting_started/quick_start.rst) describes D3D11 frame capture. Its [resource inspector](https://github.com/baldurk/renderdoc/blob/v1.x/docs/window/resource_inspector.rst) and [texture viewer](https://github.com/baldurk/renderdoc/blob/v1.x/docs/window/texture_viewer.rst) can show depth resources and their use earlier than `Present`.
+- **VERIFIED (local environment):** RenderDoc is not installed. The official portable download could not be reached from the command-line network path. A frame capture has not been made.
+- **EXPERIMENTAL PLAN:** Capture one normal 2D gameplay frame, locate DSV binds and clears alongside 3D draws, then inspect candidate textures, formats, dimensions, and view relationships. Record the game build and capture evidence before identifying scene depth. Keep the capture out of Git.
