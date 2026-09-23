@@ -109,6 +109,12 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &color_texture))) return 10;
     ID3D11RenderTargetView* color_view = nullptr;
     if (FAILED(device->CreateRenderTargetView(color_texture, nullptr, &color_view))) return 10;
+    D3D11_BUFFER_DESC probe_desc{};
+    probe_desc.ByteWidth = 4096;
+    probe_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ID3D11Buffer* probe_buffer = nullptr;
+    if (FAILED(device->CreateBuffer(&probe_desc, nullptr, &probe_buffer))) return 10;
+    context->VSSetConstantBuffers(0, 1, &probe_buffer);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     IDXGISwapChain4* newer_swap_chain = nullptr;
     if (SUCCEEDED(swap_chain->QueryInterface(__uuidof(IDXGISwapChain4),
@@ -156,6 +162,9 @@ int wmain(int argc, wchar_t** argv) {
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool hidden_input_restored = forwarded_keys == 2;
     context->OMSetRenderTargets(0, nullptr, nullptr);
+    ID3D11Buffer* no_buffer = nullptr;
+    context->VSSetConstantBuffers(0, 1, &no_buffer);
+    probe_buffer->Release();
     color_view->Release();
     color_texture->Release();
     depth_view->Release();
@@ -200,6 +209,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
         std::strstr(contents, "viewFormat=20 textureFormat=19 depth=64x64 bind=0x48") &&
         std::strstr(contents, "EDPE: depth snapshot timing #0 armedAfter=7 firstBindAfter=7 lastBindAfter=7 binds=1 handedAt=8") &&
+        std::strstr(contents, "EDPE: DSV #0 bound CB stage=VS slot=0 buffer=") &&
+        std::strstr(contents, "bytes=4096 usage=0 cpu=0x0") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
         std::strstr(contents, "EDPE: depth snapshot image submitted to ImGui") &&
         std::strstr(contents, "EDPE: depth contrast shader active in ImGui") &&

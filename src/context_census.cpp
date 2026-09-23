@@ -53,6 +53,29 @@ void recordBind(int index) {
     if (sequence_stored < bind_sequence.size()) bind_sequence[sequence_stored++] = index;
 }
 
+void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index) {
+    constexpr UINT slots = 8;
+    ID3D11Buffer* vs[slots]{};
+    ID3D11Buffer* ps[slots]{};
+    context->VSGetConstantBuffers(0, slots, vs);
+    context->PSGetConstantBuffers(0, slots, ps);
+    for (UINT stage = 0; stage < 2; ++stage) {
+        auto* buffers = stage ? ps : vs;
+        for (UINT slot = 0; slot < slots; ++slot) {
+            if (!buffers[slot]) continue;
+            D3D11_BUFFER_DESC desc{};
+            buffers[slot]->GetDesc(&desc);
+            wchar_t message[160];
+            swprintf_s(message,
+                L"EDPE: DSV #%zu bound CB stage=%s slot=%u buffer=%p bytes=%u usage=%u cpu=0x%X",
+                depth_index, stage ? L"PS" : L"VS", slot, buffers[slot],
+                desc.ByteWidth, static_cast<unsigned>(desc.Usage), desc.CPUAccessFlags);
+            EdpeLog(message);
+            buffers[slot]->Release();
+        }
+    }
+}
+
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
     const auto forward = original.load(std::memory_order_acquire);
@@ -70,6 +93,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     size_t index = 0;
     bool first_bind = false;
     bool first_color = false;
+    bool snapshot_first_bind = false;
     {
         std::lock_guard lock(seen_mutex);
         while (index < seen_count && seen[index].view != dsv) ++index;
@@ -89,6 +113,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             snapshot_index = snapshot_active;
             snapshot_active = -1;
             snapshot_waiting.store(false, std::memory_order_release);
+            snapshot_first_bind = true;
         }
         if (snapshot_view == dsv && snapshot_index == static_cast<int>(index)) {
             const auto after = last_present_frame.load(std::memory_order_relaxed);
@@ -101,6 +126,8 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             first_color = true;
         }
     }
+
+    if (snapshot_first_bind) logBoundConstantBuffers(context, index);
 
     if (!first_bind && !first_color) return;
 
