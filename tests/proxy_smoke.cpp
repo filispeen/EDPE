@@ -30,6 +30,7 @@ int wmain(int argc, wchar_t** argv) {
         nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context);
     FreeLibrary(proxy);
     if (FAILED(result) || !device || !context) return 4;
+    void* original_om_set = (*reinterpret_cast<void***>(context))[33];
 
     const auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory1)>(
         GetProcAddress(dxgi_proxy, "CreateDXGIFactory1"));
@@ -103,6 +104,8 @@ int wmain(int argc, wchar_t** argv) {
     const HRESULT second_present_result = swap_chain->Present(0, DXGI_PRESENT_TEST);
     const bool observed = present_count() == 2;
     const HRESULT first_real_present = swap_chain->Present(0, 0);
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    context->OMSetRenderTargets(0, nullptr, depth_view);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool hidden_input_passed = forwarded_keys == 1;
     SendMessageW(window, WM_KEYDOWN, VK_INSERT, 0);
@@ -126,6 +129,8 @@ int wmain(int argc, wchar_t** argv) {
     depth_view->Release();
     depth_texture->Release();
     swap_chain->Release();
+    const bool context_hook_restored =
+        (*reinterpret_cast<void***>(context))[33] == original_om_set;
     if (factory) factory->Release();
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
@@ -144,9 +149,12 @@ int wmain(int argc, wchar_t** argv) {
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
+        context_hook_restored &&
         read && std::strstr(contents, "EDPE: Present swapchain=") &&
         std::strstr(contents, "EDPE: Present bindings") &&
         std::strstr(contents, "EDPE: context dispatch frame=1") &&
+        std::strstr(contents, "EDPE: OMSetRenderTargets DSV census armed") &&
+        std::strstr(contents, "EDPE: DSV bind #0 view=") &&
         std::strstr(contents, "viewFormat=45 textureFormat=45 depth=64x64 bind=0x40") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&

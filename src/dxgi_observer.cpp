@@ -1,5 +1,6 @@
 #include "log.h"
 #include "ui.h"
+#include "context_census.h"
 
 #include <atomic>
 #include <cstddef>
@@ -69,7 +70,10 @@ ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
     const auto original = reinterpret_cast<ReleaseFn>(table->original[kRelease]);
     const ULONG remaining = original(object);
     if (remaining) *reinterpret_cast<void***>(object) = table->methods;
-    else delete table;
+    else {
+        ContextCensusOnSwapChainRelease(object);
+        delete table;
+    }
     return remaining;
 }
 
@@ -171,6 +175,7 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
     const auto frame = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (frame == 1) logFirstPresent(swap_chain);
     if (frame == 1 || (frame <= 8192 && frame % 1024 == 0)) logContextDispatch(swap_chain, frame);
+    ContextCensusOnPresent(swap_chain, frame);
     UiOnPresent(swap_chain, flags);
     const auto original = reinterpret_cast<PresentFn>(tableOf(swap_chain)->original[kPresent]);
     return original(swap_chain, sync_interval, flags);
