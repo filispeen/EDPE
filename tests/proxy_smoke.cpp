@@ -28,8 +28,25 @@ int wmain(int argc, wchar_t** argv) {
     ID3D11DeviceContext* context = nullptr;
     const HRESULT result = create_device(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context);
-    FreeLibrary(proxy);
     if (FAILED(result) || !device || !context) return 4;
+    D3D11_TEXTURE2D_DESC depth_desc{};
+    depth_desc.Width = 32;
+    depth_desc.Height = 32;
+    depth_desc.MipLevels = 1;
+    depth_desc.ArraySize = 1;
+    depth_desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    depth_desc.SampleDesc.Count = 1;
+    depth_desc.Usage = D3D11_USAGE_DEFAULT;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    ID3D11Texture2D* depth_texture = nullptr;
+    if (FAILED(device->CreateTexture2D(&depth_desc, nullptr, &depth_texture))) return 4;
+    D3D11_DEPTH_STENCIL_VIEW_DESC depth_view_desc{};
+    depth_view_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depth_view_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    ID3D11DepthStencilView* depth_view = nullptr;
+    if (FAILED(device->CreateDepthStencilView(depth_texture, &depth_view_desc, &depth_view))) return 4;
+    depth_view->Release();
+    depth_texture->Release();
 
     const auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory1)>(
         GetProcAddress(dxgi_proxy, "CreateDXGIFactory1"));
@@ -115,6 +132,7 @@ int wmain(int argc, wchar_t** argv) {
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
     context->Release();
     device->Release();
+    FreeLibrary(proxy);
     FreeLibrary(dxgi_proxy);
     const HANDLE log = CreateFileW(argv[3], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -129,7 +147,9 @@ int wmain(int argc, wchar_t** argv) {
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
         read && std::strstr(contents, "EDPE: Present swapchain=") &&
-        std::strstr(contents, "EDPE: Dear ImGui ready");
+        std::strstr(contents, "EDPE: Dear ImGui ready") &&
+        std::strstr(contents, "EDPE: DSV #1") &&
+        std::strstr(contents, "32x32 textureFormat=44 viewFormat=45 bind=0x48");
     if (!passed) std::fprintf(stderr,
         "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d insert=%d repeat=%d input=%d/%d/%d read=%d\n",
         present_result, second_present_result, first_real_present, overlay_present,

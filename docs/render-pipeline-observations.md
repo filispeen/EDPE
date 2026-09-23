@@ -96,3 +96,8 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **VERIFIED (user observation):** The missing-entry-point error is gone. The Dear ImGui overlay is visible and toggles with F5 in the game.
 - **VERIFIED (user observation):** The 3D world and HUD displayed normally with the overlay; no black screen or visible rendering fault was reported in this session.
 - **LIMIT:** The log contains only first-Present observations, not a frame count or GPU timing. Scene rendering quality, input interactions beyond F5, resize/fullscreen transitions, and long-session stability are not yet independently measured.
+
+## Initial depth-view census — 2026-09-23
+
+- **VERIFIED (Release WARP test):** The D3D11 proxy observes successful `ID3D11Device::CreateDepthStencilView` calls. A 32×32 typeless R24G8 texture with depth-stencil and shader-resource bind flags produced a D24S8 view; the log recorded both formats, bind flags, dimensions, sample count, array size, mip levels, view dimension, and resource/view pointers. Device and view release completed.
+- **EXPERIMENTAL:** Logging is limited to the first 128 successful depth views per process and runs only at creation. No draw association, clear value, frame association, or depth convention has been measured. These entries are candidates, not identified scene depth.
