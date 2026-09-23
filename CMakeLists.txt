@@ -29,3 +29,13 @@ target_link_libraries(EDPE_DXGI PRIVATE EDPE_IMGUI d3dcompiler)
 enable_testing()
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 add_test(NAME proxy_smoke COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log)
+
+set(EDPE_STAGE "${CMAKE_CURRENT_BINARY_DIR}/stage")
+add_custom_target(proxy_stage ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${EDPE_STAGE}"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:EDPE> "${EDPE_STAGE}/d3d11.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:EDPE_DXGI> "${EDPE_STAGE}/dxgi.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:proxy_smoke> "${EDPE_STAGE}/proxy_smoke.exe"
+    DEPENDS EDPE EDPE_DXGI proxy_smoke)
+add_test(NAME proxy_alias_smoke COMMAND "${EDPE_STAGE}/proxy_smoke.exe"
+    "${EDPE_STAGE}/d3d11.dll" "${EDPE_STAGE}/dxgi.dll" "${EDPE_STAGE}/edpe.log")

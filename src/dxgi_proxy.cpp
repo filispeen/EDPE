@@ -1,4 +1,5 @@
 #include "log.h"
+#include "system_dll.h"
 
 #include <dxgi.h>
 #include <windows.h>
@@ -6,8 +7,7 @@
 void ObserveDxgiFactory(REFIID iid, void* factory);
 
 extern "C" HRESULT WINAPI EdpeCreateDXGIFactory1(REFIID iid, void** factory) {
-    static const HMODULE system_dxgi = LoadLibraryExW(
-        L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
     if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());
 
     static const auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory1)>(

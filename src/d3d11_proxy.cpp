@@ -1,4 +1,5 @@
 #include "log.h"
+#include "system_dll.h"
 
 #include <d3d11.h>
 #include <windows.h>
@@ -14,8 +15,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
     ID3D11Device** device,
     D3D_FEATURE_LEVEL* feature_level,
     ID3D11DeviceContext** context) {
-    static const HMODULE system_d3d11 = LoadLibraryExW(
-        L"d3d11.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static const HMODULE system_d3d11 = LoadSystemDll(L"d3d11.dll");
     if (!system_d3d11) return HRESULT_FROM_WIN32(GetLastError());
 
     static const auto create_device = reinterpret_cast<decltype(&D3D11CreateDevice)>(
