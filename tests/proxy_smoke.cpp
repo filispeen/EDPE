@@ -93,6 +93,13 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(device->CreateTexture2D(&depth_desc, nullptr, &depth_texture))) return 10;
     ID3D11DepthStencilView* depth_view = nullptr;
     if (FAILED(device->CreateDepthStencilView(depth_texture, nullptr, &depth_view))) return 10;
+    D3D11_TEXTURE2D_DESC color_desc = depth_desc;
+    color_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    color_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ID3D11Texture2D* color_texture = nullptr;
+    if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &color_texture))) return 10;
+    ID3D11RenderTargetView* color_view = nullptr;
+    if (FAILED(device->CreateRenderTargetView(color_texture, nullptr, &color_view))) return 10;
     context->OMSetRenderTargets(0, nullptr, depth_view);
     IDXGISwapChain4* newer_swap_chain = nullptr;
     if (SUCCEEDED(swap_chain->QueryInterface(__uuidof(IDXGISwapChain4),
@@ -106,6 +113,7 @@ int wmain(int argc, wchar_t** argv) {
     const HRESULT first_real_present = swap_chain->Present(0, 0);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     context->OMSetRenderTargets(0, nullptr, depth_view);
+    context->OMSetRenderTargets(1, &color_view, depth_view);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool hidden_input_passed = forwarded_keys == 1;
     SendMessageW(window, WM_KEYDOWN, VK_INSERT, 0);
@@ -126,6 +134,8 @@ int wmain(int argc, wchar_t** argv) {
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool hidden_input_restored = forwarded_keys == 2;
     context->OMSetRenderTargets(0, nullptr, nullptr);
+    color_view->Release();
+    color_texture->Release();
     depth_view->Release();
     depth_texture->Release();
     swap_chain->Release();
@@ -154,7 +164,9 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: Present bindings") &&
         std::strstr(contents, "EDPE: context dispatch frame=1") &&
         std::strstr(contents, "EDPE: OMSetRenderTargets DSV census armed") &&
-        std::strstr(contents, "EDPE: DSV bind #0 view=") &&
+        std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
+        std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
+        std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
         std::strstr(contents, "viewFormat=45 textureFormat=45 depth=64x64 bind=0x40") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&

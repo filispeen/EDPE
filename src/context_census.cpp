@@ -18,7 +18,11 @@ IDXGISwapChain* observed_swap_chain = nullptr; // Weak; released by the game.
 void** patched_table = nullptr;
 bool attempted = false;
 std::mutex seen_mutex;
-std::array<ID3D11DepthStencilView*, 32> seen{}; // Identity only; never dereferenced later.
+struct SeenDepthView {
+    ID3D11DepthStencilView* view = nullptr; // Identity only; never dereferenced later.
+    bool color_logged = false;
+};
+std::array<SeenDepthView, 32> seen{};
 size_t seen_count = 0;
 std::atomic<unsigned long long> dsv_binds{0};
 
@@ -30,12 +34,23 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     dsv_binds.fetch_add(1, std::memory_order_relaxed);
 
     size_t index = 0;
+    bool first_bind = false;
+    bool first_color = false;
     {
         std::lock_guard lock(seen_mutex);
-        while (index < seen_count && seen[index] != dsv) ++index;
-        if (index < seen_count || seen_count == seen.size()) return;
-        seen[seen_count++] = dsv;
+        while (index < seen_count && seen[index].view != dsv) ++index;
+        if (index == seen.size()) return;
+        if (index == seen_count) {
+            seen[seen_count++].view = dsv;
+            first_bind = true;
+        }
+        if (count && targets && targets[0] && !seen[index].color_logged) {
+            seen[index].color_logged = true;
+            first_color = true;
+        }
     }
+
+    if (!first_bind && !first_color) return;
 
     D3D11_DEPTH_STENCIL_VIEW_DESC view{};
     dsv->GetDesc(&view);
@@ -51,12 +66,32 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         }
         resource->Release();
     }
-    wchar_t message[240];
+    D3D11_RENDER_TARGET_VIEW_DESC color_view{};
+    D3D11_TEXTURE2D_DESC color_texture{};
+    ID3D11RenderTargetView* color = count && targets ? targets[0] : nullptr;
+    if (color) {
+        color->GetDesc(&color_view);
+        ID3D11Resource* color_resource = nullptr;
+        color->GetResource(&color_resource);
+        if (color_resource) {
+            ID3D11Texture2D* texture = nullptr;
+            if (SUCCEEDED(color_resource->QueryInterface(__uuidof(ID3D11Texture2D),
+                    reinterpret_cast<void**>(&texture)))) {
+                texture->GetDesc(&color_texture);
+                texture->Release();
+            }
+            color_resource->Release();
+        }
+    }
+    wchar_t message[360];
     swprintf_s(message,
-        L"EDPE: DSV bind #%zu view=%p %ux%u textureFormat=%u viewFormat=%u bind=0x%X samples=%u",
-        index, dsv, texture_desc.Width, texture_desc.Height,
+        L"EDPE: DSV bind #%zu phase=%s view=%p %ux%u textureFormat=%u viewFormat=%u bind=0x%X samples=%u rtvCount=%u rtv0=%p color=%ux%u colorFormat=%u colorBind=0x%X",
+        index, first_bind ? L"first" : L"first-color", dsv,
+        texture_desc.Width, texture_desc.Height,
         static_cast<unsigned>(texture_desc.Format), static_cast<unsigned>(view.Format),
-        texture_desc.BindFlags, texture_desc.SampleDesc.Count);
+        texture_desc.BindFlags, texture_desc.SampleDesc.Count, count, color,
+        color_texture.Width, color_texture.Height,
+        static_cast<unsigned>(color_view.Format), color_texture.BindFlags);
     EdpeLog(message);
 }
 
