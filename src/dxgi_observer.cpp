@@ -116,6 +116,37 @@ void logFirstPresent(IDXGISwapChain* swap_chain) {
         static_cast<unsigned>(desc.BufferDesc.Format), device, context,
         device_methods, device_methods ? device_methods[10] : nullptr);
     EdpeLog(message);
+    if (context) {
+        ID3D11RenderTargetView* rtv = nullptr;
+        ID3D11DepthStencilView* dsv = nullptr;
+        context->OMGetRenderTargets(1, &rtv, &dsv);
+        D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
+        if (rtv) rtv->GetDesc(&rtv_desc);
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
+        D3D11_TEXTURE2D_DESC depth_desc{};
+        if (dsv) {
+            dsv->GetDesc(&dsv_desc);
+            ID3D11Resource* resource = nullptr;
+            dsv->GetResource(&resource);
+            if (resource) {
+                ID3D11Texture2D* texture = nullptr;
+                if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D),
+                        reinterpret_cast<void**>(&texture)))) {
+                    texture->GetDesc(&depth_desc);
+                    texture->Release();
+                }
+                resource->Release();
+            }
+        }
+        swprintf_s(message,
+            L"EDPE: Present bindings rtv=%p rtvFormat=%u dsv=%p viewFormat=%u textureFormat=%u depth=%ux%u bind=0x%X samples=%u",
+            rtv, static_cast<unsigned>(rtv_desc.Format), dsv,
+            static_cast<unsigned>(dsv_desc.Format), static_cast<unsigned>(depth_desc.Format),
+            depth_desc.Width, depth_desc.Height, depth_desc.BindFlags, depth_desc.SampleDesc.Count);
+        EdpeLog(message);
+        if (dsv) dsv->Release();
+        if (rtv) rtv->Release();
+    }
     if (context) context->Release();
     if (device) device->Release();
 }

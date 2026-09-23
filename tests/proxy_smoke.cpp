@@ -80,6 +80,19 @@ int wmain(int argc, wchar_t** argv) {
     IDXGISwapChain* swap_chain = nullptr;
     const HRESULT swap_result = factory->CreateSwapChain(device, &desc, &swap_chain);
     if (FAILED(swap_result) || !swap_chain) return 10;
+    D3D11_TEXTURE2D_DESC depth_desc{};
+    depth_desc.Width = 64;
+    depth_desc.Height = 64;
+    depth_desc.MipLevels = 1;
+    depth_desc.ArraySize = 1;
+    depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depth_desc.SampleDesc.Count = 1;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    ID3D11Texture2D* depth_texture = nullptr;
+    if (FAILED(device->CreateTexture2D(&depth_desc, nullptr, &depth_texture))) return 10;
+    ID3D11DepthStencilView* depth_view = nullptr;
+    if (FAILED(device->CreateDepthStencilView(depth_texture, nullptr, &depth_view))) return 10;
+    context->OMSetRenderTargets(0, nullptr, depth_view);
     IDXGISwapChain4* newer_swap_chain = nullptr;
     if (SUCCEEDED(swap_chain->QueryInterface(__uuidof(IDXGISwapChain4),
             reinterpret_cast<void**>(&newer_swap_chain)))) {
@@ -109,6 +122,9 @@ int wmain(int argc, wchar_t** argv) {
     SendMessageW(window, WM_KEYUP, VK_F5, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool hidden_input_restored = forwarded_keys == 2;
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    depth_view->Release();
+    depth_texture->Release();
     swap_chain->Release();
     if (factory) factory->Release();
     DestroyWindow(window);
@@ -129,6 +145,8 @@ int wmain(int argc, wchar_t** argv) {
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
         read && std::strstr(contents, "EDPE: Present swapchain=") &&
+        std::strstr(contents, "EDPE: Present bindings") &&
+        std::strstr(contents, "viewFormat=45 textureFormat=45 depth=64x64 bind=0x40") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");
     if (!passed) std::fprintf(stderr,
