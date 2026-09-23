@@ -148,6 +148,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: Present bindings") &&
         std::strstr(contents, "viewFormat=45 textureFormat=45 depth=64x64 bind=0x40") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
+        std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");
     if (!passed) std::fprintf(stderr,
         "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d insert=%d repeat=%d input=%d/%d/%d read=%d\n",

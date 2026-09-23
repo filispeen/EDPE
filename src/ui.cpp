@@ -7,8 +7,19 @@
 #include <imgui_impl_win32.h>
 #include <windows.h>
 #include <atomic>
+#include <mutex>
+#include <vector>
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
+struct InputMessage {
+    HWND window;
+    UINT message;
+    WPARAM wparam;
+    LPARAM lparam;
+};
+
 struct UiState {
     IDXGISwapChain* swap_chain = nullptr; // Weak: the game's Release owns its lifetime.
     ID3D11Device* device = nullptr;
@@ -18,8 +29,12 @@ struct UiState {
     HWND window = nullptr;
     WNDPROC original_wndproc = nullptr;
     bool failed = false;
+    bool input_logged = false;
 } ui;
 std::atomic<bool> menu_visible{false};
+std::mutex input_mutex;
+std::vector<InputMessage> pending_input;
+std::vector<InputMessage> render_input;
 
 bool isInputMessage(UINT message) {
     if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) return true;
@@ -36,7 +51,18 @@ LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F5) return 0;
     if (menu_visible.load()) {
         if (message == WM_INPUT) return DefWindowProcW(window, message, wparam, lparam);
-        if (isInputMessage(message)) return 1;
+        if (isInputMessage(message)) {
+            std::lock_guard lock(input_mutex);
+            const InputMessage input{window, message, wparam, lparam};
+            if (message == WM_MOUSEMOVE && !pending_input.empty() &&
+                pending_input.back().message == WM_MOUSEMOVE) {
+                pending_input.back() = input;
+            } else {
+                if (pending_input.size() == 256) pending_input.erase(pending_input.begin());
+                pending_input.push_back(input);
+            }
+            return 1;
+        }
     }
     return ui.original_wndproc ? CallWindowProcW(ui.original_wndproc, window, message, wparam, lparam)
                                : DefWindowProcW(window, message, wparam, lparam);
@@ -48,6 +74,7 @@ void releaseBackbuffer() {
 }
 
 void shutdownUi() {
+    menu_visible.store(false);
     if (ui.window && ui.original_wndproc &&
         reinterpret_cast<WNDPROC>(GetWindowLongPtrW(ui.window, GWLP_WNDPROC)) == edpeWndProc) {
         SetWindowLongPtrW(ui.window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ui.original_wndproc));
@@ -64,7 +91,9 @@ void shutdownUi() {
     if (ui.context) ui.context->Release();
     if (ui.device) ui.device->Release();
     ui = {};
-    menu_visible.store(false);
+    std::lock_guard lock(input_mutex);
+    pending_input.clear();
+    render_input.clear();
 }
 
 bool initializeUi(IDXGISwapChain* swap_chain) {
@@ -120,7 +149,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         EdpeLog(L"EDPE: Dear ImGui unavailable; presenting original frame");
         return;
     }
-    if (!menu_visible.load()) return;
+    if (!menu_visible.load()) {
+        std::lock_guard lock(input_mutex);
+        pending_input.clear();
+        return;
+    }
     if (!ui.backbuffer_rtv && !createBackbufferView(swap_chain)) {
         EdpeLog(L"EDPE: overlay backbuffer view unavailable; presenting original frame");
         return;
@@ -128,10 +161,23 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     ImGuiContext* previous = ImGui::GetCurrentContext();
     ImGui::SetCurrentContext(ui.imgui);
+    {
+        std::lock_guard lock(input_mutex);
+        pending_input.swap(render_input);
+    }
+    if (!render_input.empty() && !ui.input_logged) {
+        EdpeLog(L"EDPE: queued input routed to Dear ImGui");
+        ui.input_logged = true;
+    }
+    for (const auto& input : render_input) {
+        ImGui_ImplWin32_WndProcHandler(input.window, input.message, input.wparam, input.lparam);
+    }
+    render_input.clear();
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced");
+    bool window_open = true;
+    ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced", &window_open);
     ImGui::TextUnformatted("Version: unreleased");
     ImGui::TextUnformatted("Rendering: original game output");
     ImGui::TextUnformatted("Upscaler: Native");
@@ -141,6 +187,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::EndDisabled();
     ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
+    if (!window_open) menu_visible.store(false);
     ImGui::Render();
 
     ID3D11RenderTargetView* previous_rtv = nullptr;
