@@ -234,7 +234,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
         std::strstr(contents, "EDPE: depth snapshot image submitted to ImGui") &&
         std::strstr(contents, "EDPE: depth contrast shader active in ImGui") &&
-        std::strstr(contents, "EDPE: depth sample grid valid=64 nonzero=64 min=0.25 max=0.25") &&
+        std::strstr(contents, "EDPE: depth sample grid valid=64 nonzero=64 min=0.25 max=0.25 centerValid=1 center=0.25") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");

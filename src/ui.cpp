@@ -40,8 +40,10 @@ struct UiState {
     DXGI_FORMAT depth_sample_format = DXGI_FORMAT_UNKNOWN;
     unsigned depth_sample_attempts = 0;
     bool depth_range_valid = false;
+    bool depth_center_valid = false;
     float depth_min = 0;
     float depth_max = 0;
+    float depth_center = 0;
     UINT depth_width = 0;
     UINT depth_height = 0;
     int depth_candidate = 1;
@@ -104,6 +106,7 @@ void releaseDepthSnapshot() {
     ui.depth_copy = nullptr;
     ui.depth_samples = nullptr;
     ui.depth_range_valid = false;
+    ui.depth_center_valid = false;
     ui.depth_snapshot_index = -1;
     ui.depth_image_logged = false;
 }
@@ -164,8 +167,10 @@ void queueDepthSamples(const D3D11_TEXTURE2D_DESC& source_desc) {
     ui.depth_sample_attempts = 0;
     for (UINT y = 0; y < 8; ++y) {
         for (UINT x = 0; x < 8; ++x) {
-            const UINT sx = (2 * x + 1) * source_desc.Width / 16;
-            const UINT sy = (2 * y + 1) * source_desc.Height / 16;
+            const UINT sx = x == 4 && y == 4 ? source_desc.Width / 2
+                : (2 * x + 1) * source_desc.Width / 16;
+            const UINT sy = x == 4 && y == 4 ? source_desc.Height / 2
+                : (2 * y + 1) * source_desc.Height / 16;
             const D3D11_BOX box{sx, sy, 0, sx + 1, sy + 1, 1};
             ui.context->CopySubresourceRegion(ui.depth_samples, 0, x, y, 0,
                 ui.depth_copy, 0, &box);
@@ -198,6 +203,10 @@ void pollDepthSamples() {
                     depth = static_cast<float>(packed & 0x00FFFFFFu) / 16777215.0f;
                 }
                 if (!std::isfinite(depth)) continue;
+                if (x == 4 && y == 4) {
+                    ui.depth_center = depth;
+                    ui.depth_center_valid = true;
+                }
                 if (depth < minimum) minimum = depth;
                 if (depth > maximum) maximum = depth;
                 if (depth > 0.0f) ++nonzero;
@@ -208,9 +217,10 @@ void pollDepthSamples() {
         ui.depth_range_valid = valid != 0;
         ui.depth_min = minimum;
         ui.depth_max = maximum;
-        wchar_t message[180];
-        swprintf_s(message, L"EDPE: depth sample grid valid=%u nonzero=%u min=%.9g max=%.9g",
-            valid, nonzero, minimum, maximum);
+        wchar_t message[220];
+        swprintf_s(message, L"EDPE: depth sample grid valid=%u nonzero=%u min=%.9g max=%.9g centerValid=%u center=%.9g",
+            valid, nonzero, minimum, maximum,
+            static_cast<unsigned>(ui.depth_center_valid), ui.depth_center);
         EdpeLog(message);
     }
     ui.depth_samples->Release();
@@ -441,6 +451,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
             if (ui.depth_range_valid) ImGui::Text("8x8 sample range: %.6g .. %.6g",
                 ui.depth_min, ui.depth_max);
+            if (ui.depth_center_valid) ImGui::Text("Center raw depth: %.9g", ui.depth_center);
             if (ui.depth_contrast_shader) ImGui::Checkbox("Contrast preview", &ui.depth_contrast);
             else ImGui::TextDisabled("Contrast preview unavailable; showing raw red depth");
             float width = ImGui::GetContentRegionAvail().x;
