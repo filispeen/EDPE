@@ -1,6 +1,5 @@
 #include "ui.h"
 #include "log.h"
-#include "context_census.h"
 
 #include <d3d11.h>
 #include <imgui.h>
@@ -187,11 +186,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::TextUnformatted("DLAA / DLSS / FSR: temporal inputs not yet verified");
     ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
     ImGui::EndDisabled();
-    const bool clear_probe_available = ContextCensusDepthClearProbeAvailable();
-    if (!clear_probe_available) ImGui::BeginDisabled();
-    if (ImGui::Button("Capture depth clears (one frame)")) ContextCensusRequestDepthClearProbe();
-    if (!clear_probe_available) ImGui::EndDisabled();
-    ImGui::TextDisabled("Depth probe: %s", ContextCensusDepthClearProbeStatus());
     ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
     if (!window_open) menu_visible.store(false);

@@ -9,20 +9,11 @@
 
 namespace {
 constexpr size_t kOMSetRenderTargets = 33;
-constexpr size_t kClearDepthStencilView = 53;
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
-using ClearDepthStencilViewFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,
-    ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
-std::atomic<ClearDepthStencilViewFn> original_clear{nullptr};
 std::atomic<ID3D11DeviceContext*> observed_context{nullptr};
-std::atomic<bool> clear_probe_requested{false};
-std::atomic<bool> clear_probe_active{false};
-std::atomic<bool> clear_probe_capture_enabled{false};
-std::atomic<bool> clear_probe_disabled{false};
-std::atomic<unsigned long long> clear_probe_calls{0};
 IDXGISwapChain* observed_swap_chain = nullptr; // Weak; released by the game.
 void** patched_table = nullptr;
 bool attempted = false;
@@ -31,33 +22,10 @@ struct SeenDepthView {
     ID3D11DepthStencilView* view = nullptr; // Identity only; never dereferenced later.
     bool color_logged = false;
     unsigned long long interval_binds = 0;
-    unsigned clear_count = 0;
-    UINT clear_flags = 0;
-    FLOAT clear_min = 0;
-    FLOAT clear_max = 0;
 };
 std::array<SeenDepthView, 32> seen{};
 size_t seen_count = 0;
 std::atomic<unsigned long long> dsv_binds{0};
-
-void STDMETHODCALLTYPE observedClearDepthStencilView(ID3D11DeviceContext* context,
-    ID3D11DepthStencilView* dsv, UINT flags, FLOAT depth, UINT8 stencil) {
-    original_clear.load(std::memory_order_acquire)(context, dsv, flags, depth, stencil);
-    if (!clear_probe_capture_enabled.load(std::memory_order_acquire) ||
-        context != observed_context.load(std::memory_order_acquire)) return;
-    clear_probe_calls.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard lock(seen_mutex);
-    for (size_t i = 0; i < seen_count; ++i) {
-        if (seen[i].view != dsv) continue;
-        if (!(flags & D3D11_CLEAR_DEPTH)) break;
-        if (!seen[i].clear_count) seen[i].clear_min = seen[i].clear_max = depth;
-        if (depth < seen[i].clear_min) seen[i].clear_min = depth;
-        if (depth > seen[i].clear_max) seen[i].clear_max = depth;
-        ++seen[i].clear_count;
-        seen[i].clear_flags |= flags;
-        break;
-    }
-}
 
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
@@ -129,53 +97,19 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     EdpeLog(message);
 }
 
-bool patchSlot(void** table, size_t slot, void* expected, void* replacement) {
+bool patchSlot(void** table, void* expected, void* replacement) {
     DWORD old_protection = 0;
-    if (!VirtualProtect(table + slot, sizeof(void*), PAGE_READWRITE,
+    if (!VirtualProtect(table + kOMSetRenderTargets, sizeof(void*), PAGE_READWRITE,
             &old_protection)) return false;
     void* replaced = InterlockedCompareExchangePointer(
-        reinterpret_cast<PVOID volatile*>(table + slot), replacement, expected);
+        reinterpret_cast<PVOID volatile*>(table + kOMSetRenderTargets), replacement, expected);
     DWORD ignored = 0;
-    VirtualProtect(table + slot, sizeof(void*), old_protection, &ignored);
+    VirtualProtect(table + kOMSetRenderTargets, sizeof(void*), old_protection, &ignored);
     return replaced == expected;
-}
-
-void finishClearProbe(unsigned long long frame) {
-    clear_probe_capture_enabled.store(false, std::memory_order_release);
-    const bool restored = patchSlot(patched_table, kClearDepthStencilView,
-        reinterpret_cast<void*>(&observedClearDepthStencilView),
-        reinterpret_cast<void*>(original_clear.load(std::memory_order_acquire)));
-    clear_probe_active.store(false, std::memory_order_release);
-    if (!restored) clear_probe_disabled.store(true, std::memory_order_release);
-    wchar_t message[160];
-    swprintf_s(message, L"EDPE: depth clear probe frame=%llu calls=%llu slotRestored=%u",
-        frame, clear_probe_calls.load(std::memory_order_relaxed), restored);
-    EdpeLog(message);
-    struct ClearRecord { unsigned count; UINT flags; FLOAT min; FLOAT max; };
-    std::array<ClearRecord, 32> records{};
-    size_t distinct = 0;
-    {
-        std::lock_guard lock(seen_mutex);
-        distinct = seen_count;
-        for (size_t i = 0; i < distinct; ++i) {
-            records[i] = {seen[i].clear_count, seen[i].clear_flags,
-                seen[i].clear_min, seen[i].clear_max};
-            seen[i].clear_count = 0;
-            seen[i].clear_flags = 0;
-        }
-    }
-    for (size_t i = 0; i < distinct; ++i) {
-        if (!records[i].count) continue;
-        swprintf_s(message, L"EDPE: depth clear #%zu count=%u flags=0x%X depth=%.6f..%.6f",
-            i, records[i].count, records[i].flags, records[i].min, records[i].max);
-        EdpeLog(message);
-    }
 }
 } // namespace
 
-void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
-    if (!(flags & DXGI_PRESENT_TEST) && clear_probe_active.load(std::memory_order_acquire) &&
-        observed_swap_chain == swap_chain) finishClearProbe(frame);
+void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame) {
     if (!attempted) {
         attempted = true;
         ID3D11Device* device = nullptr;
@@ -193,7 +127,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
         original.store(forward, std::memory_order_release);
         observed_context.store(context, std::memory_order_release);
-        if (patchSlot(table, kOMSetRenderTargets, reinterpret_cast<void*>(forward),
+        if (patchSlot(table, reinterpret_cast<void*>(forward),
                 reinterpret_cast<void*>(&observedOMSetRenderTargets))) {
             patched_table = table;
             observed_swap_chain = swap_chain;
@@ -239,64 +173,10 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     }
 }
 
-void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags, HRESULT result) {
-    if ((flags & DXGI_PRESENT_TEST) || FAILED(result) ||
-        observed_swap_chain != swap_chain ||
-        clear_probe_disabled.load(std::memory_order_acquire) ||
-        !clear_probe_requested.exchange(false, std::memory_order_acq_rel)) return;
-    auto forward = reinterpret_cast<ClearDepthStencilViewFn>(patched_table[kClearDepthStencilView]);
-    if (!forward || forward == &observedClearDepthStencilView) {
-        clear_probe_disabled.store(true, std::memory_order_release);
-        EdpeLog(L"EDPE: depth clear probe unavailable (invalid forward target)");
-        return;
-    }
-    original_clear.store(forward, std::memory_order_release);
-    clear_probe_calls.store(0, std::memory_order_relaxed);
-    clear_probe_capture_enabled.store(true, std::memory_order_release);
-    if (!patchSlot(patched_table, kClearDepthStencilView, reinterpret_cast<void*>(forward),
-            reinterpret_cast<void*>(&observedClearDepthStencilView))) {
-        clear_probe_capture_enabled.store(false, std::memory_order_release);
-        clear_probe_disabled.store(true, std::memory_order_release);
-        EdpeLog(L"EDPE: depth clear probe unavailable (slot changed before install)");
-        return;
-    }
-    clear_probe_active.store(true, std::memory_order_release);
-    EdpeLog(L"EDPE: one-frame depth clear probe armed after Present");
-}
-
-bool ContextCensusDepthClearProbeAvailable() {
-    if (!patched_table || !observed_context.load(std::memory_order_acquire) ||
-        clear_probe_active.load(std::memory_order_acquire) ||
-        clear_probe_requested.load(std::memory_order_acquire) ||
-        clear_probe_disabled.load(std::memory_order_acquire)) return false;
-    std::lock_guard lock(seen_mutex);
-    return seen_count != 0;
-}
-
-bool ContextCensusRequestDepthClearProbe() {
-    if (!ContextCensusDepthClearProbeAvailable()) return false;
-    clear_probe_requested.store(true, std::memory_order_release);
-    return true;
-}
-
-const char* ContextCensusDepthClearProbeStatus() {
-    if (!patched_table) return "D3D11 context not observed";
-    if (clear_probe_disabled.load(std::memory_order_acquire)) return "Hook changed; probe disabled until restart";
-    if (clear_probe_active.load(std::memory_order_acquire)) return "Capturing one frame";
-    if (clear_probe_requested.load(std::memory_order_acquire)) return "Capture queued";
-    std::lock_guard lock(seen_mutex);
-    return seen_count ? "Ready" : "Waiting for depth targets";
-}
-
-extern "C" BOOL WINAPI EdpeRequestDepthClearProbe() {
-    return ContextCensusRequestDepthClearProbe();
-}
-
 void ContextCensusOnSwapChainRelease(IUnknown* object) {
     if (object != observed_swap_chain) return;
-    if (clear_probe_active.load(std::memory_order_acquire)) finishClearProbe(0);
     if (patched_table) {
-        patchSlot(patched_table, kOMSetRenderTargets, reinterpret_cast<void*>(&observedOMSetRenderTargets),
+        patchSlot(patched_table, reinterpret_cast<void*>(&observedOMSetRenderTargets),
             reinterpret_cast<void*>(original.load(std::memory_order_acquire)));
     }
     observed_context.exchange(nullptr, std::memory_order_acq_rel)->Release();

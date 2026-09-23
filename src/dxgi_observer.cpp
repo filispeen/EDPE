@@ -176,12 +176,10 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
     const auto frame = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (frame == 1) logFirstPresent(swap_chain);
     if (frame <= 8 || (frame <= 32768 && frame % 1024 == 0)) logContextDispatch(swap_chain, frame);
-    ContextCensusOnPresent(swap_chain, frame, flags);
+    ContextCensusOnPresent(swap_chain, frame);
     UiOnPresent(swap_chain, flags);
     const auto original = reinterpret_cast<PresentFn>(tableOf(swap_chain)->original[kPresent]);
-    const HRESULT result = original(swap_chain, sync_interval, flags);
-    ContextCensusAfterPresent(swap_chain, flags, result);
-    return result;
+    return original(swap_chain, sync_interval, flags);
 }
 
 void observeSwapChain(IDXGISwapChain* swap_chain) {
