@@ -53,7 +53,8 @@ void recordBind(int index) {
     if (sequence_stored < bind_sequence.size()) bind_sequence[sequence_stored++] = index;
 }
 
-void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index) {
+void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index,
+    unsigned bind_ordinal) {
     constexpr UINT slots = 8;
     ID3D11Buffer* vs[slots]{};
     ID3D11Buffer* ps[slots]{};
@@ -67,8 +68,8 @@ void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index) {
             buffers[slot]->GetDesc(&desc);
             wchar_t message[160];
             swprintf_s(message,
-                L"EDPE: DSV #%zu bound CB stage=%s slot=%u buffer=%p bytes=%u usage=%u cpu=0x%X",
-                depth_index, stage ? L"PS" : L"VS", slot, buffers[slot],
+                L"EDPE: DSV #%zu bind=%u CB stage=%s slot=%u buffer=%p bytes=%u usage=%u cpu=0x%X",
+                depth_index, bind_ordinal, stage ? L"PS" : L"VS", slot, buffers[slot],
                 desc.ByteWidth, static_cast<unsigned>(desc.Usage), desc.CPUAccessFlags);
             EdpeLog(message);
             buffers[slot]->Release();
@@ -93,7 +94,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     size_t index = 0;
     bool first_bind = false;
     bool first_color = false;
-    bool snapshot_first_bind = false;
+    unsigned snapshot_probe_bind = 0;
     {
         std::lock_guard lock(seen_mutex);
         while (index < seen_count && seen[index].view != dsv) ++index;
@@ -113,13 +114,13 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             snapshot_index = snapshot_active;
             snapshot_active = -1;
             snapshot_waiting.store(false, std::memory_order_release);
-            snapshot_first_bind = true;
         }
         if (snapshot_view == dsv && snapshot_index == static_cast<int>(index)) {
             const auto after = last_present_frame.load(std::memory_order_relaxed);
             if (!snapshot_bind_count) snapshot_first_bind_after = after;
             snapshot_last_bind_after = after;
             ++snapshot_bind_count;
+            snapshot_probe_bind = snapshot_bind_count;
         }
         if (count && targets && targets[0] && !seen[index].color_logged) {
             seen[index].color_logged = true;
@@ -127,7 +128,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         }
     }
 
-    if (snapshot_first_bind) logBoundConstantBuffers(context, index);
+    if (snapshot_probe_bind) logBoundConstantBuffers(context, index, snapshot_probe_bind);
 
     if (!first_bind && !first_color) return;
 
