@@ -191,6 +191,23 @@ texture, or SRV leaves the game's original frame untouched. A visible image
 would identify the candidate's contents at this point, but would not prove
 that it is HUD-free or that `Present` is the eventual temporal handoff.
 
+**VERIFIED (user observation, 2026-09-25 gameplay session; game build not
+rechecked):** The `EDPE Scene Color Snapshot` window showed the 3D world
+without the HUD, while Elite kept running. The user requested one snapshot
+of the main-camera DSV. The corresponding log records session-local DSV
+`#1`, seven binds between `Present` 17899 and 17900, a `2560×1440`
+format-19 depth copy, and a `2560×1440` format-26
+(`R11G11B10_FLOAT`) color copy. The last RTV0 bound with that DSV was the
+same HDR RTV object present at slot 3 during binds 1–3 and slot 0 during
+binds 4–7. The log also confirms ImGui submitted both snapshot images.
+
+**IMPLICATION / LIMIT:** This identifies a usable HUD-free scene-color
+*candidate* in this gameplay frame. The screenshot was not saved; the
+HUD-free assessment is the user's direct visual report. The copy occurred
+at `Present`, after the observed DSV binds, so it does not establish the
+earliest safe copy point, whether later game passes overwrite the source,
+or exact color/depth/camera correspondence. The DSV index is session-local.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
