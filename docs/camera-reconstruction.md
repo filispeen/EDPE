@@ -234,6 +234,12 @@ binds or after an unobserved state change within bind 3. Endpoint states do not
 identify every draw's state. Measure binds 1 and 2 before treating bind 3
 as the depth-producing pass or choosing a camera for reprojection.
 
+**EXPERIMENTAL NEXT CHECK:** The same requested capture now brackets binds
+1 and 2 with pipeline-statistics queries and logs their start/end
+depth-stencil states. The existing bind-3 and bind-6 measurements remain.
+This can locate earlier geometry intervals and depth-write-capable endpoint
+states, but cannot prove that a particular draw wrote the captured depth.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested

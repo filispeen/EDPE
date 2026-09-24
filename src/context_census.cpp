@@ -65,7 +65,7 @@ struct PipelineSample {
     unsigned wait = 0;
     bool active = false;
 };
-std::array<PipelineSample, 2> pipeline_samples{}; // Requested bind intervals 3 and 6 only.
+std::array<PipelineSample, 4> pipeline_samples{}; // Requested bind intervals 1, 2, 3, and 6.
 
 void logDepthState(ID3D11DeviceContext* context, const PipelineSample& sample,
     const wchar_t* edge) {
@@ -99,9 +99,9 @@ void endPipelineSample(ID3D11DeviceContext* context) {
 }
 
 void beginPipelineSample(ID3D11DeviceContext* context, unsigned bind) {
-    if (bind != 3 && bind != 6) return;
+    if (bind < 1 || (bind > 3 && bind != 6)) return;
     std::lock_guard lock(seen_mutex);
-    auto& sample = pipeline_samples[bind == 3 ? 0 : 1];
+    auto& sample = pipeline_samples[bind == 6 ? 3 : bind - 1];
     if (sample.query) return;
     ID3D11Device* device = nullptr;
     context->GetDevice(&device);

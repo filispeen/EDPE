@@ -305,8 +305,14 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "projection2D=0.050000") &&
         std::strstr(contents, "rows0=(1,0,0,42)") &&
         std::strstr(contents, "EDPE: scene CB rows1 bind=6 (0,1,0,0) rows2=(0,0,1,0)") &&
+        std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=1 iaPrimitives=0 vsInvocations=0") &&
+        std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=2 iaPrimitives=0 vsInvocations=0") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=3 iaPrimitives=1 vsInvocations=3") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=6 iaPrimitives=0 vsInvocations=0") &&
+        std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=1 edge=start") &&
+        std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=1 edge=end") &&
+        std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=2 edge=start") &&
+        std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=2 edge=end") &&
         std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=3 edge=start") &&
         std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=3 edge=end") &&
         std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=6 edge=start") &&
