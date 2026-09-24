@@ -90,6 +90,22 @@ The surface identity, HUD reference point, and exact scale remain unverified;
 do not treat the approximately 29-unit offset as the beacon's radius or
 feed this DSV to a temporal backend on this evidence alone.
 
+## Early/late scene-buffer probe — 2026-09-24
+
+**REFERENCE-CODE:** EDVR revision `96df075` records multiple writes to its
+large scene buffer and selects a camera using scene-draw association and
+continuity (`src/d3d11/temporal_pass.cpp`). Its first VR eye draw and
+projection offsets do not identify EDPE's 2D scene camera.
+
+**EXPERIMENTAL:** A requested depth snapshot now copies the 5376-byte VS
+slot-1 buffer at bind ordinals 3 and 6 of that selected DSV, using the
+existing `OMSetRenderTargets` observer. Both staging reads are nonblocking;
+the log labels both row sets and 2D projection word 1094, while the full
+hex dump remains limited to bind 6. This compares two points in one selected
+frame without adding a hook, changing the source buffer, or reading back a
+full frame. Different rows would prove that a single bind-time observation
+is insufficient; equal rows would not prove they were used by every draw.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth

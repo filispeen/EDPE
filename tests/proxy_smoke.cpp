@@ -116,6 +116,7 @@ int wmain(int argc, wchar_t** argv) {
     probe_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     float probe_values[5376 / sizeof(float)]{};
     probe_values[795] = 0.025f;
+    probe_values[1094] = 0.025f;
     probe_values[932] = probe_values[937] = probe_values[942] = 1.0f;
     D3D11_SUBRESOURCE_DATA probe_initial{};
     probe_initial.pSysMem = probe_values;
@@ -159,6 +160,8 @@ int wmain(int argc, wchar_t** argv) {
     D3D11_MAPPED_SUBRESOURCE updated_probe{};
     if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &updated_probe))) return 10;
     probe_values[795] = 0.05f;
+    probe_values[935] = 42.0f;
+    probe_values[1094] = 0.05f;
     std::memcpy(updated_probe.pData, probe_values, sizeof(probe_values));
     context->Unmap(probe_buffer, 0);
     context->OMSetRenderTargets(0, nullptr, depth_view);
@@ -227,8 +230,13 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV #0 bind=1 CB stage=VS slot=1 buffer=") &&
         std::strstr(contents, "EDPE: DSV #0 bind=2 CB stage=VS slot=1 buffer=") &&
         std::strstr(contents, "bytes=5376 usage=2 cpu=0x10000") &&
+        std::strstr(contents, "EDPE: scene CB sample bind=3 projectionZ=(0,0.025000") &&
+        std::strstr(contents, "projection2D=0.025000") &&
+        std::strstr(contents, "rows0=(1,0,0,0)") &&
         std::strstr(contents, "EDPE: scene CB sample bind=6 projectionZ=(0,0.050000") &&
-        std::strstr(contents, "EDPE: scene CB rows1=(0,1,0,0) rows2=(0,0,1,0)") &&
+        std::strstr(contents, "projection2D=0.050000") &&
+        std::strstr(contents, "rows0=(1,0,0,42)") &&
+        std::strstr(contents, "EDPE: scene CB rows1 bind=6 (0,1,0,0) rows2=(0,0,1,0)") &&
         std::strstr(contents, "EDPE: scene CB hex 0000 ") &&
         std::strstr(contents, "EDPE: scene CB hex 1312 ") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
