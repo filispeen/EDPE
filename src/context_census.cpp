@@ -157,29 +157,34 @@ void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index,
 
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,
     ID3D11RenderTargetView* const* targets) {
-    ID3D11RenderTargetView* color = count && targets ? targets[0] : nullptr;
-    D3D11_RENDER_TARGET_VIEW_DESC view{};
-    D3D11_TEXTURE2D_DESC texture_desc{};
-    if (color) {
-        color->GetDesc(&view);
-        ID3D11Resource* resource = nullptr;
-        color->GetResource(&resource);
-        if (resource) {
-            ID3D11Texture2D* texture = nullptr;
-            if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D),
-                    reinterpret_cast<void**>(&texture)))) {
-                texture->GetDesc(&texture_desc);
-                texture->Release();
-            }
-            resource->Release();
-        }
-    }
     wchar_t message[192];
-    swprintf_s(message,
-        L"EDPE: DSV #%zu bind=%u color target count=%u rtv0=%p format=%u size=%ux%u bind=0x%X",
-        depth_index, bind_ordinal, count, color, static_cast<unsigned>(view.Format),
-        texture_desc.Width, texture_desc.Height, texture_desc.BindFlags);
+    swprintf_s(message, L"EDPE: DSV #%zu bind=%u color target count=%u",
+        depth_index, bind_ordinal, count);
     EdpeLog(message);
+    for (UINT slot = 0; slot < count && slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++slot) {
+        ID3D11RenderTargetView* color = targets ? targets[slot] : nullptr;
+        D3D11_RENDER_TARGET_VIEW_DESC view{};
+        D3D11_TEXTURE2D_DESC texture_desc{};
+        if (color) {
+            color->GetDesc(&view);
+            ID3D11Resource* resource = nullptr;
+            color->GetResource(&resource);
+            if (resource) {
+                ID3D11Texture2D* texture = nullptr;
+                if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D),
+                        reinterpret_cast<void**>(&texture)))) {
+                    texture->GetDesc(&texture_desc);
+                    texture->Release();
+                }
+                resource->Release();
+            }
+        }
+        swprintf_s(message,
+            L"EDPE: DSV #%zu bind=%u rtv%u=%p format=%u size=%ux%u bind=0x%X",
+            depth_index, bind_ordinal, slot, color, static_cast<unsigned>(view.Format),
+            texture_desc.Width, texture_desc.Height, texture_desc.BindFlags);
+        EdpeLog(message);
+    }
 }
 
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,

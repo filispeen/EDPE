@@ -149,6 +149,12 @@ RTV0 alone does not reveal the purpose of either pass, all eight bound RTVs,
 draw ordering, or which camera state produced the final depth. Do not choose
 bind 3 or 6 as the production camera from this observation.
 
+**EXPERIMENTAL NEXT CHECK:** The one-shot color-target log now enumerates
+each of the up to eight RTV slots supplied with the selected DSV bind,
+including null slots. This extends the already-tested RTV0 observation;
+it does not intercept draws or modify any resource. The attachment sets
+may distinguish geometry and later color passes more reliably than RTV0.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth

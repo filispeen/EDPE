@@ -109,6 +109,11 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &color_texture))) return 10;
     ID3D11RenderTargetView* color_view = nullptr;
     if (FAILED(device->CreateRenderTargetView(color_texture, nullptr, &color_view))) return 10;
+    color_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    ID3D11Texture2D* second_color_texture = nullptr;
+    if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &second_color_texture))) return 10;
+    ID3D11RenderTargetView* second_color_view = nullptr;
+    if (FAILED(device->CreateRenderTargetView(second_color_texture, nullptr, &second_color_view))) return 10;
     D3D11_BUFFER_DESC probe_desc{};
     probe_desc.ByteWidth = 5376;
     probe_desc.Usage = D3D11_USAGE_DYNAMIC;
@@ -156,7 +161,8 @@ int wmain(int argc, wchar_t** argv) {
     context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, 0.25f, 0);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, depth_view);
-    context->OMSetRenderTargets(1, &color_view, depth_view);
+    ID3D11RenderTargetView* color_pair[]{color_view, second_color_view};
+    context->OMSetRenderTargets(2, color_pair, depth_view);
     for (int i = 0; i < 2; ++i) context->OMSetRenderTargets(0, nullptr, depth_view);
     D3D11_MAPPED_SUBRESOURCE updated_probe{};
     if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &updated_probe))) return 10;
@@ -186,6 +192,8 @@ int wmain(int argc, wchar_t** argv) {
     probe_buffer->Release();
     color_view->Release();
     color_texture->Release();
+    second_color_view->Release();
+    second_color_texture->Release();
     depth_view->Release();
     depth_texture->Release();
     swap_chain->Release();
@@ -230,9 +238,12 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: depth snapshot timing #0 armedAfter=7 firstBindAfter=7 lastBindAfter=7 binds=6 handedAt=8") &&
         std::strstr(contents, "EDPE: DSV #0 bind=1 CB stage=VS slot=1 buffer=") &&
         std::strstr(contents, "EDPE: DSV #0 bind=2 CB stage=VS slot=1 buffer=") &&
-        std::strstr(contents, "EDPE: DSV #0 bind=3 color target count=1 rtv0=") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=3 color target count=2") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=3 rtv0=") &&
         std::strstr(contents, "format=28 size=64x64 bind=0x20") &&
-        std::strstr(contents, "EDPE: DSV #0 bind=6 color target count=0 rtv0=0000000000000000 format=0 size=0x0 bind=0x0") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=3 rtv1=") &&
+        std::strstr(contents, "format=10 size=64x64 bind=0x20") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=6 color target count=0") &&
         std::strstr(contents, "bytes=5376 usage=2 cpu=0x10000") &&
         std::strstr(contents, "EDPE: scene CB sample bind=3 projectionZ=(0,0.025000") &&
         std::strstr(contents, "projection2D=0.025000") &&
