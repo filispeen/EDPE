@@ -136,6 +136,17 @@ only that the logged 2D candidate block was stable at these two observation
 points; it does not establish its matrix layout, jitter convention, or value
 at the intervening draws.
 
+**MEASURED NUMERICAL FIT (same capture):** Taking camera rows 932–943 as
+three rotation rows, the first three rows of the 2D block fit those rotation
+rows with column multipliers `(sqrt(3)/(2560/1440), sqrt(3), 1)`, using
+block columns 0, 1, and 3 respectively. The largest absolute difference
+across nine compared values is `0.000000346` against the bind-6 camera,
+versus `0.000015276` against the bind-3 camera; the camera log is rounded
+to roughly six significant digits. This supports an association between
+the 2D block and the later camera orientation in this frame. It does not
+prove which camera values the actual depth-writing draws consumed, nor
+whether the multipliers have the same meaning in other graphics settings.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
