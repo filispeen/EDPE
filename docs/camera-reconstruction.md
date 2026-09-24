@@ -241,8 +241,19 @@ button. It selects a single recent DSV only when that depth format,
 single-sample layout, MRT format pattern, and same-frame HDR RTV identity
 all match. No match or multiple matches disable the button; the manual
 index remains available. This recognizes an observed pass pattern, not a
-production-safe scene-depth identity. It has a WARP smoke test; Elite
-validation is pending.
+production-safe scene-depth identity. It has a WARP smoke test; the first
+Elite check is recorded below.
+
+**VERIFIED / MEASURED (user-confirmed gameplay test, 2026-09-25; game
+build not rechecked):** The experimental button was active, and pressing
+it produced visible depth and scene-color snapshots without
+closing Elite. The resulting log selected session-local DSV `#1` twice.
+Both captures had seven DSV binds in one `Present` interval (`14248`–`14249`
+and `14498`–`14499`), copied `2560×1440` format-19 depth and format-26
+HDR color, and submitted both ImGui images. The same HDR RTV appeared at
+MRT slot 3 during binds 1–3 and slot 0 during binds 4–7. This validates
+the experimental selector for this gameplay process; it does not establish
+that the signature is unique across all game scenes or versions.
 
 ## Required before runtime reprojection
 
