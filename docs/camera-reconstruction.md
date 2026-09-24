@@ -192,8 +192,22 @@ contracts.
 **VERIFIED (Release WARP smoke test):** A test vertex shader and one triangle
 between bind 3 and the next target bind produced `iaPrimitives=1` and
 `vsInvocations=3`; the empty bind-6 interval produced zeros. Both direct
-and staged-proxy smoke variants passed. Elite behavior and the distribution
-of scene work remain unmeasured.
+and staged-proxy smoke variants passed.
+
+**MEASURED (user-confirmed gameplay capture, 2026-09-25; game build not
+rechecked):** In the frame after `Present` 14279, the main-camera DSV bound
+seven times. The interval after bind 3 reported 39,552 IA primitives,
+69,616 VS invocations, and 39,259 PS invocations. The interval after bind 6
+reported 90 IA primitives, 180 VS invocations, and 267,900 PS invocations.
+The requested capture also copied `2560×1440` depth and HDR scene color;
+the user saw both snapshots and reported normal gameplay.
+
+**INFERENCE / LIMIT:** Bind 3 covers substantial geometry work, while bind
+6 has a much smaller primitive count and more pixel-shader invocations.
+This supports the earlier MRT-then-HDR pass interpretation. These query
+intervals do not identify individual draws, depth writes, shader camera
+inputs, or the exact point at which depth and color become a matched pair.
+Camera selection for reprojection remains unverified.
 
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
