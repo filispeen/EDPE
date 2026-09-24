@@ -208,6 +208,14 @@ at `Present`, after the observed DSV binds, so it does not establish the
 earliest safe copy point, whether later game passes overwrite the source,
 or exact color/depth/camera correspondence. The DSV index is session-local.
 
+**EXPERIMENTAL NEXT CHECK:** The same requested snapshot now reports
+whether its exact HDR RTV is still bound to any output-merger RTV slot at
+`Present`. This uses D3D11's existing
+[`OMGetRenderTargets`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-omgetrendertargets)
+query and releases its returned references. The result checks output binding
+at that point only; it cannot prove that all scene-color writes are complete
+or that the source is no longer bound through another view.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth

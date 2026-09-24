@@ -258,6 +258,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: scene CB hex 1312 ") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
         std::strstr(contents, "EDPE: scene color snapshot #0 copied 64x64 format=26") &&
+        std::strstr(contents, "EDPE: scene color RTV unbound at Present") &&
         std::strstr(contents, "EDPE: scene color snapshot image submitted to ImGui") &&
         std::strstr(contents, "EDPE: depth snapshot image submitted to ImGui") &&
         std::strstr(contents, "EDPE: depth contrast shader active in ImGui") &&

@@ -315,6 +315,15 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
 }
 
 void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
+    ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    ui.context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
+    bool still_bound = false;
+    for (auto*& target : bound) {
+        if (target == view) still_bound = true;
+        if (target) target->Release();
+    }
+    EdpeLog(still_bound ? L"EDPE: scene color RTV still bound at Present"
+                        : L"EDPE: scene color RTV unbound at Present");
     D3D11_RENDER_TARGET_VIEW_DESC target{};
     view->GetDesc(&target);
     if (target.Format != DXGI_FORMAT_R11G11B10_FLOAT) {
