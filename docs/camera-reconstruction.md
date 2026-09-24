@@ -131,6 +131,24 @@ determine whether the observed camera change crosses a color-pass boundary.
 An RTV association still does not identify the exact draw that wrote each
 depth pixel.
 
+**MEASURED (Elite Odyssey `332841`, user-confirmed gameplay capture):**
+Session-local main-camera DSV `#2` bound seven times between `Present`
+12666 and 12667. Its RTV0 was the same `2560×1440`
+`R10G10B10A2_UNORM` resource (DXGI format 24) at binds 1–3, then a different
+`2560×1440` `R11G11B10_FLOAT` resource (format 26) at binds 4–7.
+Those format names are defined by the installed Windows SDK `dxgiformat.h`.
+The bind-3 and bind-6 camera rows differed by at most `0.000008` per logged
+rotation component, approximately `0.00065°` from their rounded 3×3 rows;
+translation and projection word 1094 printed identically. The depth copy
+contained 64 finite nonzero grid samples, and the user reported normal
+game, HUD, and F5 behavior.
+
+**IMPLICATION / LIMIT:** The two camera samples straddle an RTV0 change,
+so they do not represent two points in one unchanged color-target pass.
+RTV0 alone does not reveal the purpose of either pass, all eight bound RTVs,
+draw ordering, or which camera state produced the final depth. Do not choose
+bind 3 or 6 as the production camera from this observation.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
