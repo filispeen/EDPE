@@ -32,6 +32,13 @@ struct UiState {
     ID3D11RenderTargetView* backbuffer_rtv = nullptr;
     ID3D11Texture2D* depth_copy = nullptr;
     ID3D11ShaderResourceView* depth_srv = nullptr;
+    ID3D11Texture2D* color_copy = nullptr;
+    ID3D11ShaderResourceView* color_srv = nullptr;
+    UINT color_width = 0;
+    UINT color_height = 0;
+    int color_snapshot_index = -1;
+    bool color_window_open = true;
+    bool color_image_logged = false;
     ID3D11PixelShader* depth_contrast_shader = nullptr;
     bool depth_shader_failed = false;
     bool depth_contrast = true;
@@ -109,6 +116,15 @@ void releaseDepthSnapshot() {
     ui.depth_center_valid = false;
     ui.depth_snapshot_index = -1;
     ui.depth_image_logged = false;
+}
+
+void releaseColorSnapshot() {
+    if (ui.color_srv) ui.color_srv->Release();
+    if (ui.color_copy) ui.color_copy->Release();
+    ui.color_srv = nullptr;
+    ui.color_copy = nullptr;
+    ui.color_snapshot_index = -1;
+    ui.color_image_logged = false;
 }
 
 void bindDepthContrastShader(const ImDrawList*, const ImDrawCmd*) {
@@ -298,6 +314,65 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
     source->Release();
 }
 
+void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
+    D3D11_RENDER_TARGET_VIEW_DESC target{};
+    view->GetDesc(&target);
+    if (target.Format != DXGI_FORMAT_R11G11B10_FLOAT) {
+        EdpeLog(L"EDPE: scene color snapshot skipped (last RTV0 is not R11G11B10_FLOAT)");
+        return;
+    }
+    ID3D11Resource* resource = nullptr;
+    view->GetResource(&resource);
+    ID3D11Texture2D* source = nullptr;
+    if (resource) {
+        resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&source));
+        resource->Release();
+    }
+    if (!source) {
+        EdpeLog(L"EDPE: scene color snapshot skipped (not a Texture2D)");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    if (!desc.Width || !desc.Height || desc.MipLevels != 1 || desc.ArraySize != 1 ||
+        desc.SampleDesc.Count != 1 || desc.Format != target.Format) {
+        source->Release();
+        EdpeLog(L"EDPE: scene color snapshot skipped (unsupported texture layout)");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC copy_desc = desc;
+    copy_desc.Usage = D3D11_USAGE_DEFAULT;
+    copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    copy_desc.CPUAccessFlags = 0;
+    copy_desc.MiscFlags = 0;
+    ID3D11Texture2D* copy = nullptr;
+    HRESULT result = ui.device->CreateTexture2D(&copy_desc, nullptr, &copy);
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (SUCCEEDED(result)) result = ui.device->CreateShaderResourceView(copy, nullptr, &srv);
+    if (SUCCEEDED(result)) {
+        ui.context->CopyResource(copy, source);
+        releaseColorSnapshot();
+        ui.color_copy = copy;
+        ui.color_srv = srv;
+        ui.color_width = desc.Width;
+        ui.color_height = desc.Height;
+        ui.color_snapshot_index = static_cast<int>(index);
+        ui.color_window_open = true;
+        wchar_t message[160];
+        swprintf_s(message, L"EDPE: scene color snapshot #%u copied %ux%u format=%u",
+            index, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
+        EdpeLog(message);
+    } else {
+        if (srv) srv->Release();
+        if (copy) copy->Release();
+        wchar_t message[128];
+        swprintf_s(message, L"EDPE: scene color snapshot unavailable HRESULT=0x%08X",
+            static_cast<unsigned>(result));
+        EdpeLog(message);
+    }
+    source->Release();
+}
+
 void shutdownUi() {
     menu_visible.store(false);
     if (ui.window && ui.original_wndproc &&
@@ -314,6 +389,7 @@ void shutdownUi() {
     }
     releaseBackbuffer();
     releaseDepthSnapshot();
+    releaseColorSnapshot();
     if (ui.depth_contrast_shader) ui.depth_contrast_shader->Release();
     if (ui.context) ui.context->Release();
     if (ui.device) ui.device->Release();
@@ -380,7 +456,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     pollDepthSamples();
     if (!menu_visible.load()) {
         unsigned ignored = 0;
-        if (auto* view = ContextCensusTakeDepthSnapshot(&ignored)) view->Release();
+        ID3D11RenderTargetView* color = nullptr;
+        if (auto* view = ContextCensusTakeDepthSnapshot(&ignored, &color)) view->Release();
+        if (color) color->Release();
         std::lock_guard lock(input_mutex);
         pending_input.clear();
         return;
@@ -390,9 +468,14 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         return;
     }
     unsigned captured_index = 0;
-    if (auto* view = ContextCensusTakeDepthSnapshot(&captured_index)) {
+    ID3D11RenderTargetView* color = nullptr;
+    if (auto* view = ContextCensusTakeDepthSnapshot(&captured_index, &color)) {
         captureDepthSnapshot(view, captured_index);
         view->Release();
+    }
+    if (color) {
+        captureColorSnapshot(color, captured_index);
+        color->Release();
     }
 
     ImGuiContext* previous = ImGui::GetCurrentContext();
@@ -439,6 +522,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
         if (!ui.depth_window_open && ImGui::Button("Show depth snapshot")) ui.depth_window_open = true;
     }
+    if (ui.color_srv) {
+        ImGui::Text("Scene color candidate: DSV #%d (%ux%u)",
+            ui.color_snapshot_index, ui.color_width, ui.color_height);
+        if (!ui.color_window_open && ImGui::Button("Show scene color snapshot")) ui.color_window_open = true;
+    }
     ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
     if (ui.depth_srv && ui.depth_window_open) {
@@ -467,6 +555,27 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             if (!ui.depth_image_logged) {
                 EdpeLog(L"EDPE: depth snapshot image submitted to ImGui");
                 ui.depth_image_logged = true;
+            }
+        }
+        ImGui::End();
+    }
+    if (ui.color_srv && ui.color_window_open) {
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        ImGui::SetNextWindowPos(ImVec2(display.x > 1400.0f ? display.x - 700.0f : 0.0f,
+            display.y > 500.0f ? 80.0f : 0.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("EDPE Scene Color Snapshot", &ui.color_window_open)) {
+            ImGui::Text("DSV #%d / HDR RTV0 (%ux%u)",
+                ui.color_snapshot_index, ui.color_width, ui.color_height);
+            float width = ImGui::GetContentRegionAvail().x;
+            if (width > 640.0f) width = 640.0f;
+            if (width < 1.0f) width = 1.0f;
+            float height = width * static_cast<float>(ui.color_height) / ui.color_width;
+            if (height > 360.0f) { width *= 360.0f / height; height = 360.0f; }
+            ImGui::Image(reinterpret_cast<ImTextureID>(ui.color_srv), ImVec2(width, height));
+            if (!ui.color_image_logged) {
+                EdpeLog(L"EDPE: scene color snapshot image submitted to ImGui");
+                ui.color_image_logged = true;
             }
         }
         ImGui::End();

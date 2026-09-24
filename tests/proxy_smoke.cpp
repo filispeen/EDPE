@@ -109,11 +109,13 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &color_texture))) return 10;
     ID3D11RenderTargetView* color_view = nullptr;
     if (FAILED(device->CreateRenderTargetView(color_texture, nullptr, &color_view))) return 10;
-    color_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    color_desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
     ID3D11Texture2D* second_color_texture = nullptr;
     if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &second_color_texture))) return 10;
     ID3D11RenderTargetView* second_color_view = nullptr;
     if (FAILED(device->CreateRenderTargetView(second_color_texture, nullptr, &second_color_view))) return 10;
+    const float clear_color[4]{0.25f, 0.5f, 0.75f, 1.0f};
+    context->ClearRenderTargetView(second_color_view, clear_color);
     D3D11_BUFFER_DESC probe_desc{};
     probe_desc.ByteWidth = 5376;
     probe_desc.Usage = D3D11_USAGE_DYNAMIC;
@@ -171,7 +173,7 @@ int wmain(int argc, wchar_t** argv) {
     probe_values[1094] = 0.05f;
     std::memcpy(updated_probe.pData, probe_values, sizeof(probe_values));
     context->Unmap(probe_buffer, 0);
-    context->OMSetRenderTargets(0, nullptr, depth_view);
+    context->OMSetRenderTargets(1, &second_color_view, depth_view);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     const HRESULT snapshot_present = swap_chain->Present(0, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
@@ -242,8 +244,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV #0 bind=3 rtv0=") &&
         std::strstr(contents, "format=28 size=64x64 bind=0x20") &&
         std::strstr(contents, "EDPE: DSV #0 bind=3 rtv1=") &&
-        std::strstr(contents, "format=10 size=64x64 bind=0x20") &&
-        std::strstr(contents, "EDPE: DSV #0 bind=6 color target count=0") &&
+        std::strstr(contents, "format=26 size=64x64 bind=0x20") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=6 color target count=1") &&
         std::strstr(contents, "bytes=5376 usage=2 cpu=0x10000") &&
         std::strstr(contents, "EDPE: scene CB sample bind=3 projectionZ=(0,0.025000") &&
         std::strstr(contents, "projection2D=0.025000") &&
@@ -255,6 +257,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: scene CB hex 0000 ") &&
         std::strstr(contents, "EDPE: scene CB hex 1312 ") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
+        std::strstr(contents, "EDPE: scene color snapshot #0 copied 64x64 format=26") &&
+        std::strstr(contents, "EDPE: scene color snapshot image submitted to ImGui") &&
         std::strstr(contents, "EDPE: depth snapshot image submitted to ImGui") &&
         std::strstr(contents, "EDPE: depth contrast shader active in ImGui") &&
         std::strstr(contents, "EDPE: depth sample grid valid=64 nonzero=64 min=0.25 max=0.25 centerValid=1 center=0.25") &&

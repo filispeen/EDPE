@@ -10,4 +10,5 @@ bool ContextCensusRequestBindSequence();
 bool ContextCensusBindSequenceAvailable();
 bool ContextCensusRequestDepthSnapshot(unsigned index);
 bool ContextCensusDepthSnapshotAvailable(unsigned index);
-ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index);
+ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index,
+    ID3D11RenderTargetView** color_view = nullptr);

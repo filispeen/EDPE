@@ -176,6 +176,21 @@ handoff are unverified. The stable RTV object link is stronger than a
 dimension-only classification, but it still does not identify which camera
 update matches the depth pixels or when the HDR texture is safe to sample.
 
+## Experimental HDR color snapshot — 2026-09-24
+
+**SDK-DOCUMENTED:** [Microsoft's `CopyResource` contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-copyresource)
+permits an asynchronous GPU copy between distinct resources of the same
+type and dimensions with compatible formats; neither resource may be mapped.
+
+**EXPERIMENTAL:** On a requested depth snapshot, EDPE retains the last RTV0
+bound with that DSV. At the following `Present`, it accepts only a single-
+sample 2D `R11G11B10_FLOAT` texture, copies it once into an EDPE-owned
+shader-resource texture, and opens a separate raw-color ImGui window. The
+source RTV is not modified. Failure to obtain a compatible source, copy
+texture, or SRV leaves the game's original frame untouched. A visible image
+would identify the candidate's contents at this point, but would not prove
+that it is HUD-free or that `Present` is the eventual temporal handoff.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth

@@ -39,6 +39,7 @@ int snapshot_queued = -1;
 int snapshot_active = -1;
 int snapshot_index = -1;
 ID3D11DepthStencilView* snapshot_view = nullptr; // Retained only until the next UI Present.
+ID3D11RenderTargetView* snapshot_color_view = nullptr; // Last RTV0 on the selected DSV.
 unsigned snapshot_wait_frames = 0;
 std::atomic<bool> snapshot_waiting{false};
 std::atomic<unsigned long long> last_present_frame{0};
@@ -226,6 +227,12 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             snapshot_waiting.store(false, std::memory_order_release);
         }
         if (snapshot_view == dsv && snapshot_index == static_cast<int>(index)) {
+            auto* color = count && targets ? targets[0] : nullptr;
+            if (color != snapshot_color_view) {
+                if (color) color->AddRef();
+                if (snapshot_color_view) snapshot_color_view->Release();
+                snapshot_color_view = color;
+            }
             const auto after = last_present_frame.load(std::memory_order_relaxed);
             if (!snapshot_bind_count) snapshot_first_bind_after = after;
             snapshot_last_bind_after = after;
@@ -464,8 +471,11 @@ bool ContextCensusDepthSnapshotAvailable(unsigned index) {
     return depthSnapshotAvailableLocked(index);
 }
 
-ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index) {
+ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index,
+    ID3D11RenderTargetView** color_view) {
+    if (color_view) *color_view = nullptr;
     ID3D11DepthStencilView* view = nullptr;
+    ID3D11RenderTargetView* color = nullptr;
     unsigned long long armed = 0, first = 0, last = 0;
     unsigned binds = 0, selected = 0;
     {
@@ -480,15 +490,21 @@ ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index) {
         }
         snapshot_view = nullptr;
         snapshot_index = -1;
+        color = snapshot_color_view;
+        snapshot_color_view = nullptr;
     }
     if (view) {
         if (index) *index = selected;
+        if (color_view) *color_view = color;
+        else if (color) color->Release();
         wchar_t message[192];
         swprintf_s(message,
             L"EDPE: depth snapshot timing #%u armedAfter=%llu firstBindAfter=%llu lastBindAfter=%llu binds=%u handedAt=%llu",
             selected, armed, first, last, binds,
             last_present_frame.load(std::memory_order_relaxed));
         EdpeLog(message);
+    } else if (color) {
+        color->Release();
     }
     return view;
 }
@@ -511,6 +527,8 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         snapshot_waiting.store(false, std::memory_order_release);
         if (snapshot_view) snapshot_view->Release();
         snapshot_view = nullptr;
+        if (snapshot_color_view) snapshot_color_view->Release();
+        snapshot_color_view = nullptr;
         snapshot_index = -1;
         snapshot_armed_after = snapshot_first_bind_after = snapshot_last_bind_after = 0;
         snapshot_bind_count = 0;
