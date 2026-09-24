@@ -216,6 +216,24 @@ logged as `default`. These are endpoint observations, not proof that every
 draw in the interval used that state or wrote depth. The query only runs
 for a requested snapshot and does not change the game's state.
 
+**MEASURED (user-confirmed gameplay capture, 2026-09-25; game build not
+rechecked):** For the main-camera DSV `#1` after `Present` 12108, seven
+binds preceded visible depth and HDR color snapshots. At the start of bind
+3, the state reported `enable=1 write=0 func=7`: depth test enabled,
+depth writes disabled, `GREATER_EQUAL` comparison. At the end of bind 3
+and both endpoints of bind 6 it reported `enable=0 write=1 func=2`; with
+depth testing disabled, the latter write-mask and comparison values do not
+show active depth writes. The same frame reported 39,552 IA primitives in
+bind 3 and 108 in bind 6. Microsoft documents [write mask 0 as disabling
+depth writes](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_depth_write_mask)
+and [comparison value 7 as `GREATER_EQUAL`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_comparison_func).
+
+**INFERENCE / LIMIT:** The large bind-3 geometry interval begins with a
+read-only `GREATER_EQUAL` depth test. Depth may have been written in earlier
+binds or after an unobserved state change within bind 3. Endpoint states do not
+identify every draw's state. Measure binds 1 and 2 before treating bind 3
+as the depth-producing pass or choosing a camera for reprojection.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
