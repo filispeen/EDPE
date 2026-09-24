@@ -228,6 +228,22 @@ and HUD-free HDR world snapshot remained normal. This verifies that the
 copy point in this run. It does not check alias views, UAV binding, later
 writes, or exact temporal correspondence.
 
+## Experimental scene-depth selection — 2026-09-25
+
+**MEASURED BASIS:** In two user-confirmed gameplay captures, the main-camera
+DSV was `#1` and then `#2`. Both had a `R32G8X24_TYPELESS` depth texture
+and the same four-target MRT pattern: `R10G10B10A2_UNORM`, two
+`R8G8B8A8_UNORM` targets, and `R11G11B10_FLOAT`. The exact HDR RTV then
+moved from MRT slot 3 to slot 0 within the same `Present` interval.
+
+**EXPERIMENTAL:** EDPE now offers an optional scene-candidate snapshot
+button. It selects a single recent DSV only when that depth format,
+single-sample layout, MRT format pattern, and same-frame HDR RTV identity
+all match. No match or multiple matches disable the button; the manual
+index remains available. This recognizes an observed pass pattern, not a
+production-safe scene-depth identity. It has a WARP smoke test; Elite
+validation is pending.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth

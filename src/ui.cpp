@@ -526,6 +526,14 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ContextCensusRequestDepthSnapshot(static_cast<unsigned>(ui.depth_candidate));
     if (!depth_available) ImGui::EndDisabled();
     if (!depth_available) ImGui::TextDisabled("Choose a bound R32G8X24/R24G8 single-sample DSV, or wait");
+    const int scene_candidate = ContextCensusSceneDepthCandidate();
+    if (scene_candidate < 0) ImGui::BeginDisabled();
+    if (ImGui::Button("Capture scene candidate (experimental)")) {
+        ui.depth_candidate = scene_candidate;
+        ContextCensusRequestDepthSnapshot(static_cast<unsigned>(scene_candidate));
+    }
+    if (scene_candidate < 0) ImGui::EndDisabled();
+    if (scene_candidate < 0) ImGui::TextDisabled("No unique recent scene MRT/HDR signature; use manual index");
     if (ui.depth_srv) {
         ImGui::Text("Depth snapshot: DSV #%d (%ux%u)",
             ui.depth_snapshot_index, ui.depth_width, ui.depth_height);

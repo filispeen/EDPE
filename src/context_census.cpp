@@ -25,6 +25,9 @@ struct SeenDepthView {
     UINT samples = 0;
     bool color_logged = false;
     unsigned long long interval_binds = 0;
+    ID3D11RenderTargetView* mrt_hdr_view = nullptr; // Weak; compared within one frame only.
+    unsigned long long mrt_frame = 0;
+    unsigned long long scene_match_frame = ~0ull;
 };
 std::array<SeenDepthView, 32> seen{};
 size_t seen_count = 0;
@@ -202,6 +205,16 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
     dsv_binds.fetch_add(1, std::memory_order_relaxed);
 
+    bool scene_mrt = false;
+    if (count >= 4 && targets && targets[0] && targets[1] && targets[2] && targets[3]) {
+        D3D11_RENDER_TARGET_VIEW_DESC views[4]{};
+        for (UINT slot = 0; slot < 4; ++slot) targets[slot]->GetDesc(&views[slot]);
+        scene_mrt = views[0].Format == DXGI_FORMAT_R10G10B10A2_UNORM &&
+            views[1].Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+            views[2].Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+            views[3].Format == DXGI_FORMAT_R11G11B10_FLOAT;
+    }
+
     size_t index = 0;
     bool first_bind = false;
     bool first_color = false;
@@ -218,6 +231,18 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             first_bind = true;
         }
         ++seen[index].interval_binds;
+        if (seen[index].texture_format == DXGI_FORMAT_R32G8X24_TYPELESS &&
+            seen[index].samples == 1) {
+            const auto frame = last_present_frame.load(std::memory_order_relaxed);
+            if (seen[index].mrt_frame != frame) {
+                seen[index].mrt_hdr_view = nullptr;
+                seen[index].mrt_frame = frame;
+            }
+            if (scene_mrt) seen[index].mrt_hdr_view = targets[3];
+            else if (seen[index].mrt_hdr_view && count && targets &&
+                targets[0] == seen[index].mrt_hdr_view)
+                seen[index].scene_match_frame = frame;
+        }
         if (sequence_active.load(std::memory_order_acquire)) recordBind(static_cast<int>(index));
         if (snapshot_active == static_cast<int>(index) && !snapshot_view) {
             dsv->AddRef();
@@ -471,6 +496,20 @@ bool ContextCensusDepthSnapshotAvailable(unsigned index) {
     return depthSnapshotAvailableLocked(index);
 }
 
+int ContextCensusSceneDepthCandidate() {
+    std::lock_guard lock(seen_mutex);
+    const auto frame = last_present_frame.load(std::memory_order_relaxed);
+    int candidate = -1;
+    for (size_t index = 0; index < seen_count; ++index) {
+        if (seen[index].scene_match_frame == ~0ull ||
+            seen[index].scene_match_frame + 1 != frame ||
+            !depthSnapshotAvailableLocked(static_cast<unsigned>(index))) continue;
+        if (candidate >= 0) return -1; // Ambiguous: require manual selection.
+        candidate = static_cast<int>(index);
+    }
+    return candidate;
+}
+
 ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index,
     ID3D11RenderTargetView** color_view) {
     if (color_view) *color_view = nullptr;
@@ -511,6 +550,10 @@ ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index,
 
 extern "C" BOOL WINAPI EdpeRequestDepthSnapshot(UINT index) {
     return ContextCensusRequestDepthSnapshot(index);
+}
+
+extern "C" int WINAPI EdpeSceneDepthCandidate() {
+    return ContextCensusSceneDepthCandidate();
 }
 
 extern "C" BOOL WINAPI EdpeRequestBindSequence() {

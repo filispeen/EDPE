@@ -50,6 +50,9 @@ int wmain(int argc, wchar_t** argv) {
     const auto request_depth_snapshot = reinterpret_cast<BOOL (WINAPI*)(UINT)>(
         GetProcAddress(dxgi_proxy, "EDPE_RequestDepthSnapshot"));
     if (!request_depth_snapshot) return 7;
+    const auto scene_depth_candidate = reinterpret_cast<int (WINAPI*)()>(
+        GetProcAddress(dxgi_proxy, "EDPE_SceneDepthCandidate"));
+    if (!scene_depth_candidate) return 7;
     IDXGIFactory1* factory = nullptr;
     const HRESULT factory_result = create_factory(__uuidof(IDXGIFactory1),
         reinterpret_cast<void**>(&factory));
@@ -114,6 +117,16 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &second_color_texture))) return 10;
     ID3D11RenderTargetView* second_color_view = nullptr;
     if (FAILED(device->CreateRenderTargetView(second_color_texture, nullptr, &second_color_view))) return 10;
+    color_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    ID3D11Texture2D* mrt0_texture = nullptr;
+    if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &mrt0_texture))) return 10;
+    ID3D11RenderTargetView* mrt0_view = nullptr;
+    if (FAILED(device->CreateRenderTargetView(mrt0_texture, nullptr, &mrt0_view))) return 10;
+    color_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    ID3D11Texture2D* mrt2_texture = nullptr;
+    if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &mrt2_texture))) return 10;
+    ID3D11RenderTargetView* mrt2_view = nullptr;
+    if (FAILED(device->CreateRenderTargetView(mrt2_texture, nullptr, &mrt2_view))) return 10;
     const float clear_color[4]{0.25f, 0.5f, 0.75f, 1.0f};
     context->ClearRenderTargetView(second_color_view, clear_color);
     D3D11_BUFFER_DESC probe_desc{};
@@ -163,9 +176,10 @@ int wmain(int argc, wchar_t** argv) {
     context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, 0.25f, 0);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, depth_view);
-    ID3D11RenderTargetView* color_pair[]{color_view, second_color_view};
-    context->OMSetRenderTargets(2, color_pair, depth_view);
-    for (int i = 0; i < 2; ++i) context->OMSetRenderTargets(0, nullptr, depth_view);
+    ID3D11RenderTargetView* scene_mrt[]{mrt0_view, color_view, mrt2_view, second_color_view};
+    context->OMSetRenderTargets(4, scene_mrt, depth_view);
+    context->OMSetRenderTargets(4, scene_mrt, depth_view);
+    context->OMSetRenderTargets(0, nullptr, depth_view);
     D3D11_MAPPED_SUBRESOURCE updated_probe{};
     if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &updated_probe))) return 10;
     probe_values[795] = 0.05f;
@@ -176,6 +190,7 @@ int wmain(int argc, wchar_t** argv) {
     context->OMSetRenderTargets(1, &second_color_view, depth_view);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     const HRESULT snapshot_present = swap_chain->Present(0, 0);
+    const bool scene_candidate_found = scene_depth_candidate() == 0;
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool visible_input_blocked = forwarded_keys == 1;
     const HRESULT resize_result = swap_chain->ResizeBuffers(0, 128, 128, DXGI_FORMAT_UNKNOWN, 0);
@@ -196,6 +211,10 @@ int wmain(int argc, wchar_t** argv) {
     color_texture->Release();
     second_color_view->Release();
     second_color_texture->Release();
+    mrt0_view->Release();
+    mrt0_texture->Release();
+    mrt2_view->Release();
+    mrt2_texture->Release();
     depth_view->Release();
     depth_texture->Release();
     swap_chain->Release();
@@ -218,6 +237,7 @@ int wmain(int argc, wchar_t** argv) {
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
         SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
         SUCCEEDED(snapshot_arm_present) && SUCCEEDED(snapshot_present) && snapshot_requested &&
+        scene_candidate_found &&
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
@@ -240,10 +260,12 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: depth snapshot timing #0 armedAfter=7 firstBindAfter=7 lastBindAfter=7 binds=6 handedAt=8") &&
         std::strstr(contents, "EDPE: DSV #0 bind=1 CB stage=VS slot=1 buffer=") &&
         std::strstr(contents, "EDPE: DSV #0 bind=2 CB stage=VS slot=1 buffer=") &&
-        std::strstr(contents, "EDPE: DSV #0 bind=3 color target count=2") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=3 color target count=4") &&
         std::strstr(contents, "EDPE: DSV #0 bind=3 rtv0=") &&
-        std::strstr(contents, "format=28 size=64x64 bind=0x20") &&
+        std::strstr(contents, "format=24 size=64x64 bind=0x20") &&
         std::strstr(contents, "EDPE: DSV #0 bind=3 rtv1=") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=3 rtv2=") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=3 rtv3=") &&
         std::strstr(contents, "format=26 size=64x64 bind=0x20") &&
         std::strstr(contents, "EDPE: DSV #0 bind=6 color target count=1") &&
         std::strstr(contents, "bytes=5376 usage=2 cpu=0x10000") &&
