@@ -179,6 +179,11 @@ int wmain(int argc, wchar_t** argv) {
     context->OMSetRenderTargets(0, nullptr, depth_view);
     ID3D11RenderTargetView* scene_mrt[]{mrt0_view, color_view, mrt2_view, second_color_view};
     context->OMSetRenderTargets(4, scene_mrt, depth_view);
+    D3D11_MAPPED_SUBRESOURCE middle_probe{};
+    if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &middle_probe))) return 10;
+    probe_values[1080] = 1.75f;
+    std::memcpy(middle_probe.pData, probe_values, sizeof(probe_values));
+    context->Unmap(probe_buffer, 0);
     context->OMSetRenderTargets(4, scene_mrt, depth_view);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     D3D11_MAPPED_SUBRESOURCE updated_probe{};
@@ -275,6 +280,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "projection2D=0.025000") &&
         std::strstr(contents, "rows0=(1,0,0,0)") &&
         std::strstr(contents, "EDPE: scene CB 2D xy bind=3 x=(1.25,0,0,0)") &&
+        std::strstr(contents, "EDPE: scene CB 2D xy bind=4 x=(1.75,0,0,0)") &&
         std::strstr(contents, "EDPE: scene CB 2D xy bind=6 x=(2.5,0,0,0)") &&
         std::strstr(contents, "EDPE: scene CB 2D zw bind=6 z=(0,0,0,0) w=(0,0,0.0500000007,0)") &&
         std::strstr(contents, "EDPE: scene CB sample bind=6 projectionZ=(0,0.050000") &&

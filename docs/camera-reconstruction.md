@@ -160,6 +160,13 @@ orientations, but the first residual exceeds camera-log rounding alone;
 the block may reflect a slightly different camera update. A bind-time read
 does not establish which values the depth-writing draws used.
 
+**EXPERIMENTAL NEXT CHECK:** The requested-frame buffer probe now also
+samples DSV bind 4, between the existing bind-3 and bind-6 samples. In the
+observed seven-bind pattern, bind 4 is where the same HDR RTV moves from
+MRT slot 3 to RTV slot 0. Comparing all three camera samples can locate a
+buffer change relative to that pass boundary. It still cannot identify
+the exact draw or prove that the buffer was bound throughout a pass.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested

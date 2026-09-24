@@ -57,7 +57,7 @@ struct CameraSample {
     std::atomic<bool> claimed{false};
     std::atomic<bool> ready{false};
 };
-std::array<CameraSample, 2> camera_samples{}; // One requested frame: early and late scene binds.
+std::array<CameraSample, 3> camera_samples{}; // One requested frame: scene binds 3, 4, and 6.
 
 void recordBind(int index) {
     if (index == sequence_last) return;
@@ -68,7 +68,7 @@ void recordBind(int index) {
 
 void queueCameraSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal) {
-    auto& sample = camera_samples[bind_ordinal == 3 ? 0 : 1];
+    auto& sample = camera_samples[bind_ordinal == 6 ? 2 : bind_ordinal - 3];
     bool expected = false;
     if (!sample.claimed.compare_exchange_strong(expected, true)) return;
     ID3D11Device* device = nullptr;
@@ -161,7 +161,8 @@ void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index,
                 depth_index, bind_ordinal, stage ? L"PS" : L"VS", slot, buffers[slot],
                 desc.ByteWidth, static_cast<unsigned>(desc.Usage), desc.CPUAccessFlags);
             EdpeLog(message);
-            if ((bind_ordinal == 3 || bind_ordinal == 6) && stage == 0 && slot == 1 && desc.ByteWidth == 5376 &&
+            if ((bind_ordinal == 3 || bind_ordinal == 4 || bind_ordinal == 6) &&
+                stage == 0 && slot == 1 && desc.ByteWidth == 5376 &&
                 desc.Usage == D3D11_USAGE_DYNAMIC)
                 queueCameraSample(context, buffers[slot], desc, bind_ordinal);
             buffers[slot]->Release();
