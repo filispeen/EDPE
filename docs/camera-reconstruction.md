@@ -147,6 +147,19 @@ the 2D block and the later camera orientation in this frame. It does not
 prove which camera values the actual depth-writing draws consumed, nor
 whether the multipliers have the same meaning in other graphics settings.
 
+**MEASURED (2026-09-25, second user-confirmed gameplay session; game build
+not rechecked):** After rotating the camera, two further snapshots selected
+session-local DSV `#2`. They had 11 and 10 binds respectively and produced
+visible depth and HDR color images without closing Elite. In each capture,
+the logged camera and 2D block values at binds 3 and 6 were identical at
+their printed precision. The camera rotation differed substantially between
+the two captures. The same column-multiplier calculation gave largest
+absolute differences of `0.000011742` and `0.000002774` across the nine
+rotation-related entries. The relation persists approximately across these
+orientations, but the first residual exceeds camera-log rounding alone;
+the block may reflect a slightly different camera update. A bind-time read
+does not establish which values the depth-writing draws used.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
