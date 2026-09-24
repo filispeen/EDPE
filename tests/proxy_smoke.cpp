@@ -307,6 +307,10 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: scene CB rows1 bind=6 (0,1,0,0) rows2=(0,0,1,0)") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=3 iaPrimitives=1 vsInvocations=3") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=6 iaPrimitives=0 vsInvocations=0") &&
+        std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=3 edge=start") &&
+        std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=3 edge=end") &&
+        std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=6 edge=start") &&
+        std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=6 edge=end") &&
         std::strstr(contents, "EDPE: scene CB hex 0000 ") &&
         std::strstr(contents, "EDPE: scene CB hex 1312 ") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&

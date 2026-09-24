@@ -209,6 +209,13 @@ intervals do not identify individual draws, depth writes, shader camera
 inputs, or the exact point at which depth and color become a matched pair.
 Camera selection for reprojection remains unverified.
 
+**EXPERIMENTAL NEXT CHECK:** The same one-shot query intervals now log the
+bound D3D11 depth-stencil state at their start and end. A nondefault state
+reports depth enable, write mask, and comparison function; a null state is
+logged as `default`. These are endpoint observations, not proof that every
+draw in the interval used that state or wrote depth. The query only runs
+for a requested snapshot and does not change the game's state.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested

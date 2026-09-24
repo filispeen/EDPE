@@ -67,10 +67,32 @@ struct PipelineSample {
 };
 std::array<PipelineSample, 2> pipeline_samples{}; // Requested bind intervals 3 and 6 only.
 
+void logDepthState(ID3D11DeviceContext* context, const PipelineSample& sample,
+    const wchar_t* edge) {
+    ID3D11DepthStencilState* state = nullptr;
+    UINT stencil_ref = 0;
+    context->OMGetDepthStencilState(&state, &stencil_ref);
+    wchar_t message[192];
+    if (state) {
+        D3D11_DEPTH_STENCIL_DESC desc{};
+        state->GetDesc(&desc);
+        swprintf_s(message,
+            L"EDPE: scene depth state afterPresent=%llu bind=%u edge=%s enable=%u write=%u func=%u",
+            sample.after_present, sample.bind, edge, desc.DepthEnable,
+            static_cast<unsigned>(desc.DepthWriteMask), static_cast<unsigned>(desc.DepthFunc));
+        state->Release();
+    } else {
+        swprintf_s(message, L"EDPE: scene depth state afterPresent=%llu bind=%u edge=%s default",
+            sample.after_present, sample.bind, edge);
+    }
+    EdpeLog(message);
+}
+
 void endPipelineSample(ID3D11DeviceContext* context) {
     std::lock_guard lock(seen_mutex);
     for (auto& sample : pipeline_samples) {
         if (!sample.active) continue;
+        logDepthState(context, sample, L"end");
         context->End(sample.query);
         sample.active = false;
     }
@@ -97,6 +119,7 @@ void beginPipelineSample(ID3D11DeviceContext* context, unsigned bind) {
     sample.wait = 0;
     sample.active = true;
     context->Begin(sample.query);
+    logDepthState(context, sample, L"start");
 }
 
 void pollPipelineSamples(ID3D11DeviceContext* context) {
