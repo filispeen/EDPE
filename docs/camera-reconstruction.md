@@ -106,6 +106,23 @@ frame without adding a hook, changing the source buffer, or reading back a
 full frame. Different rows would prove that a single bind-time observation
 is insufficient; equal rows would not prove they were used by every draw.
 
+**MEASURED (Elite Odyssey `332841`, first gameplay capture with this probe):**
+The main-camera depth image was session-local DSV `#1`, `2560×1440`, with
+seven binds between `Present` 18377 and 18378. Bind 3 rows began
+`(-0.965309,-0.0707018,-0.251356,19.5594)`; bind 6 rows began
+`(-0.965288,-0.0706202,-0.251458,19.5594)`. The other two rotation rows
+also changed, with maximum logged component difference about `0.000141`.
+The row rotations differ by approximately `0.0113°` using the skew of their
+relative 3×3 matrix; this estimate uses six-significant-digit log values.
+All three translation entries printed identically at both binds, and word
+1094 was `0.0250000004` at both. The game and F5 menu remained open.
+
+**IMPLICATION:** The scene-camera candidate is updated between these two
+binds within one `Present` interval, even when its position and depth
+coefficient do not change. The probe does not show which update was active
+at the scene draws that produced the copied depth. Production camera
+selection needs draw/pass association before motion or jitter is enabled.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
