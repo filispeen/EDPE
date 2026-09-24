@@ -123,13 +123,18 @@ coefficient do not change. The probe does not show which update was active
 at the scene draws that produced the copied depth. Production camera
 selection needs draw/pass association before motion or jitter is enabled.
 
-**EXPERIMENTAL NEXT CHECK (2026-09-25):** The existing bind-3 and bind-6
-small-buffer readbacks now log float words 1080–1095 as four 2D
-view-projection candidate rows for both samples. The prior full hex dump
-covered bind 6 only. Comparing both rows in one user-requested frame can
-show whether scale, off-center terms, or depth coefficient change between
-the early and late scene binds. It adds no hook or GPU copy. The row labels
-are diagnostic; matrix layout and jitter semantics remain unverified.
+**MEASURED (2026-09-25, user-confirmed gameplay capture; game build not
+rechecked):** The existing bind-3 and bind-6 readbacks logged all 16 float
+words 1080–1095 in one requested frame. The four printed rows were identical
+at both binds: `(-0.940040827,-0.119412839,0,-0.253565669)`,
+`(0.0020389352,1.66782808,0,-0.269775897)`,
+`(0.256004214,-0.451764196,0,-0.928937793)`, and
+`(0,0,0.0250000004,0)`. The separately logged camera rows 932–943 differed
+slightly between bind 3 and bind 6. The scene selector produced visible
+depth and color snapshots, and Elite continued running. This establishes
+only that the logged 2D candidate block was stable at these two observation
+points; it does not establish its matrix layout, jitter convention, or value
+at the intervening draws.
 
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
