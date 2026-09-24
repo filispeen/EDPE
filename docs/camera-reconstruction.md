@@ -167,6 +167,16 @@ MRT slot 3 to RTV slot 0. Comparing all three camera samples can locate a
 buffer change relative to that pass boundary. It still cannot identify
 the exact draw or prove that the buffer was bound throughout a pass.
 
+**MEASURED (2026-09-25, user-confirmed gameplay capture; game build not
+rechecked):** Session-local DSV `#1` had seven binds, and the user saw both
+snapshots while Elite kept running. Camera words 932–943 printed identically
+at binds 3 and 4. By bind 6, rotation entries changed by up to about
+`0.000003`, while all three translation entries printed identically. All
+16 logged words of the 2D block were identical at binds 3, 4, and 6. Thus
+the observed camera-row change occurred after the bind-4 sample and before
+the bind-6 sample in this frame. This does not identify the responsible
+buffer write or associate either sample with particular draws.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
