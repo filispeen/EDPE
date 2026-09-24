@@ -137,6 +137,7 @@ int wmain(int argc, wchar_t** argv) {
     float probe_values[5376 / sizeof(float)]{};
     probe_values[795] = 0.025f;
     probe_values[1094] = 0.025f;
+    probe_values[1080] = 1.25f;
     probe_values[932] = probe_values[937] = probe_values[942] = 1.0f;
     D3D11_SUBRESOURCE_DATA probe_initial{};
     probe_initial.pSysMem = probe_values;
@@ -185,6 +186,7 @@ int wmain(int argc, wchar_t** argv) {
     probe_values[795] = 0.05f;
     probe_values[935] = 42.0f;
     probe_values[1094] = 0.05f;
+    probe_values[1080] = 2.5f;
     std::memcpy(updated_probe.pData, probe_values, sizeof(probe_values));
     context->Unmap(probe_buffer, 0);
     context->OMSetRenderTargets(1, &second_color_view, depth_view);
@@ -272,6 +274,9 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: scene CB sample bind=3 projectionZ=(0,0.025000") &&
         std::strstr(contents, "projection2D=0.025000") &&
         std::strstr(contents, "rows0=(1,0,0,0)") &&
+        std::strstr(contents, "EDPE: scene CB 2D xy bind=3 x=(1.25,0,0,0)") &&
+        std::strstr(contents, "EDPE: scene CB 2D xy bind=6 x=(2.5,0,0,0)") &&
+        std::strstr(contents, "EDPE: scene CB 2D zw bind=6 z=(0,0,0,0) w=(0,0,0.0500000007,0)") &&
         std::strstr(contents, "EDPE: scene CB sample bind=6 projectionZ=(0,0.050000") &&
         std::strstr(contents, "projection2D=0.050000") &&
         std::strstr(contents, "rows0=(1,0,0,42)") &&

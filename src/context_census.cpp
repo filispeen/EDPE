@@ -111,6 +111,16 @@ void pollCameraSamples(ID3D11DeviceContext* context) {
                 sample.bind, values[936], values[937], values[938], values[939],
                 values[940], values[941], values[942], values[943]);
             EdpeLog(message);
+            swprintf_s(message,
+                L"EDPE: scene CB 2D xy bind=%u x=(%.9g,%.9g,%.9g,%.9g) y=(%.9g,%.9g,%.9g,%.9g)",
+                sample.bind, values[1080], values[1081], values[1082], values[1083],
+                values[1084], values[1085], values[1086], values[1087]);
+            EdpeLog(message);
+            swprintf_s(message,
+                L"EDPE: scene CB 2D zw bind=%u z=(%.9g,%.9g,%.9g,%.9g) w=(%.9g,%.9g,%.9g,%.9g)",
+                sample.bind, values[1088], values[1089], values[1090], values[1091],
+                values[1092], values[1093], values[1094], values[1095]);
+            EdpeLog(message);
             if (sample.bind == 6) for (size_t offset = 0; offset < 5376 / sizeof(float); offset += 32) {
                 wchar_t words[320];
                 int used = swprintf_s(words, L"EDPE: scene CB hex %04zu ", offset);

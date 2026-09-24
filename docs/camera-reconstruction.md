@@ -123,6 +123,14 @@ coefficient do not change. The probe does not show which update was active
 at the scene draws that produced the copied depth. Production camera
 selection needs draw/pass association before motion or jitter is enabled.
 
+**EXPERIMENTAL NEXT CHECK (2026-09-25):** The existing bind-3 and bind-6
+small-buffer readbacks now log float words 1080–1095 as four 2D
+view-projection candidate rows for both samples. The prior full hex dump
+covered bind 6 only. Comparing both rows in one user-requested frame can
+show whether scale, off-center terms, or depth coefficient change between
+the early and late scene binds. It adds no hook or GPU copy. The row labels
+are diagnostic; matrix layout and jitter semantics remain unverified.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
