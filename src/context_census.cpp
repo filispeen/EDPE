@@ -58,6 +58,69 @@ struct CameraSample {
     std::atomic<bool> ready{false};
 };
 std::array<CameraSample, 3> camera_samples{}; // One requested frame: scene binds 3, 4, and 6.
+struct PipelineSample {
+    ID3D11Query* query = nullptr;
+    unsigned bind = 0;
+    unsigned long long after_present = 0;
+    unsigned wait = 0;
+    bool active = false;
+};
+std::array<PipelineSample, 2> pipeline_samples{}; // Requested bind intervals 3 and 6 only.
+
+void endPipelineSample(ID3D11DeviceContext* context) {
+    std::lock_guard lock(seen_mutex);
+    for (auto& sample : pipeline_samples) {
+        if (!sample.active) continue;
+        context->End(sample.query);
+        sample.active = false;
+    }
+}
+
+void beginPipelineSample(ID3D11DeviceContext* context, unsigned bind) {
+    if (bind != 3 && bind != 6) return;
+    std::lock_guard lock(seen_mutex);
+    auto& sample = pipeline_samples[bind == 3 ? 0 : 1];
+    if (sample.query) return;
+    ID3D11Device* device = nullptr;
+    context->GetDevice(&device);
+    D3D11_QUERY_DESC desc{D3D11_QUERY_PIPELINE_STATISTICS, 0};
+    const HRESULT result = device ? device->CreateQuery(&desc, &sample.query) : E_FAIL;
+    if (device) device->Release();
+    if (FAILED(result) || !sample.query) {
+        if (sample.query) sample.query->Release();
+        sample.query = nullptr;
+        EdpeLog(L"EDPE: scene pipeline statistics unavailable (query creation failed)");
+        return;
+    }
+    sample.bind = bind;
+    sample.after_present = last_present_frame.load(std::memory_order_relaxed);
+    sample.wait = 0;
+    sample.active = true;
+    context->Begin(sample.query);
+}
+
+void pollPipelineSamples(ID3D11DeviceContext* context) {
+    std::lock_guard lock(seen_mutex);
+    for (auto& sample : pipeline_samples) {
+        if (!sample.query || sample.active) continue;
+        D3D11_QUERY_DATA_PIPELINE_STATISTICS stats{};
+        const HRESULT result = context->GetData(sample.query, &stats, sizeof(stats),
+            D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (result == S_FALSE && ++sample.wait < 120) continue;
+        if (result == S_OK) {
+            wchar_t message[208];
+            swprintf_s(message,
+                L"EDPE: scene pipeline afterPresent=%llu bind=%u iaPrimitives=%llu vsInvocations=%llu psInvocations=%llu",
+                sample.after_present, sample.bind, stats.IAPrimitives,
+                stats.VSInvocations, stats.PSInvocations);
+            EdpeLog(message);
+        } else {
+            EdpeLog(L"EDPE: scene pipeline statistics unavailable (query failed or timed out)");
+        }
+        sample.query->Release();
+        sample = {};
+    }
+}
 
 void recordBind(int index) {
     if (index == sequence_last) return;
@@ -205,6 +268,8 @@ void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT coun
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
     const auto forward = original.load(std::memory_order_acquire);
+    if (context == observed_context.load(std::memory_order_acquire))
+        endPipelineSample(context);
     forward(context, count, targets, dsv);
     if (context != observed_context.load(std::memory_order_acquire)) return;
     if (!dsv) {
@@ -282,6 +347,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
 
     if (snapshot_probe_bind) {
+        beginPipelineSample(context, snapshot_probe_bind);
         logSnapshotColorTarget(index, snapshot_probe_bind, count, targets);
         logBoundConstantBuffers(context, index, snapshot_probe_bind);
     }
@@ -349,6 +415,11 @@ bool patchSlot(void** table, void* expected, void* replacement) {
 } // namespace
 
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
+    if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
+        auto* context = observed_context.load(std::memory_order_acquire);
+        endPipelineSample(context);
+        pollPipelineSamples(context);
+    }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
         pollCameraSamples(observed_context.load(std::memory_order_acquire));
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
@@ -594,6 +665,14 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         sample.buffer = nullptr;
         sample.ready.store(false, std::memory_order_release);
         sample.claimed.store(false, std::memory_order_release);
+    }
+    {
+        std::lock_guard lock(seen_mutex);
+        for (auto& sample : pipeline_samples) {
+            if (sample.active) observed_context.load(std::memory_order_acquire)->End(sample.query);
+            if (sample.query) sample.query->Release();
+            sample = {};
+        }
     }
     if (patched_table) {
         patchSlot(patched_table, reinterpret_cast<void*>(&observedOMSetRenderTargets),

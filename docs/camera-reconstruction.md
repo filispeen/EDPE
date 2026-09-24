@@ -177,6 +177,24 @@ the observed camera-row change occurred after the bind-4 sample and before
 the bind-6 sample in this frame. This does not identify the responsible
 buffer write or associate either sample with particular draws.
 
+**EXPERIMENTAL NEXT CHECK:** A requested snapshot now brackets the work after
+DSV binds 3 and 6 with one-shot D3D11 pipeline-statistics queries. EDPE ends
+each interval at the next `OMSetRenderTargets` call or `Present`, then polls
+`GetData` once per later frame with `D3D11_ASYNC_GETDATA_DONOTFLUSH`. The
+logged IA primitive and VS/PS invocation counts can establish whether
+graphics work occurred in those intervals without another draw hook. They
+do not identify individual draws, depth writes, or which camera values a
+shader consumed. Query failure leaves the original rendering untouched.
+See Microsoft's [query type](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_query)
+and [non-flushing readback](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_async_getdata_flag)
+contracts.
+
+**VERIFIED (Release WARP smoke test):** A test vertex shader and one triangle
+between bind 3 and the next target bind produced `iaPrimitives=1` and
+`vsInvocations=3`; the empty bind-6 interval produced zeros. Both direct
+and staged-proxy smoke variants passed. Elite behavior and the distribution
+of scene work remain unmeasured.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested

@@ -1,4 +1,5 @@
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <windows.h>
 #include <cstring>
@@ -179,6 +180,22 @@ int wmain(int argc, wchar_t** argv) {
     context->OMSetRenderTargets(0, nullptr, depth_view);
     ID3D11RenderTargetView* scene_mrt[]{mrt0_view, color_view, mrt2_view, second_color_view};
     context->OMSetRenderTargets(4, scene_mrt, depth_view);
+    constexpr char vertex_source[] =
+        "float4 main(uint id : SV_VertexID) : SV_Position { "
+        "return float4(id == 1 ? 1 : -1, id == 2 ? 1 : -1, 0, 1); }";
+    ID3DBlob* vertex_bytecode = nullptr;
+    if (FAILED(D3DCompile(vertex_source, sizeof(vertex_source) - 1, nullptr, nullptr,
+            nullptr, "main", "vs_5_0", 0, 0, &vertex_bytecode, nullptr))) return 10;
+    ID3D11VertexShader* vertex_shader = nullptr;
+    const HRESULT vertex_result = device->CreateVertexShader(vertex_bytecode->GetBufferPointer(),
+        vertex_bytecode->GetBufferSize(), nullptr, &vertex_shader);
+    vertex_bytecode->Release();
+    if (FAILED(vertex_result)) return 10;
+    context->VSSetShader(vertex_shader, nullptr, 0);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->Draw(3, 0);
+    context->VSSetShader(nullptr, nullptr, 0);
+    vertex_shader->Release();
     D3D11_MAPPED_SUBRESOURCE middle_probe{};
     if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &middle_probe))) return 10;
     probe_values[1080] = 1.75f;
@@ -202,7 +219,8 @@ int wmain(int argc, wchar_t** argv) {
     const bool visible_input_blocked = forwarded_keys == 1;
     const HRESULT resize_result = swap_chain->ResizeBuffers(0, 128, 128, DXGI_FORMAT_UNKNOWN, 0);
     const HRESULT resized_present = SUCCEEDED(resize_result) ? swap_chain->Present(0, 0) : resize_result;
-    for (int i = 9; i < 1024; ++i) swap_chain->Present(0, DXGI_PRESENT_TEST);
+    for (int i = 0; i < 16; ++i) swap_chain->Present(0, 0);
+    for (int i = 25; i < 1024; ++i) swap_chain->Present(0, DXGI_PRESENT_TEST);
     const bool interval_observed = present_count() == 1024;
     SendMessageW(window, WM_KEYUP, VK_F5, 0);
     SendMessageW(window, WM_KEYDOWN, VK_F5, 0);
@@ -287,6 +305,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "projection2D=0.050000") &&
         std::strstr(contents, "rows0=(1,0,0,42)") &&
         std::strstr(contents, "EDPE: scene CB rows1 bind=6 (0,1,0,0) rows2=(0,0,1,0)") &&
+        std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=3 iaPrimitives=1 vsInvocations=3") &&
+        std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=6 iaPrimitives=0 vsInvocations=0") &&
         std::strstr(contents, "EDPE: scene CB hex 0000 ") &&
         std::strstr(contents, "EDPE: scene CB hex 1312 ") &&
         std::strstr(contents, "EDPE: depth snapshot #0 copied 64x64 format=19") &&
