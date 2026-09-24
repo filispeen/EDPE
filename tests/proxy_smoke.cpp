@@ -156,7 +156,8 @@ int wmain(int argc, wchar_t** argv) {
     context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, 0.25f, 0);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, depth_view);
-    for (int i = 0; i < 3; ++i) context->OMSetRenderTargets(0, nullptr, depth_view);
+    context->OMSetRenderTargets(1, &color_view, depth_view);
+    for (int i = 0; i < 2; ++i) context->OMSetRenderTargets(0, nullptr, depth_view);
     D3D11_MAPPED_SUBRESOURCE updated_probe{};
     if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &updated_probe))) return 10;
     probe_values[795] = 0.05f;
@@ -229,6 +230,9 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: depth snapshot timing #0 armedAfter=7 firstBindAfter=7 lastBindAfter=7 binds=6 handedAt=8") &&
         std::strstr(contents, "EDPE: DSV #0 bind=1 CB stage=VS slot=1 buffer=") &&
         std::strstr(contents, "EDPE: DSV #0 bind=2 CB stage=VS slot=1 buffer=") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=3 color target count=1 rtv0=") &&
+        std::strstr(contents, "format=28 size=64x64 bind=0x20") &&
+        std::strstr(contents, "EDPE: DSV #0 bind=6 color target count=0 rtv0=0000000000000000 format=0 size=0x0 bind=0x0") &&
         std::strstr(contents, "bytes=5376 usage=2 cpu=0x10000") &&
         std::strstr(contents, "EDPE: scene CB sample bind=3 projectionZ=(0,0.025000") &&
         std::strstr(contents, "projection2D=0.025000") &&

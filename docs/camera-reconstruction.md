@@ -123,6 +123,14 @@ coefficient do not change. The probe does not show which update was active
 at the scene draws that produced the copied depth. Production camera
 selection needs draw/pass association before motion or jitter is enabled.
 
+**EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
+identity, format, dimensions, and bind flags at each target bind. This uses
+the existing `OMSetRenderTargets` arguments and runs only for the requested
+snapshot. Compare bind 3 and bind 6 color targets with their camera rows to
+determine whether the observed camera change crosses a color-pass boundary.
+An RTV association still does not identify the exact draw that wrote each
+depth pixel.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
