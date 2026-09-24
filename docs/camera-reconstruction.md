@@ -155,6 +155,27 @@ including null slots. This extends the already-tested RTV0 observation;
 it does not intercept draws or modify any resource. The attachment sets
 may distinguish geometry and later color passes more reliably than RTV0.
 
+**MEASURED (Elite Odyssey `332841`, user-confirmed gameplay capture):**
+Session-local main-camera DSV `#1` bound seven times between `Present`
+14279 and 14280, always with `NumViews=8` but with null entries in unused
+slots. Binds 1–3 had the same four nonnull `2560×1440` RTVs:
+`R10G10B10A2_UNORM` at slot 0, `R8G8B8A8_UNORM` at slots 1 and 2, and
+`R11G11B10_FLOAT` at slot 3. Bind 4 moved that **same slot-3 RTV object**
+to slot 0 and paired it with an `R16_FLOAT` RTV at slot 1. Binds 5–7 kept
+only that `R11G11B10_FLOAT` RTV at slot 0. All nonnull textures reported
+bind flags `0xA8` (shader resource, render target, unordered access). The
+installed Windows SDK `dxgiformat.h` defines the format names. Bind-3 and
+bind-6 camera rows changed slightly while translation and projection word
+1094 remained the same; the depth grid was nonuniform and the user reported
+normal rendering.
+
+**INFERENCE / LIMIT:** The four-target first phase is consistent with a
+geometry/MRT pass, followed by processing into a shared HDR color target.
+The exact shader purpose, draw counts, depth writes, and final scene-color
+handoff are unverified. The stable RTV object link is stronger than a
+dimension-only classification, but it still does not identify which camera
+update matches the depth pixels or when the HDR texture is safe to sample.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
