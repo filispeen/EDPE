@@ -216,6 +216,18 @@ query and releases its returned references. The result checks output binding
 at that point only; it cannot prove that all scene-color writes are complete
 or that the source is no longer bound through another view.
 
+**VERIFIED / MEASURED (user-confirmed gameplay capture, 2026-09-25; game
+build not rechecked):** The main-camera depth candidate was session-local
+DSV `#2` this time. It bound seven times between `Present` 15167 and 15168.
+The same `2560×1440` `R11G11B10_FLOAT` RTV object appeared at slot 3 in
+binds 1–3 and at slot 0 in binds 4–7. EDPE copied its color and the
+format-19 depth at `Present` 15168, submitted the color image to ImGui, and
+logged `scene color RTV unbound at Present`. The user reported that the game
+and HUD-free HDR world snapshot remained normal. This verifies that the
+*exact retained RTV view* was not bound to an output-merger RTV slot at this
+copy point in this run. It does not check alias views, UAV binding, later
+writes, or exact temporal correspondence.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
