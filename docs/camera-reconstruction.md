@@ -240,6 +240,24 @@ depth-stencil states. The existing bind-3 and bind-6 measurements remain.
 This can locate earlier geometry intervals and depth-write-capable endpoint
 states, but cannot prove that a particular draw wrote the captured depth.
 
+**MEASURED (user-confirmed gameplay capture, 2026-09-25; game build not
+rechecked):** Main-camera DSV `#1` bound seven times after `Present` 13500;
+the depth and HDR color snapshots appeared and Elite kept running. Bind 1
+reported one IA primitive, three VS invocations, and no PS invocations;
+depth testing was disabled at both endpoints. Bind 2 reported 432,236 IA
+primitives, 538,784 VS invocations, and 8,989,612 PS invocations. Its
+start state was `enable=1 write=1 func=7` (depth test and writes enabled,
+`GREATER_EQUAL`); its end state was `enable=1 write=0 func=7`. Bind 3
+started with the latter read-only state and reported 39,552 IA primitives.
+Bind 6 had 92 IA primitives and depth testing disabled at both endpoints.
+
+**INFERENCE / LIMIT:** Bind 2 is the strongest observed depth-producing
+interval: substantial geometry and pixel work occurs between a writable
+and a read-only depth state. The state changed somewhere inside that
+interval. The query does not say which draws wrote depth, whether later
+passes changed it, or which camera values were active at those draws.
+The next camera probe should include bind 2 and the bind-2/3 boundary.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
