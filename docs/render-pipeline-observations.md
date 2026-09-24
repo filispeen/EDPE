@@ -230,6 +230,16 @@ Still unknown: which swapchain corresponds to the 2D scene, actual `Present` tim
 - **LIMIT:** These clear values identify operations on three tracked DSVs, not the scene-depth target or a global standard/reversed-Z convention. The successful local tests did not predict slot-53 ownership in the game.
 - **DECISION:** Restore the previously working game DLLs and remove the experimental probe from EDPE. Do not intercept slot 53 again without a dispatch strategy that accounts for observed hook displacement.
 
+**EXPERIMENTAL (2026-09-25, WARP only):** A separate temporary slot-12
+`DrawIndexed` observer reported installation but did not satisfy the proxy
+smoke test's draw-call observation. Three local attempts did not establish
+why; the hook and test edits were reverted before any Elite deployment. A
+standalone WARP probe did reach slot 12 through a virtual call, so the
+slot number alone is not the demonstrated cause. The doubtful assumption is
+that patching this context-table entry guarantees EDPE sees the draws made
+through the tested proxy path. Do not base camera/depth association on that
+unverified observer.
+
 ## One-frame DSV bind-order capture — 2026-09-23
 
 - **EXPERIMENTAL:** The F5 menu can request one frame of DSV bind transitions using the existing slot-33 `OMSetRenderTargets` observer. Capture starts after the menu is drawn and stops at the next real `Present`. It logs at most the first 64 transitions, including `-1` for no DSV and `-3` for an untracked DSV. No additional context method is hooked, and the original call remains unchanged.
