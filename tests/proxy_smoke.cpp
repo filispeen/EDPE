@@ -188,6 +188,7 @@ int wmain(int argc, wchar_t** argv) {
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->VSSetConstantBuffers(1, 1, &probe_buffer);
+    for (int i = 0; i < 50; ++i) context->VSSetConstantBuffers(1, 1, &probe_buffer);
     ID3D11RenderTargetView* scene_mrt[]{mrt0_view, color_view, mrt2_view, second_color_view};
     context->OMSetRenderTargets(4, scene_mrt, depth_view);
     constexpr char vertex_source[] =
@@ -320,9 +321,10 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: scene CB rows1 bind=6 (0,1,0,0) rows2=(0,0,1,0)") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=1 iaPrimitives=0 vsInvocations=0") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=2 iaPrimitives=0 vsInvocations=0") &&
-        std::strstr(contents, "EDPE: depth-pass VS bindings calls=1 sceneBufferCalls=1 first=") &&
+        std::strstr(contents, "EDPE: depth-pass VS bindings calls=51 sceneBufferCalls=51 first=") &&
         std::strstr(contents, "switches=0 slotRestored=1") &&
         std::strstr(contents, "EDPE: scene CB sample bind=0 projectionZ=(0,0.025000") &&
+        std::strstr(contents, "EDPE: scene CB sample bind=51 projectionZ=(0,0.025000") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=3 iaPrimitives=1 vsInvocations=3") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=6 iaPrimitives=0 vsInvocations=0") &&
         std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=1 edge=start") &&
