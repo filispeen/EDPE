@@ -300,7 +300,8 @@ and hook safety remain unverified. That check did not alter the game DLL.
 **EXPERIMENTAL NEXT CHECK:** A requested snapshot now observes VS constant-
 buffer binding calls only between main-camera DSV bind 2 and the next
 `OMSetRenderTargets` (or `Present`). It counts calls and 5376-byte dynamic
-buffer binds at VS slot 1, retains only the last buffer identity, and
+buffer binds at VS slot 1, retains the first and last buffer identities,
+counts identity switches, and
 forwards every call. It restores slot 7 only if EDPE still owns it; if
 another component replaced the slot, EDPE logs the loss and leaves that
 entry untouched. No draw is intercepted and no buffer is modified.
@@ -321,6 +322,15 @@ the bind-2 boundary. The log retains only the last buffer identity; it
 does not establish whether all 101 calls used that object, what its rows
 contained at each call, or which draw consumed each binding. Those facts
 still need verification before camera-driven motion or jitter.
+
+**MEASURED (user-confirmed gameplay captures, 2026-09-25; game build not
+rechecked):** Three later snapshots of main-camera DSV `#2` each logged
+101 qualifying VS-slot-1 binds in interval 2, with the same first and last
+buffer identity (`000001CDFD51B8A0` in this process), zero identity
+switches, and `slotRestored=1`. Depth and HDR color snapshots remained
+visible and the game continued normally. This verifies buffer-object
+identity for those observed binds, not constant-buffer contents or the
+draw-to-depth relationship. The same dynamic buffer can be rewritten.
 
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
