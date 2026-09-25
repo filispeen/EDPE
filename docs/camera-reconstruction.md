@@ -274,6 +274,22 @@ buffer and logs its 12 raw 32-bit words after a nonblocking read. This
 tests whether the small buffer contains a camera-related matrix; its size
 alone is not evidence of camera semantics. The source is not modified.
 
+**MEASURED (next user-confirmed gameplay capture, 2026-09-25; game build
+not rechecked):** Main-camera DSV `#2` bound seven times after `Present`
+14813, and the user saw both snapshots while Elite kept running. Bind 2
+again had substantial work (432,236 IA primitives, 539,698 VS invocations,
+8,917,462 PS invocations) and began with depth testing and writes enabled.
+However, the bind-2 constant-buffer census found no VS or PS buffer in
+slots 0–7 at that observation point. The 48-byte probe therefore had no
+source and emitted no data line. At bind 3, VS slot 1 held the 5376-byte
+scene buffer and the usual camera rows were sampled.
+
+**IMPLICATION / LIMIT:** A 48-byte slot-2 buffer was present at bind 2 in
+the prior capture but absent here. Neither bind-time state identifies the
+buffers used by the many draws inside bind 2. EDVR associates its VR
+camera writes with a scene draw; EDPE's 2D path needs its own verified
+within-pass association before camera-driven motion or jitter is enabled.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
