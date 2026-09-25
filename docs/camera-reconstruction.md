@@ -256,7 +256,17 @@ interval: substantial geometry and pixel work occurs between a writable
 and a read-only depth state. The state changed somewhere inside that
 interval. The query does not say which draws wrote depth, whether later
 passes changed it, or which camera values were active at those draws.
-The next camera probe should include bind 2 and the bind-2/3 boundary.
+Therefore the depth camera is not yet identified.
+
+**MEASURED (same capture):** At binds 1 and 2, the VS/PS constant-buffer
+census found only slot 2 bound to the same 48-byte dynamic buffer; VS slot
+1 was absent among slots 0–7.
+At bind 3, VS slot 1 held the 5376-byte scene buffer sampled in earlier
+captures, while VS slots 0 and 2 held 208-byte and 192-byte buffers.
+
+**IMPLICATION / LIMIT:** Sampling the large buffer at bind-2 start would
+not identify the camera used by the depth-writing work. The 48-byte
+buffer's contents and any binding changes within bind 2 remain unknown.
 
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
