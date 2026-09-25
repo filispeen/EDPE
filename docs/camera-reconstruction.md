@@ -305,6 +305,23 @@ forwards every call. It restores slot 7 only if EDPE still owns it; if
 another component replaced the slot, EDPE logs the loss and leaves that
 entry untouched. No draw is intercepted and no buffer is modified.
 
+**MEASURED (user-confirmed gameplay capture, 2026-09-25; game build not
+rechecked):** The main-camera DSV was session-local `#2`, with seven binds
+after `Present` 12185. Depth and HDR color snapshots were visible and Elite
+kept running. During bind 2, the one-shot observer received 101
+`VSSetConstantBuffers` calls; all 101 included a 5376-byte dynamic buffer
+at VS slot 1. The last recorded buffer identity matched VS slot 1 at bind
+3 (`00000212B46B3960` in this process). The observer reported
+`slotRestored=1`. Bind 2 contained 432,236 IA primitives and began with
+depth testing and writes enabled.
+
+**IMPLICATION / LIMIT:** The large scene-buffer class is bound repeatedly
+inside the likely depth-producing interval, even though it was absent at
+the bind-2 boundary. The log retains only the last buffer identity; it
+does not establish whether all 101 calls used that object, what its rows
+contained at each call, or which draw consumed each binding. Those facts
+still need verification before camera-driven motion or jitter.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
