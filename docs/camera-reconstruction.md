@@ -341,6 +341,17 @@ Elite remained open. This comparison covers the printed fields only; it
 does not prove byte-for-byte equality throughout the buffer or exclude
 rewrites between those two sample points.
 
+**MEASURED (user-confirmed gameplay capture, 2026-09-25; game build not
+rechecked):** A later one-shot capture sampled the same 5376-byte VS-slot-1
+buffer at its first and 51st qualifying binds inside DSV interval 2, plus
+the boundary at DSV bind 3 (`afterPresent=12243`). All three copies printed
+identical projection fields, three matrix rows, and 2D rows. Interval 2
+recorded 432,236 IA primitives and 539,557 VS invocations. The game and
+both scene snapshots remained normal. This supports a stable camera-field
+candidate across sampled points in the principal depth-producing interval;
+it does not establish byte-for-byte equality or the camera used by every
+draw.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
