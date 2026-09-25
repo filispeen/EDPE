@@ -332,6 +332,15 @@ visible and the game continued normally. This verifies buffer-object
 identity for those observed binds, not constant-buffer contents or the
 draw-to-depth relationship. The same dynamic buffer can be rewritten.
 
+**MEASURED (user-confirmed gameplay capture, 2026-09-25; game build not
+rechecked):** A one-shot GPU copy at the first 5376-byte VS-slot-1 bind
+inside DSV interval 2 produced the same logged projection fields, three
+matrix rows, and 2D rows as the copy at DSV bind 3 in that frame
+(`afterPresent=11235`). Both depth and HDR color snapshots appeared and
+Elite remained open. This comparison covers the printed fields only; it
+does not prove byte-for-byte equality throughout the buffer or exclude
+rewrites between those two sample points.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
