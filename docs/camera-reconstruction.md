@@ -352,6 +352,16 @@ candidate across sampled points in the principal depth-producing interval;
 it does not establish byte-for-byte equality or the camera used by every
 draw.
 
+**MEASURED (user-confirmed gameplay capture, 2026-09-25; game build not
+rechecked):** For one later frame (`afterPresent=11836`), the first and 51st
+in-pass copies had the same FNV-1a 64-bit hash `580756BD496AD174`; the
+DSV-bind-3 copy had `6AC5E36D8B7E3F1D`. Their printed camera and 2D
+projection fields still matched. The changed hash establishes that some
+buffer bytes differed by bind 3, while the equal hashes are only a
+noncryptographic equality check at the two in-pass sample points. The game
+and both snapshots remained normal. Camera-field stability must be judged
+from the fields themselves, not from whole-buffer identity.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
