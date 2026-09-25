@@ -267,10 +267,16 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
             const auto* values = static_cast<const float*>(mapped.pData);
             if (sample.bind == 0 || sample.bind == 51 || sample.bind == 3) {
                 unsigned long long hash = 14695981039346656037ull;
+                unsigned long long camera_hash = 14695981039346656037ull;
                 const auto* bytes = static_cast<const unsigned char*>(mapped.pData);
                 for (size_t i = 0; i < 5376; ++i) hash = (hash ^ bytes[i]) * 1099511628211ull;
-                wchar_t message[96];
-                swprintf_s(message, L"EDPE: scene CB hash bind=%u fnv64=%016llX", sample.bind, hash);
+                for (size_t i = 932 * sizeof(float); i < 944 * sizeof(float); ++i)
+                    camera_hash = (camera_hash ^ bytes[i]) * 1099511628211ull;
+                for (size_t i = 1080 * sizeof(float); i < 1096 * sizeof(float); ++i)
+                    camera_hash = (camera_hash ^ bytes[i]) * 1099511628211ull;
+                wchar_t message[128];
+                swprintf_s(message, L"EDPE: scene CB hash bind=%u fnv64=%016llX camera64=%016llX",
+                    sample.bind, hash, camera_hash);
                 EdpeLog(message);
             }
             if (sample.bind == 2) {
