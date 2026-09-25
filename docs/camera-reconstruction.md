@@ -505,6 +505,26 @@ MRT slot 3 during binds 1–3 and slot 0 during binds 4–7. This validates
 the experimental selector for this gameplay process; it does not establish
 that the signature is unique across all game scenes or versions.
 
+## Experimental camera-field parser — 2026-09-25
+
+**MEASURED (2026-09-25, user-confirmed gameplay capture; game build not
+rechecked):** An isolated CPU parser checked the measured 5376-byte buffer
+layout: orthonormal camera axes at words 932–943, the matching scaled X/Y
+columns and forward column at words 1080–1091, and positive depth coefficient
+at word 1094. In the selected scene DSV `#2` frame after `Present` 19243,
+all five samples (first and 51st in-pass VS binds, then DSV binds 3, 4, 6)
+passed. The first four returned `scaleX=0.974278629`,
+`scaleY=1.73205078`, `depthB=0.0250000004`; bind 6 differed by less than
+`0.0000003` in the scales. The camera-field FNV hash was identical at the
+first, 51st, and bind-3 samples (`6315915729E0887F`), while their full-buffer
+hashes differed. The same requested frame copied visible depth and HDR color,
+and the user reported that Elite and both snapshots worked normally.
+
+**LIMIT:** This validates internal consistency of these fields at sampled
+points in one gameplay frame. It does not prove a camera-to-depth match for
+every draw, infinite-far projection, Y orientation, or safe continuous
+capture. The parser remains diagnostic; runtime reprojection is disabled.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
