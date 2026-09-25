@@ -7,16 +7,6 @@
 
 int forwarded_keys = 0;
 int forwarded_insert = 0;
-using SetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT,
-    ID3D11Buffer* const*);
-SetConstantBuffersFn original_set_buffers = nullptr;
-int observed_set_buffers = 0;
-
-void STDMETHODCALLTYPE observeSetConstantBuffers(ID3D11DeviceContext* context, UINT slot,
-    UINT count, ID3D11Buffer* const* buffers) {
-    ++observed_set_buffers;
-    original_set_buffers(context, slot, count, buffers);
-}
 
 LRESULT CALLBACK testWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_KEYDOWN && wparam == 'A') ++forwarded_keys;
@@ -197,6 +187,7 @@ int wmain(int argc, wchar_t** argv) {
     context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, 0.25f, 0);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, depth_view);
+    context->VSSetConstantBuffers(1, 1, &probe_buffer);
     ID3D11RenderTargetView* scene_mrt[]{mrt0_view, color_view, mrt2_view, second_color_view};
     context->OMSetRenderTargets(4, scene_mrt, depth_view);
     constexpr char vertex_source[] =
@@ -247,35 +238,6 @@ int wmain(int argc, wchar_t** argv) {
     SendMessageW(window, WM_KEYUP, VK_F5, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool hidden_input_restored = forwarded_keys == 2;
-    void** context_table = *reinterpret_cast<void***>(context);
-    original_set_buffers = reinterpret_cast<SetConstantBuffersFn>(context_table[7]);
-    DWORD old_protection = 0;
-    bool set_buffers_hook_works = false;
-    if (VirtualProtect(context_table + 7, sizeof(void*), PAGE_READWRITE,
-            &old_protection)) {
-        const auto previous = InterlockedCompareExchangePointer(
-            reinterpret_cast<PVOID volatile*>(context_table + 7),
-            reinterpret_cast<void*>(&observeSetConstantBuffers),
-            reinterpret_cast<void*>(original_set_buffers));
-        DWORD ignored = 0;
-        VirtualProtect(context_table + 7, sizeof(void*), old_protection, &ignored);
-        if (previous == reinterpret_cast<void*>(original_set_buffers)) {
-            context->VSSetConstantBuffers(1, 1, &probe_buffer);
-            ID3D11Buffer* bound = nullptr;
-            context->VSGetConstantBuffers(1, 1, &bound);
-            set_buffers_hook_works = observed_set_buffers == 1 && bound == probe_buffer;
-            if (bound) bound->Release();
-            if (VirtualProtect(context_table + 7, sizeof(void*), PAGE_READWRITE,
-                    &old_protection)) {
-                const auto replaced = InterlockedCompareExchangePointer(
-                    reinterpret_cast<PVOID volatile*>(context_table + 7),
-                    reinterpret_cast<void*>(original_set_buffers),
-                    reinterpret_cast<void*>(&observeSetConstantBuffers));
-                VirtualProtect(context_table + 7, sizeof(void*), old_protection, &ignored);
-                set_buffers_hook_works &= replaced == reinterpret_cast<void*>(&observeSetConstantBuffers);
-            } else set_buffers_hook_works = false;
-        }
-    }
     context->OMSetRenderTargets(0, nullptr, nullptr);
     ID3D11Buffer* no_buffer = nullptr;
     context->VSSetConstantBuffers(1, 1, &no_buffer);
@@ -317,7 +279,6 @@ int wmain(int argc, wchar_t** argv) {
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
         context_hook_restored &&
-        set_buffers_hook_works &&
         interval_observed &&
         read && std::strstr(contents, "EDPE: Present swapchain=") &&
         std::strstr(contents, "EDPE: Present bindings") &&
@@ -359,6 +320,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: scene CB rows1 bind=6 (0,1,0,0) rows2=(0,0,1,0)") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=1 iaPrimitives=0 vsInvocations=0") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=2 iaPrimitives=0 vsInvocations=0") &&
+        std::strstr(contents, "EDPE: depth-pass VS bindings calls=1 sceneBufferCalls=1 sceneBuffer=") &&
+        std::strstr(contents, "slotRestored=1") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=3 iaPrimitives=1 vsInvocations=3") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=6 iaPrimitives=0 vsInvocations=0") &&
         std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=1 edge=start") &&

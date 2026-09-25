@@ -9,11 +9,17 @@
 #include <windows.h>
 
 namespace {
+constexpr size_t kVSSetConstantBuffers = 7;
 constexpr size_t kOMSetRenderTargets = 33;
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
+using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
+    UINT, ID3D11Buffer* const*);
+
+bool patchSlot(void** table, size_t slot, void* expected, void* replacement);
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
+std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
 std::atomic<ID3D11DeviceContext*> observed_context{nullptr};
 IDXGISwapChain* observed_swap_chain = nullptr; // Weak; released by the game.
 void** patched_table = nullptr;
@@ -66,6 +72,62 @@ struct PipelineSample {
     bool active = false;
 };
 std::array<PipelineSample, 4> pipeline_samples{}; // Requested bind intervals 1, 2, 3, and 6.
+std::atomic<bool> vs_buffer_probe_active{false};
+std::atomic<unsigned> vs_buffer_calls{0};
+std::atomic<unsigned> vs_scene_buffer_calls{0};
+std::atomic<ID3D11Buffer*> vs_scene_buffer{nullptr}; // Identity only.
+
+void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context,
+    UINT start, UINT count, ID3D11Buffer* const* buffers) {
+    const auto forward = original_vs_set_buffers.load(std::memory_order_acquire);
+    forward(context, start, count, buffers);
+    if (context != observed_context.load(std::memory_order_acquire) ||
+        !vs_buffer_probe_active.load(std::memory_order_acquire)) return;
+    vs_buffer_calls.fetch_add(1, std::memory_order_relaxed);
+    if (start > 1 || count <= 1 - start || !buffers || !buffers[1 - start]) return;
+    ID3D11Buffer* buffer = buffers[1 - start];
+    D3D11_BUFFER_DESC desc{};
+    buffer->GetDesc(&desc);
+    if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC) {
+        vs_scene_buffer_calls.fetch_add(1, std::memory_order_relaxed);
+        vs_scene_buffer.store(buffer, std::memory_order_relaxed);
+    }
+}
+
+void endVSBufferProbe() {
+    if (!vs_buffer_probe_active.exchange(false, std::memory_order_acq_rel)) return;
+    const bool restored = patched_table && patchSlot(patched_table,
+        kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers),
+        reinterpret_cast<void*>(original_vs_set_buffers.load(std::memory_order_acquire)));
+    wchar_t message[192];
+    swprintf_s(message,
+        L"EDPE: depth-pass VS bindings calls=%u sceneBufferCalls=%u sceneBuffer=%p slotRestored=%u",
+        vs_buffer_calls.load(std::memory_order_relaxed),
+        vs_scene_buffer_calls.load(std::memory_order_relaxed),
+        vs_scene_buffer.load(std::memory_order_relaxed), restored);
+    EdpeLog(message);
+}
+
+void beginVSBufferProbe() {
+    if (!patched_table) return;
+    auto forward = reinterpret_cast<VSSetConstantBuffersFn>(
+        patched_table[kVSSetConstantBuffers]);
+    if (!forward || forward == &observedVSSetConstantBuffers) {
+        EdpeLog(L"EDPE: depth-pass VS bindings unavailable (invalid forward)");
+        return;
+    }
+    original_vs_set_buffers.store(forward, std::memory_order_release);
+    vs_buffer_calls.store(0, std::memory_order_relaxed);
+    vs_scene_buffer_calls.store(0, std::memory_order_relaxed);
+    vs_scene_buffer.store(nullptr, std::memory_order_relaxed);
+    vs_buffer_probe_active.store(true, std::memory_order_release);
+    if (!patchSlot(patched_table, kVSSetConstantBuffers,
+            reinterpret_cast<void*>(forward),
+            reinterpret_cast<void*>(&observedVSSetConstantBuffers))) {
+        vs_buffer_probe_active.store(false, std::memory_order_release);
+        EdpeLog(L"EDPE: depth-pass VS bindings unavailable (slot changed)");
+    }
+}
 
 void logDepthState(ID3D11DeviceContext* context, const PipelineSample& sample,
     const wchar_t* edge) {
@@ -301,8 +363,10 @@ void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT coun
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
     const auto forward = original.load(std::memory_order_acquire);
-    if (context == observed_context.load(std::memory_order_acquire))
+    if (context == observed_context.load(std::memory_order_acquire)) {
+        endVSBufferProbe();
         endPipelineSample(context);
+    }
     forward(context, count, targets, dsv);
     if (context != observed_context.load(std::memory_order_acquire)) return;
     if (!dsv) {
@@ -383,6 +447,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         beginPipelineSample(context, snapshot_probe_bind);
         logSnapshotColorTarget(index, snapshot_probe_bind, count, targets);
         logBoundConstantBuffers(context, index, snapshot_probe_bind);
+        if (snapshot_probe_bind == 2) beginVSBufferProbe();
     }
 
     if (!first_bind && !first_color) return;
@@ -435,14 +500,14 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     EdpeLog(message);
 }
 
-bool patchSlot(void** table, void* expected, void* replacement) {
+bool patchSlot(void** table, size_t slot, void* expected, void* replacement) {
     DWORD old_protection = 0;
-    if (!VirtualProtect(table + kOMSetRenderTargets, sizeof(void*), PAGE_READWRITE,
+    if (!VirtualProtect(table + slot, sizeof(void*), PAGE_READWRITE,
             &old_protection)) return false;
     void* replaced = InterlockedCompareExchangePointer(
-        reinterpret_cast<PVOID volatile*>(table + kOMSetRenderTargets), replacement, expected);
+        reinterpret_cast<PVOID volatile*>(table + slot), replacement, expected);
     DWORD ignored = 0;
-    VirtualProtect(table + kOMSetRenderTargets, sizeof(void*), old_protection, &ignored);
+    VirtualProtect(table + slot, sizeof(void*), old_protection, &ignored);
     return replaced == expected;
 }
 } // namespace
@@ -450,6 +515,7 @@ bool patchSlot(void** table, void* expected, void* replacement) {
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         auto* context = observed_context.load(std::memory_order_acquire);
+        endVSBufferProbe();
         endPipelineSample(context);
         pollPipelineSamples(context);
     }
@@ -507,7 +573,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
         original.store(forward, std::memory_order_release);
         observed_context.store(context, std::memory_order_release);
-        if (patchSlot(table, reinterpret_cast<void*>(forward),
+        if (patchSlot(table, kOMSetRenderTargets, reinterpret_cast<void*>(forward),
                 reinterpret_cast<void*>(&observedOMSetRenderTargets))) {
             patched_table = table;
             observed_swap_chain = swap_chain;
@@ -707,8 +773,10 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
             sample = {};
         }
     }
+    endVSBufferProbe();
     if (patched_table) {
-        patchSlot(patched_table, reinterpret_cast<void*>(&observedOMSetRenderTargets),
+        patchSlot(patched_table, kOMSetRenderTargets,
+            reinterpret_cast<void*>(&observedOMSetRenderTargets),
             reinterpret_cast<void*>(original.load(std::memory_order_acquire)));
     }
     observed_context.exchange(nullptr, std::memory_order_acq_rel)->Release();

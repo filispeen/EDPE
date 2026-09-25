@@ -295,7 +295,15 @@ in-place observation of context vtable slot 7 received one explicit
 `VSSetConstantBuffers` call, forwarded it, and verified the requested
 buffer remained bound. The slot was restored before context release. This
 checks the local proxy dispatch path only; Elite's in-pass binding traffic
-and hook safety remain unverified. No slot-7 hook was added to the game DLL.
+and hook safety remain unverified. That check did not alter the game DLL.
+
+**EXPERIMENTAL NEXT CHECK:** A requested snapshot now observes VS constant-
+buffer binding calls only between main-camera DSV bind 2 and the next
+`OMSetRenderTargets` (or `Present`). It counts calls and 5376-byte dynamic
+buffer binds at VS slot 1, retains only the last buffer identity, and
+forwards every call. It restores slot 7 only if EDPE still owns it; if
+another component replaced the slot, EDPE logs the loss and leaves that
+entry untouched. No draw is intercepted and no buffer is modified.
 
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
