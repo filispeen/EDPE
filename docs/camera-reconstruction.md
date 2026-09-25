@@ -362,6 +362,17 @@ noncryptographic equality check at the two in-pass sample points. The game
 and both snapshots remained normal. Camera-field stability must be judged
 from the fields themselves, not from whole-buffer identity.
 
+**MEASURED (user-confirmed gameplay capture, 2026-09-25; game build not
+rechecked):** In one frame (`afterPresent=13033`), the first and 51st
+in-pass copies and the DSV-bind-3 copy all had camera-field hash
+`4F62573AF0775CAA` over float words 932–943 and 1080–1095. Their full
+5376-byte hashes differed: first and 51st were `E1EC476DC60FC055`, while
+bind 3 was `032ADF6EFBB983E0`. The selected fields therefore matched under
+this noncryptographic byte check at three observation points even as other
+buffer bytes changed. Depth and HDR color snapshots remained visible and
+Elite continued normally. This does not establish the camera bound to each
+individual draw or safety across scene transitions.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
