@@ -325,6 +325,9 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "switches=0 slotRestored=1") &&
         std::strstr(contents, "EDPE: scene CB sample bind=0 projectionZ=(0,0.025000") &&
         std::strstr(contents, "EDPE: scene CB sample bind=51 projectionZ=(0,0.025000") &&
+        std::strstr(contents, "EDPE: scene CB hash bind=0 fnv64=") &&
+        std::strstr(contents, "EDPE: scene CB hash bind=51 fnv64=") &&
+        std::strstr(contents, "EDPE: scene CB hash bind=3 fnv64=") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=3 iaPrimitives=1 vsInvocations=3") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=6 iaPrimitives=0 vsInvocations=0") &&
         std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=1 edge=start") &&

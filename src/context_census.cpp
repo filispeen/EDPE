@@ -265,6 +265,14 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
             D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
         if (SUCCEEDED(result) && mapped.pData) {
             const auto* values = static_cast<const float*>(mapped.pData);
+            if (sample.bind == 0 || sample.bind == 51 || sample.bind == 3) {
+                unsigned long long hash = 14695981039346656037ull;
+                const auto* bytes = static_cast<const unsigned char*>(mapped.pData);
+                for (size_t i = 0; i < 5376; ++i) hash = (hash ^ bytes[i]) * 1099511628211ull;
+                wchar_t message[96];
+                swprintf_s(message, L"EDPE: scene CB hash bind=%u fnv64=%016llX", sample.bind, hash);
+                EdpeLog(message);
+            }
             if (sample.bind == 2) {
                 wchar_t words[192];
                 int used = swprintf_s(words, L"EDPE: depth-pass CB bind=2 slot=2 hex=");
