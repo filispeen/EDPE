@@ -75,7 +75,9 @@ std::array<PipelineSample, 4> pipeline_samples{}; // Requested bind intervals 1,
 std::atomic<bool> vs_buffer_probe_active{false};
 std::atomic<unsigned> vs_buffer_calls{0};
 std::atomic<unsigned> vs_scene_buffer_calls{0};
-std::atomic<ID3D11Buffer*> vs_scene_buffer{nullptr}; // Identity only.
+std::atomic<unsigned> vs_scene_buffer_switches{0};
+std::atomic<ID3D11Buffer*> vs_first_scene_buffer{nullptr}; // Identity only.
+std::atomic<ID3D11Buffer*> vs_scene_buffer{nullptr};
 
 void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context,
     UINT start, UINT count, ID3D11Buffer* const* buffers) {
@@ -90,7 +92,11 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
     buffer->GetDesc(&desc);
     if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC) {
         vs_scene_buffer_calls.fetch_add(1, std::memory_order_relaxed);
-        vs_scene_buffer.store(buffer, std::memory_order_relaxed);
+        ID3D11Buffer* expected = nullptr;
+        vs_first_scene_buffer.compare_exchange_strong(expected, buffer, std::memory_order_relaxed);
+        auto* previous = vs_scene_buffer.exchange(buffer, std::memory_order_relaxed);
+        if (previous && previous != buffer)
+            vs_scene_buffer_switches.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -99,12 +105,14 @@ void endVSBufferProbe() {
     const bool restored = patched_table && patchSlot(patched_table,
         kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers),
         reinterpret_cast<void*>(original_vs_set_buffers.load(std::memory_order_acquire)));
-    wchar_t message[192];
+    wchar_t message[256];
     swprintf_s(message,
-        L"EDPE: depth-pass VS bindings calls=%u sceneBufferCalls=%u sceneBuffer=%p slotRestored=%u",
+        L"EDPE: depth-pass VS bindings calls=%u sceneBufferCalls=%u first=%p last=%p switches=%u slotRestored=%u",
         vs_buffer_calls.load(std::memory_order_relaxed),
         vs_scene_buffer_calls.load(std::memory_order_relaxed),
-        vs_scene_buffer.load(std::memory_order_relaxed), restored);
+        vs_first_scene_buffer.load(std::memory_order_relaxed),
+        vs_scene_buffer.load(std::memory_order_relaxed),
+        vs_scene_buffer_switches.load(std::memory_order_relaxed), restored);
     EdpeLog(message);
 }
 
@@ -119,6 +127,8 @@ void beginVSBufferProbe() {
     original_vs_set_buffers.store(forward, std::memory_order_release);
     vs_buffer_calls.store(0, std::memory_order_relaxed);
     vs_scene_buffer_calls.store(0, std::memory_order_relaxed);
+    vs_scene_buffer_switches.store(0, std::memory_order_relaxed);
+    vs_first_scene_buffer.store(nullptr, std::memory_order_relaxed);
     vs_scene_buffer.store(nullptr, std::memory_order_relaxed);
     vs_buffer_probe_active.store(true, std::memory_order_release);
     if (!patchSlot(patched_table, kVSSetConstantBuffers,
