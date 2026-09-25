@@ -16,7 +16,15 @@ LRESULT CALLBACK testWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 
 int wmain(int argc, wchar_t** argv) {
     if (argc != 4) return 1;
-    DeleteFileW(argv[3]);
+    const HANDLE stale_log = CreateFileW(argv[3], GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (stale_log == INVALID_HANDLE_VALUE) return 11;
+    constexpr char stale_line[] = "OLD_SESSION\n";
+    DWORD seeded = 0;
+    const BOOL seed_ok = WriteFile(stale_log, stale_line, sizeof(stale_line) - 1, &seeded, nullptr);
+    CloseHandle(stale_log);
+    if (!seed_ok || seeded != sizeof(stale_line) - 1) return 11;
     const HMODULE dxgi_proxy = LoadLibraryW(argv[2]);
     if (!dxgi_proxy) return 5;
     const HMODULE proxy = LoadLibraryW(argv[1]);
@@ -281,7 +289,10 @@ int wmain(int argc, wchar_t** argv) {
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
         context_hook_restored &&
         interval_observed &&
-        read && std::strstr(contents, "EDPE: Present swapchain=") &&
+        read && !std::strstr(contents, "OLD_SESSION") &&
+        std::strstr(contents, "EDPE: D3D11 device created") &&
+        std::strstr(contents, "EDPE: DXGI factory created") &&
+        std::strstr(contents, "EDPE: Present swapchain=") &&
         std::strstr(contents, "EDPE: Present bindings") &&
         std::strstr(contents, "EDPE: context dispatch frame=1") &&
         std::strstr(contents, "EDPE: context dispatch frame=8") &&
