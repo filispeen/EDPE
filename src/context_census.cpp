@@ -1,4 +1,5 @@
 #include "context_census.h"
+#include "elite_camera.h"
 #include "log.h"
 
 #include <array>
@@ -306,6 +307,12 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
                     L"EDPE: scene CB 2D zw bind=%u z=(%.9g,%.9g,%.9g,%.9g) w=(%.9g,%.9g,%.9g,%.9g)",
                     sample.bind, values[1088], values[1089], values[1090], values[1091],
                     values[1092], values[1093], values[1094], values[1095]);
+                EdpeLog(message);
+                edpe::CameraProjection camera{};
+                const bool parsed = edpe::parseEliteCamera(values, 5376 / sizeof(float), &camera);
+                swprintf_s(message,
+                    L"EDPE: scene camera candidate bind=%u valid=%u scale=(%.9g,%.9g) depthB=%.9g",
+                    sample.bind, parsed, camera.scaleX, camera.scaleY, camera.depthB);
                 EdpeLog(message);
                 if (sample.bind == 6) for (size_t offset = 0; offset < 5376 / sizeof(float); offset += 32) {
                     wchar_t words[320];
