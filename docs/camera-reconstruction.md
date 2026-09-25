@@ -290,6 +290,13 @@ buffers used by the many draws inside bind 2. EDVR associates its VR
 camera writes with a scene draw; EDPE's 2D path needs its own verified
 within-pass association before camera-driven motion or jitter is enabled.
 
+**VERIFIED (Release WARP proxy smoke test, 2026-09-25):** A test-only
+in-place observation of context vtable slot 7 received one explicit
+`VSSetConstantBuffers` call, forwarded it, and verified the requested
+buffer remained bound. The slot was restored before context release. This
+checks the local proxy dispatch path only; Elite's in-pass binding traffic
+and hook safety remain unverified. No slot-7 hook was added to the game DLL.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
