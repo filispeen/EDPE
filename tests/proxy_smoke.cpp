@@ -322,6 +322,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=2 iaPrimitives=0 vsInvocations=0") &&
         std::strstr(contents, "EDPE: depth-pass VS bindings calls=1 sceneBufferCalls=1 first=") &&
         std::strstr(contents, "switches=0 slotRestored=1") &&
+        std::strstr(contents, "EDPE: scene CB sample bind=0 projectionZ=(0,0.025000") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=3 iaPrimitives=1 vsInvocations=3") &&
         std::strstr(contents, "EDPE: scene pipeline afterPresent=7 bind=6 iaPrimitives=0 vsInvocations=0") &&
         std::strstr(contents, "EDPE: scene depth state afterPresent=7 bind=1 edge=start") &&

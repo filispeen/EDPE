@@ -63,7 +63,7 @@ struct ConstantBufferSample {
     std::atomic<bool> claimed{false};
     std::atomic<bool> ready{false};
 };
-std::array<ConstantBufferSample, 4> constant_buffer_samples{}; // Requested binds 2, 3, 4, and 6.
+std::array<ConstantBufferSample, 5> constant_buffer_samples{}; // Requested binds 2, 3, 4, 6, and first in-pass VS bind.
 struct PipelineSample {
     ID3D11Query* query = nullptr;
     unsigned bind = 0;
@@ -79,6 +79,9 @@ std::atomic<unsigned> vs_scene_buffer_switches{0};
 std::atomic<ID3D11Buffer*> vs_first_scene_buffer{nullptr}; // Identity only.
 std::atomic<ID3D11Buffer*> vs_scene_buffer{nullptr};
 
+void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
+    const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
+
 void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context,
     UINT start, UINT count, ID3D11Buffer* const* buffers) {
     const auto forward = original_vs_set_buffers.load(std::memory_order_acquire);
@@ -93,7 +96,8 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
     if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC) {
         vs_scene_buffer_calls.fetch_add(1, std::memory_order_relaxed);
         ID3D11Buffer* expected = nullptr;
-        vs_first_scene_buffer.compare_exchange_strong(expected, buffer, std::memory_order_relaxed);
+        if (vs_first_scene_buffer.compare_exchange_strong(expected, buffer, std::memory_order_relaxed))
+            queueConstantBufferSample(context, buffer, desc, 0); // 0 labels the first bind inside DSV interval 2.
         auto* previous = vs_scene_buffer.exchange(buffer, std::memory_order_relaxed);
         if (previous && previous != buffer)
             vs_scene_buffer_switches.fetch_add(1, std::memory_order_relaxed);
@@ -226,7 +230,7 @@ void recordBind(int index) {
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal) {
-    auto& sample = constant_buffer_samples[bind_ordinal == 6 ? 3 : bind_ordinal - 2];
+    auto& sample = constant_buffer_samples[bind_ordinal == 0 ? 4 : bind_ordinal == 6 ? 3 : bind_ordinal - 2];
     bool expected = false;
     if (!sample.claimed.compare_exchange_strong(expected, true)) return;
     ID3D11Device* device = nullptr;
