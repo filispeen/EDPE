@@ -1,5 +1,7 @@
 #include "temporal_math.h"
+#include "elite_camera.h"
 
+#include <array>
 #include <cmath>
 
 int main() {
@@ -31,4 +33,22 @@ int main() {
 
     if (edpe::cameraDepthMotion(now, previous, 100, 100, 49.5f, 49.5f, 0, &dx, &dy)) return 5;
     if (edpe::cameraDepthMotion(now, previous, 0, 100, 49.5f, 49.5f, depth, &dx, &dy)) return 6;
+
+    // Rounded fields from a user-confirmed Odyssey 332841 scene capture.
+    std::array<float, 1344> scene{};
+    const float rows[]{-.965338f, -.0708149f, -.251214f, 19.5594f,
+                       -.00114341f, .963628f, -.267244f, -39.2084f,
+                       .261002f, -.257694f, -.930307f, -99.7282f};
+    const float block[]{-.940506756f, -.122647151f, 0, -.251219571f,
+                        -.00110631355f, 1.6690501f, 0, -.267250597f,
+                        .254292488f, -.446352154f, 0, -.93030417f,
+                        0, 0, .0250000004f, 0};
+    for (size_t i = 0; i < 12; ++i) scene[932 + i] = rows[i];
+    for (size_t i = 0; i < 16; ++i) scene[1080 + i] = block[i];
+    edpe::CameraProjection parsed{};
+    if (!edpe::parseEliteCamera(scene.data(), scene.size(), &parsed) ||
+        std::fabs(parsed.scaleX - std::sqrt(3.0f) * 1440 / 2560) > 0.001f ||
+        std::fabs(parsed.scaleY - std::sqrt(3.0f)) > 0.001f) return 7;
+    scene[1083] += .01f;
+    if (edpe::parseEliteCamera(scene.data(), scene.size(), &parsed)) return 8;
 }
