@@ -145,6 +145,15 @@ int wmain(int argc, wchar_t** argv) {
     ID3D11Buffer* probe_buffer = nullptr;
     if (FAILED(device->CreateBuffer(&probe_desc, &probe_initial, &probe_buffer))) return 10;
     context->VSSetConstantBuffers(1, 1, &probe_buffer);
+    const float depth_pass_words[12]{1,2,3,4,5,6,7,8,9,10,11,12};
+    D3D11_BUFFER_DESC depth_pass_desc = probe_desc;
+    depth_pass_desc.ByteWidth = sizeof(depth_pass_words);
+    D3D11_SUBRESOURCE_DATA depth_pass_initial{};
+    depth_pass_initial.pSysMem = depth_pass_words;
+    ID3D11Buffer* depth_pass_buffer = nullptr;
+    if (FAILED(device->CreateBuffer(&depth_pass_desc, &depth_pass_initial,
+            &depth_pass_buffer))) return 10;
+    context->VSSetConstantBuffers(2, 1, &depth_pass_buffer);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     IDXGISwapChain4* newer_swap_chain = nullptr;
     if (SUCCEEDED(swap_chain->QueryInterface(__uuidof(IDXGISwapChain4),
@@ -231,6 +240,8 @@ int wmain(int argc, wchar_t** argv) {
     context->OMSetRenderTargets(0, nullptr, nullptr);
     ID3D11Buffer* no_buffer = nullptr;
     context->VSSetConstantBuffers(1, 1, &no_buffer);
+    context->VSSetConstantBuffers(2, 1, &no_buffer);
+    depth_pass_buffer->Release();
     probe_buffer->Release();
     color_view->Release();
     color_texture->Release();
@@ -300,6 +311,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: scene CB 2D xy bind=3 x=(1.25,0,0,0)") &&
         std::strstr(contents, "EDPE: scene CB 2D xy bind=4 x=(1.75,0,0,0)") &&
         std::strstr(contents, "EDPE: scene CB 2D xy bind=6 x=(2.5,0,0,0)") &&
+        std::strstr(contents, "EDPE: depth-pass CB bind=2 slot=2 hex=3F8000004000000040400000") &&
         std::strstr(contents, "EDPE: scene CB 2D zw bind=6 z=(0,0,0,0) w=(0,0,0.0500000007,0)") &&
         std::strstr(contents, "EDPE: scene CB sample bind=6 projectionZ=(0,0.050000") &&
         std::strstr(contents, "projection2D=0.050000") &&

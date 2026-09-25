@@ -50,14 +50,14 @@ unsigned long long snapshot_armed_after = 0;
 unsigned long long snapshot_first_bind_after = 0;
 unsigned long long snapshot_last_bind_after = 0;
 unsigned snapshot_bind_count = 0;
-struct CameraSample {
+struct ConstantBufferSample {
     ID3D11Buffer* buffer = nullptr;
     unsigned bind = 0;
     unsigned wait = 0;
     std::atomic<bool> claimed{false};
     std::atomic<bool> ready{false};
 };
-std::array<CameraSample, 3> camera_samples{}; // One requested frame: scene binds 3, 4, and 6.
+std::array<ConstantBufferSample, 4> constant_buffer_samples{}; // Requested binds 2, 3, 4, and 6.
 struct PipelineSample {
     ID3D11Query* query = nullptr;
     unsigned bind = 0;
@@ -152,9 +152,9 @@ void recordBind(int index) {
     if (sequence_stored < bind_sequence.size()) bind_sequence[sequence_stored++] = index;
 }
 
-void queueCameraSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
+void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal) {
-    auto& sample = camera_samples[bind_ordinal == 6 ? 2 : bind_ordinal - 3];
+    auto& sample = constant_buffer_samples[bind_ordinal == 6 ? 3 : bind_ordinal - 2];
     bool expected = false;
     if (!sample.claimed.compare_exchange_strong(expected, true)) return;
     ID3D11Device* device = nullptr;
@@ -179,41 +179,50 @@ void queueCameraSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     sample.ready.store(true, std::memory_order_release);
 }
 
-void pollCameraSamples(ID3D11DeviceContext* context) {
-    for (auto& sample : camera_samples) {
+void pollConstantBufferSamples(ID3D11DeviceContext* context) {
+    for (auto& sample : constant_buffer_samples) {
         if (!sample.ready.load(std::memory_order_acquire)) continue;
         D3D11_MAPPED_SUBRESOURCE mapped{};
         const HRESULT result = context->Map(sample.buffer, 0, D3D11_MAP_READ,
             D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
         if (SUCCEEDED(result) && mapped.pData) {
             const auto* values = static_cast<const float*>(mapped.pData);
-            wchar_t message[320];
-            swprintf_s(message,
-                L"EDPE: scene CB sample bind=%u projectionZ=(%.9g,%.9g) projection2D=%.9g rows0=(%.6g,%.6g,%.6g,%.6g)",
-                sample.bind, values[794], values[795], values[1094],
-                values[932], values[933], values[934], values[935]);
-            EdpeLog(message);
-            swprintf_s(message, L"EDPE: scene CB rows1 bind=%u (%.6g,%.6g,%.6g,%.6g) rows2=(%.6g,%.6g,%.6g,%.6g)",
-                sample.bind, values[936], values[937], values[938], values[939],
-                values[940], values[941], values[942], values[943]);
-            EdpeLog(message);
-            swprintf_s(message,
-                L"EDPE: scene CB 2D xy bind=%u x=(%.9g,%.9g,%.9g,%.9g) y=(%.9g,%.9g,%.9g,%.9g)",
-                sample.bind, values[1080], values[1081], values[1082], values[1083],
-                values[1084], values[1085], values[1086], values[1087]);
-            EdpeLog(message);
-            swprintf_s(message,
-                L"EDPE: scene CB 2D zw bind=%u z=(%.9g,%.9g,%.9g,%.9g) w=(%.9g,%.9g,%.9g,%.9g)",
-                sample.bind, values[1088], values[1089], values[1090], values[1091],
-                values[1092], values[1093], values[1094], values[1095]);
-            EdpeLog(message);
-            if (sample.bind == 6) for (size_t offset = 0; offset < 5376 / sizeof(float); offset += 32) {
-                wchar_t words[320];
-                int used = swprintf_s(words, L"EDPE: scene CB hex %04zu ", offset);
-                for (size_t i = 0; i < 32; ++i)
-                    used += swprintf_s(words + used, 320 - used, L"%08X",
-                        std::bit_cast<unsigned>(values[offset + i]));
+            if (sample.bind == 2) {
+                wchar_t words[192];
+                int used = swprintf_s(words, L"EDPE: depth-pass CB bind=2 slot=2 hex=");
+                const auto* raw = static_cast<const unsigned*>(mapped.pData);
+                for (size_t i = 0; i < 12; ++i)
+                    used += swprintf_s(words + used, 192 - used, L"%08X", raw[i]);
                 EdpeLog(words);
+            } else {
+                wchar_t message[320];
+                swprintf_s(message,
+                    L"EDPE: scene CB sample bind=%u projectionZ=(%.9g,%.9g) projection2D=%.9g rows0=(%.6g,%.6g,%.6g,%.6g)",
+                    sample.bind, values[794], values[795], values[1094],
+                    values[932], values[933], values[934], values[935]);
+                EdpeLog(message);
+                swprintf_s(message, L"EDPE: scene CB rows1 bind=%u (%.6g,%.6g,%.6g,%.6g) rows2=(%.6g,%.6g,%.6g,%.6g)",
+                    sample.bind, values[936], values[937], values[938], values[939],
+                    values[940], values[941], values[942], values[943]);
+                EdpeLog(message);
+                swprintf_s(message,
+                    L"EDPE: scene CB 2D xy bind=%u x=(%.9g,%.9g,%.9g,%.9g) y=(%.9g,%.9g,%.9g,%.9g)",
+                    sample.bind, values[1080], values[1081], values[1082], values[1083],
+                    values[1084], values[1085], values[1086], values[1087]);
+                EdpeLog(message);
+                swprintf_s(message,
+                    L"EDPE: scene CB 2D zw bind=%u z=(%.9g,%.9g,%.9g,%.9g) w=(%.9g,%.9g,%.9g,%.9g)",
+                    sample.bind, values[1088], values[1089], values[1090], values[1091],
+                    values[1092], values[1093], values[1094], values[1095]);
+                EdpeLog(message);
+                if (sample.bind == 6) for (size_t offset = 0; offset < 5376 / sizeof(float); offset += 32) {
+                    wchar_t words[320];
+                    int used = swprintf_s(words, L"EDPE: scene CB hex %04zu ", offset);
+                    for (size_t i = 0; i < 32; ++i)
+                        used += swprintf_s(words + used, 320 - used, L"%08X",
+                            std::bit_cast<unsigned>(values[offset + i]));
+                    EdpeLog(words);
+                }
             }
             context->Unmap(sample.buffer, 0);
         } else if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++sample.wait < 120) {
@@ -247,10 +256,11 @@ void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index,
                 depth_index, bind_ordinal, stage ? L"PS" : L"VS", slot, buffers[slot],
                 desc.ByteWidth, static_cast<unsigned>(desc.Usage), desc.CPUAccessFlags);
             EdpeLog(message);
-            if ((bind_ordinal == 3 || bind_ordinal == 4 || bind_ordinal == 6) &&
-                stage == 0 && slot == 1 && desc.ByteWidth == 5376 &&
-                desc.Usage == D3D11_USAGE_DYNAMIC)
-                queueCameraSample(context, buffers[slot], desc, bind_ordinal);
+            if (stage == 0 && desc.Usage == D3D11_USAGE_DYNAMIC &&
+                ((bind_ordinal == 2 && slot == 2 && desc.ByteWidth == 48) ||
+                 ((bind_ordinal == 3 || bind_ordinal == 4 || bind_ordinal == 6) &&
+                  slot == 1 && desc.ByteWidth == 5376)))
+                queueConstantBufferSample(context, buffers[slot], desc, bind_ordinal);
             buffers[slot]->Release();
         }
     }
@@ -444,7 +454,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         pollPipelineSamples(context);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
-        pollCameraSamples(observed_context.load(std::memory_order_acquire));
+        pollConstantBufferSamples(observed_context.load(std::memory_order_acquire));
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
         last_present_frame.store(frame, std::memory_order_relaxed);
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
@@ -683,7 +693,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     }
     sequence_active.store(false, std::memory_order_release);
     sequence_requested.store(false, std::memory_order_release);
-    for (auto& sample : camera_samples) {
+    for (auto& sample : constant_buffer_samples) {
         if (sample.buffer) sample.buffer->Release();
         sample.buffer = nullptr;
         sample.ready.store(false, std::memory_order_release);

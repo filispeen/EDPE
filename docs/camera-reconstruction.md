@@ -268,6 +268,12 @@ captures, while VS slots 0 and 2 held 208-byte and 192-byte buffers.
 not identify the camera used by the depth-writing work. The 48-byte
 buffer's contents and any binding changes within bind 2 remain unknown.
 
+**EXPERIMENTAL NEXT CHECK:** On a requested snapshot, EDPE now copies the
+48-byte dynamic VS slot-2 buffer bound at depth-pass bind 2 into a staging
+buffer and logs its 12 raw 32-bit words after a nonblocking read. This
+tests whether the small buffer contains a camera-related matrix; its size
+alone is not evidence of camera semantics. The source is not modified.
+
 **EXPERIMENTAL NEXT CHECK:** The same requested DSV capture now logs RTV0
 identity, format, dimensions, and bind flags at each target bind. This uses
 the existing `OMSetRenderTargets` arguments and runs only for the requested
