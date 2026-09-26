@@ -81,6 +81,9 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_center_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
+UINT motion_snapshot_width = 0;
+UINT motion_snapshot_height = 0;
 unsigned motion_center_wait = 0;
 unsigned motion_hook_watch = 0;
 struct PairDepthSample {
@@ -607,6 +610,9 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         motion_depth_view.Reset();
         return;
     }
+    motion_snapshot = motion_pass->output();
+    motion_snapshot_width = desc.Width;
+    motion_snapshot_height = desc.Height;
     Microsoft::WRL::ComPtr<ID3D11Resource> output;
     motion_pass->output()->GetResource(&output);
     D3D11_TEXTURE2D_DESC read_desc{};
@@ -1092,6 +1098,13 @@ bool ContextCensusRequestMotionPair(unsigned index) {
     return true;
 }
 
+ID3D11ShaderResourceView* ContextCensusTakeMotionSnapshot(UINT* width, UINT* height) {
+    if (!motion_snapshot) return nullptr;
+    if (width) *width = motion_snapshot_width;
+    if (height) *height = motion_snapshot_height;
+    return motion_snapshot.Detach();
+}
+
 int ContextCensusSceneDepthCandidate() {
     std::lock_guard lock(seen_mutex);
     const auto frame = last_present_frame.load(std::memory_order_relaxed);
@@ -1186,6 +1199,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_depth.Reset();
         motion_depth_view.Reset();
         motion_center_readback.Reset();
+        motion_snapshot.Reset();
         motion_pass.reset();
         motion_camera_frames = {~0ull, ~0ull};
         motion_depth_frame = ~0ull;

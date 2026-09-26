@@ -107,13 +107,15 @@ in this run. The near-zero motion does not validate moving-scene quality.
 
 ## Limits
 
-The module runs in Elite only after an explicit experimental F5 request;
-that path has not yet been tested in the game. The camera is still a
+The module runs in Elite only after an explicit experimental F5 request.
+The new F5 motion snapshot displays its GPU texture through a signed-color
+preview; the WARP proxy verifies shader creation and UI handoff, but the
+image has not yet been inspected in Elite. The camera is still a
 bind-3 candidate, not the verified camera for every depth-writing draw.
 The diagnostic still reads back 5376-byte camera buffers and one output
 pixel asynchronously; this is not the production GPU-only camera path.
 Jitter is excluded. The in-game depth/camera pairing and moving-cockpit
 measurements are in
 [camera-reconstruction.md](camera-reconstruction.md). Runtime integration
-still needs GPU-side camera capture, a debug view, and visual validation
+still needs GPU-side camera capture and moving-scene visual validation
 before any upscaler receives motion.

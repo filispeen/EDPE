@@ -34,6 +34,12 @@ struct UiState {
     ID3D11ShaderResourceView* depth_srv = nullptr;
     ID3D11Texture2D* color_copy = nullptr;
     ID3D11ShaderResourceView* color_srv = nullptr;
+    ID3D11ShaderResourceView* motion_srv = nullptr;
+    UINT motion_width = 0;
+    UINT motion_height = 0;
+    bool motion_window_open = true;
+    ID3D11PixelShader* motion_preview_shader = nullptr;
+    bool motion_shader_failed = false;
     UINT color_width = 0;
     UINT color_height = 0;
     int color_snapshot_index = -1;
@@ -125,6 +131,39 @@ void releaseColorSnapshot() {
     ui.color_copy = nullptr;
     ui.color_snapshot_index = -1;
     ui.color_image_logged = false;
+}
+
+void bindMotionPreviewShader(const ImDrawList*, const ImDrawCmd*) {
+    auto* state = static_cast<ImGui_ImplDX11_RenderState*>(
+        ImGui::GetPlatformIO().Renderer_RenderState);
+    if (state && ui.motion_preview_shader)
+        state->DeviceContext->PSSetShader(ui.motion_preview_shader, nullptr, 0);
+}
+
+void ensureMotionPreviewShader() {
+    if (ui.motion_preview_shader || ui.motion_shader_failed) return;
+    static constexpr char source[] = R"(
+        struct PS_INPUT { float4 pos : SV_POSITION; float4 col : COLOR0; float2 uv : TEXCOORD0; };
+        Texture2D<float2> texture0 : register(t0);
+        SamplerState sampler0 : register(s0);
+        float4 main(PS_INPUT input) : SV_Target {
+            float2 motion = texture0.Sample(sampler0, input.uv);
+            float2 color = 0.5 + 0.5 * motion / (abs(motion) + 0.1);
+            return float4(color, 0.5, 1.0) * input.col;
+        }
+    )";
+    ID3DBlob* bytecode = nullptr;
+    HRESULT result = D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr,
+        "main", "ps_4_0", 0, 0, &bytecode, nullptr);
+    if (SUCCEEDED(result)) result = ui.device->CreatePixelShader(bytecode->GetBufferPointer(),
+        bytecode->GetBufferSize(), nullptr, &ui.motion_preview_shader);
+    if (bytecode) bytecode->Release();
+    if (FAILED(result)) {
+        ui.motion_shader_failed = true;
+        EdpeLog(L"EDPE: motion preview shader unavailable");
+    } else {
+        EdpeLog(L"EDPE: motion preview shader ready");
+    }
 }
 
 void bindDepthContrastShader(const ImDrawList*, const ImDrawCmd*) {
@@ -399,6 +438,8 @@ void shutdownUi() {
     releaseBackbuffer();
     releaseDepthSnapshot();
     releaseColorSnapshot();
+    if (ui.motion_srv) ui.motion_srv->Release();
+    if (ui.motion_preview_shader) ui.motion_preview_shader->Release();
     if (ui.depth_contrast_shader) ui.depth_contrast_shader->Release();
     if (ui.context) ui.context->Release();
     if (ui.device) ui.device->Release();
@@ -484,6 +525,13 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         return;
     }
     pollDepthSamples();
+    if (auto* motion = ContextCensusTakeMotionSnapshot(&ui.motion_width, &ui.motion_height)) {
+        if (ui.motion_srv) ui.motion_srv->Release();
+        ui.motion_srv = motion;
+        ui.motion_window_open = true;
+        ensureMotionPreviewShader();
+        EdpeLog(L"EDPE: motion snapshot handed to ImGui");
+    }
     if (!menu_visible.load()) {
         unsigned ignored = 0;
         ID3D11RenderTargetView* color = nullptr;
@@ -569,6 +617,12 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ui.color_snapshot_index, ui.color_width, ui.color_height);
         if (!ui.color_window_open && ImGui::Button("Show scene color snapshot")) ui.color_window_open = true;
     }
+    if (ui.motion_srv) {
+        ImGui::Text("Motion candidate: %ux%u, current to previous pixels",
+            ui.motion_width, ui.motion_height);
+        if (!ui.motion_window_open && ImGui::Button("Show motion snapshot"))
+            ui.motion_window_open = true;
+    }
     ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
     if (ui.depth_srv && ui.depth_window_open) {
@@ -618,6 +672,27 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             if (!ui.color_image_logged) {
                 EdpeLog(L"EDPE: scene color snapshot image submitted to ImGui");
                 ui.color_image_logged = true;
+            }
+        }
+        ImGui::End();
+    }
+    if (ui.motion_srv && ui.motion_window_open) {
+        ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("EDPE Motion Snapshot", &ui.motion_window_open)) {
+            ImGui::TextUnformatted("Neutral gray = 0 pixels; red = horizontal, green = vertical");
+            ImGui::TextUnformatted("Nonlinear preview: 0.1 pixel shifts a channel by 0.25");
+            float width = ImGui::GetContentRegionAvail().x;
+            if (width > 640.0f) width = 640.0f;
+            if (width < 1.0f) width = 1.0f;
+            float height = width * static_cast<float>(ui.motion_height) / ui.motion_width;
+            if (height > 360.0f) { width *= 360.0f / height; height = 360.0f; }
+            if (ui.motion_preview_shader) {
+                ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                draw_list->AddCallback(bindMotionPreviewShader);
+                ImGui::Image(reinterpret_cast<ImTextureID>(ui.motion_srv), ImVec2(width, height));
+                draw_list->AddCallback(ImGui::GetPlatformIO().DrawCallback_ResetRenderState);
+            } else {
+                ImGui::TextDisabled("Motion preview unavailable (shader creation failed)");
             }
         }
         ImGui::End();

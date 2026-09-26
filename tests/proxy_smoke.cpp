@@ -416,6 +416,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "centerValid=1 center=0.5 size=64x64") &&
         std::strstr(contents, "EDPE: motion candidate depth retained on GPU") &&
         std::strstr(contents, "EDPE: motion candidate GPU pass completed") &&
+        std::strstr(contents, "EDPE: motion preview shader ready") &&
+        std::strstr(contents, "EDPE: motion snapshot handed to ImGui") &&
         std::strstr(contents, "EDPE: DSV observer restored after context-state swap") &&
         std::strstr(contents, "EDPE: motion candidate currentAfterPresent=17 center=(6.39844,0)") &&
         std::strstr(contents, "pixels finite=1") &&
