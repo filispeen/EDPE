@@ -92,7 +92,18 @@ the motion draw but original again after `Present`. EDPE now conditionally
 restores only its own observer slot after the original `Present` returns,
 and leaves any unknown replacement untouched. The WARP smoke test confirms
 that a later DSV bind reaches the observer and that the slot remains active.
-The restored behavior in Elite has not yet been checked.
+The WARP result alone does not establish the restored behavior in Elite.
+
+**VERIFIED (Elite Odyssey, 2026-09-26; game build not rechecked):** After
+installing the observer fix, the user repeated the one-shot motion capture
+and reported normal game, HUD, and F5 menu behavior. Session-local DSV `#2`
+supplied valid cameras at `afterPresent=67395/67396`, with matching center
+depth readings near `2.70103e-06` at `2560×1440`. GPU center motion was
+`(-0.000244141,0.0000610352)` render pixels. The log recorded
+`DSV observer restored after context-state swap`; subsequent census entries
+at frames 67584 and 68608 both had `slotActive=1`, and total DSV binds rose
+from 964729 to 982874. This verifies continued observation after the pass
+in this run. The near-zero motion does not validate moving-scene quality.
 
 ## Limits
 
