@@ -119,6 +119,18 @@ entries retained `slotActive=1` and increasing bind counts. The saturated
 regions suggest motion magnitudes above the preview's nonlinear display
 range, but their numeric values and correctness are not yet measured.
 
+**MEASURED (Elite Odyssey, 2026-09-26; game build not rechecked):** A
+second user-confirmed capture produced the motion image while the game
+continued normally. Both camera samples passed validation at
+`afterPresent=23202/23203`, with X/Y scales near `0.9742787/1.7320512`
+and center depth near `2.705e-06`. The one-shot 5×5 motion grid had 25
+finite samples: 18 exceeded 1 render pixel on at least one axis, 10
+exceeded 10 pixels, X ranged from `-2.34961` to `83.9375`, and Y from
+`-48.8125` to `9.17969`. Center motion was `(0.995117,-2.36914)` pixels.
+These magnitudes explain why the 0.1-pixel preview mapping nearly saturates
+large regions; they do not establish that motion direction or scale is
+correct for every pixel.
+
 ## Limits
 
 The module runs in Elite only after an explicit experimental F5 request.
