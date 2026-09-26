@@ -129,7 +129,9 @@ exceeded 10 pixels, X ranged from `-2.34961` to `83.9375`, and Y from
 `-48.8125` to `9.17969`. Center motion was `(0.995117,-2.36914)` pixels.
 These magnitudes explain why the 0.1-pixel preview mapping nearly saturates
 large regions; they do not establish that motion direction or scale is
-correct for every pixel.
+correct for every pixel. The F5 preview now uses a 10-pixel mapping so
+variation across the measured range is visible; this display change has not
+yet been checked in Elite.
 
 ## Limits
 

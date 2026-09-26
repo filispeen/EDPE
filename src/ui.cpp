@@ -148,7 +148,7 @@ void ensureMotionPreviewShader() {
         SamplerState sampler0 : register(s0);
         float4 main(PS_INPUT input) : SV_Target {
             float2 motion = texture0.Sample(sampler0, input.uv);
-            float2 color = 0.5 + 0.5 * motion / (abs(motion) + 0.1);
+            float2 color = 0.5 + 0.5 * motion / (abs(motion) + 10.0);
             return float4(color, 0.5, 1.0) * input.col;
         }
     )";
@@ -680,7 +680,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("EDPE Motion Snapshot", &ui.motion_window_open)) {
             ImGui::TextUnformatted("Neutral gray = 0 pixels; red = horizontal, green = vertical");
-            ImGui::TextUnformatted("Nonlinear preview: 0.1 pixel shifts a channel by 0.25");
+            ImGui::TextUnformatted("Nonlinear preview: 10 pixels shifts a channel by 0.25");
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;
