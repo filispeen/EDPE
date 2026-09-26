@@ -105,12 +105,26 @@ at frames 67584 and 68608 both had `slotActive=1`, and total DSV binds rose
 from 964729 to 982874. This verifies continued observation after the pass
 in this run. The near-zero motion does not validate moving-scene quality.
 
+**VERIFIED / MEASURED (Elite Odyssey, 2026-09-26; game build not rechecked):**
+After the projection-block parser and scene-candidate UI fixes, the user
+reported a stable F5 menu, normal game operation, and an `EDPE Motion
+Snapshot` window. The supplied screenshot contains scene-shaped regions:
+neutral gray near the top and large saturated yellow, green, magenta, and
+blue regions elsewhere. The corresponding log records valid adjacent
+camera samples at `afterPresent=87592/87593`, `2560×1440` depth center
+values `3.05051412e-06/3.05094977e-06`, a successful GPU motion pass and
+preview shader, UI handoff, and DSV observer restoration. The center motion
+sample was `(-0.00012207,-0.000366211)` render pixels; later DSV census
+entries retained `slotActive=1` and increasing bind counts. The saturated
+regions suggest motion magnitudes above the preview's nonlinear display
+range, but their numeric values and correctness are not yet measured.
+
 ## Limits
 
 The module runs in Elite only after an explicit experimental F5 request.
-The new F5 motion snapshot displays its GPU texture through a signed-color
-preview; the WARP proxy verifies shader creation and UI handoff, but the
-image has not yet been inspected in Elite. The camera is still a
+The F5 motion snapshot displays its GPU texture through a signed-color
+preview. It has been seen in Elite, but the large saturated regions need
+numeric and moving-scene validation. The camera is still a
 bind-3 candidate, not the verified camera for every depth-writing draw.
 The diagnostic still reads back 5376-byte camera buffers and one output
 pixel asynchronously; this is not the production GPU-only camera path.
