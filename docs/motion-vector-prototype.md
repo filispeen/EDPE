@@ -31,6 +31,12 @@ vertex shader, line topology, and viewport unchanged. Microsoft documents
 as a way for plug-ins to save and restore application state on the immediate
 context. The runtime path must check D3D11.1 availability and fail open.
 
+**EXPERIMENTAL game capability probe:** On overlay initialization, EDPE now
+queries the game's D3D11 device and immediate context for the 11.1 interfaces,
+tries to create a same-feature-level context state, logs availability, and
+releases the probe object. It does not activate that state or draw motion.
+The WARP proxy smoke tests observe `available=1`; an Elite result is pending.
+
 ## Limits
 
 The shader is used only by the standalone test. It does not run inside Elite,

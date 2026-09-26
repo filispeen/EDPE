@@ -381,6 +381,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "centerValid=1 center=0.25 size=64x64") &&
         std::strstr(contents, "centerValid=1 center=0.5 size=64x64") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
+        std::strstr(contents, "EDPE: D3D11 context state available=1") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");
     if (!passed) std::fprintf(stderr,

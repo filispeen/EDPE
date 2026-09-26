@@ -2,7 +2,7 @@
 #include "log.h"
 #include "context_census.h"
 
-#include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
@@ -438,6 +438,27 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
         SetWindowLongPtrW(ui.window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(edpeWndProc)));
     if (!ui.original_wndproc) return false;
     ui.swap_chain = swap_chain;
+    ID3D11Device1* device1 = nullptr;
+    ID3D11DeviceContext1* context1 = nullptr;
+    ID3DDeviceContextState* motion_state = nullptr;
+    HRESULT state_result = ui.device->QueryInterface(__uuidof(ID3D11Device1),
+        reinterpret_cast<void**>(&device1));
+    if (SUCCEEDED(state_result)) state_result = ui.context->QueryInterface(
+        __uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&context1));
+    if (SUCCEEDED(state_result)) {
+        const auto level = ui.device->GetFeatureLevel();
+        const UINT state_flags = ui.device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED
+            ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED : 0;
+        state_result = device1->CreateDeviceContextState(state_flags, &level, 1,
+            D3D11_SDK_VERSION, __uuidof(ID3D11Device1), nullptr, &motion_state);
+    }
+    wchar_t state_message[120];
+    swprintf_s(state_message, L"EDPE: D3D11 context state available=%u HRESULT=0x%08X",
+        SUCCEEDED(state_result) && motion_state, static_cast<unsigned>(state_result));
+    EdpeLog(state_message);
+    if (motion_state) motion_state->Release();
+    if (context1) context1->Release();
+    if (device1) device1->Release();
     EdpeLog(L"EDPE: Dear ImGui ready; F5 toggles menu");
     return true;
 }
