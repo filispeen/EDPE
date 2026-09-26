@@ -1,14 +1,18 @@
 #include "context_census.h"
 #include "elite_camera.h"
 #include "log.h"
+#include "motion_pass.h"
 
+#include <DirectXPackedVector.h>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
 #include <d3d11.h>
+#include <memory>
 #include <mutex>
+#include <wrl/client.h>
 #include <windows.h>
 
 namespace {
@@ -66,6 +70,16 @@ int camera_pair_target = -1;
 unsigned long long camera_pair_armed_after = 0;
 unsigned long long camera_pair_bind_frame = ~0ull;
 unsigned camera_pair_bind_count = 0;
+bool motion_pair_queued = false;
+bool motion_pair_active = false;
+std::array<edpe::CameraProjection, 2> motion_cameras{};
+std::array<unsigned long long, 2> motion_camera_frames{~0ull, ~0ull};
+unsigned long long motion_depth_frame = ~0ull;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_center_readback;
+std::unique_ptr<edpe::MotionPass> motion_pass;
+unsigned motion_center_wait = 0;
 struct PairDepthSample {
     ID3D11DepthStencilView* view = nullptr;
     ID3D11Texture2D* staging = nullptr;
@@ -333,6 +347,12 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
                 EdpeLog(message);
                 edpe::CameraProjection camera{};
                 const bool parsed = edpe::parseEliteCamera(values, 5376 / sizeof(float), &camera);
+                if (motion_pair_active && parsed &&
+                    (sample.bind == kPairFirstSample || sample.bind == kPairSecondSample)) {
+                    const unsigned slot = sample.bind - kPairFirstSample;
+                    motion_cameras[slot] = camera;
+                    motion_camera_frames[slot] = sample.after_present;
+                }
                 swprintf_s(message,
                     L"EDPE: scene camera candidate afterPresent=%llu bind=%u valid=%u scale=(%.9g,%.9g) depthB=%.9g",
                     sample.after_present, sample.bind, parsed, camera.scaleX, camera.scaleY, camera.depthB);
@@ -404,6 +424,34 @@ void queueCameraPairSample(ID3D11DeviceContext* context, unsigned sample_label) 
     buffer->Release();
 }
 
+void queueMotionDepth(ID3D11DeviceContext* context, ID3D11Texture2D* source,
+    const D3D11_TEXTURE2D_DESC& source_desc, unsigned long long after_present) {
+    if (!motion_pair_active || after_present != camera_pair_armed_after + 1) return;
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    D3D11_TEXTURE2D_DESC desc = source_desc;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = desc.MiscFlags = 0;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> copy;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+    D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{};
+    view_desc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    view_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    view_desc.Texture2D.MipLevels = 1;
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, &copy)) ||
+        FAILED(device->CreateShaderResourceView(copy.Get(), &view_desc, &view))) {
+        EdpeLog(L"EDPE: motion candidate unavailable (GPU depth copy creation failed)");
+        motion_pair_active = false;
+        return;
+    }
+    context->CopyResource(copy.Get(), source);
+    motion_depth = copy;
+    motion_depth_view = view;
+    motion_depth_frame = after_present;
+    EdpeLog(L"EDPE: motion candidate depth retained on GPU");
+}
+
 void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
     for (auto& sample : camera_pair_depth) {
         ID3D11DepthStencilView* view = nullptr;
@@ -446,6 +494,7 @@ void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame
         }
         ID3D11Device* device = nullptr;
         context->GetDevice(&device);
+        queueMotionDepth(context, source, desc, sample.after_present);
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -494,6 +543,89 @@ void pollCameraPairDepth(ID3D11DeviceContext* context) {
         sample.staging->Release();
         sample.staging = nullptr;
     }
+}
+
+void pollMotionCenter(ID3D11DeviceContext* context) {
+    if (!motion_center_readback) return;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT result = context->Map(motion_center_readback.Get(), 0,
+        D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++motion_center_wait < 120) return;
+    if (SUCCEEDED(result) && mapped.pData) {
+        const auto* halves = static_cast<const uint16_t*>(mapped.pData);
+        const float x = DirectX::PackedVector::XMConvertHalfToFloat(halves[0]);
+        const float y = DirectX::PackedVector::XMConvertHalfToFloat(halves[1]);
+        context->Unmap(motion_center_readback.Get(), 0);
+        wchar_t message[192];
+        swprintf_s(message,
+            L"EDPE: motion candidate currentAfterPresent=%llu center=(%.6g,%.6g) pixels finite=%u",
+            motion_depth_frame, x, y, std::isfinite(x) && std::isfinite(y));
+        EdpeLog(message);
+    } else {
+        EdpeLog(L"EDPE: motion candidate center unavailable (nonblocking readback failed)");
+    }
+    motion_center_readback.Reset();
+}
+
+void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
+    if (!motion_pair_active) return;
+    if (frame > camera_pair_armed_after + 120) {
+        EdpeLog(L"EDPE: motion candidate unavailable (camera/depth pair timed out)");
+        motion_pair_active = false;
+        motion_depth.Reset();
+        motion_depth_view.Reset();
+        return;
+    }
+    if (motion_camera_frames[0] != camera_pair_armed_after ||
+        motion_camera_frames[1] != camera_pair_armed_after + 1 ||
+        motion_depth_frame != camera_pair_armed_after + 1 ||
+        !motion_depth_view) return;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    motion_depth->GetDesc(&desc);
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!motion_pass) {
+        auto candidate = std::make_unique<edpe::MotionPass>();
+        if (!candidate->initialize(device.Get(), context)) {
+            EdpeLog(L"EDPE: motion candidate unavailable (motion pass initialization failed)");
+            motion_pair_active = false;
+            motion_depth.Reset();
+            motion_depth_view.Reset();
+            return;
+        }
+        motion_pass = std::move(candidate);
+    }
+    if (!motion_pass->render(motion_depth_view.Get(), motion_cameras[1],
+            motion_cameras[0], desc.Width, desc.Height)) {
+        EdpeLog(L"EDPE: motion candidate unavailable (GPU motion draw rejected inputs)");
+        motion_pair_active = false;
+        motion_depth.Reset();
+        motion_depth_view.Reset();
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D11Resource> output;
+    motion_pass->output()->GetResource(&output);
+    D3D11_TEXTURE2D_DESC read_desc{};
+    read_desc.Width = read_desc.Height = 1;
+    read_desc.MipLevels = read_desc.ArraySize = 1;
+    read_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    read_desc.SampleDesc.Count = 1;
+    read_desc.Usage = D3D11_USAGE_STAGING;
+    read_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device->CreateTexture2D(&read_desc, nullptr, &motion_center_readback))) {
+        EdpeLog(L"EDPE: motion candidate unavailable (center readback creation failed)");
+    } else {
+        const UINT x = desc.Width / 2, y = desc.Height / 2;
+        const D3D11_BOX center{x, y, 0, x + 1, y + 1, 1};
+        context->CopySubresourceRegion(motion_center_readback.Get(), 0, 0, 0, 0,
+            output.Get(), 0, &center);
+        motion_center_wait = 0;
+        EdpeLog(L"EDPE: motion candidate GPU pass completed; center readback queued");
+    }
+    motion_pair_active = false;
+    motion_depth.Reset();
+    motion_depth_view.Reset();
 }
 
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,
@@ -716,6 +848,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         auto* context = observed_context.load(std::memory_order_acquire);
         queueCameraPairDepth(context, frame);
         pollCameraPairDepth(context);
+        pollMotionCenter(context);
+        tryMotionPair(context, frame);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
         last_present_frame.store(frame, std::memory_order_relaxed);
@@ -862,6 +996,12 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             camera_pair_armed_after = last_present_frame.load(std::memory_order_relaxed);
             camera_pair_bind_frame = ~0ull;
             camera_pair_bind_count = 0;
+            motion_pair_active = motion_pair_queued;
+            motion_pair_queued = false;
+            motion_camera_frames = {~0ull, ~0ull};
+            motion_depth_frame = ~0ull;
+            motion_depth.Reset();
+            motion_depth_view.Reset();
             armed_pair = camera_pair_target;
         }
     }
@@ -890,7 +1030,8 @@ bool depthSnapshotAvailableLocked(unsigned index) {
     if (!patched_table || index >= seen_count || snapshot_queued >= 0 ||
         snapshot_active >= 0 || snapshot_view || camera_pair_queued >= 0 ||
         camera_pair_target >= 0 || camera_pair_depth[0].staging ||
-        camera_pair_depth[1].staging) return false;
+        camera_pair_depth[1].staging || motion_pair_active ||
+        motion_center_readback) return false;
     const auto& candidate = seen[index];
     return candidate.samples == 1 &&
         (candidate.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS ||
@@ -914,6 +1055,15 @@ bool ContextCensusRequestCameraPair(unsigned index) {
     std::lock_guard lock(seen_mutex);
     if (!depthSnapshotAvailableLocked(index)) return false;
     camera_pair_queued = static_cast<int>(index);
+    return true;
+}
+
+bool ContextCensusRequestMotionPair(unsigned index) {
+    std::lock_guard lock(seen_mutex);
+    if (!depthSnapshotAvailableLocked(index) ||
+        seen[index].texture_format != DXGI_FORMAT_R32G8X24_TYPELESS) return false;
+    camera_pair_queued = static_cast<int>(index);
+    motion_pair_queued = true;
     return true;
 }
 
@@ -977,6 +1127,10 @@ extern "C" BOOL WINAPI EdpeRequestCameraPair(UINT index) {
     return ContextCensusRequestCameraPair(index);
 }
 
+extern "C" BOOL WINAPI EdpeRequestMotionPair(UINT index) {
+    return ContextCensusRequestMotionPair(index);
+}
+
 extern "C" int WINAPI EdpeSceneDepthCandidate() {
     return ContextCensusSceneDepthCandidate();
 }
@@ -1002,6 +1156,13 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         snapshot_bind_count = 0;
         camera_pair_queued = -1;
         camera_pair_target = -1;
+        motion_pair_queued = motion_pair_active = false;
+        motion_depth.Reset();
+        motion_depth_view.Reset();
+        motion_center_readback.Reset();
+        motion_pass.reset();
+        motion_camera_frames = {~0ull, ~0ull};
+        motion_depth_frame = ~0ull;
         camera_pair_bind_frame = ~0ull;
         camera_pair_bind_count = 0;
         for (auto& sample : camera_pair_depth) {

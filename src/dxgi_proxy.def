@@ -6,4 +6,5 @@ EXPORTS
     EDPE_RequestBindSequence=EdpeRequestBindSequence
     EDPE_RequestDepthSnapshot=EdpeRequestDepthSnapshot
     EDPE_RequestCameraPair=EdpeRequestCameraPair
+    EDPE_RequestMotionPair=EdpeRequestMotionPair
     EDPE_SceneDepthCandidate=EdpeSceneDepthCandidate

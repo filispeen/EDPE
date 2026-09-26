@@ -62,6 +62,9 @@ int wmain(int argc, wchar_t** argv) {
     const auto request_camera_pair = reinterpret_cast<BOOL (WINAPI*)(UINT)>(
         GetProcAddress(dxgi_proxy, "EDPE_RequestCameraPair"));
     if (!request_camera_pair) return 7;
+    const auto request_motion_pair = reinterpret_cast<BOOL (WINAPI*)(UINT)>(
+        GetProcAddress(dxgi_proxy, "EDPE_RequestMotionPair"));
+    if (!request_motion_pair) return 7;
     const auto scene_depth_candidate = reinterpret_cast<int (WINAPI*)()>(
         GetProcAddress(dxgi_proxy, "EDPE_SceneDepthCandidate"));
     if (!scene_depth_candidate) return 7;
@@ -249,6 +252,34 @@ int wmain(int argc, wchar_t** argv) {
         pair_present = swap_chain->Present(0, 0);
         if (FAILED(pair_present)) break;
     }
+    for (int i = 0; i < 4; ++i) swap_chain->Present(0, 0);
+    probe_values[935] = 0;
+    probe_values[1080] = probe_values[1085] = probe_values[1091] = 1;
+    probe_values[1094] = .025f;
+    D3D11_MAPPED_SUBRESOURCE motion_probe{};
+    if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
+            &motion_probe))) return 10;
+    std::memcpy(motion_probe.pData, probe_values, sizeof(probe_values));
+    context->Unmap(probe_buffer, 0);
+    const bool motion_requested = request_motion_pair(0);
+    const HRESULT motion_arm_present = swap_chain->Present(0, 0);
+    HRESULT motion_present = S_OK;
+    for (int frame = 0; frame < 2; ++frame) {
+        if (frame) {
+            probe_values[935] = .01f;
+            if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
+                    &motion_probe))) return 10;
+            std::memcpy(motion_probe.pData, probe_values, sizeof(probe_values));
+            context->Unmap(probe_buffer, 0);
+        }
+        context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, .5f, 0);
+        for (int bind = 0; bind < 3; ++bind)
+            context->OMSetRenderTargets(4, scene_mrt, depth_view);
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        motion_present = swap_chain->Present(0, 0);
+        if (FAILED(motion_present)) break;
+    }
+    for (int i = 0; i < 8; ++i) swap_chain->Present(0, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool visible_input_blocked = forwarded_keys == 1;
     const HRESULT resize_result = swap_chain->ResizeBuffers(0, 128, 128, DXGI_FORMAT_UNKNOWN, 0);
@@ -299,7 +330,8 @@ int wmain(int argc, wchar_t** argv) {
         SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
         SUCCEEDED(snapshot_arm_present) && SUCCEEDED(snapshot_present) && snapshot_requested &&
         scene_candidate_found && pair_requested && SUCCEEDED(pair_arm_present) &&
-        SUCCEEDED(pair_present) &&
+        SUCCEEDED(pair_present) && motion_requested &&
+        SUCCEEDED(motion_arm_present) && SUCCEEDED(motion_present) &&
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
@@ -317,7 +349,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:19") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:25") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
@@ -380,6 +412,10 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: adjacent depth afterPresent=") &&
         std::strstr(contents, "centerValid=1 center=0.25 size=64x64") &&
         std::strstr(contents, "centerValid=1 center=0.5 size=64x64") &&
+        std::strstr(contents, "EDPE: motion candidate depth retained on GPU") &&
+        std::strstr(contents, "EDPE: motion candidate GPU pass completed") &&
+        std::strstr(contents, "EDPE: motion candidate currentAfterPresent=17 center=(6.39844,0)") &&
+        std::strstr(contents, "pixels finite=1") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: D3D11 context state available=1") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&

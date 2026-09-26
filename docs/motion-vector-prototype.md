@@ -57,12 +57,33 @@ At one depth pixel it compares the GPU half-float motion to EDPE's CPU
 checks the shader's matrix order against the CPU implementation for an
 observed orientation. It does not verify motion from two actual Elite frames.
 
+## One-shot runtime candidate — 2026-09-26
+
+**EXPERIMENTAL:** The F5 menu offers `Capture motion candidate`. It uses the
+existing scene DSV signature and copies VS slot-1 camera buffers at bind 3
+in two consecutive frame intervals. After the second interval, it retains a
+GPU-only copy of that frame's depth. The camera staging buffers are polled
+without waiting; only after both parse successfully and their frame labels
+match the depth copy does `MotionPass` draw. A one-pixel staging readback
+logs center motion in render pixels. The original game image is untouched.
+The request expires if the pair remains incomplete for 120 Presents.
+
+**VERIFIED (Release WARP proxy smoke):** Synthetic valid camera buffers,
+a `64×64` typeless depth target, and a `+0.01` camera X translation yielded
+center motion `(6.39844,0)` in the half-float GPU result. The frame labels
+were consecutive, the GPU pass completed, and all four project tests passed.
+This verifies the one-shot dispatch and resource lifetime in the harness;
+it is not an Elite visual or camera-selection validation.
+
 ## Limits
 
-The module is compiled into `dxgi.dll` but is not called inside Elite. It
-does not yet read Elite's DSV, modify its output, or establish the correct
-camera for every depth-writing draw. Jitter is excluded. The in-game
-depth/camera pairing and moving-cockpit measurements are in
+The module runs in Elite only after an explicit experimental F5 request;
+that path has not yet been tested in the game. The camera is still a
+bind-3 candidate, not the verified camera for every depth-writing draw.
+The diagnostic still reads back 5376-byte camera buffers and one output
+pixel asynchronously; this is not the production GPU-only camera path.
+Jitter is excluded. The in-game depth/camera pairing and moving-cockpit
+measurements are in
 [camera-reconstruction.md](camera-reconstruction.md). Runtime integration
 still needs GPU-side camera capture, a debug view, and visual validation
 before any upscaler receives motion.
