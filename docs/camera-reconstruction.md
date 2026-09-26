@@ -559,6 +559,18 @@ not that the sampled camera produced the depth values or that `Present` is
 the correct temporal handoff. The current diagnostic copies a full depth
 texture only when requested; it is not a production motion-vector path.
 
+**MEASURED OFFLINE FIT (same 15 pairs):** Using the logged rounded camera
+rows as row-major view-to-world transforms, pixel `(1280,720)`, and
+`viewZ=0.0250000004/rawDepth`, the two center-pixel world points in each
+pair differ by `0.00000007`–`0.0272` scene units (median `0.00266`) at
+view-axis distance about `82` scene units. This is consistent with a nearly
+stationary visible surface and the candidate camera/depth convention.
+Camera rows are printed to roughly six significant digits, and the two
+center rays need not hit exactly the same surface point. Logged camera
+translation stayed fixed and rotation changed only slightly, so this fit
+cannot independently establish motion direction, scale, or behavior during
+rapid camera movement.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
