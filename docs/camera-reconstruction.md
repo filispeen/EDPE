@@ -587,6 +587,27 @@ verify camera translation, camera/depth correspondence during gameplay, or
 motion-vector direction. They confirm that the frame-labelled camera and
 depth readbacks remained available and the game continued running.
 
+**MEASURED (2026-09-26, user-confirmed in-game cockpit capture; game build
+not rechecked):** Three requested pairs selected session-local DSV `#2`, a
+`2560×1440` single-sample `R32G8X24_TYPELESS` texture. All six camera
+samples passed the parser and all six center-depth samples were finite.
+Between consecutive `Present` intervals 28134/28135, 28856/28857, and
+28948/28949, camera translation changed by `2.8135`, `2.5013`, and `2.6037`
+scene units. Its displacement was almost entirely along the logged forward
+axis. With `viewZ=0.0250000004/rawDepth`, center-pixel view-axis distance
+decreased by `2.5162`, `2.4291`, and `3.0112` units respectively, at total
+distance about `6.2–8.6` thousand units. Reconstructed center-pixel world
+points differed by `0.289`, `0.068`, and `0.408` units within those pairs.
+Elite and its F5 menu remained open.
+
+**INFERENCE / LIMIT:** The matching direction and approximate magnitude of
+camera travel and depth change provide stronger evidence for the candidate
+reversed-Z depth conversion and frame association under real translation.
+The camera rows in the log are rounded, and a moving center ray can hit a
+different surface point. These observations do not prove the exact camera
+used by each depth-writing draw, motion-vector sign or Y convention, or
+continuity through scene transitions. Runtime reprojection stays disabled.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
