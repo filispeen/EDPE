@@ -82,6 +82,9 @@ std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 2> gpu_camera_pair{};
 unsigned long long motion_depth_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
+Microsoft::WRL::ComPtr<ID3D11RenderTargetView> motion_color_source;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_view;
+unsigned long long motion_color_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
@@ -480,6 +483,59 @@ void queueMotionDepth(ID3D11DeviceContext* context, ID3D11Texture2D* source,
     EdpeLog(L"EDPE: motion candidate depth retained on GPU");
 }
 
+void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
+    if (!motion_pair_active || !motion_color_source ||
+        motion_color_frame + 1 != frame || motion_depth_frame != motion_color_frame)
+        return;
+    auto source_view = std::move(motion_color_source);
+    ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
+    bool still_bound = false;
+    for (auto* view : bound) {
+        still_bound |= view == source_view.Get();
+        if (view) view->Release();
+    }
+    if (still_bound) {
+        EdpeLog(L"EDPE: motion color candidate unavailable (RTV still bound)");
+        return;
+    }
+    D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
+    source_view->GetDesc(&rtv_desc);
+    Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+    source_view->GetResource(&resource);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+    if (!resource || FAILED(resource.As(&source))) {
+        EdpeLog(L"EDPE: motion color candidate unavailable (not a Texture2D)");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc{}, depth_desc{};
+    source->GetDesc(&desc);
+    motion_depth->GetDesc(&depth_desc);
+    if (desc.Format != DXGI_FORMAT_R11G11B10_FLOAT ||
+        rtv_desc.Format != desc.Format || desc.Width != depth_desc.Width ||
+        desc.Height != depth_desc.Height || desc.MipLevels != 1 ||
+        desc.ArraySize != 1 || desc.SampleDesc.Count != 1) {
+        EdpeLog(L"EDPE: motion color candidate unavailable (layout mismatch)");
+        return;
+    }
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = desc.MiscFlags = 0;
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> copy;
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, &copy)) ||
+        FAILED(device->CreateShaderResourceView(copy.Get(), nullptr, &motion_color_view))) {
+        EdpeLog(L"EDPE: motion color candidate unavailable (GPU copy creation failed)");
+        return;
+    }
+    context->CopyResource(copy.Get(), source.Get());
+    wchar_t message[160];
+    swprintf_s(message, L"EDPE: motion color retained on GPU afterPresent=%llu size=%ux%u format=%u",
+        motion_color_frame, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
+    EdpeLog(message);
+}
+
 void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
     for (auto& sample : camera_pair_depth) {
         ID3D11DepthStencilView* view = nullptr;
@@ -542,6 +598,7 @@ void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame
         }
         source->Release();
     }
+    queueMotionColor(context, frame);
 }
 
 void pollCameraPairDepth(ID3D11DeviceContext* context) {
@@ -624,6 +681,8 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         motion_pair_active = false;
         motion_depth.Reset();
         motion_depth_view.Reset();
+        motion_color_source.Reset();
+        motion_color_view.Reset();
         return;
     }
     if (motion_camera_frames[0] != camera_pair_armed_after ||
@@ -660,8 +719,13 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         motion_pair_active = false;
         motion_depth.Reset();
         motion_depth_view.Reset();
+        motion_color_source.Reset();
+        motion_color_view.Reset();
         return;
     }
+    EdpeLog(motion_color_view ? L"EDPE: motion candidate has same-frame HDR color" :
+        L"EDPE: motion candidate HDR color unavailable");
+    motion_color_view.Reset();
     motion_snapshot = motion_pass->output();
     motion_snapshot_width = desc.Width;
     motion_snapshot_height = desc.Height;
@@ -820,6 +884,11 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                         dsv->AddRef();
                         depth.view = dsv;
                         depth.after_present = frame;
+                    }
+                    if (motion_pair_active && camera_pair_sample == kPairSecondSample &&
+                        targets[3] && !motion_color_source) {
+                        motion_color_source = targets[3];
+                        motion_color_frame = frame;
                     }
                 }
             }
@@ -1065,6 +1134,9 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             motion_pair_queued = false;
             motion_camera_frames = {~0ull, ~0ull};
             gpu_camera_pair = {};
+            motion_color_source.Reset();
+            motion_color_view.Reset();
+            motion_color_frame = ~0ull;
             motion_depth_frame = ~0ull;
             motion_depth.Reset();
             motion_depth_view.Reset();
@@ -1255,6 +1327,9 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_hook_watch = 0;
         motion_depth.Reset();
         motion_depth_view.Reset();
+        motion_color_source.Reset();
+        motion_color_view.Reset();
+        motion_color_frame = ~0ull;
         motion_grid_readback.Reset();
         motion_snapshot.Reset();
         motion_pass.reset();
