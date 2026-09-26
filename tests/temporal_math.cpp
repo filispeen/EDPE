@@ -51,4 +51,18 @@ int main() {
         std::fabs(parsed.scaleY - std::sqrt(3.0f)) > 0.001f) return 7;
     scene[1083] += .01f;
     if (edpe::parseEliteCamera(scene.data(), scene.size(), &parsed)) return 8;
+
+    const auto first = edpe::projectionJitter(0, 100, 50);
+    const auto second = edpe::projectionJitter(1, 100, 50);
+    const auto third = edpe::projectionJitter(2, 100, 50);
+    if (std::fabs(first.pixelX) > 0.000001f ||
+        std::fabs(first.pixelY + 1.0f / 6) > 0.000001f ||
+        std::fabs(first.ndcY - 1.0f / 150) > 0.000001f ||
+        std::fabs(second.pixelX + 0.25f) > 0.000001f ||
+        std::fabs(second.pixelY - 1.0f / 6) > 0.000001f ||
+        std::fabs(second.ndcX + 0.005f) > 0.000001f ||
+        std::fabs(third.pixelX - 0.25f) > 0.000001f ||
+        std::fabs(third.pixelY + 7.0f / 18) > 0.000001f) return 9;
+    if (edpe::projectionJitter(1, 0, 50).pixelX != 0 ||
+        edpe::projectionJitter(1, 100, 0).ndcY != 0) return 10;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 
 namespace edpe {
 
@@ -44,6 +45,31 @@ inline bool cameraDepthMotion(const CameraProjection& now, const CameraProjectio
     *motionX = static_cast<float>(dx);
     *motionY = static_cast<float>(dy);
     return true;
+}
+
+struct ProjectionJitter {
+    float pixelX, pixelY;
+    float ndcX, ndcY;
+};
+
+// Halton 2,3 in pixel units; D3D viewport maps positive NDC Y upward.
+// Math only: applying this to Elite's projection requires a verified pass and
+// a working temporal reconstruction path that can always disable the offset.
+inline ProjectionJitter projectionJitter(std::uint64_t frame, unsigned width, unsigned height) {
+    if (!width || !height) return {};
+    auto halton = [](std::uint64_t index, std::uint64_t base) {
+        double value = 0, weight = 1;
+        while (index) {
+            weight /= base;
+            value += weight * (index % base);
+            index /= base;
+        }
+        return value;
+    };
+    const auto index = frame + 1;
+    const float x = static_cast<float>(halton(index, 2) - 0.5);
+    const float y = static_cast<float>(halton(index, 3) - 0.5);
+    return {x, y, 2 * x / width, -2 * y / height};
 }
 
 } // namespace edpe
