@@ -133,6 +133,16 @@ correct for every pixel. The F5 preview now uses a 10-pixel mapping so
 variation across the measured range is visible; this display change has not
 yet been checked in Elite.
 
+**MEASURED OFFLINE CHECK (same capture):** Using the logged projection
+columns divided by their logged X/Y scales as the current and previous
+orientation, the logged row translations, raw center depth
+`2.70442024e-06`, `depthB=0.0250000004`, and pixel center `(1280.5,720.5)`,
+CPU reprojection gives approximately `(0.99522,-2.37110)` render pixels.
+The GPU half-float sample was `(0.995117,-2.36914)`. This close agreement
+verifies that the GPU pass follows the documented reconstruction math at
+this pixel. The matrix rows are rounded in the log; the comparison does
+not prove that Elite used this camera for every depth-writing draw.
+
 ## Limits
 
 The module runs in Elite only after an explicit experimental F5 request.
