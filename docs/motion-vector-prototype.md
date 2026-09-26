@@ -35,7 +35,13 @@ context. The runtime path must check D3D11.1 availability and fail open.
 queries the game's D3D11 device and immediate context for the 11.1 interfaces,
 tries to create a same-feature-level context state, logs availability, and
 releases the probe object. It does not activate that state or draw motion.
-The WARP proxy smoke tests observe `available=1`; an Elite result is pending.
+The WARP proxy smoke tests observe `available=1`.
+
+**VERIFIED (2026-09-26, user-confirmed cockpit run; game build not
+rechecked):** Elite logged `available=1` and `HRESULT=0x00000000` for D3D11
+context state on overlay initialization. The user reported normal game
+world, HUD, and F5 menu behavior. This verifies interface and state-object
+creation on that device; no context swap or motion draw ran in Elite.
 
 ## Limits
 
