@@ -1110,8 +1110,9 @@ int ContextCensusSceneDepthCandidate() {
     const auto frame = last_present_frame.load(std::memory_order_relaxed);
     int candidate = -1;
     for (size_t index = 0; index < seen_count; ++index) {
-        if (seen[index].scene_match_frame == ~0ull ||
-            seen[index].scene_match_frame + 1 != frame ||
+        const auto match = seen[index].scene_match_frame;
+        // Present can run between scene signature binds; keep a recent match stable.
+        if (match == ~0ull || match > frame || frame - match > 32 ||
             !depthSnapshotAvailableLocked(static_cast<unsigned>(index))) continue;
         if (candidate >= 0) return -1; // Ambiguous: require manual selection.
         candidate = static_cast<int>(index);

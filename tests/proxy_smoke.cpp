@@ -282,11 +282,13 @@ int wmain(int argc, wchar_t** argv) {
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     for (int i = 0; i < 8; ++i) swap_chain->Present(0, 0);
+    const bool scene_candidate_held = scene_depth_candidate() == 0;
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool visible_input_blocked = forwarded_keys == 1;
     const HRESULT resize_result = swap_chain->ResizeBuffers(0, 128, 128, DXGI_FORMAT_UNKNOWN, 0);
     const HRESULT resized_present = SUCCEEDED(resize_result) ? swap_chain->Present(0, 0) : resize_result;
     for (int i = 0; i < 16; ++i) swap_chain->Present(0, 0);
+    const bool scene_candidate_expired = scene_depth_candidate() == -1;
     while (present_count() < 1024) swap_chain->Present(0, DXGI_PRESENT_TEST);
     const bool interval_observed = present_count() == 1024;
     SendMessageW(window, WM_KEYUP, VK_F5, 0);
@@ -331,7 +333,8 @@ int wmain(int argc, wchar_t** argv) {
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
         SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
         SUCCEEDED(snapshot_arm_present) && SUCCEEDED(snapshot_present) && snapshot_requested &&
-        scene_candidate_found && pair_requested && SUCCEEDED(pair_arm_present) &&
+        scene_candidate_found && scene_candidate_held && scene_candidate_expired &&
+        pair_requested && SUCCEEDED(pair_arm_present) &&
         SUCCEEDED(pair_present) && motion_requested &&
         SUCCEEDED(motion_arm_present) && SUCCEEDED(motion_present) &&
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
