@@ -423,6 +423,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: motion snapshot handed to ImGui") &&
         std::strstr(contents, "EDPE: DSV observer restored after context-state swap") &&
         std::strstr(contents, "EDPE: motion candidate currentAfterPresent=17 center=(6.39844,0)") &&
+        std::strstr(contents, "EDPE: motion grid 5x5 finite=25") &&
         std::strstr(contents, "pixels finite=1") &&
         std::strstr(contents, "EDPE: DSV census frame=1024 binds=26 unique=1 slotActive=1") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&

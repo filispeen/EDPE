@@ -4,6 +4,7 @@
 #include "motion_pass.h"
 
 #include <DirectXPackedVector.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <d3d11.h>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <wrl/client.h>
 #include <windows.h>
@@ -79,12 +81,12 @@ std::array<unsigned long long, 2> motion_camera_frames{~0ull, ~0ull};
 unsigned long long motion_depth_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
-Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_center_readback;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
 UINT motion_snapshot_width = 0;
 UINT motion_snapshot_height = 0;
-unsigned motion_center_wait = 0;
+unsigned motion_grid_wait = 0;
 unsigned motion_hook_watch = 0;
 struct PairDepthSample {
     ID3D11DepthStencilView* view = nullptr;
@@ -551,26 +553,48 @@ void pollCameraPairDepth(ID3D11DeviceContext* context) {
     }
 }
 
-void pollMotionCenter(ID3D11DeviceContext* context) {
-    if (!motion_center_readback) return;
+void pollMotionGrid(ID3D11DeviceContext* context) {
+    if (!motion_grid_readback) return;
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    const HRESULT result = context->Map(motion_center_readback.Get(), 0,
+    const HRESULT result = context->Map(motion_grid_readback.Get(), 0,
         D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-    if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++motion_center_wait < 120) return;
+    if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++motion_grid_wait < 120) return;
     if (SUCCEEDED(result) && mapped.pData) {
-        const auto* halves = static_cast<const uint16_t*>(mapped.pData);
-        const float x = DirectX::PackedVector::XMConvertHalfToFloat(halves[0]);
-        const float y = DirectX::PackedVector::XMConvertHalfToFloat(halves[1]);
-        context->Unmap(motion_center_readback.Get(), 0);
+        float min_x = std::numeric_limits<float>::infinity();
+        float max_x = -min_x, min_y = min_x, max_y = -min_x;
+        float center_x = 0, center_y = 0;
+        unsigned finite = 0, over_one = 0, over_ten = 0;
+        for (unsigned row = 0; row < 5; ++row) {
+            const auto* halves = reinterpret_cast<const uint16_t*>(
+                static_cast<const unsigned char*>(mapped.pData) + row * mapped.RowPitch);
+            for (unsigned column = 0; column < 5; ++column) {
+                const float x = DirectX::PackedVector::XMConvertHalfToFloat(halves[column * 2]);
+                const float y = DirectX::PackedVector::XMConvertHalfToFloat(halves[column * 2 + 1]);
+                if (row == 2 && column == 2) { center_x = x; center_y = y; }
+                if (!std::isfinite(x) || !std::isfinite(y)) continue;
+                ++finite;
+                min_x = (std::min)(min_x, x); max_x = (std::max)(max_x, x);
+                min_y = (std::min)(min_y, y); max_y = (std::max)(max_y, y);
+                const float magnitude = (std::max)(std::fabs(x), std::fabs(y));
+                over_one += magnitude > 1.0f;
+                over_ten += magnitude > 10.0f;
+            }
+        }
+        context->Unmap(motion_grid_readback.Get(), 0);
         wchar_t message[192];
         swprintf_s(message,
             L"EDPE: motion candidate currentAfterPresent=%llu center=(%.6g,%.6g) pixels finite=%u",
-            motion_depth_frame, x, y, std::isfinite(x) && std::isfinite(y));
+            motion_depth_frame, center_x, center_y,
+            std::isfinite(center_x) && std::isfinite(center_y));
+        EdpeLog(message);
+        swprintf_s(message,
+            L"EDPE: motion grid 5x5 finite=%u over1=%u over10=%u x=[%.6g,%.6g] y=[%.6g,%.6g] pixels",
+            finite, over_one, over_ten, min_x, max_x, min_y, max_y);
         EdpeLog(message);
     } else {
-        EdpeLog(L"EDPE: motion candidate center unavailable (nonblocking readback failed)");
+        EdpeLog(L"EDPE: motion candidate grid unavailable (nonblocking readback failed)");
     }
-    motion_center_readback.Reset();
+    motion_grid_readback.Reset();
 }
 
 void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
@@ -616,21 +640,24 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
     Microsoft::WRL::ComPtr<ID3D11Resource> output;
     motion_pass->output()->GetResource(&output);
     D3D11_TEXTURE2D_DESC read_desc{};
-    read_desc.Width = read_desc.Height = 1;
+    read_desc.Width = read_desc.Height = 5;
     read_desc.MipLevels = read_desc.ArraySize = 1;
     read_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
     read_desc.SampleDesc.Count = 1;
     read_desc.Usage = D3D11_USAGE_STAGING;
     read_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (FAILED(device->CreateTexture2D(&read_desc, nullptr, &motion_center_readback))) {
-        EdpeLog(L"EDPE: motion candidate unavailable (center readback creation failed)");
+    if (FAILED(device->CreateTexture2D(&read_desc, nullptr, &motion_grid_readback))) {
+        EdpeLog(L"EDPE: motion candidate unavailable (grid readback creation failed)");
     } else {
-        const UINT x = desc.Width / 2, y = desc.Height / 2;
-        const D3D11_BOX center{x, y, 0, x + 1, y + 1, 1};
-        context->CopySubresourceRegion(motion_center_readback.Get(), 0, 0, 0, 0,
-            output.Get(), 0, &center);
-        motion_center_wait = 0;
-        EdpeLog(L"EDPE: motion candidate GPU pass completed; center readback queued");
+        for (UINT row = 0; row < 5; ++row) for (UINT column = 0; column < 5; ++column) {
+            const UINT x = (column * (desc.Width - 1) + 2) / 4;
+            const UINT y = (row * (desc.Height - 1) + 2) / 4;
+            const D3D11_BOX pixel{x, y, 0, x + 1, y + 1, 1};
+            context->CopySubresourceRegion(motion_grid_readback.Get(), 0, column, row, 0,
+                output.Get(), 0, &pixel);
+        }
+        motion_grid_wait = 0;
+        EdpeLog(L"EDPE: motion candidate GPU pass completed; grid readback queued");
     }
     motion_pair_active = false;
     motion_depth.Reset();
@@ -858,7 +885,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         auto* context = observed_context.load(std::memory_order_acquire);
         queueCameraPairDepth(context, frame);
         pollCameraPairDepth(context);
-        pollMotionCenter(context);
+        pollMotionGrid(context);
         tryMotionPair(context, frame);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
@@ -1062,7 +1089,7 @@ bool depthSnapshotAvailableLocked(unsigned index) {
         snapshot_active >= 0 || snapshot_view || camera_pair_queued >= 0 ||
         camera_pair_target >= 0 || camera_pair_depth[0].staging ||
         camera_pair_depth[1].staging || motion_pair_active ||
-        motion_center_readback) return false;
+        motion_grid_readback) return false;
     const auto& candidate = seen[index];
     return candidate.samples == 1 &&
         (candidate.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS ||
@@ -1199,7 +1226,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_hook_watch = 0;
         motion_depth.Reset();
         motion_depth_view.Reset();
-        motion_center_readback.Reset();
+        motion_grid_readback.Reset();
         motion_snapshot.Reset();
         motion_pass.reset();
         motion_camera_frames = {~0ull, ~0ull};
