@@ -23,15 +23,19 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     if (FAILED(device->CheckFormatSupport(DXGI_FORMAT_R16G16_FLOAT, &format_support)) ||
         !(format_support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) ||
         !(format_support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE)) return false;
-    Microsoft::WRL::ComPtr<ID3DBlob> vertex_code, pixel_code;
+    Microsoft::WRL::ComPtr<ID3DBlob> vertex_code, pixel_code, pixel_gpu_code;
     if (FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, nullptr,
             nullptr, "vs", "vs_5_0", 0, 0, &vertex_code, nullptr)) ||
         FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, nullptr,
             nullptr, "ps", "ps_5_0", 0, 0, &pixel_code, nullptr)) ||
+        FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, nullptr,
+            nullptr, "ps_gpu", "ps_5_0", 0, 0, &pixel_gpu_code, nullptr)) ||
         FAILED(device->CreateVertexShader(vertex_code->GetBufferPointer(),
             vertex_code->GetBufferSize(), nullptr, &vertex_)) ||
         FAILED(device->CreatePixelShader(pixel_code->GetBufferPointer(),
-            pixel_code->GetBufferSize(), nullptr, &pixel_))) return false;
+            pixel_code->GetBufferSize(), nullptr, &pixel_)) ||
+        FAILED(device->CreatePixelShader(pixel_gpu_code->GetBufferPointer(),
+            pixel_gpu_code->GetBufferSize(), nullptr, &pixel_gpu_))) return false;
     D3D11_BUFFER_DESC desc{};
     desc.ByteWidth = 32 * sizeof(float);
     desc.Usage = D3D11_USAGE_DEFAULT;
@@ -51,6 +55,43 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
         !std::isfinite(previous.scaleY)) return false;
     for (float value : now.worldFromView) if (!std::isfinite(value)) return false;
     for (float value : previous.worldFromView) if (!std::isfinite(value)) return false;
+    float values[32]{};
+    for (unsigned i = 0; i < 12; ++i) {
+        values[i] = now.worldFromView[i];
+        values[12 + i] = previous.worldFromView[i];
+    }
+    values[24] = now.scaleX;
+    values[25] = now.scaleY;
+    values[26] = previous.scaleX;
+    values[27] = previous.scaleY;
+    values[28] = now.depthB;
+    values[29] = static_cast<float>(width);
+    values[30] = static_cast<float>(height);
+    return renderInternal(depth, values, nullptr, nullptr, width, height);
+}
+
+bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
+    ID3D11Buffer* now, ID3D11Buffer* previous, UINT width, UINT height) {
+    if (!device_ || !now || !previous || !width || !height) return false;
+    ID3D11Buffer* camera_buffers[] = {now, previous};
+    for (auto* buffer : camera_buffers) {
+        D3D11_BUFFER_DESC desc{};
+        buffer->GetDesc(&desc);
+        Microsoft::WRL::ComPtr<ID3D11Device> owner;
+        buffer->GetDevice(&owner);
+        if (owner.Get() != device_.Get() || desc.ByteWidth != 5376 ||
+            !(desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) return false;
+    }
+    float values[32]{};
+    values[29] = static_cast<float>(width);
+    values[30] = static_cast<float>(height);
+    return renderInternal(depth, values, now, previous, width, height);
+}
+
+bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
+    const float (&values)[32], ID3D11Buffer* now, ID3D11Buffer* previous,
+    UINT width, UINT height) {
+    if (!device_ || !depth || !width || !height) return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     depth->GetDesc(&srv_desc);
     if (srv_desc.Format != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
@@ -94,25 +135,13 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
         height_ = height;
     }
 
-    float values[32]{};
-    for (unsigned i = 0; i < 12; ++i) {
-        values[i] = now.worldFromView[i];
-        values[12 + i] = previous.worldFromView[i];
-    }
-    values[24] = now.scaleX;
-    values[25] = now.scaleY;
-    values[26] = previous.scaleX;
-    values[27] = previous.scaleY;
-    values[28] = now.depthB;
-    values[29] = static_cast<float>(width);
-    values[30] = static_cast<float>(height);
     context_->UpdateSubresource(constants_.Get(), 0, nullptr, values, 0, 0);
 
     Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
     context_->SwapDeviceContextState(state_.Get(), &prior);
     auto* rtv = output_rtv_.Get();
     auto* srv = depth;
-    auto* cb = constants_.Get();
+    ID3D11Buffer* buffers[] = {constants_.Get(), now, previous};
     const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(width),
         static_cast<float>(height), 0, 1};
     context_->OMSetRenderTargets(1, &rtv, nullptr);
@@ -120,9 +149,9 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     context_->IASetInputLayout(nullptr);
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vertex_.Get(), nullptr, 0);
-    context_->PSSetShader(pixel_.Get(), nullptr, 0);
+    context_->PSSetShader(now ? pixel_gpu_.Get() : pixel_.Get(), nullptr, 0);
     context_->PSSetShaderResources(0, 1, &srv);
-    context_->PSSetConstantBuffers(0, 1, &cb);
+    context_->PSSetConstantBuffers(0, now ? 3 : 1, buffers);
     context_->Draw(3, 0);
     ID3D11ShaderResourceView* empty_srv = nullptr;
     context_->PSSetShaderResources(0, 1, &empty_srv);

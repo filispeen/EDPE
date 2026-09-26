@@ -177,5 +177,40 @@ int main() {
     const auto* shader_values = static_cast<const float*>(camera_map.pData);
     const bool shader_read = shader_values[0] == 19.5594f && shader_values[1] == .025f;
     context->Unmap(camera_result_readback.Get(), 0);
-    return shader_read ? 0 : 25;
+    if (!shader_read) return 25;
+
+    // The game CB stores scaled basis columns at float offsets 1080..1091,
+    // translation at 935/939/943 and reversed-Z depthB at 1094.
+    auto pack_camera = [](const edpe::CameraProjection& camera) {
+        std::array<float, 1344> words{};
+        for (unsigned row = 0; row < 3; ++row) {
+            words[932 + row * 4 + 3] = camera.worldFromView[row * 4 + 3];
+            words[1080 + row * 4] = camera.worldFromView[row * 4] * camera.scaleX;
+            words[1081 + row * 4] = camera.worldFromView[row * 4 + 1] * camera.scaleY;
+            words[1083 + row * 4] = camera.worldFromView[row * 4 + 2];
+        }
+        words[1094] = camera.depthB;
+        return words;
+    };
+    const auto now_words = pack_camera(now);
+    const auto previous_words = pack_camera(previous);
+    camera_desc.Usage = D3D11_USAGE_DEFAULT;
+    camera_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    camera_desc.CPUAccessFlags = 0;
+    ComPtr<ID3D11Buffer> previous_gpu_camera;
+    if (FAILED(device->CreateBuffer(&camera_desc, nullptr, &previous_gpu_camera))) return 26;
+    context->UpdateSubresource(gpu_camera.Get(), 0, nullptr, now_words.data(), 0, 0);
+    context->UpdateSubresource(previous_gpu_camera.Get(), 0, nullptr,
+        previous_words.data(), 0, 0);
+    if (!pass.renderGpuCameras(depth_view.Get(), gpu_camera.Get(),
+            previous_gpu_camera.Get(), 4, 4)) return 27;
+    context->CopyResource(readback.Get(), output.Get());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 28;
+    valid = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch + 4);
+    const float gpu_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
+    const float gpu_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
+    context->Unmap(readback.Get(), 0);
+    return std::fabs(gpu_x - expected_x) < .01f &&
+        std::fabs(gpu_y - expected_y) < .01f ? 0 : 29;
 }
