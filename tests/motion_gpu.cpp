@@ -1,6 +1,7 @@
 #include "motion_pass.h"
 
 #include <DirectXPackedVector.h>
+#include <d3dcompiler.h>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -131,5 +132,50 @@ int main() {
     const bool camera_copied = camera_words[932] == 19.5594f &&
         camera_words[1094] == .025f;
     context->Unmap(verify_camera.Get(), 0);
-    return camera_copied ? 0 : 20;
+    if (!camera_copied) return 20;
+
+    static constexpr char camera_shader[] = R"(
+        cbuffer Camera : register(b0) { float4 words[336]; };
+        RWTexture2D<float4> result : register(u0);
+        [numthreads(1, 1, 1)]
+        void main(uint3 id : SV_DispatchThreadID) {
+            result[id.xy] = float4(words[233].x, words[273].z, 0, 1);
+        }
+    )";
+    ComPtr<ID3DBlob> code;
+    ComPtr<ID3D11ComputeShader> shader;
+    if (FAILED(D3DCompile(camera_shader, sizeof(camera_shader) - 1, nullptr,
+            nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, nullptr)) ||
+        FAILED(device->CreateComputeShader(code->GetBufferPointer(),
+            code->GetBufferSize(), nullptr, &shader))) return 21;
+    D3D11_TEXTURE2D_DESC camera_result_desc{};
+    camera_result_desc.Width = camera_result_desc.Height = 1;
+    camera_result_desc.MipLevels = camera_result_desc.ArraySize = 1;
+    camera_result_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    camera_result_desc.SampleDesc.Count = 1;
+    camera_result_desc.Usage = D3D11_USAGE_DEFAULT;
+    camera_result_desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    ComPtr<ID3D11Texture2D> camera_result, camera_result_readback;
+    ComPtr<ID3D11UnorderedAccessView> camera_result_uav;
+    if (FAILED(device->CreateTexture2D(&camera_result_desc, nullptr, &camera_result)) ||
+        FAILED(device->CreateUnorderedAccessView(camera_result.Get(), nullptr,
+            &camera_result_uav))) return 22;
+    camera_result_desc.Usage = D3D11_USAGE_STAGING;
+    camera_result_desc.BindFlags = 0;
+    camera_result_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device->CreateTexture2D(&camera_result_desc, nullptr,
+            &camera_result_readback))) return 23;
+    auto* gpu_cb = gpu_camera.Get();
+    auto* uav = camera_result_uav.Get();
+    context->CSSetShader(shader.Get(), nullptr, 0);
+    context->CSSetConstantBuffers(0, 1, &gpu_cb);
+    context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+    context->Dispatch(1, 1, 1);
+    context->CopyResource(camera_result_readback.Get(), camera_result.Get());
+    if (FAILED(context->Map(camera_result_readback.Get(), 0, D3D11_MAP_READ, 0,
+            &camera_map))) return 24;
+    const auto* shader_values = static_cast<const float*>(camera_map.pData);
+    const bool shader_read = shader_values[0] == 19.5594f && shader_values[1] == .025f;
+    context->Unmap(camera_result_readback.Get(), 0);
+    return shader_read ? 0 : 25;
 }

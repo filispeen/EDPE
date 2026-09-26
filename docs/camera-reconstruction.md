@@ -628,8 +628,11 @@ default-buffer copy has now been observed in Elite: in a user-confirmed
 were queued at binds 100 and 101, their downstream staging samples passed
 the camera parser at `afterPresent=18329/18330`, and the game, HUD, and F5
 menu continued normally. This verifies the one-shot copy path in that run;
-motion still uses the staging-parsed CPU camera. Shader consumption remains
-unbuilt.
+motion still uses the staging-parsed CPU camera. A separate WARP compute
+test now binds the copied default buffer as a shader constant buffer and
+reads observed offsets 932 and 1094, checking their values through a 1×1
+test texture. This verifies shader addressability of the GPU copy in WARP;
+Elite motion-shader consumption remains unbuilt.
 
 **MEASURED / EXPERIMENTAL (2026-09-26, Elite Odyssey; game build not
 rechecked):** During three user-requested motion captures with a turning
