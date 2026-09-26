@@ -156,6 +156,18 @@ not prove that Elite used this camera for every depth-writing draw.
 
 ## Limits
 
+**VERIFIED / MEASURED (Elite Odyssey, 2026-09-26; game build not
+rechecked):** With the additional GPU camera-buffer copy, the user again
+reported a visible motion snapshot and normal game operation. Both camera
+samples passed parsing at `afterPresent=18329/18330`. Center raw depth was
+about `4.192e-11` in both frames, which corresponds to a very distant
+view-axis point under the experimental `0.025/depth` formula. The 5×5
+motion grid had 25 finite values, 14 over 1 pixel and 12 over 10 pixels;
+X ranged from `-84.3125` to `0.00891113`, Y from `-13.7422` to `21.1094`.
+This capture supports GPU-copy availability and continued rendering. It
+does not validate motion on nearby world geometry or classify the distant
+center pixel as sky.
+
 The module runs in Elite only after an explicit experimental F5 request.
 The F5 motion snapshot displays its GPU texture through a signed-color
 preview. It has been seen in Elite, but the large saturated regions need

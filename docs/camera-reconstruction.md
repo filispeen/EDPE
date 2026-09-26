@@ -623,8 +623,13 @@ scene rendering. For one-shot pair requests EDPE now queues that
 default-buffer copy before the existing staging copy, then retains both
 GPU buffers until the next request or swap-chain release. The WARP proxy
 passes through this path and parses the resulting camera buffers. The
-default-buffer copy has not yet been observed in Elite; motion still uses
-the staging-parsed CPU camera. Shader consumption remains unbuilt.
+default-buffer copy has now been observed in Elite: in a user-confirmed
+3D capture on 2026-09-26 (game build not rechecked), both 5376-byte copies
+were queued at binds 100 and 101, their downstream staging samples passed
+the camera parser at `afterPresent=18329/18330`, and the game, HUD, and F5
+menu continued normally. This verifies the one-shot copy path in that run;
+motion still uses the staging-parsed CPU camera. Shader consumption remains
+unbuilt.
 
 **MEASURED / EXPERIMENTAL (2026-09-26, Elite Odyssey; game build not
 rechecked):** During three user-requested motion captures with a turning
