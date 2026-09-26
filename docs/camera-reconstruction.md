@@ -525,6 +525,22 @@ points in one gameplay frame. It does not prove a camera-to-depth match for
 every draw, infinite-far projection, Y orientation, or safe continuous
 capture. The parser remains diagnostic; runtime reprojection is disabled.
 
+**MEASURED (2026-09-26, user-triggered gameplay diagnostic; game build not
+rechecked):** A requested two-frame probe copied the 5376-byte VS slot-1
+buffer at the third bind of the same session-local scene DSV `#2` in two
+consecutive `Present` intervals. It completed twice: after `Present`
+15882/15883 and 16319/16320. All four copies passed the camera-field
+parser. Each pair kept the logged translation and depth coefficient
+`0.0250000004`, while rotation entries changed slightly. Parsed X/Y scales
+stayed within `0.0000004` of `0.9742787` and `1.7320510` respectively.
+The diagnostic generated no new images, consistent with the user's report.
+
+**LIMIT:** These are adjacent camera candidates sampled at one DSV boundary,
+not proven camera/depth pairs. The copies were requested for two intervals;
+they do not establish that the same buffer is available or valid on every
+rendered frame, nor whether the sampled orientation was used for every depth
+draw. No motion texture is generated.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
