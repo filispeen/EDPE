@@ -610,6 +610,17 @@ continuity through scene transitions. Runtime reprojection stays disabled.
 
 ## Required before runtime reprojection
 
+**SDK-DOCUMENTED / EXPERIMENTAL (2026-09-26):** D3D11
+[`CopyResource`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-copyresource)
+queues a GPU resource copy when source and destination are compatible and
+unmapped. The observed 5376-byte Elite camera buffer is a dynamic constant
+buffer; a default-usage buffer of the same size could retain one frame's
+contents for shader access. The standalone WARP test copies a synthetic
+5376-byte dynamic constant buffer to a default constant buffer, then reads
+it back only to verify the copy. This proves that copy route in the test
+device, not that the bind-3 Elite buffer is the correct camera throughout
+scene rendering. Runtime capture and shader consumption remain unbuilt.
+
 **MEASURED / EXPERIMENTAL (2026-09-26, Elite Odyssey; game build not
 rechecked):** During three user-requested motion captures with a turning
 camera, DSV `#2` and adjacent 5376-byte camera buffers were present, but

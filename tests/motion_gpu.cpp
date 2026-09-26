@@ -1,6 +1,7 @@
 #include "motion_pass.h"
 
 #include <DirectXPackedVector.h>
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -96,6 +97,39 @@ int main() {
     const float actual_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
     const float actual_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
     context->Unmap(readback.Get(), 0);
-    return std::fabs(actual_x - expected_x) < .01f &&
-           std::fabs(actual_y - expected_y) < .01f ? 0 : 14;
+    if (std::fabs(actual_x - expected_x) >= .01f ||
+        std::fabs(actual_y - expected_y) >= .01f) return 14;
+
+    // The observed 5376-byte dynamic camera CB can be retained on the GPU.
+    D3D11_BUFFER_DESC camera_desc{};
+    camera_desc.ByteWidth = 5376;
+    camera_desc.Usage = D3D11_USAGE_DYNAMIC;
+    camera_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    camera_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ComPtr<ID3D11Buffer> game_camera, gpu_camera, verify_camera;
+    if (FAILED(device->CreateBuffer(&camera_desc, nullptr, &game_camera))) return 15;
+    D3D11_MAPPED_SUBRESOURCE camera_map{};
+    if (FAILED(context->Map(game_camera.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+            &camera_map))) return 16;
+    auto* camera_words = static_cast<float*>(camera_map.pData);
+    std::fill_n(camera_words, 5376 / sizeof(float), 0.0f);
+    camera_words[932] = 19.5594f;
+    camera_words[1094] = .025f;
+    context->Unmap(game_camera.Get(), 0);
+    camera_desc.Usage = D3D11_USAGE_DEFAULT;
+    camera_desc.CPUAccessFlags = 0;
+    if (FAILED(device->CreateBuffer(&camera_desc, nullptr, &gpu_camera))) return 17;
+    camera_desc.Usage = D3D11_USAGE_STAGING;
+    camera_desc.BindFlags = 0;
+    camera_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device->CreateBuffer(&camera_desc, nullptr, &verify_camera))) return 18;
+    context->CopyResource(gpu_camera.Get(), game_camera.Get());
+    context->CopyResource(verify_camera.Get(), gpu_camera.Get());
+    if (FAILED(context->Map(verify_camera.Get(), 0, D3D11_MAP_READ, 0,
+            &camera_map))) return 19;
+    camera_words = static_cast<float*>(camera_map.pData);
+    const bool camera_copied = camera_words[932] == 19.5594f &&
+        camera_words[1094] == .025f;
+    context->Unmap(verify_camera.Get(), 0);
+    return camera_copied ? 0 : 20;
 }
