@@ -130,8 +130,18 @@ exceeded 10 pixels, X ranged from `-2.34961` to `83.9375`, and Y from
 These magnitudes explain why the 0.1-pixel preview mapping nearly saturates
 large regions; they do not establish that motion direction or scale is
 correct for every pixel. The F5 preview now uses a 10-pixel mapping so
-variation across the measured range is visible; this display change has not
-yet been checked in Elite.
+variation across the measured range is visible.
+
+**VERIFIED / MEASURED (Elite Odyssey, 2026-09-26; game build not
+rechecked):** The user repeated the capture with the 10-pixel preview and
+reported visibly more color variation and normal game operation. The log
+shows two valid camera samples at `afterPresent=23540/23541`, a successful
+motion pass and UI handoff, and restoration of the DSV observer. Its 5×5
+grid contained 25 finite values; 12 exceeded 1 pixel and 10 exceeded 10
+pixels. X ranged from `0` to `72.125`, Y from `-51.125` to `0`, and the
+center was `(0.993164,-2.48242)` render pixels. The preview is now useful
+for seeing scene structure, while camera/depth association for every draw
+remains unverified.
 
 **MEASURED OFFLINE CHECK (same capture):** Using the logged projection
 columns divided by their logged X/Y scales as the current and previous
