@@ -541,7 +541,8 @@ they do not establish that the same buffer is available or valid on every
 rendered frame, nor whether the sampled orientation was used for every depth
 draw. No motion texture is generated.
 
-**MEASURED (2026-09-26, user-confirmed gameplay; game build not rechecked):**
+**MEASURED (2026-09-26, user-confirmed 3D scene; menu/gameplay location not
+recorded; game build not rechecked):**
 The same two-frame probe also copied the selected DSV at `Present` and read
 its center raw depth asynchronously. In the first pair, session-local DSV
 `#2` produced finite center values `0.000302753208` and `0.000302759407`
@@ -570,6 +571,21 @@ center rays need not hit exactly the same surface point. Logged camera
 translation stayed fixed and rotation changed only slightly, so this fit
 cannot independently establish motion direction, scale, or behavior during
 rapid camera movement.
+
+**MEASURED (2026-09-26, user-confirmed main-menu 3D scene; game build not
+rechecked):** The user captured a rotating menu camera, not ship movement.
+Two requested pairs selected session-local DSV `#2`, after `Present`
+13329/13330 and 14389/14390. All four camera samples passed the parser,
+and all four `2560×1440` center-depth values were finite, near `0.000304`.
+Within each adjacent pair, the three camera translation entries printed
+identically to four decimal places; rotation entries changed slightly. The
+candidate center-point world positions differed by about `0.00096` and
+`0.00104` scene units using the logged rounded rows and raw depths.
+
+**LIMIT:** These samples test the rotating main-menu scene only. They do not
+verify camera translation, camera/depth correspondence during gameplay, or
+motion-vector direction. They confirm that the frame-labelled camera and
+depth readbacks remained available and the game continued running.
 
 ## Required before runtime reprojection
 
