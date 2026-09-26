@@ -610,6 +610,19 @@ continuity through scene transitions. Runtime reprojection stays disabled.
 
 ## Required before runtime reprojection
 
+**MEASURED / EXPERIMENTAL (2026-09-26, Elite Odyssey; game build not
+rechecked):** During three user-requested motion captures with a turning
+camera, DSV `#2` and adjacent 5376-byte camera buffers were present, but
+the parser rejected all six samples. In one logged sample, the Y entry of
+the projection block differed from the same rotation row multiplied by its
+fitted scale by about `0.0034`, above the former `0.002` threshold. The
+projection block and unscaled rotation rows appear to update at slightly
+different moments. The diagnostic parser now derives the orientation and
+X/Y scales from the projection block itself, uses translation from the
+unscaled rows, and rejects pairs whose normalized directions differ by
+more than `0.02`. This is tested with synthetic skew and WARP, but has not
+yet been retested in Elite. It does not establish a production camera source.
+
 Verify which buffer update and scene pass provide the camera for each depth
 frame, including scene transitions. Verify projection X/Y, Y orientation,
 near/far behavior, and whether a previous-camera transform can be captured

@@ -31,30 +31,33 @@ inline bool parseEliteCamera(const float* words, size_t count, CameraProjection*
         }
     }
 
-    double xNumerator = 0, xDenominator = 0, yNumerator = 0, yDenominator = 0;
+    double xLength = 0, yLength = 0;
     for (size_t row = 0; row < 3; ++row) {
-        const double x = words[932 + row * 4];
-        const double y = words[933 + row * 4];
-        xNumerator += x * words[1080 + row * 4];
-        xDenominator += x * x;
-        yNumerator += y * words[1081 + row * 4];
-        yDenominator += y * y;
+        const double x = words[1080 + row * 4];
+        const double y = words[1081 + row * 4];
+        xLength += x * x;
+        yLength += y * y;
     }
-    const double scaleX = xNumerator / xDenominator;
-    const double scaleY = yNumerator / yDenominator;
+    const double scaleX = std::sqrt(xLength);
+    const double scaleY = std::sqrt(yLength);
     if (!(scaleX > 0 && scaleY > 0 && words[1094] > 0 && words[1094] <= 1)) return false;
 
+    // During a rapid turn the unscaled rows can lag the projection block.
+    // Take the coherent orientation from the block, retaining its row translation.
     for (size_t row = 0; row < 3; ++row) {
         const size_t c = 932 + row * 4, p = 1080 + row * 4;
-        if (std::fabs(words[p] - scaleX * words[c]) > 0.002 ||
-            std::fabs(words[p + 1] - scaleY * words[c + 1]) > 0.002 ||
+        if (std::fabs(words[p] / scaleX - words[c]) > 0.02 ||
+            std::fabs(words[p + 1] / scaleY - words[c + 1]) > 0.02 ||
             std::fabs(words[p + 2]) > 0.002 ||
-            std::fabs(words[p + 3] - words[c + 2]) > 0.002) return false;
+            std::fabs(words[p + 3] - words[c + 2]) > 0.02) return false;
+        camera->worldFromView[row * 4] = static_cast<float>(words[p] / scaleX);
+        camera->worldFromView[row * 4 + 1] = static_cast<float>(words[p + 1] / scaleY);
+        camera->worldFromView[row * 4 + 2] = words[p + 3];
+        camera->worldFromView[row * 4 + 3] = words[c + 3];
     }
     if (std::fabs(words[1092]) > 0.002 || std::fabs(words[1093]) > 0.002 ||
         std::fabs(words[1095]) > 0.002) return false;
 
-    for (size_t i = 0; i < 12; ++i) camera->worldFromView[i] = words[932 + i];
     camera->scaleX = static_cast<float>(scaleX);
     camera->scaleY = static_cast<float>(scaleY);
     camera->depthB = words[1094];

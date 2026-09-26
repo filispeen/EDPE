@@ -49,8 +49,27 @@ int main() {
     if (!edpe::parseEliteCamera(scene.data(), scene.size(), &parsed) ||
         std::fabs(parsed.scaleX - std::sqrt(3.0f) * 1440 / 2560) > 0.001f ||
         std::fabs(parsed.scaleY - std::sqrt(3.0f)) > 0.001f) return 7;
-    scene[1083] += .01f;
+    scene[1083] += .1f;
     if (edpe::parseEliteCamera(scene.data(), scene.size(), &parsed)) return 8;
+    scene[1083] -= .1f;
+    // The projection orientation may be one update ahead during a turn.
+    scene[1089] -= .0048f;
+    scene[1087] += .002f;
+    if (!edpe::parseEliteCamera(scene.data(), scene.size(), &parsed) ||
+        std::fabs(parsed.worldFromView[9] - scene[1089] / parsed.scaleY) > .0001f) return 9;
+    scene.fill(0);
+    const float turning_rows[]{.974892f, .148231f, .166172f, 4.80449f,
+                               -.152375f, .988245f, .0124005f, 4.34171f,
+                               -.16238f, -.0374095f, .986019f, 24.7976f};
+    const float turning_block[]{.949832499f, .255993724f, 0, .166460797f,
+                                -.148358271f, 1.71167052f, 0, .0143891573f,
+                                -.158198923f, -.0682011172f, 0, .985943079f,
+                                0, 0, .0250000004f, 0};
+    for (size_t i = 0; i < 12; ++i) scene[932 + i] = turning_rows[i];
+    for (size_t i = 0; i < 16; ++i) scene[1080 + i] = turning_block[i];
+    if (!edpe::parseEliteCamera(scene.data(), scene.size(), &parsed) ||
+        std::fabs(parsed.worldFromView[9] - turning_block[9] / parsed.scaleY) > .0001f)
+        return 10;
 
     const auto first = edpe::projectionJitter(0, 100, 50);
     const auto second = edpe::projectionJitter(1, 100, 50);
