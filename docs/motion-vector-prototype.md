@@ -49,6 +49,14 @@ this production module twice, checks `(2,-2)` and zero-depth output, confirms
 that the same output resource is reused, and checks that the original viewport
 and topology survive both draws. All four project tests passed.
 
+**VERIFIED (Release WARP camera-matrix parity test):** With row-major camera
+rows and projection scales recorded in a user-confirmed Odyssey scene capture,
+the test applies a synthetic `(+2.5,-1.25)` world-space camera translation.
+At one depth pixel it compares the GPU half-float motion to EDPE's CPU
+`cameraDepthMotion` result; both axes agree within `0.01` render pixel. This
+checks the shader's matrix order against the CPU implementation for an
+observed orientation. It does not verify motion from two actual Elite frames.
+
 ## Limits
 
 The module is compiled into `dxgi.dll` but is not called inside Elite. It

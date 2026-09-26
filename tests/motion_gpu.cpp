@@ -1,7 +1,9 @@
 #include "motion_pass.h"
 
+#include <DirectXPackedVector.h>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 
 using Microsoft::WRL::ComPtr;
@@ -73,5 +75,27 @@ int main() {
     const bool correct = invalid[0] == 0 && invalid[1] == 0 &&
         valid[0] == 0x4000 && valid[1] == 0xC000;
     context->Unmap(readback.Get(), 0);
-    return correct ? 0 : 10;
+    if (!correct) return 10;
+
+    // Camera rows and projection scales from a user-confirmed Odyssey scene capture.
+    previous = {{-.965338f,-.0708149f,-.251214f,19.5594f,
+                 -.00114341f,.963628f,-.267244f,-39.2084f,
+                 .261002f,-.257694f,-.930307f,-99.7282f},
+                .974278629f,1.73205078f,.0250000004f};
+    now = previous;
+    now.worldFromView[3] += 2.5f;
+    now.worldFromView[7] -= 1.25f;
+    float expected_x = 0, expected_y = 0;
+    if (!edpe::cameraDepthMotion(now, previous, 4, 4, 1, 1, .0025f,
+            &expected_x, &expected_y)) return 11;
+    if (!pass.render(depth_view.Get(), now, previous, 4, 4)) return 12;
+    context->CopyResource(readback.Get(), output.Get());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 13;
+    valid = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch + 4);
+    const float actual_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
+    const float actual_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
+    context->Unmap(readback.Get(), 0);
+    return std::fabs(actual_x - expected_x) < .01f &&
+           std::fabs(actual_y - expected_y) < .01f ? 0 : 14;
 }
