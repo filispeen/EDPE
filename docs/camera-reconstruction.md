@@ -541,6 +541,24 @@ they do not establish that the same buffer is available or valid on every
 rendered frame, nor whether the sampled orientation was used for every depth
 draw. No motion texture is generated.
 
+**MEASURED (2026-09-26, user-confirmed gameplay; game build not rechecked):**
+The same two-frame probe also copied the selected DSV at `Present` and read
+its center raw depth asynchronously. In the first pair, session-local DSV
+`#2` produced finite center values `0.000302753208` and `0.000302759407`
+at `2560×1440`, associated by `afterPresent=14216/14217` with two valid
+camera-buffer samples. Both reported `depthB=0.0250000004` and X/Y scales
+near `0.9742787/1.73205125`; their rotation rows changed slightly while
+the logged translation stayed fixed. Fourteen further requested pairs in the
+same run also logged two valid camera candidates and two finite depth values.
+The user reported that Elite and the F5 menu remained open; the probe did
+not create images by design. A Release WARP smoke test independently checked
+that two synthetic depth clears, `0.25` and `0.5`, are read in order.
+
+**LIMIT:** This demonstrates frame-labelled camera and depth observations,
+not that the sampled camera produced the depth values or that `Present` is
+the correct temporal handoff. The current diagnostic copies a full depth
+texture only when requested; it is not a production motion-vector path.
+
 ## Required before runtime reprojection
 
 Verify which buffer update and scene pass provide the camera for each depth
