@@ -24,6 +24,13 @@ current camera +10 units in X and Y while leaving the previous camera at
 the origin produced exactly `(2,-2)` in the half-float output. A zero-depth
 pixel produced `(0,0)`. All four project tests passed.
 
+**VERIFIED (Release WARP state test):** The motion draw runs under a separate
+`ID3DDeviceContextState`. After switching back, the test observes its prior
+vertex shader, line topology, and viewport unchanged. Microsoft documents
+[`SwapDeviceContextState`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11_1/nf-d3d11_1-id3d11devicecontext1-swapdevicecontextstate)
+as a way for plug-ins to save and restore application state on the immediate
+context. The runtime path must check D3D11.1 availability and fail open.
+
 ## Limits
 
 The shader is used only by the standalone test. It does not run inside Elite,

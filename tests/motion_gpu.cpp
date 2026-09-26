@@ -1,6 +1,6 @@
 #include "motion_shader.h"
 
-#include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <array>
@@ -76,6 +76,20 @@ int main() {
     ComPtr<ID3D11Buffer> camera;
     if (FAILED(device->CreateBuffer(&buffer_desc, &buffer_data, &camera))) return 8;
 
+    ComPtr<ID3D11Device1> device1;
+    ComPtr<ID3D11DeviceContext1> context1;
+    ComPtr<ID3DDeviceContextState> motion_state;
+    const auto level = device->GetFeatureLevel();
+    if (FAILED(device.As(&device1)) || FAILED(context.As(&context1)) ||
+        FAILED(device1->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION,
+            __uuidof(ID3D11Device1), nullptr, &motion_state))) return 11;
+    const D3D11_VIEWPORT prior_viewport{0, 0, 2, 2, 0, 1};
+    context->VSSetShader(vertex.Get(), nullptr, 0);
+    context->RSSetViewports(1, &prior_viewport);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+    ComPtr<ID3DDeviceContextState> prior_state;
+    context1->SwapDeviceContextState(motion_state.Get(), &prior_state);
+
     const D3D11_VIEWPORT viewport{0, 0, 4, 4, 0, 1};
     auto* rtv = motion_view.Get();
     auto* srv = depth_view.Get();
@@ -89,6 +103,17 @@ int main() {
     context->PSSetConstantBuffers(0, 1, &cb);
     context->Draw(3, 0);
     context->OMSetRenderTargets(0, nullptr, nullptr);
+    context1->SwapDeviceContextState(prior_state.Get(), nullptr);
+    ComPtr<ID3D11VertexShader> restored_vertex;
+    D3D11_PRIMITIVE_TOPOLOGY restored_topology{};
+    UINT restored_count = 1;
+    D3D11_VIEWPORT restored_viewport{};
+    context->VSGetShader(&restored_vertex, nullptr, nullptr);
+    context->IAGetPrimitiveTopology(&restored_topology);
+    context->RSGetViewports(&restored_count, &restored_viewport);
+    if (restored_vertex.Get() != vertex.Get() ||
+        restored_topology != D3D11_PRIMITIVE_TOPOLOGY_LINELIST ||
+        restored_count != 1 || restored_viewport.Width != 2) return 12;
     context->CopyResource(readback.Get(), motion.Get());
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
