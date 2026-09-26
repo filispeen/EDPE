@@ -173,10 +173,18 @@ The F5 motion snapshot displays its GPU texture through a signed-color
 preview. It has been seen in Elite, but the large saturated regions need
 numeric and moving-scene validation. The camera is still a
 bind-3 candidate, not the verified camera for every depth-writing draw.
-The diagnostic still reads back 5376-byte camera buffers and a sparse
-output grid asynchronously; this is not the production GPU-only camera path.
-Jitter is excluded. The in-game depth/camera pairing and moving-cockpit
-measurements are in
+**WARP-VERIFIED (2026-09-26):** A second motion shader reads the two retained
+5376-byte camera constant buffers directly on the GPU. A synthetic buffer
+with the observed Elite offsets produces the same motion at a tested pixel
+as the CPU-parsed path within 0.01 render pixel. The one-shot Elite capture
+now selects this shader when both GPU copies exist and otherwise uses the
+previous CPU path. Elite output from this new path still needs a game check.
+
+The diagnostic still reads back 5376-byte camera buffers to validate their
+contents and a sparse output grid asynchronously. These readbacks are
+one-shot diagnostics, not part of a production GPU-only camera path. Jitter
+is excluded. The in-game depth/camera pairing and moving-cockpit measurements
+are in
 [camera-reconstruction.md](camera-reconstruction.md). Runtime integration
-still needs GPU-side camera capture and moving-scene visual validation
-before any upscaler receives motion.
+still needs verification of this GPU-camera path in Elite and moving-scene
+validation before any upscaler receives motion.

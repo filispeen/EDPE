@@ -646,8 +646,16 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         }
         motion_pass = std::move(candidate);
     }
-    if (!motion_pass->render(motion_depth_view.Get(), motion_cameras[1],
-            motion_cameras[0], desc.Width, desc.Height)) {
+    const bool gpu_cameras = gpu_camera_pair[0] && gpu_camera_pair[1];
+    const bool gpu_rendered = gpu_cameras && motion_pass->renderGpuCameras(
+        motion_depth_view.Get(), gpu_camera_pair[1].Get(), gpu_camera_pair[0].Get(),
+        desc.Width, desc.Height);
+    const bool rendered = gpu_rendered || motion_pass->render(motion_depth_view.Get(),
+        motion_cameras[1], motion_cameras[0], desc.Width, desc.Height);
+    EdpeLog(gpu_rendered ? L"EDPE: motion candidate used GPU camera buffers" :
+        L"EDPE: motion candidate used CPU camera fallback");
+    gpu_camera_pair = {};
+    if (!rendered) {
         EdpeLog(L"EDPE: motion candidate unavailable (GPU motion draw rejected inputs)");
         motion_pair_active = false;
         motion_depth.Reset();
