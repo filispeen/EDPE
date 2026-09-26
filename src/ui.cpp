@@ -532,6 +532,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.depth_candidate = scene_candidate;
         ContextCensusRequestDepthSnapshot(static_cast<unsigned>(scene_candidate));
     }
+    if (ImGui::Button("Capture adjacent camera frames (experimental)"))
+        ContextCensusRequestCameraPair(static_cast<unsigned>(scene_candidate));
     if (scene_candidate < 0) ImGui::EndDisabled();
     if (scene_candidate < 0) ImGui::TextDisabled("No unique recent scene MRT/HDR signature; use manual index");
     if (ui.depth_srv) {

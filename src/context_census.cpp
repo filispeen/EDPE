@@ -12,6 +12,8 @@
 namespace {
 constexpr size_t kVSSetConstantBuffers = 7;
 constexpr size_t kOMSetRenderTargets = 33;
+constexpr unsigned kPairFirstSample = 100;
+constexpr unsigned kPairSecondSample = 101;
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
 using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
@@ -57,14 +59,20 @@ unsigned long long snapshot_armed_after = 0;
 unsigned long long snapshot_first_bind_after = 0;
 unsigned long long snapshot_last_bind_after = 0;
 unsigned snapshot_bind_count = 0;
+int camera_pair_queued = -1;
+int camera_pair_target = -1;
+unsigned long long camera_pair_armed_after = 0;
+unsigned long long camera_pair_bind_frame = ~0ull;
+unsigned camera_pair_bind_count = 0;
 struct ConstantBufferSample {
     ID3D11Buffer* buffer = nullptr;
     unsigned bind = 0;
+    unsigned long long after_present = 0;
     unsigned wait = 0;
     std::atomic<bool> claimed{false};
     std::atomic<bool> ready{false};
 };
-std::array<ConstantBufferSample, 6> constant_buffer_samples{}; // Requested binds 2, 3, 4, 6, and in-pass VS binds 1 and 51.
+std::array<ConstantBufferSample, 8> constant_buffer_samples{}; // Six snapshot probes and two adjacent-frame probes.
 struct PipelineSample {
     ID3D11Query* query = nullptr;
     unsigned bind = 0;
@@ -232,8 +240,11 @@ void recordBind(int index) {
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal) {
-    auto& sample = constant_buffer_samples[bind_ordinal == 51 ? 5
-        : bind_ordinal == 0 ? 4 : bind_ordinal == 6 ? 3 : bind_ordinal - 2];
+    const unsigned slot = bind_ordinal == kPairFirstSample || bind_ordinal == kPairSecondSample
+        ? 6 + bind_ordinal - kPairFirstSample
+        : bind_ordinal == 51 ? 5 : bind_ordinal == 0 ? 4
+        : bind_ordinal == 6 ? 3 : bind_ordinal - 2;
+    auto& sample = constant_buffer_samples[slot];
     bool expected = false;
     if (!sample.claimed.compare_exchange_strong(expected, true)) return;
     ID3D11Device* device = nullptr;
@@ -254,6 +265,7 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
     context->CopyResource(staging, source);
     sample.buffer = staging;
     sample.bind = bind_ordinal;
+    sample.after_present = last_present_frame.load(std::memory_order_relaxed);
     sample.wait = 0;
     sample.ready.store(true, std::memory_order_release);
 }
@@ -311,8 +323,8 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
                 edpe::CameraProjection camera{};
                 const bool parsed = edpe::parseEliteCamera(values, 5376 / sizeof(float), &camera);
                 swprintf_s(message,
-                    L"EDPE: scene camera candidate bind=%u valid=%u scale=(%.9g,%.9g) depthB=%.9g",
-                    sample.bind, parsed, camera.scaleX, camera.scaleY, camera.depthB);
+                    L"EDPE: scene camera candidate afterPresent=%llu bind=%u valid=%u scale=(%.9g,%.9g) depthB=%.9g",
+                    sample.after_present, sample.bind, parsed, camera.scaleX, camera.scaleY, camera.depthB);
                 EdpeLog(message);
                 if (sample.bind == 6) for (size_t offset = 0; offset < 5376 / sizeof(float); offset += 32) {
                     wchar_t words[320];
@@ -363,6 +375,22 @@ void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index,
             buffers[slot]->Release();
         }
     }
+}
+
+void queueCameraPairSample(ID3D11DeviceContext* context, unsigned sample_label) {
+    ID3D11Buffer* buffer = nullptr;
+    context->VSGetConstantBuffers(1, 1, &buffer);
+    if (!buffer) {
+        EdpeLog(L"EDPE: adjacent camera sample unavailable (VS slot 1 empty)");
+        return;
+    }
+    D3D11_BUFFER_DESC desc{};
+    buffer->GetDesc(&desc);
+    if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC)
+        queueConstantBufferSample(context, buffer, desc, sample_label);
+    else
+        EdpeLog(L"EDPE: adjacent camera sample unavailable (unexpected buffer)");
+    buffer->Release();
 }
 
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,
@@ -429,6 +457,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     bool first_bind = false;
     bool first_color = false;
     unsigned snapshot_probe_bind = 0;
+    unsigned camera_pair_sample = 0;
     {
         std::lock_guard lock(seen_mutex);
         while (index < seen_count && seen[index].view != dsv) ++index;
@@ -474,6 +503,19 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             ++snapshot_bind_count;
             snapshot_probe_bind = snapshot_bind_count;
         }
+        if (camera_pair_target == static_cast<int>(index)) {
+            const auto frame = last_present_frame.load(std::memory_order_relaxed);
+            if (frame == camera_pair_armed_after || frame == camera_pair_armed_after + 1) {
+                if (camera_pair_bind_frame != frame) {
+                    camera_pair_bind_frame = frame;
+                    camera_pair_bind_count = 0;
+                }
+                if (++camera_pair_bind_count == 3 && scene_mrt &&
+                    seen[index].mrt_frame == frame && seen[index].mrt_hdr_view)
+                    camera_pair_sample = frame == camera_pair_armed_after
+                        ? kPairFirstSample : kPairSecondSample;
+            }
+        }
         if (count && targets && targets[0] && !seen[index].color_logged) {
             seen[index].color_logged = true;
             first_color = true;
@@ -486,6 +528,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         logBoundConstantBuffers(context, index, snapshot_probe_bind);
         if (snapshot_probe_bind == 2) beginVSBufferProbe();
     }
+    if (camera_pair_sample) queueCameraPairSample(context, camera_pair_sample);
 
     if (!first_bind && !first_color) return;
 
@@ -560,6 +603,22 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         pollConstantBufferSamples(observed_context.load(std::memory_order_acquire));
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
         last_present_frame.store(frame, std::memory_order_relaxed);
+    if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
+        int finished_pair = -1;
+        {
+            std::lock_guard lock(seen_mutex);
+            if (camera_pair_target >= 0 && frame >= camera_pair_armed_after + 2) {
+                finished_pair = camera_pair_target;
+                camera_pair_target = -1;
+            }
+        }
+        if (finished_pair >= 0) {
+            wchar_t message[128];
+            swprintf_s(message, L"EDPE: adjacent camera probe finished DSV #%d at Present %llu",
+                finished_pair, frame);
+            EdpeLog(message);
+        }
+    }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
         snapshot_waiting.load(std::memory_order_acquire)) {
         bool expired = false;
@@ -659,6 +718,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
 void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
     if ((flags & DXGI_PRESENT_TEST) || !patched_table || observed_swap_chain != swap_chain) return;
     const bool arm_sequence = sequence_requested.exchange(false, std::memory_order_acq_rel);
+    int armed_pair = -1;
     {
         std::lock_guard lock(seen_mutex);
         if (arm_sequence) {
@@ -676,8 +736,22 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             snapshot_first_bind_after = snapshot_last_bind_after = 0;
             snapshot_bind_count = 0;
         }
+        if (camera_pair_queued >= 0) {
+            camera_pair_target = camera_pair_queued;
+            camera_pair_queued = -1;
+            camera_pair_armed_after = last_present_frame.load(std::memory_order_relaxed);
+            camera_pair_bind_frame = ~0ull;
+            camera_pair_bind_count = 0;
+            armed_pair = camera_pair_target;
+        }
     }
     if (arm_sequence) EdpeLog(L"EDPE: one-frame DSV bind sequence armed after overlay");
+    if (armed_pair >= 0) {
+        wchar_t message[128];
+        swprintf_s(message, L"EDPE: adjacent camera probe armed DSV #%d after Present %llu",
+            armed_pair, camera_pair_armed_after);
+        EdpeLog(message);
+    }
 }
 
 bool ContextCensusRequestBindSequence() {
@@ -694,7 +768,8 @@ bool ContextCensusBindSequenceAvailable() {
 namespace {
 bool depthSnapshotAvailableLocked(unsigned index) {
     if (!patched_table || index >= seen_count || snapshot_queued >= 0 ||
-        snapshot_active >= 0 || snapshot_view) return false;
+        snapshot_active >= 0 || snapshot_view || camera_pair_queued >= 0 ||
+        camera_pair_target >= 0) return false;
     const auto& candidate = seen[index];
     return candidate.samples == 1 &&
         (candidate.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS ||
@@ -712,6 +787,13 @@ bool ContextCensusRequestDepthSnapshot(unsigned index) {
 bool ContextCensusDepthSnapshotAvailable(unsigned index) {
     std::lock_guard lock(seen_mutex);
     return depthSnapshotAvailableLocked(index);
+}
+
+bool ContextCensusRequestCameraPair(unsigned index) {
+    std::lock_guard lock(seen_mutex);
+    if (!depthSnapshotAvailableLocked(index)) return false;
+    camera_pair_queued = static_cast<int>(index);
+    return true;
 }
 
 int ContextCensusSceneDepthCandidate() {
@@ -793,6 +875,10 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         snapshot_index = -1;
         snapshot_armed_after = snapshot_first_bind_after = snapshot_last_bind_after = 0;
         snapshot_bind_count = 0;
+        camera_pair_queued = -1;
+        camera_pair_target = -1;
+        camera_pair_bind_frame = ~0ull;
+        camera_pair_bind_count = 0;
     }
     sequence_active.store(false, std::memory_order_release);
     sequence_requested.store(false, std::memory_order_release);
