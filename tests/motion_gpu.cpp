@@ -211,6 +211,30 @@ int main() {
     const float gpu_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
     const float gpu_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
     context->Unmap(readback.Get(), 0);
-    return std::fabs(gpu_x - expected_x) < .01f &&
-        std::fabs(gpu_y - expected_y) < .01f ? 0 : 29;
+    if (std::fabs(gpu_x - expected_x) >= .01f ||
+        std::fabs(gpu_y - expected_y) >= .01f) return 29;
+
+    // A camera turn exercises different current and previous projection bases.
+    constexpr float cosine = .965925826f, sine = .258819045f;
+    previous = {{1,0,0,0, 0,1,0,0, 0,0,1,0}, .974278629f,1.73205078f,.025f};
+    now = {{cosine,0,sine,0, 0,1,0,0, -sine,0,cosine,0},
+        previous.scaleX, previous.scaleY, previous.depthB};
+    if (!edpe::cameraDepthMotion(now, previous, 4, 4, 1, 1, .0025f,
+            &expected_x, &expected_y)) return 30;
+    const auto turned_now = pack_camera(now);
+    const auto turned_previous = pack_camera(previous);
+    context->UpdateSubresource(gpu_camera.Get(), 0, nullptr, turned_now.data(), 0, 0);
+    context->UpdateSubresource(previous_gpu_camera.Get(), 0, nullptr,
+        turned_previous.data(), 0, 0);
+    if (!pass.renderGpuCameras(depth_view.Get(), gpu_camera.Get(),
+            previous_gpu_camera.Get(), 4, 4)) return 31;
+    context->CopyResource(readback.Get(), output.Get());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 32;
+    valid = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch + 4);
+    const float turned_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
+    const float turned_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
+    context->Unmap(readback.Get(), 0);
+    return std::fabs(turned_x - expected_x) < .01f &&
+        std::fabs(turned_y - expected_y) < .01f ? 0 : 33;
 }
