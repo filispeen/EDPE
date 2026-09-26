@@ -43,12 +43,18 @@ context state on overlay initialization. The user reported normal game
 world, HUD, and F5 menu behavior. This verifies interface and state-object
 creation on that device; no context swap or motion draw ran in Elite.
 
+**VERIFIED (Release WARP module test):** `MotionPass` now owns a persistent
+`R16G16_FLOAT` output and a separate D3D11 context state. The test invokes
+this production module twice, checks `(2,-2)` and zero-depth output, confirms
+that the same output resource is reused, and checks that the original viewport
+and topology survive both draws. All four project tests passed.
+
 ## Limits
 
-The shader is used only by the standalone test. It does not run inside Elite,
-read its DSV, modify its output, or establish the correct camera for every
-depth-writing draw. Jitter is excluded. The in-game depth/camera pairing and
-moving-cockpit measurements are in
+The module is compiled into `dxgi.dll` but is not called inside Elite. It
+does not yet read Elite's DSV, modify its output, or establish the correct
+camera for every depth-writing draw. Jitter is excluded. The in-game
+depth/camera pairing and moving-cockpit measurements are in
 [camera-reconstruction.md](camera-reconstruction.md). Runtime integration
-still needs GPU-side camera capture, state-safe execution, a debug view, and
-visual validation before any upscaler receives motion.
+still needs GPU-side camera capture, a debug view, and visual validation
+before any upscaler receives motion.
