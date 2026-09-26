@@ -418,6 +418,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "centerValid=1 center=0.25 size=64x64") &&
         std::strstr(contents, "centerValid=1 center=0.5 size=64x64") &&
         std::strstr(contents, "EDPE: motion candidate depth retained on GPU") &&
+        std::strstr(contents, "EDPE: camera GPU copy queued bind=100 bytes=5376") &&
+        std::strstr(contents, "EDPE: camera GPU copy queued bind=101 bytes=5376") &&
         std::strstr(contents, "EDPE: motion candidate GPU pass completed") &&
         std::strstr(contents, "EDPE: motion preview shader ready") &&
         std::strstr(contents, "EDPE: motion snapshot handed to ImGui") &&

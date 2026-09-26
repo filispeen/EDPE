@@ -619,7 +619,12 @@ contents for shader access. The standalone WARP test copies a synthetic
 5376-byte dynamic constant buffer to a default constant buffer, then reads
 it back only to verify the copy. This proves that copy route in the test
 device, not that the bind-3 Elite buffer is the correct camera throughout
-scene rendering. Runtime capture and shader consumption remain unbuilt.
+scene rendering. For one-shot pair requests EDPE now queues that
+default-buffer copy before the existing staging copy, then retains both
+GPU buffers until the next request or swap-chain release. The WARP proxy
+passes through this path and parses the resulting camera buffers. The
+default-buffer copy has not yet been observed in Elite; motion still uses
+the staging-parsed CPU camera. Shader consumption remains unbuilt.
 
 **MEASURED / EXPERIMENTAL (2026-09-26, Elite Odyssey; game build not
 rechecked):** During three user-requested motion captures with a turning

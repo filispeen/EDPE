@@ -64,8 +64,9 @@ existing scene DSV signature and copies VS slot-1 camera buffers at bind 3
 in two consecutive frame intervals. After the second interval, it retains a
 GPU-only copy of that frame's depth. The camera staging buffers are polled
 without waiting; only after both parse successfully and their frame labels
-match the depth copy does `MotionPass` draw. A one-pixel staging readback
-logs center motion in render pixels. The original game image is untouched.
+match the depth copy does `MotionPass` draw. A sparse 5×5 staging readback
+logs center motion and a spatial range in render pixels. The original game
+image is untouched.
 The request expires if the pair remains incomplete for 120 Presents.
 
 **VERIFIED (Release WARP proxy smoke):** Synthetic valid camera buffers,
@@ -160,8 +161,8 @@ The F5 motion snapshot displays its GPU texture through a signed-color
 preview. It has been seen in Elite, but the large saturated regions need
 numeric and moving-scene validation. The camera is still a
 bind-3 candidate, not the verified camera for every depth-writing draw.
-The diagnostic still reads back 5376-byte camera buffers and one output
-pixel asynchronously; this is not the production GPU-only camera path.
+The diagnostic still reads back 5376-byte camera buffers and a sparse
+output grid asynchronously; this is not the production GPU-only camera path.
 Jitter is excluded. The in-game depth/camera pairing and moving-cockpit
 measurements are in
 [camera-reconstruction.md](camera-reconstruction.md). Runtime integration

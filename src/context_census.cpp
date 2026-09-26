@@ -78,6 +78,7 @@ bool motion_pair_queued = false;
 bool motion_pair_active = false;
 std::array<edpe::CameraProjection, 2> motion_cameras{};
 std::array<unsigned long long, 2> motion_camera_frames{~0ull, ~0ull};
+std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 2> gpu_camera_pair{};
 unsigned long long motion_depth_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
@@ -289,13 +290,32 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
     desc.MiscFlags = 0;
     ID3D11Buffer* staging = nullptr;
     const HRESULT result = device ? device->CreateBuffer(&desc, nullptr, &staging) : E_FAIL;
-    if (device) device->Release();
     if (FAILED(result) || !staging) {
+        if (device) device->Release();
         sample.claimed.store(false, std::memory_order_release);
         EdpeLog(L"EDPE: scene CB sample unavailable (staging creation failed)");
         return;
     }
-    context->CopyResource(staging, source);
+    const bool pair = bind_ordinal == kPairFirstSample || bind_ordinal == kPairSecondSample;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> gpu_copy;
+    if (pair) {
+        desc = source_desc;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+        if (SUCCEEDED(device->CreateBuffer(&desc, nullptr, &gpu_copy))) {
+            context->CopyResource(gpu_copy.Get(), source);
+            gpu_camera_pair[bind_ordinal - kPairFirstSample] = gpu_copy;
+            wchar_t message[112];
+            swprintf_s(message, L"EDPE: camera GPU copy queued bind=%u bytes=%u",
+                bind_ordinal, desc.ByteWidth);
+            EdpeLog(message);
+        } else {
+            EdpeLog(L"EDPE: camera GPU copy unavailable; staging source directly");
+        }
+    }
+    context->CopyResource(staging, gpu_copy ? gpu_copy.Get() : source);
+    if (device) device->Release();
     sample.buffer = staging;
     sample.bind = bind_ordinal;
     sample.after_present = last_present_frame.load(std::memory_order_relaxed);
@@ -1036,6 +1056,7 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             motion_pair_active = motion_pair_queued;
             motion_pair_queued = false;
             motion_camera_frames = {~0ull, ~0ull};
+            gpu_camera_pair = {};
             motion_depth_frame = ~0ull;
             motion_depth.Reset();
             motion_depth_view.Reset();
@@ -1230,6 +1251,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_snapshot.Reset();
         motion_pass.reset();
         motion_camera_frames = {~0ull, ~0ull};
+        gpu_camera_pair = {};
         motion_depth_frame = ~0ull;
         camera_pair_bind_frame = ~0ull;
         camera_pair_bind_count = 0;
