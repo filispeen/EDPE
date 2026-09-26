@@ -279,6 +279,8 @@ int wmain(int argc, wchar_t** argv) {
         motion_present = swap_chain->Present(0, 0);
         if (FAILED(motion_present)) break;
     }
+    context->OMSetRenderTargets(0, nullptr, depth_view);
+    context->OMSetRenderTargets(0, nullptr, nullptr);
     for (int i = 0; i < 8; ++i) swap_chain->Present(0, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool visible_input_blocked = forwarded_keys == 1;
@@ -349,7 +351,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:25") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:26") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
@@ -414,8 +416,10 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "centerValid=1 center=0.5 size=64x64") &&
         std::strstr(contents, "EDPE: motion candidate depth retained on GPU") &&
         std::strstr(contents, "EDPE: motion candidate GPU pass completed") &&
+        std::strstr(contents, "EDPE: DSV observer restored after context-state swap") &&
         std::strstr(contents, "EDPE: motion candidate currentAfterPresent=17 center=(6.39844,0)") &&
         std::strstr(contents, "pixels finite=1") &&
+        std::strstr(contents, "EDPE: DSV census frame=1024 binds=26 unique=1 slotActive=1") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: D3D11 context state available=1") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&

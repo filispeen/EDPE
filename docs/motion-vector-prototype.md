@@ -75,6 +75,25 @@ were consecutive, the GPU pass completed, and all four project tests passed.
 This verifies the one-shot dispatch and resource lifetime in the harness;
 it is not an Elite visual or camera-selection validation.
 
+**MEASURED (Elite Odyssey, 2026-09-26; game build not rechecked):** The user
+confirmed that the 3D world, HUD, and F5 menu remained normal after one
+motion-candidate capture. Session-local DSV `#2` supplied two valid camera
+samples labelled `afterPresent=13869/13870`, each with scales near
+`(0.974279,1.732051)` and `depthB=0.025`. The matching `2560×1440` center
+depths were `0.000304676854/0.000304607762`. The second frame's GPU depth
+copy produced finite center motion `(-0.0128174,-0.0128174)` pixels. This
+verifies one in-game dispatch and readback, not visual correctness of the
+whole motion texture or the exact camera used for every depth draw.
+
+**MEASURED observer fix:** In that run, the DSV observer's context-vtable
+slot reverted to the original method after the motion pass and its bind
+counter stopped. The WARP proxy reproduced this: the slot was active during
+the motion draw but original again after `Present`. EDPE now conditionally
+restores only its own observer slot after the original `Present` returns,
+and leaves any unknown replacement untouched. The WARP smoke test confirms
+that a later DSV bind reaches the observer and that the slot remains active.
+The restored behavior in Elite has not yet been checked.
+
 ## Limits
 
 The module runs in Elite only after an explicit experimental F5 request;

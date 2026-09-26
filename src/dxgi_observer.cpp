@@ -180,7 +180,9 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
     UiOnPresent(swap_chain, flags);
     ContextCensusAfterOverlay(swap_chain, flags);
     const auto original = reinterpret_cast<PresentFn>(tableOf(swap_chain)->original[kPresent]);
-    return original(swap_chain, sync_interval, flags);
+    const HRESULT result = original(swap_chain, sync_interval, flags);
+    ContextCensusAfterPresent(swap_chain, flags);
+    return result;
 }
 
 void observeSwapChain(IDXGISwapChain* swap_chain) {

@@ -26,6 +26,8 @@ using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UI
     UINT, ID3D11Buffer* const*);
 
 bool patchSlot(void** table, size_t slot, void* expected, void* replacement);
+void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
+    ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv);
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
@@ -80,6 +82,7 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_center_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 unsigned motion_center_wait = 0;
+unsigned motion_hook_watch = 0;
 struct PairDepthSample {
     ID3D11DepthStencilView* view = nullptr;
     ID3D11Texture2D* staging = nullptr;
@@ -626,6 +629,7 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
     motion_pair_active = false;
     motion_depth.Reset();
     motion_depth_view.Reset();
+    motion_hook_watch = 8;
 }
 
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,
@@ -1014,6 +1018,27 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
     }
 }
 
+void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags) {
+    if ((flags & DXGI_PRESENT_TEST) || observed_swap_chain != swap_chain ||
+        !motion_hook_watch || !patched_table) return;
+    // A WARP and Elite run observed this slot reverting after the motion pass.
+    // Restore only our known original slot; leave any other hook untouched.
+    --motion_hook_watch;
+    const auto forward = original.load(std::memory_order_acquire);
+    auto* current = patched_table[kOMSetRenderTargets];
+    if (current == reinterpret_cast<void*>(forward)) {
+        const bool restored = patchSlot(patched_table, kOMSetRenderTargets,
+            reinterpret_cast<void*>(forward),
+            reinterpret_cast<void*>(&observedOMSetRenderTargets));
+        EdpeLog(restored ? L"EDPE: DSV observer restored after context-state swap"
+                         : L"EDPE: DSV observer unavailable after context-state swap");
+        motion_hook_watch = 0;
+    } else if (current != reinterpret_cast<void*>(&observedOMSetRenderTargets)) {
+        EdpeLog(L"EDPE: DSV observer changed unexpectedly after motion pass");
+        motion_hook_watch = 0;
+    }
+}
+
 bool ContextCensusRequestBindSequence() {
     if (!ContextCensusBindSequenceAvailable()) return false;
     bool expected = false;
@@ -1157,6 +1182,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         camera_pair_queued = -1;
         camera_pair_target = -1;
         motion_pair_queued = motion_pair_active = false;
+        motion_hook_watch = 0;
         motion_depth.Reset();
         motion_depth_view.Reset();
         motion_center_readback.Reset();
