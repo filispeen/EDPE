@@ -4,6 +4,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <array>
+#include <bit>
 #include <cstdint>
 
 using Microsoft::WRL::ComPtr;
@@ -26,21 +27,25 @@ int main() {
         FAILED(device->CreatePixelShader(pixel_code->GetBufferPointer(),
             pixel_code->GetBufferSize(), nullptr, &pixel))) return 3;
 
-    std::array<float, 16> depth_values{};
-    depth_values.fill(0.0025f); // depthB=.025, viewZ=10
+    std::array<std::uint64_t, 16> depth_values{};
+    depth_values.fill(std::bit_cast<std::uint32_t>(0.0025f)); // depthB=.025, viewZ=10
     depth_values[0] = 0;        // Invalid far/background pixel.
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = desc.Height = 4;
     desc.MipLevels = desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA initial{depth_values.data(), 4 * sizeof(float), 0};
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DEPTH_STENCIL;
+    D3D11_SUBRESOURCE_DATA initial{depth_values.data(), 4 * sizeof(std::uint64_t), 0};
     ComPtr<ID3D11Texture2D> depth;
     ComPtr<ID3D11ShaderResourceView> depth_view;
+    D3D11_SHADER_RESOURCE_VIEW_DESC depth_srv_desc{};
+    depth_srv_desc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    depth_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    depth_srv_desc.Texture2D.MipLevels = 1;
     if (FAILED(device->CreateTexture2D(&desc, &initial, &depth)) ||
-        FAILED(device->CreateShaderResourceView(depth.Get(), nullptr, &depth_view))) return 4;
+        FAILED(device->CreateShaderResourceView(depth.Get(), &depth_srv_desc, &depth_view))) return 4;
 
     UINT support = 0;
     if (FAILED(device->CheckFormatSupport(DXGI_FORMAT_R16G16_FLOAT, &support)) ||

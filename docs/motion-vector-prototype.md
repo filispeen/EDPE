@@ -16,8 +16,10 @@ render-target view; Microsoft lists render-target support for this format
 among [required DXGI formats](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/required-dxgi-formats).
 The test checks support at runtime with `CheckFormatSupport` as well.
 
-**VERIFIED (Release WARP test):** A synthetic 4×4 depth texture with
-`depthB=0.025` and raw depth `0.0025` represents view Z=10. Moving the
+**VERIFIED (Release WARP test):** A synthetic 4×4 depth texture uses Elite's
+observed `R32G8X24_TYPELESS` resource format and an
+`R32_FLOAT_X8X24_TYPELESS` shader-resource view. With `depthB=0.025`, raw
+depth `0.0025` represents view Z=10. Moving the
 current camera +10 units in X and Y while leaving the previous camera at
 the origin produced exactly `(2,-2)` in the half-float output. A zero-depth
 pixel produced `(0,0)`. All four project tests passed.
