@@ -532,6 +532,16 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ensureMotionPreviewShader();
         EdpeLog(L"EDPE: motion snapshot handed to ImGui");
     }
+    UINT motion_color_width = 0, motion_color_height = 0;
+    if (auto* color = ContextCensusTakeMotionColorSnapshot(
+            &motion_color_width, &motion_color_height)) {
+        releaseColorSnapshot();
+        ui.color_srv = color;
+        ui.color_width = motion_color_width;
+        ui.color_height = motion_color_height;
+        ui.color_window_open = true;
+        EdpeLog(L"EDPE: same-frame HDR color handed to ImGui");
+    }
     if (!menu_visible.load()) {
         unsigned ignored = 0;
         ID3D11RenderTargetView* color = nullptr;
@@ -661,8 +671,12 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             display.y > 500.0f ? 80.0f : 0.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("EDPE Scene Color Snapshot", &ui.color_window_open)) {
-            ImGui::Text("DSV #%d / HDR RTV0 (%ux%u)",
-                ui.color_snapshot_index, ui.color_width, ui.color_height);
+            if (ui.color_snapshot_index >= 0)
+                ImGui::Text("DSV #%d / HDR RTV0 (%ux%u)",
+                    ui.color_snapshot_index, ui.color_width, ui.color_height);
+            else
+                ImGui::Text("Motion frame / HDR RTV3 (%ux%u)",
+                    ui.color_width, ui.color_height);
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;

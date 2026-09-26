@@ -84,6 +84,9 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> motion_color_source;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_view;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_snapshot;
+UINT motion_color_snapshot_width = 0;
+UINT motion_color_snapshot_height = 0;
 unsigned long long motion_color_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
@@ -725,7 +728,9 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
     }
     EdpeLog(motion_color_view ? L"EDPE: motion candidate has same-frame HDR color" :
         L"EDPE: motion candidate HDR color unavailable");
-    motion_color_view.Reset();
+    motion_color_snapshot = std::move(motion_color_view);
+    motion_color_snapshot_width = desc.Width;
+    motion_color_snapshot_height = desc.Height;
     motion_snapshot = motion_pass->output();
     motion_snapshot_width = desc.Width;
     motion_snapshot_height = desc.Height;
@@ -1136,6 +1141,7 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             gpu_camera_pair = {};
             motion_color_source.Reset();
             motion_color_view.Reset();
+            motion_color_snapshot.Reset();
             motion_color_frame = ~0ull;
             motion_depth_frame = ~0ull;
             motion_depth.Reset();
@@ -1231,6 +1237,13 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionSnapshot(UINT* width, UINT* hei
     if (width) *width = motion_snapshot_width;
     if (height) *height = motion_snapshot_height;
     return motion_snapshot.Detach();
+}
+
+ID3D11ShaderResourceView* ContextCensusTakeMotionColorSnapshot(UINT* width, UINT* height) {
+    if (!motion_color_snapshot) return nullptr;
+    if (width) *width = motion_color_snapshot_width;
+    if (height) *height = motion_color_snapshot_height;
+    return motion_color_snapshot.Detach();
 }
 
 int ContextCensusSceneDepthCandidate() {
@@ -1329,6 +1342,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_depth_view.Reset();
         motion_color_source.Reset();
         motion_color_view.Reset();
+        motion_color_snapshot.Reset();
         motion_color_frame = ~0ull;
         motion_grid_readback.Reset();
         motion_snapshot.Reset();
