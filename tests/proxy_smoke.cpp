@@ -59,6 +59,9 @@ int wmain(int argc, wchar_t** argv) {
     const auto request_depth_snapshot = reinterpret_cast<BOOL (WINAPI*)(UINT)>(
         GetProcAddress(dxgi_proxy, "EDPE_RequestDepthSnapshot"));
     if (!request_depth_snapshot) return 7;
+    const auto request_camera_pair = reinterpret_cast<BOOL (WINAPI*)(UINT)>(
+        GetProcAddress(dxgi_proxy, "EDPE_RequestCameraPair"));
+    if (!request_camera_pair) return 7;
     const auto scene_depth_candidate = reinterpret_cast<int (WINAPI*)()>(
         GetProcAddress(dxgi_proxy, "EDPE_SceneDepthCandidate"));
     if (!scene_depth_candidate) return 7;
@@ -234,12 +237,24 @@ int wmain(int argc, wchar_t** argv) {
     context->OMSetRenderTargets(0, nullptr, nullptr);
     const HRESULT snapshot_present = swap_chain->Present(0, 0);
     const bool scene_candidate_found = scene_depth_candidate() == 0;
+    const bool pair_requested = request_camera_pair(0);
+    const HRESULT pair_arm_present = swap_chain->Present(0, 0);
+    HRESULT pair_present = S_OK;
+    for (int frame = 0; frame < 2; ++frame) {
+        context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH,
+            frame ? 0.5f : 0.25f, 0);
+        for (int bind = 0; bind < 3; ++bind)
+            context->OMSetRenderTargets(4, scene_mrt, depth_view);
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        pair_present = swap_chain->Present(0, 0);
+        if (FAILED(pair_present)) break;
+    }
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool visible_input_blocked = forwarded_keys == 1;
     const HRESULT resize_result = swap_chain->ResizeBuffers(0, 128, 128, DXGI_FORMAT_UNKNOWN, 0);
     const HRESULT resized_present = SUCCEEDED(resize_result) ? swap_chain->Present(0, 0) : resize_result;
     for (int i = 0; i < 16; ++i) swap_chain->Present(0, 0);
-    for (int i = 25; i < 1024; ++i) swap_chain->Present(0, DXGI_PRESENT_TEST);
+    while (present_count() < 1024) swap_chain->Present(0, DXGI_PRESENT_TEST);
     const bool interval_observed = present_count() == 1024;
     SendMessageW(window, WM_KEYUP, VK_F5, 0);
     SendMessageW(window, WM_KEYDOWN, VK_F5, 0);
@@ -283,7 +298,8 @@ int wmain(int argc, wchar_t** argv) {
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
         SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
         SUCCEEDED(snapshot_arm_present) && SUCCEEDED(snapshot_present) && snapshot_requested &&
-        scene_candidate_found &&
+        scene_candidate_found && pair_requested && SUCCEEDED(pair_arm_present) &&
+        SUCCEEDED(pair_present) &&
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
@@ -301,7 +317,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:13") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:19") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
@@ -358,6 +374,12 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: depth snapshot image submitted to ImGui") &&
         std::strstr(contents, "EDPE: depth contrast shader active in ImGui") &&
         std::strstr(contents, "EDPE: depth sample grid valid=64 nonzero=64 min=0.25 max=0.25 centerValid=1 center=0.25") &&
+        std::strstr(contents, "EDPE: adjacent camera probe armed DSV #0") &&
+        std::strstr(contents, "EDPE: scene CB sample bind=100") &&
+        std::strstr(contents, "EDPE: scene CB sample bind=101") &&
+        std::strstr(contents, "EDPE: adjacent depth afterPresent=") &&
+        std::strstr(contents, "centerValid=1 center=0.25 size=64x64") &&
+        std::strstr(contents, "centerValid=1 center=0.5 size=64x64") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");

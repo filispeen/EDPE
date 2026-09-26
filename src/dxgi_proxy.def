@@ -5,4 +5,5 @@ EXPORTS
     EDPE_MenuVisible=EdpeMenuVisible
     EDPE_RequestBindSequence=EdpeRequestBindSequence
     EDPE_RequestDepthSnapshot=EdpeRequestDepthSnapshot
+    EDPE_RequestCameraPair=EdpeRequestCameraPair
     EDPE_SceneDepthCandidate=EdpeSceneDepthCandidate

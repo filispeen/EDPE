@@ -5,6 +5,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cmath>
+#include <cstring>
 #include <d3d11.h>
 #include <mutex>
 #include <windows.h>
@@ -64,6 +66,15 @@ int camera_pair_target = -1;
 unsigned long long camera_pair_armed_after = 0;
 unsigned long long camera_pair_bind_frame = ~0ull;
 unsigned camera_pair_bind_count = 0;
+struct PairDepthSample {
+    ID3D11DepthStencilView* view = nullptr;
+    ID3D11Texture2D* staging = nullptr;
+    unsigned long long after_present = 0;
+    UINT width = 0;
+    UINT height = 0;
+    unsigned wait = 0;
+};
+std::array<PairDepthSample, 2> camera_pair_depth{}; // One-shot diagnostic only.
 struct ConstantBufferSample {
     ID3D11Buffer* buffer = nullptr;
     unsigned bind = 0;
@@ -393,6 +404,98 @@ void queueCameraPairSample(ID3D11DeviceContext* context, unsigned sample_label) 
     buffer->Release();
 }
 
+void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
+    for (auto& sample : camera_pair_depth) {
+        ID3D11DepthStencilView* view = nullptr;
+        {
+            std::lock_guard lock(seen_mutex);
+            if (sample.view && sample.after_present + 1 == frame) {
+                view = sample.view;
+                sample.view = nullptr;
+            }
+        }
+        if (!view) continue;
+        ID3D11DepthStencilView* bound = nullptr;
+        context->OMGetRenderTargets(0, nullptr, &bound);
+        if (bound) {
+            bound->Release();
+            view->Release();
+            EdpeLog(L"EDPE: adjacent depth sample skipped (DSV still bound at Present)");
+            continue;
+        }
+        ID3D11Resource* resource = nullptr;
+        view->GetResource(&resource);
+        ID3D11Texture2D* source = nullptr;
+        if (resource) {
+            resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&source));
+            resource->Release();
+        }
+        view->Release();
+        if (!source) {
+            EdpeLog(L"EDPE: adjacent depth sample unavailable (not a Texture2D)");
+            continue;
+        }
+        D3D11_TEXTURE2D_DESC desc{};
+        source->GetDesc(&desc);
+        if (desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS || desc.MipLevels != 1 ||
+            desc.ArraySize != 1 || desc.SampleDesc.Count != 1 || !desc.Width || !desc.Height ||
+            static_cast<unsigned long long>(desc.Width) * desc.Height > 3840ull * 2160) {
+            source->Release();
+            EdpeLog(L"EDPE: adjacent depth sample unavailable (unsupported layout)");
+            continue;
+        }
+        ID3D11Device* device = nullptr;
+        context->GetDevice(&device);
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.MiscFlags = 0;
+        ID3D11Texture2D* staging = nullptr;
+        const HRESULT result = device ? device->CreateTexture2D(&desc, nullptr, &staging) : E_FAIL;
+        if (device) device->Release();
+        if (SUCCEEDED(result) && staging) {
+            context->CopyResource(staging, source); // One-shot full depth copy; no normal-frame readback.
+            std::lock_guard lock(seen_mutex);
+            sample.staging = staging;
+            sample.width = desc.Width;
+            sample.height = desc.Height;
+            sample.wait = 0;
+        } else {
+            EdpeLog(L"EDPE: adjacent depth sample unavailable (staging creation failed)");
+        }
+        source->Release();
+    }
+}
+
+void pollCameraPairDepth(ID3D11DeviceContext* context) {
+    std::lock_guard lock(seen_mutex);
+    for (auto& sample : camera_pair_depth) {
+        if (!sample.staging) continue;
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        const HRESULT result = context->Map(sample.staging, 0, D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++sample.wait < 120) continue;
+        if (SUCCEEDED(result) && mapped.pData) {
+            float depth = 0;
+            const auto* pixel = static_cast<const unsigned char*>(mapped.pData) +
+                static_cast<size_t>(sample.height / 2) * mapped.RowPitch +
+                static_cast<size_t>(sample.width / 2) * 8;
+            std::memcpy(&depth, pixel, sizeof(depth));
+            context->Unmap(sample.staging, 0);
+            wchar_t message[160];
+            swprintf_s(message,
+                L"EDPE: adjacent depth afterPresent=%llu centerValid=%u center=%.9g size=%ux%u",
+                sample.after_present, std::isfinite(depth) && depth >= 0 && depth <= 1,
+                depth, sample.width, sample.height);
+            EdpeLog(message);
+        } else {
+            EdpeLog(L"EDPE: adjacent depth sample unavailable (nonblocking map failed)");
+        }
+        sample.staging->Release();
+        sample.staging = nullptr;
+    }
+}
+
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,
     ID3D11RenderTargetView* const* targets) {
     wchar_t message[192];
@@ -514,6 +617,14 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                     seen[index].mrt_frame == frame && seen[index].mrt_hdr_view)
                     camera_pair_sample = frame == camera_pair_armed_after
                         ? kPairFirstSample : kPairSecondSample;
+                if (camera_pair_sample) {
+                    auto& depth = camera_pair_depth[camera_pair_sample - kPairFirstSample];
+                    if (!depth.view && !depth.staging) {
+                        dsv->AddRef();
+                        depth.view = dsv;
+                        depth.after_present = frame;
+                    }
+                }
             }
         }
         if (count && targets && targets[0] && !seen[index].color_logged) {
@@ -601,6 +712,11 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
         pollConstantBufferSamples(observed_context.load(std::memory_order_acquire));
+    if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
+        auto* context = observed_context.load(std::memory_order_acquire);
+        queueCameraPairDepth(context, frame);
+        pollCameraPairDepth(context);
+    }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
         last_present_frame.store(frame, std::memory_order_relaxed);
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
@@ -610,6 +726,10 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             if (camera_pair_target >= 0 && frame >= camera_pair_armed_after + 2) {
                 finished_pair = camera_pair_target;
                 camera_pair_target = -1;
+                for (auto& sample : camera_pair_depth) {
+                    if (sample.view) sample.view->Release();
+                    sample.view = nullptr;
+                }
             }
         }
         if (finished_pair >= 0) {
@@ -769,7 +889,8 @@ namespace {
 bool depthSnapshotAvailableLocked(unsigned index) {
     if (!patched_table || index >= seen_count || snapshot_queued >= 0 ||
         snapshot_active >= 0 || snapshot_view || camera_pair_queued >= 0 ||
-        camera_pair_target >= 0) return false;
+        camera_pair_target >= 0 || camera_pair_depth[0].staging ||
+        camera_pair_depth[1].staging) return false;
     const auto& candidate = seen[index];
     return candidate.samples == 1 &&
         (candidate.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS ||
@@ -852,6 +973,10 @@ extern "C" BOOL WINAPI EdpeRequestDepthSnapshot(UINT index) {
     return ContextCensusRequestDepthSnapshot(index);
 }
 
+extern "C" BOOL WINAPI EdpeRequestCameraPair(UINT index) {
+    return ContextCensusRequestCameraPair(index);
+}
+
 extern "C" int WINAPI EdpeSceneDepthCandidate() {
     return ContextCensusSceneDepthCandidate();
 }
@@ -879,6 +1004,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         camera_pair_target = -1;
         camera_pair_bind_frame = ~0ull;
         camera_pair_bind_count = 0;
+        for (auto& sample : camera_pair_depth) {
+            if (sample.view) sample.view->Release();
+            if (sample.staging) sample.staging->Release();
+            sample = {};
+        }
     }
     sequence_active.store(false, std::memory_order_release);
     sequence_requested.store(false, std::memory_order_release);
