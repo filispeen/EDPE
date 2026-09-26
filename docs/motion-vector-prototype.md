@@ -178,7 +178,21 @@ bind-3 candidate, not the verified camera for every depth-writing draw.
 with the observed Elite offsets produces the same motion at a tested pixel
 as the CPU-parsed path within 0.01 render pixel. The one-shot Elite capture
 now selects this shader when both GPU copies exist and otherwise uses the
-previous CPU path. Elite output from this new path still needs a game check.
+previous CPU path.
+
+**VERIFIED / MEASURED (Elite Odyssey, 2026-09-26; game build not
+rechecked):** The user captured a visible motion snapshot with the GPU-camera
+shader and reported normal game operation. The log records two 5376-byte GPU
+camera copies at `afterPresent=17679/17680`, both parsed as valid with
+scales about `(0.9742787,1.7320510)` and `depthB=0.025`. It explicitly
+reports `used GPU camera buffers`, a completed motion draw, UI handoff and
+DSV observer restoration. The 5×5 sparse grid contained 25 finite samples,
+16 above 1 pixel and 12 above 10 pixels; X ranged from `-54.2812` to
+`0.5625`, Y from `0` to `64.5625` render pixels. The center depth sample
+was 0, so the center motion was `(0,0)` by the shader's invalid-depth rule.
+This verifies GPU-camera access and a visible diagnostic output. It does not
+verify moving-object vectors, all-pixel depth association or the sign/scale
+required by a vendor upscaler.
 
 The diagnostic still reads back 5376-byte camera buffers to validate their
 contents and a sparse output grid asynchronously. These readbacks are
@@ -186,5 +200,4 @@ one-shot diagnostics, not part of a production GPU-only camera path. Jitter
 is excluded. The in-game depth/camera pairing and moving-cockpit measurements
 are in
 [camera-reconstruction.md](camera-reconstruction.md). Runtime integration
-still needs verification of this GPU-camera path in Elite and moving-scene
-validation before any upscaler receives motion.
+still needs moving-scene validation before any upscaler receives motion.
