@@ -21,8 +21,27 @@ binaries are committed to EDPE.
 The current `nvsdk_ngx.h` documents
 `NVSDK_NGX_D3D11_Init_with_ProjectID` for custom engines using a unique
 GUID-like project ID and `NVSDK_NGX_ENGINE_TYPE_CUSTOM`. EDPE must use its
-own identifier; the EDVR ID is not reusable. An initialization result or
-capability query has not yet been tested on this machine.
+own identifier; the EDVR ID is not reusable. NGX initialization and the
+capability query were measured only in the isolated probe below.
+
+## Standalone NGX lifecycle probe — 2026-09-27
+
+**MEASURED (official SDK v310.9.1, RTX 3060, no Elite process):** An
+ignored local D3D11 test executable used a fresh probe-specific GUID-like
+project ID with `NVSDK_NGX_ENGINE_TYPE_CUSTOM`. Hardware
+`D3D11CreateDevice` returned `0x00000000`; NGX D3D11 initialization and
+`GetCapabilityParameters` each returned success (`0x00000001`).
+`SuperSampling.Available` returned 0 without a feature DLL search path and
+1 when `NVSDK_NGX_FeatureCommonInfo::PathListInfo` pointed at the SDK's
+`Windows_x86_64/rel` directory. No NGX feature was created or evaluated.
+
+**MEASURED / BLOCKED:** The isolated probe did not return from
+`NVSDK_NGX_D3D11_Shutdown1` within more than 20 seconds, with either the
+D3D11 device or `nullptr`; the test process consumed CPU until stopped.
+This repeated across three runs. The cause is unknown. Capability success
+does not establish safe initialization/shutdown for EDPE, so NGX remains
+outside the game process until its lifecycle is understood. The local SDK
+and probe executable remain ignored build artifacts.
 
 ## SDK-documented D3D11 inputs
 
