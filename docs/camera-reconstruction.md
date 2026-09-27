@@ -768,3 +768,23 @@ between captures. The game may be rewriting other fields in the same
 dynamic buffer. A hash does not establish the values' semantic use by the
 shader, the point at which the first draw receives its projection, or safe
 runtime jitter. EDPE continues to leave the buffer unchanged.
+
+**VERIFIED / MEASURED (user-confirmed gameplay capture, 2026-09-27; game
+build not rechecked):** In one frame at `afterPresent=36378`, the first
+scene-MRT interval mapped a 5376-byte dynamic constant buffer before any
+VS-slot-1 binding of that class. Its `Map` resource identity was
+`000001AA9DC0C860`. The following depth-writing main interval bound the
+same identity at VS slot 1 for 101 calls and processed 432236
+input-assembler primitives. The early write's camera/projection hashes
+(`2A61EB1DA5A12CB9`, `AC5ED8A2AF9FD3AF`) matched all 13 subsequent
+observed writes in the main interval. The user's game, HUD, menu, and
+snapshots worked; the Map/Unmap hooks restored.
+
+**IMPLICATION / LIMIT:** This frame has a candidate write point before the
+heavy scene rasterization, with resource identity established rather than
+inferred from matching dimensions or contents. The first MRT interval did
+execute one unrelated `DrawInstanced` call before that Map; the 5376-byte
+buffer was not bound at VS slot 1 for that draw. The observation does not
+show whether the same early write exists in frames where the main pass is
+third, how many camera buffers coexist, or how to revert a jittered frame
+if temporal reconstruction fails. Runtime jitter remains disabled.
