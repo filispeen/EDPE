@@ -257,6 +257,13 @@ int wmain(int argc, wchar_t** argv) {
             FAILED(vertex_shader->GetPrivateData(kEdpeVertexBytecodeGuid, &bytes, captured)) ||
             bytes != vertex_bytecode->GetBufferSize() ||
             std::memcmp(captured, vertex_bytecode->GetBufferPointer(), bytes) != 0) return 12;
+        std::uint64_t hash = 0;
+        bytes = sizeof(hash);
+        if (FAILED(vertex_shader->GetPrivateData(kEdpeShaderHashGuid, &bytes, &hash)) ||
+            bytes != sizeof(hash) ||
+            hash != EdpeEdvrShaderHash(vertex_bytecode->GetBufferPointer(),
+                vertex_bytecode->GetBufferSize()) ||
+            EdpeEdvrShaderHash("abc", 3) != 0xe16801510db89efdull) return 12;
     }
     vertex_bytecode->Release();
     if (FAILED(vertex_result)) return 10;
@@ -265,6 +272,27 @@ int wmain(int argc, wchar_t** argv) {
     context->Draw(3, 0);
     context->VSSetShader(nullptr, nullptr, 0);
     vertex_shader->Release();
+    if (shader_probe) {
+        constexpr char pixel_source[] =
+            "float4 main() : SV_Target { return float4(1, 0, 0, 1); }";
+        ID3DBlob* pixel_bytecode = nullptr;
+        if (FAILED(D3DCompile(pixel_source, sizeof(pixel_source) - 1, nullptr,
+                nullptr, nullptr, "main", "ps_5_0", 0, 0, &pixel_bytecode, nullptr))) return 12;
+        ID3D11PixelShader* pixel_shader = nullptr;
+        const HRESULT pixel_result = device->CreatePixelShader(
+            pixel_bytecode->GetBufferPointer(), pixel_bytecode->GetBufferSize(),
+            nullptr, &pixel_shader);
+        std::uint64_t hash = 0;
+        UINT bytes = sizeof(hash);
+        const bool hash_ok = SUCCEEDED(pixel_result) && pixel_shader &&
+            SUCCEEDED(pixel_shader->GetPrivateData(kEdpeShaderHashGuid, &bytes, &hash)) &&
+            bytes == sizeof(hash) &&
+            hash == EdpeEdvrShaderHash(pixel_bytecode->GetBufferPointer(),
+                pixel_bytecode->GetBufferSize());
+        if (pixel_shader) pixel_shader->Release();
+        pixel_bytecode->Release();
+        if (!hash_ok) return 12;
+    }
     D3D11_MAPPED_SUBRESOURCE middle_probe{};
     if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &middle_probe))) return 10;
     probe_values[1080] = 1.75f;

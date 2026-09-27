@@ -10,7 +10,10 @@
 namespace {
 using CreateVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*,
     SIZE_T, ID3D11ClassLinkage*, ID3D11VertexShader**);
+using CreatePixelShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*,
+    SIZE_T, ID3D11ClassLinkage*, ID3D11PixelShader**);
 std::atomic<CreateVertexShaderFn> original_create_vertex_shader{nullptr};
+std::atomic<CreatePixelShaderFn> original_create_pixel_shader{nullptr};
 std::atomic<void**> hooked_device_table{nullptr};
 
 HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
@@ -18,8 +21,23 @@ HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     ID3D11VertexShader** shader) {
     const HRESULT result = original_create_vertex_shader.load(std::memory_order_acquire)(
         device, bytecode, size, linkage, shader);
-    if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536)
+    if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
         (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
+        const auto hash = EdpeEdvrShaderHash(bytecode, size);
+        (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE observedCreatePixelShader(ID3D11Device* device,
+    const void* bytecode, SIZE_T size, ID3D11ClassLinkage* linkage,
+    ID3D11PixelShader** shader) {
+    const HRESULT result = original_create_pixel_shader.load(std::memory_order_acquire)(
+        device, bytecode, size, linkage, shader);
+    if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
+        const auto hash = EdpeEdvrShaderHash(bytecode, size);
+        (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
+    }
     return result;
 }
 
@@ -40,6 +58,7 @@ void hookShaderCreation(ID3D11Device* device) {
     void** table = *reinterpret_cast<void***>(device);
     if (hooked_device_table.load(std::memory_order_acquire)) return;
     constexpr size_t slot = 12; // ID3D11Device::CreateVertexShader.
+    constexpr size_t pixel_slot = 15; // ID3D11Device::CreatePixelShader.
     auto forward = reinterpret_cast<CreateVertexShaderFn>(table[slot]);
     if (!forward || forward == &observedCreateVertexShader) return;
     original_create_vertex_shader.store(forward, std::memory_order_release);
@@ -53,7 +72,22 @@ void hookShaderCreation(ID3D11Device* device) {
     VirtualProtect(table + slot, sizeof(void*), old_protection, &ignored);
     if (replaced == reinterpret_cast<void*>(forward)) {
         hooked_device_table.store(table, std::memory_order_release);
-        EdpeLog(L"EDPE: one-run vertex shader bytecode probe armed");
+        bool pixel_hooked = false;
+        auto pixel_forward = reinterpret_cast<CreatePixelShaderFn>(table[pixel_slot]);
+        if (pixel_forward && pixel_forward != &observedCreatePixelShader) {
+            original_create_pixel_shader.store(pixel_forward, std::memory_order_release);
+            if (VirtualProtect(table + pixel_slot, sizeof(void*), PAGE_READWRITE, &old_protection)) {
+                replaced = InterlockedCompareExchangePointer(
+                    reinterpret_cast<PVOID volatile*>(table + pixel_slot),
+                    reinterpret_cast<void*>(&observedCreatePixelShader),
+                    reinterpret_cast<void*>(pixel_forward));
+                VirtualProtect(table + pixel_slot, sizeof(void*), old_protection, &ignored);
+                pixel_hooked = replaced == reinterpret_cast<void*>(pixel_forward);
+            }
+        }
+        EdpeLog(pixel_hooked
+            ? L"EDPE: one-run vertex/pixel shader signature probe armed"
+            : L"EDPE: one-run vertex shader probe armed; pixel shader hook unavailable");
     } else EdpeLog(L"EDPE: vertex shader bytecode probe unavailable (slot changed)");
 }
 }
