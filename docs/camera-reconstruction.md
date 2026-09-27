@@ -815,3 +815,34 @@ buffer. The user confirmed normal gameplay, HUD, F5 menu, and both snapshots.
 scene draw. It does not prove which fields that vertex shader consumes, that
 all scene shaders share this projection, or a safe jitter fallback. The main
 pass was again bind 2; the main-pass-at-bind-3 ordering still needs this check.
+
+## Vertex-shader projection use — 2026-09-27
+
+**VERIFIED / MEASURED (Elite Odyssey gameplay; build not rechecked):** An
+explicitly armed, one-run D3D11 `CreateVertexShader` probe retained bytecode
+on each created shader object. During one user-requested scene capture at
+`afterPresent=13884`, EDPE saved the vertex shader bound at the first
+5376-byte-buffer draw in scene-MRT binds 2 and 3. The user confirmed normal
+gameplay, HUD, F5 menu, and both snapshots. The files were respectively
+4468 and 4820 bytes, with SHA-256
+`50B9D32451500694E846BCE7D4D6A890B4757E17A2248165C162EAB06ED0853C`
+and
+`9EC010F54D70778A7566E3499823D26EB414CEFEEDC7C3F3580A278E0B50382B`.
+The one-run marker was consumed at device creation. Raw game shader bytecode
+stays in ignored local build files and is not redistributed in this project.
+
+**VERIFIED (D3D11 disassembly of those exact local captures):** Both shaders
+declare `CB1[276]` and form clip position from `cb1[270]` through
+`cb1[273]`: each of the first three registers is multiplied by a component
+of the position, and the fourth is added. Register 270 starts at float word
+1080 of the observed scene buffer; register 273 ends at word 1095. Bind 2
+writes that result directly to `SV_Position`. Bind 3 adjusts its Z component
+afterward but preserves X, Y, and W. Both also read `cb1[275].xyz` before
+the projection calculation. This proves that the candidate block supplies
+clip X/Y/W for these two observed vertex shaders, beyond mere buffer binding.
+
+**LIMIT / IMPLICATION:** These are the first shaders observed in two scene
+intervals, not a census of every shader or the main-pass-at-bind-3 case.
+The projection block's clip arithmetic supports deriving an exact jitter
+offset, but a frame-wide application point and fail-open reconstruction
+path remain unverified. EDPE still does not edit Elite's projection.
