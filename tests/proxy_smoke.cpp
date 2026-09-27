@@ -201,14 +201,14 @@ int wmain(int argc, wchar_t** argv) {
     context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, 0.25f, 0);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, depth_view);
+    ID3D11RenderTargetView* scene_mrt[]{mrt0_view, color_view, mrt2_view, second_color_view};
+    context->OMSetRenderTargets(4, scene_mrt, depth_view);
     context->VSSetConstantBuffers(1, 1, &probe_buffer);
     for (int i = 0; i < 50; ++i) context->VSSetConstantBuffers(1, 1, &probe_buffer);
     context->DrawIndexed(0, 0, 0); // Exercise the one-shot draw observer without rendering.
     context->VSSetConstantBuffers(1, 1, &depth_pass_buffer);
     context->DrawIndexed(0, 0, 0);
     context->VSSetConstantBuffers(1, 1, &probe_buffer);
-    ID3D11RenderTargetView* scene_mrt[]{mrt0_view, color_view, mrt2_view, second_color_view};
-    context->OMSetRenderTargets(4, scene_mrt, depth_view);
     constexpr char vertex_source[] =
         "float4 main(uint id : SV_VertexID) : SV_Position { "
         "return float4(id == 1 ? 1 : -1, id == 2 ? 1 : -1, 0, 1); }";

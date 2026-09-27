@@ -176,15 +176,20 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
 
 void endDrawProbe() {
     if (!draw_probe_active.exchange(false, std::memory_order_acq_rel)) return;
+    auto* forward = reinterpret_cast<void*>(original_draw_indexed.load(std::memory_order_acquire));
     const bool restored = patched_table && patchSlot(patched_table, kDrawIndexed,
-        reinterpret_cast<void*>(&observedDrawIndexed),
-        reinterpret_cast<void*>(original_draw_indexed.load(std::memory_order_acquire)));
+        reinterpret_cast<void*>(&observedDrawIndexed), forward);
     wchar_t message[160];
     swprintf_s(message,
         L"EDPE: depth-pass DrawIndexed calls=%u with5376VS1=%u slotRestored=%u",
         draw_indexed_calls.load(std::memory_order_relaxed),
         draw_indexed_scene_calls.load(std::memory_order_relaxed), restored);
     EdpeLog(message);
+    if (!restored && patched_table) {
+        swprintf_s(message, L"EDPE: DrawIndexed slot changed current=%p forward=%p",
+            patched_table[kDrawIndexed], forward);
+        EdpeLog(message);
+    }
 }
 
 void beginDrawProbe() {
@@ -965,7 +970,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         beginPipelineSample(context, snapshot_probe_bind);
         logSnapshotColorTarget(index, snapshot_probe_bind, count, targets);
         logBoundConstantBuffers(context, index, snapshot_probe_bind);
-        if (snapshot_probe_bind == 2) beginVSBufferProbe(context);
+        if (snapshot_probe_bind == 3) beginVSBufferProbe(context);
     }
     if (camera_pair_sample) queueCameraPairSample(context, camera_pair_sample);
 
