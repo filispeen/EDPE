@@ -250,7 +250,10 @@ int wmain(int argc, wchar_t** argv) {
     if (shader_probe && SUCCEEDED(vertex_result)) {
         unsigned char captured[8192]{};
         UINT bytes = sizeof(captured);
+        UINT queried = 0;
+        vertex_shader->GetPrivateData(kEdpeVertexBytecodeGuid, &queried, nullptr);
         if (vertex_bytecode->GetBufferSize() > sizeof(captured) ||
+            queried != vertex_bytecode->GetBufferSize() ||
             FAILED(vertex_shader->GetPrivateData(kEdpeVertexBytecodeGuid, &bytes, captured)) ||
             bytes != vertex_bytecode->GetBufferSize() ||
             std::memcmp(captured, vertex_bytecode->GetBufferPointer(), bytes) != 0) return 12;

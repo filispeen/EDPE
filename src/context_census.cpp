@@ -29,6 +29,7 @@ constexpr size_t kDrawInstanced = 21;
 constexpr size_t kOMSetRenderTargets = 33;
 constexpr unsigned kPairFirstSample = 100;
 constexpr unsigned kPairSecondSample = 101;
+constexpr unsigned kAlternateProjectionSample = 102;
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
 using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
@@ -134,7 +135,7 @@ struct ConstantBufferSample {
     std::atomic<bool> claimed{false};
     std::atomic<bool> ready{false};
 };
-std::array<ConstantBufferSample, 8> constant_buffer_samples{}; // Six snapshot probes and two adjacent-frame probes.
+std::array<ConstantBufferSample, 9> constant_buffer_samples{}; // Snapshot, adjacent-frame, and alternate-projection probes.
 struct PipelineSample {
     ID3D11Query* query = nullptr;
     unsigned bind = 0;
@@ -192,6 +193,9 @@ std::atomic<unsigned long long> scene_last_camera_hash{0};
 std::atomic<unsigned long long> scene_first_projection_hash{0};
 std::atomic<unsigned long long> scene_last_projection_hash{0};
 
+void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
+    const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
+
 void observeFirstSceneDraw(ID3D11DeviceContext* context) {
     if (!vs_scene_buffer_bound.load(std::memory_order_relaxed)) return;
     const bool first = !first_scene_draw_seen.exchange(true, std::memory_order_relaxed);
@@ -226,6 +230,37 @@ void observeFirstSceneDraw(ID3D11DeviceContext* context) {
             auto& sample = scene_shaders[scene_shader_count++];
             sample.shader.Attach(shader); // VSGetShader transferred one reference.
             sample.draws = 1;
+            // Exact one-run diagnostic signature from the captured CB0 shader.
+            UINT bytes = 0;
+            shader->GetPrivateData(kEdpeVertexBytecodeGuid, &bytes, nullptr);
+            if (bytes == 4884) {
+                std::array<unsigned char, 4884> bytecode{};
+                if (SUCCEEDED(shader->GetPrivateData(kEdpeVertexBytecodeGuid,
+                        &bytes, bytecode.data()))) {
+                    unsigned long long hash = 14695981039346656037ull;
+                    for (unsigned char value : bytecode)
+                        hash = (hash ^ value) * 1099511628211ull;
+                    if (hash == 0x22D371BE9A186044ull) {
+                        ID3D11Buffer* buffer = nullptr;
+                        context->VSGetConstantBuffers(0, 1, &buffer);
+                        if (buffer) {
+                            D3D11_BUFFER_DESC desc{};
+                            buffer->GetDesc(&desc);
+                            wchar_t message[160];
+                            swprintf_s(message,
+                                L"EDPE: alternate VS CB0 buffer=%p bytes=%u usage=%u bind=0x%X",
+                                buffer, desc.ByteWidth, static_cast<unsigned>(desc.Usage),
+                                desc.BindFlags);
+                            EdpeLog(message);
+                            if (desc.ByteWidth >= 128 &&
+                                (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER))
+                                queueConstantBufferSample(context, buffer, desc,
+                                    kAlternateProjectionSample);
+                            buffer->Release();
+                        }
+                    }
+                }
+            }
             return;
         }
         ++scene_shader_overflow_draws;
@@ -299,9 +334,6 @@ void dumpSceneShaders() {
     scene_shader_count = 0;
     scene_shader_overflow_draws = 0;
 }
-
-void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
-    const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
 
 void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context,
     UINT start, UINT count, ID3D11Buffer* const* buffers) {
@@ -739,6 +771,7 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal) {
     const unsigned slot = bind_ordinal == kPairFirstSample || bind_ordinal == kPairSecondSample
         ? 6 + bind_ordinal - kPairFirstSample
+        : bind_ordinal == kAlternateProjectionSample ? 8
         : bind_ordinal == 51 ? 5 : bind_ordinal == 0 ? 4
         : bind_ordinal == 6 ? 3 : bind_ordinal - 2;
     auto& sample = constant_buffer_samples[slot];
@@ -808,7 +841,21 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
                     sample.bind, hash, camera_hash);
                 EdpeLog(message);
             }
-            if (sample.bind == 2) {
+            if (sample.bind == kAlternateProjectionSample) {
+                D3D11_BUFFER_DESC desc{};
+                sample.buffer->GetDesc(&desc);
+                wchar_t message[192];
+                swprintf_s(message, L"EDPE: alternate VS CB0 sample afterPresent=%llu bytes=%u",
+                    sample.after_present, desc.ByteWidth);
+                EdpeLog(message);
+                for (unsigned row = 4; row < 8; ++row) {
+                    const unsigned offset = row * 4;
+                    swprintf_s(message, L"EDPE: alternate VS CB0 row%u=(%.9g,%.9g,%.9g,%.9g)",
+                        row, values[offset], values[offset + 1],
+                        values[offset + 2], values[offset + 3]);
+                    EdpeLog(message);
+                }
+            } else if (sample.bind == 2) {
                 wchar_t words[192];
                 int used = swprintf_s(words, L"EDPE: depth-pass CB bind=2 slot=2 hex=");
                 const auto* raw = static_cast<const unsigned*>(mapped.pData);
