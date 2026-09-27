@@ -159,6 +159,8 @@ std::atomic<unsigned> draw_indexed_instanced_calls{0};
 std::atomic<unsigned> draw_indexed_instanced_scene_calls{0};
 std::atomic<unsigned> draw_instanced_calls{0};
 std::atomic<unsigned> draw_instanced_scene_calls{0};
+std::atomic<bool> first_scene_draw_seen{false};
+std::atomic<ID3D11Buffer*> first_scene_draw_buffer{nullptr}; // Identity only.
 std::atomic<bool> draw_hook_active{false};
 std::atomic<bool> draw_indexed_instanced_hook_active{false};
 std::atomic<bool> draw_instanced_hook_active{false};
@@ -177,6 +179,15 @@ std::atomic<unsigned long long> scene_first_camera_hash{0};
 std::atomic<unsigned long long> scene_last_camera_hash{0};
 std::atomic<unsigned long long> scene_first_projection_hash{0};
 std::atomic<unsigned long long> scene_last_projection_hash{0};
+
+void observeFirstSceneDraw(ID3D11DeviceContext* context) {
+    if (!vs_scene_buffer_bound.load(std::memory_order_relaxed) ||
+        first_scene_draw_seen.exchange(true, std::memory_order_relaxed)) return;
+    ID3D11Buffer* buffer = nullptr;
+    context->VSGetConstantBuffers(1, 1, &buffer);
+    first_scene_draw_buffer.store(buffer, std::memory_order_relaxed);
+    if (buffer) buffer->Release();
+}
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
@@ -217,6 +228,7 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
         draw_indexed_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
             draw_indexed_scene_calls.fetch_add(1, std::memory_order_relaxed);
+        observeFirstSceneDraw(context);
     }
     original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
 }
@@ -227,6 +239,7 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
         draw_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
             draw_scene_calls.fetch_add(1, std::memory_order_relaxed);
+        observeFirstSceneDraw(context);
     }
     original_draw.load(std::memory_order_acquire)(context, count, start);
 }
@@ -239,6 +252,7 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
         draw_indexed_instanced_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
             draw_indexed_instanced_scene_calls.fetch_add(1, std::memory_order_relaxed);
+        observeFirstSceneDraw(context);
     }
     original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
         index_count, instance_count, start_index, base_vertex, start_instance);
@@ -251,6 +265,7 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         draw_instanced_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
             draw_instanced_scene_calls.fetch_add(1, std::memory_order_relaxed);
+        observeFirstSceneDraw(context);
     }
     original_draw_instanced.load(std::memory_order_acquire)(context,
         vertex_count, instance_count, start_vertex, start_instance);
@@ -364,6 +379,11 @@ void endDrawProbe() {
         draw_restored, indexed_instanced_restored, instanced_restored,
         vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
+    swprintf_s(message, L"EDPE: first scene draw VS1=%p observed=%u bind=%u",
+        first_scene_draw_buffer.load(std::memory_order_relaxed),
+        first_scene_draw_seen.load(std::memory_order_relaxed),
+        vs_probe_bind_ordinal.load(std::memory_order_relaxed));
+    EdpeLog(message);
     auto* map_target = scene_map_target.exchange(nullptr, std::memory_order_acq_rel);
     scene_mapped_data.store(nullptr, std::memory_order_release);
     const bool map_restored = !map_hook_active.exchange(false) || patchSlot(patched_table,
@@ -406,6 +426,8 @@ void beginDrawProbe() {
     draw_indexed_instanced_scene_calls.store(0, std::memory_order_relaxed);
     draw_instanced_calls.store(0, std::memory_order_relaxed);
     draw_instanced_scene_calls.store(0, std::memory_order_relaxed);
+    first_scene_draw_seen.store(false, std::memory_order_relaxed);
+    first_scene_draw_buffer.store(nullptr, std::memory_order_relaxed);
     scene_maps.store(0, std::memory_order_relaxed);
     scene_unmaps.store(0, std::memory_order_relaxed);
     scene_maps_after_draw.store(0, std::memory_order_relaxed);
