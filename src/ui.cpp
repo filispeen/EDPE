@@ -34,6 +34,7 @@ struct UiState {
     ID3D11ShaderResourceView* depth_srv = nullptr;
     ID3D11Texture2D* color_copy = nullptr;
     ID3D11ShaderResourceView* color_srv = nullptr;
+    ID3D11ShaderResourceView* early_color_srv = nullptr;
     ID3D11ShaderResourceView* motion_srv = nullptr;
     UINT motion_width = 0;
     UINT motion_height = 0;
@@ -45,6 +46,9 @@ struct UiState {
     int color_snapshot_index = -1;
     bool color_window_open = true;
     bool color_image_logged = false;
+    UINT early_color_width = 0;
+    UINT early_color_height = 0;
+    bool early_color_window_open = true;
     ID3D11PixelShader* depth_contrast_shader = nullptr;
     bool depth_shader_failed = false;
     bool depth_contrast = true;
@@ -131,6 +135,11 @@ void releaseColorSnapshot() {
     ui.color_copy = nullptr;
     ui.color_snapshot_index = -1;
     ui.color_image_logged = false;
+}
+
+void releaseEarlyColorSnapshot() {
+    if (ui.early_color_srv) ui.early_color_srv->Release();
+    ui.early_color_srv = nullptr;
 }
 
 void bindMotionPreviewShader(const ImDrawList*, const ImDrawCmd*) {
@@ -438,6 +447,7 @@ void shutdownUi() {
     releaseBackbuffer();
     releaseDepthSnapshot();
     releaseColorSnapshot();
+    releaseEarlyColorSnapshot();
     if (ui.motion_srv) ui.motion_srv->Release();
     if (ui.motion_preview_shader) ui.motion_preview_shader->Release();
     if (ui.depth_contrast_shader) ui.depth_contrast_shader->Release();
@@ -542,6 +552,13 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.color_window_open = true;
         EdpeLog(L"EDPE: same-frame HDR color handed to ImGui");
     }
+    if (auto* early = ContextCensusTakeMotionEarlyColorSnapshot(
+            &ui.early_color_width, &ui.early_color_height)) {
+        releaseEarlyColorSnapshot();
+        ui.early_color_srv = early;
+        ui.early_color_window_open = true;
+        EdpeLog(L"EDPE: early HDR color handed to ImGui");
+    }
     if (!menu_visible.load()) {
         unsigned ignored = 0;
         ID3D11RenderTargetView* color = nullptr;
@@ -627,6 +644,12 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ui.color_snapshot_index, ui.color_width, ui.color_height);
         if (!ui.color_window_open && ImGui::Button("Show scene color snapshot")) ui.color_window_open = true;
     }
+    if (ui.early_color_srv) {
+        ImGui::Text("Early HDR candidate: %ux%u", ui.early_color_width,
+            ui.early_color_height);
+        if (!ui.early_color_window_open && ImGui::Button("Show early HDR snapshot"))
+            ui.early_color_window_open = true;
+    }
     if (ui.motion_srv) {
         ImGui::Text("Motion candidate: %ux%u, current to previous pixels",
             ui.motion_width, ui.motion_height);
@@ -689,6 +712,21 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 EdpeLog(L"EDPE: scene color snapshot image submitted to ImGui");
                 ui.color_image_logged = true;
             }
+        }
+        ImGui::End();
+    }
+    if (ui.early_color_srv && ui.early_color_window_open) {
+        ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("EDPE Early HDR Snapshot", &ui.early_color_window_open)) {
+            ImGui::TextUnformatted("First RTV3 exit; scene completeness unverified");
+            float width = ImGui::GetContentRegionAvail().x;
+            if (width > 640.0f) width = 640.0f;
+            if (width < 1.0f) width = 1.0f;
+            float height = width * static_cast<float>(ui.early_color_height) /
+                ui.early_color_width;
+            if (height > 360.0f) { width *= 360.0f / height; height = 360.0f; }
+            ImGui::Image(reinterpret_cast<ImTextureID>(ui.early_color_srv),
+                ImVec2(width, height));
         }
         ImGui::End();
     }

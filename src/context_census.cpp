@@ -108,8 +108,12 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> motion_color_source;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_view;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_snapshot;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_early_color_view;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_early_color_snapshot;
 UINT motion_color_snapshot_width = 0;
 UINT motion_color_snapshot_height = 0;
+UINT motion_early_color_width = 0;
+UINT motion_early_color_height = 0;
 unsigned long long motion_color_frame = ~0ull;
 bool motion_color_bound = false;
 bool motion_color_rebound = false;
@@ -1052,6 +1056,56 @@ void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
     EdpeLog(message);
 }
 
+void captureEarlyMotionColor(ID3D11DeviceContext* context) {
+    if (motion_early_color_view || !motion_color_source) return;
+    ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
+    bool still_bound = false;
+    for (auto* view : bound) {
+        still_bound |= view == motion_color_source.Get();
+        if (view) view->Release();
+    }
+    if (still_bound) {
+        EdpeLog(L"EDPE: early HDR copy skipped (RTV still bound)");
+        return;
+    }
+    D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
+    motion_color_source->GetDesc(&rtv_desc);
+    Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+    motion_color_source->GetResource(&resource);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+    if (!resource || FAILED(resource.As(&source))) {
+        EdpeLog(L"EDPE: early HDR copy unavailable (RTV has no Texture2D)");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_R11G11B10_FLOAT ||
+        rtv_desc.Format != desc.Format || !desc.Width || !desc.Height ||
+        desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1 ||
+        static_cast<unsigned long long>(desc.Width) * desc.Height > 3840ull * 2160) {
+        EdpeLog(L"EDPE: early HDR copy unavailable (unsupported texture layout)");
+        return;
+    }
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = desc.MiscFlags = 0;
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> copy;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+    if (!device || FAILED(device->CreateTexture2D(&desc, nullptr, &copy)) ||
+        FAILED(device->CreateShaderResourceView(copy.Get(), nullptr, &view))) {
+        EdpeLog(L"EDPE: early HDR copy unavailable (resource creation failed)");
+        return;
+    }
+    context->CopyResource(copy.Get(), source.Get());
+    motion_early_color_view = std::move(view);
+    motion_early_color_width = desc.Width;
+    motion_early_color_height = desc.Height;
+    EdpeLog(L"EDPE: early HDR color copied at first RTV3 exit");
+}
+
 void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
     for (auto& sample : camera_pair_depth) {
         ID3D11DepthStencilView* view = nullptr;
@@ -1199,6 +1253,7 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         motion_depth_view.Reset();
         motion_color_source.Reset();
         motion_color_view.Reset();
+        motion_early_color_view.Reset();
         return;
     }
     if (motion_camera_frames[0] != camera_pair_armed_after ||
@@ -1217,6 +1272,7 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
             motion_pair_active = false;
             motion_depth.Reset();
             motion_depth_view.Reset();
+            motion_early_color_view.Reset();
             return;
         }
         motion_pass = std::move(candidate);
@@ -1237,11 +1293,13 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         motion_depth_view.Reset();
         motion_color_source.Reset();
         motion_color_view.Reset();
+        motion_early_color_view.Reset();
         return;
     }
     EdpeLog(motion_color_view ? L"EDPE: motion candidate has same-frame HDR color" :
         L"EDPE: motion candidate HDR color unavailable");
     motion_color_snapshot = std::move(motion_color_view);
+    motion_early_color_snapshot = std::move(motion_early_color_view);
     motion_color_snapshot_width = desc.Width;
     motion_color_snapshot_height = desc.Height;
     motion_snapshot = motion_pass->output();
@@ -1328,6 +1386,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 L"EDPE: motion HDR RTV3 first exit frame=%llu nextRTVs=%u nextDSV=%p",
                 motion_color_frame, count, dsv);
             EdpeLog(message);
+            captureEarlyMotionColor(context);
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
         motion_color_bound = bound;
@@ -1673,6 +1732,8 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             motion_color_source.Reset();
             motion_color_view.Reset();
             motion_color_snapshot.Reset();
+            motion_early_color_view.Reset();
+            motion_early_color_snapshot.Reset();
             motion_color_frame = ~0ull;
             motion_color_bound = motion_color_rebound =
                 motion_color_first_exit_logged = false;
@@ -1779,6 +1840,13 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionColorSnapshot(UINT* width, UINT
     return motion_color_snapshot.Detach();
 }
 
+ID3D11ShaderResourceView* ContextCensusTakeMotionEarlyColorSnapshot(UINT* width, UINT* height) {
+    if (!motion_early_color_snapshot) return nullptr;
+    if (width) *width = motion_early_color_width;
+    if (height) *height = motion_early_color_height;
+    return motion_early_color_snapshot.Detach();
+}
+
 int ContextCensusSceneDepthCandidate() {
     std::lock_guard lock(seen_mutex);
     const auto frame = last_present_frame.load(std::memory_order_relaxed);
@@ -1876,6 +1944,8 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_color_source.Reset();
         motion_color_view.Reset();
         motion_color_snapshot.Reset();
+        motion_early_color_view.Reset();
+        motion_early_color_snapshot.Reset();
         motion_color_frame = ~0ull;
         motion_color_bound = motion_color_rebound =
             motion_color_first_exit_logged = false;
