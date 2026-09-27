@@ -111,6 +111,9 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_snapshot;
 UINT motion_color_snapshot_width = 0;
 UINT motion_color_snapshot_height = 0;
 unsigned long long motion_color_frame = ~0ull;
+bool motion_color_bound = false;
+bool motion_color_rebound = false;
+bool motion_color_first_exit_logged = false;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
@@ -994,6 +997,12 @@ void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
     if (!motion_pair_active || !motion_color_source ||
         motion_color_frame + 1 != frame || motion_depth_frame != motion_color_frame)
         return;
+    wchar_t transition[160];
+    swprintf_s(transition,
+        L"EDPE: motion HDR RTV3 frame=%llu firstExit=%u rebound=%u lastObservedBound=%u",
+        motion_color_frame, motion_color_first_exit_logged, motion_color_rebound,
+        motion_color_bound);
+    EdpeLog(transition);
     auto source_view = std::move(motion_color_source);
     ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
@@ -1307,6 +1316,22 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
     forward(context, count, targets, dsv);
     if (context != observed_context.load(std::memory_order_acquire)) return;
+    if (motion_pair_active && motion_color_source &&
+        motion_color_frame == last_present_frame.load(std::memory_order_relaxed)) {
+        bool bound = false;
+        for (UINT slot = 0; targets && slot < count; ++slot)
+            bound |= targets[slot] == motion_color_source.Get();
+        if (motion_color_bound && !bound && !motion_color_first_exit_logged) {
+            motion_color_first_exit_logged = true;
+            wchar_t message[160];
+            swprintf_s(message,
+                L"EDPE: motion HDR RTV3 first exit frame=%llu nextRTVs=%u nextDSV=%p",
+                motion_color_frame, count, dsv);
+            EdpeLog(message);
+        }
+        if (!motion_color_bound && bound) motion_color_rebound = true;
+        motion_color_bound = bound;
+    }
     if (!dsv) {
         if (sequence_active.load(std::memory_order_acquire)) {
             std::lock_guard lock(seen_mutex);
@@ -1398,6 +1423,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                         targets[3] && !motion_color_source) {
                         motion_color_source = targets[3];
                         motion_color_frame = frame;
+                        motion_color_bound = true;
                     }
                 }
             }
@@ -1648,6 +1674,8 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             motion_color_view.Reset();
             motion_color_snapshot.Reset();
             motion_color_frame = ~0ull;
+            motion_color_bound = motion_color_rebound =
+                motion_color_first_exit_logged = false;
             motion_depth_frame = ~0ull;
             motion_depth.Reset();
             motion_depth_view.Reset();
@@ -1849,6 +1877,8 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_color_view.Reset();
         motion_color_snapshot.Reset();
         motion_color_frame = ~0ull;
+        motion_color_bound = motion_color_rebound =
+            motion_color_first_exit_logged = false;
         motion_grid_readback.Reset();
         motion_snapshot.Reset();
         motion_pass.reset();
