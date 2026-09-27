@@ -45,6 +45,14 @@ and probe executable remain ignored build artifacts.
 The probe also produced `dlls/nvngx_dlss*.dll` in the repository root;
 that SDK-created directory is ignored and none of its binaries are tracked.
 
+**MEASURED (verbose callback, same date):** With SDK logging written to an
+unbuffered local file, `DestroyParameters` returned success (`0x00000001`).
+The probe then entered `Shutdown1(nullptr)` and timed out after 20 seconds.
+The final SDK messages reported telemetry shutdown and two
+`NGXCubinGeneric::Shutdown` resource lists of size 0. No feature had been
+created. This narrows the stall to SDK shutdown but does not identify its
+cause. The probe was terminated; its full log remains under ignored `build/`.
+
 ## SDK-documented D3D11 inputs
 
 - `NGX_D3D11_CREATE_DLSS_EXT` sets input width/height, output width/height,
