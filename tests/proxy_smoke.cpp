@@ -403,6 +403,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: scene buffer maps=0 afterDraw=0 unmaps=0 restored=11 bind=1") &&
         std::strstr(contents, "EDPE: scene buffer maps=0 afterDraw=0 unmaps=0 restored=11 bind=2") &&
         std::strstr(contents, "EDPE: scene buffer maps=1 afterDraw=1 unmaps=1 restored=11 bind=3") &&
+        std::strstr(contents, "EDPE: scene write hashes sampled=1 cameraChanges=0 projectionChanges=0 camera=") &&
         std::strstr(contents, "EDPE: scene CB sample bind=0 projectionZ=(0,0.025000") &&
         std::strstr(contents, "EDPE: scene CB sample bind=51 projectionZ=(0,0.025000") &&
         std::strstr(contents, "EDPE: scene CB hash bind=0 fnv64=") &&

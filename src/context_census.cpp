@@ -168,6 +168,14 @@ std::atomic<bool> unmap_hook_active{false};
 std::atomic<unsigned> scene_maps{0};
 std::atomic<unsigned> scene_unmaps{0};
 std::atomic<unsigned> scene_maps_after_draw{0};
+std::atomic<void*> scene_mapped_data{nullptr};
+std::atomic<unsigned> scene_hashed_writes{0};
+std::atomic<unsigned> scene_camera_changes{0};
+std::atomic<unsigned> scene_projection_changes{0};
+std::atomic<unsigned long long> scene_first_camera_hash{0};
+std::atomic<unsigned long long> scene_last_camera_hash{0};
+std::atomic<unsigned long long> scene_first_projection_hash{0};
+std::atomic<unsigned long long> scene_last_projection_hash{0};
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
@@ -255,6 +263,7 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
         resource == scene_map_target.load(std::memory_order_acquire) &&
         map_hook_active.load(std::memory_order_acquire)) {
         scene_maps.fetch_add(1, std::memory_order_relaxed);
+        scene_mapped_data.store(mapped ? mapped->pData : nullptr, std::memory_order_release);
         if (draw_indexed_calls.load(std::memory_order_relaxed) ||
             draw_calls.load(std::memory_order_relaxed) ||
             draw_indexed_instanced_calls.load(std::memory_order_relaxed) ||
@@ -268,8 +277,30 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
     UINT subresource) {
     if (context == observed_context.load(std::memory_order_acquire) &&
         resource == scene_map_target.load(std::memory_order_acquire) &&
-        unmap_hook_active.load(std::memory_order_acquire))
+        unmap_hook_active.load(std::memory_order_acquire)) {
         scene_unmaps.fetch_add(1, std::memory_order_relaxed);
+        const auto* data = static_cast<const unsigned char*>(
+            scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel));
+        if (data) {
+            unsigned long long camera = 14695981039346656037ull;
+            unsigned long long projection = camera;
+            for (size_t i = 932 * 4; i < 944 * 4; ++i)
+                camera = (camera ^ data[i]) * 1099511628211ull;
+            for (size_t i = 1080 * 4; i < 1096 * 4; ++i)
+                projection = (projection ^ data[i]) * 1099511628211ull;
+            if (scene_hashed_writes.fetch_add(1, std::memory_order_relaxed) == 0) {
+                scene_first_camera_hash.store(camera, std::memory_order_relaxed);
+                scene_first_projection_hash.store(projection, std::memory_order_relaxed);
+            } else {
+                if (camera != scene_last_camera_hash.load(std::memory_order_relaxed))
+                    scene_camera_changes.fetch_add(1, std::memory_order_relaxed);
+                if (projection != scene_last_projection_hash.load(std::memory_order_relaxed))
+                    scene_projection_changes.fetch_add(1, std::memory_order_relaxed);
+            }
+            scene_last_camera_hash.store(camera, std::memory_order_relaxed);
+            scene_last_projection_hash.store(projection, std::memory_order_relaxed);
+        }
+    }
     original_unmap.load(std::memory_order_acquire)(context, resource, subresource);
 }
 
@@ -278,7 +309,7 @@ void endDrawProbe() {
     auto* forward = reinterpret_cast<void*>(original_draw_indexed.load(std::memory_order_acquire));
     const bool restored = patched_table && patchSlot(patched_table, kDrawIndexed,
         reinterpret_cast<void*>(&observedDrawIndexed), forward);
-    wchar_t message[160];
+    wchar_t message[256];
     swprintf_s(message,
         L"EDPE: depth-pass DrawIndexed calls=%u with5376VS1=%u slotRestored=%u bind=%u",
         draw_indexed_calls.load(std::memory_order_relaxed),
@@ -313,6 +344,7 @@ void endDrawProbe() {
         vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
     scene_map_target.store(nullptr, std::memory_order_release);
+    scene_mapped_data.store(nullptr, std::memory_order_release);
     const bool map_restored = !map_hook_active.exchange(false) || patchSlot(patched_table,
         kMap, reinterpret_cast<void*>(&observedMap),
         reinterpret_cast<void*>(original_map.load(std::memory_order_acquire)));
@@ -323,6 +355,17 @@ void endDrawProbe() {
         scene_maps.load(std::memory_order_relaxed),
         scene_maps_after_draw.load(std::memory_order_relaxed),
         scene_unmaps.load(std::memory_order_relaxed), map_restored, unmap_restored,
+        vs_probe_bind_ordinal.load(std::memory_order_relaxed));
+    EdpeLog(message);
+    swprintf_s(message,
+        L"EDPE: scene write hashes sampled=%u cameraChanges=%u projectionChanges=%u camera=%016llX/%016llX projection=%016llX/%016llX bind=%u",
+        scene_hashed_writes.load(std::memory_order_relaxed),
+        scene_camera_changes.load(std::memory_order_relaxed),
+        scene_projection_changes.load(std::memory_order_relaxed),
+        scene_first_camera_hash.load(std::memory_order_relaxed),
+        scene_last_camera_hash.load(std::memory_order_relaxed),
+        scene_first_projection_hash.load(std::memory_order_relaxed),
+        scene_last_projection_hash.load(std::memory_order_relaxed),
         vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
 }
@@ -343,6 +386,14 @@ void beginDrawProbe() {
     scene_maps.store(0, std::memory_order_relaxed);
     scene_unmaps.store(0, std::memory_order_relaxed);
     scene_maps_after_draw.store(0, std::memory_order_relaxed);
+    scene_mapped_data.store(nullptr, std::memory_order_relaxed);
+    scene_hashed_writes.store(0, std::memory_order_relaxed);
+    scene_camera_changes.store(0, std::memory_order_relaxed);
+    scene_projection_changes.store(0, std::memory_order_relaxed);
+    scene_first_camera_hash.store(0, std::memory_order_relaxed);
+    scene_last_camera_hash.store(0, std::memory_order_relaxed);
+    scene_first_projection_hash.store(0, std::memory_order_relaxed);
+    scene_last_projection_hash.store(0, std::memory_order_relaxed);
     if (patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(forward),
             reinterpret_cast<void*>(&observedDrawIndexed))) {
         draw_probe_active.store(true, std::memory_order_release);
