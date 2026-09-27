@@ -888,3 +888,32 @@ Draw counts do not measure the primitive or pixel share of each shader.
 This is one scene frame and one pass ordering, not a census of all game
 scenes or frames. Runtime jitter remains disabled while these paths and
 safe fallback remain unresolved.
+
+## Alternate projection buffer — 2026-09-27
+
+**MEASURED / VERIFIED (Elite Odyssey gameplay; build not rechecked):** A
+second explicitly armed, one-run capture matched the exact bytecode hash
+of the three-draw bind-2 shader above. At its first draw in frame
+`afterPresent=10780`, VS slot 0 held a 208-byte dynamic constant buffer
+with the constant-buffer bind flag. EDPE copied that buffer to staging on
+the GPU and read it later without waiting in the draw hook. The user
+reported normal game, HUD, menu, and both snapshots. The shader again
+accounted for three of 251 scene-buffer draws; the census did not overflow.
+
+**VERIFIED (same-frame buffer comparison):** `cb0[4..7]` is the transpose
+of the observed `cb1[270..273]` projection block at the displayed
+nine-digit precision, except `cb0[7].w = 2.38418579e-6` while
+`cb1[273].w = 0`. For example, `cb0[4] =
+(-0.94005692, 0.00193103834, 0.255945712, 0)` matches the X component
+of each `cb1` register. The shared depth coefficient is
+`0.0250000004`. The captured shader calculates each clip component as a
+dot product of one `cb0` row with its position vector, so this layout
+also produces a camera-dependent clip position.
+
+**IMPLICATION / LIMIT:** A complete projection-jitter implementation must
+handle both buffer layouts in the relevant scene draws. For this shader's
+dot-product layout, the algebraic X/Y offset would add `ndcX*cb0[7]` to
+`cb0[4]` and `ndcY*cb0[7]` to `cb0[5]`. This is a CPU-side derivation,
+not a verified mutation point. Buffer update order, other scenes, the
+passthrough draw, and fail-open restoration remain unverified; EDPE still
+does not modify either game buffer.

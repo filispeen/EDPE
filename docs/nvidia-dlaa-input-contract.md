@@ -40,11 +40,12 @@ No NGX evaluation was run in Elite.
 - **BLOCKED FOR RUNTIME DLAA:** Read-only captures identify a camera-buffer
   write before the main scene pass. A one-frame shader census found that
   248/251 draws in its heavy pass used the observed projection block for
-  clip X/Y/W, while three used a different matrix. Other scenes and pass
-  orders, plus a guaranteed way to remove jitter if evaluation fails, remain
-  unverified. The current Halton sequence must remain inactive in Elite. NGX
-  must not consume diagnostic captures as production inputs until that safety
-  condition and the input conventions are verified.
+  clip X/Y/W, while three used a separate, transposed copy in VS slot 0.
+  Other scenes and pass orders, plus a guaranteed way to remove jitter if
+  evaluation fails, remain unverified. The current Halton sequence must
+  remain inactive in Elite. NGX must not consume diagnostic captures as
+  production inputs until that safety condition and the input conventions
+  are verified.
 
 **Implication:** Keep EDPE's scene observations and motion generation
 backend-neutral. Translate measured EDPE conventions at the future NGX
