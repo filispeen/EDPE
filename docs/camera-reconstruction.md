@@ -712,3 +712,20 @@ is bound during substantial scene rasterization, stronger than sampling it
 only at an MRT bind. It does not prove which fields each shader actually
 reads, whether all depth-writing draws use the same camera, or that a write
 to this buffer would be safe. Projection jitter remains disabled.
+
+**MEASURED (later user-confirmed gameplay captures, 2026-09-27; game build
+not rechecked):** The scene-MRT order changed within another session. At
+`afterPresent=13657`, bind 2 began with depth test/write enabled and
+reported 432236 input-assembler primitives; bind 3 began with depth write
+disabled and reported 39552. A second capture at `afterPresent=14779`
+repeated this ordering. The bind-3 draw probe saw 58
+`DrawIndexedInstanced` and one `DrawInstanced` call, all with the same
+5376-byte VS-slot-1 buffer. Its buffer-specific `Map`/`Unmap` counts were
+zero and its hooks restored. Those zero counts describe bind 3 only; they
+do not establish that the game never maps the buffer in the heavier bind-2
+interval or before either bind. The user confirmed normal game and snapshots.
+
+**IMPLICATION:** A fixed DSV bind ordinal cannot select the main geometry
+pass across gameplay states. The one-shot probe now reports each of the
+first three MRT intervals separately. Runtime camera selection and jitter
+still require evidence from the actual drawing and buffer-write sequence.
