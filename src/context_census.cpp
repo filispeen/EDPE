@@ -19,6 +19,7 @@
 
 namespace {
 constexpr size_t kVSSetConstantBuffers = 7;
+constexpr size_t kDrawIndexed = 12;
 constexpr size_t kOMSetRenderTargets = 33;
 constexpr unsigned kPairFirstSample = 100;
 constexpr unsigned kPairSecondSample = 101;
@@ -26,6 +27,7 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT
     ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
 using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     UINT, ID3D11Buffer* const*);
+using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 
 bool patchSlot(void** table, size_t slot, void* expected, void* replacement);
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
@@ -33,6 +35,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
+std::atomic<DrawIndexedFn> original_draw_indexed{nullptr};
 std::atomic<ID3D11DeviceContext*> observed_context{nullptr};
 IDXGISwapChain* observed_swap_chain = nullptr; // Weak; released by the game.
 void** patched_table = nullptr;
@@ -127,6 +130,10 @@ std::atomic<unsigned> vs_scene_buffer_calls{0};
 std::atomic<unsigned> vs_scene_buffer_switches{0};
 std::atomic<ID3D11Buffer*> vs_first_scene_buffer{nullptr}; // Identity only.
 std::atomic<ID3D11Buffer*> vs_scene_buffer{nullptr};
+std::atomic<bool> vs_scene_buffer_bound{false};
+std::atomic<bool> draw_probe_active{false};
+std::atomic<unsigned> draw_indexed_calls{0};
+std::atomic<unsigned> draw_indexed_scene_calls{0};
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
@@ -138,11 +145,13 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
     if (context != observed_context.load(std::memory_order_acquire) ||
         !vs_buffer_probe_active.load(std::memory_order_acquire)) return;
     vs_buffer_calls.fetch_add(1, std::memory_order_relaxed);
-    if (start > 1 || count <= 1 - start || !buffers || !buffers[1 - start]) return;
-    ID3D11Buffer* buffer = buffers[1 - start];
+    if (start > 1 || count <= 1 - start) return;
+    ID3D11Buffer* buffer = buffers ? buffers[1 - start] : nullptr;
     D3D11_BUFFER_DESC desc{};
-    buffer->GetDesc(&desc);
-    if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC) {
+    if (buffer) buffer->GetDesc(&desc);
+    const bool scene = desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC;
+    vs_scene_buffer_bound.store(scene, std::memory_order_relaxed);
+    if (scene) {
         const unsigned scene_bind = vs_scene_buffer_calls.fetch_add(1, std::memory_order_relaxed) + 1;
         ID3D11Buffer* expected = nullptr;
         if (vs_first_scene_buffer.compare_exchange_strong(expected, buffer, std::memory_order_relaxed))
@@ -154,7 +163,46 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
     }
 }
 
+void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
+    UINT start, INT base) {
+    if (context == observed_context.load(std::memory_order_acquire) &&
+        draw_probe_active.load(std::memory_order_acquire)) {
+        draw_indexed_calls.fetch_add(1, std::memory_order_relaxed);
+        if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
+            draw_indexed_scene_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
+}
+
+void endDrawProbe() {
+    if (!draw_probe_active.exchange(false, std::memory_order_acq_rel)) return;
+    const bool restored = patched_table && patchSlot(patched_table, kDrawIndexed,
+        reinterpret_cast<void*>(&observedDrawIndexed),
+        reinterpret_cast<void*>(original_draw_indexed.load(std::memory_order_acquire)));
+    wchar_t message[160];
+    swprintf_s(message,
+        L"EDPE: depth-pass DrawIndexed calls=%u with5376VS1=%u slotRestored=%u",
+        draw_indexed_calls.load(std::memory_order_relaxed),
+        draw_indexed_scene_calls.load(std::memory_order_relaxed), restored);
+    EdpeLog(message);
+}
+
+void beginDrawProbe() {
+    if (!patched_table || !vs_buffer_probe_active.load(std::memory_order_acquire)) return;
+    auto forward = reinterpret_cast<DrawIndexedFn>(patched_table[kDrawIndexed]);
+    if (!forward || forward == &observedDrawIndexed) return;
+    original_draw_indexed.store(forward, std::memory_order_release);
+    draw_indexed_calls.store(0, std::memory_order_relaxed);
+    draw_indexed_scene_calls.store(0, std::memory_order_relaxed);
+    if (patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(forward),
+            reinterpret_cast<void*>(&observedDrawIndexed)))
+        draw_probe_active.store(true, std::memory_order_release);
+    else
+        EdpeLog(L"EDPE: depth-pass DrawIndexed probe unavailable (slot changed)");
+}
+
 void endVSBufferProbe() {
+    endDrawProbe();
     if (!vs_buffer_probe_active.exchange(false, std::memory_order_acq_rel)) return;
     const bool restored = patched_table && patchSlot(patched_table,
         kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers),
@@ -170,7 +218,7 @@ void endVSBufferProbe() {
     EdpeLog(message);
 }
 
-void beginVSBufferProbe() {
+void beginVSBufferProbe(ID3D11DeviceContext* context) {
     if (!patched_table) return;
     auto forward = reinterpret_cast<VSSetConstantBuffersFn>(
         patched_table[kVSSetConstantBuffers]);
@@ -184,13 +232,22 @@ void beginVSBufferProbe() {
     vs_scene_buffer_switches.store(0, std::memory_order_relaxed);
     vs_first_scene_buffer.store(nullptr, std::memory_order_relaxed);
     vs_scene_buffer.store(nullptr, std::memory_order_relaxed);
+    ID3D11Buffer* initial = nullptr;
+    context->VSGetConstantBuffers(1, 1, &initial);
+    D3D11_BUFFER_DESC initial_desc{};
+    if (initial) {
+        initial->GetDesc(&initial_desc);
+        initial->Release();
+    }
+    vs_scene_buffer_bound.store(initial_desc.ByteWidth == 5376 &&
+        initial_desc.Usage == D3D11_USAGE_DYNAMIC, std::memory_order_relaxed);
     vs_buffer_probe_active.store(true, std::memory_order_release);
     if (!patchSlot(patched_table, kVSSetConstantBuffers,
             reinterpret_cast<void*>(forward),
             reinterpret_cast<void*>(&observedVSSetConstantBuffers))) {
         vs_buffer_probe_active.store(false, std::memory_order_release);
         EdpeLog(L"EDPE: depth-pass VS bindings unavailable (slot changed)");
-    }
+    } else beginDrawProbe();
 }
 
 void logDepthState(ID3D11DeviceContext* context, const PipelineSample& sample,
@@ -908,7 +965,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         beginPipelineSample(context, snapshot_probe_bind);
         logSnapshotColorTarget(index, snapshot_probe_bind, count, targets);
         logBoundConstantBuffers(context, index, snapshot_probe_bind);
-        if (snapshot_probe_bind == 2) beginVSBufferProbe();
+        if (snapshot_probe_bind == 2) beginVSBufferProbe(context);
     }
     if (camera_pair_sample) queueCameraPairSample(context, camera_pair_sample);
 
