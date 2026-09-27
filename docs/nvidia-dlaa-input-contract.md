@@ -42,6 +42,8 @@ This repeated across three runs. The cause is unknown. Capability success
 does not establish safe initialization/shutdown for EDPE, so NGX remains
 outside the game process until its lifecycle is understood. The local SDK
 and probe executable remain ignored build artifacts.
+The probe also produced `dlls/nvngx_dlss*.dll` in the repository root;
+that SDK-created directory is ignored and none of its binaries are tracked.
 
 ## SDK-documented D3D11 inputs
 

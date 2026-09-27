@@ -1,4 +1,5 @@
 /build/
+/dlls/
 /.vs/
 *.log
 .*/
