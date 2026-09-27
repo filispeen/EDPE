@@ -72,4 +72,29 @@ inline ProjectionJitter projectionJitter(std::uint64_t frame, unsigned width, un
     return {x, y, 2 * x / width, -2 * y / height};
 }
 
+// CPU-only: the observed vertex shaders form clip position as
+// position.x * block[0] + position.y * block[1] + position.z * block[2]
+// + block[3], with each block row containing four float components.
+// Adding NDC jitter times clip W to clip X/Y therefore changes columns
+// X/Y by the corresponding fraction of column W. No game buffer is edited.
+inline bool jitterEliteProjectionBlock(const float* source, float* output,
+    ProjectionJitter jitter) {
+    if (!source || !output || !std::isfinite(jitter.ndcX) ||
+        !std::isfinite(jitter.ndcY)) return false;
+    float result[16];
+    for (unsigned i = 0; i < 16; ++i) {
+        if (!std::isfinite(source[i])) return false;
+        result[i] = source[i];
+    }
+    for (unsigned row = 0; row < 4; ++row) {
+        const unsigned base = row * 4;
+        result[base] += jitter.ndcX * source[base + 3];
+        result[base + 1] += jitter.ndcY * source[base + 3];
+        if (!std::isfinite(result[base]) || !std::isfinite(result[base + 1]))
+            return false;
+    }
+    for (unsigned i = 0; i < 16; ++i) output[i] = result[i];
+    return true;
+}
+
 } // namespace edpe

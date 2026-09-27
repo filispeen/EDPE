@@ -846,3 +846,14 @@ intervals, not a census of every shader or the main-pass-at-bind-3 case.
 The projection block's clip arithmetic supports deriving an exact jitter
 offset, but a frame-wide application point and fail-open reconstruction
 path remain unverified. EDPE still does not edit Elite's projection.
+
+**EXPERIMENTAL (CPU-only derivation, 2026-09-27):** For the observed clip
+arithmetic, `clip = x*row270 + y*row271 + z*row272 + row273`. A desired
+screen offset of `(pixelX, pixelY)` at render size `(width, height)` is
+`ndcX = 2*pixelX/width`, `ndcY = -2*pixelY/height`. Adding `ndcX*clip.w`
+to clip X and `ndcY*clip.w` to clip Y is equivalent to adding
+`ndcX*row.w` and `ndcY*row.w` to the X/Y components of each of the four
+observed registers. The CPU test checks the resulting pixel displacement
+and leaves depth components intact. This math does not establish a safe
+game-buffer modification point or complete scene-shader coverage; runtime
+jitter remains disabled.

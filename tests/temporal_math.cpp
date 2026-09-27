@@ -84,4 +84,27 @@ int main() {
         std::fabs(third.pixelY + 7.0f / 18) > 0.000001f) return 9;
     if (edpe::projectionJitter(1, 0, 50).pixelX != 0 ||
         edpe::projectionJitter(1, 100, 0).ndcY != 0) return 10;
+
+    // Match the two captured vertex shaders' cb1[270..273] clip arithmetic.
+    const float clip_block[]{1, 0, 0, 0,
+                             0, 1, 0, 0,
+                             0, 0, 0, 1,
+                             0, 0, .025f, 0};
+    float shifted[16]{};
+    if (!edpe::jitterEliteProjectionBlock(clip_block, shifted, third)) return 11;
+    const auto clip = [](const float* b, unsigned component) {
+        return b[component] + 2 * b[4 + component] + 10 * b[8 + component] +
+            b[12 + component];
+    };
+    const float original_w = clip(clip_block, 3), shifted_w = clip(shifted, 3);
+    const float pixel_shift_x = 50 * (clip(shifted, 0) / shifted_w -
+        clip(clip_block, 0) / original_w);
+    const float pixel_shift_y = -25 * (clip(shifted, 1) / shifted_w -
+        clip(clip_block, 1) / original_w);
+    if (std::fabs(pixel_shift_x - third.pixelX) > .00001f ||
+        std::fabs(pixel_shift_y - third.pixelY) > .00001f ||
+        shifted[10] != clip_block[10] || shifted[14] != clip_block[14]) return 12;
+    float unchanged[16]{};
+    if (edpe::jitterEliteProjectionBlock(nullptr, unchanged, third) ||
+        unchanged[0] != 0) return 13;
 }
