@@ -53,6 +53,15 @@ The final SDK messages reported telemetry shutdown and two
 created. This narrows the stall to SDK shutdown but does not identify its
 cause. The probe was terminated; its full log remains under ignored `build/`.
 
+**MEASURED (Windows Debugger, 2026-09-27):** Attaching `cdb` to the stalled
+probe after eight seconds showed its main thread in
+`KERNELBASE!WaitForSingleObjectEx` →
+`NvTelemetryAPI64!UninitializeTelemetry` → driver `_nvngx` shutdown →
+`NVSDK_NGX_D3D11_Shutdown1` → `ngx_probe`. Other NVIDIA telemetry and CUDA
+threads existed. This places the observed wait in NVIDIA's shutdown path;
+the stack does not establish why the wait persists. EDPE does not modify
+NVIDIA telemetry settings or run NGX inside Elite.
+
 ## SDK-documented D3D11 inputs
 
 - `NGX_D3D11_CREATE_DLSS_EXT` sets input width/height, output width/height,
