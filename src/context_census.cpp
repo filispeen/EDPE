@@ -21,6 +21,8 @@ namespace {
 constexpr size_t kVSSetConstantBuffers = 7;
 constexpr size_t kDrawIndexed = 12;
 constexpr size_t kDraw = 13;
+constexpr size_t kMap = 14;
+constexpr size_t kUnmap = 15;
 constexpr size_t kDrawIndexedInstanced = 20;
 constexpr size_t kDrawInstanced = 21;
 constexpr size_t kOMSetRenderTargets = 33;
@@ -32,6 +34,9 @@ using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UI
     UINT, ID3D11Buffer* const*);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
+using MapFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*,
+    UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
+using UnmapFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
 using DrawIndexedInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     UINT, UINT, INT, UINT);
 using DrawInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
@@ -45,6 +50,8 @@ std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
 std::atomic<DrawIndexedFn> original_draw_indexed{nullptr};
 std::atomic<DrawFn> original_draw{nullptr};
+std::atomic<MapFn> original_map{nullptr};
+std::atomic<UnmapFn> original_unmap{nullptr};
 std::atomic<DrawIndexedInstancedFn> original_draw_indexed_instanced{nullptr};
 std::atomic<DrawInstancedFn> original_draw_instanced{nullptr};
 std::atomic<ID3D11DeviceContext*> observed_context{nullptr};
@@ -154,6 +161,12 @@ std::atomic<unsigned> draw_instanced_scene_calls{0};
 std::atomic<bool> draw_hook_active{false};
 std::atomic<bool> draw_indexed_instanced_hook_active{false};
 std::atomic<bool> draw_instanced_hook_active{false};
+std::atomic<ID3D11Buffer*> scene_map_target{nullptr}; // Weak; valid only for this bind interval.
+std::atomic<bool> map_hook_active{false};
+std::atomic<bool> unmap_hook_active{false};
+std::atomic<unsigned> scene_maps{0};
+std::atomic<unsigned> scene_unmaps{0};
+std::atomic<unsigned> scene_maps_after_draw{0};
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
@@ -174,8 +187,10 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
     if (scene) {
         const unsigned scene_bind = vs_scene_buffer_calls.fetch_add(1, std::memory_order_relaxed) + 1;
         ID3D11Buffer* expected = nullptr;
-        if (vs_first_scene_buffer.compare_exchange_strong(expected, buffer, std::memory_order_relaxed))
+        if (vs_first_scene_buffer.compare_exchange_strong(expected, buffer, std::memory_order_relaxed)) {
+            scene_map_target.store(buffer, std::memory_order_release);
             queueConstantBufferSample(context, buffer, desc, 0); // 0 labels the first CB bind inside DSV interval 3.
+        }
         if (scene_bind == 51) queueConstantBufferSample(context, buffer, desc, 51);
         auto* previous = vs_scene_buffer.exchange(buffer, std::memory_order_relaxed);
         if (previous && previous != buffer)
@@ -229,6 +244,32 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         vertex_count, instance_count, start_vertex, start_instance);
 }
 
+HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
+    UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
+    const HRESULT result = original_map.load(std::memory_order_acquire)(
+        context, resource, subresource, type, flags, mapped);
+    if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
+        resource == scene_map_target.load(std::memory_order_acquire) &&
+        map_hook_active.load(std::memory_order_acquire)) {
+        scene_maps.fetch_add(1, std::memory_order_relaxed);
+        if (draw_indexed_calls.load(std::memory_order_relaxed) ||
+            draw_calls.load(std::memory_order_relaxed) ||
+            draw_indexed_instanced_calls.load(std::memory_order_relaxed) ||
+            draw_instanced_calls.load(std::memory_order_relaxed))
+            scene_maps_after_draw.fetch_add(1, std::memory_order_relaxed);
+    }
+    return result;
+}
+
+void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
+    UINT subresource) {
+    if (context == observed_context.load(std::memory_order_acquire) &&
+        resource == scene_map_target.load(std::memory_order_acquire) &&
+        unmap_hook_active.load(std::memory_order_acquire))
+        scene_unmaps.fetch_add(1, std::memory_order_relaxed);
+    original_unmap.load(std::memory_order_acquire)(context, resource, subresource);
+}
+
 void endDrawProbe() {
     if (!draw_probe_active.exchange(false, std::memory_order_acq_rel)) return;
     auto* forward = reinterpret_cast<void*>(original_draw_indexed.load(std::memory_order_acquire));
@@ -266,6 +307,18 @@ void endDrawProbe() {
         draw_instanced_scene_calls.load(std::memory_order_relaxed),
         draw_restored, indexed_instanced_restored, instanced_restored);
     EdpeLog(message);
+    scene_map_target.store(nullptr, std::memory_order_release);
+    const bool map_restored = !map_hook_active.exchange(false) || patchSlot(patched_table,
+        kMap, reinterpret_cast<void*>(&observedMap),
+        reinterpret_cast<void*>(original_map.load(std::memory_order_acquire)));
+    const bool unmap_restored = !unmap_hook_active.exchange(false) || patchSlot(patched_table,
+        kUnmap, reinterpret_cast<void*>(&observedUnmap),
+        reinterpret_cast<void*>(original_unmap.load(std::memory_order_acquire)));
+    swprintf_s(message, L"EDPE: scene buffer maps=%u afterDraw=%u unmaps=%u restored=%u%u",
+        scene_maps.load(std::memory_order_relaxed),
+        scene_maps_after_draw.load(std::memory_order_relaxed),
+        scene_unmaps.load(std::memory_order_relaxed), map_restored, unmap_restored);
+    EdpeLog(message);
 }
 
 void beginDrawProbe() {
@@ -281,6 +334,9 @@ void beginDrawProbe() {
     draw_indexed_instanced_scene_calls.store(0, std::memory_order_relaxed);
     draw_instanced_calls.store(0, std::memory_order_relaxed);
     draw_instanced_scene_calls.store(0, std::memory_order_relaxed);
+    scene_maps.store(0, std::memory_order_relaxed);
+    scene_unmaps.store(0, std::memory_order_relaxed);
+    scene_maps_after_draw.store(0, std::memory_order_relaxed);
     if (patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(forward),
             reinterpret_cast<void*>(&observedDrawIndexed))) {
         draw_probe_active.store(true, std::memory_order_release);
@@ -303,6 +359,16 @@ void beginDrawProbe() {
                 reinterpret_cast<void*>(instanced_forward),
                 reinterpret_cast<void*>(&observedDrawInstanced)))
             draw_instanced_hook_active.store(true, std::memory_order_release);
+        auto map_forward = reinterpret_cast<MapFn>(patched_table[kMap]);
+        auto unmap_forward = reinterpret_cast<UnmapFn>(patched_table[kUnmap]);
+        original_map.store(map_forward, std::memory_order_release);
+        original_unmap.store(unmap_forward, std::memory_order_release);
+        if (map_forward && patchSlot(patched_table, kMap,
+                reinterpret_cast<void*>(map_forward), reinterpret_cast<void*>(&observedMap)))
+            map_hook_active.store(true, std::memory_order_release);
+        if (unmap_forward && patchSlot(patched_table, kUnmap,
+                reinterpret_cast<void*>(unmap_forward), reinterpret_cast<void*>(&observedUnmap)))
+            unmap_hook_active.store(true, std::memory_order_release);
     } else
         EdpeLog(L"EDPE: depth-pass DrawIndexed probe unavailable (slot changed)");
 }
@@ -347,6 +413,8 @@ void beginVSBufferProbe(ID3D11DeviceContext* context) {
     }
     vs_scene_buffer_bound.store(initial_desc.ByteWidth == 5376 &&
         initial_desc.Usage == D3D11_USAGE_DYNAMIC, std::memory_order_relaxed);
+    scene_map_target.store(vs_scene_buffer_bound.load(std::memory_order_relaxed)
+        ? initial : nullptr, std::memory_order_release);
     vs_buffer_probe_active.store(true, std::memory_order_release);
     if (!patchSlot(patched_table, kVSSetConstantBuffers,
             reinterpret_cast<void*>(forward),
