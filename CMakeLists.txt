@@ -38,8 +38,10 @@ target_include_directories(motion_gpu_test PRIVATE src)
 target_link_libraries(motion_gpu_test PRIVATE d3d11 d3dcompiler)
 add_test(NAME motion_gpu COMMAND motion_gpu_test)
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
+target_include_directories(proxy_smoke PRIVATE src)
 target_link_libraries(proxy_smoke PRIVATE d3dcompiler)
 add_test(NAME proxy_smoke COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log)
+add_test(NAME proxy_shader_probe COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log shader-probe)
 
 set(EDPE_STAGE "${CMAKE_CURRENT_BINARY_DIR}/stage")
 add_custom_target(proxy_stage ALL

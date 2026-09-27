@@ -1,5 +1,6 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include "shader_probe.h"
 #include <dxgi1_6.h>
 #include <windows.h>
 #include <cstring>
@@ -15,7 +16,21 @@ LRESULT CALLBACK testWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 }
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 4) return 1;
+    if (argc != 4 && argc != 5) return 1;
+    const bool shader_probe = argc == 5 && wcscmp(argv[4], L"shader-probe") == 0;
+    if (argc == 5 && !shader_probe) return 1;
+    if (shader_probe) {
+        wchar_t marker[MAX_PATH];
+        const DWORD length = GetModuleFileNameW(nullptr, marker, MAX_PATH);
+        if (!length || length >= MAX_PATH) return 12;
+        wchar_t* name = wcsrchr(marker, L'\\');
+        if (!name) return 12;
+        wcscpy_s(name + 1, MAX_PATH - (name + 1 - marker), L"edpe_shader_probe.once");
+        const HANDLE file = CreateFileW(marker, GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return 12;
+        CloseHandle(file);
+    }
     const HANDLE stale_log = CreateFileW(argv[3], GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -37,7 +52,7 @@ int wmain(int argc, wchar_t** argv) {
     ID3D11DeviceContext* context = nullptr;
     const HRESULT result = create_device(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context);
-    FreeLibrary(proxy);
+    if (!shader_probe) FreeLibrary(proxy);
     if (FAILED(result) || !device || !context) return 4;
     void* original_om_set = (*reinterpret_cast<void***>(context))[33];
 
@@ -232,6 +247,14 @@ int wmain(int argc, wchar_t** argv) {
     ID3D11VertexShader* vertex_shader = nullptr;
     const HRESULT vertex_result = device->CreateVertexShader(vertex_bytecode->GetBufferPointer(),
         vertex_bytecode->GetBufferSize(), nullptr, &vertex_shader);
+    if (shader_probe && SUCCEEDED(vertex_result)) {
+        unsigned char captured[8192]{};
+        UINT bytes = sizeof(captured);
+        if (vertex_bytecode->GetBufferSize() > sizeof(captured) ||
+            FAILED(vertex_shader->GetPrivateData(kEdpeVertexBytecodeGuid, &bytes, captured)) ||
+            bytes != vertex_bytecode->GetBufferSize() ||
+            std::memcmp(captured, vertex_bytecode->GetBufferPointer(), bytes) != 0) return 12;
+    }
     vertex_bytecode->Release();
     if (FAILED(vertex_result)) return 10;
     context->VSSetShader(vertex_shader, nullptr, 0);
@@ -339,6 +362,7 @@ int wmain(int argc, wchar_t** argv) {
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
     context->Release();
     device->Release();
+    if (shader_probe) FreeLibrary(proxy);
     FreeLibrary(dxgi_proxy);
     const HANDLE log = CreateFileW(argv[3], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);

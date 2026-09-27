@@ -2,6 +2,7 @@
 #include "elite_camera.h"
 #include "log.h"
 #include "motion_pass.h"
+#include "shader_probe.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -161,6 +162,8 @@ std::atomic<unsigned> draw_instanced_calls{0};
 std::atomic<unsigned> draw_instanced_scene_calls{0};
 std::atomic<bool> first_scene_draw_seen{false};
 std::atomic<ID3D11Buffer*> first_scene_draw_buffer{nullptr}; // Identity only.
+std::array<unsigned char, 65536> first_scene_shader_bytecode{}; // One-shot diagnostic.
+std::atomic<UINT> first_scene_shader_bytes{0};
 std::atomic<bool> draw_hook_active{false};
 std::atomic<bool> draw_indexed_instanced_hook_active{false};
 std::atomic<bool> draw_instanced_hook_active{false};
@@ -187,6 +190,40 @@ void observeFirstSceneDraw(ID3D11DeviceContext* context) {
     context->VSGetConstantBuffers(1, 1, &buffer);
     first_scene_draw_buffer.store(buffer, std::memory_order_relaxed);
     if (buffer) buffer->Release();
+    ID3D11VertexShader* shader = nullptr;
+    context->VSGetShader(&shader, nullptr, nullptr);
+    if (shader) {
+        UINT bytes = static_cast<UINT>(first_scene_shader_bytecode.size());
+        if (SUCCEEDED(shader->GetPrivateData(kEdpeVertexBytecodeGuid, &bytes,
+                first_scene_shader_bytecode.data())))
+            first_scene_shader_bytes.store(bytes, std::memory_order_release);
+        shader->Release();
+    }
+}
+
+void dumpFirstSceneShader() {
+    const UINT bytes = first_scene_shader_bytes.load(std::memory_order_acquire);
+    if (!bytes) return;
+    wchar_t path[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return;
+    wchar_t* name = wcsrchr(path, L'\\');
+    if (!name) return;
+    const size_t prefix = name + 1 - path;
+    if (swprintf_s(name + 1, MAX_PATH - prefix, L"edpe-vs-bind%u.dxbc",
+            vs_probe_bind_ordinal.load(std::memory_order_relaxed)) <= 0) return;
+    const HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    const BOOL saved = WriteFile(file, first_scene_shader_bytecode.data(),
+        bytes, &written, nullptr);
+    CloseHandle(file);
+    wchar_t message[160];
+    swprintf_s(message, L"EDPE: first scene shader dump bind=%u bytes=%u saved=%u",
+        vs_probe_bind_ordinal.load(std::memory_order_relaxed),
+        bytes, saved && written == bytes);
+    EdpeLog(message);
 }
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
@@ -384,6 +421,7 @@ void endDrawProbe() {
         first_scene_draw_seen.load(std::memory_order_relaxed),
         vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
+    dumpFirstSceneShader();
     auto* map_target = scene_map_target.exchange(nullptr, std::memory_order_acq_rel);
     scene_mapped_data.store(nullptr, std::memory_order_release);
     const bool map_restored = !map_hook_active.exchange(false) || patchSlot(patched_table,
@@ -428,6 +466,7 @@ void beginDrawProbe() {
     draw_instanced_scene_calls.store(0, std::memory_order_relaxed);
     first_scene_draw_seen.store(false, std::memory_order_relaxed);
     first_scene_draw_buffer.store(nullptr, std::memory_order_relaxed);
+    first_scene_shader_bytes.store(0, std::memory_order_relaxed);
     scene_maps.store(0, std::memory_order_relaxed);
     scene_unmaps.store(0, std::memory_order_relaxed);
     scene_maps_after_draw.store(0, std::memory_order_relaxed);
