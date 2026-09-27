@@ -364,7 +364,7 @@ void endDrawProbe() {
         draw_restored, indexed_instanced_restored, instanced_restored,
         vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
-    scene_map_target.store(nullptr, std::memory_order_release);
+    auto* map_target = scene_map_target.exchange(nullptr, std::memory_order_acq_rel);
     scene_mapped_data.store(nullptr, std::memory_order_release);
     const bool map_restored = !map_hook_active.exchange(false) || patchSlot(patched_table,
         kMap, reinterpret_cast<void*>(&observedMap),
@@ -372,12 +372,13 @@ void endDrawProbe() {
     const bool unmap_restored = !unmap_hook_active.exchange(false) || patchSlot(patched_table,
         kUnmap, reinterpret_cast<void*>(&observedUnmap),
         reinterpret_cast<void*>(original_unmap.load(std::memory_order_acquire)));
-    swprintf_s(message, L"EDPE: scene buffer maps=%u afterDraw=%u unmaps=%u restored=%u%u bind=%u beforeBind=%u",
+    swprintf_s(message, L"EDPE: scene buffer maps=%u afterDraw=%u unmaps=%u restored=%u%u bind=%u beforeBind=%u target=%p firstVS=%p",
         scene_maps.load(std::memory_order_relaxed),
         scene_maps_after_draw.load(std::memory_order_relaxed),
         scene_unmaps.load(std::memory_order_relaxed), map_restored, unmap_restored,
         vs_probe_bind_ordinal.load(std::memory_order_relaxed),
-        scene_maps_before_bind.load(std::memory_order_relaxed));
+        scene_maps_before_bind.load(std::memory_order_relaxed), map_target,
+        vs_first_scene_buffer.load(std::memory_order_relaxed));
     EdpeLog(message);
     swprintf_s(message,
         L"EDPE: scene write hashes sampled=%u cameraChanges=%u projectionChanges=%u camera=%016llX/%016llX projection=%016llX/%016llX bind=%u",
