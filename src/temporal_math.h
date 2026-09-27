@@ -97,4 +97,20 @@ inline bool jitterEliteProjectionBlock(const float* source, float* output,
     return true;
 }
 
+// The alternate scene shader uses dot(cb0[4..7], position): the transpose
+// of the block above. Reuse the same checked CPU math in that layout.
+inline bool jitterEliteDotProjectionBlock(const float* source, float* output,
+    ProjectionJitter jitter) {
+    if (!source || !output) return false;
+    float transposed[16], shifted[16];
+    for (unsigned row = 0; row < 4; ++row)
+        for (unsigned column = 0; column < 4; ++column)
+            transposed[row * 4 + column] = source[column * 4 + row];
+    if (!jitterEliteProjectionBlock(transposed, shifted, jitter)) return false;
+    for (unsigned row = 0; row < 4; ++row)
+        for (unsigned column = 0; column < 4; ++column)
+            output[row * 4 + column] = shifted[column * 4 + row];
+    return true;
+}
+
 } // namespace edpe

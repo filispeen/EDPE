@@ -107,4 +107,17 @@ int main() {
     float unchanged[16]{};
     if (edpe::jitterEliteProjectionBlock(nullptr, unchanged, third) ||
         unchanged[0] != 0) return 13;
+
+    float dot_block[16]{}, dot_shifted[16]{};
+    for (unsigned row = 0; row < 4; ++row)
+        for (unsigned column = 0; column < 4; ++column)
+            dot_block[row * 4 + column] = clip_block[column * 4 + row];
+    if (!edpe::jitterEliteDotProjectionBlock(dot_block, dot_shifted, third)) return 14;
+    for (unsigned row = 0; row < 4; ++row)
+        for (unsigned column = 0; column < 4; ++column)
+            if (std::fabs(dot_shifted[row * 4 + column] -
+                    shifted[column * 4 + row]) > .000001f) return 15;
+    if (!edpe::jitterEliteDotProjectionBlock(dot_block, dot_block, third)) return 16;
+    for (unsigned i = 0; i < 16; ++i)
+        if (std::fabs(dot_block[i] - dot_shifted[i]) > .000001f) return 17;
 }

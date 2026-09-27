@@ -914,6 +914,7 @@ also produces a camera-dependent clip position.
 handle both buffer layouts in the relevant scene draws. For this shader's
 dot-product layout, the algebraic X/Y offset would add `ndcX*cb0[7]` to
 `cb0[4]` and `ndcY*cb0[7]` to `cb0[5]`. This is a CPU-side derivation,
-not a verified mutation point. Buffer update order, other scenes, the
+checked against the first layout by a deterministic CPU test, not a verified
+mutation point. Buffer update order, other scenes, the
 passthrough draw, and fail-open restoration remain unverified; EDPE still
 does not modify either game buffer.
