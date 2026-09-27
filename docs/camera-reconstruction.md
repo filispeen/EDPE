@@ -798,3 +798,20 @@ projection hashes matched the early write through those 13 writes. The
 pointer differs from the prior run as expected for a process-local identity;
 it is not a persistent resource signature. Bind 3 had no buffer maps. The
 game and both snapshots continued to work.
+
+**MEASURED / VERIFIED (first-draw probe, 2026-09-27; game build not
+rechecked):** A third user-confirmed gameplay capture at `afterPresent=12559`
+queried VS slot 1 immediately before the first draw classified as using the
+5376-byte scene buffer. The buffer identity was `0000025C98BBD560`, matching
+the early bind-1 `Map` target and the first VS-slot-1 binding in the heavy
+bind-2 pass. That pass recorded 432236 input-assembler primitives, 247
+`DrawIndexedInstanced` and four `DrawInstanced` calls with the scene buffer.
+The 13 later writes kept the same camera/projection hashes as the early
+write. Bind 1's single `DrawInstanced` had no scene-buffer binding and zero
+pixel-shader invocations. Bind 3's first scene draw also used the same
+buffer. The user confirmed normal gameplay, HUD, F5 menu, and both snapshots.
+
+**LIMIT:** The query establishes actual D3D11 binding at the observed first
+scene draw. It does not prove which fields that vertex shader consumes, that
+all scene shaders share this projection, or a safe jitter fallback. The main
+pass was again bind 2; the main-pass-at-bind-3 ordering still needs this check.
