@@ -677,6 +677,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             else
                 ImGui::Text("Motion frame / HDR RTV3 (%ux%u)",
                     ui.color_width, ui.color_height);
+            if (ui.color_snapshot_index < 0)
+                ImGui::TextUnformatted("Present-time HDR color; may include HUD");
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;
@@ -693,6 +695,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ui.motion_srv && ui.motion_window_open) {
         ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("EDPE Motion Snapshot", &ui.motion_window_open)) {
+            ImGui::TextUnformatted("Camera + depth motion; HUD is not represented");
             ImGui::TextUnformatted("Neutral gray = 0 pixels; red = horizontal, green = vertical");
             ImGui::TextUnformatted("Nonlinear preview: 10 pixels shifts a channel by 0.25");
             float width = ImGui::GetContentRegionAvail().x;
