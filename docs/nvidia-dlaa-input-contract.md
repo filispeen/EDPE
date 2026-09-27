@@ -7,6 +7,23 @@ Date: 2026-09-27. Target: Elite Dangerous Odyssey 2D, observed build
 and EDPE's [renderer observations](render-pipeline-observations.md).
 No NGX evaluation was run in Elite.
 
+## SDK revision and provenance
+
+**SDK-DOCUMENTED (checked 2026-09-27):** The official
+[NVIDIA/DLSS v310.9.1 release](https://github.com/NVIDIA/DLSS/releases/tag/v310.9.1)
+at commit `374959484e79a640feaba44c93ac8cfb0a03f5b5` supplies the
+D3D11 headers, x64 NGX import library, and DLSS runtime. Its D3D11
+evaluation helper confirms the input semantics below. The SDK uses
+[NVIDIA's proprietary RTX SDK license](https://github.com/NVIDIA/DLSS/blob/v310.9.1/LICENSE.txt);
+the local copy stays in ignored `build/tools` and no SDK files or runtime
+binaries are committed to EDPE.
+
+The current `nvsdk_ngx.h` documents
+`NVSDK_NGX_D3D11_Init_with_ProjectID` for custom engines using a unique
+GUID-like project ID and `NVSDK_NGX_ENGINE_TYPE_CUSTOM`. EDPE must use its
+own identifier; the EDVR ID is not reusable. An initialization result or
+capability query has not yet been tested on this machine.
+
 ## SDK-documented D3D11 inputs
 
 - `NGX_D3D11_CREATE_DLSS_EXT` sets input width/height, output width/height,
