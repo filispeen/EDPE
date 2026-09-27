@@ -729,3 +729,23 @@ interval or before either bind. The user confirmed normal game and snapshots.
 pass across gameplay states. The one-shot probe now reports each of the
 first three MRT intervals separately. Runtime camera selection and jitter
 still require evidence from the actual drawing and buffer-write sequence.
+
+**MEASURED / VERIFIED (two further user-confirmed gameplay captures,
+2026-09-27; game build not rechecked):** The expanded one-shot probe followed
+MRT intervals 1–3 separately. At `afterPresent=11324`, bind 2 produced
+432236 input-assembler primitives, 247 `DrawIndexedInstanced` and four
+`DrawInstanced` calls with the 5376-byte VS-slot-1 buffer, and 13 successful
+`Map`/`Unmap` pairs for that same buffer after drawing began. Bind 3 had
+39552 primitives, 59 observed draws, and no buffer maps. At
+`afterPresent=21492`, the heavy work moved to bind 3: 480860 primitives,
+18 buffer `Map`/`Unmap` pairs after drawing began, and 101 rebindings of the
+same VS-slot-1 buffer. The user confirmed normal game, HUD, menu, and
+snapshots. The Map/Unmap hooks restored their slots in both captures.
+
+**LIMIT:** In the second capture the four draw-method slots returned to
+their pre-probe pointers before the end of bind 3. Its 17 observed
+`DrawIndexedInstanced` calls are therefore a lower bound, not a pass total.
+The buffer map counts remained available until the interval ended. These
+observations identify CPU writes during scene rasterization, but not which
+projection fields changed, which draws consumed each write, or a safe
+jitter/fallback scheme. EDPE still does not modify the game's buffer.
