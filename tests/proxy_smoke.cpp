@@ -247,6 +247,16 @@ int wmain(int argc, wchar_t** argv) {
     ID3D11VertexShader* vertex_shader = nullptr;
     const HRESULT vertex_result = device->CreateVertexShader(vertex_bytecode->GetBufferPointer(),
         vertex_bytecode->GetBufferSize(), nullptr, &vertex_shader);
+    if (SUCCEEDED(vertex_result) && !vertex_shader) return 12;
+    if (SUCCEEDED(vertex_result)) {
+        std::uint64_t hash = 0;
+        UINT bytes = sizeof(hash);
+        if (FAILED(vertex_shader->GetPrivateData(kEdpeShaderHashGuid, &bytes, &hash)) ||
+            bytes != sizeof(hash) ||
+            hash != EdpeEdvrShaderHash(vertex_bytecode->GetBufferPointer(),
+                vertex_bytecode->GetBufferSize()) ||
+            EdpeEdvrShaderHash("abc", 3) != 0xe16801510db89efdull) return 12;
+    }
     if (shader_probe && SUCCEEDED(vertex_result)) {
         unsigned char captured[8192]{};
         UINT bytes = sizeof(captured);
@@ -257,13 +267,6 @@ int wmain(int argc, wchar_t** argv) {
             FAILED(vertex_shader->GetPrivateData(kEdpeVertexBytecodeGuid, &bytes, captured)) ||
             bytes != vertex_bytecode->GetBufferSize() ||
             std::memcmp(captured, vertex_bytecode->GetBufferPointer(), bytes) != 0) return 12;
-        std::uint64_t hash = 0;
-        bytes = sizeof(hash);
-        if (FAILED(vertex_shader->GetPrivateData(kEdpeShaderHashGuid, &bytes, &hash)) ||
-            bytes != sizeof(hash) ||
-            hash != EdpeEdvrShaderHash(vertex_bytecode->GetBufferPointer(),
-                vertex_bytecode->GetBufferSize()) ||
-            EdpeEdvrShaderHash("abc", 3) != 0xe16801510db89efdull) return 12;
     }
     vertex_bytecode->Release();
     if (FAILED(vertex_result)) return 10;
@@ -272,7 +275,7 @@ int wmain(int argc, wchar_t** argv) {
     context->Draw(3, 0);
     context->VSSetShader(nullptr, nullptr, 0);
     vertex_shader->Release();
-    if (shader_probe) {
+    {
         constexpr char pixel_source[] =
             "float4 main() : SV_Target { return float4(1, 0, 0, 1); }";
         ID3DBlob* pixel_bytecode = nullptr;

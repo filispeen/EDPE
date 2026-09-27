@@ -15,6 +15,7 @@ using CreatePixelShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const voi
 std::atomic<CreateVertexShaderFn> original_create_vertex_shader{nullptr};
 std::atomic<CreatePixelShaderFn> original_create_pixel_shader{nullptr};
 std::atomic<void**> hooked_device_table{nullptr};
+std::atomic<bool> retain_vertex_bytecode{false};
 
 HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     const void* bytecode, SIZE_T size, ID3D11ClassLinkage* linkage,
@@ -22,7 +23,8 @@ HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     const HRESULT result = original_create_vertex_shader.load(std::memory_order_acquire)(
         device, bytecode, size, linkage, shader);
     if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
-        (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
+        if (retain_vertex_bytecode.load(std::memory_order_relaxed))
+            (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
         const auto hash = EdpeEdvrShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
     }
@@ -54,9 +56,17 @@ bool armShaderProbe() {
 }
 
 void hookShaderCreation(ID3D11Device* device) {
-    if (!armShaderProbe()) return;
     void** table = *reinterpret_cast<void***>(device);
     if (hooked_device_table.load(std::memory_order_acquire)) return;
+    retain_vertex_bytecode.store(armShaderProbe(), std::memory_order_relaxed);
+    // COM vtable callbacks must stay valid even if the caller frees this proxy.
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(&observedCreateVertexShader), &self)) {
+        EdpeLog(L"EDPE: shader signatures unavailable (proxy lifetime cannot be pinned)");
+        return;
+    }
     constexpr size_t slot = 12; // ID3D11Device::CreateVertexShader.
     constexpr size_t pixel_slot = 15; // ID3D11Device::CreatePixelShader.
     auto forward = reinterpret_cast<CreateVertexShaderFn>(table[slot]);
@@ -86,8 +96,10 @@ void hookShaderCreation(ID3D11Device* device) {
             }
         }
         EdpeLog(pixel_hooked
-            ? L"EDPE: one-run vertex/pixel shader signature probe armed"
-            : L"EDPE: one-run vertex shader probe armed; pixel shader hook unavailable");
+            ? L"EDPE: vertex/pixel shader signatures available"
+            : L"EDPE: vertex shader signatures available; pixel shader hook unavailable");
+        if (retain_vertex_bytecode.load(std::memory_order_relaxed))
+            EdpeLog(L"EDPE: one-run vertex shader bytecode probe armed");
     } else EdpeLog(L"EDPE: vertex shader bytecode probe unavailable (slot changed)");
 }
 }
