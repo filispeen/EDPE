@@ -143,6 +143,7 @@ struct PipelineSample {
 };
 std::array<PipelineSample, 4> pipeline_samples{}; // Requested bind intervals 1, 2, 3, and 6.
 std::atomic<bool> vs_buffer_probe_active{false};
+std::atomic<unsigned> vs_probe_bind_ordinal{0};
 std::atomic<unsigned> vs_buffer_calls{0};
 std::atomic<unsigned> vs_scene_buffer_calls{0};
 std::atomic<unsigned> vs_scene_buffer_switches{0};
@@ -189,9 +190,11 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
         ID3D11Buffer* expected = nullptr;
         if (vs_first_scene_buffer.compare_exchange_strong(expected, buffer, std::memory_order_relaxed)) {
             scene_map_target.store(buffer, std::memory_order_release);
-            queueConstantBufferSample(context, buffer, desc, 0); // 0 labels the first CB bind inside DSV interval 3.
+            if (vs_probe_bind_ordinal.load(std::memory_order_relaxed) == 3)
+                queueConstantBufferSample(context, buffer, desc, 0); // Existing interval-3 diagnostic.
         }
-        if (scene_bind == 51) queueConstantBufferSample(context, buffer, desc, 51);
+        if (scene_bind == 51 && vs_probe_bind_ordinal.load(std::memory_order_relaxed) == 3)
+            queueConstantBufferSample(context, buffer, desc, 51);
         auto* previous = vs_scene_buffer.exchange(buffer, std::memory_order_relaxed);
         if (previous && previous != buffer)
             vs_scene_buffer_switches.fetch_add(1, std::memory_order_relaxed);
@@ -277,9 +280,10 @@ void endDrawProbe() {
         reinterpret_cast<void*>(&observedDrawIndexed), forward);
     wchar_t message[160];
     swprintf_s(message,
-        L"EDPE: depth-pass DrawIndexed calls=%u with5376VS1=%u slotRestored=%u",
+        L"EDPE: depth-pass DrawIndexed calls=%u with5376VS1=%u slotRestored=%u bind=%u",
         draw_indexed_calls.load(std::memory_order_relaxed),
-        draw_indexed_scene_calls.load(std::memory_order_relaxed), restored);
+        draw_indexed_scene_calls.load(std::memory_order_relaxed), restored,
+        vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
     if (!restored && patched_table) {
         swprintf_s(message, L"EDPE: DrawIndexed slot changed current=%p forward=%p",
@@ -298,14 +302,15 @@ void endDrawProbe() {
         patched_table, kDrawInstanced, reinterpret_cast<void*>(&observedDrawInstanced),
         reinterpret_cast<void*>(original_draw_instanced.load(std::memory_order_acquire)));
     swprintf_s(message,
-        L"EDPE: scene draws Draw=%u/%u DrawIndexedInstanced=%u/%u DrawInstanced=%u/%u restored=%u%u%u",
+        L"EDPE: scene draws Draw=%u/%u DrawIndexedInstanced=%u/%u DrawInstanced=%u/%u restored=%u%u%u bind=%u",
         draw_calls.load(std::memory_order_relaxed),
         draw_scene_calls.load(std::memory_order_relaxed),
         draw_indexed_instanced_calls.load(std::memory_order_relaxed),
         draw_indexed_instanced_scene_calls.load(std::memory_order_relaxed),
         draw_instanced_calls.load(std::memory_order_relaxed),
         draw_instanced_scene_calls.load(std::memory_order_relaxed),
-        draw_restored, indexed_instanced_restored, instanced_restored);
+        draw_restored, indexed_instanced_restored, instanced_restored,
+        vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
     scene_map_target.store(nullptr, std::memory_order_release);
     const bool map_restored = !map_hook_active.exchange(false) || patchSlot(patched_table,
@@ -314,10 +319,11 @@ void endDrawProbe() {
     const bool unmap_restored = !unmap_hook_active.exchange(false) || patchSlot(patched_table,
         kUnmap, reinterpret_cast<void*>(&observedUnmap),
         reinterpret_cast<void*>(original_unmap.load(std::memory_order_acquire)));
-    swprintf_s(message, L"EDPE: scene buffer maps=%u afterDraw=%u unmaps=%u restored=%u%u",
+    swprintf_s(message, L"EDPE: scene buffer maps=%u afterDraw=%u unmaps=%u restored=%u%u bind=%u",
         scene_maps.load(std::memory_order_relaxed),
         scene_maps_after_draw.load(std::memory_order_relaxed),
-        scene_unmaps.load(std::memory_order_relaxed), map_restored, unmap_restored);
+        scene_unmaps.load(std::memory_order_relaxed), map_restored, unmap_restored,
+        vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
 }
 
@@ -381,17 +387,19 @@ void endVSBufferProbe() {
         reinterpret_cast<void*>(original_vs_set_buffers.load(std::memory_order_acquire)));
     wchar_t message[256];
     swprintf_s(message,
-        L"EDPE: depth-pass VS bindings calls=%u sceneBufferCalls=%u first=%p last=%p switches=%u slotRestored=%u",
+        L"EDPE: depth-pass VS bindings calls=%u sceneBufferCalls=%u first=%p last=%p switches=%u slotRestored=%u bind=%u",
         vs_buffer_calls.load(std::memory_order_relaxed),
         vs_scene_buffer_calls.load(std::memory_order_relaxed),
         vs_first_scene_buffer.load(std::memory_order_relaxed),
         vs_scene_buffer.load(std::memory_order_relaxed),
-        vs_scene_buffer_switches.load(std::memory_order_relaxed), restored);
+        vs_scene_buffer_switches.load(std::memory_order_relaxed), restored,
+        vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
 }
 
-void beginVSBufferProbe(ID3D11DeviceContext* context) {
+void beginVSBufferProbe(ID3D11DeviceContext* context, unsigned bind_ordinal) {
     if (!patched_table) return;
+    vs_probe_bind_ordinal.store(bind_ordinal, std::memory_order_relaxed);
     auto forward = reinterpret_cast<VSSetConstantBuffersFn>(
         patched_table[kVSSetConstantBuffers]);
     if (!forward || forward == &observedVSSetConstantBuffers) {
@@ -1139,7 +1147,8 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         beginPipelineSample(context, snapshot_probe_bind);
         logSnapshotColorTarget(index, snapshot_probe_bind, count, targets);
         logBoundConstantBuffers(context, index, snapshot_probe_bind);
-        if (snapshot_probe_bind == 3) beginVSBufferProbe(context);
+        if (snapshot_probe_bind >= 1 && snapshot_probe_bind <= 3)
+            beginVSBufferProbe(context, snapshot_probe_bind);
     }
     if (camera_pair_sample) queueCameraPairSample(context, camera_pair_sample);
 
