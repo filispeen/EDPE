@@ -118,6 +118,9 @@ unsigned long long motion_color_frame = ~0ull;
 bool motion_color_bound = false;
 bool motion_color_rebound = false;
 bool motion_color_first_exit_logged = false;
+std::atomic<bool> hud_draw_probe_active{false};
+unsigned hud_draw_hook_mask = 0;
+unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
@@ -202,6 +205,45 @@ std::atomic<unsigned long long> scene_last_projection_hash{0};
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
+void captureEarlyMotionColor(ID3D11DeviceContext* context);
+
+void observeHudDraw(ID3D11DeviceContext* context) {
+    if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
+        !motion_color_source || !motion_color_bound || motion_early_color_view) return;
+    ++hud_target_draws;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
+    context->VSGetShader(&vs, nullptr, nullptr);
+    context->PSGetShader(&ps, nullptr, nullptr);
+    if (!vs || !ps) return;
+    std::uint64_t vs_hash = 0, ps_hash = 0;
+    UINT size = sizeof(vs_hash);
+    if (FAILED(vs->GetPrivateData(kEdpeShaderHashGuid, &size, &vs_hash)) ||
+        size != sizeof(vs_hash)) return;
+    size = sizeof(ps_hash);
+    if (FAILED(ps->GetPrivateData(kEdpeShaderHashGuid, &size, &ps_hash)) ||
+        size != sizeof(ps_hash)) return;
+    // Exact UI shader pairs documented by EDVR; validate the bound Desktop target too.
+    const bool hud = (vs_hash == 0xB7790CBFC6554097ull &&
+                      ps_hash == 0x8DEF46452FA459F5ull) ||
+                     (vs_hash == 0x81216C77F90DEDD6ull &&
+                      ps_hash == 0xA2965EC2931A39C8ull);
+    if (!hud) return;
+    ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
+    bool target_matches = false;
+    for (auto* view : bound) {
+        target_matches |= view == motion_color_source.Get();
+        if (view) view->Release();
+    }
+    if (!target_matches) return;
+    wchar_t message[160];
+    swprintf_s(message, L"EDPE: HUD draw on HDR target VS=%016llX PS=%016llX frame=%llu",
+        vs_hash, ps_hash, motion_color_frame);
+    EdpeLog(message);
+    captureEarlyMotionColor(context);
+    hud_draw_probe_active.store(false, std::memory_order_relaxed);
+}
 
 void observeFirstSceneDraw(ID3D11DeviceContext* context) {
     if (!vs_scene_buffer_bound.load(std::memory_order_relaxed)) return;
@@ -373,6 +415,7 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
 
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
     UINT start, INT base) {
+    if (context == observed_context.load(std::memory_order_acquire)) observeHudDraw(context);
     if (context == observed_context.load(std::memory_order_acquire) &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_indexed_calls.fetch_add(1, std::memory_order_relaxed);
@@ -384,6 +427,7 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
 }
 
 void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start) {
+    if (context == observed_context.load(std::memory_order_acquire)) observeHudDraw(context);
     if (context == observed_context.load(std::memory_order_acquire) &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_calls.fetch_add(1, std::memory_order_relaxed);
@@ -397,6 +441,7 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
     UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
     UINT start_instance) {
+    if (context == observed_context.load(std::memory_order_acquire)) observeHudDraw(context);
     if (context == observed_context.load(std::memory_order_acquire) &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_indexed_instanced_calls.fetch_add(1, std::memory_order_relaxed);
@@ -410,6 +455,7 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
 
 void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
+    if (context == observed_context.load(std::memory_order_acquire)) observeHudDraw(context);
     if (context == observed_context.load(std::memory_order_acquire) &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_instanced_calls.fetch_add(1, std::memory_order_relaxed);
@@ -419,6 +465,53 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     }
     original_draw_instanced.load(std::memory_order_acquire)(context,
         vertex_count, instance_count, start_vertex, start_instance);
+}
+
+void beginHudDrawProbe() {
+    if (!patched_table || hud_draw_hook_mask ||
+        draw_probe_active.load(std::memory_order_acquire)) return;
+    auto install = [&](size_t slot, auto& original_fn, auto observer, unsigned bit) {
+        auto forward = reinterpret_cast<decltype(observer)>(patched_table[slot]);
+        if (!forward || forward == observer) return;
+        original_fn.store(forward, std::memory_order_release);
+        if (patchSlot(patched_table, slot, reinterpret_cast<void*>(forward),
+                reinterpret_cast<void*>(observer))) hud_draw_hook_mask |= bit;
+    };
+    install(kDrawIndexed, original_draw_indexed, &observedDrawIndexed, 1);
+    install(kDraw, original_draw, &observedDraw, 2);
+    install(kDrawIndexedInstanced, original_draw_indexed_instanced,
+        &observedDrawIndexedInstanced, 4);
+    install(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
+    hud_target_draws = 0;
+    hud_draw_probe_active.store(hud_draw_hook_mask != 0, std::memory_order_release);
+    wchar_t message[128];
+    swprintf_s(message, L"EDPE: HUD draw probe armed mask=0x%X frame=%llu",
+        hud_draw_hook_mask, motion_color_frame);
+    EdpeLog(message);
+}
+
+void endHudDrawProbe() {
+    if (!hud_draw_hook_mask) return;
+    hud_draw_probe_active.store(false, std::memory_order_release);
+    unsigned restored = 0;
+    auto restore = [&](size_t slot, auto& original_fn, auto observer, unsigned bit) {
+        if ((hud_draw_hook_mask & bit) && patchSlot(patched_table, slot,
+                reinterpret_cast<void*>(observer),
+                reinterpret_cast<void*>(original_fn.load(std::memory_order_acquire))))
+            restored |= bit;
+    };
+    restore(kDrawIndexed, original_draw_indexed, &observedDrawIndexed, 1);
+    restore(kDraw, original_draw, &observedDraw, 2);
+    restore(kDrawIndexedInstanced, original_draw_indexed_instanced,
+        &observedDrawIndexedInstanced, 4);
+    restore(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
+    wchar_t message[160];
+    swprintf_s(message,
+        L"EDPE: HUD draw probe frame=%llu mask=0x%X restored=0x%X draws=%u copy=%u",
+        motion_color_frame, hud_draw_hook_mask, restored, hud_target_draws,
+        static_cast<unsigned>(motion_early_color_view != nullptr));
+    EdpeLog(message);
+    hud_draw_hook_mask = 0;
 }
 
 HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
@@ -1058,17 +1151,6 @@ void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
 
 void captureEarlyMotionColor(ID3D11DeviceContext* context) {
     if (motion_early_color_view || !motion_color_source) return;
-    ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
-    bool still_bound = false;
-    for (auto* view : bound) {
-        still_bound |= view == motion_color_source.Get();
-        if (view) view->Release();
-    }
-    if (still_bound) {
-        EdpeLog(L"EDPE: early HDR copy skipped (RTV still bound)");
-        return;
-    }
     D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
     motion_color_source->GetDesc(&rtv_desc);
     Microsoft::WRL::ComPtr<ID3D11Resource> resource;
@@ -1103,7 +1185,7 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context) {
     motion_early_color_view = std::move(view);
     motion_early_color_width = desc.Width;
     motion_early_color_height = desc.Height;
-    EdpeLog(L"EDPE: early HDR color copied at first RTV3 exit");
+    EdpeLog(L"EDPE: HDR color copied before first matched HUD draw");
 }
 
 void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
@@ -1386,7 +1468,6 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 L"EDPE: motion HDR RTV3 first exit frame=%llu nextRTVs=%u nextDSV=%p",
                 motion_color_frame, count, dsv);
             EdpeLog(message);
-            captureEarlyMotionColor(context);
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
         motion_color_bound = bound;
@@ -1415,6 +1496,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     bool first_color = false;
     unsigned snapshot_probe_bind = 0;
     unsigned camera_pair_sample = 0;
+    bool hud_probe_begin = false;
     {
         std::lock_guard lock(seen_mutex);
         while (index < seen_count && seen[index].view != dsv) ++index;
@@ -1483,6 +1565,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                         motion_color_source = targets[3];
                         motion_color_frame = frame;
                         motion_color_bound = true;
+                        hud_probe_begin = true;
                     }
                 }
             }
@@ -1493,6 +1576,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         }
     }
 
+    if (hud_probe_begin) beginHudDrawProbe();
     if (snapshot_probe_bind) {
         beginPipelineSample(context, snapshot_probe_bind);
         logSnapshotColorTarget(index, snapshot_probe_bind, count, targets);
@@ -1567,6 +1651,7 @@ bool patchSlot(void** table, size_t slot, void* expected, void* replacement) {
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         auto* context = observed_context.load(std::memory_order_acquire);
+        endHudDrawProbe();
         endVSBufferProbe();
         endPipelineSample(context);
         pollPipelineSamples(context);

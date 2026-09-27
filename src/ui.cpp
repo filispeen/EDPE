@@ -718,7 +718,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ui.early_color_srv && ui.early_color_window_open) {
         ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("EDPE Early HDR Snapshot", &ui.early_color_window_open)) {
-            ImGui::TextUnformatted("First RTV3 exit; scene completeness unverified");
+            ImGui::TextUnformatted("Before first matched HUD draw; later world passes unverified");
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;

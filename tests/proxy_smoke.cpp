@@ -55,6 +55,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!shader_probe) FreeLibrary(proxy);
     if (FAILED(result) || !device || !context) return 4;
     void* original_om_set = (*reinterpret_cast<void***>(context))[33];
+    void* original_draws[]{(*reinterpret_cast<void***>(context))[12],
+        (*reinterpret_cast<void***>(context))[13],
+        (*reinterpret_cast<void***>(context))[20],
+        (*reinterpret_cast<void***>(context))[21]};
 
     const auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory1)>(
         GetProcAddress(dxgi_proxy, "CreateDXGIFactory1"));
@@ -350,6 +354,38 @@ int wmain(int argc, wchar_t** argv) {
         context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, .5f, 0);
         for (int bind = 0; bind < 3; ++bind)
             context->OMSetRenderTargets(4, scene_mrt, depth_view);
+        if (frame == 1) {
+            // Synthetic EDVR HUD signature exercises the copy before the draw.
+            ID3DBlob* vs_code = nullptr;
+            ID3DBlob* ps_code = nullptr;
+            constexpr char ps_source[] =
+                "float4 main() : SV_Target { return float4(1, 0, 0, 1); }";
+            if (FAILED(D3DCompile(vertex_source, sizeof(vertex_source) - 1,
+                    nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0,
+                    &vs_code, nullptr)) ||
+                FAILED(D3DCompile(ps_source, sizeof(ps_source) - 1,
+                    nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0,
+                    &ps_code, nullptr))) return 12;
+            ID3D11VertexShader* vs = nullptr;
+            ID3D11PixelShader* ps = nullptr;
+            if (FAILED(device->CreateVertexShader(vs_code->GetBufferPointer(),
+                    vs_code->GetBufferSize(), nullptr, &vs)) ||
+                FAILED(device->CreatePixelShader(ps_code->GetBufferPointer(),
+                    ps_code->GetBufferSize(), nullptr, &ps))) return 12;
+            const std::uint64_t hud_vs = 0xB7790CBFC6554097ull;
+            const std::uint64_t hud_ps = 0x8DEF46452FA459F5ull;
+            vs->SetPrivateData(kEdpeShaderHashGuid, sizeof(hud_vs), &hud_vs);
+            ps->SetPrivateData(kEdpeShaderHashGuid, sizeof(hud_ps), &hud_ps);
+            context->VSSetShader(vs, nullptr, 0);
+            context->PSSetShader(ps, nullptr, 0);
+            context->Draw(3, 0);
+            context->VSSetShader(nullptr, nullptr, 0);
+            context->PSSetShader(nullptr, nullptr, 0);
+            vs->Release();
+            ps->Release();
+            vs_code->Release();
+            ps_code->Release();
+        }
         context->OMSetRenderTargets(0, nullptr, nullptr);
         motion_present = swap_chain->Present(0, 0);
         if (FAILED(motion_present)) break;
@@ -391,6 +427,11 @@ int wmain(int argc, wchar_t** argv) {
     swap_chain->Release();
     const bool context_hook_restored =
         (*reinterpret_cast<void***>(context))[33] == original_om_set;
+    const bool draw_hooks_restored =
+        (*reinterpret_cast<void***>(context))[12] == original_draws[0] &&
+        (*reinterpret_cast<void***>(context))[13] == original_draws[1] &&
+        (*reinterpret_cast<void***>(context))[20] == original_draws[2] &&
+        (*reinterpret_cast<void***>(context))[21] == original_draws[3];
     if (factory) factory->Release();
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
@@ -416,7 +457,7 @@ int wmain(int argc, wchar_t** argv) {
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
-        context_hook_restored &&
+        context_hook_restored && draw_hooks_restored &&
         interval_observed &&
         read && !std::strstr(contents, "OLD_SESSION") &&
         std::strstr(contents, "EDPE: D3D11 device created") &&
@@ -427,6 +468,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: context dispatch frame=8") &&
         std::strstr(contents, "slot12=") && std::strstr(contents, "slot53=") &&
         std::strstr(contents, "EDPE: OMSetRenderTargets DSV census armed") &&
+        std::strstr(contents, "EDPE: HDR color copied before first matched HUD draw") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
