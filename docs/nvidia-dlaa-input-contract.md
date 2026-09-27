@@ -38,8 +38,9 @@ No NGX evaluation was run in Elite.
   unverified. The motion preview omits HUD shapes while HDR color contains
   them, so the current pair is not a complete temporal description of HUD.
 - **BLOCKED FOR RUNTIME DLAA:** Read-only captures identify a camera-buffer
-  write before the main scene pass, and two captured vertex shaders use its
-  projection block for clip X/Y/W. Coverage across scene shaders and pass
+  write before the main scene pass. A one-frame shader census found that
+  248/251 draws in its heavy pass used the observed projection block for
+  clip X/Y/W, while three used a different matrix. Other scenes and pass
   orders, plus a guaranteed way to remove jitter if evaluation fails, remain
   unverified. The current Halton sequence must remain inactive in Elite. NGX
   must not consume diagnostic captures as production inputs until that safety

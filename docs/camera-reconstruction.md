@@ -857,3 +857,34 @@ observed registers. The CPU test checks the resulting pixel displacement
 and leaves depth components intact. This math does not establish a safe
 game-buffer modification point or complete scene-shader coverage; runtime
 jitter remains disabled.
+
+## One-frame vertex-shader coverage — 2026-09-27
+
+**MEASURED / VERIFIED (Elite Odyssey gameplay; build not rechecked):** An
+explicitly armed, one-run probe retained the vertex shader bound for each
+draw using the 5376-byte VS-slot-1 scene buffer during one user-confirmed
+scene capture (`afterPresent=13550`). The user reported normal game, HUD,
+menu, and both snapshots. The heavy bind-2 interval had 251 such draws,
+ten distinct shaders, and zero diagnostic overflow; its pipeline query
+reported 432236 input-assembler primitives. Bind 3 had 59 such draws, two
+distinct shaders, zero overflow, and 39552 primitives. Raw game bytecode
+was inspected locally and is not redistributed.
+
+**VERIFIED (disassembly of the 12 captured shaders):** Nine bind-2 shaders
+accounting for 248 draws form clip X/Y/W through `cb1[270..273]`. Two of
+these adjust only clip Z afterward. Bind-3's first shader accounts for
+58 draws and uses the same block for X/Y/W. Bind-2's remaining shader
+(three draws; SHA-256
+`39C9671A162D25FCAE440B9D699A18878638D5651AB590D626AE7A4FE4694E9E`)
+does not read `cb1[270..273]`: it computes `SV_Position` from
+`cb0[4..7]`. Bind-3's remaining shader (one draw; SHA-256
+`92AC45AAAA217B7CBC0B70ABC4DC6464F2F71EC5964A31EA0FAC04F862DC3128`)
+passes input position directly to `SV_Position`.
+
+**IMPLICATION / LIMIT:** Modifying only the observed `cb1` projection
+would leave the three bind-2 `cb0` draws unjittered. The one passthrough
+draw may already receive a projected position, but its role is unverified.
+Draw counts do not measure the primitive or pixel share of each shader.
+This is one scene frame and one pass ordering, not a census of all game
+scenes or frames. Runtime jitter remains disabled while these paths and
+safe fallback remain unresolved.
