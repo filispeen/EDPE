@@ -749,3 +749,22 @@ The buffer map counts remained available until the interval ended. These
 observations identify CPU writes during scene rasterization, but not which
 projection fields changed, which draws consumed each write, or a safe
 jitter/fallback scheme. EDPE still does not modify the game's buffer.
+
+**MEASURED / VERIFIED (two subsequent user-confirmed gameplay captures,
+2026-09-27; game build not rechecked):** The one-shot `Unmap` observer hashed
+the view-to-world candidate at float words 932–943 and the projection
+candidate at 1080–1095 before forwarding each game write. In the first
+capture, all 13 bind-2 writes had identical hashes for both blocks:
+`D4EB112AEC494771` and `AFB7E0BB6C79B3D3`. In the second, the two
+bind-2 writes and 16 bind-3 writes shared camera hash
+`C782C76F22189D7B` and projection hash `8050A858E115BE5B`.
+The relevant pass contained 432236 and 606170 input-assembler primitives,
+respectively. Map/Unmap counts matched and those two hooks restored.
+The user confirmed normal game, HUD, menu, and snapshots.
+
+**IMPLICATION / LIMIT:** These exact byte ranges were stable through every
+observed write within each measured scene pass, while their hashes differed
+between captures. The game may be rewriting other fields in the same
+dynamic buffer. A hash does not establish the values' semantic use by the
+shader, the point at which the first draw receives its projection, or safe
+runtime jitter. EDPE continues to leave the buffer unchanged.
