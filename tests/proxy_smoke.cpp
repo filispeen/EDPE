@@ -206,8 +206,14 @@ int wmain(int argc, wchar_t** argv) {
     context->VSSetConstantBuffers(1, 1, &probe_buffer);
     for (int i = 0; i < 50; ++i) context->VSSetConstantBuffers(1, 1, &probe_buffer);
     context->DrawIndexed(0, 0, 0); // Exercise the one-shot draw observer without rendering.
+    context->Draw(0, 0);
+    context->DrawIndexedInstanced(0, 0, 0, 0, 0);
+    context->DrawInstanced(0, 0, 0, 0);
     context->VSSetConstantBuffers(1, 1, &depth_pass_buffer);
     context->DrawIndexed(0, 0, 0);
+    context->Draw(0, 0);
+    context->DrawIndexedInstanced(0, 0, 0, 0, 0);
+    context->DrawInstanced(0, 0, 0, 0);
     context->VSSetConstantBuffers(1, 1, &probe_buffer);
     constexpr char vertex_source[] =
         "float4 main(uint id : SV_VertexID) : SV_Position { "
@@ -392,6 +398,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: depth-pass VS bindings calls=53 sceneBufferCalls=52 first=") &&
         std::strstr(contents, "switches=0 slotRestored=1") &&
         std::strstr(contents, "EDPE: depth-pass DrawIndexed calls=2 with5376VS1=1 slotRestored=1") &&
+        std::strstr(contents, "EDPE: scene draws Draw=3/2 DrawIndexedInstanced=2/1 DrawInstanced=2/1 restored=111") &&
         std::strstr(contents, "EDPE: scene CB sample bind=0 projectionZ=(0,0.025000") &&
         std::strstr(contents, "EDPE: scene CB sample bind=51 projectionZ=(0,0.025000") &&
         std::strstr(contents, "EDPE: scene CB hash bind=0 fnv64=") &&

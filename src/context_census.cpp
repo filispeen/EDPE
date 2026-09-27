@@ -20,6 +20,9 @@
 namespace {
 constexpr size_t kVSSetConstantBuffers = 7;
 constexpr size_t kDrawIndexed = 12;
+constexpr size_t kDraw = 13;
+constexpr size_t kDrawIndexedInstanced = 20;
+constexpr size_t kDrawInstanced = 21;
 constexpr size_t kOMSetRenderTargets = 33;
 constexpr unsigned kPairFirstSample = 100;
 constexpr unsigned kPairSecondSample = 101;
@@ -28,6 +31,11 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT
 using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     UINT, ID3D11Buffer* const*);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
+using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
+using DrawIndexedInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
+    UINT, UINT, INT, UINT);
+using DrawInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
+    UINT, UINT, UINT);
 
 bool patchSlot(void** table, size_t slot, void* expected, void* replacement);
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
@@ -36,6 +44,9 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
 std::atomic<DrawIndexedFn> original_draw_indexed{nullptr};
+std::atomic<DrawFn> original_draw{nullptr};
+std::atomic<DrawIndexedInstancedFn> original_draw_indexed_instanced{nullptr};
+std::atomic<DrawInstancedFn> original_draw_instanced{nullptr};
 std::atomic<ID3D11DeviceContext*> observed_context{nullptr};
 IDXGISwapChain* observed_swap_chain = nullptr; // Weak; released by the game.
 void** patched_table = nullptr;
@@ -134,6 +145,15 @@ std::atomic<bool> vs_scene_buffer_bound{false};
 std::atomic<bool> draw_probe_active{false};
 std::atomic<unsigned> draw_indexed_calls{0};
 std::atomic<unsigned> draw_indexed_scene_calls{0};
+std::atomic<unsigned> draw_calls{0};
+std::atomic<unsigned> draw_scene_calls{0};
+std::atomic<unsigned> draw_indexed_instanced_calls{0};
+std::atomic<unsigned> draw_indexed_instanced_scene_calls{0};
+std::atomic<unsigned> draw_instanced_calls{0};
+std::atomic<unsigned> draw_instanced_scene_calls{0};
+std::atomic<bool> draw_hook_active{false};
+std::atomic<bool> draw_indexed_instanced_hook_active{false};
+std::atomic<bool> draw_instanced_hook_active{false};
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
@@ -155,7 +175,7 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
         const unsigned scene_bind = vs_scene_buffer_calls.fetch_add(1, std::memory_order_relaxed) + 1;
         ID3D11Buffer* expected = nullptr;
         if (vs_first_scene_buffer.compare_exchange_strong(expected, buffer, std::memory_order_relaxed))
-            queueConstantBufferSample(context, buffer, desc, 0); // 0 labels the first bind inside DSV interval 2.
+            queueConstantBufferSample(context, buffer, desc, 0); // 0 labels the first CB bind inside DSV interval 3.
         if (scene_bind == 51) queueConstantBufferSample(context, buffer, desc, 51);
         auto* previous = vs_scene_buffer.exchange(buffer, std::memory_order_relaxed);
         if (previous && previous != buffer)
@@ -174,6 +194,41 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
     original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
 }
 
+void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start) {
+    if (context == observed_context.load(std::memory_order_acquire) &&
+        draw_probe_active.load(std::memory_order_acquire)) {
+        draw_calls.fetch_add(1, std::memory_order_relaxed);
+        if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
+            draw_scene_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    original_draw.load(std::memory_order_acquire)(context, count, start);
+}
+
+void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
+    UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
+    UINT start_instance) {
+    if (context == observed_context.load(std::memory_order_acquire) &&
+        draw_probe_active.load(std::memory_order_acquire)) {
+        draw_indexed_instanced_calls.fetch_add(1, std::memory_order_relaxed);
+        if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
+            draw_indexed_instanced_scene_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
+        index_count, instance_count, start_index, base_vertex, start_instance);
+}
+
+void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
+    UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
+    if (context == observed_context.load(std::memory_order_acquire) &&
+        draw_probe_active.load(std::memory_order_acquire)) {
+        draw_instanced_calls.fetch_add(1, std::memory_order_relaxed);
+        if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
+            draw_instanced_scene_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    original_draw_instanced.load(std::memory_order_acquire)(context,
+        vertex_count, instance_count, start_vertex, start_instance);
+}
+
 void endDrawProbe() {
     if (!draw_probe_active.exchange(false, std::memory_order_acq_rel)) return;
     auto* forward = reinterpret_cast<void*>(original_draw_indexed.load(std::memory_order_acquire));
@@ -190,6 +245,27 @@ void endDrawProbe() {
             patched_table[kDrawIndexed], forward);
         EdpeLog(message);
     }
+    const bool draw_restored = !draw_hook_active.exchange(false) || patchSlot(
+        patched_table, kDraw, reinterpret_cast<void*>(&observedDraw),
+        reinterpret_cast<void*>(original_draw.load(std::memory_order_acquire)));
+    const bool indexed_instanced_restored =
+        !draw_indexed_instanced_hook_active.exchange(false) || patchSlot(
+            patched_table, kDrawIndexedInstanced,
+            reinterpret_cast<void*>(&observedDrawIndexedInstanced),
+            reinterpret_cast<void*>(original_draw_indexed_instanced.load(std::memory_order_acquire)));
+    const bool instanced_restored = !draw_instanced_hook_active.exchange(false) || patchSlot(
+        patched_table, kDrawInstanced, reinterpret_cast<void*>(&observedDrawInstanced),
+        reinterpret_cast<void*>(original_draw_instanced.load(std::memory_order_acquire)));
+    swprintf_s(message,
+        L"EDPE: scene draws Draw=%u/%u DrawIndexedInstanced=%u/%u DrawInstanced=%u/%u restored=%u%u%u",
+        draw_calls.load(std::memory_order_relaxed),
+        draw_scene_calls.load(std::memory_order_relaxed),
+        draw_indexed_instanced_calls.load(std::memory_order_relaxed),
+        draw_indexed_instanced_scene_calls.load(std::memory_order_relaxed),
+        draw_instanced_calls.load(std::memory_order_relaxed),
+        draw_instanced_scene_calls.load(std::memory_order_relaxed),
+        draw_restored, indexed_instanced_restored, instanced_restored);
+    EdpeLog(message);
 }
 
 void beginDrawProbe() {
@@ -199,10 +275,35 @@ void beginDrawProbe() {
     original_draw_indexed.store(forward, std::memory_order_release);
     draw_indexed_calls.store(0, std::memory_order_relaxed);
     draw_indexed_scene_calls.store(0, std::memory_order_relaxed);
+    draw_calls.store(0, std::memory_order_relaxed);
+    draw_scene_calls.store(0, std::memory_order_relaxed);
+    draw_indexed_instanced_calls.store(0, std::memory_order_relaxed);
+    draw_indexed_instanced_scene_calls.store(0, std::memory_order_relaxed);
+    draw_instanced_calls.store(0, std::memory_order_relaxed);
+    draw_instanced_scene_calls.store(0, std::memory_order_relaxed);
     if (patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(forward),
-            reinterpret_cast<void*>(&observedDrawIndexed)))
+            reinterpret_cast<void*>(&observedDrawIndexed))) {
         draw_probe_active.store(true, std::memory_order_release);
-    else
+        auto draw_forward = reinterpret_cast<DrawFn>(patched_table[kDraw]);
+        auto indexed_instanced_forward = reinterpret_cast<DrawIndexedInstancedFn>(
+            patched_table[kDrawIndexedInstanced]);
+        auto instanced_forward = reinterpret_cast<DrawInstancedFn>(patched_table[kDrawInstanced]);
+        original_draw.store(draw_forward, std::memory_order_release);
+        original_draw_indexed_instanced.store(indexed_instanced_forward,
+            std::memory_order_release);
+        original_draw_instanced.store(instanced_forward, std::memory_order_release);
+        if (draw_forward && patchSlot(patched_table, kDraw,
+                reinterpret_cast<void*>(draw_forward), reinterpret_cast<void*>(&observedDraw)))
+            draw_hook_active.store(true, std::memory_order_release);
+        if (indexed_instanced_forward && patchSlot(patched_table, kDrawIndexedInstanced,
+                reinterpret_cast<void*>(indexed_instanced_forward),
+                reinterpret_cast<void*>(&observedDrawIndexedInstanced)))
+            draw_indexed_instanced_hook_active.store(true, std::memory_order_release);
+        if (instanced_forward && patchSlot(patched_table, kDrawInstanced,
+                reinterpret_cast<void*>(instanced_forward),
+                reinterpret_cast<void*>(&observedDrawInstanced)))
+            draw_instanced_hook_active.store(true, std::memory_order_release);
+    } else
         EdpeLog(L"EDPE: depth-pass DrawIndexed probe unavailable (slot changed)");
 }
 
