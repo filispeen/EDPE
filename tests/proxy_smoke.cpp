@@ -469,6 +469,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "slot12=") && std::strstr(contents, "slot53=") &&
         std::strstr(contents, "EDPE: OMSetRenderTargets DSV census armed") &&
         std::strstr(contents, "EDPE: HDR color copied before first matched HUD draw") &&
+        std::strstr(contents, "EDPE: HDR draw shader 0 VS=B7790CBFC6554097 PS=8DEF46452FA459F5") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&

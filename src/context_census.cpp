@@ -114,6 +114,16 @@ UINT motion_color_snapshot_width = 0;
 UINT motion_color_snapshot_height = 0;
 UINT motion_early_color_width = 0;
 UINT motion_early_color_height = 0;
+bool motion_early_color_from_hud = false;
+struct HudShaderSample {
+    std::uint64_t vs = 0;
+    std::uint64_t ps = 0;
+    unsigned draws = 0;
+};
+std::array<HudShaderSample, 32> hud_shader_samples{};
+size_t hud_shader_sample_count = 0;
+unsigned hud_shader_sample_overflow = 0;
+unsigned hud_shader_missing_hash = 0;
 unsigned long long motion_color_frame = ~0ull;
 bool motion_color_bound = false;
 bool motion_color_rebound = false;
@@ -205,30 +215,12 @@ std::atomic<unsigned long long> scene_last_projection_hash{0};
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
-void captureEarlyMotionColor(ID3D11DeviceContext* context);
+void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud);
 
 void observeHudDraw(ID3D11DeviceContext* context) {
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
-        !motion_color_source || !motion_color_bound || motion_early_color_view) return;
+        !motion_color_source || !motion_color_bound) return;
     ++hud_target_draws;
-    Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
-    context->VSGetShader(&vs, nullptr, nullptr);
-    context->PSGetShader(&ps, nullptr, nullptr);
-    if (!vs || !ps) return;
-    std::uint64_t vs_hash = 0, ps_hash = 0;
-    UINT size = sizeof(vs_hash);
-    if (FAILED(vs->GetPrivateData(kEdpeShaderHashGuid, &size, &vs_hash)) ||
-        size != sizeof(vs_hash)) return;
-    size = sizeof(ps_hash);
-    if (FAILED(ps->GetPrivateData(kEdpeShaderHashGuid, &size, &ps_hash)) ||
-        size != sizeof(ps_hash)) return;
-    // Exact UI shader pairs documented by EDVR; validate the bound Desktop target too.
-    const bool hud = (vs_hash == 0xB7790CBFC6554097ull &&
-                      ps_hash == 0x8DEF46452FA459F5ull) ||
-                     (vs_hash == 0x81216C77F90DEDD6ull &&
-                      ps_hash == 0xA2965EC2931A39C8ull);
-    if (!hud) return;
     ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
     bool target_matches = false;
@@ -237,11 +229,45 @@ void observeHudDraw(ID3D11DeviceContext* context) {
         if (view) view->Release();
     }
     if (!target_matches) return;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
+    context->VSGetShader(&vs, nullptr, nullptr);
+    context->PSGetShader(&ps, nullptr, nullptr);
+    if (!vs || !ps) {
+        ++hud_shader_missing_hash;
+        return;
+    }
+    std::uint64_t vs_hash = 0, ps_hash = 0;
+    UINT size = sizeof(vs_hash);
+    if (FAILED(vs->GetPrivateData(kEdpeShaderHashGuid, &size, &vs_hash)) ||
+        size != sizeof(vs_hash)) {
+        ++hud_shader_missing_hash;
+        return;
+    }
+    size = sizeof(ps_hash);
+    if (FAILED(ps->GetPrivateData(kEdpeShaderHashGuid, &size, &ps_hash)) ||
+        size != sizeof(ps_hash)) {
+        ++hud_shader_missing_hash;
+        return;
+    }
+    auto sample = std::find_if(hud_shader_samples.begin(),
+        hud_shader_samples.begin() + hud_shader_sample_count,
+        [=](const HudShaderSample& item) { return item.vs == vs_hash && item.ps == ps_hash; });
+    if (sample != hud_shader_samples.begin() + hud_shader_sample_count) ++sample->draws;
+    else if (hud_shader_sample_count < hud_shader_samples.size())
+        hud_shader_samples[hud_shader_sample_count++] = {vs_hash, ps_hash, 1};
+    else ++hud_shader_sample_overflow;
+    // Exact UI shader pairs documented by EDVR; validate them in Desktop captures.
+    const bool hud = (vs_hash == 0xB7790CBFC6554097ull &&
+                      ps_hash == 0x8DEF46452FA459F5ull) ||
+                     (vs_hash == 0x81216C77F90DEDD6ull &&
+                      ps_hash == 0xA2965EC2931A39C8ull);
+    if (!hud) return;
     wchar_t message[160];
     swprintf_s(message, L"EDPE: HUD draw on HDR target VS=%016llX PS=%016llX frame=%llu",
         vs_hash, ps_hash, motion_color_frame);
     EdpeLog(message);
-    captureEarlyMotionColor(context);
+    captureEarlyMotionColor(context, true);
     hud_draw_probe_active.store(false, std::memory_order_relaxed);
 }
 
@@ -483,6 +509,9 @@ void beginHudDrawProbe() {
         &observedDrawIndexedInstanced, 4);
     install(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
     hud_target_draws = 0;
+    hud_shader_sample_count = 0;
+    hud_shader_sample_overflow = 0;
+    hud_shader_missing_hash = 0;
     hud_draw_probe_active.store(hud_draw_hook_mask != 0, std::memory_order_release);
     wchar_t message[128];
     swprintf_s(message, L"EDPE: HUD draw probe armed mask=0x%X frame=%llu",
@@ -494,11 +523,13 @@ void endHudDrawProbe() {
     if (!hud_draw_hook_mask) return;
     hud_draw_probe_active.store(false, std::memory_order_release);
     unsigned restored = 0;
+    unsigned reverted = 0;
     auto restore = [&](size_t slot, auto& original_fn, auto observer, unsigned bit) {
-        if ((hud_draw_hook_mask & bit) && patchSlot(patched_table, slot,
-                reinterpret_cast<void*>(observer),
-                reinterpret_cast<void*>(original_fn.load(std::memory_order_acquire))))
+        if (!(hud_draw_hook_mask & bit)) return;
+        auto* forward = reinterpret_cast<void*>(original_fn.load(std::memory_order_acquire));
+        if (patchSlot(patched_table, slot, reinterpret_cast<void*>(observer), forward))
             restored |= bit;
+        else if (patched_table[slot] == forward) reverted |= bit;
     };
     restore(kDrawIndexed, original_draw_indexed, &observedDrawIndexed, 1);
     restore(kDraw, original_draw, &observedDraw, 2);
@@ -507,10 +538,16 @@ void endHudDrawProbe() {
     restore(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
     wchar_t message[160];
     swprintf_s(message,
-        L"EDPE: HUD draw probe frame=%llu mask=0x%X restored=0x%X draws=%u copy=%u",
-        motion_color_frame, hud_draw_hook_mask, restored, hud_target_draws,
-        static_cast<unsigned>(motion_early_color_view != nullptr));
+        L"EDPE: HUD draw probe frame=%llu mask=0x%X restored=0x%X reverted=0x%X draws=%u hudCopy=%u missingHash=%u overflow=%u",
+        motion_color_frame, hud_draw_hook_mask, restored, reverted, hud_target_draws,
+        motion_early_color_from_hud, hud_shader_missing_hash, hud_shader_sample_overflow);
     EdpeLog(message);
+    for (size_t i = 0; i < hud_shader_sample_count; ++i) {
+        const auto& sample = hud_shader_samples[i];
+        swprintf_s(message, L"EDPE: HDR draw shader %zu VS=%016llX PS=%016llX draws=%u",
+            i, sample.vs, sample.ps, sample.draws);
+        EdpeLog(message);
+    }
     hud_draw_hook_mask = 0;
 }
 
@@ -1149,8 +1186,8 @@ void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
     EdpeLog(message);
 }
 
-void captureEarlyMotionColor(ID3D11DeviceContext* context) {
-    if (motion_early_color_view || !motion_color_source) return;
+void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
+    if ((motion_early_color_view && !from_hud) || !motion_color_source) return;
     D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
     motion_color_source->GetDesc(&rtv_desc);
     Microsoft::WRL::ComPtr<ID3D11Resource> resource;
@@ -1185,7 +1222,9 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context) {
     motion_early_color_view = std::move(view);
     motion_early_color_width = desc.Width;
     motion_early_color_height = desc.Height;
-    EdpeLog(L"EDPE: HDR color copied before first matched HUD draw");
+    motion_early_color_from_hud = from_hud;
+    EdpeLog(from_hud ? L"EDPE: HDR color copied before first matched HUD draw" :
+                       L"EDPE: early HDR color copied at first RTV3 exit");
 }
 
 void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
@@ -1468,6 +1507,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 L"EDPE: motion HDR RTV3 first exit frame=%llu nextRTVs=%u nextDSV=%p",
                 motion_color_frame, count, dsv);
             EdpeLog(message);
+            captureEarlyMotionColor(context, false);
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
         motion_color_bound = bound;
@@ -1819,6 +1859,7 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             motion_color_snapshot.Reset();
             motion_early_color_view.Reset();
             motion_early_color_snapshot.Reset();
+            motion_early_color_from_hud = false;
             motion_color_frame = ~0ull;
             motion_color_bound = motion_color_rebound =
                 motion_color_first_exit_logged = false;
