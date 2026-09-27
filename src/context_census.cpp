@@ -164,6 +164,15 @@ std::atomic<bool> first_scene_draw_seen{false};
 std::atomic<ID3D11Buffer*> first_scene_draw_buffer{nullptr}; // Identity only.
 std::array<unsigned char, 65536> first_scene_shader_bytecode{}; // One-shot diagnostic.
 std::atomic<UINT> first_scene_shader_bytes{0};
+struct SceneShaderSample {
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> shader;
+    unsigned draws = 0;
+};
+std::mutex scene_shader_mutex;
+std::array<SceneShaderSample, 64> scene_shaders{}; // Bounded one-shot diagnostic.
+size_t scene_shader_count = 0;
+unsigned scene_shader_overflow_draws = 0;
+std::atomic<bool> scene_shader_probe_active{false};
 std::atomic<bool> draw_hook_active{false};
 std::atomic<bool> draw_indexed_instanced_hook_active{false};
 std::atomic<bool> draw_instanced_hook_active{false};
@@ -184,21 +193,44 @@ std::atomic<unsigned long long> scene_first_projection_hash{0};
 std::atomic<unsigned long long> scene_last_projection_hash{0};
 
 void observeFirstSceneDraw(ID3D11DeviceContext* context) {
-    if (!vs_scene_buffer_bound.load(std::memory_order_relaxed) ||
-        first_scene_draw_seen.exchange(true, std::memory_order_relaxed)) return;
-    ID3D11Buffer* buffer = nullptr;
-    context->VSGetConstantBuffers(1, 1, &buffer);
-    first_scene_draw_buffer.store(buffer, std::memory_order_relaxed);
-    if (buffer) buffer->Release();
+    if (!vs_scene_buffer_bound.load(std::memory_order_relaxed)) return;
+    const bool first = !first_scene_draw_seen.exchange(true, std::memory_order_relaxed);
+    if (first) {
+        ID3D11Buffer* buffer = nullptr;
+        context->VSGetConstantBuffers(1, 1, &buffer);
+        first_scene_draw_buffer.store(buffer, std::memory_order_relaxed);
+        if (buffer) buffer->Release();
+    }
+    if (!first && !scene_shader_probe_active.load(std::memory_order_acquire)) return;
     ID3D11VertexShader* shader = nullptr;
     context->VSGetShader(&shader, nullptr, nullptr);
-    if (shader) {
+    if (!shader) return;
+    if (first) {
         UINT bytes = static_cast<UINT>(first_scene_shader_bytecode.size());
         if (SUCCEEDED(shader->GetPrivateData(kEdpeVertexBytecodeGuid, &bytes,
-                first_scene_shader_bytecode.data())))
+                first_scene_shader_bytecode.data()))) {
             first_scene_shader_bytes.store(bytes, std::memory_order_release);
-        shader->Release();
+            scene_shader_probe_active.store(true, std::memory_order_release);
+        }
     }
+    if (scene_shader_probe_active.load(std::memory_order_acquire)) {
+        std::lock_guard lock(scene_shader_mutex);
+        for (size_t i = 0; i < scene_shader_count; ++i) {
+            if (scene_shaders[i].shader.Get() == shader) {
+                ++scene_shaders[i].draws;
+                shader->Release();
+                return;
+            }
+        }
+        if (scene_shader_count < scene_shaders.size()) {
+            auto& sample = scene_shaders[scene_shader_count++];
+            sample.shader.Attach(shader); // VSGetShader transferred one reference.
+            sample.draws = 1;
+            return;
+        }
+        ++scene_shader_overflow_draws;
+    }
+    shader->Release();
 }
 
 void dumpFirstSceneShader() {
@@ -224,6 +256,48 @@ void dumpFirstSceneShader() {
         vs_probe_bind_ordinal.load(std::memory_order_relaxed),
         bytes, saved && written == bytes);
     EdpeLog(message);
+}
+
+void dumpSceneShaders() {
+    if (!scene_shader_probe_active.exchange(false, std::memory_order_acq_rel)) return;
+    std::lock_guard lock(scene_shader_mutex);
+    wchar_t path[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t* name = length && length < MAX_PATH ? wcsrchr(path, L'\\') : nullptr;
+    const size_t prefix = name ? name + 1 - path : 0;
+    std::array<unsigned char, 65536> bytecode{};
+    for (size_t i = 0; i < scene_shader_count; ++i) {
+        auto& sample = scene_shaders[i];
+        UINT bytes = static_cast<UINT>(bytecode.size());
+        bool saved = false;
+        if (name && SUCCEEDED(sample.shader->GetPrivateData(kEdpeVertexBytecodeGuid,
+                &bytes, bytecode.data())) &&
+            swprintf_s(name + 1, MAX_PATH - prefix, L"edpe-vs-bind%u-%zu.dxbc",
+                vs_probe_bind_ordinal.load(std::memory_order_relaxed), i) > 0) {
+            const HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ,
+                nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file != INVALID_HANDLE_VALUE) {
+                DWORD written = 0;
+                saved = WriteFile(file, bytecode.data(), bytes, &written, nullptr) &&
+                    written == bytes;
+                CloseHandle(file);
+            }
+        }
+        wchar_t message[160];
+        swprintf_s(message, L"EDPE: scene shader bind=%u index=%zu draws=%u bytes=%u saved=%u",
+            vs_probe_bind_ordinal.load(std::memory_order_relaxed), i,
+            sample.draws, bytes, saved);
+        EdpeLog(message);
+        sample.shader.Reset();
+        sample.draws = 0;
+    }
+    wchar_t message[160];
+    swprintf_s(message, L"EDPE: scene shader census bind=%u unique=%zu overflowDraws=%u",
+        vs_probe_bind_ordinal.load(std::memory_order_relaxed), scene_shader_count,
+        scene_shader_overflow_draws);
+    EdpeLog(message);
+    scene_shader_count = 0;
+    scene_shader_overflow_draws = 0;
 }
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
@@ -422,6 +496,7 @@ void endDrawProbe() {
         vs_probe_bind_ordinal.load(std::memory_order_relaxed));
     EdpeLog(message);
     dumpFirstSceneShader();
+    dumpSceneShaders();
     auto* map_target = scene_map_target.exchange(nullptr, std::memory_order_acq_rel);
     scene_mapped_data.store(nullptr, std::memory_order_release);
     const bool map_restored = !map_hook_active.exchange(false) || patchSlot(patched_table,
@@ -467,6 +542,13 @@ void beginDrawProbe() {
     first_scene_draw_seen.store(false, std::memory_order_relaxed);
     first_scene_draw_buffer.store(nullptr, std::memory_order_relaxed);
     first_scene_shader_bytes.store(0, std::memory_order_relaxed);
+    scene_shader_probe_active.store(false, std::memory_order_release);
+    {
+        std::lock_guard lock(scene_shader_mutex);
+        for (auto& sample : scene_shaders) sample.shader.Reset();
+        scene_shader_count = 0;
+        scene_shader_overflow_draws = 0;
+    }
     scene_maps.store(0, std::memory_order_relaxed);
     scene_unmaps.store(0, std::memory_order_relaxed);
     scene_maps_after_draw.store(0, std::memory_order_relaxed);
