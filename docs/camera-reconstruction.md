@@ -692,3 +692,23 @@ that this block is the raster shader's sole projection source, that every
 depth-writing draw uses it, or that `SSAAMultiplier` can safely lower only
 the expensive 3D scene resolution. No graphics setting was changed for this
 measurement.
+
+## Scene draw association — 2026-09-27
+
+**MEASURED / VERIFIED (Elite Odyssey gameplay; game build not rechecked):**
+A user-requested scene snapshot enabled one-shot D3D11 context hooks only
+between the third and fourth matching scene-DSV binds. The third bind used
+the four-target MRT pattern and had 465443 input-assembler primitives,
+613847 vertex-shader invocations, and 1923929 pixel-shader invocations.
+Within that interval EDPE observed 109 `DrawIndexedInstanced` and 12
+`DrawInstanced` calls; every one occurred while a 5376-byte dynamic buffer
+was bound at VS slot 1. There were zero `Draw` and zero `DrawIndexed` calls.
+`VSSetConstantBuffers` rebound the same 5376-byte buffer identity 91 times.
+All four temporary draw hooks and the VS-binding hook restored their slots.
+The user confirmed normal gameplay, HUD, F5 menu, and snapshots.
+
+**IMPLICATION / LIMIT:** This is direct evidence that the candidate buffer
+is bound during substantial scene rasterization, stronger than sampling it
+only at an MRT bind. It does not prove which fields each shader actually
+reads, whether all depth-writing draws use the same camera, or that a write
+to this buffer would be safe. Projection jitter remains disabled.
