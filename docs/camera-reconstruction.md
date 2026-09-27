@@ -610,6 +610,15 @@ continuity through scene transitions. Runtime reprojection stays disabled.
 
 ## Required before runtime reprojection
 
+**REFERENCE-CODE / IMPLICATION (EDVR revision `96df075`, 2026-09-26):**
+`src/d3d11/native_temporal.cpp` requests each VR eye's jitter through a
+`tangentShift` in the native VR frame API and refuses temporal evaluation
+when that frame has no matching projection query. EDPE's 2D renderer has
+no such VR producer. The current D3D11 VS constant-buffer observation
+only reads the 5376-byte scene block at a bind; it does not provide a
+safe projection-write point or a guaranteed bypass for a jittered frame.
+Do not enable runtime jitter by transplanting EDVR's VR path.
+
 **SDK-DOCUMENTED / EXPERIMENTAL (2026-09-26):** D3D11
 [`CopyResource`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-copyresource)
 queues a GPU resource copy when source and destination are compatible and
@@ -628,11 +637,17 @@ default-buffer copy has now been observed in Elite: in a user-confirmed
 were queued at binds 100 and 101, their downstream staging samples passed
 the camera parser at `afterPresent=18329/18330`, and the game, HUD, and F5
 menu continued normally. This verifies the one-shot copy path in that run;
-motion still uses the staging-parsed CPU camera. A separate WARP compute
-test now binds the copied default buffer as a shader constant buffer and
+motion still used the staging-parsed CPU camera at that stage. A separate
+WARP compute test now binds the copied default buffer as a shader constant buffer and
 reads observed offsets 932 and 1094, checking their values through a 1×1
-test texture. This verifies shader addressability of the GPU copy in WARP;
-Elite motion-shader consumption remains unbuilt.
+test texture. This verifies shader addressability of the GPU copy in WARP.
+Subsequent WARP tests compared the GPU-camera motion shader with the
+CPU camera-depth result for translation and rotation within 0.01 render
+pixel. In the later user-confirmed Elite capture at `afterPresent=17679/17680`,
+the log explicitly reported `used GPU camera buffers`, a visible motion
+snapshot and DSV observer restoration. See
+[motion-vector-prototype.md](motion-vector-prototype.md). The CPU camera
+readback remains in this one-shot diagnostic for validation and fallback.
 
 **MEASURED / EXPERIMENTAL (2026-09-26, Elite Odyssey; game build not
 rechecked):** During three user-requested motion captures with a turning
@@ -644,8 +659,10 @@ projection block and unscaled rotation rows appear to update at slightly
 different moments. The diagnostic parser now derives the orientation and
 X/Y scales from the projection block itself, uses translation from the
 unscaled rows, and rejects pairs whose normalized directions differ by
-more than `0.02`. This is tested with synthetic skew and WARP, but has not
-yet been retested in Elite. It does not establish a production camera source.
+more than `0.02`. Synthetic skew and WARP tests passed. Later Elite
+captures parsed adjacent frames successfully during camera motion. The
+projection scales differed across sessions; the cause was not measured. This
+still does not establish a production camera source for every scene draw.
 
 Verify which buffer update and scene pass provide the camera for each depth
 frame, including scene transitions. Verify projection X/Y, Y orientation,
