@@ -168,6 +168,7 @@ std::atomic<bool> unmap_hook_active{false};
 std::atomic<unsigned> scene_maps{0};
 std::atomic<unsigned> scene_unmaps{0};
 std::atomic<unsigned> scene_maps_after_draw{0};
+std::atomic<unsigned> scene_maps_before_bind{0};
 std::atomic<void*> scene_mapped_data{nullptr};
 std::atomic<unsigned> scene_hashed_writes{0};
 std::atomic<unsigned> scene_camera_changes{0};
@@ -260,6 +261,26 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
     const HRESULT result = original_map.load(std::memory_order_acquire)(
         context, resource, subresource, type, flags, mapped);
     if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
+        resource && !scene_map_target.load(std::memory_order_acquire) &&
+        map_hook_active.load(std::memory_order_acquire)) {
+        D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+        resource->GetType(&dimension);
+        if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            ID3D11Buffer* buffer = nullptr;
+            if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Buffer),
+                    reinterpret_cast<void**>(&buffer)))) {
+                D3D11_BUFFER_DESC desc{};
+                buffer->GetDesc(&desc);
+                if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
+                    (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+                    scene_map_target.store(buffer, std::memory_order_release);
+                    scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
+                }
+                buffer->Release();
+            }
+        }
+    }
+    if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
         resource == scene_map_target.load(std::memory_order_acquire) &&
         map_hook_active.load(std::memory_order_acquire)) {
         scene_maps.fetch_add(1, std::memory_order_relaxed);
@@ -351,11 +372,12 @@ void endDrawProbe() {
     const bool unmap_restored = !unmap_hook_active.exchange(false) || patchSlot(patched_table,
         kUnmap, reinterpret_cast<void*>(&observedUnmap),
         reinterpret_cast<void*>(original_unmap.load(std::memory_order_acquire)));
-    swprintf_s(message, L"EDPE: scene buffer maps=%u afterDraw=%u unmaps=%u restored=%u%u bind=%u",
+    swprintf_s(message, L"EDPE: scene buffer maps=%u afterDraw=%u unmaps=%u restored=%u%u bind=%u beforeBind=%u",
         scene_maps.load(std::memory_order_relaxed),
         scene_maps_after_draw.load(std::memory_order_relaxed),
         scene_unmaps.load(std::memory_order_relaxed), map_restored, unmap_restored,
-        vs_probe_bind_ordinal.load(std::memory_order_relaxed));
+        vs_probe_bind_ordinal.load(std::memory_order_relaxed),
+        scene_maps_before_bind.load(std::memory_order_relaxed));
     EdpeLog(message);
     swprintf_s(message,
         L"EDPE: scene write hashes sampled=%u cameraChanges=%u projectionChanges=%u camera=%016llX/%016llX projection=%016llX/%016llX bind=%u",
@@ -386,6 +408,7 @@ void beginDrawProbe() {
     scene_maps.store(0, std::memory_order_relaxed);
     scene_unmaps.store(0, std::memory_order_relaxed);
     scene_maps_after_draw.store(0, std::memory_order_relaxed);
+    scene_maps_before_bind.store(0, std::memory_order_relaxed);
     scene_mapped_data.store(nullptr, std::memory_order_relaxed);
     scene_hashed_writes.store(0, std::memory_order_relaxed);
     scene_camera_changes.store(0, std::memory_order_relaxed);

@@ -199,7 +199,15 @@ int wmain(int argc, wchar_t** argv) {
     const bool snapshot_requested = request_depth_snapshot(0);
     const HRESULT snapshot_arm_present = swap_chain->Present(0, 0);
     context->ClearDepthStencilView(depth_view, D3D11_CLEAR_DEPTH, 0.25f, 0);
+    ID3D11Buffer* no_scene_buffer = nullptr;
+    context->VSSetConstantBuffers(1, 1, &no_scene_buffer);
     context->OMSetRenderTargets(0, nullptr, depth_view);
+    D3D11_MAPPED_SUBRESOURCE early_probe{};
+    if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
+            &early_probe))) return 10;
+    std::memcpy(early_probe.pData, probe_values, sizeof(probe_values));
+    context->Unmap(probe_buffer, 0);
+    context->VSSetConstantBuffers(1, 1, &probe_buffer);
     context->OMSetRenderTargets(0, nullptr, depth_view);
     ID3D11RenderTargetView* scene_mrt[]{mrt0_view, color_view, mrt2_view, second_color_view};
     context->OMSetRenderTargets(4, scene_mrt, depth_view);
@@ -370,7 +378,6 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
         std::strstr(contents, "viewFormat=20 textureFormat=19 depth=64x64 bind=0x48") &&
         std::strstr(contents, "EDPE: depth snapshot timing #0 armedAfter=7 firstBindAfter=7 lastBindAfter=7 binds=6 handedAt=8") &&
-        std::strstr(contents, "EDPE: DSV #0 bind=1 CB stage=VS slot=1 buffer=") &&
         std::strstr(contents, "EDPE: DSV #0 bind=2 CB stage=VS slot=1 buffer=") &&
         std::strstr(contents, "EDPE: DSV #0 bind=3 color target count=4") &&
         std::strstr(contents, "EDPE: DSV #0 bind=3 rtv0=") &&
@@ -400,7 +407,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: depth-pass DrawIndexed calls=2 with5376VS1=1 slotRestored=1") &&
         std::strstr(contents, "EDPE: scene draws Draw=3/2 DrawIndexedInstanced=2/1 DrawInstanced=2/1 restored=111") &&
         std::strstr(contents, "EDPE: scene buffer maps=1 afterDraw=1 unmaps=1 restored=11") &&
-        std::strstr(contents, "EDPE: scene buffer maps=0 afterDraw=0 unmaps=0 restored=11 bind=1") &&
+        std::strstr(contents, "EDPE: scene buffer maps=1 afterDraw=0 unmaps=1 restored=11 bind=1 beforeBind=1") &&
         std::strstr(contents, "EDPE: scene buffer maps=0 afterDraw=0 unmaps=0 restored=11 bind=2") &&
         std::strstr(contents, "EDPE: scene buffer maps=1 afterDraw=1 unmaps=1 restored=11 bind=3") &&
         std::strstr(contents, "EDPE: scene write hashes sampled=1 cameraChanges=0 projectionChanges=0 camera=") &&
