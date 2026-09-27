@@ -37,11 +37,13 @@ No NGX evaluation was run in Elite.
   exposure, moving-object motion, and the optimal evaluation point remain
   unverified. The motion preview omits HUD shapes while HDR color contains
   them, so the current pair is not a complete temporal description of HUD.
-- **BLOCKED FOR RUNTIME DLAA:** EDPE has no verified raster-projection write
-  point and no guaranteed way to remove jitter if evaluation fails. Its
-  current Halton sequence must remain inactive in Elite. NGX must not consume
-  the diagnostic captures as production inputs until that safety condition
-  and the input conventions are verified.
+- **BLOCKED FOR RUNTIME DLAA:** Two read-only gameplay captures identified
+  a candidate camera-buffer write before the main scene pass, but have not
+  established the shader's projection use across pass orders or a guaranteed
+  way to remove jitter if evaluation fails. The current Halton sequence must
+  remain inactive in Elite. NGX must not consume the diagnostic captures as
+  production inputs until that safety condition and the input conventions
+  are verified.
 
 **Implication:** Keep EDPE's scene observations and motion generation
 backend-neutral. Translate measured EDPE conventions at the future NGX

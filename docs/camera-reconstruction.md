@@ -788,3 +788,13 @@ buffer was not bound at VS slot 1 for that draw. The observation does not
 show whether the same early write exists in frames where the main pass is
 third, how many camera buffers coexist, or how to revert a jittered frame
 if temporal reconstruction fails. Runtime jitter remains disabled.
+
+**MEASURED / VERIFIED (second user-confirmed run, 2026-09-27; game build not
+rechecked):** The next requested capture reproduced this sequence at
+`afterPresent=20618`. Bind 1 mapped buffer `00000170B6E81A20` before a
+5376-byte VS-slot-1 binding. Bind 2 used that same buffer for the main pass
+(432236 input-assembler primitives) and mapped it 13 more times. Camera and
+projection hashes matched the early write through those 13 writes. The
+pointer differs from the prior run as expected for a process-local identity;
+it is not a persistent resource signature. Bind 3 had no buffer maps. The
+game and both snapshots continued to work.
