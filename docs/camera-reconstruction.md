@@ -670,3 +670,25 @@ near/far behavior, and whether a previous-camera transform can be captured
 without a blocking readback. Keep camera selection tied to resource/pass
 evidence rather than a session-local DSV number. Until then, do not feed this
 depth or camera candidate to DLSS or FSR, and do not apply projection jitter.
+
+## Configured FOV matches the captured projection scale — 2026-09-27
+
+**VERIFIED / MEASURED (Elite Odyssey; game build not rechecked):** The active
+local graphics configuration names the `Custom` preset, sets display size
+`2560×1440`, and has `FOV=60.000000` degrees. The custom preset
+has `SSAAMultiplier=1.000000`. In the next user-confirmed in-game motion
+capture, the adjacent camera candidates at `afterPresent=27784/27785`
+reported `(scaleX,scaleY)=(0.974278629,1.73205101)` and
+`(0.974278688,1.73205113)`. For a 60-degree vertical field of view,
+`scaleY=1/tan(30°)=1.7320508076`; dividing by `2560/1440` gives
+`scaleX=0.9742785793`. The observed differences are below `3.3e-7`.
+The same capture copied `2560×1440` HDR color and used GPU camera buffers
+for motion. The user confirmed normal game, HUD, F5 menu, and diagnostic
+windows.
+
+**IMPLICATION / LIMIT:** This strongly supports interpreting words 1080–1095
+as a camera/projection block at this FOV and aspect ratio. It does not prove
+that this block is the raster shader's sole projection source, that every
+depth-writing draw uses it, or that `SSAAMultiplier` can safely lower only
+the expensive 3D scene resolution. No graphics setting was changed for this
+measurement.
