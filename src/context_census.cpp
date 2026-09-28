@@ -115,6 +115,9 @@ UINT motion_color_snapshot_height = 0;
 UINT motion_early_color_width = 0;
 UINT motion_early_color_height = 0;
 bool motion_early_color_from_hud = false;
+bool hud_first_match_seen = false;
+unsigned hud_after_copy_draws = 0;
+unsigned glass_after_copy_draws = 0;
 struct HudShaderSample {
     std::uint64_t vs = 0;
     std::uint64_t ps = 0;
@@ -244,6 +247,7 @@ void observeHudDraw(ID3D11DeviceContext* context) {
         if (view) view->Release();
     }
     if (!target_matches) return;
+    if (hud_first_match_seen) ++hud_after_copy_draws;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
     context->VSGetShader(&vs, nullptr, nullptr);
@@ -272,6 +276,11 @@ void observeHudDraw(ID3D11DeviceContext* context) {
     else if (hud_shader_sample_count < hud_shader_samples.size())
         hud_shader_samples[hud_shader_sample_count++] = {vs_hash, ps_hash, 1};
     else ++hud_shader_sample_overflow;
+    if (hud_first_match_seen) {
+        if (vs_hash == 0xF512712C40D93C12ull &&
+            ps_hash == 0x4A71EB0D34E9F2EFull) ++glass_after_copy_draws;
+        return;
+    }
     // Exact UI shader pairs documented by EDVR; validate them in Desktop captures.
     const bool hud = (vs_hash == 0xB7790CBFC6554097ull &&
                       ps_hash == 0x8DEF46452FA459F5ull) ||
@@ -284,8 +293,8 @@ void observeHudDraw(ID3D11DeviceContext* context) {
     swprintf_s(message, L"EDPE: HUD draw on HDR target VS=%016llX PS=%016llX frame=%llu",
         vs_hash, ps_hash, motion_color_frame);
     EdpeLog(message);
+    hud_first_match_seen = true;
     captureEarlyMotionColor(context, true);
-    hud_draw_probe_active.store(false, std::memory_order_relaxed);
 }
 
 void observeFirstSceneDraw(ID3D11DeviceContext* context) {
@@ -530,6 +539,8 @@ void beginHudDrawProbe() {
     hud_shader_sample_count = 0;
     hud_shader_sample_overflow = 0;
     hud_shader_missing_hash = 0;
+    hud_first_match_seen = false;
+    hud_after_copy_draws = glass_after_copy_draws = 0;
     hud_draw_probe_active.store(hud_draw_hook_mask != 0, std::memory_order_release);
     wchar_t message[128];
     swprintf_s(message, L"EDPE: HUD draw probe armed mask=0x%X frame=%llu",
@@ -572,11 +583,12 @@ void endHudDrawProbe() {
     restore(kDrawIndexedInstanced, original_draw_indexed_instanced,
         &observedDrawIndexedInstanced, 4);
     restore(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
-    wchar_t message[160];
+    wchar_t message[256];
     swprintf_s(message,
-        L"EDPE: HUD draw probe frame=%llu mask=0x%X rearmed=0x%X restored=0x%X reverted=0x%X draws=%u hudCopy=%u missingHash=%u overflow=%u",
+        L"EDPE: HUD draw probe frame=%llu mask=0x%X rearmed=0x%X restored=0x%X reverted=0x%X draws=%u hudCopy=%u afterHud=%u glassAfterHud=%u missingHash=%u overflow=%u",
         motion_color_frame, hud_draw_hook_mask, hud_draw_rearmed_mask, restored, reverted, hud_target_draws,
-        motion_early_color_from_hud, hud_shader_missing_hash, hud_shader_sample_overflow);
+        motion_early_color_from_hud, hud_after_copy_draws, glass_after_copy_draws,
+        hud_shader_missing_hash, hud_shader_sample_overflow);
     EdpeLog(message);
     for (size_t i = 0; i < hud_shader_sample_count; ++i) {
         const auto& sample = hud_shader_samples[i];
