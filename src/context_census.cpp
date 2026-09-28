@@ -333,8 +333,24 @@ const wchar_t* glassReplayRefusal(ID3D11DeviceContext* context, char kind,
         back.StencilFunc != D3D11_COMPARISON_ALWAYS ||
         back.StencilFailOp != D3D11_STENCIL_OP_KEEP ||
         back.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP ||
-        back.StencilPassOp != D3D11_STENCIL_OP_KEEP)
+        back.StencilPassOp != D3D11_STENCIL_OP_KEEP) {
+        if (!glass_replay_reason_logged) {
+            wchar_t message[256];
+            swprintf_s(message,
+                L"EDPE: glass depth state enabled=%u write=%u func=%u stencil=%u read=%u writeMask=%u ref=%u",
+                depth_desc.DepthEnable, static_cast<unsigned>(depth_desc.DepthWriteMask),
+                static_cast<unsigned>(depth_desc.DepthFunc), depth_desc.StencilEnable,
+                depth_desc.StencilReadMask, depth_desc.StencilWriteMask, stencil_ref);
+            EdpeLog(message);
+            swprintf_s(message,
+                L"EDPE: glass stencil front=%u/%u/%u/%u back=%u/%u/%u/%u (fail/depthFail/pass/func)",
+                front.StencilFailOp, front.StencilDepthFailOp, front.StencilPassOp,
+                front.StencilFunc, back.StencilFailOp, back.StencilDepthFailOp,
+                back.StencilPassOp, back.StencilFunc);
+            EdpeLog(message);
+        }
         return L"glass depth/stencil state differs";
+    }
     return nullptr;
 }
 
