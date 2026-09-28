@@ -142,6 +142,11 @@ void releaseEarlyColorSnapshot() {
     ui.early_color_srv = nullptr;
 }
 
+void releaseMotionSnapshot() {
+    if (ui.motion_srv) ui.motion_srv->Release();
+    ui.motion_srv = nullptr;
+}
+
 void bindMotionPreviewShader(const ImDrawList*, const ImDrawCmd*) {
     auto* state = static_cast<ImGui_ImplDX11_RenderState*>(
         ImGui::GetPlatformIO().Renderer_RenderState);
@@ -448,7 +453,7 @@ void shutdownUi() {
     releaseDepthSnapshot();
     releaseColorSnapshot();
     releaseEarlyColorSnapshot();
-    if (ui.motion_srv) ui.motion_srv->Release();
+    releaseMotionSnapshot();
     if (ui.motion_preview_shader) ui.motion_preview_shader->Release();
     if (ui.depth_contrast_shader) ui.depth_contrast_shader->Release();
     if (ui.context) ui.context->Release();
@@ -536,7 +541,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     pollDepthSamples();
     if (auto* motion = ContextCensusTakeMotionSnapshot(&ui.motion_width, &ui.motion_height)) {
-        if (ui.motion_srv) ui.motion_srv->Release();
+        releaseMotionSnapshot();
         ui.motion_srv = motion;
         ui.motion_window_open = true;
         ensureMotionPreviewShader();
@@ -630,8 +635,12 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     if (ImGui::Button("Capture adjacent camera frames (experimental)"))
         ContextCensusRequestCameraPair(static_cast<unsigned>(scene_candidate));
-    if (ImGui::Button("Capture motion candidate (experimental)"))
-        ContextCensusRequestMotionPair(static_cast<unsigned>(scene_candidate));
+    if (ImGui::Button("Capture motion candidate (experimental)") &&
+        ContextCensusRequestMotionPair(static_cast<unsigned>(scene_candidate))) {
+        releaseMotionSnapshot();
+        releaseColorSnapshot();
+        releaseEarlyColorSnapshot();
+    }
     if (scene_candidate < 0) ImGui::EndDisabled();
     if (scene_candidate < 0) ImGui::TextDisabled("No unique recent scene MRT/HDR signature; use manual index");
     if (ui.depth_srv) {
