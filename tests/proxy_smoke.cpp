@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <cstring>
 #include <cstdio>
+#include <vector>
 
 int forwarded_keys = 0;
 int forwarded_insert = 0;
@@ -298,9 +299,20 @@ int wmain(int argc, wchar_t** argv) {
             bytes == sizeof(hash) &&
             hash == EdpeEdvrShaderHash(pixel_bytecode->GetBufferPointer(),
                 pixel_bytecode->GetBufferSize());
+        UINT retained_size = 0;
+        if (pixel_shader)
+            pixel_shader->GetPrivateData(kEdpePixelBytecodeGuid, &retained_size, nullptr);
+        const bool bytes_ok = retained_size == pixel_bytecode->GetBufferSize();
+        std::vector<unsigned char> retained(retained_size);
+        const bool contents_ok = bytes_ok &&
+            SUCCEEDED(pixel_shader->GetPrivateData(kEdpePixelBytecodeGuid,
+                &retained_size, retained.data())) &&
+            retained_size == pixel_bytecode->GetBufferSize() &&
+            std::memcmp(retained.data(), pixel_bytecode->GetBufferPointer(),
+                retained_size) == 0;
         if (pixel_shader) pixel_shader->Release();
         pixel_bytecode->Release();
-        if (!hash_ok) return 12;
+        if (!hash_ok || !contents_ok) return 12;
     }
     D3D11_MAPPED_SUBRESOURCE middle_probe{};
     if (FAILED(context->Map(probe_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &middle_probe))) return 10;

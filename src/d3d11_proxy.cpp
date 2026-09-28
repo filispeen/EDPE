@@ -39,6 +39,7 @@ HRESULT STDMETHODCALLTYPE observedCreatePixelShader(ID3D11Device* device,
     if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
         const auto hash = EdpeEdvrShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
+        (*shader)->SetPrivateData(kEdpePixelBytecodeGuid, static_cast<UINT>(size), bytecode);
     }
     return result;
 }

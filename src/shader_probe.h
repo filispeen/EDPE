@@ -8,6 +8,10 @@
 constexpr GUID kEdpeVertexBytecodeGuid =
     {0x0f6d1490, 0x137f, 0x47a3, {0x92, 0xca, 0xb8, 0x55, 0x36, 0xce, 0x71, 0x42}};
 
+// Pixel bytecode is retained at creation for later one-frame HDR fanout.
+constexpr GUID kEdpePixelBytecodeGuid =
+    {0x8b7c68fa, 0x223f, 0x49e9, {0xb1, 0x0c, 0x7c, 0xd5, 0x2e, 0x86, 0x09, 0xa4}};
+
 // EDVR uses this FNV offset for its game shader signatures (MIT, revision 96df075).
 inline std::uint64_t EdpeEdvrShaderHash(const void* bytes, std::size_t size) {
     auto hash = std::uint64_t{1469598103934665603};
