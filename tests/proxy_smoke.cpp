@@ -355,6 +355,14 @@ int wmain(int argc, wchar_t** argv) {
         for (int bind = 0; bind < 3; ++bind)
             context->OMSetRenderTargets(4, scene_mrt, depth_view);
         if (frame == 1) {
+            // Emulate the runtime restoring Draw's vtable slot during a frame.
+            void** table = *reinterpret_cast<void***>(context);
+            DWORD protection = 0, ignored = 0;
+            if (!VirtualProtect(table + 13, sizeof(void*), PAGE_READWRITE, &protection)) return 12;
+            InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(table + 13),
+                original_draws[1]);
+            VirtualProtect(table + 13, sizeof(void*), protection, &ignored);
+            context->OMSetRenderTargets(4, scene_mrt, depth_view);
             // Synthetic EDVR HUD signature exercises the copy before the draw.
             ID3DBlob* vs_code = nullptr;
             ID3DBlob* ps_code = nullptr;
@@ -470,10 +478,11 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: OMSetRenderTargets DSV census armed") &&
         std::strstr(contents, "EDPE: HDR color copied before first matched HUD draw") &&
         std::strstr(contents, "EDPE: HDR draw shader 0 VS=B7790CBFC6554097 PS=8DEF46452FA459F5") &&
+        std::strstr(contents, "rearmed=0x2 restored=0xF") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:26") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:27") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
@@ -552,7 +561,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: motion candidate currentAfterPresent=17 center=(6.39844,0)") &&
         std::strstr(contents, "EDPE: motion grid 5x5 finite=25") &&
         std::strstr(contents, "pixels finite=1") &&
-        std::strstr(contents, "EDPE: DSV census frame=1024 binds=26 unique=1 slotActive=1") &&
+        std::strstr(contents, "EDPE: DSV census frame=1024 binds=27 unique=1 slotActive=1") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: D3D11 context state available=1") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&

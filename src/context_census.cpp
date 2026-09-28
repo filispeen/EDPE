@@ -130,6 +130,7 @@ bool motion_color_rebound = false;
 bool motion_color_first_exit_logged = false;
 std::atomic<bool> hud_draw_probe_active{false};
 unsigned hud_draw_hook_mask = 0;
+unsigned hud_draw_rearmed_mask = 0;
 unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
@@ -509,6 +510,7 @@ void beginHudDrawProbe() {
         &observedDrawIndexedInstanced, 4);
     install(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
     hud_target_draws = 0;
+    hud_draw_rearmed_mask = 0;
     hud_shader_sample_count = 0;
     hud_shader_sample_overflow = 0;
     hud_shader_missing_hash = 0;
@@ -517,6 +519,24 @@ void beginHudDrawProbe() {
     swprintf_s(message, L"EDPE: HUD draw probe armed mask=0x%X frame=%llu",
         hud_draw_hook_mask, motion_color_frame);
     EdpeLog(message);
+}
+
+void rearmHudDrawProbe() {
+    if (!hud_draw_probe_active.load(std::memory_order_acquire) || !patched_table) return;
+    // EDVR's VTableHook::reclaim documents runtime vtable rewrites. During this
+    // one-shot probe, reclaim only a slot that reverted to our known forward.
+    auto rearm = [&](size_t slot, auto& original_fn, auto observer, unsigned bit) {
+        if (!(hud_draw_hook_mask & bit)) return;
+        auto* forward = reinterpret_cast<void*>(original_fn.load(std::memory_order_acquire));
+        if (patched_table[slot] == forward &&
+            patchSlot(patched_table, slot, forward, reinterpret_cast<void*>(observer)))
+            hud_draw_rearmed_mask |= bit;
+    };
+    rearm(kDrawIndexed, original_draw_indexed, &observedDrawIndexed, 1);
+    rearm(kDraw, original_draw, &observedDraw, 2);
+    rearm(kDrawIndexedInstanced, original_draw_indexed_instanced,
+        &observedDrawIndexedInstanced, 4);
+    rearm(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
 }
 
 void endHudDrawProbe() {
@@ -538,8 +558,8 @@ void endHudDrawProbe() {
     restore(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
     wchar_t message[160];
     swprintf_s(message,
-        L"EDPE: HUD draw probe frame=%llu mask=0x%X restored=0x%X reverted=0x%X draws=%u hudCopy=%u missingHash=%u overflow=%u",
-        motion_color_frame, hud_draw_hook_mask, restored, reverted, hud_target_draws,
+        L"EDPE: HUD draw probe frame=%llu mask=0x%X rearmed=0x%X restored=0x%X reverted=0x%X draws=%u hudCopy=%u missingHash=%u overflow=%u",
+        motion_color_frame, hud_draw_hook_mask, hud_draw_rearmed_mask, restored, reverted, hud_target_draws,
         motion_early_color_from_hud, hud_shader_missing_hash, hud_shader_sample_overflow);
     EdpeLog(message);
     for (size_t i = 0; i < hud_shader_sample_count; ++i) {
@@ -1495,6 +1515,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
     forward(context, count, targets, dsv);
     if (context != observed_context.load(std::memory_order_acquire)) return;
+    rearmHudDrawProbe();
     if (motion_pair_active && motion_color_source &&
         motion_color_frame == last_present_frame.load(std::memory_order_relaxed)) {
         bool bound = false;
