@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <memory>
 #include <limits>
 #include <mutex>
@@ -119,6 +120,9 @@ bool motion_early_color_from_hud = false;
 bool hud_first_match_seen = false;
 unsigned hud_after_copy_draws = 0;
 unsigned glass_after_copy_draws = 0;
+unsigned glass_replayed_draws = 0;
+unsigned glass_replay_declined = 0;
+bool glass_replay_reason_logged = false;
 struct HudShaderSample {
     std::uint64_t vs = 0;
     std::uint64_t ps = 0;
@@ -236,9 +240,116 @@ bool sameRenderTargetResource(ID3D11RenderTargetView* view,
         identity_a.Get() == identity_b.Get();
 }
 
-void observeHudDraw(ID3D11DeviceContext* context) {
+// Adapted from EDVR's exact glass-state gate. Only a one-shot diagnostic
+// replay can pass this; unsupported state leaves the game's draw untouched.
+const wchar_t* glassReplayRefusal(ID3D11DeviceContext* context, char kind,
+    UINT instances) {
+    if (!motion_clean_color_target || !motion_early_color_from_hud)
+        return L"clean HDR target unavailable";
+    if (kind != 'X' || instances != 1)
+        return L"glass draw shape differs from indexed-instanced x1";
+    for (const auto& sample : pipeline_samples)
+        if (sample.active) return L"EDPE pipeline query is active";
+    ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth;
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, &depth);
+    const bool target_matches = sameRenderTargetResource(bound[0], motion_color_source.Get());
+    bool multiple = false;
+    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+        multiple |= i != 0 && bound[i] != nullptr;
+        if (bound[i]) bound[i]->Release();
+    }
+    if (!target_matches || multiple || !depth) return L"glass target or depth differs";
+    ID3D11UnorderedAccessView* uavs[D3D11_PS_CS_UAV_REGISTER_COUNT]{};
+    context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr,
+        0, D3D11_PS_CS_UAV_REGISTER_COUNT, uavs);
+    bool has_uav = false;
+    for (auto* uav : uavs) {
+        has_uav |= uav != nullptr;
+        if (uav) uav->Release();
+    }
+    if (has_uav) return L"glass draw uses an output UAV";
+    D3D11_PRIMITIVE_TOPOLOGY topology{};
+    context->IAGetPrimitiveTopology(&topology);
+    if (topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+        return L"glass topology differs from triangle list";
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> gs;
+    Microsoft::WRL::ComPtr<ID3D11HullShader> hs;
+    Microsoft::WRL::ComPtr<ID3D11DomainShader> ds;
+    context->GSGetShader(&gs, nullptr, nullptr);
+    context->HSGetShader(&hs, nullptr, nullptr);
+    context->DSGetShader(&ds, nullptr, nullptr);
+    if (gs || hs || ds) return L"glass uses another shader stage";
+    ID3D11Buffer* stream_output[D3D11_SO_BUFFER_SLOT_COUNT]{};
+    context->SOGetTargets(D3D11_SO_BUFFER_SLOT_COUNT, stream_output);
+    bool has_stream_output = false;
+    for (auto* buffer : stream_output) {
+        has_stream_output |= buffer != nullptr;
+        if (buffer) buffer->Release();
+    }
+    if (has_stream_output) return L"glass uses stream output";
+    Microsoft::WRL::ComPtr<ID3D11Predicate> predicate;
+    BOOL predicate_value = FALSE;
+    context->GetPredication(&predicate, &predicate_value);
+    if (predicate) return L"glass draw is predicated";
+    Microsoft::WRL::ComPtr<ID3D11BlendState> blend;
+    float factors[4]{};
+    UINT sample_mask = 0;
+    context->OMGetBlendState(&blend, factors, &sample_mask);
+    if (!blend || sample_mask != ~0u) return L"glass blend state or sample mask differs";
+    D3D11_BLEND_DESC blend_desc{};
+    blend->GetDesc(&blend_desc);
+    const auto& rt = blend_desc.RenderTarget[0];
+    if (blend_desc.AlphaToCoverageEnable || !rt.BlendEnable ||
+        rt.RenderTargetWriteMask != D3D11_COLOR_WRITE_ENABLE_ALL ||
+        rt.SrcBlend != D3D11_BLEND_ONE || rt.DestBlend != D3D11_BLEND_SRC1_COLOR ||
+        rt.BlendOp != D3D11_BLEND_OP_ADD || rt.SrcBlendAlpha != D3D11_BLEND_ONE ||
+        rt.DestBlendAlpha != D3D11_BLEND_SRC1_ALPHA ||
+        rt.BlendOpAlpha != D3D11_BLEND_OP_ADD)
+        return L"glass dual-source blend equation differs";
+    Microsoft::WRL::ComPtr<ID3D11BlendState1> blend1;
+    if (SUCCEEDED(blend.As(&blend1))) {
+        D3D11_BLEND_DESC1 blend_desc1{};
+        blend1->GetDesc1(&blend_desc1);
+        if (blend_desc1.RenderTarget[0].LogicOpEnable)
+            return L"glass render target uses a logic operation";
+    }
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> stencil;
+    UINT stencil_ref = 0;
+    context->OMGetDepthStencilState(&stencil, &stencil_ref);
+    if (!stencil) return L"glass depth/stencil state absent";
+    D3D11_DEPTH_STENCIL_DESC depth_desc{};
+    stencil->GetDesc(&depth_desc);
+    const auto& front = depth_desc.FrontFace;
+    const auto& back = depth_desc.BackFace;
+    if (!depth_desc.DepthEnable || depth_desc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO ||
+        depth_desc.DepthFunc != D3D11_COMPARISON_GREATER_EQUAL ||
+        !depth_desc.StencilEnable || depth_desc.StencilReadMask != 0 ||
+        depth_desc.StencilWriteMask != 4 || stencil_ref != 4 ||
+        front.StencilFunc != D3D11_COMPARISON_ALWAYS ||
+        front.StencilFailOp != D3D11_STENCIL_OP_KEEP ||
+        front.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP ||
+        front.StencilPassOp != D3D11_STENCIL_OP_REPLACE ||
+        back.StencilFunc != D3D11_COMPARISON_ALWAYS ||
+        back.StencilFailOp != D3D11_STENCIL_OP_KEEP ||
+        back.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP ||
+        back.StencilPassOp != D3D11_STENCIL_OP_KEEP)
+        return L"glass depth/stencil state differs";
+    return nullptr;
+}
+
+void declineGlassReplay(const wchar_t* reason) {
+    ++glass_replay_declined;
+    if (glass_replay_reason_logged) return;
+    wchar_t message[160];
+    swprintf_s(message, L"EDPE: glass replay declined: %ls", reason);
+    EdpeLog(message);
+    glass_replay_reason_logged = true;
+}
+
+bool observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
-        !motion_color_source || !motion_color_bound) return;
+        !motion_color_source || !motion_color_bound) return false;
     ++hud_target_draws;
     ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
@@ -247,7 +358,7 @@ void observeHudDraw(ID3D11DeviceContext* context) {
         target_matches |= sameRenderTargetResource(view, motion_color_source.Get());
         if (view) view->Release();
     }
-    if (!target_matches) return;
+    if (!target_matches) return false;
     if (hud_first_match_seen) ++hud_after_copy_draws;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
@@ -255,20 +366,20 @@ void observeHudDraw(ID3D11DeviceContext* context) {
     context->PSGetShader(&ps, nullptr, nullptr);
     if (!vs || !ps) {
         ++hud_shader_missing_hash;
-        return;
+        return false;
     }
     std::uint64_t vs_hash = 0, ps_hash = 0;
     UINT size = sizeof(vs_hash);
     if (FAILED(vs->GetPrivateData(kEdpeShaderHashGuid, &size, &vs_hash)) ||
         size != sizeof(vs_hash)) {
         ++hud_shader_missing_hash;
-        return;
+        return false;
     }
     size = sizeof(ps_hash);
     if (FAILED(ps->GetPrivateData(kEdpeShaderHashGuid, &size, &ps_hash)) ||
         size != sizeof(ps_hash)) {
         ++hud_shader_missing_hash;
-        return;
+        return false;
     }
     auto sample = std::find_if(hud_shader_samples.begin(),
         hud_shader_samples.begin() + hud_shader_sample_count,
@@ -279,8 +390,15 @@ void observeHudDraw(ID3D11DeviceContext* context) {
     else ++hud_shader_sample_overflow;
     if (hud_first_match_seen) {
         if (vs_hash == 0xF512712C40D93C12ull &&
-            ps_hash == 0x4A71EB0D34E9F2EFull) ++glass_after_copy_draws;
-        return;
+            ps_hash == 0x4A71EB0D34E9F2EFull) {
+            ++glass_after_copy_draws;
+            if (const auto* reason = glassReplayRefusal(context, kind, instances)) {
+                declineGlassReplay(reason);
+                return false;
+            }
+            return true;
+        }
+        return false;
     }
     // Exact UI shader pairs documented by EDVR; validate them in Desktop captures.
     const bool hud = (vs_hash == 0xB7790CBFC6554097ull &&
@@ -289,13 +407,43 @@ void observeHudDraw(ID3D11DeviceContext* context) {
                       ps_hash == 0xA2965EC2931A39C8ull) ||
                      (vs_hash == 0xE508648660A352B2ull &&
                       ps_hash == 0x63ABD86359B57D01ull);
-    if (!hud) return;
+    if (!hud) return false;
     wchar_t message[160];
     swprintf_s(message, L"EDPE: HUD draw on HDR target VS=%016llX PS=%016llX frame=%llu",
         vs_hash, ps_hash, motion_color_frame);
     EdpeLog(message);
     hud_first_match_seen = true;
     captureEarlyMotionColor(context, true);
+    return false;
+}
+
+void replayGlassDraw(ID3D11DeviceContext* context, UINT index_count,
+    UINT instance_count, UINT start_index, INT base_vertex, UINT start_instance) {
+    const auto set_targets = original.load(std::memory_order_acquire);
+    const auto draw = original_draw_indexed_instanced.load(std::memory_order_acquire);
+    if (!set_targets || !draw || !motion_clean_color_target) {
+        declineGlassReplay(L"draw hook or clean target unavailable");
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> game_target;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth;
+    context->OMGetRenderTargets(1, game_target.GetAddressOf(), depth.GetAddressOf());
+    if (!sameRenderTargetResource(game_target.Get(), motion_color_source.Get()) || !depth) {
+        declineGlassReplay(L"game target changed before duplicate draw");
+        return;
+    }
+    ID3D11RenderTargetView* clean = motion_clean_color_target.Get();
+    set_targets(context, 1, &clean, depth.Get());
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rebound;
+    context->OMGetRenderTargets(1, rebound.GetAddressOf(), nullptr);
+    if (rebound.Get() == clean) {
+        draw(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        ++glass_replayed_draws;
+    } else {
+        declineGlassReplay(L"clean target binding failed");
+    }
+    ID3D11RenderTargetView* restore = game_target.Get();
+    set_targets(context, 1, &restore, depth.Get());
 }
 
 void observeFirstSceneDraw(ID3D11DeviceContext* context) {
@@ -468,7 +616,8 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
 
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
     UINT start, INT base) {
-    if (context == observed_context.load(std::memory_order_acquire)) observeHudDraw(context);
+    if (context == observed_context.load(std::memory_order_acquire))
+        observeHudDraw(context, 'I', 1);
     if (context == observed_context.load(std::memory_order_acquire) &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_indexed_calls.fetch_add(1, std::memory_order_relaxed);
@@ -480,7 +629,8 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
 }
 
 void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start) {
-    if (context == observed_context.load(std::memory_order_acquire)) observeHudDraw(context);
+    if (context == observed_context.load(std::memory_order_acquire))
+        observeHudDraw(context, 'D', 1);
     if (context == observed_context.load(std::memory_order_acquire) &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_calls.fetch_add(1, std::memory_order_relaxed);
@@ -494,7 +644,8 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
     UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
     UINT start_instance) {
-    if (context == observed_context.load(std::memory_order_acquire)) observeHudDraw(context);
+    const bool replay = context == observed_context.load(std::memory_order_acquire) &&
+        observeHudDraw(context, 'X', instance_count);
     if (context == observed_context.load(std::memory_order_acquire) &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_indexed_instanced_calls.fetch_add(1, std::memory_order_relaxed);
@@ -504,11 +655,14 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
     }
     original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
         index_count, instance_count, start_index, base_vertex, start_instance);
+    if (replay) replayGlassDraw(context, index_count, instance_count,
+        start_index, base_vertex, start_instance);
 }
 
 void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
-    if (context == observed_context.load(std::memory_order_acquire)) observeHudDraw(context);
+    if (context == observed_context.load(std::memory_order_acquire))
+        observeHudDraw(context, 'N', instance_count);
     if (context == observed_context.load(std::memory_order_acquire) &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_instanced_calls.fetch_add(1, std::memory_order_relaxed);
@@ -542,6 +696,8 @@ void beginHudDrawProbe() {
     hud_shader_missing_hash = 0;
     hud_first_match_seen = false;
     hud_after_copy_draws = glass_after_copy_draws = 0;
+    glass_replayed_draws = glass_replay_declined = 0;
+    glass_replay_reason_logged = false;
     hud_draw_probe_active.store(hud_draw_hook_mask != 0, std::memory_order_release);
     wchar_t message[128];
     swprintf_s(message, L"EDPE: HUD draw probe armed mask=0x%X frame=%llu",
@@ -584,11 +740,12 @@ void endHudDrawProbe() {
     restore(kDrawIndexedInstanced, original_draw_indexed_instanced,
         &observedDrawIndexedInstanced, 4);
     restore(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
-    wchar_t message[256];
+    wchar_t message[320];
     swprintf_s(message,
-        L"EDPE: HUD draw probe frame=%llu mask=0x%X rearmed=0x%X restored=0x%X reverted=0x%X draws=%u hudCopy=%u afterHud=%u glassAfterHud=%u missingHash=%u overflow=%u",
+        L"EDPE: HUD draw probe frame=%llu mask=0x%X rearmed=0x%X restored=0x%X reverted=0x%X draws=%u hudCopy=%u afterHud=%u glassAfterHud=%u glassReplay=%u glassDeclined=%u missingHash=%u overflow=%u",
         motion_color_frame, hud_draw_hook_mask, hud_draw_rearmed_mask, restored, reverted, hud_target_draws,
         motion_early_color_from_hud, hud_after_copy_draws, glass_after_copy_draws,
+        glass_replayed_draws, glass_replay_declined,
         hud_shader_missing_hash, hud_shader_sample_overflow);
     EdpeLog(message);
     for (size_t i = 0; i < hud_shader_sample_count; ++i) {

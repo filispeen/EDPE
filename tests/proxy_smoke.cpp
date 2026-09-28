@@ -345,6 +345,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool motion_requested = request_motion_pair(0);
     const HRESULT motion_arm_present = swap_chain->Present(0, 0);
     HRESULT motion_present = S_OK;
+    bool glass_target_restored = false;
     for (int frame = 0; frame < 2; ++frame) {
         if (frame) {
             probe_values[935] = .01f;
@@ -392,12 +393,84 @@ int wmain(int argc, wchar_t** argv) {
             context->PSSetShader(ps, nullptr, 0);
             context->Draw(3, 0);
             const std::uint64_t glass_vs = 0xF512712C40D93C12ull;
-            const std::uint64_t glass_ps = 0x4A71EB0D34E9F2EFull;
+            const std::uint64_t glass_ps_hash = 0x4A71EB0D34E9F2EFull;
+            constexpr char glass_source[] =
+                "struct Out { float4 color : SV_Target0; float4 transmission : SV_Target1; }; "
+                "Out main() { Out o; o.color = float4(.5, 0, 0, 1); "
+                "o.transmission = float4(.5, .5, .5, .5); return o; }";
+            ID3DBlob* glass_code = nullptr;
+            ID3D11PixelShader* glass_ps = nullptr;
+            if (FAILED(D3DCompile(glass_source, sizeof(glass_source) - 1,
+                    nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0,
+                    &glass_code, nullptr)) ||
+                FAILED(device->CreatePixelShader(glass_code->GetBufferPointer(),
+                    glass_code->GetBufferSize(), nullptr, &glass_ps))) return 12;
             vs->SetPrivateData(kEdpeShaderHashGuid, sizeof(glass_vs), &glass_vs);
-            ps->SetPrivateData(kEdpeShaderHashGuid, sizeof(glass_ps), &glass_ps);
-            context->Draw(3, 0);
+            glass_ps->SetPrivateData(kEdpeShaderHashGuid,
+                sizeof(glass_ps_hash), &glass_ps_hash);
+            D3D11_BLEND_DESC glass_blend_desc{};
+            auto& rt = glass_blend_desc.RenderTarget[0];
+            rt.BlendEnable = TRUE;
+            rt.SrcBlend = D3D11_BLEND_ONE;
+            rt.DestBlend = D3D11_BLEND_SRC1_COLOR;
+            rt.BlendOp = D3D11_BLEND_OP_ADD;
+            rt.SrcBlendAlpha = D3D11_BLEND_ONE;
+            rt.DestBlendAlpha = D3D11_BLEND_SRC1_ALPHA;
+            rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            ID3D11BlendState* glass_blend = nullptr;
+            if (FAILED(device->CreateBlendState(&glass_blend_desc, &glass_blend))) return 12;
+            D3D11_DEPTH_STENCIL_DESC glass_depth_desc{};
+            glass_depth_desc.DepthEnable = TRUE;
+            glass_depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+            glass_depth_desc.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+            glass_depth_desc.StencilEnable = TRUE;
+            glass_depth_desc.StencilReadMask = 0;
+            glass_depth_desc.StencilWriteMask = 4;
+            glass_depth_desc.FrontFace = {D3D11_STENCIL_OP_KEEP,
+                D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_REPLACE,
+                D3D11_COMPARISON_ALWAYS};
+            glass_depth_desc.BackFace = {D3D11_STENCIL_OP_KEEP,
+                D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP,
+                D3D11_COMPARISON_ALWAYS};
+            ID3D11DepthStencilState* glass_depth = nullptr;
+            if (FAILED(device->CreateDepthStencilState(&glass_depth_desc, &glass_depth))) return 12;
+            const UINT indices[3]{0, 1, 2};
+            D3D11_BUFFER_DESC index_desc{};
+            index_desc.ByteWidth = sizeof(indices);
+            index_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+            D3D11_SUBRESOURCE_DATA index_data{};
+            index_data.pSysMem = indices;
+            ID3D11Buffer* index_buffer = nullptr;
+            if (FAILED(device->CreateBuffer(&index_desc, &index_data, &index_buffer))) return 12;
+            D3D11_VIEWPORT viewport{0, 0, 64, 64, 0, 1};
+            context->RSSetViewports(1, &viewport);
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context->IASetIndexBuffer(index_buffer, DXGI_FORMAT_R32_UINT, 0);
+            context->OMSetRenderTargets(1, &second_color_alias, depth_view);
+            context->OMSetBlendState(glass_blend, nullptr, ~0u);
+            context->OMSetDepthStencilState(glass_depth, 4);
+            context->ClearDepthStencilView(depth_view,
+                D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 0, 0);
+            context->PSSetShader(glass_ps, nullptr, 0);
+            context->Draw(0, 0); // Same signature, unsupported draw shape: no replay.
+            context->DrawIndexedInstanced(3, 1, 0, 0, 0);
+            ID3D11RenderTargetView* restored_target = nullptr;
+            context->OMGetRenderTargets(1, &restored_target, nullptr);
+            glass_target_restored = restored_target == second_color_alias;
+            if (restored_target) restored_target->Release();
+            context->ClearDepthStencilView(depth_view,
+                D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, .5f, 0);
+            context->OMSetBlendState(nullptr, nullptr, ~0u);
+            context->OMSetDepthStencilState(nullptr, 0);
+            context->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
             context->VSSetShader(nullptr, nullptr, 0);
             context->PSSetShader(nullptr, nullptr, 0);
+            index_buffer->Release();
+            glass_depth->Release();
+            glass_blend->Release();
+            glass_ps->Release();
+            glass_code->Release();
             vs->Release();
             ps->Release();
             vs_code->Release();
@@ -415,7 +488,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool visible_input_blocked = forwarded_keys == 1;
     const HRESULT resize_result = swap_chain->ResizeBuffers(0, 128, 128, DXGI_FORMAT_UNKNOWN, 0);
     const HRESULT resized_present = SUCCEEDED(resize_result) ? swap_chain->Present(0, 0) : resize_result;
-    for (int i = 0; i < 16; ++i) swap_chain->Present(0, 0);
+    for (int i = 0; i < 40; ++i) swap_chain->Present(0, 0);
     const bool scene_candidate_expired = scene_depth_candidate() == -1;
     while (present_count() < 1024) swap_chain->Present(0, DXGI_PRESENT_TEST);
     const bool interval_observed = present_count() == 1024;
@@ -472,6 +545,7 @@ int wmain(int argc, wchar_t** argv) {
         pair_requested && SUCCEEDED(pair_arm_present) &&
         SUCCEEDED(pair_present) && motion_requested &&
         SUCCEEDED(motion_arm_present) && SUCCEEDED(motion_present) &&
+        glass_target_restored &&
         SUCCEEDED(resize_result) && SUCCEEDED(resized_present) && opened && closed &&
         insert_passed && f5_repeat_ignored &&
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
@@ -488,13 +562,15 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: OMSetRenderTargets DSV census armed") &&
         std::strstr(contents, "EDPE: HDR color copied before first matched HUD draw") &&
         std::strstr(contents, "EDPE: clean HDR RTV ready for diagnostic world replay") &&
-        std::strstr(contents, "hudCopy=1 afterHud=1 glassAfterHud=1") &&
+        std::strstr(contents, "hudCopy=1 afterHud=2 glassAfterHud=2") &&
+        std::strstr(contents, "glassReplay=1 glassDeclined=1") &&
+        std::strstr(contents, "EDPE: glass replay declined: glass draw shape differs") &&
         std::strstr(contents, "EDPE: HDR draw shader 0 VS=B7790CBFC6554097 PS=8DEF46452FA459F5") &&
         std::strstr(contents, "rearmed=0x2 restored=0xF") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:27") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:28") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
@@ -573,16 +649,19 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: motion candidate currentAfterPresent=17 center=(6.39844,0)") &&
         std::strstr(contents, "EDPE: motion grid 5x5 finite=25") &&
         std::strstr(contents, "pixels finite=1") &&
-        std::strstr(contents, "EDPE: DSV census frame=1024 binds=27 unique=1 slotActive=1") &&
+        std::strstr(contents, "EDPE: DSV census frame=1024 binds=28 unique=1 slotActive=1") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: D3D11 context state available=1") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");
     if (!passed) std::fprintf(stderr,
-        "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d insert=%d repeat=%d input=%d/%d/%d read=%d\n",
+        "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d insert=%d repeat=%d input=%d/%d/%d read=%d glassRestored=%d candidate=%d/%d/%d interval=%d hooks=%d/%d requests=%d/%d/%d\n",
         present_result, second_present_result, first_real_present, overlay_present,
         resize_result, resized_present, observed, opened, closed,
         insert_passed, f5_repeat_ignored,
-        hidden_input_passed, visible_input_blocked, hidden_input_restored, read);
+        hidden_input_passed, visible_input_blocked, hidden_input_restored, read,
+        glass_target_restored, scene_candidate_found, scene_candidate_held,
+        scene_candidate_expired, interval_observed, context_hook_restored,
+        draw_hooks_restored, sequence_requested, snapshot_requested, pair_requested);
     return passed ? 0 : 12;
 }
