@@ -127,8 +127,9 @@ struct HudShaderSample {
     std::uint64_t vs = 0;
     std::uint64_t ps = 0;
     unsigned draws = 0;
+    unsigned after_hud = 0;
 };
-std::array<HudShaderSample, 32> hud_shader_samples{};
+std::array<HudShaderSample, 256> hud_shader_samples{};
 size_t hud_shader_sample_count = 0;
 unsigned hud_shader_sample_overflow = 0;
 unsigned hud_shader_missing_hash = 0;
@@ -402,9 +403,13 @@ bool observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
     auto sample = std::find_if(hud_shader_samples.begin(),
         hud_shader_samples.begin() + hud_shader_sample_count,
         [=](const HudShaderSample& item) { return item.vs == vs_hash && item.ps == ps_hash; });
-    if (sample != hud_shader_samples.begin() + hud_shader_sample_count) ++sample->draws;
+    if (sample != hud_shader_samples.begin() + hud_shader_sample_count) {
+        ++sample->draws;
+        if (hud_first_match_seen) ++sample->after_hud;
+    }
     else if (hud_shader_sample_count < hud_shader_samples.size())
-        hud_shader_samples[hud_shader_sample_count++] = {vs_hash, ps_hash, 1};
+        hud_shader_samples[hud_shader_sample_count++] =
+            {vs_hash, ps_hash, 1, hud_first_match_seen ? 1u : 0u};
     else ++hud_shader_sample_overflow;
     if (hud_first_match_seen) {
         if (vs_hash == 0xF512712C40D93C12ull &&
@@ -768,8 +773,8 @@ void endHudDrawProbe() {
     EdpeLog(message);
     for (size_t i = 0; i < hud_shader_sample_count; ++i) {
         const auto& sample = hud_shader_samples[i];
-        swprintf_s(message, L"EDPE: HDR draw shader %zu VS=%016llX PS=%016llX draws=%u",
-            i, sample.vs, sample.ps, sample.draws);
+        swprintf_s(message, L"EDPE: HDR draw shader %zu VS=%016llX PS=%016llX draws=%u afterHud=%u",
+            i, sample.vs, sample.ps, sample.draws, sample.after_hud);
         EdpeLog(message);
     }
     hud_draw_hook_mask = 0;

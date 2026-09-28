@@ -599,7 +599,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "hudCopy=1 afterHud=2 glassAfterHud=2") &&
         std::strstr(contents, "glassReplay=1 glassDeclined=1") &&
         std::strstr(contents, "EDPE: glass replay declined: glass draw shape differs") &&
-        std::strstr(contents, "EDPE: HDR draw shader 0 VS=B7790CBFC6554097 PS=8DEF46452FA459F5") &&
+        std::strstr(contents, "EDPE: HDR draw shader 0 VS=B7790CBFC6554097 PS=8DEF46452FA459F5 draws=1 afterHud=0") &&
+        std::strstr(contents, "EDPE: HDR draw shader 1 VS=F512712C40D93C12 PS=4A71EB0D34E9F2EF draws=2 afterHud=2") &&
         std::strstr(contents, "rearmed=0x2 restored=0xF") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
