@@ -276,7 +276,9 @@ void observeHudDraw(ID3D11DeviceContext* context) {
     const bool hud = (vs_hash == 0xB7790CBFC6554097ull &&
                       ps_hash == 0x8DEF46452FA459F5ull) ||
                      (vs_hash == 0x81216C77F90DEDD6ull &&
-                      ps_hash == 0xA2965EC2931A39C8ull);
+                      ps_hash == 0xA2965EC2931A39C8ull) ||
+                     (vs_hash == 0xE508648660A352B2ull &&
+                      ps_hash == 0x63ABD86359B57D01ull);
     if (!hud) return;
     wchar_t message[160];
     swprintf_s(message, L"EDPE: HUD draw on HDR target VS=%016llX PS=%016llX frame=%llu",
