@@ -6,6 +6,8 @@ The shims also append creation and first-Present diagnostics to `edpe.log` besid
 
 The experimental Dear ImGui status window toggles with `F5`. When hidden, other keyboard and mouse messages, including `Insert`, pass to the original window procedure. Temporal options are disabled until their inputs are verified.
 
+Each successful manual depth or motion capture also saves a BMP of the displayed game frame and EDPE diagnostic windows under `edpe-captures` beside `EliteDangerous64.exe`. The file is a visual screenshot, not raw depth or motion data. EDPE queues the GPU copy only for a capture and polls its readback without waiting for the GPU.
+
 Build from an x64 MSVC developer PowerShell:
 
 ```powershell

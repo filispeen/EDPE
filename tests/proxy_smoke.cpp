@@ -537,6 +537,39 @@ int wmain(int argc, wchar_t** argv) {
     DWORD bytes_read = 0;
     const BOOL read = ReadFile(log, contents, sizeof(contents) - 1, &bytes_read, nullptr);
     CloseHandle(log);
+    wchar_t capture_path[MAX_PATH]{};
+    const DWORD executable_length = GetModuleFileNameW(nullptr, capture_path, MAX_PATH);
+    bool saved_bmp = false;
+    if (executable_length && executable_length < MAX_PATH) {
+        wchar_t* name = wcsrchr(capture_path, L'\\');
+        if (name) {
+            wcscpy_s(name + 1, MAX_PATH - (name + 1 - capture_path),
+                L"edpe-captures\\*.bmp");
+            WIN32_FIND_DATAW entry{};
+            const HANDLE search = FindFirstFileW(capture_path, &entry);
+            if (search != INVALID_HANDLE_VALUE) {
+                FindClose(search);
+                wcscpy_s(name + 1, MAX_PATH - (name + 1 - capture_path),
+                    L"edpe-captures\\");
+                wcscat_s(capture_path, entry.cFileName);
+                const HANDLE image = CreateFileW(capture_path, GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (image != INVALID_HANDLE_VALUE) {
+                    BITMAPFILEHEADER header{};
+                    BITMAPINFOHEADER info{};
+                    DWORD count = 0;
+                    const bool header_read = ReadFile(image, &header, sizeof(header), &count, nullptr) &&
+                        count == sizeof(header);
+                    const bool info_read = ReadFile(image, &info, sizeof(info), &count, nullptr) &&
+                        count == sizeof(info);
+                    saved_bmp = header_read && info_read && header.bfType == 0x4D42 &&
+                        info.biWidth == 64 && info.biHeight == -64 && info.biBitCount == 32;
+                    CloseHandle(image);
+                }
+            }
+        }
+    }
     const bool passed = SUCCEEDED(present_result) && SUCCEEDED(second_present_result) && observed &&
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
         SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
@@ -551,7 +584,8 @@ int wmain(int argc, wchar_t** argv) {
         hidden_input_passed && visible_input_blocked && hidden_input_restored &&
         context_hook_restored && draw_hooks_restored &&
         interval_observed &&
-        read && !std::strstr(contents, "OLD_SESSION") &&
+        read && saved_bmp && !std::strstr(contents, "OLD_SESSION") &&
+        std::strstr(contents, "EDPE: frame capture saved ") &&
         std::strstr(contents, "EDPE: D3D11 device created") &&
         std::strstr(contents, "EDPE: DXGI factory created") &&
         std::strstr(contents, "EDPE: Present swapchain=") &&

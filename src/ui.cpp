@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <vector>
 
@@ -36,6 +38,13 @@ struct UiState {
     ID3D11ShaderResourceView* color_srv = nullptr;
     ID3D11ShaderResourceView* early_color_srv = nullptr;
     ID3D11ShaderResourceView* motion_srv = nullptr;
+    ID3D11Texture2D* frame_staging = nullptr;
+    DXGI_FORMAT frame_format = DXGI_FORMAT_UNKNOWN;
+    UINT frame_width = 0;
+    UINT frame_height = 0;
+    unsigned frame_attempts = 0;
+    unsigned frame_serial = 0;
+    bool snapshot_ready = false;
     UINT motion_width = 0;
     UINT motion_height = 0;
     bool motion_window_open = true;
@@ -145,6 +154,103 @@ void releaseEarlyColorSnapshot() {
 void releaseMotionSnapshot() {
     if (ui.motion_srv) ui.motion_srv->Release();
     ui.motion_srv = nullptr;
+}
+
+void pollFrameCapture() {
+    if (!ui.frame_staging) return;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT result = ui.context->Map(ui.frame_staging, 0, D3D11_MAP_READ,
+        D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++ui.frame_attempts < 120) return;
+    if (SUCCEEDED(result)) {
+        wchar_t executable[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
+        std::error_code error;
+        if (length && length < MAX_PATH) {
+            const auto folder = std::filesystem::path(executable).parent_path() /
+                L"edpe-captures";
+            std::filesystem::create_directories(folder, error);
+            if (!error) {
+                SYSTEMTIME now{};
+                GetLocalTime(&now);
+                wchar_t name[96];
+                swprintf_s(name, L"capture-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
+                    now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                    now.wSecond, now.wMilliseconds, ++ui.frame_serial);
+                const auto path = folder / name;
+                std::ofstream file(path, std::ios::binary);
+                const DWORD image_bytes = ui.frame_width * ui.frame_height * 4;
+                BITMAPFILEHEADER header{};
+                header.bfType = 0x4D42;
+                header.bfOffBits = sizeof(header) + sizeof(BITMAPINFOHEADER);
+                header.bfSize = header.bfOffBits + image_bytes;
+                BITMAPINFOHEADER info{};
+                info.biSize = sizeof(info);
+                info.biWidth = static_cast<LONG>(ui.frame_width);
+                info.biHeight = -static_cast<LONG>(ui.frame_height); // Top-down D3D rows.
+                info.biPlanes = 1;
+                info.biBitCount = 32;
+                info.biCompression = BI_RGB;
+                info.biSizeImage = image_bytes;
+                file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+                file.write(reinterpret_cast<const char*>(&info), sizeof(info));
+                std::vector<unsigned char> row(ui.frame_width * 4);
+                for (UINT y = 0; y < ui.frame_height && file; ++y) {
+                    const auto* source = static_cast<const unsigned char*>(mapped.pData) +
+                        static_cast<size_t>(y) * mapped.RowPitch;
+                    for (UINT x = 0; x < ui.frame_width; ++x) {
+                        const auto* pixel = source + 4 * x;
+                        auto* output = row.data() + 4 * x;
+                        output[0] = ui.frame_format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[2] : pixel[0];
+                        output[1] = pixel[1];
+                        output[2] = ui.frame_format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[0] : pixel[2];
+                        output[3] = 255;
+                    }
+                    file.write(reinterpret_cast<const char*>(row.data()), row.size());
+                }
+                file.flush();
+                if (file) EdpeLog((L"EDPE: frame capture saved " + path.wstring()).c_str());
+                else EdpeLog(L"EDPE: frame capture file write failed");
+            }
+        }
+        if (error || !length || length >= MAX_PATH)
+            EdpeLog(L"EDPE: frame capture directory unavailable");
+        ui.context->Unmap(ui.frame_staging, 0);
+    } else {
+        EdpeLog(L"EDPE: frame capture readback unavailable");
+    }
+    ui.frame_staging->Release();
+    ui.frame_staging = nullptr;
+}
+
+void queueFrameCapture(IDXGISwapChain* swap_chain) {
+    if (ui.frame_staging) return;
+    ID3D11Texture2D* backbuffer = nullptr;
+    if (FAILED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) return;
+    D3D11_TEXTURE2D_DESC desc{};
+    backbuffer->GetDesc(&desc);
+    if ((desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+         desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) ||
+        !desc.Width || !desc.Height || desc.SampleDesc.Count != 1 ||
+        static_cast<unsigned long long>(desc.Width) * desc.Height > 3840ull * 2160) {
+        EdpeLog(L"EDPE: frame capture skipped (unsupported backbuffer)");
+        backbuffer->Release();
+        return;
+    }
+    ui.frame_format = desc.Format;
+    ui.frame_width = desc.Width;
+    ui.frame_height = desc.Height;
+    ui.frame_attempts = 0;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    if (SUCCEEDED(ui.device->CreateTexture2D(&desc, nullptr, &ui.frame_staging))) {
+        ui.context->CopyResource(ui.frame_staging, backbuffer);
+    } else {
+        EdpeLog(L"EDPE: frame capture staging texture unavailable");
+    }
+    backbuffer->Release();
 }
 
 void bindMotionPreviewShader(const ImDrawList*, const ImDrawCmd*) {
@@ -350,6 +456,7 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
         ui.depth_height = desc.Height;
         ui.depth_snapshot_index = static_cast<int>(index);
         ui.depth_window_open = true;
+        ui.snapshot_ready = true;
         ensureDepthContrastShader();
         queueDepthSamples(desc);
         wchar_t message[160];
@@ -454,6 +561,7 @@ void shutdownUi() {
     releaseColorSnapshot();
     releaseEarlyColorSnapshot();
     releaseMotionSnapshot();
+    if (ui.frame_staging) ui.frame_staging->Release();
     if (ui.motion_preview_shader) ui.motion_preview_shader->Release();
     if (ui.depth_contrast_shader) ui.depth_contrast_shader->Release();
     if (ui.context) ui.context->Release();
@@ -540,10 +648,12 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         return;
     }
     pollDepthSamples();
+    pollFrameCapture();
     if (auto* motion = ContextCensusTakeMotionSnapshot(&ui.motion_width, &ui.motion_height)) {
         releaseMotionSnapshot();
         ui.motion_srv = motion;
         ui.motion_window_open = true;
+        ui.snapshot_ready = true;
         ensureMotionPreviewShader();
         EdpeLog(L"EDPE: motion snapshot handed to ImGui");
     }
@@ -772,6 +882,10 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ui.context->OMSetRenderTargets(1, &previous_rtv, previous_dsv);
     if (previous_rtv) previous_rtv->Release();
     if (previous_dsv) previous_dsv->Release();
+    if (ui.snapshot_ready && !ui.frame_staging) {
+        queueFrameCapture(swap_chain);
+        ui.snapshot_ready = false;
+    }
     ImGui::SetCurrentContext(previous);
 }
 
