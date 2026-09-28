@@ -110,6 +110,7 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_view;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_snapshot;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_early_color_view;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_early_color_snapshot;
+Microsoft::WRL::ComPtr<ID3D11RenderTargetView> motion_clean_color_target;
 UINT motion_color_snapshot_width = 0;
 UINT motion_color_snapshot_height = 0;
 UINT motion_early_color_width = 0;
@@ -1255,22 +1256,26 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
         return;
     }
     desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
     desc.CPUAccessFlags = desc.MiscFlags = 0;
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
     Microsoft::WRL::ComPtr<ID3D11Texture2D> copy;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
     if (!device || FAILED(device->CreateTexture2D(&desc, nullptr, &copy)) ||
-        FAILED(device->CreateShaderResourceView(copy.Get(), nullptr, &view))) {
+        FAILED(device->CreateShaderResourceView(copy.Get(), nullptr, &view)) ||
+        FAILED(device->CreateRenderTargetView(copy.Get(), nullptr, &target))) {
         EdpeLog(L"EDPE: early HDR copy unavailable (resource creation failed)");
         return;
     }
     context->CopyResource(copy.Get(), source.Get());
     motion_early_color_view = std::move(view);
+    motion_clean_color_target = std::move(target);
     motion_early_color_width = desc.Width;
     motion_early_color_height = desc.Height;
     motion_early_color_from_hud = from_hud;
+    if (from_hud) EdpeLog(L"EDPE: clean HDR RTV ready for diagnostic world replay");
     EdpeLog(from_hud ? L"EDPE: HDR color copied before first matched HUD draw" :
                        L"EDPE: early HDR color copied at first RTV3 exit");
 }
@@ -1423,6 +1428,7 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         motion_color_source.Reset();
         motion_color_view.Reset();
         motion_early_color_view.Reset();
+        motion_clean_color_target.Reset();
         return;
     }
     if (motion_camera_frames[0] != camera_pair_armed_after ||
@@ -1442,6 +1448,7 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
             motion_depth.Reset();
             motion_depth_view.Reset();
             motion_early_color_view.Reset();
+            motion_clean_color_target.Reset();
             return;
         }
         motion_pass = std::move(candidate);
@@ -1463,12 +1470,14 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         motion_color_source.Reset();
         motion_color_view.Reset();
         motion_early_color_view.Reset();
+        motion_clean_color_target.Reset();
         return;
     }
     EdpeLog(motion_color_view ? L"EDPE: motion candidate has same-frame HDR color" :
         L"EDPE: motion candidate HDR color unavailable");
     motion_color_snapshot = std::move(motion_color_view);
     motion_early_color_snapshot = std::move(motion_early_color_view);
+    motion_clean_color_target.Reset();
     motion_color_snapshot_width = desc.Width;
     motion_color_snapshot_height = desc.Height;
     motion_snapshot = motion_pass->output();
@@ -1908,6 +1917,7 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             motion_color_snapshot.Reset();
             motion_early_color_view.Reset();
             motion_early_color_snapshot.Reset();
+            motion_clean_color_target.Reset();
             motion_early_color_from_hud = false;
             motion_color_frame = ~0ull;
             motion_color_bound = motion_color_rebound =
@@ -2121,6 +2131,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_color_snapshot.Reset();
         motion_early_color_view.Reset();
         motion_early_color_snapshot.Reset();
+        motion_clean_color_target.Reset();
         motion_color_frame = ~0ull;
         motion_color_bound = motion_color_rebound =
             motion_color_first_exit_logged = false;

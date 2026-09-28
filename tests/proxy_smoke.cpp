@@ -487,6 +487,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "slot12=") && std::strstr(contents, "slot53=") &&
         std::strstr(contents, "EDPE: OMSetRenderTargets DSV census armed") &&
         std::strstr(contents, "EDPE: HDR color copied before first matched HUD draw") &&
+        std::strstr(contents, "EDPE: clean HDR RTV ready for diagnostic world replay") &&
         std::strstr(contents, "hudCopy=1 afterHud=1 glassAfterHud=1") &&
         std::strstr(contents, "EDPE: HDR draw shader 0 VS=B7790CBFC6554097 PS=8DEF46452FA459F5") &&
         std::strstr(contents, "rearmed=0x2 restored=0xF") &&
