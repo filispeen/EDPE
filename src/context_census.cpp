@@ -333,7 +333,8 @@ const wchar_t* glassReplayRefusal(ID3D11DeviceContext* context, char kind,
         back.StencilFunc != D3D11_COMPARISON_ALWAYS ||
         back.StencilFailOp != D3D11_STENCIL_OP_KEEP ||
         back.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP ||
-        back.StencilPassOp != D3D11_STENCIL_OP_KEEP) {
+        (back.StencilPassOp != D3D11_STENCIL_OP_KEEP &&
+         back.StencilPassOp != D3D11_STENCIL_OP_REPLACE)) {
         if (!glass_replay_reason_logged) {
             wchar_t message[256];
             swprintf_s(message,
@@ -351,6 +352,7 @@ const wchar_t* glassReplayRefusal(ID3D11DeviceContext* context, char kind,
         }
         return L"glass depth/stencil state differs";
     }
+    // With read mask 0, write mask/ref 4, REPLACE writes the same stencil bit twice.
     return nullptr;
 }
 

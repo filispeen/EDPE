@@ -431,7 +431,7 @@ int wmain(int argc, wchar_t** argv) {
                 D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_REPLACE,
                 D3D11_COMPARISON_ALWAYS};
             glass_depth_desc.BackFace = {D3D11_STENCIL_OP_KEEP,
-                D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP,
+                D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_REPLACE,
                 D3D11_COMPARISON_ALWAYS};
             ID3D11DepthStencilState* glass_depth = nullptr;
             if (FAILED(device->CreateDepthStencilState(&glass_depth_desc, &glass_depth))) return 12;
