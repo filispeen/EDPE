@@ -10,7 +10,7 @@ target_compile_features(EDPE PRIVATE cxx_std_20)
 target_compile_definitions(EDPE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(EDPE PROPERTIES OUTPUT_NAME EDPE)
 
-add_library(EDPE_DXGI SHARED src/dllmain.cpp src/log.cpp src/dxgi_proxy.cpp src/dxgi_observer.cpp src/context_census.cpp src/ui.cpp src/motion_pass.cpp src/dxgi_proxy.def)
+add_library(EDPE_DXGI SHARED src/dllmain.cpp src/log.cpp src/dxgi_proxy.cpp src/dxgi_observer.cpp src/context_census.cpp src/dxbc_hash.cpp src/ui.cpp src/motion_pass.cpp src/dxgi_proxy.def)
 target_compile_features(EDPE_DXGI PRIVATE cxx_std_20)
 target_compile_definitions(EDPE_DXGI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(EDPE_DXGI PROPERTIES OUTPUT_NAME dxgi)

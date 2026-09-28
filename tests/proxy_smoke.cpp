@@ -404,6 +404,11 @@ int wmain(int argc, wchar_t** argv) {
             context->VSSetShader(vs, nullptr, 0);
             context->PSSetShader(ps, nullptr, 0);
             context->Draw(3, 0);
+            const std::uint64_t world_vs = 0x9AEC596A2B036EA6ull;
+            const std::uint64_t world_ps = 0x3789CA2062E196FBull;
+            vs->SetPrivateData(kEdpeShaderHashGuid, sizeof(world_vs), &world_vs);
+            ps->SetPrivateData(kEdpeShaderHashGuid, sizeof(world_ps), &world_ps);
+            context->Draw(3, 0); // Diagnostic fanout creation; original PS stays bound.
             const std::uint64_t glass_vs = 0xF512712C40D93C12ull;
             const std::uint64_t glass_ps_hash = 0x4A71EB0D34E9F2EFull;
             constexpr char glass_source[] =
@@ -608,11 +613,14 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: OMSetRenderTargets DSV census armed") &&
         std::strstr(contents, "EDPE: HDR color copied before first matched HUD draw") &&
         std::strstr(contents, "EDPE: clean HDR RTV ready for diagnostic world replay") &&
-        std::strstr(contents, "hudCopy=1 afterHud=2 glassAfterHud=2") &&
+        std::strstr(contents, "hudCopy=1 afterHud=3 glassAfterHud=2") &&
         std::strstr(contents, "glassReplay=1 glassDeclined=1") &&
         std::strstr(contents, "EDPE: glass replay declined: glass draw shape differs") &&
+        std::strstr(contents, "EDPE: world fanout probe VS=9AEC596A2B036EA6 PS=3789CA2062E196FB bytes=") &&
+        std::strstr(contents, "result=ready") &&
         std::strstr(contents, "EDPE: HDR draw shader 0 VS=B7790CBFC6554097 PS=8DEF46452FA459F5 draws=1 afterHud=0") &&
-        std::strstr(contents, "EDPE: HDR draw shader 1 VS=F512712C40D93C12 PS=4A71EB0D34E9F2EF draws=2 afterHud=2") &&
+        std::strstr(contents, "EDPE: HDR draw shader 1 VS=9AEC596A2B036EA6 PS=3789CA2062E196FB draws=1 afterHud=1") &&
+        std::strstr(contents, "EDPE: HDR draw shader 2 VS=F512712C40D93C12 PS=4A71EB0D34E9F2EF draws=2 afterHud=2") &&
         std::strstr(contents, "rearmed=0x2 restored=0xF") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&

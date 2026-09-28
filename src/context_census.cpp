@@ -1,4 +1,5 @@
 #include "context_census.h"
+#include "dxbc_fanout.h"
 #include "elite_camera.h"
 #include "log.h"
 #include "motion_pass.h"
@@ -16,6 +17,8 @@
 #include <memory>
 #include <limits>
 #include <mutex>
+#include <string>
+#include <vector>
 #include <wrl/client.h>
 #include <windows.h>
 
@@ -128,6 +131,7 @@ struct HudShaderSample {
     std::uint64_t ps = 0;
     unsigned draws = 0;
     unsigned after_hud = 0;
+    bool fanout_checked = false;
 };
 std::array<HudShaderSample, 256> hud_shader_samples{};
 size_t hud_shader_sample_count = 0;
@@ -366,6 +370,39 @@ void declineGlassReplay(const wchar_t* reason) {
     glass_replay_reason_logged = true;
 }
 
+void probeWorldShaderFanout(ID3D11DeviceContext* context,
+    ID3D11PixelShader* shader, std::uint64_t vs, std::uint64_t ps) {
+    UINT bytes = 0;
+    shader->GetPrivateData(kEdpePixelBytecodeGuid, &bytes, nullptr);
+    const wchar_t* result = L"bytecode unavailable";
+    std::wstring detail;
+    if (bytes && bytes <= 65536) {
+        try {
+            std::vector<BYTE> source(bytes), patched;
+            if (SUCCEEDED(shader->GetPrivateData(kEdpePixelBytecodeGuid,
+                    &bytes, source.data()))) {
+                std::string reason;
+                if (edpe::colourFanout(source.data(), bytes, patched, reason)) {
+                    Microsoft::WRL::ComPtr<ID3D11Device> device;
+                    Microsoft::WRL::ComPtr<ID3D11PixelShader> candidate;
+                    context->GetDevice(&device);
+                    result = device && SUCCEEDED(device->CreatePixelShader(
+                        patched.data(), patched.size(), nullptr, &candidate))
+                        ? L"ready" : L"CreatePixelShader failed";
+                } else {
+                    result = L"DXBC fanout declined";
+                    detail.assign(reason.begin(), reason.end());
+                }
+            } else result = L"bytecode read failed";
+        } catch (...) { result = L"allocation failed"; }
+    }
+    wchar_t message[256];
+    swprintf_s(message,
+        L"EDPE: world fanout probe VS=%016llX PS=%016llX bytes=%u result=%ls %ls",
+        vs, ps, bytes, result, detail.c_str());
+    EdpeLog(message);
+}
+
 bool observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
         !motion_color_source || !motion_color_bound) return false;
@@ -409,9 +446,21 @@ bool observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
     }
     else if (hud_shader_sample_count < hud_shader_samples.size())
         hud_shader_samples[hud_shader_sample_count++] =
-            {vs_hash, ps_hash, 1, hud_first_match_seen ? 1u : 0u};
+            {vs_hash, ps_hash, 1, hud_first_match_seen ? 1u : 0u, false};
     else ++hud_shader_sample_overflow;
     if (hud_first_match_seen) {
+        const bool world_candidate =
+            (vs_hash == 0x9AEC596A2B036EA6ull &&
+             ps_hash == 0x3789CA2062E196FBull) ||
+            (vs_hash == 0x025B4B9FF54622EDull &&
+             ps_hash == 0xC5A5C7E8216CB9AFull) ||
+            (vs_hash == 0x3D05E7CF11AC9BEEull &&
+             ps_hash == 0x912477AEF6958379ull);
+        if (world_candidate && sample != hud_shader_samples.begin() + hud_shader_sample_count &&
+            !sample->fanout_checked) {
+            sample->fanout_checked = true;
+            probeWorldShaderFanout(context, ps.Get(), vs_hash, ps_hash);
+        }
         if (vs_hash == 0xF512712C40D93C12ull &&
             ps_hash == 0x4A71EB0D34E9F2EFull) {
             ++glass_after_copy_draws;
