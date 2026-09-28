@@ -151,6 +151,8 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &second_color_texture))) return 10;
     ID3D11RenderTargetView* second_color_view = nullptr;
     if (FAILED(device->CreateRenderTargetView(second_color_texture, nullptr, &second_color_view))) return 10;
+    ID3D11RenderTargetView* second_color_alias = nullptr;
+    if (FAILED(device->CreateRenderTargetView(second_color_texture, nullptr, &second_color_alias))) return 10;
     color_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
     ID3D11Texture2D* mrt0_texture = nullptr;
     if (FAILED(device->CreateTexture2D(&color_desc, nullptr, &mrt0_texture))) return 10;
@@ -362,7 +364,9 @@ int wmain(int argc, wchar_t** argv) {
             InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(table + 13),
                 original_draws[1]);
             VirtualProtect(table + 13, sizeof(void*), protection, &ignored);
-            context->OMSetRenderTargets(4, scene_mrt, depth_view);
+            ID3D11RenderTargetView* alias_mrt[4]{scene_mrt[0], scene_mrt[1],
+                scene_mrt[2], second_color_alias};
+            context->OMSetRenderTargets(4, alias_mrt, depth_view);
             // Synthetic EDVR HUD signature exercises the copy before the draw.
             ID3DBlob* vs_code = nullptr;
             ID3DBlob* ps_code = nullptr;
@@ -425,6 +429,7 @@ int wmain(int argc, wchar_t** argv) {
     color_view->Release();
     color_texture->Release();
     second_color_view->Release();
+    second_color_alias->Release();
     second_color_texture->Release();
     mrt0_view->Release();
     mrt0_texture->Release();

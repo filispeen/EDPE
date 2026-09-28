@@ -218,6 +218,20 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
 void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud);
 
+bool sameRenderTargetResource(ID3D11RenderTargetView* view,
+    ID3D11RenderTargetView* source) {
+    if (!view || !source) return false;
+    if (view == source) return true;
+    Microsoft::WRL::ComPtr<ID3D11Resource> a, b;
+    view->GetResource(&a);
+    source->GetResource(&b);
+    if (!a || !b) return false;
+    if (a.Get() == b.Get()) return true;
+    Microsoft::WRL::ComPtr<IUnknown> identity_a, identity_b;
+    return SUCCEEDED(a.As(&identity_a)) && SUCCEEDED(b.As(&identity_b)) &&
+        identity_a.Get() == identity_b.Get();
+}
+
 void observeHudDraw(ID3D11DeviceContext* context) {
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
         !motion_color_source || !motion_color_bound) return;
@@ -226,7 +240,7 @@ void observeHudDraw(ID3D11DeviceContext* context) {
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
     bool target_matches = false;
     for (auto* view : bound) {
-        target_matches |= view == motion_color_source.Get();
+        target_matches |= sameRenderTargetResource(view, motion_color_source.Get());
         if (view) view->Release();
     }
     if (!target_matches) return;
@@ -1162,7 +1176,7 @@ void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
     bool still_bound = false;
     for (auto* view : bound) {
-        still_bound |= view == source_view.Get();
+        still_bound |= sameRenderTargetResource(view, source_view.Get());
         if (view) view->Release();
     }
     if (still_bound) {
@@ -1520,7 +1534,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         motion_color_frame == last_present_frame.load(std::memory_order_relaxed)) {
         bool bound = false;
         for (UINT slot = 0; targets && slot < count; ++slot)
-            bound |= targets[slot] == motion_color_source.Get();
+            bound |= sameRenderTargetResource(targets[slot], motion_color_source.Get());
         if (motion_color_bound && !bound && !motion_color_first_exit_logged) {
             motion_color_first_exit_logged = true;
             wchar_t message[160];
