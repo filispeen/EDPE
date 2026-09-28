@@ -8,6 +8,7 @@
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -251,6 +252,22 @@ void queueFrameCapture(IDXGISwapChain* swap_chain) {
         EdpeLog(L"EDPE: frame capture staging texture unavailable");
     }
     backbuffer->Release();
+}
+
+void placeSnapshotWindow(int column, int row = 0) {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const bool depth_row = ui.depth_srv &&
+        (ui.early_color_srv || ui.motion_srv || ui.color_srv);
+    const float width = std::min(700.0f, std::max(1.0f, (display.x - 40.0f) / 3.0f));
+    const float left = std::max(0.0f, (display.x - 3.0f * width - 20.0f) * 0.5f);
+    const float top = display.y > 600.0f ? 80.0f : 10.0f;
+    const float height = std::min(440.0f,
+        std::max(1.0f, (display.y - top - (depth_row ? 30.0f : 10.0f)) /
+            (depth_row ? 2.0f : 1.0f)));
+    const ImGuiCond condition = ui.snapshot_ready ? ImGuiCond_Always : ImGuiCond_Appearing;
+    ImGui::SetNextWindowPos(ImVec2(left + column * (width + 10.0f),
+        top + row * (height + 10.0f)), condition);
+    ImGui::SetNextWindowSize(ImVec2(width, height), condition);
 }
 
 void bindMotionPreviewShader(const ImDrawList*, const ImDrawCmd*) {
@@ -778,10 +795,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
     if (ui.depth_srv && ui.depth_window_open) {
-        const ImVec2 display = ImGui::GetIO().DisplaySize;
-        ImGui::SetNextWindowPos(ImVec2(display.x > 700.0f ? (display.x - 700.0f) * 0.5f : 0.0f,
-            display.y > 500.0f ? 80.0f : 0.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
+        placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);
         if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
             ImGui::Text("DSV #%d (%ux%u)",
                 ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
@@ -808,10 +822,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::End();
     }
     if (ui.color_srv && ui.color_window_open) {
-        const ImVec2 display = ImGui::GetIO().DisplaySize;
-        ImGui::SetNextWindowPos(ImVec2(display.x > 1400.0f ? display.x - 700.0f : 0.0f,
-            display.y > 500.0f ? 80.0f : 0.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
+        placeSnapshotWindow(2);
         if (ImGui::Begin("EDPE Scene Color Snapshot", &ui.color_window_open)) {
             if (ui.color_snapshot_index >= 0)
                 ImGui::Text("DSV #%d / HDR RTV0 (%ux%u)",
@@ -835,7 +846,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::End();
     }
     if (ui.early_color_srv && ui.early_color_window_open) {
-        ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
+        placeSnapshotWindow(0);
         if (ImGui::Begin("EDPE Early HDR Snapshot", &ui.early_color_window_open)) {
             ImGui::TextUnformatted("Early HDR candidate; capture point in edpe.log");
             float width = ImGui::GetContentRegionAvail().x;
@@ -850,7 +861,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::End();
     }
     if (ui.motion_srv && ui.motion_window_open) {
-        ImGui::SetNextWindowSize(ImVec2(700.0f, 440.0f), ImGuiCond_FirstUseEver);
+        placeSnapshotWindow(1);
         if (ImGui::Begin("EDPE Motion Snapshot", &ui.motion_window_open)) {
             ImGui::TextUnformatted("Camera + depth motion; HUD is not represented");
             ImGui::TextUnformatted("Neutral gray = 0 pixels; red = horizontal, green = vertical");
