@@ -18,6 +18,14 @@ After cloning the repository, fetch Dear ImGui:
 git submodule update --init --recursive
 ```
 
+Alternatively, use the repository setup script from PowerShell to install Git, CMake 3.25+, Visual Studio 2022 Build Tools with the C++ workload/recommended Windows SDK components, and initialize the ImGui submodule:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-build-requirements.ps1
+```
+
+The script requires `winget` (App Installer) and may request administrator approval during installation. It skips Git and CMake installation when Git is available and CMake 3.25+ is already on `PATH`. It adds the C++ workload to an existing Visual Studio 2022 installation when found. After it finishes, open a new x64 Developer PowerShell so the MSVC and NMake environment is loaded.
+
 ## Build
 
 From the repository root in an x64 Developer PowerShell:
