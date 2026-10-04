@@ -36,13 +36,21 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
 
     // NGX D3D11 initialization with custom project ID.
     // NVSDK_NGX_D3D11_Init_with_ProjectID is the entry point for custom engines.
-    // The SDK documentation warns: shutdown may hang >20s; handle accordingly.
-
-    // TODO: Load nvngx_dlss.dll and call NVSDK_NGX_D3D11_Init_with_ProjectID.
-    // For now, mark as uninitialized and return safely.
+    // Critical safety constraint (per nvidia-dlaa-input-contract.md):
+    // SDK probe hung >20s in NVSDK_NGX_D3D11_Shutdown1; cause unknown.
+    // NGX must NOT be used in Elite runtime until shutdown lifecycle is understood.
+    // Do not block the game exit path. Fail open: if shutdown safety cannot be
+    // guaranteed, disable NGX and present original frame.
+    // TODO: Load nvngx_dlss.dll and call NVSDK_NGX_D3D11_Init_with_ProjectID
+    //       with custom project ID {0xED, 0xPE, 0x11, 0x22} and
+    //       NVSDK_NGX_ENGINE_TYPE_CUSTOM.
     // TODO: On success, query capability parameters via GetCapabilityParameters.
-    // TODO: Populate feature availability (DLAA vs DLSS SR).
+    // TODO: Populate feature availability (DLAA vs DLSS SR) and optimal settings.
+    // TODO: Populate render dimensions from NGX optimal settings query.
 
+    // Intentionally disabled until shutdown safety is verified.
+    // Do not consume NGX as production input until conventions are validated
+    // in Elite (jitter sign/motion scale/depth flag combinations).
     g_ngx_state.initialized = false; // placeholder until SDK integration is verified
     return false; // intentionally disabled until shutdown lifecycle is understood
 }

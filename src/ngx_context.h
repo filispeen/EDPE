@@ -8,14 +8,20 @@ namespace edpe {
 // NGX context management.
 // Handles NVIDIA DLSS Super Resolution and DLAA initialization, evaluation,
 // and shutdown through the NVIDIA NGX D3D11 SDK.
-// 
-// Important: NGX shutdown may hang >20s (empirically observed in SDK probe).
-// Do not block the game exit path. Fail open: if NGX cannot be safely
-// initialized or evaluated, disable upscaler and present original frame.
+//
+// Critical safety constraint (per nvidia-dlaa-input-contract.md, 2026-09-27):
+// SDK probe hung >20s in NVSDK_NGX_D3D11_Shutdown1; cause unknown.
+// NGX must NOT consume diagnostic captures as production inputs in Elite
+// until input conventions are verified (jitter, motion scale, depth flags,
+// reset semantics). Shutdown safety must be established before any runtime
+// NGX usage. Fail open: if NGX cannot be safely initialized or evaluated,
+// disable upscaler and present original frame.
 // Input conventions must be verified in Elite before NGX is consumed as
 // production input (depth, motion, jitter, reset semantics).
-
-class NgxContext {
+//
+// Design principle: every subsystem must answer "Did it run? Which backend? 
+// What dimensions? What formats? What temporal conventions? Why did it fail? 
+// What did it cost?" (per AGENTS.md diagnostics section).
 public:
     NgxContext() = default;
     ~NgxContext() { shutdown(); }
