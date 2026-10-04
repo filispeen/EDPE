@@ -10,7 +10,9 @@ namespace edpe {
 namespace {
 // Custom engine project ID for NGX (GUID-like, not EDVR's).
 // Must be unique per engine; do not reuse EDVR's NGX Project ID.
-constexpr unsigned kNgxProjectId[4] = {0xED, 0xPE, 0x11, 0x22};
+// Use only valid hex digits (0-9, A-F). 0xPE is invalid — P is not a hex digit.
+// Project ID format: four 32-bit values, each with only valid hex characters.
+constexpr unsigned kNgxProjectId[4] = {0xED, 0xEA, 0x1B, 0x22};
 
 // NGX feature state.
 struct NgxFeatureState {
