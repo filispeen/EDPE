@@ -8,6 +8,13 @@
 // Timeout for NGX Shutdown1 in milliseconds
 #define NGX_SHUTDOWN_TIMEOUT_MS 30000
 
+// Shutdown variant constants - must match ngx_probe.cpp definitions
+#define VARIANT_V1_Shutdown1_only 1
+#define VARIANT_V2_Shutdown_only 2
+#define VARIANT_V3_FlushWaitThenShutdown1 3
+#define VARIANT_V4_Shutdown1ThenHold 4
+#define VARIANT_SkipEvaluate 5
+
 // Child process command line
 // Runs ngx_probe.exe and exits with appropriate code
 int main(int argc, char* argv[]) {
@@ -85,7 +92,7 @@ int main(int argc, char* argv[]) {
              "F:/Code/С++/EDPE");
 
     FILE* f = fopen(log_file, "r");
-    const char* last_completed_stage = "unknown";
+    char* last_completed_stage = "unknown";  // Fixed: removed const to allow assignment
     double last_completed_time_ms = 0.0;
 
     if (f) {

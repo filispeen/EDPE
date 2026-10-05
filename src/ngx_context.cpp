@@ -7,13 +7,6 @@
 
 namespace edpe {
 
-namespace {
-// Custom engine project ID for NGX (GUID-like, not EDVR's).
-// Must be unique per engine; do not reuse EDVR's NGX Project ID.
-// Use only valid hex digits (0-9, A-F). 0xPE is invalid — P is not a hex digit.
-// Project ID format: four 32-bit values, each with only valid hex characters.
-constexpr unsigned kNgxProjectId[4] = {0xED, 0xEA, 0x1B, 0x22};
-
 // NGX feature state.
 struct NgxFeatureState {
     bool initialized = false;
@@ -27,7 +20,17 @@ struct NgxFeatureState {
     bool reset_requested = false;
 };
 
-// Global NGX state (protected by module lifetime).
+// Constant for NGX project GUID.
+// This is a project-owned identifier; do not reuse EDVR's NGX Project ID.
+// Format: GUID-like string matching NVSDK_NGX_D3D11_Init_with_ProjectID expectation.
+// TODO: Obtain a proper NVIDIA-assigned application ID for NVSDK_NGX_D3D11_Init.
+// Until then, use NVSDK_NGX_D3D11_Init(0, ...) as documented:
+// "Until NVIDIA has assigned you an applicationId, use 0."
+// "If you do not have one please contact us."
+// project_id_string is used only with Init_with_ProjectID.
+constexpr char kNgxProjectIdString[] = "edpe-custom-engine-2026";
+
+// NGX feature state.
 inline NgxFeatureState g_ngx_state{};
 
 } // namespace anonymous
@@ -36,23 +39,17 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     if (!device || !context) return false;
     if (g_ngx_state.initialized) return true; // already initialized
 
-    // NGX D3D11 initialization with custom project ID.
-    // NVSDK_NGX_D3D11_Init_with_ProjectID is the entry point for custom engines.
-    // Critical safety constraint (per nvidia-dlaa-input-contract.md):
-    // SDK probe hung >20s in NVSDK_NGX_D3D11_Shutdown1; cause unknown.
-    // NGX must NOT be used in Elite runtime until shutdown lifecycle is understood.
-    // Do not block the game exit path. Fail open: if shutdown safety cannot be
-    // guaranteed, disable NGX and present original frame.
-    // TODO: Load nvngx_dlss.dll and call NVSDK_NGX_D3D11_Init_with_ProjectID
-    //       with custom project ID {0xED, 0xPE, 0x11, 0x22} and
-    //       NVSDK_NGX_ENGINE_TYPE_CUSTOM.
-    // TODO: On success, query capability parameters via GetCapabilityParameters.
-    // TODO: Populate feature availability (DLAA vs DLSS SR) and optimal settings.
-    // TODO: Populate render dimensions from NGX optimal settings query.
+    // NGX D3D11 initialization.
+    // Two pathways:
+    // 1) NVSDK_NGX_D3D11_Init_with_ProjectID() — for custom engines without an NVIDIA application ID.
+    //    Project ID must be GUID-like; this string is project-owned and not EDVR's.
+    // 2) NVSDK_NGX_D3D11_Init() — with InApplicationId = 0 until NVIDIA assigns one.
+    //    Per SDK docs: "Until NVIDIA has assigned you an applicationId, use 0."
+    //    "If an application ID is not available, use NVSDK_NGX_Init_with_ProjectID to supply your own identifier."
 
     // Intentionally disabled until shutdown safety is verified.
     // Do not consume NGX as production input until conventions are validated
-    // in Elite (jitter sign/motion scale/depth flag combinations).
+    // in Elite (jitter sign/motion-scale/depth-flag/reset semantics).
     g_ngx_state.initialized = false; // placeholder until SDK integration is verified
     return false; // intentionally disabled until shutdown lifecycle is understood
 }
@@ -103,5 +100,3 @@ bool NgxContext::reset_requested() {
 void NgxContext::set_reset_requested(bool reset) {
     g_ngx_state.reset_requested = reset;
 }
-
-} // namespace edpe
