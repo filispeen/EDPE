@@ -36,16 +36,28 @@ target_compile_features(motion_gpu_test PRIVATE cxx_std_20)
 target_compile_definitions(motion_gpu_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(motion_gpu_test PRIVATE src)
 target_link_libraries(motion_gpu_test PRIVATE d3d11 d3dcompiler)
+add_test(NAME motion_gpu COMMAND motion_gpu_test)
 add_executable(dxbc_fanout_test tests/dxbc_fanout.cpp src/dxbc_hash.cpp)
 target_compile_features(dxbc_fanout_test PRIVATE cxx_std_20)
 target_compile_definitions(dxbc_fanout_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(dxbc_fanout_test PRIVATE src)
 target_link_libraries(dxbc_fanout_test PRIVATE d3d11 d3dcompiler)
+add_test(NAME dxbc_fanout COMMAND dxbc_fanout_test)
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)
 target_link_libraries(proxy_smoke PRIVATE d3dcompiler)
 add_test(NAME proxy_smoke COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log)
 add_test(NAME proxy_shader_probe COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log shader-probe)
+
+set(EDPE_STAGE "${CMAKE_CURRENT_BINARY_DIR}/stage")
+add_custom_target(proxy_stage ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${EDPE_STAGE}"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:EDPE> "${EDPE_STAGE}/d3d11.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:EDPE_DXGI> "${EDPE_STAGE}/dxgi.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:proxy_smoke> "${EDPE_STAGE}/proxy_smoke.exe"
+    DEPENDS EDPE EDPE_DXGI proxy_smoke)
+add_test(NAME proxy_alias_smoke COMMAND "${EDPE_STAGE}/proxy_smoke.exe"
+    "${EDPE_STAGE}/d3d11.dll" "${EDPE_STAGE}/dxgi.dll" "${EDPE_STAGE}/edpe.log")
 
 # === NGX PROBE TARGET (SDK-wired, Elite-safe) ===
 # Builds tools/ngx_probe with real NVIDIA DLSS SDK calls (currently stubbed).
