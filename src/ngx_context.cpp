@@ -33,8 +33,6 @@ constexpr char kNgxProjectIdString[] = "edpe-custom-engine-2026";
 // NGX feature state.
 inline NgxFeatureState g_ngx_state{};
 
-} // namespace anonymous
-
 bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
     if (!device || !context) return false;
     if (g_ngx_state.initialized) return true; // already initialized
@@ -100,3 +98,5 @@ bool NgxContext::reset_requested() {
 void NgxContext::set_reset_requested(bool reset) {
     g_ngx_state.reset_requested = reset;
 }
+
+} // namespace edpe

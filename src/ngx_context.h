@@ -56,4 +56,25 @@ namespace edpe {
 //   (a) Shutdown lifecycle is validated in isolated process, AND
 //   (b) All Elite input conventions are verified (see nvidia-dlaa-input-contract.md).
 
+// Disabled stub: initialize() always returns false. No NGX call is made.
+class NgxContext {
+public:
+    static bool initialize(ID3D11Device* device, ID3D11DeviceContext* context);
+    static void shutdown();
+
+    static bool is_dlss_available();
+    static bool is_dlaa_available();
+
+    static uint32_t get_quality_mode();
+    static void set_quality_mode(uint32_t mode);
+
+    static uint32_t get_render_width();
+    static uint32_t get_render_height();
+    static uint32_t get_output_width();
+    static uint32_t get_output_height();
+
+    static bool reset_requested();
+    static void set_reset_requested(bool reset);
+};
+
 } // namespace edpe
