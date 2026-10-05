@@ -59,18 +59,29 @@ add_custom_target(proxy_stage ALL
 add_test(NAME proxy_alias_smoke COMMAND "${EDPE_STAGE}/proxy_smoke.exe"
     "${EDPE_STAGE}/d3d11.dll" "${EDPE_STAGE}/dxgi.dll" "${EDPE_STAGE}/edpe.log")
 
-# === NGX PROBE TARGET (SDK-wired, Elite-safe) ===
-# Builds tools/ngx_probe with real NVIDIA DLSS SDK calls (currently stubbed).
-# Does NOT link the SDK into EDPE.dll or the dxgi proxy.
-# NGX_STUB: use stubbed NGX calls returning success for probe infrastructure testing.
-set(NGX_PROBE_SRC tools/ngx_probe/ngx_probe.cpp)
+# === NGX PROBE (standalone, never part of EDPE.dll or the proxy) ===
+# ngx_probe       child: real NGX SDK calls on a hardware adapter, one log line per stage
+# ngx_probe_host  parent: runs the child with a 30 s wall-clock timeout and kills it on hang
+# The SDK lives in external/DLSS (gitignored); the probe is skipped when it is absent.
+set(NGX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/DLSS")
+if(EXISTS "${NGX_SDK_DIR}/include/nvsdk_ngx.h")
+    add_executable(ngx_probe tools/ngx_probe/ngx_probe.cpp)
+    target_compile_features(ngx_probe PRIVATE cxx_std_20)
+    target_compile_definitions(ngx_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(ngx_probe PRIVATE "${NGX_SDK_DIR}/include" tools/ngx_probe)
+    # x64, dynamic CRT (/MD, /MDd): nvsdk_ngx_d*.lib are the dynamic-CRT variants.
+    target_link_libraries(ngx_probe PRIVATE
+        "$<IF:$<CONFIG:Debug>,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib>"
+        d3d11 dxgi version)
+    add_custom_command(TARGET ngx_probe POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NGX_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$<TARGET_FILE_DIR:ngx_probe>/")
 
-add_executable(ngx_probe
-    ${NGX_PROBE_SRC}
-)
-target_include_directories(ngx_probe PRIVATE external/DLSS/include)
-# Link only d3d11 (needed for device creation), not NGX SDK import library
-# (SDK linkage blocked by CRT/mismatch issues; see ngx_probe.cpp NGX_STUB handling)
-target_link_libraries(ngx_probe PRIVATE d3d11)
-# NGX_STUB: use stubbed NGX calls returning success for probe infrastructure testing
-add_compile_definitions(NGX_STUB)
+    add_executable(ngx_probe_host tools/ngx_probe/ngx_probe_host.cpp)
+    target_compile_features(ngx_probe_host PRIVATE cxx_std_20)
+    target_compile_definitions(ngx_probe_host PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(ngx_probe_host PRIVATE tools/ngx_probe)
+    add_dependencies(ngx_probe_host ngx_probe)
+else()
+    message(STATUS "external/DLSS not found: ngx_probe and ngx_probe_host are not built")
+endif()
