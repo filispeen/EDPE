@@ -62,9 +62,9 @@ ctest --test-dir build --output-on-failure
 
 The current tests cover temporal math, the GPU motion pass, DXBC fanout, and proxy smoke checks. The GPU test requires Windows and an available D3D11 device.
 
-## Current build caveat
+## NGX project ID
 
-`src/ngx_context.cpp` currently initializes `kNgxProjectId` with `0xPE`. This is not a valid C++ numeric literal and may cause MSVC compilation to fail. The constant must be changed to a valid value before the current source can build successfully. NGX functionality remains disabled behind a stub regardless.
+`src/ngx_context.cpp` and `tools/ngx_probe/ngx_probe.cpp` each define `kNgxProjectId`, an EDPE-owned GUID for `NVSDK_NGX_D3D11_Init_with_ProjectID` (not EDVR's ID). `NgxContext` remains a disabled stub: it makes no NGX calls.
 
 ## Staging proxies for a local game run
 

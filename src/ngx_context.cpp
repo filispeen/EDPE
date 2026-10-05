@@ -20,15 +20,13 @@ struct NgxFeatureState {
     bool reset_requested = false;
 };
 
-// Constant for NGX project GUID.
-// This is a project-owned identifier; do not reuse EDVR's NGX Project ID.
-// Format: GUID-like string matching NVSDK_NGX_D3D11_Init_with_ProjectID expectation.
-// TODO: Obtain a proper NVIDIA-assigned application ID for NVSDK_NGX_D3D11_Init.
-// Until then, use NVSDK_NGX_D3D11_Init(0, ...) as documented:
-// "Until NVIDIA has assigned you an applicationId, use 0."
-// "If you do not have one please contact us."
-// project_id_string is used only with Init_with_ProjectID.
-constexpr char kNgxProjectIdString[] = "edpe-custom-engine-2026";
+// EDPE's own NGX project ID, for NVSDK_NGX_D3D11_Init_with_ProjectID.
+// Generated for EDPE with PowerShell New-Guid on 2026-10-05; it is not EDVR's ID
+// and not the example GUID from the SDK header. nvsdk_ngx.h requires a GUID-like
+// string without braces. Keep identical to kNgxProjectId in tools/ngx_probe/ngx_probe.cpp.
+constexpr char kNgxProjectId[] = "48d353f3-d07b-4048-876b-09f8622f5a27";
+// Engine type passed alongside it is NVSDK_NGX_ENGINE_TYPE_CUSTOM.
+constexpr char kNgxEngineVersion[] = "EDPE-unreleased";
 
 // NGX feature state.
 inline NgxFeatureState g_ngx_state{};
@@ -37,13 +35,10 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     if (!device || !context) return false;
     if (g_ngx_state.initialized) return true; // already initialized
 
-    // NGX D3D11 initialization.
-    // Two pathways:
-    // 1) NVSDK_NGX_D3D11_Init_with_ProjectID() — for custom engines without an NVIDIA application ID.
-    //    Project ID must be GUID-like; this string is project-owned and not EDVR's.
-    // 2) NVSDK_NGX_D3D11_Init() — with InApplicationId = 0 until NVIDIA assigns one.
-    //    Per SDK docs: "Until NVIDIA has assigned you an applicationId, use 0."
-    //    "If an application ID is not available, use NVSDK_NGX_Init_with_ProjectID to supply your own identifier."
+    // NGX D3D11 initialization would use NVSDK_NGX_D3D11_Init_with_ProjectID
+    // (nvsdk_ngx.h:246) with kNgxProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM and
+    // kNgxEngineVersion. NVSDK_NGX_D3D11_Init (nvsdk_ngx.h:150) takes an
+    // NVIDIA-assigned unsigned long long ApplicationId, which EDPE does not have.
 
     // Intentionally disabled until shutdown safety is verified.
     // Do not consume NGX as production input until conventions are validated

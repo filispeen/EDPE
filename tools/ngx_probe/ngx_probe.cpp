@@ -8,6 +8,13 @@
 #include "nvsdk_ngx.h"
 #include "nvsdk_ngx_helpers_d3d.h"
 
+// EDPE's own NGX project ID for NVSDK_NGX_D3D11_Init_with_ProjectID.
+// Generated for EDPE with PowerShell New-Guid on 2026-10-05; it is not EDVR's ID
+// and not the example GUID from nvsdk_ngx.h. Must be GUID-like, no braces.
+// Keep identical to kNgxProjectId in src/ngx_context.cpp.
+static const char kNgxProjectId[] = "48d353f3-d07b-4048-876b-09f8622f5a27";
+static const char kNgxEngineVersion[] = "EDPE-unreleased";
+
 // === NGX_STUB: when defined, NGX calls are stubbed to return success ===
 // This allows the probe to build and run without the NGX SDK import library,
 // which has CRT compatibility issues. Real SDK calls can be wired later.
@@ -184,9 +191,9 @@ int main(int argc, char* argv[]) {
         ngx_result = NVSDK_NGX_Result_Success;
 #else
         ngx_result = NVSDK_NGX_D3D11_Init_with_ProjectID(
-            "edpe-custom-engine-2026",
-            NVSDK_NGX_EngineType_CUSTOM,
-            "1.0",
+            kNgxProjectId,
+            NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+            kNgxEngineVersion,
             nullptr,
             d3d_device,
             nullptr,
