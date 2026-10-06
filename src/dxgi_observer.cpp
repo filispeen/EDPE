@@ -15,6 +15,7 @@ namespace {
 // COM vtable slots and interface lengths come from the Windows SDK DXGI headers.
 constexpr size_t kCreateSwapChain = 10;
 constexpr size_t kPresent = 8;
+constexpr size_t kAddRef = 1;
 constexpr size_t kRelease = 2;
 constexpr size_t kResizeBuffers = 13;
 constexpr size_t kMaxMethods = 41;
@@ -65,9 +66,14 @@ using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT,
 
 ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
     auto* table = tableOf(object);
-    UiOnRelease(object);
     *reinterpret_cast<void***>(object) = table->original;
     const auto original = reinterpret_cast<ReleaseFn>(table->original[kRelease]);
+    // Tear the overlay down only on the release that destroys the object. Any other
+    // Release (QueryInterface/GetBuffer pairs) must not shut the UI down mid-frame.
+    const auto add_ref = reinterpret_cast<ReleaseFn>(table->original[kAddRef]);
+    const ULONG count_before = add_ref(object) - 1;
+    original(object);
+    if (count_before == 1) UiOnRelease(object);
     const ULONG remaining = original(object);
     if (remaining) *reinterpret_cast<void***>(object) = table->methods;
     else {
