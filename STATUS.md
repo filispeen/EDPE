@@ -26,7 +26,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 5. Projection jitter | **Math prototype only; runtime use blocked** | Halton jitter and projection-block transformation helpers exist. Jitter is intentionally not applied in Elite because full shader/pass coverage and a guaranteed fail-open path that removes jitter have not been proven. |
 | 6. Motion vectors | **Diagnostic prototype; not backend-ready** | A D3D11 GPU motion pass and CPU math have synthetic/WARP evidence, and sparse in-game diagnostic captures show finite output during camera movement. Nearby geometry, per-pixel depth association, moving objects, scene cuts, stable camera selection, and vendor-specific direction/scale conventions still need validation. The capture path is explicitly experimental/manual. |
 | 7. Shared temporal input layer | **Not implemented** | There is no backend-neutral `TemporalFrameInputs` handoff or production history/reset/resource-lifetime manager. Current color, depth, camera, and motion observations are separate diagnostics. |
-| 8. NVIDIA DLAA | **Blocked / not implemented** | `NgxContext` is a disabled stub. A standalone SDK probe reportedly initialized and queried capabilities, but hung during NGX shutdown; NGX is therefore not run in the game. The Elite input conventions and safe jitter rollback are also unresolved. |
+| 8. NVIDIA DLAA | **Blocked / not implemented** | `NgxContext` is a disabled stub. MEASURED (2026-10-07): the standalone probe (`tools/ngx_probe`, RTX 3060, driver 617.14, `nvngx_dlss.dll` 310.9.1.0) completed init, capability query, DLAA create and evaluate on synthetic inputs, and shutdown with clean exits in variants V1 to V5, two runs each; the earlier reported shutdown hang was not reproduced. NGX is not run in the game. The Elite input conventions and safe jitter rollback are unresolved. |
 | 9. NVIDIA DLSS Super Resolution | **Not started** | No evaluation path is implemented. |
 | 10. True render-scale control | **Not started** | No Cobra scaling mechanism or selective scene-resource scaling has been implemented. The game still renders the expensive scene at native resolution. |
 | 11. AMD FSR upscaling | **Not started** | No FidelityFX backend is implemented. The project notes compare the D3D11 community route with an official API/interoperability route, but no production choice or evaluation exists. |
@@ -43,7 +43,6 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 - Experimental F5 actions can capture selected scene/depth/camera/motion candidates. Captures are diagnostic evidence, not production temporal inputs.
 - The proxy writes `edpe.log` beside the host executable. Manual captures may also save visual BMP screenshots under `edpe-captures`; those images are not raw depth or motion data.
 - The repository defines CPU math, WARP motion, DXBC fanout, and proxy smoke tests. Earlier project notes record successful runs, but tests were not rerun for this status review.
-- Current source contains `0xPE` in `src/ngx_context.cpp` as an initializer. It is not a valid C++ numeric literal and may prevent a fresh build. Existing binaries or earlier test results do not establish that the current checkout builds; correct and rebuild before treating the current revision as build-verified.
 
 ---
 
@@ -148,13 +147,13 @@ Per `docs/render-pipeline-observations.md` (2026-09-23 game build `2026.09.03.33
 **Current EDPE state:**
 
 - `src/ngx_context.cpp/h`: Framework present but `initialize()` returns `false` (intentionally disabled until safety verified)
-- Project ID fixed: `{0xED, 0xEA, 0x1B, 0x22}` (valid hex only; `0xPE` was invalid — P is not a hex digit)
+- Project ID: EDPE-owned GUID `48d353f3-d07b-4048-876b-09f8622f5a27` via `NVSDK_NGX_D3D11_Init_with_ProjectID` in `src/ngx_context.cpp` and `tools/ngx_probe/ngx_probe.cpp` (never EDVR's ID)
 - **NOT:** NGX evaluated or consuming Elite resources
-- **Standalone probe:** `tools/ngx_probe/` created — separate executable with 30s timeout on Shutdown1, no threading to bypass hang
+- **MEASURED (2026-10-07):** standalone probe `tools/ngx_probe/` (parent `ngx_probe_host` with 30 s timeout, child `ngx_probe` with real NGX calls, no threading) ran V1 to V5, two runs each, all clean exits, no hang; details in `docs/ngx_probe-results.md`. Evaluate used synthetic inputs only; output was not inspected
 - **Convention translation planned** at NGX boundary (jitter, motion scale, depth flag, reset semantics)
 - **DLAA mode:** input width == output width, input height == output height (2560×1440) — removes scaling issue but does not satisfy convention requirements
 
-**Upcoming task (per task list):** Standalone NGX probe execution with stage-by-stage timing and timeout documentation.
+**Next:** verify Elite input conventions; NGX stays out of the Elite process.
 
 ---
 
@@ -186,14 +185,14 @@ Per `docs/render-pipeline-observations.md` (2026-09-23 game build `2026.09.03.33
 | `motion_gpu_test` | ✅ Requires D3D11 | GPU motion pass test |
 | `dxbc_fanout_test` | ✅ DXBC fanout probe | Shader hash analysis |
 | `proxy_smoke` | ✅ DLL load + Present observation | Requires EDPE.dll + dxgi.dll beside game |
-| NGX runtime in Elite | ❌ Blocked | Shutdown hang >20s; conventions unvalidated |
-| Standalone NGX probe | 🔧 In progress | `tools/ngx_probe/` — 30s timeout mechanism |
+| NGX runtime in Elite | ❌ Blocked | Conventions unvalidated; NGX not run in game |
+| Standalone NGX probe | ✅ MEASURED | `tools/ngx_probe/` V1-V5 clean, 2 runs each |
 
 ---
 
 ## Next Verified Milestones (per PLAN.md order)
 
-1. **NGX shutdown lifecycle** — validated in isolated process with 30s timeout (standalone probe)
+1. **NGX shutdown lifecycle** - MEASURED clean in an isolated process (V1 to V5, 2 runs each); repeated init/shutdown cycles and in-game behavior remain unverified
 2. **Elite input conventions** — jitter sign/motion-scale/depth-flag/reset semantics
 3. **DLAA at native resolution** — input == output (2560×1440), conventions verified
 4. **DLSS Super Resolution** — after DLAA validated, reduced render resolution
