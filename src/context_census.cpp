@@ -1306,9 +1306,12 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
                     motion_cameras[slot] = camera;
                     motion_camera_frames[slot] = sample.after_present;
                 }
+                edpe::NdcOffset native{};
+                const bool have_native = edpe::estimateEliteBlockNdcOffset(values + 1080, &native);
                 swprintf_s(message,
-                    L"EDPE: scene camera candidate afterPresent=%llu bind=%u valid=%u scale=(%.9g,%.9g) depthB=%.9g",
-                    sample.after_present, sample.bind, parsed, camera.scaleX, camera.scaleY, camera.depthB);
+                    L"EDPE: scene camera candidate afterPresent=%llu bind=%u valid=%u scale=(%.9g,%.9g) depthB=%.9g nativeNdc=(%.3g,%.3g) nativeValid=%u",
+                    sample.after_present, sample.bind, parsed, camera.scaleX, camera.scaleY, camera.depthB,
+                    native.x, native.y, have_native);
                 EdpeLog(message);
                 if (sample.bind == 6) for (size_t offset = 0; offset < 5376 / sizeof(float); offset += 32) {
                     wchar_t words[320];

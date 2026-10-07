@@ -113,4 +113,29 @@ inline bool jitterEliteDotProjectionBlock(const float* source, float* output,
     return true;
 }
 
+struct NdcOffset {
+    float x, y;
+};
+
+// Observation only: inverse of jitterEliteProjectionBlock. Rows 0..2 of the
+// 4x4 block are view-space inputs, columns are clip X, Y, Z, W; column W is
+// the view Z axis. For a rigid camera columns X and Y are orthogonal to column
+// W, so their component along column W is an NDC offset already folded into
+// the block (x right, y up, same sign as ProjectionJitter::ndcX/ndcY).
+inline bool estimateEliteBlockNdcOffset(const float* block, NdcOffset* out) {
+    if (!block || !out) return false;
+    double ww = 0, xw = 0, yw = 0;
+    for (unsigned row = 0; row < 3; ++row) {
+        const double x = block[row * 4], y = block[row * 4 + 1], w = block[row * 4 + 3];
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w)) return false;
+        ww += w * w;
+        xw += x * w;
+        yw += y * w;
+    }
+    if (!(ww > 1e-6)) return false;
+    out->x = static_cast<float>(xw / ww);
+    out->y = static_cast<float>(yw / ww);
+    return true;
+}
+
 } // namespace edpe

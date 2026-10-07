@@ -120,4 +120,24 @@ int main() {
     if (!edpe::jitterEliteDotProjectionBlock(dot_block, dot_block, third)) return 16;
     for (unsigned i = 0; i < 16; ++i)
         if (std::fabs(dot_block[i] - dot_shifted[i]) > .000001f) return 17;
+
+    // The two stored Odyssey 332841 blocks (9 digits) carry no built-in offset.
+    edpe::NdcOffset native{};
+    for (const float* stored : {block, turning_block})
+        if (!edpe::estimateEliteBlockNdcOffset(stored, &native) ||
+            std::fabs(native.x) > 1e-6f || std::fabs(native.y) > 1e-6f) return 18;
+
+    // Offsets applied by jitterEliteProjectionBlock are recovered with the same sign.
+    for (unsigned frame = 0; frame < 16; ++frame) {
+        const auto jitter = edpe::projectionJitter(frame, 2560, 1440);
+        float jittered[16]{};
+        if (!edpe::jitterEliteProjectionBlock(block, jittered, jitter) ||
+            !edpe::estimateEliteBlockNdcOffset(jittered, &native)) return 19;
+        const float pixel_x = native.x * 2560 / 2, pixel_y = -native.y * 1440 / 2;
+        if (std::fabs(pixel_x - jitter.pixelX) > .01f ||
+            std::fabs(pixel_y - jitter.pixelY) > .01f) return 20;
+    }
+    const float no_w[16]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0};
+    if (edpe::estimateEliteBlockNdcOffset(no_w, &native) ||
+        edpe::estimateEliteBlockNdcOffset(nullptr, &native)) return 21;
 }
