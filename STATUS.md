@@ -187,6 +187,7 @@ Per `docs/render-pipeline-observations.md` (2026-09-23 game build `2026.09.03.33
 | `proxy_smoke` | ✅ DLL load + Present observation | Requires EDPE.dll + dxgi.dll beside game |
 | NGX runtime in Elite | ❌ Blocked | Conventions unvalidated; NGX not run in game |
 | Standalone NGX probe | ✅ MEASURED | `tools/ngx_probe/` V1-V5 clean, 2 runs each |
+| Overlay lifecycle in Elite (4d8e157) | ✅ MEASURED | Game run to 3D world past frame 15360: one "Dear ImGui ready", no per-Present re-init, clean exit with "swap chain destroyed; shutting overlay down" (earlier 295ff46 build: 326 re-inits, then game exit) |
 
 ---
 
