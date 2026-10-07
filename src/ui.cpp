@@ -908,7 +908,10 @@ void UiOnResize(IDXGISwapChain* swap_chain) {
 }
 
 void UiOnRelease(IUnknown* object) {
-    if (ui.swap_chain == object) shutdownUi();
+    if (ui.swap_chain == object) {
+        EdpeLog(L"EDPE: swap chain destroyed; shutting overlay down");
+        shutdownUi();
+    }
 }
 
 bool UiMenuVisible() { return menu_visible.load(); }

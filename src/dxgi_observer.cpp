@@ -68,15 +68,12 @@ ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
     auto* table = tableOf(object);
     *reinterpret_cast<void***>(object) = table->original;
     const auto original = reinterpret_cast<ReleaseFn>(table->original[kRelease]);
-    // Tear the overlay down only on the release that destroys the object. Any other
-    // Release (QueryInterface/GetBuffer pairs) must not shut the UI down mid-frame.
-    const auto add_ref = reinterpret_cast<ReleaseFn>(table->original[kAddRef]);
-    const ULONG count_before = add_ref(object) - 1;
-    original(object);
-    if (count_before == 1) UiOnRelease(object);
     const ULONG remaining = original(object);
     if (remaining) *reinterpret_cast<void***>(object) = table->methods;
     else {
+        // Tear the overlay down only when the object is really destroyed (the actual
+        // Release returned 0). Other Releases must not shut the UI down mid-frame.
+        UiOnRelease(object);
         ContextCensusOnSwapChainRelease(object);
         delete table;
     }
