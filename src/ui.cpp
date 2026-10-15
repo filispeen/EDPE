@@ -3,6 +3,7 @@
 #include "context_census.h"
 #include "upscaler_backend.h"
 #include "capture_format.h"
+#include "config.h"
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -1006,10 +1007,16 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             if (nvidia_available) {
                 upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
                 upscaler.setMode(edpe::UpscaleMode::NativeAA);
+                edpe::Config::instance().upscalerBackend = 1;
+                edpe::Config::instance().upscaleMode = 1;
+                edpe::Config::instance().save();
             }
         } else {
             upscaler.setBackend(edpe::UpscalerBackend::None);
             upscaler.setMode(edpe::UpscaleMode::Native);
+            edpe::Config::instance().upscalerBackend = 0;
+            edpe::Config::instance().upscaleMode = 0;
+            edpe::Config::instance().save();
         }
     }
 
@@ -1088,7 +1095,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ui.motion_window_open = true;
     }
     ImGui::Separator();
-    ImGui::TextUnformatted("Projection Jitter (Phase 5)");
+    ImGui::TextUnformatted("Projection Jitter & Motion Tuning (DLAA Stability)");
     bool jitter_enabled = ContextCensusGetJitterEnabled();
     if (ImGui::Checkbox("Enable Projection Jitter (Halton 2,3)", &jitter_enabled)) {
         ContextCensusSetJitterEnabled(jitter_enabled);
@@ -1096,6 +1103,64 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     bool jitter_override = ContextCensusGetJitterTestOverride();
     if (ImGui::Checkbox("Force Jitter test override (subpixel vibration test)", &jitter_override)) {
         ContextCensusSetJitterTestOverride(jitter_override);
+    }
+
+    bool j_inv_x = ContextCensusGetJitterInvertX();
+    if (ImGui::Checkbox("Invert Jitter X (pass -JitterX to DLSS)", &j_inv_x)) {
+        ContextCensusSetJitterInvertX(j_inv_x);
+        edpe::Config::instance().save();
+    }
+    ImGui::SameLine();
+    bool j_inv_y = ContextCensusGetJitterInvertY();
+    if (ImGui::Checkbox("Invert Jitter Y (pass -JitterY to DLSS)", &j_inv_y)) {
+        ContextCensusSetJitterInvertY(j_inv_y);
+        edpe::Config::instance().save();
+    }
+
+    bool j_swap = ContextCensusGetJitterSwapXY();
+    if (ImGui::Checkbox("Swap Jitter X/Y", &j_swap)) {
+        ContextCensusSetJitterSwapXY(j_swap);
+        edpe::Config::instance().save();
+    }
+
+    float j_scale = ContextCensusGetJitterScale();
+    if (ImGui::SliderFloat("Jitter Scale (0.0 = disable jitter)", &j_scale, 0.0f, 2.0f, "%.2f")) {
+        ContextCensusSetJitterScale(j_scale);
+        edpe::Config::instance().save();
+    }
+
+    int j_phases = static_cast<int>(ContextCensusGetJitterPhaseCount());
+    if (ImGui::SliderInt("Jitter Phase Cycle (DLAA default: 32)", &j_phases, 2, 64)) {
+        ContextCensusSetJitterPhaseCount(static_cast<unsigned>(j_phases));
+        edpe::Config::instance().save();
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Motion Vectors Tuning");
+    bool zero_mv = ContextCensusGetZeroMotion();
+    if (ImGui::Checkbox("Zero Motion Vectors (Force stationary 0,0)", &zero_mv)) {
+        ContextCensusSetZeroMotion(zero_mv);
+        edpe::Config::instance().save();
+    }
+    bool m_inv_x = ContextCensusGetMotionInvertX();
+    if (ImGui::Checkbox("Invert Motion X", &m_inv_x)) {
+        ContextCensusSetMotionInvertX(m_inv_x);
+        edpe::Config::instance().save();
+    }
+    ImGui::SameLine();
+    bool m_inv_y = ContextCensusGetMotionInvertY();
+    if (ImGui::Checkbox("Invert Motion Y", &m_inv_y)) {
+        ContextCensusSetMotionInvertY(m_inv_y);
+        edpe::Config::instance().save();
+    }
+    float m_scale = ContextCensusGetMotionScale();
+    if (ImGui::SliderFloat("Motion Scale", &m_scale, 0.0f, 2.0f, "%.2f")) {
+        ContextCensusSetMotionScale(m_scale);
+        edpe::Config::instance().save();
+    }
+
+    if (ImGui::Button("Save Tuning to edpe.ini")) {
+        edpe::Config::instance().save();
     }
     const bool jitter_active = ContextCensusIsJitterActive();
     if (jitter_active) {

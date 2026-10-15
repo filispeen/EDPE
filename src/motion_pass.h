@@ -16,6 +16,7 @@ public:
     bool renderGpuCameras(ID3D11ShaderResourceView* depth, ID3D11Buffer* now,
         ID3D11Buffer* previous, UINT width, UINT height);
     ID3D11ShaderResourceView* output() const { return output_srv_.Get(); }
+    void clear(ID3D11DeviceContext* context);
 
 private:
     bool renderInternal(ID3D11ShaderResourceView* depth, const float (&values)[32],

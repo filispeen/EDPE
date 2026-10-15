@@ -160,4 +160,10 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     return true;
 }
 
+void MotionPass::clear(ID3D11DeviceContext* context) {
+    if (!context || !output_rtv_) return;
+    const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    context->ClearRenderTargetView(output_rtv_.Get(), zero);
+}
+
 } // namespace edpe

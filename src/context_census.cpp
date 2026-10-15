@@ -7,6 +7,7 @@
 #include "shader_probe.h"
 #include "temporal_math.h"
 #include "upscaler_backend.h"
+#include "config.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -268,6 +269,18 @@ std::mutex jitter_mutex;
 edpe::ProjectionJitter active_projection_jitter{};
 UINT active_render_width = 0;
 UINT active_render_height = 0;
+
+std::atomic<bool> s_jitter_invert_x{false};
+std::atomic<bool> s_jitter_invert_y{false};
+std::atomic<bool> s_jitter_swap_xy{false};
+std::atomic<float> s_jitter_scale{1.0f};
+std::atomic<unsigned> s_jitter_phase_count{32};
+
+std::atomic<bool> s_zero_motion_vectors{false};
+std::atomic<bool> s_motion_invert_x{false};
+std::atomic<bool> s_motion_invert_y{false};
+std::atomic<float> s_motion_scale{1.0f};
+static bool s_config_loaded = false;
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
@@ -1442,14 +1455,7 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
 }
 
 void logCameraDelta(unsigned long long frame, bool parsed, const edpe::CameraProjection& camera) {
-    if (parsed) {
-        s_camera_previous = s_camera_now;
-        s_camera_now = camera;
-    }
     const auto r = camera_delta_tracker.feed(frame, parsed, camera);
-    if (!parsed || (r.flags & (edpe::kCameraDeltaLost | edpe::kCameraDeltaGap))) {
-        s_camera_reset = true;
-    }
     wchar_t message[512]; // swprintf_s aborts on overflow; worst case is about 260 chars.
     if (!camera_delta_announced) {
         camera_delta_announced = true;
@@ -2052,9 +2058,13 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long frame) 
         motion_pass = std::move(candidate);
     }
 
-    // Render motion vectors using current and previous camera projections
-    motion_pass->render(motion_depth_view.Get(),
-        s_camera_now, s_camera_previous, colorDesc.Width, colorDesc.Height);
+    if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
+        motion_pass->clear(context);
+    } else {
+        // Render motion vectors using current and previous camera projections
+        motion_pass->render(motion_depth_view.Get(),
+            s_camera_now, s_camera_previous, colorDesc.Width, colorDesc.Height);
+    }
 
     if (!motion_pass->output()) return;
 
@@ -2073,6 +2083,20 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long frame) 
     float jx = 0.0f, jy = 0.0f, ndcx = 0.0f, ndcy = 0.0f;
     ContextCensusGetActiveJitter(&jx, &jy, &ndcx, &ndcy);
 
+    if (s_jitter_swap_xy.load(std::memory_order_relaxed)) {
+        std::swap(jx, jy);
+    }
+    if (s_jitter_invert_x.load(std::memory_order_relaxed)) {
+        jx = -jx;
+    }
+    if (s_jitter_invert_y.load(std::memory_order_relaxed)) {
+        jy = -jy;
+    }
+
+    const float mScale = s_motion_scale.load(std::memory_order_relaxed);
+    const float mScaleX = (s_motion_invert_x.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
+    const float mScaleY = (s_motion_invert_y.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
+
     edpe::TemporalFrameInputs inputs{};
     inputs.color = colorTexture.Get();
     inputs.depth = motion_depth.Get();
@@ -2084,6 +2108,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long frame) 
     inputs.outputHeight = colorDesc.Height;
     inputs.jitterX = jx;
     inputs.jitterY = jy;
+    inputs.motionScaleX = mScaleX;
+    inputs.motionScaleY = mScaleY;
     inputs.frameTimeMs = 16.667f;
     inputs.reset = s_camera_reset;
     inputs.depthInverted = true;
@@ -2401,6 +2427,28 @@ void rearmContextHooks() {
 } // namespace
 
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
+    if (!s_config_loaded) {
+        s_config_loaded = true;
+        auto& cfg = edpe::Config::instance();
+        cfg.load();
+        s_jitter_invert_x.store(cfg.jitterInvertX, std::memory_order_relaxed);
+        s_jitter_invert_y.store(cfg.jitterInvertY, std::memory_order_relaxed);
+        s_jitter_swap_xy.store(cfg.jitterSwapXY, std::memory_order_relaxed);
+        s_jitter_scale.store(cfg.jitterScale, std::memory_order_relaxed);
+        s_jitter_phase_count.store(cfg.jitterPhaseCount, std::memory_order_relaxed);
+        s_zero_motion_vectors.store(cfg.zeroMotionVectors, std::memory_order_relaxed);
+        s_motion_invert_x.store(cfg.motionInvertX, std::memory_order_relaxed);
+        s_motion_invert_y.store(cfg.motionInvertY, std::memory_order_relaxed);
+        s_motion_scale.store(cfg.motionScale, std::memory_order_relaxed);
+
+        if (cfg.upscalerBackend == 1) {
+            auto& upscaler = edpe::UpscalerManager::instance();
+            if (upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss)) {
+                upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
+                upscaler.setMode(edpe::UpscaleMode::NativeAA);
+            }
+        }
+    }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         auto* context = observed_context.load(std::memory_order_acquire);
         endHudDrawProbe();
@@ -2537,7 +2585,14 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
         if (active_render_width && active_render_height) {
             std::lock_guard lock(jitter_mutex);
-            active_projection_jitter = edpe::projectionJitter(frame, active_render_width, active_render_height);
+            const unsigned phases = s_jitter_phase_count.load(std::memory_order_relaxed);
+            auto jitter = edpe::projectionJitter(frame, active_render_width, active_render_height, phases);
+            const float scale = s_jitter_scale.load(std::memory_order_relaxed);
+            jitter.pixelX *= scale;
+            jitter.pixelY *= scale;
+            jitter.ndcX *= scale;
+            jitter.ndcY *= scale;
+            active_projection_jitter = jitter;
             jitter_frame_index.store(frame, std::memory_order_relaxed);
         }
     }
@@ -2945,4 +3000,70 @@ extern "C" void WINAPI EdpeGetActiveJitter(float* pixelX, float* pixelY, float* 
     unsigned long long* frameIndex) {
     ContextCensusGetActiveJitter(pixelX, pixelY, ndcX, ndcY, frameIndex);
 }
+
+void ContextCensusSetJitterInvertX(bool invert) {
+    s_jitter_invert_x.store(invert, std::memory_order_relaxed);
+    edpe::Config::instance().jitterInvertX = invert;
+}
+bool ContextCensusGetJitterInvertX() {
+    return s_jitter_invert_x.load(std::memory_order_relaxed);
+}
+void ContextCensusSetJitterInvertY(bool invert) {
+    s_jitter_invert_y.store(invert, std::memory_order_relaxed);
+    edpe::Config::instance().jitterInvertY = invert;
+}
+bool ContextCensusGetJitterInvertY() {
+    return s_jitter_invert_y.load(std::memory_order_relaxed);
+}
+void ContextCensusSetJitterSwapXY(bool swap) {
+    s_jitter_swap_xy.store(swap, std::memory_order_relaxed);
+    edpe::Config::instance().jitterSwapXY = swap;
+}
+bool ContextCensusGetJitterSwapXY() {
+    return s_jitter_swap_xy.load(std::memory_order_relaxed);
+}
+void ContextCensusSetJitterScale(float scale) {
+    s_jitter_scale.store(scale, std::memory_order_relaxed);
+    edpe::Config::instance().jitterScale = scale;
+}
+float ContextCensusGetJitterScale() {
+    return s_jitter_scale.load(std::memory_order_relaxed);
+}
+void ContextCensusSetJitterPhaseCount(unsigned count) {
+    s_jitter_phase_count.store(count, std::memory_order_relaxed);
+    edpe::Config::instance().jitterPhaseCount = count;
+}
+unsigned ContextCensusGetJitterPhaseCount() {
+    return s_jitter_phase_count.load(std::memory_order_relaxed);
+}
+
+void ContextCensusSetZeroMotion(bool zero) {
+    s_zero_motion_vectors.store(zero, std::memory_order_relaxed);
+    edpe::Config::instance().zeroMotionVectors = zero;
+}
+bool ContextCensusGetZeroMotion() {
+    return s_zero_motion_vectors.load(std::memory_order_relaxed);
+}
+void ContextCensusSetMotionInvertX(bool invert) {
+    s_motion_invert_x.store(invert, std::memory_order_relaxed);
+    edpe::Config::instance().motionInvertX = invert;
+}
+bool ContextCensusGetMotionInvertX() {
+    return s_motion_invert_x.load(std::memory_order_relaxed);
+}
+void ContextCensusSetMotionInvertY(bool invert) {
+    s_motion_invert_y.store(invert, std::memory_order_relaxed);
+    edpe::Config::instance().motionInvertY = invert;
+}
+bool ContextCensusGetMotionInvertY() {
+    return s_motion_invert_y.load(std::memory_order_relaxed);
+}
+void ContextCensusSetMotionScale(float scale) {
+    s_motion_scale.store(scale, std::memory_order_relaxed);
+    edpe::Config::instance().motionScale = scale;
+}
+float ContextCensusGetMotionScale() {
+    return s_motion_scale.load(std::memory_order_relaxed);
+}
+
 

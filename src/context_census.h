@@ -31,3 +31,24 @@ void ContextCensusGetActiveJitter(float* pixelX, float* pixelY, float* ndcX, flo
     unsigned long long* frameIndex = nullptr);
 unsigned ContextCensusGetJitteredWritesCount();
 unsigned ContextCensusGetJitterRejectionsCount();
+
+// Jitter and Motion Runtime Tuning (Phase 5 / DLAA stability)
+void ContextCensusSetJitterInvertX(bool invert);
+bool ContextCensusGetJitterInvertX();
+void ContextCensusSetJitterInvertY(bool invert);
+bool ContextCensusGetJitterInvertY();
+void ContextCensusSetJitterSwapXY(bool swap);
+bool ContextCensusGetJitterSwapXY();
+void ContextCensusSetJitterScale(float scale);
+float ContextCensusGetJitterScale();
+void ContextCensusSetJitterPhaseCount(unsigned count);
+unsigned ContextCensusGetJitterPhaseCount();
+
+void ContextCensusSetZeroMotion(bool zero);
+bool ContextCensusGetZeroMotion();
+void ContextCensusSetMotionInvertX(bool invert);
+bool ContextCensusGetMotionInvertX();
+void ContextCensusSetMotionInvertY(bool invert);
+bool ContextCensusGetMotionInvertY();
+void ContextCensusSetMotionScale(float scale);
+float ContextCensusGetMotionScale();

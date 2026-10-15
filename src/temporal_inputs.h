@@ -143,6 +143,8 @@ struct TemporalFrameInputs {
     // Motion vector format convention: EDPE writes current->previous displacement in render pixels.
     bool motionJittered = false; // EDPE motion excludes subpixel projection jitter
     bool motionIsLowRes = true;  // Motion generated at render resolution
+    float motionScaleX = 1.0f;   // Motion scale multiplier (supports sign inversion for debug/tuning)
+    float motionScaleY = 1.0f;
 
     // Validates that all required inputs are present, finite, and dimensionally coherent.
     bool isValid(const wchar_t** outReason = nullptr) const {
@@ -210,9 +212,8 @@ inline bool translateToNvidia(const TemporalFrameInputs& inputs,
     outParams->jitterY = inputs.jitterY;
 
     // Motion vector scale: EDPE generates displacement in render pixels.
-    // The NGX helper substitutes 1.0 if scale is 0.0; passing 1.0 explicitly is standard.
-    outParams->motionScaleX = 1.0f;
-    outParams->motionScaleY = 1.0f;
+    outParams->motionScaleX = inputs.motionScaleX;
+    outParams->motionScaleY = inputs.motionScaleY;
 
     // Depth convention: Elite's reversed Z maps to DepthInverted.
     outParams->depthInverted = inputs.depthInverted;
@@ -252,8 +253,8 @@ inline bool translateToAmd(const TemporalFrameInputs& inputs,
     outParams->jitterY = inputs.jitterY;
 
     // Motion vector scale: EDPE generates render pixels; FSR expects screen pixels.
-    outParams->motionVectorScaleX = 1.0f;
-    outParams->motionVectorScaleY = 1.0f;
+    outParams->motionVectorScaleX = inputs.motionScaleX;
+    outParams->motionVectorScaleY = inputs.motionScaleY;
 
     // Depth convention: Elite reversed Z and infinite far plane.
     outParams->depthInverted = inputs.depthInverted;
