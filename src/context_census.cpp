@@ -1,4 +1,5 @@
 #include "context_census.h"
+#include "camera_delta.h"
 #include "dxbc_fanout.h"
 #include "elite_camera.h"
 #include "log.h"
@@ -106,6 +107,25 @@ bool motion_pair_active = false;
 std::array<edpe::CameraProjection, 2> motion_cameras{};
 std::array<unsigned long long, 2> motion_camera_frames{~0ull, ~0ull};
 std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 2> gpu_camera_pair{};
+// Per-frame camera delta log (observation only, docs/elite-input-conventions.md
+// step 4). The 5376-byte VS slot-1 buffer bound at the first scene-MRT bind of
+// a frame is copied when that interval ends into a persistent staging ring and
+// read at a later Present with DO_NOT_WAIT. Nothing is written to the game.
+struct CameraDeltaSlot {
+    Microsoft::WRL::ComPtr<ID3D11Buffer> staging;
+    unsigned long long frame = 0;
+};
+constexpr size_t kCameraDeltaRing = 4;
+std::array<CameraDeltaSlot, kCameraDeltaRing> camera_delta_ring{};
+size_t camera_delta_head = 0;  // next slot to read
+size_t camera_delta_count = 0; // slots holding queued copies
+Microsoft::WRL::ComPtr<ID3D11Buffer> camera_delta_source; // copied at the next OMSetRenderTargets
+unsigned long long camera_delta_source_frame = 0;
+unsigned long long camera_delta_taken_frame = ~0ull;
+unsigned camera_delta_dropped = 0;  // ring full or map failure, reset each summary
+bool camera_delta_disabled = false; // staging creation failed; log stays off
+bool camera_delta_announced = false;
+edpe::CameraDeltaTracker camera_delta_tracker;
 unsigned long long motion_depth_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
@@ -1335,6 +1355,120 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
     }
 }
 
+void logCameraDelta(unsigned long long frame, bool parsed, const edpe::CameraProjection& camera) {
+    const auto r = camera_delta_tracker.feed(frame, parsed, camera);
+    wchar_t message[512]; // swprintf_s aborts on overflow; worst case is about 260 chars.
+    if (!camera_delta_announced) {
+        camera_delta_announced = true;
+        swprintf_s(message, L"EDPE: camera delta log first sample frame=%llu valid=%u window=%u",
+            frame, parsed, edpe::CameraDeltaTracker::kWindow);
+        EdpeLog(message);
+    }
+    SYSTEMTIME now{};
+    if (r.logEvent || r.summary) GetLocalTime(&now);
+    if (r.logEvent) {
+        const float* m = camera.worldFromView;
+        swprintf_s(message,
+            L"EDPE: camera delta event time=%02u:%02u:%02u.%03u frame=%llu flags=0x%X valid=%u gap=%llu move=%.6g turnDeg=%.6g projection=%.3g depthB=%.3g pos=(%.7g,%.7g,%.7g) scale=(%.9g,%.9g)",
+            now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
+            frame, r.flags, parsed, r.gap, r.delta.translation, r.delta.rotationDeg,
+            r.delta.projection, r.delta.depthB, m[3], m[7], m[11], camera.scaleX, camera.scaleY);
+        EdpeLog(message);
+    }
+    if (!r.summary) return;
+    const auto& w = camera_delta_tracker.window();
+    const double deltas = w.deltas ? w.deltas : 1;
+    swprintf_s(message,
+        L"EDPE: camera delta summary time=%02u:%02u:%02u frames=%llu-%llu samples=%u invalid=%u gaps=%u dropped=%u maxMove=%.6g meanMove=%.6g maxTurnDeg=%.6g meanTurnDeg=%.6g events=%u suppressed=%u",
+        now.wHour, now.wMinute, now.wSecond,
+        w.firstFrame, w.lastFrame, w.samples, w.invalid, w.gaps, camera_delta_dropped,
+        w.maxTranslation, w.sumTranslation / deltas, w.maxRotationDeg, w.sumRotationDeg / deltas,
+        w.events, w.suppressed);
+    EdpeLog(message);
+    camera_delta_tracker.nextWindow();
+    camera_delta_dropped = 0;
+}
+
+// Called at the first scene-MRT bind of a frame: retain the VS slot-1 buffer.
+void takeCameraDeltaSource(ID3D11DeviceContext* context, unsigned long long frame) {
+    if (camera_delta_disabled || camera_delta_source || camera_delta_taken_frame == frame) return;
+    camera_delta_taken_frame = frame;
+    ID3D11Buffer* buffer = nullptr;
+    context->VSGetConstantBuffers(1, 1, &buffer);
+    if (!buffer) return;
+    D3D11_BUFFER_DESC desc{};
+    buffer->GetDesc(&desc);
+    if (desc.ByteWidth != 5376 || desc.Usage != D3D11_USAGE_DYNAMIC) {
+        buffer->Release();
+        return;
+    }
+    camera_delta_source.Attach(buffer);
+    camera_delta_source_frame = frame;
+}
+
+// Called when the scene-MRT interval ends: queue a 5376-byte GPU copy.
+void copyCameraDeltaSource(ID3D11DeviceContext* context) {
+    if (!camera_delta_source) return;
+    const auto source = std::move(camera_delta_source);
+    if (camera_delta_count == kCameraDeltaRing) {
+        ++camera_delta_dropped;
+        return;
+    }
+    auto& slot = camera_delta_ring[(camera_delta_head + camera_delta_count) % kCameraDeltaRing];
+    if (!slot.staging) { // Created once per slot, never per frame.
+        D3D11_BUFFER_DESC desc{};
+        source->GetDesc(&desc);
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.MiscFlags = 0;
+        desc.StructureByteStride = 0;
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        if (!device || FAILED(device->CreateBuffer(&desc, nullptr, &slot.staging))) {
+            camera_delta_disabled = true;
+            EdpeLog(L"EDPE: camera delta log disabled (staging creation failed)");
+            return;
+        }
+    }
+    context->CopyResource(slot.staging.Get(), source.Get());
+    slot.frame = camera_delta_source_frame;
+    ++camera_delta_count;
+}
+
+// Called at Present: read finished copies in order without waiting.
+void pollCameraDeltaRing(ID3D11DeviceContext* context) {
+    while (camera_delta_count) {
+        auto& slot = camera_delta_ring[camera_delta_head];
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        const HRESULT result = context->Map(slot.staging.Get(), 0, D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (result == DXGI_ERROR_WAS_STILL_DRAWING) return;
+        if (SUCCEEDED(result) && mapped.pData) {
+            edpe::CameraProjection camera{};
+            const bool parsed = edpe::parseEliteCamera(static_cast<const float*>(mapped.pData),
+                5376 / sizeof(float), &camera);
+            context->Unmap(slot.staging.Get(), 0);
+            logCameraDelta(slot.frame, parsed, camera);
+        } else {
+            ++camera_delta_dropped;
+        }
+        camera_delta_head = (camera_delta_head + 1) % kCameraDeltaRing;
+        --camera_delta_count;
+    }
+}
+
+void resetCameraDelta() {
+    camera_delta_source.Reset();
+    for (auto& slot : camera_delta_ring) slot = {};
+    camera_delta_head = camera_delta_count = 0;
+    camera_delta_taken_frame = ~0ull;
+    camera_delta_dropped = 0;
+    camera_delta_disabled = false;
+    camera_delta_announced = false;
+    camera_delta_tracker.reset();
+}
+
 void logBoundConstantBuffers(ID3D11DeviceContext* context, size_t depth_index,
     unsigned bind_ordinal) {
     constexpr UINT slots = 8;
@@ -1784,6 +1918,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
     forward(context, count, targets, dsv);
     if (context != observed_context.load(std::memory_order_acquire)) return;
+    copyCameraDeltaSource(context);
     rearmHudDrawProbe();
     if (motion_pair_active && motion_color_source &&
         motion_color_frame == last_present_frame.load(std::memory_order_relaxed)) {
@@ -1827,6 +1962,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     unsigned snapshot_probe_bind = 0;
     unsigned camera_pair_sample = 0;
     bool hud_probe_begin = false;
+    bool camera_delta_take = false;
     {
         std::lock_guard lock(seen_mutex);
         while (index < seen_count && seen[index].view != dsv) ++index;
@@ -1850,6 +1986,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             else if (seen[index].mrt_hdr_view && count && targets &&
                 targets[0] == seen[index].mrt_hdr_view)
                 seen[index].scene_match_frame = frame;
+            camera_delta_take = scene_mrt;
         }
         if (sequence_active.load(std::memory_order_acquire)) recordBind(static_cast<int>(index));
         if (snapshot_active == static_cast<int>(index) && !snapshot_view) {
@@ -1915,6 +2052,8 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             beginVSBufferProbe(context, snapshot_probe_bind);
     }
     if (camera_pair_sample) queueCameraPairSample(context, camera_pair_sample);
+    if (camera_delta_take)
+        takeCameraDeltaSource(context, last_present_frame.load(std::memory_order_relaxed));
 
     if (!first_bind && !first_color) return;
 
@@ -1988,6 +2127,11 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
         pollConstantBufferSamples(observed_context.load(std::memory_order_acquire));
+    if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
+        auto* context = observed_context.load(std::memory_order_acquire);
+        copyCameraDeltaSource(context);
+        pollCameraDeltaRing(context);
+    }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         auto* context = observed_context.load(std::memory_order_acquire);
         queueCameraPairDepth(context, frame);
@@ -2398,6 +2542,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         }
     }
     endVSBufferProbe();
+    resetCameraDelta();
     if (patched_table) {
         patchSlot(patched_table, kOMSetRenderTargets,
             reinterpret_cast<void*>(&observedOMSetRenderTargets),

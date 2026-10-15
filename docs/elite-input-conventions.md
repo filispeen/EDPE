@@ -14,8 +14,8 @@ Date: 2026-10-07. Target: Elite Dangerous Odyssey 2D, build `2026.09.03.332841` 
 1. DONE, no game: `estimateEliteBlockNdcOffset` estimates the NDC offset already folded into a projection block, and the existing `scene camera candidate` log line now prints it as `nativeNdc` and `nativeValid`. Test pins the EDPE jitter sign by round trip.
 2. GAME A, jitter included or excluded, depth flag and clear value. In the F5 menu press `Capture adjacent camera frames (experimental)` and then `Capture depth candidate (one frame)` once in each of three scenes: (a) cockpit, stationary, (b) flying straight forward at steady speed toward a large static surface (station or planet), (c) looking at empty sky only. Send back, labeled a/b/c, the `edpe.log` lines matching `scene camera candidate|adjacent depth|depth sample grid|adjacent camera probe`. Decides: `nativeNdc` near zero in every scene means the game does not jitter; center depth rising in (b) and equal to 0 in (c) confirms reversed Z with clear 0; `0.025/depth` change versus forward displacement gives the scale check.
 3. GAME B, motion units and direction. Press `Capture motion candidate (experimental)` (a) during a steady pure yaw, (b) during steady pure forward flight. Send back the `motion grid 5x5` line, both `scene camera candidate` lines, the four `scene CB 2D xy/zw` lines of each sample, the `adjacent depth` lines, and the `edpe-captures` BMP plus the F5 snapshot screenshot. Decides: GPU grid versus CPU `cameraDepthMotion` within 0.01 px, yaw value versus `W/2 * scaleX * tan(angle)`. Limit: this does not prove direction against the real image; that needs two color frames and stays open.
-4. NO GAME, later: add a read-only, throttled, nonblocking per-Present camera delta log (translation distance, rotation angle) on the existing staged constant-buffer path. Needed because step 2 and 3 only see one adjacent pair.
-5. GAME C, reset semantics, after step 4. Perform jump or supercruise entry and exit, dock and undock, menu to cockpit, view switch. Send back the delta log lines around each event with the event name and rough time. Decides: the camera delta that separates normal motion from scene cuts, which is the basis for `InReset`.
+4. DONE, no game: read-only, throttled, nonblocking per-frame camera delta log. See "Step 4 result" below.
+5. GAME C, reset semantics. No F5 action is needed; the log runs whenever the scene MRT pass is drawn. Perform, with a few seconds of normal flight between them: hyperspace jump, supercruise entry, supercruise exit, docking, undocking, main menu to cockpit, external camera on and off, galaxy map open and close. Note each event name and rough wall-clock time. Send back all `edpe.log` lines matching `camera delta` with their timestamps. Decides: the per-frame `move`/`turnDeg` range of normal flight (from `summary`) versus the values at scene cuts (from `event`), which is the basis for `InReset`; also whether camera translation is world-absolute or floating-origin (`pos` jumps without motion).
 
 ## Step 1 result
 
@@ -34,3 +34,24 @@ Implications:
 
 - EDPE side jitter convention is now pinned by a deterministic test: positive `pixelX` moves scene content right, positive `pixelY` moves it down, `ndcY = -2*pixelY/height`. What NGX expects remains unresolved.
 - The stored blocks show no built-in offset. Whether this holds across scenes is the question of step 2. `MVJittered` stays unset in the plan until step 2 is read.
+
+## Step 4 result
+
+Date: 2026-10-15. No game run.
+
+Method: on the first bind per frame of a single-sample `R32G8X24_TYPELESS` DSV with the scene MRT pattern (`R10G10B10A2`, `R8G8B8A8`, `R8G8B8A8`, `R11G11B10`), EDPE retains the 5376-byte dynamic VS slot-1 buffer. At the next `OMSetRenderTargets` (end of that interval) it queues one `CopyResource` into a ring of four persistent staging buffers, created once each. At `Present` it maps finished copies in order with `D3D11_MAP_FLAG_DO_NOT_WAIT` and stops at the first still drawing. A full ring drops the frame and counts it. `parseEliteCamera` reads each copy; `edpe::CameraDeltaTracker` (`src/camera_delta.h`) compares it with the last valid camera. Nothing is written to the game, no jitter is applied, NGX is not called.
+
+Log lines (all contain `camera delta`):
+
+- `first sample frame= valid= window=120`: once per swap chain; proves the path ran.
+- `summary time= frames=a-b samples= invalid= gaps= dropped= maxMove= meanMove= maxTurnDeg= meanTurnDeg= events= suppressed=`: every 120 samples.
+- `event time= frame= flags= valid= gap= move= turnDeg= projection= depthB= pos=(x,y,z) scale=(sx,sy)`: at most 8 per window. Flags: `0x1` turn above 2 degrees, `0x2` move above 50 scene units, `0x4` scale or depthB change above 1e-4, `0x8` Present frames skipped since the last valid sample, `0x10` parser rejected after a valid sample, `0x20` first valid sample after rejections.
+
+Conventions: `move` is the distance between the translation columns of the row-major view-to-world `[R | C]` in scene units; `turnDeg` is the angle of `R_prev^T * R_now`. `frame` is the Present count before the sampled scene pass. Thresholds only choose which lines to print; they are not reset thresholds.
+
+Evidence:
+
+- `ctest -C Release -j 1`: 7 of 7 pass, including the new `camera_delta` test (translation, yaw both orders, FOV change, gap, lost and regained, rate limit, window rollover).
+- Release WARP proxy smoke log contains `EDPE: camera delta log first sample frame=7 valid=0 window=120`; the synthetic buffer is not a valid camera, so `valid=0` is expected.
+
+Confidence: CPU math and the D3D11 copy and readback path are tested; the sampling point in Elite is not. Limits: the camera is taken from the first scene-MRT interval only. Earlier Unmap hashing (camera-reconstruction.md, 2026-09-27) found identical camera and projection hashes across all writes within a frame, so this should be the frame camera, but this is not proven for every scene. Frames without that MRT pattern (menus, loading, galaxy map) produce no sample and appear as a `gap` on return.

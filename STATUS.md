@@ -1,6 +1,6 @@
 # EDPE Status — Elite Dangerous Performance Enhanced
 
-**Last updated:** 2026-10-05
+**Last updated:** 2026-10-15
 
 This file documents **verified facts only**. Unverified claims, hypotheses, or speculative results are not recorded here. See `AGENTS.md` and `PLAN.md` for project governance and roadmap.
 
@@ -182,6 +182,7 @@ Per `docs/render-pipeline-observations.md` (2026-09-23 game build `2026.09.03.33
 |--------|--------|-------|
 | `EDPE.dll` + `dxgi.dll` | ✅ Built and deployable | Pre-built; CMake + NMake MSVC x64 |
 | `temporal_math_test` | ✅ Unit test | Runs CPU math verification |
+| `camera_delta_test` | ✅ Unit test | Runs CPU delta math, event flags and rate limiting verification |
 | `motion_gpu_test` | ✅ Requires D3D11 | GPU motion pass test |
 | `dxbc_fanout_test` | ✅ DXBC fanout probe | Shader hash analysis |
 | `proxy_smoke` | ✅ DLL load + Present observation | Requires EDPE.dll + dxgi.dll beside game |
@@ -194,7 +195,7 @@ Per `docs/render-pipeline-observations.md` (2026-09-23 game build `2026.09.03.33
 ## Next Verified Milestones (per PLAN.md order)
 
 1. **NGX shutdown lifecycle** - MEASURED clean in an isolated process (V1 to V5, 2 runs each); repeated init/shutdown cycles and in-game behavior remain unverified
-2. **Elite input conventions** — jitter sign/motion-scale/depth-flag/reset semantics. Observation plan in `docs/elite-input-conventions.md`. Step 1 done: native projection offset estimator, MEASURED below 1e-6 NDC on two stored Odyssey 332841 blocks; live in-game data still pending (steps 2, 3, 5)
+2. **Elite input conventions** — jitter sign/motion-scale/depth-flag/reset semantics. Observation plan in `docs/elite-input-conventions.md`. Step 1 done (native projection offset estimator); Step 4 done (read-only, throttled, nonblocking per-frame camera delta log); live in-game data still pending (steps 2, 3, 5)
 3. **DLAA at native resolution** — input == output (2560×1440), conventions verified
 4. **DLSS Super Resolution** — after DLAA validated, reduced render resolution
 
