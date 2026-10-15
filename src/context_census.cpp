@@ -134,11 +134,15 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_view;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_snapshot;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_early_color_view;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_early_color_snapshot;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_snapshot;
 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> motion_clean_color_target;
 UINT motion_color_snapshot_width = 0;
 UINT motion_color_snapshot_height = 0;
 UINT motion_early_color_width = 0;
 UINT motion_early_color_height = 0;
+UINT motion_depth_snapshot_width = 0;
+UINT motion_depth_snapshot_height = 0;
+unsigned motion_depth_snapshot_index = 0;
 bool motion_early_color_from_hud = false;
 bool hud_first_match_seen = false;
 unsigned hud_after_copy_draws = 0;
@@ -1843,6 +1847,10 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         L"EDPE: motion candidate HDR color unavailable");
     motion_color_snapshot = std::move(motion_color_view);
     motion_early_color_snapshot = std::move(motion_early_color_view);
+    motion_depth_snapshot = std::move(motion_depth_view);
+    motion_depth_snapshot_width = desc.Width;
+    motion_depth_snapshot_height = desc.Height;
+    motion_depth_snapshot_index = static_cast<unsigned>(camera_pair_target >= 0 ? camera_pair_target : 0);
     motion_clean_color_target.Reset();
     motion_color_snapshot_width = desc.Width;
     motion_color_snapshot_height = desc.Height;
@@ -2293,6 +2301,7 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             motion_color_snapshot.Reset();
             motion_early_color_view.Reset();
             motion_early_color_snapshot.Reset();
+            motion_depth_snapshot.Reset();
             motion_clean_color_target.Reset();
             motion_early_color_from_hud = false;
             motion_color_frame = ~0ull;
@@ -2408,6 +2417,14 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionEarlyColorSnapshot(UINT* width,
     return motion_early_color_snapshot.Detach();
 }
 
+ID3D11ShaderResourceView* ContextCensusTakeMotionDepthSnapshot(UINT* width, UINT* height, unsigned* index) {
+    if (!motion_depth_snapshot) return nullptr;
+    if (width) *width = motion_depth_snapshot_width;
+    if (height) *height = motion_depth_snapshot_height;
+    if (index) *index = motion_depth_snapshot_index;
+    return motion_depth_snapshot.Detach();
+}
+
 int ContextCensusSceneDepthCandidate() {
     std::lock_guard lock(seen_mutex);
     const auto frame = last_present_frame.load(std::memory_order_relaxed);
@@ -2507,6 +2524,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_color_snapshot.Reset();
         motion_early_color_view.Reset();
         motion_early_color_snapshot.Reset();
+        motion_depth_snapshot.Reset();
         motion_clean_color_target.Reset();
         motion_color_frame = ~0ull;
         motion_color_bound = motion_color_rebound =

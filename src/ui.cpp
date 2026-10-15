@@ -62,6 +62,7 @@ struct UiState {
     std::vector<TextureCaptureRequest> pending_captures;
     unsigned capture_serial = 0;
     bool pending_backbuffer_capture = false;
+    bool pending_backbuffer_capture_on_motion = false;
     bool snapshot_ready = false;
     UINT motion_width = 0;
     UINT motion_height = 0;
@@ -101,6 +102,7 @@ struct UiState {
     bool input_logged = false;
 } ui;
 std::atomic<bool> menu_visible{false};
+std::atomic<bool> all_captures_requested{false};
 std::mutex input_mutex;
 std::vector<InputMessage> pending_input;
 std::vector<InputMessage> render_input;
@@ -118,6 +120,13 @@ LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         return 0;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F5) return 0;
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        wparam == VK_F6 && !(lparam & (1LL << 30))) {
+        all_captures_requested.store(true, std::memory_order_release);
+        EdpeLog(L"EDPE: F6 pressed — requesting full capture (color, motion, depth, emission, frame)");
+        return 0;
+    }
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F6) return 0;
     if (menu_visible.load()) {
         if (message == WM_INPUT) return DefWindowProcW(window, message, wparam, lparam);
         if (isInputMessage(message)) {
@@ -855,6 +864,32 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     pollDepthSamples();
     pollFrameCapture();
+    if (all_captures_requested.exchange(false, std::memory_order_acq_rel)) {
+        int candidate = ContextCensusSceneDepthCandidate();
+        if (candidate < 0 && ui.depth_candidate >= 0 &&
+            ContextCensusDepthSnapshotAvailable(static_cast<unsigned>(ui.depth_candidate))) {
+            candidate = ui.depth_candidate;
+        }
+        if (candidate < 0 && ContextCensusDepthSnapshotAvailable(2)) {
+            candidate = 2;
+        }
+        if (candidate >= 0) {
+            ui.depth_candidate = candidate;
+            ContextCensusRequestMotionPair(static_cast<unsigned>(candidate));
+            ui.pending_backbuffer_capture_on_motion = true;
+            releaseMotionSnapshot();
+            releaseColorSnapshot();
+            releaseEarlyColorSnapshot();
+            releaseDepthSnapshot();
+            wchar_t msg[160];
+            swprintf_s(msg, L"EDPE: F6 all-captures armed on DSV #%d", candidate);
+            EdpeLog(msg);
+        } else {
+            EdpeLog(L"EDPE: F6 all-captures armed backbuffer only (no depth candidate yet)");
+            ui.pending_backbuffer_capture = true;
+        }
+    }
+    bool motion_batch_ready = false;
     if (auto* motion = ContextCensusTakeMotionSnapshot(&ui.motion_width, &ui.motion_height)) {
         releaseMotionSnapshot();
         ui.motion_srv = motion;
@@ -863,6 +898,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ensureMotionPreviewShader();
         queueTextureCaptureFromSrv(ui.motion_srv, UiState::CaptureKind::Motion);
         EdpeLog(L"EDPE: motion snapshot handed to ImGui");
+        motion_batch_ready = true;
     }
     UINT motion_color_width = 0, motion_color_height = 0;
     if (auto* color = ContextCensusTakeMotionColorSnapshot(
@@ -883,19 +919,27 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         queueTextureCaptureFromSrv(ui.early_color_srv, UiState::CaptureKind::EarlyHdr);
         EdpeLog(L"EDPE: early HDR color handed to ImGui");
     }
-    if (!menu_visible.load()) {
-        unsigned ignored = 0;
-        ID3D11RenderTargetView* color = nullptr;
-        if (auto* view = ContextCensusTakeDepthSnapshot(&ignored, &color)) view->Release();
-        if (color) color->Release();
-        std::lock_guard lock(input_mutex);
-        pending_input.clear();
-        return;
+    UINT motion_depth_width = 0, motion_depth_height = 0;
+    unsigned motion_depth_idx = 0;
+    if (auto* depth_view = ContextCensusTakeMotionDepthSnapshot(
+            &motion_depth_width, &motion_depth_height, &motion_depth_idx)) {
+        releaseDepthSnapshot();
+        ui.depth_srv = depth_view;
+        ui.depth_width = motion_depth_width;
+        ui.depth_height = motion_depth_height;
+        ui.depth_snapshot_index = static_cast<int>(motion_depth_idx);
+        ui.depth_window_open = true;
+        ui.snapshot_ready = true;
+        ensureDepthContrastShader();
+        queueTextureCaptureFromSrv(ui.depth_srv, UiState::CaptureKind::Depth, static_cast<int>(motion_depth_idx));
+        EdpeLog(L"EDPE: same-frame depth handed to ImGui");
     }
-    if (!ui.backbuffer_rtv && !createBackbufferView(swap_chain)) {
-        EdpeLog(L"EDPE: overlay backbuffer view unavailable; presenting original frame");
-        return;
+    if (motion_batch_ready && ui.pending_backbuffer_capture_on_motion) {
+        ui.pending_backbuffer_capture_on_motion = false;
+        ui.pending_backbuffer_capture = true;
     }
+
+    // Manual single depth snapshot (if triggered separately via menu button)
     unsigned captured_index = 0;
     ID3D11RenderTargetView* color = nullptr;
     if (auto* view = ContextCensusTakeDepthSnapshot(&captured_index, &color)) {
@@ -905,6 +949,27 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (color) {
         captureColorSnapshot(color, captured_index);
         color->Release();
+    }
+
+    // Clean backbuffer capture (captured before ImGui overlay is drawn)
+    if (ui.pending_backbuffer_capture) {
+        ui.pending_backbuffer_capture = false;
+        ID3D11Texture2D* backbuffer = nullptr;
+        if (SUCCEEDED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) {
+            queueTextureCapture(backbuffer, UiState::CaptureKind::Backbuffer);
+            backbuffer->Release();
+            EdpeLog(L"EDPE: clean game frame backbuffer queued for capture");
+        }
+    }
+
+    if (!menu_visible.load()) {
+        std::lock_guard lock(input_mutex);
+        pending_input.clear();
+        return;
+    }
+    if (!ui.backbuffer_rtv && !createBackbufferView(swap_chain)) {
+        EdpeLog(L"EDPE: overlay backbuffer view unavailable; presenting original frame");
+        return;
     }
 
     ImGuiContext* previous = ImGui::GetCurrentContext();
@@ -990,10 +1055,15 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (!ui.motion_window_open && ImGui::Button("Show motion snapshot"))
             ui.motion_window_open = true;
     }
+    if (ImGui::Button("Capture ALL buffers (F6)")) {
+        all_captures_requested.store(true, std::memory_order_release);
+    }
+    ImGui::SameLine();
+    ImGui::TextUnformatted("(color, motion, depth, emission, frame)");
     if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
         ui.pending_backbuffer_capture = true;
     }
-    ImGui::TextUnformatted("F5: hide menu");
+    ImGui::TextUnformatted("F5: toggle menu | F6: capture all 5 buffers");
     ImGui::End();
     if (ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);
@@ -1100,15 +1170,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     if (!window_open) menu_visible.store(false);
     ImGui::Render();
-
-    if (ui.pending_backbuffer_capture) {
-        ui.pending_backbuffer_capture = false;
-        ID3D11Texture2D* backbuffer = nullptr;
-        if (SUCCEEDED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) {
-            queueTextureCapture(backbuffer, UiState::CaptureKind::Backbuffer);
-            backbuffer->Release();
-        }
-    }
 
     ID3D11RenderTargetView* previous_rtv = nullptr;
     ID3D11DepthStencilView* previous_dsv = nullptr;

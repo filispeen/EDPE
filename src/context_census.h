@@ -16,6 +16,7 @@ bool ContextCensusRequestMotionPair(unsigned index);
 ID3D11ShaderResourceView* ContextCensusTakeMotionSnapshot(UINT* width, UINT* height);
 ID3D11ShaderResourceView* ContextCensusTakeMotionColorSnapshot(UINT* width, UINT* height);
 ID3D11ShaderResourceView* ContextCensusTakeMotionEarlyColorSnapshot(UINT* width, UINT* height);
+ID3D11ShaderResourceView* ContextCensusTakeMotionDepthSnapshot(UINT* width, UINT* height, unsigned* index = nullptr);
 int ContextCensusSceneDepthCandidate();
 ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index,
     ID3D11RenderTargetView** color_view = nullptr);
