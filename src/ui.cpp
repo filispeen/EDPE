@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "log.h"
 #include "context_census.h"
+#include "upscaler_backend.h"
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -583,6 +584,7 @@ void shutdownUi() {
     if (ui.depth_contrast_shader) ui.depth_contrast_shader->Release();
     if (ui.context) ui.context->Release();
     if (ui.device) ui.device->Release();
+    edpe::UpscalerManager::instance().shutdown();
     ui = {};
     std::lock_guard lock(input_mutex);
     pending_input.clear();
@@ -640,6 +642,7 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     if (motion_state) motion_state->Release();
     if (context1) context1->Release();
     if (device1) device1->Release();
+    edpe::UpscalerManager::instance().initialize(ui.device, ui.context);
     EdpeLog(L"EDPE: Dear ImGui ready; F5 toggles menu");
     return true;
 }
@@ -736,9 +739,15 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced", &window_open);
     ImGui::TextUnformatted("Version: unreleased");
     ImGui::TextUnformatted("Rendering: original game output");
-    ImGui::TextUnformatted("Upscaler: Native");
+    auto& upscaler = edpe::UpscalerManager::instance();
+    ImGui::Text("Upscaler: %ls", edpe::getUpscalerBackendName(upscaler.getBackend()));
+    ImGui::Text("Mode: %ls", edpe::getUpscaleModeName(upscaler.getMode()));
+    ImGui::Text("Status: %ls", upscaler.getDiagnostics().statusMessage);
     ImGui::BeginDisabled();
-    ImGui::TextUnformatted("DLAA / DLSS / FSR: temporal inputs not yet verified");
+    ImGui::Text("NVIDIA DLAA / DLSS: %ls",
+        upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
+    ImGui::Text("AMD FSR: %ls",
+        upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::AmdFsr));
     ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
     ImGui::EndDisabled();
     const bool sequence_available = ContextCensusBindSequenceAvailable();
