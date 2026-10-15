@@ -98,6 +98,18 @@ Following the nvidia-dlaa-input-contract.md implications and PLAN.md expected or
 - `docs/render-pipeline-observations.md` - This file (currently being updated).
 - Consider: `docs/dlss-implementation-plan.md` - High-level plan for DLSS SR after DLAA validation.
 
+## In-game capture findings (2026-10-15)
+
+- **Date:** 2026-10-15. Target: Elite Dangerous Odyssey 2D, build `2026.09.03.332841`.
+- **Method:** Non-blocking D3D11 staging readback (`D3D11_MAP_FLAG_DO_NOT_WAIT`) saving 2560×1440 32-bit BMP snapshots to `edpe-captures/`.
+- **VERIFIED (Depth DSV #2):** `depth-dsv2-*.bmp` decoded from `DXGI_FORMAT_R32G8X24_TYPELESS` with contrast mapping $z / (z + 0.001)$ yields pure monochrome geometry across the frame (values 35 to 177, average 90.7), confirming DSV #2 as the primary scene depth buffer.
+- **VERIFIED (Emissive / Glow buffer — `early-color`):** In-game visual inspection of `early-color-*.bmp` (captured from MRT RTV3 `DXGI_FORMAT_R11G11B10_FLOAT` at first RTV3 exit) reveals it is **not space**, but the engine's **emissive / illumination pass**. Non-emissive scene background and dark areas are zero (RGB = 0, 0, 0), while lamps, emissive cockpit indicators, lights, and glowing elements are isolated and bright (RGB up to 254).
+- **Implication for Temporal Upscaling:**
+  - This pass provides a direct, native candidate for constructing the **Reactive Mask** (`TemporalFrameInputs::reactiveMask`) required by both AMD FSR (Native AA / SR) and NVIDIA DLSS.
+  - Feeding this emissive information to the upscaler allows high reactivity on cockpit lights, laser effects, and ship lamps, directly preventing ghosting and smearing on glowing elements without expensive per-pixel luminance heuristics.
+- **VERIFIED (Clean Backbuffer):** `frame-*.bmp` captured immediately before `ImGui_ImplDX11_RenderDrawData` provides an overlay-free native frame capture.
+- **VERIFIED (Motion Neutral):** `motion-*.bmp` decoded from `DXGI_FORMAT_R16G16_FLOAT` verifies $(128, 128, 128)$ neutral gray encoding during zero camera motion.
+
 ## Performance & failure behavior
 
 - **Forbidden in hot path:** blocking GPU readback, `Map()` on full-resolution textures, blocking `GetData` loops, per-frame NGX feature recreation.

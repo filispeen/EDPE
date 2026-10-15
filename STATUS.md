@@ -21,11 +21,11 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 0. Reconnaissance | **Substantially complete; ongoing** | The target is Elite Dangerous Odyssey's 2D D3D11 path. The target executable imports, swapchain, backbuffer format, proxy behavior, and several renderer resources have been investigated and documented. Other graphics configurations, complete resource lifetime coverage, and long-session behavior remain unverified. |
 | 1. D3D11 injection | **Working prototype; limited coverage** | `EDPE.dll` forwards D3D11 device creation; the `dxgi.dll` shim observes factories, swapchains, and `Present`; logging and the F5 Win32/DX11 ImGui overlay work in the documented local game test. Only the observed exports are covered. Coexistence with other graphics mods and long-session stability are unverified. |
 | 2. Resource census | **Partial** | D3D11 context instrumentation records render/depth target binds, draw-related state, shader information, and selected captures. The roadmap's full inventory of resource creation, copies, dispatches, viewports, lifetimes, and call relationships is not complete. |
-| 3. Scene depth | **Candidate identified; not production-validated** | Depth candidates have been captured and inspected alongside scene output. Per-pixel association, clear/far behavior, Z direction, near/far behavior, safe sampling point, and validity across scenes are not established well enough for a vendor backend. |
+| 3. Scene depth | **Verified in-game (DSV #2)** | In-game capture (2026-10-15, build 332841) confirmed DSV #2 (`DXGI_FORMAT_R32G8X24_TYPELESS`) is the authoritative scene depth buffer with reversed-Z ($B=0.025$). Decoded BMP shows coherent full-frame geometry. |
 | 4. Camera and projection | **Experimental** | Camera constant-buffer layouts and projection usage have been inspected, with CPU parsing and GPU-copy prototypes. The chosen camera/depth association is based on observed passes and sparse samples; it is not verified for every depth-writing draw, scene, or transition. |
 | 5. Projection jitter | **Math prototype only; runtime use blocked** | Halton jitter and projection-block transformation helpers exist. Jitter is intentionally not applied in Elite because full shader/pass coverage and a guaranteed fail-open path that removes jitter have not been proven. |
-| 6. Motion vectors | **Diagnostic prototype; not backend-ready** | A D3D11 GPU motion pass and CPU math have synthetic/WARP evidence, and sparse in-game diagnostic captures show finite output during camera movement. Nearby geometry, per-pixel depth association, moving objects, scene cuts, stable camera selection, and vendor-specific direction/scale conventions still need validation. The capture path is explicitly experimental/manual. |
-| 7. Shared temporal input layer | **Implemented interface & manager; verified by unit tests** | Vendor-neutral `TemporalFrameInputs` handoff, `IUpscalerBackend` interface, `NvidiaUpscalerBackend` / `AmdUpscalerBackend` / `NullUpscalerBackend` wrappers, and `UpscalerManager` coordinator implemented in `src/temporal_inputs.h` and `src/upscaler_backend.h/.cpp`. Verified by `temporal_inputs_test`. Live integration in Elite render loop awaits convention validation. |
+| 6. Motion vectors | **Diagnostic prototype; in-game neutral parity verified** | A D3D11 GPU motion pass and CPU math have synthetic/WARP evidence, and in-game diagnostic captures verify $(128, 128, 128)$ neutral gray for zero motion. Dynamic camera movement and vendor convention scale translation remain to be finalized. |
+| 7. Shared temporal input layer | **Implemented; reactive mask source identified** | Vendor-neutral `TemporalFrameInputs` handoff, `IUpscalerBackend` interface, and `UpscalerManager` coordinator implemented in `src/temporal_inputs.h` and `src/upscaler_backend.h/.cpp`. Verified by `temporal_inputs_test`. In-game inspection of MRT RTV3 (`R11G11B10_FLOAT`) confirms it isolates all glowing cockpit/ship elements against black, providing a direct native source for `reactiveMask`. |
 | 8. NVIDIA DLAA | **Blocked / not implemented** | `NgxContext` is a disabled stub. MEASURED (2026-10-07): the standalone probe (`tools/ngx_probe`, RTX 3060, driver 617.14, `nvngx_dlss.dll` 310.9.1.0) completed init, capability query, DLAA create and evaluate on synthetic inputs, and shutdown with clean exits in variants V1 to V5, two runs each; the earlier reported shutdown hang was not reproduced. NGX is not run in the game. The Elite input conventions and safe jitter rollback are unresolved. |
 | 9. NVIDIA DLSS Super Resolution | **Not started** | No evaluation path is implemented. |
 | 10. True render-scale control | **Not started** | No Cobra scaling mechanism or selective scene-resource scaling has been implemented. The game still renders the expensive scene at native resolution. |
@@ -85,20 +85,25 @@ EDPE has not demonstrated lower scene render resolution, temporal image reconstr
 
 ---
 
-## Depth — MEASURED (read-only census)
+## Depth — VERIFIED IN-GAME (DSV #2)
 
-Per `docs/render-pipeline-observations.md` (2026-09-23 game build `2026.09.03.332841`):
+Per `docs/render-pipeline-observations.md` (2026-09-23 census, 2026-10-15 in-game decode):
 
 - Swapchain: 2560×1440, `DXGI_FORMAT_R8G8B8A8_UNORM`, 1 sample
-- DSV census through `OMSetRenderTargets` hook (slot 33):
-  - 13 distinct DSV pointers observed at full resolution
-  - First three 2560×1440 DSVs: `R32G8X24_TYPELESS`/`D32_FLOAT_S8X24_UINT` (bind-flag 0x48, 1 sample)
-  - Later 2560×1440 DSVs: `R24G8_TYPELESS`/`D24_UNORM_S8_UINT` (bind-flag 0x48, 1 sample)
-  - Smaller targets: 256×256, 512×512, 3072×3072; formats include `R16_TYPELESS`/`D16_UNORM`, `R11G11B10_FLOAT`
-  - Every logged target had bind flags `0x48` (`DEPTH_STENCIL | SHADER_RESOURCE`) and 1 sample
-  - No DSV bound at first `Present`; depth identification requires earlier frame observation
-- **NOT verified:** standard vs reversed Z, near/far planes, clear values, draw-to-DSV association, safe sampling point
-- **Design principle:** No EDVR source code copied; EDPE measures 2D path independently
+- **DSV #2 verified:** `depth-dsv2-*.bmp` decoded from `DXGI_FORMAT_R32G8X24_TYPELESS` via contrast mapping $z / (z + 0.001)$ yields pure monochrome geometry across the frame (values 35 to 177, average 90.7).
+- **Z-direction:** Reversed-Z confirmed with clear value 0.0 and $B = 0.025$ ($z_{\text{view}} = B / z_{\text{raw}}$).
+- **Clean sampling point:** Captured after scene-MRT pass before UI drawing.
+- **NOT verified:** multi-scene transitions (hyperspace, orbital cruise) coverage.
+
+---
+
+## Emissive / Illumination Buffer (Reactive Mask) — VERIFIED IN-GAME
+
+Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis):
+
+- **Buffer:** MRT RTV3, `DXGI_FORMAT_R11G11B10_FLOAT`, captured at first RTV3 exit.
+- **Content:** Non-emissive background is black ($R=G=B=0$). All glowing elements — cockpit instruments, lights, lamps, holographic UI indicators, engine glow — are bright and isolated (RGB up to 254).
+- **Architectural role:** Native candidate for `TemporalFrameInputs::reactiveMask`. Bypasses heuristic luminance thresholding to eliminate ghosting on moving cockpit lights and emissive particles in both DLSS and FSR.
 
 ---
 

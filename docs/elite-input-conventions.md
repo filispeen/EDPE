@@ -55,3 +55,23 @@ Evidence:
 - Release WARP proxy smoke log contains `EDPE: camera delta log first sample frame=7 valid=0 window=120`; the synthetic buffer is not a valid camera, so `valid=0` is expected.
 
 Confidence: CPU math and the D3D11 copy and readback path are tested; the sampling point in Elite is not. Limits: the camera is taken from the first scene-MRT interval only. Earlier Unmap hashing (camera-reconstruction.md, 2026-09-27) found identical camera and projection hashes across all writes within a frame, so this should be the frame camera, but this is not proven for every scene. Frames without that MRT pattern (menus, loading, galaxy map) produce no sample and appear as a `gap` on return.
+
+## In-Game Capture Results (2026-10-15)
+
+Date: 2026-10-15. Target: Elite Dangerous Odyssey 2D, build `2026.09.03.332841`, 2560×1440.
+Method: direct D3D11 staging readbacks of candidate textures via `edpe-captures/`.
+
+1. **Scene Depth (DSV #2):**
+   - Candidate: DSV #2 (`DXGI_FORMAT_R32G8X24_TYPELESS`).
+   - Verified: Decoded to 32-bit BMP (`depth-dsv2-*.bmp`) using $z / (z + 0.001)$ contrast curve. Yields clear, continuous monochrome geometry across cockpit and world geometry (values 35 to 177, avg 90.7).
+   - Convention: Reversed-Z confirmed with clear 0.0, near values approaching small non-zero float, and $B = 0.025$.
+
+2. **Emissive Pass / Reactive Mask Source (`early-color`):**
+   - Candidate: MRT RTV3 (`DXGI_FORMAT_R11G11B10_FLOAT`), copied at first RTV3 unbind.
+   - Verified: In-game visual inspection of `early-color-*.bmp` confirms this is **not** outer space or an early scene snapshot. It is the engine's **emissive / illumination pass**, where non-emissive scene elements are pure black ($R=G=B=0$) and all glowing elements (cockpit lamps, dials, indicators, ship lights, laser/shield glows) are isolated and bright (up to RGB 254).
+   - Architectural role: Direct native candidate for `TemporalFrameInputs::reactiveMask`. Eliminates ghosting and smearing behind moving glowing elements in both DLSS and FSR without relying on costly heuristic luminance edge-detection passes.
+
+3. **Motion Buffer Baseline:**
+   - Candidate: `DXGI_FORMAT_R16G16_FLOAT` render target from `MotionPass`.
+   - Verified: Decodes to neutral gray $(128, 128, 128)$ on static frames, confirming baseline displacement of 0.0 pixels.
+

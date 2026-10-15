@@ -979,9 +979,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (!ui.color_window_open && ImGui::Button("Show scene color snapshot")) ui.color_window_open = true;
     }
     if (ui.early_color_srv) {
-        ImGui::Text("Early HDR candidate: %ux%u", ui.early_color_width,
+        ImGui::Text("Emissive (Early HDR) candidate: %ux%u", ui.early_color_width,
             ui.early_color_height);
-        if (!ui.early_color_window_open && ImGui::Button("Show early HDR snapshot"))
+        if (!ui.early_color_window_open && ImGui::Button("Show emissive / glow snapshot"))
             ui.early_color_window_open = true;
     }
     if (ui.motion_srv) {
@@ -1056,9 +1056,10 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     if (ui.early_color_srv && ui.early_color_window_open) {
         placeSnapshotWindow(0);
-        if (ImGui::Begin("EDPE Early HDR Snapshot", &ui.early_color_window_open)) {
-            ImGui::TextUnformatted("Early HDR candidate; capture point in edpe.log");
-            if (ui.early_color_srv && ImGui::Button("Save early HDR to BMP")) {
+        if (ImGui::Begin("EDPE Emissive / Glow (Early HDR) Snapshot", &ui.early_color_window_open)) {
+            ImGui::TextUnformatted("Emissive / illumination pass: lamps, dials, lights");
+            ImGui::TextUnformatted("Direct native candidate for upscaler Reactive Mask");
+            if (ui.early_color_srv && ImGui::Button("Save emissive to BMP")) {
                 queueTextureCaptureFromSrv(ui.early_color_srv, UiState::CaptureKind::EarlyHdr);
             }
             float width = ImGui::GetContentRegionAvail().x;
