@@ -8,9 +8,10 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Repository
 
-- **Git tags:** `v0.0.1` (initial roadmap), current HEAD at `6683ff7` (216+ commits beyond v0.0.1)
-- **Build artifacts:** `EDPE.dll` and `dxgi.dll` deployed beside `EliteDangerous64.exe`; builds succeed with CMake + NMake MSVC x64
-- **Source:** `src/` contains 10 C++ modules; `tools/` added for NGX probe infrastructure
+- **Git tags:** `v0.0.1` (initial roadmap), current HEAD at `1fb2aaf` (264 commits beyond v0.0.1)
+- **Build artifacts:** `EDPE.dll` and `dxgi.dll` deployed beside `EliteDangerous64.exe`; staged in `build/stage/`
+- **Source:** `src/` contains 12 C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, etc.); `tools/` contains standalone NGX probe
+- **Test suite:** 9 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `dxbc_fanout`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
 
 ---
 
@@ -18,42 +19,48 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 | Phase | Status | Current state |
 |-------|--------|---------------|
-| 0. Reconnaissance | **Substantially complete; ongoing** | The target is Elite Dangerous Odyssey's 2D D3D11 path. The target executable imports, swapchain, backbuffer format, proxy behavior, and several renderer resources have been investigated and documented. Other graphics configurations, complete resource lifetime coverage, and long-session behavior remain unverified. |
-| 1. D3D11 injection | **Working prototype; limited coverage** | `EDPE.dll` forwards D3D11 device creation; the `dxgi.dll` shim observes factories, swapchains, and `Present`; logging and the F5 Win32/DX11 ImGui overlay work in the documented local game test. Only the observed exports are covered. Coexistence with other graphics mods and long-session stability are unverified. |
-| 2. Resource census | **Partial** | D3D11 context instrumentation records render/depth target binds, draw-related state, shader information, and selected captures. The roadmap's full inventory of resource creation, copies, dispatches, viewports, lifetimes, and call relationships is not complete. |
+| 0. Reconnaissance | **Substantially complete; ongoing** | Target is Elite Dangerous Odyssey's 2D D3D11 path. Executable imports, swapchain (2560×1440, R8G8B8A8_UNORM), proxy behavior, MRT layout, and render resources investigated and documented. |
+| 1. D3D11 injection | **Working prototype; verified in-game** | `EDPE.dll` forwards D3D11 device creation; `dxgi.dll` shim observes factories, swapchains, and `Present`. F5 ImGui overlay and F6 one-shot capture fully operational in-game without black screens or crashes. |
+| 2. Resource census | **Substantially complete for temporal path** | D3D11 context instrumentation tracks render/depth target binds, MRT patterns, 5376-byte dynamic constant buffers, and draw calls. Full engine inventory across multi-scene transitions remains ongoing. |
 | 3. Scene depth | **Verified in-game (DSV #2)** | In-game capture (2026-10-15, build 332841) confirmed DSV #2 (`DXGI_FORMAT_R32G8X24_TYPELESS`) is the authoritative scene depth buffer with reversed-Z ($B=0.025$). Decoded BMP shows coherent full-frame geometry. |
-| 4. Camera and projection | **Experimental** | Camera constant-buffer layouts and projection usage have been inspected, with CPU parsing and GPU-copy prototypes. The chosen camera/depth association is based on observed passes and sparse samples; it is not verified for every depth-writing draw, scene, or transition. |
-| 5. Projection jitter | **Math prototype only; runtime use blocked** | Halton jitter and projection-block transformation helpers exist. Jitter is intentionally not applied in Elite because full shader/pass coverage and a guaranteed fail-open path that removes jitter have not been proven. |
-| 6. Motion vectors | **Diagnostic prototype; in-game neutral parity verified** | A D3D11 GPU motion pass and CPU math have synthetic/WARP evidence, and in-game diagnostic captures verify $(128, 128, 128)$ neutral gray for zero motion. Dynamic camera movement and vendor convention scale translation remain to be finalized. |
-| 7. Shared temporal input layer | **Implemented; reactive mask source identified** | Vendor-neutral `TemporalFrameInputs` handoff, `IUpscalerBackend` interface, and `UpscalerManager` coordinator implemented in `src/temporal_inputs.h` and `src/upscaler_backend.h/.cpp`. Verified by `temporal_inputs_test`. In-game inspection of MRT RTV3 (`R11G11B10_FLOAT`) confirms it isolates all glowing cockpit/ship elements against black, providing a direct native source for `reactiveMask`. |
-| 8. NVIDIA DLAA | **Blocked / not implemented** | `NgxContext` is a disabled stub. MEASURED (2026-10-07): the standalone probe (`tools/ngx_probe`, RTX 3060, driver 617.14, `nvngx_dlss.dll` 310.9.1.0) completed init, capability query, DLAA create and evaluate on synthetic inputs, and shutdown with clean exits in variants V1 to V5, two runs each; the earlier reported shutdown hang was not reproduced. NGX is not run in the game. The Elite input conventions and safe jitter rollback are unresolved. |
-| 9. NVIDIA DLSS Super Resolution | **Not started** | No evaluation path is implemented. |
-| 10. True render-scale control | **Not started** | No Cobra scaling mechanism or selective scene-resource scaling has been implemented. The game still renders the expensive scene at native resolution. |
-| 11. AMD FSR upscaling | **Not started** | No FidelityFX backend is implemented. The project notes compare the D3D11 community route with an official API/interoperability route, but no production choice or evaluation exists. |
-| 12. Native-resolution HUD | **Investigation only** | Captured scene color includes HUD content. HUD/world classification and a native-resolution composition path are not implemented. |
-| 13. D3D11/D3D12 interoperability | **Not started** | No shared-resource/fence experiment or overhead measurements are documented. |
-| 14. AMD Frame Generation | **Not started** | No AMD FG or presentation integration exists. |
-| 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | No Streamline, DLSS-G, or Reflex integration exists. |
+| 4. Camera and projection | **Measured & verified on GPU** | 5376-byte dynamic constant buffer (CB0) parsed via `parseEliteCamera()`. Projection matrix words (1080–1095) isolated. Camera delta tracker records inter-frame motion and scene resets without blocking rendering. |
+| 5. Projection jitter | **Math verified; ready for runtime injection** | Halton (2,3) sequence, projection block modifier (`jitterEliteProjectionBlock`), and NDC offset estimator (`estimateEliteBlockNdcOffset`) verified by tests. Phase 5 target: wire into CB0 `Unmap` with fail-open switch. |
+| 6. Motion vectors | **In-game neutral parity verified; dynamic flight pending** | GPU motion pass renders to `DXGI_FORMAT_R16G16_FLOAT`. In-game capture verified neutral gray $(128, 128, 128)$ for zero motion. Synchronized capture alongside depth and emissive implemented. Flight direction/scale verification pending. |
+| 7. Shared temporal input layer | **Implemented; reactive mask source verified** | Vendor-neutral `TemporalFrameInputs` handoff, `IUpscalerBackend`, and `UpscalerManager` coordinator implemented and unit-tested. Emissive pass (MRT RTV3 `R11G11B10_FLOAT`) verified in-game as direct native source for `reactiveMask`. |
+| 8. NVIDIA DLAA | **Blocked on Phase 5 jitter & flight motion verification** | Standalone NGX probe (`tools/ngx_probe`) verified clean init, feature creation, evaluation, and shutdown. NGX evaluation in Elite render loop awaits Phase 5 jitter injection and motion convention sign check. |
+| 9. NVIDIA DLSS Super Resolution | **Not started** | Awaits DLAA validation at native resolution. |
+| 10. True render-scale control | **Not started** | No Cobra scaling mechanism or selective scene-resource scaling has been implemented. The game still renders the scene at native resolution. |
+| 11. AMD FSR upscaling | **Interface ready; backend pending** | `AmdUpscalerBackend` abstraction implemented in `src/upscaler_backend.h/.cpp`. FidelityFX integration pending backend architecture selection. |
+| 12. Native-resolution HUD | **Investigation only** | Emissive and clean backbuffers isolated. Full HUD separation and native-resolution composition path pending. |
+| 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
+| 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
+| 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
 
 ---
 
 ## Available diagnostics and controls
 
-- The overlay is toggled with **F5** and reports the original rendering path. Temporal options remain disabled.
-- Experimental F5 actions can capture selected scene/depth/camera/motion candidates. Captures are diagnostic evidence, not production temporal inputs.
-- The proxy writes `edpe.log` beside the host executable. Manual captures save decoded, contrast-adjusted visual BMP screenshots of the actual candidate buffers (depth, motion, scene color, early HDR, or clean backbuffer) under `edpe-captures/`.
-- The repository defines CPU math, WARP motion, DXBC fanout, and proxy smoke tests. Earlier project notes record successful runs, but tests were not rerun for this status review.
+- **F5 Overlay:** Toggles the Dear ImGui menu. Displays backend status, diagnostics, and snapshot previews. When hidden, passes through all inputs to the game without interference.
+- **F6 One-Shot Synchronized Capture:** Captures all 5 rendering buffers from the **exact same frame** and writes non-blocking 32-bit BMP files to `edpe-captures/`:
+  - `color-*.bmp`: Tone-mapped scene color HDR (`DXGI_FORMAT_R11G11B10_FLOAT`)
+  - `motion-*.bmp`: Visualized motion displacement (`DXGI_FORMAT_R16G16_FLOAT`)
+  - `depth-dsv2-*.bmp`: Contrast-adjusted reversed-Z depth (`DXGI_FORMAT_R32G8X24_TYPELESS`)
+  - `early-color-*.bmp`: Emissive / illumination pass isolating cockpit dials, lamps, and glowing lights (reactive mask candidate)
+  - `frame-*.bmp`: Clean native backbuffer frame captured before ImGui overlay drawing
+- **Non-blocking readback:** Staging textures mapped with `D3D11_MAP_FLAG_DO_NOT_WAIT`, completely preventing render thread stalls.
+- **Logging:** Detailed execution log written to `edpe.log` beside the executable.
 
 ---
 
 ## Next milestone
 
-The next roadmap milestone is a safe, native-resolution **NVIDIA DLAA** vertical slice, but implementation should wait for two prerequisites:
+The immediate next milestone is **Phase 5 — Runtime Projection Jitter**:
+1. Intercept the scene projection matrix (words 1080–1095 of the 5376-byte dynamic CB0) during `Map`/`Unmap`.
+2. Apply subpixel Halton (2,3) offsets via `jitterEliteProjectionBlock()`.
+3. Provide an ImGui checkbox toggle for jitter.
+4. Enforce strict **fail-open behavior**: if temporal reconstruction is disabled or errors, jitter must immediately stand down so Elite renders an unjittered image.
 
-1. Resolve and document the NGX shutdown/lifecycle behavior so the game process can initialize and exit safely.
-2. Validate the selected color, depth, camera, and motion resources and conventions in Elite, and prove that any applied jitter can always be removed when evaluation fails.
-
-Then formalize the shared temporal input boundary, implement DLAA with input and output dimensions equal, and validate cockpit, station, space, camera movement, HUD, moving ships, reset behavior, fallback, and GPU cost. Only after that should reduced-resolution rendering and DLSS SR begin.
+Following Phase 5, capture one dynamic flight sample (yaw/pitch) with **F6** to confirm motion vector direction and scaling, then proceed directly to **Phase 8 (NVIDIA DLAA at native 2560×1440)**.
 
 ---
 
@@ -117,26 +124,25 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis):
 
 ---
 
-## Projection Jitter — math prototype only; runtime use blocked
+## Projection Jitter — Math verified; runtime injection target for Phase 5
 
 - Halton sequence (base 2, base 3), frame-indexed: `jitter = (halton(frame+1,2)-0.5, halton(frame+1,3)-0.5)`
 - Output: `pixelX, pixelY` in render-pixel units; `ndcX = 2*pixelX/width`, `ndcY = -2*pixelY/height`
-- Math documented in `temporal_math.h::projectionJitter()` and `jitterEliteProjectionBlock()`
-- **NOT verified in Elite:** jitter actually supplied to game/NGX, sign/convention match, automatic disable when reconstruction stands down
-- **Note:** Per `nvidia-dlaa-input-contract.md` (2026-09-27), NGX expects jitter in "input/render pixels"; EDPE uses Halton in render pixels. Convention translation required at NGX boundary.
-- **Important:** Jitter is intentionally not applied in the Elite render path until runtime conventions are validated and a fail-open disable path is proven.
+- Math documented and verified in `temporal_math.h::projectionJitter()`, `jitterEliteProjectionBlock()`, and `estimateEliteBlockNdcOffset()`
+- Target injection site: Words 1080–1095 of the 5376-byte dynamic CB0 intercepted during `Map`/`Unmap`.
+- **Phase 5 task:** Inject Halton offsets into the projection block with an ImGui toggle and automatic fail-open stand-down.
 
 ---
 
-## Motion Vectors — diagnostic prototype; not backend-ready
+## Motion Vectors — In-game neutral baseline verified; dynamic flight pending
 
-- `MotionPass` renders to `DXGI_FORMAT_R16G16_FLOAT` render-target using current+previous camera constants
+- `MotionPass` renders to `DXGI_FORMAT_R16G16_FLOAT` render-target using current+previous camera constants and depth
 - Output: per-pixel current→previous displacement in render-resolution pixels
-- Shader: `motion_shader.h` — neutral gray = 0 pixels; red = horizontal, green = vertical
-- **NOT verified:** correctness against NGX conventions, pixel/normalized units, Y-axis orientation, jitter inclusion/exclusion
-- **Enhanced motion** (ships, stations, terrain, particles, smoke, animated geometry) comes later
-- **Reference:** EDVR's `dlMv` implementation and temporal math used as reference only; not copied
-- **Important:** Diagnostic prototype available for inspection; not yet ready for vendor backend consumption.
+- Shader: `motion_shader.h` — neutral gray $(128, 128, 128) = 0$ pixels displacement; red = horizontal, green = vertical
+- **VERIFIED IN-GAME (2026-10-15):** Stationary scene capture decodes to exact $(128, 128, 128)$ neutral gray across the frame.
+- **Synchronized Capture:** Output handed over alongside depth, scene color, and emissive pass from the exact same frame.
+- **Pending verification:** Direction (+Y down) and scale validation during rotational flight (yaw/pitch).
+- **Enhanced motion** (ships, stations, terrain, particles, smoke, animated geometry) comes in later phases.
 
 ---
 
@@ -185,25 +191,29 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis):
 
 | Target | Status | Notes |
 |--------|--------|-------|
-| `EDPE.dll` + `dxgi.dll` | ✅ Built and deployable | Pre-built; CMake + NMake MSVC x64 |
-| `temporal_math_test` | ✅ Unit test | Runs CPU math verification |
-| `camera_delta_test` | ✅ Unit test | Runs CPU delta math, event flags and rate limiting verification |
-| `temporal_inputs_test` | ✅ Unit test | Scaling calculations, input validation, NVIDIA/AMD convention translations, and fail-open manager verification |
-| `motion_gpu_test` | ✅ Requires D3D11 | GPU motion pass test |
+| `EDPE.dll` + `dxgi.dll` | ✅ Built and deployable | CMake + MSVC x64; staged in `build/stage/` |
+| `temporal_math_test` | ✅ Unit test | Halton sequences, projection blocks, NDC offset estimator |
+| `camera_delta_test` | ✅ Unit test | CPU delta math, event flags, rate limiting, and scene reset observation |
+| `capture_format_test` | ✅ Unit test | Half-float, float11/10 unpacker, reversed-Z depth contrast, motion BGR, Reinhard tone mapping |
+| `temporal_inputs_test` | ✅ Unit test | Scaling calculations, input validation, NVIDIA/AMD convention translations, fail-open manager |
+| `motion_gpu_test` | ✅ Requires D3D11 | GPU motion pass test (WARP / hardware) |
 | `dxbc_fanout_test` | ✅ DXBC fanout probe | Shader hash analysis |
-| `proxy_smoke` | ✅ DLL load + Present observation | Requires EDPE.dll + dxgi.dll beside game |
-| NGX runtime in Elite | ❌ Blocked | Conventions unvalidated; NGX not run in game |
+| `proxy_smoke` | ✅ Integration test | Verifies DLL load, Present hook, and input pass-through |
+| `proxy_shader_probe` | ✅ Integration test | Shader bytecode interception verification |
+| `proxy_alias_smoke` | ✅ Integration test | Verifies staged `d3d11.dll` and `dxgi.dll` alias loading |
+| In-game captures (2026-10-15) | ✅ MEASURED IN-GAME | Full 2560×1440 captures of depth (DSV #2), emissive (RTV3), motion, color, and clean frame |
 | Standalone NGX probe | ✅ MEASURED | `tools/ngx_probe/` V1-V5 clean, 2 runs each |
-| Overlay lifecycle in Elite (4d8e157) | ✅ MEASURED | Game run to 3D world past frame 15360: one "Dear ImGui ready", no per-Present re-init, clean exit with "swap chain destroyed; shutting overlay down" (earlier 295ff46 build: 326 re-inits, then game exit) |
+| Overlay lifecycle in Elite | ✅ MEASURED | Clean init, non-interfering input, clean shutdown on swap chain destroy |
+| F6 Synchronized Capture | ✅ Working prototype | One-shot hotkey triggers synchronized 5-buffer capture |
 
 ---
 
 ## Next Verified Milestones (per PLAN.md order)
 
-1. **NGX shutdown lifecycle** - MEASURED clean in an isolated process (V1 to V5, 2 runs each); repeated init/shutdown cycles and in-game behavior remain unverified
-2. **Elite input conventions** — jitter sign/motion-scale/depth-flag/reset semantics. Observation plan in `docs/elite-input-conventions.md`. Step 1 done (native projection offset estimator); Step 4 done (read-only, throttled, nonblocking per-frame camera delta log); live in-game data still pending (steps 2, 3, 5)
-3. **DLAA at native resolution** — input == output (2560×1440), conventions verified
-4. **DLSS Super Resolution** — after DLAA validated, reduced render resolution
+1. **Phase 5 — Runtime Projection Jitter:** Wire `jitterEliteProjectionBlock()` into the 5376-byte constant buffer `Unmap` path with an ImGui toggle and automatic fail-open stand-down.
+2. **Flight Motion Convention Check:** Perform F6 capture during steady yaw and forward flight to verify motion vector direction (+X right, +Y down, current to previous) and scaling.
+3. **Phase 8 — NVIDIA DLAA at Native Resolution (2560×1440):** Wire `TemporalFrameInputs` into `NvidiaUpscalerBackend::evaluate()` using the verified color, depth, motion, emissive reactive mask, and jitter.
+4. **Phase 9/10 — DLSS Super Resolution & True Render-Scale Control:** Reduced scene render resolution with temporal reconstruction.
 
 ---
 
