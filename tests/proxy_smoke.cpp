@@ -602,7 +602,8 @@ int wmain(int argc, wchar_t** argv) {
         context_hook_restored && draw_hooks_restored &&
         interval_observed &&
         read && saved_bmp && !std::strstr(contents, "OLD_SESSION") &&
-        std::strstr(contents, "EDPE: frame capture saved ") &&
+        (std::strstr(contents, "EDPE: depth capture saved ") ||
+         std::strstr(contents, "EDPE: frame capture saved ")) &&
         std::strstr(contents, "EDPE: D3D11 device created") &&
         std::strstr(contents, "EDPE: DXGI factory created") &&
         std::strstr(contents, "EDPE: Present swapchain=") &&

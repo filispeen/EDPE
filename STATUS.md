@@ -41,7 +41,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 - The overlay is toggled with **F5** and reports the original rendering path. Temporal options remain disabled.
 - Experimental F5 actions can capture selected scene/depth/camera/motion candidates. Captures are diagnostic evidence, not production temporal inputs.
-- The proxy writes `edpe.log` beside the host executable. Manual captures may also save visual BMP screenshots under `edpe-captures`; those images are not raw depth or motion data.
+- The proxy writes `edpe.log` beside the host executable. Manual captures save decoded, contrast-adjusted visual BMP screenshots of the actual candidate buffers (depth, motion, scene color, early HDR, or clean backbuffer) under `edpe-captures/`.
 - The repository defines CPU math, WARP motion, DXBC fanout, and proxy smoke tests. Earlier project notes record successful runs, but tests were not rerun for this status review.
 
 ---

@@ -2,6 +2,7 @@
 #include "log.h"
 #include "context_census.h"
 #include "upscaler_backend.h"
+#include "capture_format.h"
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -30,6 +31,24 @@ struct InputMessage {
 };
 
 struct UiState {
+    enum class CaptureKind {
+        Depth,
+        Motion,
+        SceneColor,
+        EarlyHdr,
+        Backbuffer
+    };
+
+    struct TextureCaptureRequest {
+        ID3D11Texture2D* staging = nullptr;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        UINT width = 0;
+        UINT height = 0;
+        unsigned attempts = 0;
+        CaptureKind kind = CaptureKind::Depth;
+        int index = -1;
+    };
+
     IDXGISwapChain* swap_chain = nullptr; // Weak: the game's Release owns its lifetime.
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -40,12 +59,9 @@ struct UiState {
     ID3D11ShaderResourceView* color_srv = nullptr;
     ID3D11ShaderResourceView* early_color_srv = nullptr;
     ID3D11ShaderResourceView* motion_srv = nullptr;
-    ID3D11Texture2D* frame_staging = nullptr;
-    DXGI_FORMAT frame_format = DXGI_FORMAT_UNKNOWN;
-    UINT frame_width = 0;
-    UINT frame_height = 0;
-    unsigned frame_attempts = 0;
-    unsigned frame_serial = 0;
+    std::vector<TextureCaptureRequest> pending_captures;
+    unsigned capture_serial = 0;
+    bool pending_backbuffer_capture = false;
     bool snapshot_ready = false;
     UINT motion_width = 0;
     UINT motion_height = 0;
@@ -158,101 +174,266 @@ void releaseMotionSnapshot() {
     ui.motion_srv = nullptr;
 }
 
+void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int index = -1) {
+    if (!source || !ui.device || !ui.context) return;
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    if (!desc.Width || !desc.Height || desc.SampleDesc.Count != 1 ||
+        static_cast<unsigned long long>(desc.Width) * desc.Height > 7680ull * 4320) {
+        EdpeLog(L"EDPE: texture capture skipped (unsupported layout or dimensions)");
+        return;
+    }
+    if (ui.pending_captures.size() >= 8) {
+        EdpeLog(L"EDPE: texture capture skipped (too many pending captures)");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.MiscFlags = 0;
+    staging_desc.MipLevels = 1;
+    staging_desc.ArraySize = 1;
+    ID3D11Texture2D* staging = nullptr;
+    if (SUCCEEDED(ui.device->CreateTexture2D(&staging_desc, nullptr, &staging))) {
+        ui.context->CopyResource(staging, source);
+        ui.pending_captures.push_back({staging, desc.Format, desc.Width, desc.Height, 0, kind, index});
+        wchar_t msg[128];
+        swprintf_s(msg, L"EDPE: queued %ls capture %ux%u format=%u",
+            kind == UiState::CaptureKind::Depth ? L"depth" :
+            kind == UiState::CaptureKind::Motion ? L"motion" :
+            kind == UiState::CaptureKind::SceneColor ? L"scene color" :
+            kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" : L"backbuffer",
+            desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
+        EdpeLog(msg);
+    } else {
+        EdpeLog(L"EDPE: texture capture staging creation failed");
+    }
+}
+
+void queueTextureCaptureFromSrv(ID3D11ShaderResourceView* srv, UiState::CaptureKind kind, int index = -1) {
+    if (!srv) return;
+    ID3D11Resource* resource = nullptr;
+    srv->GetResource(&resource);
+    if (resource) {
+        ID3D11Texture2D* tex = nullptr;
+        if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex)))) {
+            queueTextureCapture(tex, kind, index);
+            tex->Release();
+        }
+        resource->Release();
+    }
+}
+
 void pollFrameCapture() {
-    if (!ui.frame_staging) return;
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    const HRESULT result = ui.context->Map(ui.frame_staging, 0, D3D11_MAP_READ,
-        D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-    if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++ui.frame_attempts < 120) return;
-    if (SUCCEEDED(result)) {
-        wchar_t executable[MAX_PATH]{};
-        const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    if (ui.pending_captures.empty()) return;
+
+    wchar_t executable[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    std::filesystem::path folder;
+    if (length && length < MAX_PATH) {
         std::error_code error;
-        if (length && length < MAX_PATH) {
-            const auto folder = std::filesystem::path(executable).parent_path() /
-                L"edpe-captures";
-            std::filesystem::create_directories(folder, error);
-            if (!error) {
+        folder = std::filesystem::path(executable).parent_path() / L"edpe-captures";
+        std::filesystem::create_directories(folder, error);
+        if (error) {
+            EdpeLog(L"EDPE: capture directory unavailable");
+            folder.clear();
+        }
+    }
+
+    for (auto it = ui.pending_captures.begin(); it != ui.pending_captures.end();) {
+        auto& req = *it;
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        const HRESULT result = ui.context->Map(req.staging, 0, D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+
+        if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++req.attempts < 120) {
+            ++it;
+            continue;
+        }
+
+        if (SUCCEEDED(result)) {
+            if (!folder.empty()) {
                 SYSTEMTIME now{};
                 GetLocalTime(&now);
-                wchar_t name[96];
-                swprintf_s(name, L"capture-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
-                    now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
-                    now.wSecond, now.wMilliseconds, ++ui.frame_serial);
+                wchar_t name[128];
+                switch (req.kind) {
+                case UiState::CaptureKind::Depth:
+                    if (req.index >= 0)
+                        swprintf_s(name, L"depth-dsv%d-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
+                            req.index, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                            now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                    else
+                        swprintf_s(name, L"depth-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
+                            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                            now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                    break;
+                case UiState::CaptureKind::Motion:
+                    swprintf_s(name, L"motion-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
+                        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                        now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                    break;
+                case UiState::CaptureKind::SceneColor:
+                    if (req.index >= 0)
+                        swprintf_s(name, L"color-dsv%d-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
+                            req.index, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                            now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                    else
+                        swprintf_s(name, L"color-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
+                            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                            now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                    break;
+                case UiState::CaptureKind::EarlyHdr:
+                    swprintf_s(name, L"early-color-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
+                        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                        now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                    break;
+                case UiState::CaptureKind::Backbuffer:
+                default:
+                    swprintf_s(name, L"frame-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
+                        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                        now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                    break;
+                }
+
                 const auto path = folder / name;
                 std::ofstream file(path, std::ios::binary);
-                const DWORD image_bytes = ui.frame_width * ui.frame_height * 4;
+                const DWORD image_bytes = req.width * req.height * 4;
                 BITMAPFILEHEADER header{};
                 header.bfType = 0x4D42;
                 header.bfOffBits = sizeof(header) + sizeof(BITMAPINFOHEADER);
                 header.bfSize = header.bfOffBits + image_bytes;
                 BITMAPINFOHEADER info{};
                 info.biSize = sizeof(info);
-                info.biWidth = static_cast<LONG>(ui.frame_width);
-                info.biHeight = -static_cast<LONG>(ui.frame_height); // Top-down D3D rows.
+                info.biWidth = static_cast<LONG>(req.width);
+                info.biHeight = -static_cast<LONG>(req.height); // Top-down
                 info.biPlanes = 1;
                 info.biBitCount = 32;
                 info.biCompression = BI_RGB;
                 info.biSizeImage = image_bytes;
                 file.write(reinterpret_cast<const char*>(&header), sizeof(header));
                 file.write(reinterpret_cast<const char*>(&info), sizeof(info));
-                std::vector<unsigned char> row(ui.frame_width * 4);
-                for (UINT y = 0; y < ui.frame_height && file; ++y) {
+
+                std::vector<unsigned char> row(req.width * 4);
+                for (UINT y = 0; y < req.height && file; ++y) {
                     const auto* source = static_cast<const unsigned char*>(mapped.pData) +
                         static_cast<size_t>(y) * mapped.RowPitch;
-                    for (UINT x = 0; x < ui.frame_width; ++x) {
-                        const auto* pixel = source + 4 * x;
-                        auto* output = row.data() + 4 * x;
-                        output[0] = ui.frame_format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[2] : pixel[0];
-                        output[1] = pixel[1];
-                        output[2] = ui.frame_format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[0] : pixel[2];
-                        output[3] = 255;
+
+                    if (req.kind == UiState::CaptureKind::Depth) {
+                        for (UINT x = 0; x < req.width; ++x) {
+                            float depth = 0.0f;
+                            if (req.format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+                                req.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) {
+                                std::memcpy(&depth, source + 8 * x, sizeof(depth));
+                            } else if (req.format == DXGI_FORMAT_R24G8_TYPELESS ||
+                                       req.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                       req.format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                                uint32_t packed = 0;
+                                std::memcpy(&packed, source + 4 * x, sizeof(packed));
+                                depth = static_cast<float>(packed & 0x00FFFFFFu) / 16777215.0f;
+                            } else if (req.format == DXGI_FORMAT_R32_TYPELESS ||
+                                       req.format == DXGI_FORMAT_R32_FLOAT ||
+                                       req.format == DXGI_FORMAT_D32_FLOAT) {
+                                std::memcpy(&depth, source + 4 * x, sizeof(depth));
+                            } else if (req.format == DXGI_FORMAT_R16_TYPELESS ||
+                                       req.format == DXGI_FORMAT_R16_UNORM ||
+                                       req.format == DXGI_FORMAT_D16_UNORM) {
+                                uint16_t packed = 0;
+                                std::memcpy(&packed, source + 2 * x, sizeof(packed));
+                                depth = static_cast<float>(packed) / 65535.0f;
+                            }
+                            const float contrast = edpe::depthContrast(depth);
+                            const auto gray = static_cast<unsigned char>(contrast * 255.0f + 0.5f);
+                            row[4 * x + 0] = gray;
+                            row[4 * x + 1] = gray;
+                            row[4 * x + 2] = gray;
+                            row[4 * x + 3] = 255;
+                        }
+                    } else if (req.kind == UiState::CaptureKind::Motion) {
+                        for (UINT x = 0; x < req.width; ++x) {
+                            float mx = 0.0f, my = 0.0f;
+                            if (req.format == DXGI_FORMAT_R16G16_FLOAT) {
+                                const auto* px = reinterpret_cast<const uint16_t*>(source + 4 * x);
+                                mx = edpe::halfToFloat(px[0]);
+                                my = edpe::halfToFloat(px[1]);
+                            } else if (req.format == DXGI_FORMAT_R32G32_FLOAT) {
+                                const auto* px = reinterpret_cast<const float*>(source + 8 * x);
+                                mx = px[0];
+                                my = px[1];
+                            }
+                            uint8_t mb = 128, mg = 128, mr = 128;
+                            edpe::motionToBgr(mx, my, mb, mg, mr);
+                            row[4 * x + 0] = mb;
+                            row[4 * x + 1] = mg;
+                            row[4 * x + 2] = mr;
+                            row[4 * x + 3] = 255;
+                        }
+                    } else if (req.kind == UiState::CaptureKind::SceneColor ||
+                               req.kind == UiState::CaptureKind::EarlyHdr) {
+                        for (UINT x = 0; x < req.width; ++x) {
+                            if (req.format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                                uint32_t val = 0;
+                                std::memcpy(&val, source + 4 * x, sizeof(val));
+                                const float cr = edpe::decodeFloat11(val & 0x7FF);
+                                const float cg = edpe::decodeFloat11((val >> 11) & 0x7FF);
+                                const float cb = edpe::decodeFloat10((val >> 22) & 0x3FF);
+                                row[4 * x + 0] = edpe::toneMapSrgb(cb);
+                                row[4 * x + 1] = edpe::toneMapSrgb(cg);
+                                row[4 * x + 2] = edpe::toneMapSrgb(cr);
+                                row[4 * x + 3] = 255;
+                            } else if (req.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                                uint32_t val = 0;
+                                std::memcpy(&val, source + 4 * x, sizeof(val));
+                                row[4 * x + 0] = static_cast<unsigned char>(((val >> 20) & 0x3FF) >> 2);
+                                row[4 * x + 1] = static_cast<unsigned char>(((val >> 10) & 0x3FF) >> 2);
+                                row[4 * x + 2] = static_cast<unsigned char>((val & 0x3FF) >> 2);
+                                row[4 * x + 3] = 255;
+                            } else if (req.format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+                                const auto* px = source + 4 * x;
+                                row[4 * x + 0] = px[0];
+                                row[4 * x + 1] = px[1];
+                                row[4 * x + 2] = px[2];
+                                row[4 * x + 3] = 255;
+                            } else {
+                                const auto* px = source + 4 * x;
+                                row[4 * x + 0] = px[2];
+                                row[4 * x + 1] = px[1];
+                                row[4 * x + 2] = px[0];
+                                row[4 * x + 3] = 255;
+                            }
+                        }
+                    } else { // Backbuffer
+                        for (UINT x = 0; x < req.width; ++x) {
+                            const auto* pixel = source + 4 * x;
+                            row[4 * x + 0] = req.format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[2] : pixel[0];
+                            row[4 * x + 1] = pixel[1];
+                            row[4 * x + 2] = req.format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[0] : pixel[2];
+                            row[4 * x + 3] = 255;
+                        }
                     }
                     file.write(reinterpret_cast<const char*>(row.data()), row.size());
                 }
                 file.flush();
-                if (file) EdpeLog((L"EDPE: frame capture saved " + path.wstring()).c_str());
-                else EdpeLog(L"EDPE: frame capture file write failed");
+                if (file) {
+                    wchar_t log_msg[256];
+                    swprintf_s(log_msg, L"EDPE: %ls capture saved %ls",
+                        req.kind == UiState::CaptureKind::Depth ? L"depth" :
+                        req.kind == UiState::CaptureKind::Motion ? L"motion" :
+                        req.kind == UiState::CaptureKind::SceneColor ? L"scene color" :
+                        req.kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" : L"frame",
+                        path.wstring().c_str());
+                    EdpeLog(log_msg);
+                } else {
+                    EdpeLog(L"EDPE: capture file write failed");
+                }
             }
+            ui.context->Unmap(req.staging, 0);
+        } else {
+            EdpeLog(L"EDPE: capture readback failed or timed out");
         }
-        if (error || !length || length >= MAX_PATH)
-            EdpeLog(L"EDPE: frame capture directory unavailable");
-        ui.context->Unmap(ui.frame_staging, 0);
-    } else {
-        EdpeLog(L"EDPE: frame capture readback unavailable");
+        req.staging->Release();
+        it = ui.pending_captures.erase(it);
     }
-    ui.frame_staging->Release();
-    ui.frame_staging = nullptr;
-}
-
-void queueFrameCapture(IDXGISwapChain* swap_chain) {
-    if (ui.frame_staging) return;
-    ID3D11Texture2D* backbuffer = nullptr;
-    if (FAILED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) return;
-    D3D11_TEXTURE2D_DESC desc{};
-    backbuffer->GetDesc(&desc);
-    if ((desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
-         desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) ||
-        !desc.Width || !desc.Height || desc.SampleDesc.Count != 1 ||
-        static_cast<unsigned long long>(desc.Width) * desc.Height > 3840ull * 2160) {
-        EdpeLog(L"EDPE: frame capture skipped (unsupported backbuffer)");
-        backbuffer->Release();
-        return;
-    }
-    ui.frame_format = desc.Format;
-    ui.frame_width = desc.Width;
-    ui.frame_height = desc.Height;
-    ui.frame_attempts = 0;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    desc.MiscFlags = 0;
-    if (SUCCEEDED(ui.device->CreateTexture2D(&desc, nullptr, &ui.frame_staging))) {
-        ui.context->CopyResource(ui.frame_staging, backbuffer);
-    } else {
-        EdpeLog(L"EDPE: frame capture staging texture unavailable");
-    }
-    backbuffer->Release();
 }
 
 void placeSnapshotWindow(int column, int row = 0) {
@@ -477,6 +658,7 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
         ui.snapshot_ready = true;
         ensureDepthContrastShader();
         queueDepthSamples(desc);
+        queueTextureCapture(copy, UiState::CaptureKind::Depth, static_cast<int>(index));
         wchar_t message[160];
         swprintf_s(message, L"EDPE: depth snapshot #%u copied %ux%u format=%u",
             index, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
@@ -545,6 +727,7 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
         ui.color_height = desc.Height;
         ui.color_snapshot_index = static_cast<int>(index);
         ui.color_window_open = true;
+        queueTextureCapture(copy, UiState::CaptureKind::SceneColor, static_cast<int>(index));
         wchar_t message[160];
         swprintf_s(message, L"EDPE: scene color snapshot #%u copied %ux%u format=%u",
             index, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
@@ -579,7 +762,10 @@ void shutdownUi() {
     releaseColorSnapshot();
     releaseEarlyColorSnapshot();
     releaseMotionSnapshot();
-    if (ui.frame_staging) ui.frame_staging->Release();
+    for (auto& req : ui.pending_captures) {
+        if (req.staging) req.staging->Release();
+    }
+    ui.pending_captures.clear();
     if (ui.motion_preview_shader) ui.motion_preview_shader->Release();
     if (ui.depth_contrast_shader) ui.depth_contrast_shader->Release();
     if (ui.context) ui.context->Release();
@@ -675,6 +861,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.motion_window_open = true;
         ui.snapshot_ready = true;
         ensureMotionPreviewShader();
+        queueTextureCaptureFromSrv(ui.motion_srv, UiState::CaptureKind::Motion);
         EdpeLog(L"EDPE: motion snapshot handed to ImGui");
     }
     UINT motion_color_width = 0, motion_color_height = 0;
@@ -685,6 +872,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.color_width = motion_color_width;
         ui.color_height = motion_color_height;
         ui.color_window_open = true;
+        queueTextureCaptureFromSrv(ui.color_srv, UiState::CaptureKind::SceneColor);
         EdpeLog(L"EDPE: same-frame HDR color handed to ImGui");
     }
     if (auto* early = ContextCensusTakeMotionEarlyColorSnapshot(
@@ -692,6 +880,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         releaseEarlyColorSnapshot();
         ui.early_color_srv = early;
         ui.early_color_window_open = true;
+        queueTextureCaptureFromSrv(ui.early_color_srv, UiState::CaptureKind::EarlyHdr);
         EdpeLog(L"EDPE: early HDR color handed to ImGui");
     }
     if (!menu_visible.load()) {
@@ -801,6 +990,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (!ui.motion_window_open && ImGui::Button("Show motion snapshot"))
             ui.motion_window_open = true;
     }
+    if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
+        ui.pending_backbuffer_capture = true;
+    }
     ImGui::TextUnformatted("F5: hide menu");
     ImGui::End();
     if (ui.depth_srv && ui.depth_window_open) {
@@ -813,6 +1005,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             if (ui.depth_center_valid) ImGui::Text("Center raw depth: %.9g", ui.depth_center);
             if (ui.depth_contrast_shader) ImGui::Checkbox("Contrast preview", &ui.depth_contrast);
             else ImGui::TextDisabled("Contrast preview unavailable; showing raw red depth");
+            if (ui.depth_copy && ImGui::Button("Save depth snapshot to BMP")) {
+                queueTextureCapture(ui.depth_copy, UiState::CaptureKind::Depth, ui.depth_snapshot_index);
+            }
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;
@@ -841,6 +1036,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                     ui.color_width, ui.color_height);
             if (ui.color_snapshot_index < 0)
                 ImGui::TextUnformatted("Present-time HDR color; may include HUD");
+            if (ui.color_copy && ImGui::Button("Save scene color to BMP")) {
+                queueTextureCapture(ui.color_copy, UiState::CaptureKind::SceneColor, ui.color_snapshot_index);
+            } else if (ui.color_srv && ImGui::Button("Save scene color to BMP")) {
+                queueTextureCaptureFromSrv(ui.color_srv, UiState::CaptureKind::SceneColor, ui.color_snapshot_index);
+            }
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;
@@ -858,6 +1058,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         placeSnapshotWindow(0);
         if (ImGui::Begin("EDPE Early HDR Snapshot", &ui.early_color_window_open)) {
             ImGui::TextUnformatted("Early HDR candidate; capture point in edpe.log");
+            if (ui.early_color_srv && ImGui::Button("Save early HDR to BMP")) {
+                queueTextureCaptureFromSrv(ui.early_color_srv, UiState::CaptureKind::EarlyHdr);
+            }
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;
@@ -875,6 +1078,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ImGui::TextUnformatted("Camera + depth motion; HUD is not represented");
             ImGui::TextUnformatted("Neutral gray = 0 pixels; red = horizontal, green = vertical");
             ImGui::TextUnformatted("Nonlinear preview: 10 pixels shifts a channel by 0.25");
+            if (ui.motion_srv && ImGui::Button("Save motion to BMP")) {
+                queueTextureCaptureFromSrv(ui.motion_srv, UiState::CaptureKind::Motion);
+            }
             float width = ImGui::GetContentRegionAvail().x;
             if (width > 640.0f) width = 640.0f;
             if (width < 1.0f) width = 1.0f;
@@ -894,6 +1100,15 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (!window_open) menu_visible.store(false);
     ImGui::Render();
 
+    if (ui.pending_backbuffer_capture) {
+        ui.pending_backbuffer_capture = false;
+        ID3D11Texture2D* backbuffer = nullptr;
+        if (SUCCEEDED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) {
+            queueTextureCapture(backbuffer, UiState::CaptureKind::Backbuffer);
+            backbuffer->Release();
+        }
+    }
+
     ID3D11RenderTargetView* previous_rtv = nullptr;
     ID3D11DepthStencilView* previous_dsv = nullptr;
     ui.context->OMGetRenderTargets(1, &previous_rtv, &previous_dsv);
@@ -902,10 +1117,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ui.context->OMSetRenderTargets(1, &previous_rtv, previous_dsv);
     if (previous_rtv) previous_rtv->Release();
     if (previous_dsv) previous_dsv->Release();
-    if (ui.snapshot_ready && !ui.frame_staging) {
-        queueFrameCapture(swap_chain);
-        ui.snapshot_ready = false;
-    }
+    ui.snapshot_ready = false;
     ImGui::SetCurrentContext(previous);
 }
 
