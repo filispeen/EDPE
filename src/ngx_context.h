@@ -56,7 +56,11 @@ namespace edpe {
 //   (a) Shutdown lifecycle is validated in isolated process, AND
 //   (b) All Elite input conventions are verified (see nvidia-dlaa-input-contract.md).
 
-// Disabled stub: initialize() always returns false. No NGX call is made.
+struct NvidiaDlssInputParams;
+
+// NGX context management.
+// Handles NVIDIA DLSS Super Resolution and DLAA initialization, evaluation,
+// and shutdown through the NVIDIA NGX D3D11 SDK.
 class NgxContext {
 public:
     static bool initialize(ID3D11Device* device, ID3D11DeviceContext* context);
@@ -75,6 +79,23 @@ public:
 
     static bool reset_requested();
     static void set_reset_requested(bool reset);
+
+    // Feature lifecycle
+    static bool ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height);
+    static void releaseFeature();
+
+    // Evaluation
+    static bool evaluateDlaa(ID3D11DeviceContext* context,
+        const NvidiaDlssInputParams& params,
+        ID3D11Resource* colorIn,
+        ID3D11Resource* outputUav,
+        ID3D11Resource* depthIn,
+        ID3D11Resource* motionIn,
+        ID3D11Resource* reactiveMaskIn,
+        uint32_t width,
+        uint32_t height);
+
+    static const wchar_t* get_status_message();
 };
 
 } // namespace edpe

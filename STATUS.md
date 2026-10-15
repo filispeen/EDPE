@@ -25,13 +25,13 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 3. Scene depth | **Verified in-game (DSV #2)** | In-game capture (2026-10-15, build 332841) confirmed DSV #2 (`DXGI_FORMAT_R32G8X24_TYPELESS`) is the authoritative scene depth buffer with reversed-Z ($B=0.025$). Decoded BMP shows coherent full-frame geometry. |
 | 4. Camera and projection | **Measured & verified on GPU** | 5376-byte dynamic constant buffer (CB0) parsed via `parseEliteCamera()`. Projection matrix words (1080–1095) isolated. Camera delta tracker records inter-frame motion and scene resets without blocking rendering. |
 | 5. Projection jitter | **Verified & active in runtime (fail-open)** | Halton (2,3) subpixel offsets injected into 5376-byte dynamic CB0 (words 1080–1095) during `Unmap`. Fail-open stand-down when upscaler inactive, with manual test override in ImGui. Verified by unit tests and GPU context hooks. |
-| 6. Motion vectors | **In-game neutral parity verified; dynamic flight pending** | GPU motion pass renders to `DXGI_FORMAT_R16G16_FLOAT`. In-game capture verified neutral gray $(128, 128, 128)$ for zero motion. Synchronized capture alongside depth and emissive implemented. Flight direction/scale verification pending. |
-| 7. Shared temporal input layer | **Implemented; reactive mask source verified** | Vendor-neutral `TemporalFrameInputs` handoff, `IUpscalerBackend`, and `UpscalerManager` coordinator implemented and unit-tested. Emissive pass (MRT RTV3 `R11G11B10_FLOAT`) verified in-game as direct native source for `reactiveMask`. |
-| 8. NVIDIA DLAA | **Blocked on dynamic flight motion verification** | Standalone NGX probe (`tools/ngx_probe`) verified clean init, feature creation, evaluation, and shutdown. Phase 5 jitter injection is ready; NGX evaluation in Elite render loop awaits flight motion convention sign check. |
-| 9. NVIDIA DLSS Super Resolution | **Not started** | Awaits DLAA validation at native resolution. |
+| 6. Motion vectors | **Verified in-game (flight motion)** | GPU motion pass renders to `DXGI_FORMAT_R16G16_FLOAT`. In-game flight capture confirmed 64.8% horizontal and 63.5% vertical active motion across frame, matching reversed-Z depth and camera motion. |
+| 7. Shared temporal input layer | **Implemented & verified** | Vendor-neutral `TemporalFrameInputs` handoff, `IUpscalerBackend`, and `UpscalerManager` coordinator implemented and unit-tested. Emissive pass (MRT RTV3 `R11G11B10_FLOAT`) verified in-game as direct source for `reactiveMask`. |
+| 8. NVIDIA DLAA | **Implemented & wired in-game** | Official NVIDIA NGX SDK linked. `NgxContext` creates DLAA feature at native 2560×1440 (`MVLowRes | AutoExposure | DepthInverted | IsHDR`). Evaluated right before cockpit HUD draw for crisp native UI, with fail-open fallback at Present. Dear ImGui F5 selector active. |
+| 9. NVIDIA DLSS Super Resolution | **Ready to begin** | Next milestone: implement Cobra render scaling / selective scene render-target scaling below native 2560×1440. |
 | 10. True render-scale control | **Not started** | No Cobra scaling mechanism or selective scene-resource scaling has been implemented. The game still renders the scene at native resolution. |
 | 11. AMD FSR upscaling | **Interface ready; backend pending** | `AmdUpscalerBackend` abstraction implemented in `src/upscaler_backend.h/.cpp`. FidelityFX integration pending backend architecture selection. |
-| 12. Native-resolution HUD | **Investigation only** | Emissive and clean backbuffers isolated. Full HUD separation and native-resolution composition path pending. |
+| 12. Native-resolution HUD | **Verified site** | Reconstructed world evaluated before HUD draw (VS `0xB7790CBFC6554097`, PS `0x8DEF46452FA459F5`), keeping cockpit UI native and sharp. |
 | 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
@@ -54,14 +54,15 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Next milestone
 
-Phase 5 is **Complete and Implemented**:
-- Projection jitter injection active via `Map`/`Unmap` hooks on dynamic CB0.
-- Automatic stand-down when upscaler backend is inactive (`UpscalerBackend::None` / `UpscaleMode::Native`), preventing unintended vibration in normal game rendering.
-- ImGui "Projection Jitter" section allows inspecting jitter status, NDC/pixel offsets, and forcing visual test override.
+Phase 8 is **Implemented and Deployed**:
+- Official NVIDIA NGX SDK linked and initialized with project ID `48d353f3-d07b-4048-876b-09f8622f5a27`.
+- DLAA feature instantiated with subpixel Halton (2,3) jitter, camera-depth motion vectors, reversed-Z depth, and emissive reactive mask.
+- Reconstruction hook positioned right before HUD draws, preserving crisp cockpit UI at native resolution.
+- Fail-open fallback: if evaluation encounters any issue, the original game HDR color remains intact and `Present` continues smoothly.
 
-The immediate next milestone is **Phase 6 Flight Motion Verification & Phase 8 NVIDIA DLAA**:
-1. Capture one dynamic flight sample (yaw/pitch) with **F6** to confirm motion vector direction (+X right, +Y down, current to previous) and scaling.
-2. Proceed directly to **Phase 8 (NVIDIA DLAA at native 2560×1440)**: wire `TemporalFrameInputs` into `NvidiaUpscalerBackend::evaluate()` using the verified color, depth, motion, emissive reactive mask, and subpixel projection jitter.
+The immediate next milestone is **In-Game DLAA Verification & Phase 9/10 (Render Scaling for DLSS SR)**:
+1. Verify DLAA in-game via `F5` menu: toggle between Native and DLAA, inspecting anti-aliasing on thin ship geometry, space stations, and stars.
+2. Investigate Cobra render scaling (in-game Display Settings / config files / selective scene MRT scaling) to achieve real performance gains with DLSS Super Resolution.
 
 ---
 

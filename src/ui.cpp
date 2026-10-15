@@ -994,12 +994,44 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::TextUnformatted("Version: unreleased");
     ImGui::TextUnformatted("Rendering: original game output");
     auto& upscaler = edpe::UpscalerManager::instance();
-    ImGui::Text("Upscaler: %ls", edpe::getUpscalerBackendName(upscaler.getBackend()));
-    ImGui::Text("Mode: %ls", edpe::getUpscaleModeName(upscaler.getMode()));
-    ImGui::Text("Status: %ls", upscaler.getDiagnostics().statusMessage);
+    const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);
+
+    // Upscaler backend selector
+    const char* upscaler_items[] = { "Native (Bypass)", "NVIDIA DLSS / DLAA", "AMD FSR (unavailable)" };
+    int current_backend_idx = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) ? 1 :
+                              (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) ? 2 : 0;
+
+    if (ImGui::Combo("Upscaler Backend", &current_backend_idx, upscaler_items, IM_ARRAYSIZE(upscaler_items))) {
+        if (current_backend_idx == 1) {
+            if (nvidia_available) {
+                upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
+                upscaler.setMode(edpe::UpscaleMode::NativeAA);
+            }
+        } else {
+            upscaler.setBackend(edpe::UpscalerBackend::None);
+            upscaler.setMode(edpe::UpscaleMode::Native);
+        }
+    }
+
+    if (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "Reconstruction: NVIDIA DLAA Active (Native 2560x1440)");
+    } else {
+        ImGui::TextUnformatted("Reconstruction: Inactive (Original game output)");
+    }
+
+    const auto& diag = upscaler.getDiagnostics();
+    ImGui::Text("Backend: %ls | Mode: %ls",
+        edpe::getUpscalerBackendName(upscaler.getBackend()),
+        edpe::getUpscaleModeName(upscaler.getMode()));
+    ImGui::Text("Status: %ls", diag.statusMessage);
+    if (diag.didRun) {
+        ImGui::Text("GPU Reconstruction Time: %.3f ms", diag.gpuTimeMs);
+    }
+    if (!nvidia_available) {
+        ImGui::TextDisabled("NVIDIA DLAA reason: %ls",
+            upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
+    }
     ImGui::BeginDisabled();
-    ImGui::Text("NVIDIA DLAA / DLSS: %ls",
-        upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
     ImGui::Text("AMD FSR: %ls",
         upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::AmdFsr));
     ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");

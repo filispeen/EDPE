@@ -16,7 +16,7 @@ bool NvidiaUpscalerBackend::isAvailable() const {
 
 const wchar_t* NvidiaUpscalerBackend::unavailableReason() const {
     if (isAvailable()) return L"";
-    return L"NGX runtime blocked: input conventions unverified in Elite and shutdown lifecycle safety pending";
+    return NgxContext::get_status_message();
 }
 
 bool NvidiaUpscalerBackend::isModeSupported(UpscaleMode mode) const {
@@ -39,17 +39,67 @@ bool NvidiaUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext
 }
 
 void NvidiaUpscalerBackend::shutdown() {
+    outputTexture_.Reset();
+    outputUav_.Reset();
+    outputWidth_ = 0;
+    outputHeight_ = 0;
+    outputFormat_ = DXGI_FORMAT_UNKNOWN;
     if (initialized_) {
         NgxContext::shutdown();
         initialized_ = false;
     }
 }
 
-bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* /*context*/,
+bool NvidiaUpscalerBackend::ensureOutputTexture(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format) {
+    if (outputTexture_ && outputWidth_ == width && outputHeight_ == height && outputFormat_ == format) {
+        return true;
+    }
+    outputTexture_.Reset();
+    outputUav_.Reset();
+    outputWidth_ = 0;
+    outputHeight_ = 0;
+    outputFormat_ = DXGI_FORMAT_UNKNOWN;
+
+    if (!device || !width || !height) return false;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, &outputTexture_))) {
+        EdpeLog(L"EDPE: failed to create DLAA intermediate output texture");
+        return false;
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+    uavDesc.Format = format;
+    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    uavDesc.Texture2D.MipSlice = 0;
+
+    if (FAILED(device->CreateUnorderedAccessView(outputTexture_.Get(), &uavDesc, &outputUav_))) {
+        EdpeLog(L"EDPE: failed to create DLAA intermediate output UAV");
+        outputTexture_.Reset();
+        return false;
+    }
+
+    outputWidth_ = width;
+    outputHeight_ = height;
+    outputFormat_ = format;
+    return true;
+}
+
+bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     const TemporalFrameInputs& inputs,
-    ID3D11RenderTargetView* /*destinationRtv*/,
-    ID3D11Texture2D* /*destinationTexture*/) {
-    if (!isAvailable()) return false;
+    ID3D11RenderTargetView* destinationRtv,
+    ID3D11Texture2D* destinationTexture) {
+    (void)destinationRtv;
+    if (!isAvailable() || !context) return false;
 
     // Translate EDPE temporal conventions to NVIDIA NGX expectations.
     NvidiaDlssInputParams params{};
@@ -61,8 +111,35 @@ bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* /*context*/,
         return false;
     }
 
-    // NGX evaluation will be wired when runtime safety & Elite conventions are verified.
-    return false;
+    if (!inputs.color) return false;
+
+    D3D11_TEXTURE2D_DESC colorDesc{};
+    inputs.color->GetDesc(&colorDesc);
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, colorDesc.Format)) {
+        return false;
+    }
+
+    ID3D11Resource* colorIn = inputs.color;
+    ID3D11Resource* depthIn = inputs.depth;
+    ID3D11Resource* motionIn = inputs.motionVectors;
+    ID3D11Resource* reactiveIn = inputs.reactiveMask;
+
+    bool evalOk = NgxContext::evaluateDlaa(context, params,
+        colorIn, outputTexture_.Get(), depthIn, motionIn, reactiveIn,
+        inputs.renderWidth, inputs.renderHeight);
+
+    if (!evalOk) {
+        return false;
+    }
+
+    ID3D11Texture2D* dest = destinationTexture ? destinationTexture : inputs.color;
+    if (dest) {
+        context->CopyResource(dest, outputTexture_.Get());
+    }
+    return true;
 }
 
 void NvidiaUpscalerBackend::resetHistory() {

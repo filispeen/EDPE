@@ -5,6 +5,13 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "EDPE requires 64-bit Windows")
 endif()
 
+set(NGX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/DLSS")
+if(EXISTS "${NGX_SDK_DIR}/include/nvsdk_ngx.h")
+    set(EDPE_HAVE_NGX TRUE)
+else()
+    set(EDPE_HAVE_NGX FALSE)
+endif()
+
 add_library(EDPE SHARED src/dllmain.cpp src/log.cpp src/d3d11_proxy.cpp src/d3d11_proxy.def)
 target_compile_features(EDPE PRIVATE cxx_std_20)
 target_compile_definitions(EDPE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -26,6 +33,17 @@ target_include_directories(EDPE_IMGUI PUBLIC external/imgui external/imgui/backe
 target_compile_definitions(EDPE_IMGUI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(EDPE_DXGI PRIVATE EDPE_IMGUI d3dcompiler)
 
+if(EDPE_HAVE_NGX)
+    target_include_directories(EDPE_DXGI PRIVATE "${NGX_SDK_DIR}/include")
+    target_compile_definitions(EDPE_DXGI PRIVATE EDPE_ENABLE_NGX=1)
+    target_link_libraries(EDPE_DXGI PRIVATE
+        "$<IF:$<CONFIG:Debug>,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib>"
+        version)
+    add_custom_command(TARGET EDPE_DXGI POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NGX_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$<TARGET_FILE_DIR:EDPE_DXGI>/")
+endif()
+
 enable_testing()
 add_executable(temporal_math_test tests/temporal_math.cpp)
 target_compile_features(temporal_math_test PRIVATE cxx_std_20)
@@ -43,6 +61,13 @@ add_executable(temporal_inputs_test tests/temporal_inputs.cpp src/upscaler_backe
 target_compile_features(temporal_inputs_test PRIVATE cxx_std_20)
 target_compile_definitions(temporal_inputs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(temporal_inputs_test PRIVATE src)
+if(EDPE_HAVE_NGX)
+    target_include_directories(temporal_inputs_test PRIVATE "${NGX_SDK_DIR}/include")
+    target_compile_definitions(temporal_inputs_test PRIVATE EDPE_ENABLE_NGX=1)
+    target_link_libraries(temporal_inputs_test PRIVATE
+        "$<IF:$<CONFIG:Debug>,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib>"
+        version)
+endif()
 add_test(NAME temporal_inputs COMMAND temporal_inputs_test)
 add_executable(motion_gpu_test tests/motion_gpu.cpp src/motion_pass.cpp)
 target_compile_features(motion_gpu_test PRIVATE cxx_std_20)
@@ -70,6 +95,11 @@ add_custom_target(proxy_stage ALL
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:EDPE_DXGI> "${EDPE_STAGE}/dxgi.dll"
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:proxy_smoke> "${EDPE_STAGE}/proxy_smoke.exe"
     DEPENDS EDPE EDPE_DXGI proxy_smoke)
+if(EDPE_HAVE_NGX)
+    add_custom_command(TARGET proxy_stage POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NGX_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "${EDPE_STAGE}/nvngx_dlss.dll")
+endif()
 add_test(NAME proxy_alias_smoke COMMAND "${EDPE_STAGE}/proxy_smoke.exe"
     "${EDPE_STAGE}/d3d11.dll" "${EDPE_STAGE}/dxgi.dll" "${EDPE_STAGE}/edpe.log")
 
@@ -77,8 +107,7 @@ add_test(NAME proxy_alias_smoke COMMAND "${EDPE_STAGE}/proxy_smoke.exe"
 # ngx_probe       child: real NGX SDK calls on a hardware adapter, one log line per stage
 # ngx_probe_host  parent: runs the child with a 30 s wall-clock timeout and kills it on hang
 # The SDK lives in external/DLSS (gitignored); the probe is skipped when it is absent.
-set(NGX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/DLSS")
-if(EXISTS "${NGX_SDK_DIR}/include/nvsdk_ngx.h")
+if(EDPE_HAVE_NGX)
     add_executable(ngx_probe tools/ngx_probe/ngx_probe.cpp)
     target_compile_features(ngx_probe PRIVATE cxx_std_20)
     target_compile_definitions(ngx_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
