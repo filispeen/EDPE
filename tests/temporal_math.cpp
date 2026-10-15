@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 
 int main() {
     const edpe::CameraProjection previous{{1, 0, 0, 0,
@@ -140,4 +141,42 @@ int main() {
     const float no_w[16]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0};
     if (edpe::estimateEliteBlockNdcOffset(no_w, &native) ||
         edpe::estimateEliteBlockNdcOffset(nullptr, &native)) return 21;
+
+    // -------------------------------------------------------------------------
+    // Phase 5: Projection jitter sequence properties and validation bounds
+    // -------------------------------------------------------------------------
+    double sumX = 0, sumY = 0;
+    for (unsigned frame = 0; frame < 64; ++frame) {
+        const auto jitter = edpe::projectionJitter(frame, 2560, 1440);
+        // Pixel offsets must remain strictly within [-0.5, 0.5]
+        if (jitter.pixelX < -0.5f || jitter.pixelX > 0.5f ||
+            jitter.pixelY < -0.5f || jitter.pixelY > 0.5f) return 22;
+        // NDC offsets must scale with render dimensions
+        if (std::fabs(jitter.ndcX - 2.0f * jitter.pixelX / 2560.0f) > 1e-6f ||
+            std::fabs(jitter.ndcY - (-2.0f * jitter.pixelY / 1440.0f)) > 1e-6f) return 23;
+        sumX += jitter.pixelX;
+        sumY += jitter.pixelY;
+    }
+    // Halton sequence mean over 64 samples must stay close to 0 (< 0.1 pixel)
+    if (std::fabs(sumX / 64.0) > 0.1 || std::fabs(sumY / 64.0) > 0.1) return 24;
+
+    // Test rejection of invalid blocks (fail-open protection)
+    float bad_block[16]{};
+    std::memcpy(bad_block, block, sizeof(block));
+    bad_block[5] = std::numeric_limits<float>::quiet_NaN();
+    float out_block[16]{};
+    if (edpe::jitterEliteProjectionBlock(bad_block, out_block, edpe::projectionJitter(0, 2560, 1440)))
+        return 25;
+
+    // Jittered projection block continues to pass parseEliteCamera checks
+    for (unsigned frame = 0; frame < 16; ++frame) {
+        const auto jitter = edpe::projectionJitter(frame, 2560, 1440);
+        float jittered[16]{};
+        if (!edpe::jitterEliteProjectionBlock(turning_block, jittered, jitter)) return 26;
+        for (size_t i = 0; i < 16; ++i) scene[1080 + i] = jittered[i];
+        edpe::CameraProjection jittered_cam{};
+        if (!edpe::parseEliteCamera(scene.data(), scene.size(), &jittered_cam)) return 27;
+    }
+
+    return 0; // All temporal math tests passed
 }

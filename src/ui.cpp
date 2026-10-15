@@ -1055,6 +1055,29 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (!ui.motion_window_open && ImGui::Button("Show motion snapshot"))
             ui.motion_window_open = true;
     }
+    ImGui::Separator();
+    ImGui::TextUnformatted("Projection Jitter (Phase 5)");
+    bool jitter_enabled = ContextCensusGetJitterEnabled();
+    if (ImGui::Checkbox("Enable Projection Jitter (Halton 2,3)", &jitter_enabled)) {
+        ContextCensusSetJitterEnabled(jitter_enabled);
+    }
+    bool jitter_override = ContextCensusGetJitterTestOverride();
+    if (ImGui::Checkbox("Force Jitter test override (subpixel vibration test)", &jitter_override)) {
+        ContextCensusSetJitterTestOverride(jitter_override);
+    }
+    const bool jitter_active = ContextCensusIsJitterActive();
+    if (jitter_active) {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "Jitter Status: ACTIVE (Injected into CB0)");
+    } else {
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Jitter Status: STAND-DOWN (Bypass)");
+    }
+    float jx = 0, jy = 0, jndcx = 0, jndcy = 0;
+    unsigned long long jframe = 0;
+    ContextCensusGetActiveJitter(&jx, &jy, &jndcx, &jndcy, &jframe);
+    ImGui::Text("Jitter: Pixel (%.3f, %.3f) | NDC (%.6f, %.6f)", jx, jy, jndcx, jndcy);
+    ImGui::Text("Jittered Writes: %u | Rejections: %u | Frame: %llu",
+        ContextCensusGetJitteredWritesCount(), ContextCensusGetJitterRejectionsCount(), jframe);
+    ImGui::Separator();
     if (ImGui::Button("Capture ALL buffers (F6)")) {
         all_captures_requested.store(true, std::memory_order_release);
     }

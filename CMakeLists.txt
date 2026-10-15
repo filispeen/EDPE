@@ -61,6 +61,7 @@ target_include_directories(proxy_smoke PRIVATE src)
 target_link_libraries(proxy_smoke PRIVATE d3dcompiler)
 add_test(NAME proxy_smoke COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log)
 add_test(NAME proxy_shader_probe COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log shader-probe)
+set_tests_properties(proxy_smoke proxy_shader_probe PROPERTIES RUN_SERIAL TRUE)
 
 set(EDPE_STAGE "${CMAKE_CURRENT_BINARY_DIR}/stage")
 add_custom_target(proxy_stage ALL

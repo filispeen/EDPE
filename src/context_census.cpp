@@ -5,6 +5,8 @@
 #include "log.h"
 #include "motion_pass.h"
 #include "shader_probe.h"
+#include "temporal_math.h"
+#include "upscaler_backend.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -250,6 +252,17 @@ std::atomic<unsigned long long> scene_first_camera_hash{0};
 std::atomic<unsigned long long> scene_last_camera_hash{0};
 std::atomic<unsigned long long> scene_first_projection_hash{0};
 std::atomic<unsigned long long> scene_last_projection_hash{0};
+
+// Phase 5: Projection Jitter State
+std::atomic<bool> jitter_enabled{true};
+std::atomic<bool> jitter_test_override{false};
+std::atomic<unsigned> jittered_writes_count{0};
+std::atomic<unsigned> jitter_rejection_count{0};
+std::atomic<unsigned long long> jitter_frame_index{0};
+std::mutex jitter_mutex;
+edpe::ProjectionJitter active_projection_jitter{};
+UINT active_render_width = 0;
+UINT active_render_height = 0;
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
@@ -858,35 +871,35 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
     const HRESULT result = original_map.load(std::memory_order_acquire)(
         context, resource, subresource, type, flags, mapped);
     if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
-        resource && !scene_map_target.load(std::memory_order_acquire) &&
-        map_hook_active.load(std::memory_order_acquire)) {
-        D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-        resource->GetType(&dimension);
-        if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
-            ID3D11Buffer* buffer = nullptr;
-            if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Buffer),
-                    reinterpret_cast<void**>(&buffer)))) {
-                D3D11_BUFFER_DESC desc{};
-                buffer->GetDesc(&desc);
-                if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
-                    (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
-                    scene_map_target.store(buffer, std::memory_order_release);
-                    scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
+        resource && map_hook_active.load(std::memory_order_acquire)) {
+        if (!scene_map_target.load(std::memory_order_acquire)) {
+            D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+            resource->GetType(&dimension);
+            if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+                ID3D11Buffer* buffer = nullptr;
+                if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Buffer),
+                        reinterpret_cast<void**>(&buffer)))) {
+                    D3D11_BUFFER_DESC desc{};
+                    buffer->GetDesc(&desc);
+                    if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
+                        (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+                        scene_map_target.store(buffer, std::memory_order_release);
+                        scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
+                        EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
+                    }
+                    buffer->Release();
                 }
-                buffer->Release();
             }
         }
-    }
-    if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
-        resource == scene_map_target.load(std::memory_order_acquire) &&
-        map_hook_active.load(std::memory_order_acquire)) {
-        scene_maps.fetch_add(1, std::memory_order_relaxed);
-        scene_mapped_data.store(mapped ? mapped->pData : nullptr, std::memory_order_release);
-        if (draw_indexed_calls.load(std::memory_order_relaxed) ||
-            draw_calls.load(std::memory_order_relaxed) ||
-            draw_indexed_instanced_calls.load(std::memory_order_relaxed) ||
-            draw_instanced_calls.load(std::memory_order_relaxed))
-            scene_maps_after_draw.fetch_add(1, std::memory_order_relaxed);
+        if (resource == scene_map_target.load(std::memory_order_acquire)) {
+            scene_maps.fetch_add(1, std::memory_order_relaxed);
+            scene_mapped_data.store(mapped ? mapped->pData : nullptr, std::memory_order_release);
+            if (draw_indexed_calls.load(std::memory_order_relaxed) ||
+                draw_calls.load(std::memory_order_relaxed) ||
+                draw_indexed_instanced_calls.load(std::memory_order_relaxed) ||
+                draw_instanced_calls.load(std::memory_order_relaxed))
+                scene_maps_after_draw.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     return result;
 }
@@ -897,11 +910,11 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
         resource == scene_map_target.load(std::memory_order_acquire) &&
         unmap_hook_active.load(std::memory_order_acquire)) {
         scene_unmaps.fetch_add(1, std::memory_order_relaxed);
-        const auto* data = static_cast<const unsigned char*>(
-            scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel));
-        if (data) {
+        void* mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
+        if (mapped_ptr) {
             unsigned long long camera = 14695981039346656037ull;
             unsigned long long projection = camera;
+            const auto* data = static_cast<const unsigned char*>(mapped_ptr);
             for (size_t i = 932 * 4; i < 944 * 4; ++i)
                 camera = (camera ^ data[i]) * 1099511628211ull;
             for (size_t i = 1080 * 4; i < 1096 * 4; ++i)
@@ -917,6 +930,54 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             }
             scene_last_camera_hash.store(camera, std::memory_order_relaxed);
             scene_last_projection_hash.store(projection, std::memory_order_relaxed);
+
+            // Phase 5: Projection jitter injection into words 1080..1095
+            if (ContextCensusIsJitterActive()) {
+                float* words = static_cast<float*>(mapped_ptr);
+                bool valid_projection = true;
+                for (size_t i = 1080; i < 1096; ++i) {
+                    if (!std::isfinite(words[i])) {
+                        valid_projection = false;
+                        break;
+                    }
+                }
+                if (valid_projection) {
+                    const float depthB = words[1094];
+                    if (depthB <= 0.0f || depthB > 1.0f ||
+                        std::fabs(words[1092]) > 0.002f ||
+                        std::fabs(words[1093]) > 0.002f ||
+                        std::fabs(words[1095]) > 0.002f) {
+                        valid_projection = false;
+                    }
+                }
+                if (valid_projection) {
+                    edpe::ProjectionJitter jitter{};
+                    {
+                        std::lock_guard lock(jitter_mutex);
+                        jitter = active_projection_jitter;
+                    }
+                    float jittered_block[16]{};
+                    if (edpe::jitterEliteProjectionBlock(&words[1080], jittered_block, jitter)) {
+                        std::memcpy(&words[1080], jittered_block, sizeof(jittered_block));
+                        const unsigned count = jittered_writes_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (count == 1 || count % 1024 == 0) {
+                            edpe::NdcOffset verified_offset{};
+                            edpe::estimateEliteBlockNdcOffset(&words[1080], &verified_offset);
+                            wchar_t msg[256];
+                            swprintf_s(msg,
+                                L"EDPE: projection jitter applied #%u frame=%llu pixel=(%.4f, %.4f) ndc=(%.6g, %.6g) verified_ndc=(%.6g, %.6g)",
+                                count, jitter_frame_index.load(std::memory_order_relaxed),
+                                jitter.pixelX, jitter.pixelY, jitter.ndcX, jitter.ndcY,
+                                verified_offset.x, verified_offset.y);
+                            EdpeLog(msg);
+                        }
+                    } else {
+                        jitter_rejection_count.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else {
+                    jitter_rejection_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
     }
     original_unmap.load(std::memory_order_acquire)(context, resource, subresource);
@@ -970,12 +1031,8 @@ void endDrawProbe() {
     dumpSceneShaders();
     auto* map_target = scene_map_target.exchange(nullptr, std::memory_order_acq_rel);
     scene_mapped_data.store(nullptr, std::memory_order_release);
-    const bool map_restored = !map_hook_active.exchange(false) || patchSlot(patched_table,
-        kMap, reinterpret_cast<void*>(&observedMap),
-        reinterpret_cast<void*>(original_map.load(std::memory_order_acquire)));
-    const bool unmap_restored = !unmap_hook_active.exchange(false) || patchSlot(patched_table,
-        kUnmap, reinterpret_cast<void*>(&observedUnmap),
-        reinterpret_cast<void*>(original_unmap.load(std::memory_order_acquire)));
+    const bool map_restored = map_hook_active.load(std::memory_order_acquire);
+    const bool unmap_restored = unmap_hook_active.load(std::memory_order_acquire);
     swprintf_s(message, L"EDPE: scene buffer maps=%u afterDraw=%u unmaps=%u restored=%u%u bind=%u beforeBind=%u target=%p firstVS=%p",
         scene_maps.load(std::memory_order_relaxed),
         scene_maps_after_draw.load(std::memory_order_relaxed),
@@ -1054,16 +1111,20 @@ void beginDrawProbe() {
                 reinterpret_cast<void*>(instanced_forward),
                 reinterpret_cast<void*>(&observedDrawInstanced)))
             draw_instanced_hook_active.store(true, std::memory_order_release);
-        auto map_forward = reinterpret_cast<MapFn>(patched_table[kMap]);
-        auto unmap_forward = reinterpret_cast<UnmapFn>(patched_table[kUnmap]);
-        original_map.store(map_forward, std::memory_order_release);
-        original_unmap.store(unmap_forward, std::memory_order_release);
-        if (map_forward && patchSlot(patched_table, kMap,
-                reinterpret_cast<void*>(map_forward), reinterpret_cast<void*>(&observedMap)))
-            map_hook_active.store(true, std::memory_order_release);
-        if (unmap_forward && patchSlot(patched_table, kUnmap,
-                reinterpret_cast<void*>(unmap_forward), reinterpret_cast<void*>(&observedUnmap)))
-            unmap_hook_active.store(true, std::memory_order_release);
+        if (!map_hook_active.load(std::memory_order_acquire)) {
+            auto map_forward = reinterpret_cast<MapFn>(patched_table[kMap]);
+            if (map_forward) original_map.store(map_forward, std::memory_order_release);
+            if (map_forward && patchSlot(patched_table, kMap,
+                    reinterpret_cast<void*>(map_forward), reinterpret_cast<void*>(&observedMap)))
+                map_hook_active.store(true, std::memory_order_release);
+        }
+        if (!unmap_hook_active.load(std::memory_order_acquire)) {
+            auto unmap_forward = reinterpret_cast<UnmapFn>(patched_table[kUnmap]);
+            if (unmap_forward) original_unmap.store(unmap_forward, std::memory_order_release);
+            if (unmap_forward && patchSlot(patched_table, kUnmap,
+                    reinterpret_cast<void*>(unmap_forward), reinterpret_cast<void*>(&observedUnmap)))
+                unmap_hook_active.store(true, std::memory_order_release);
+        }
     } else
         EdpeLog(L"EDPE: depth-pass DrawIndexed probe unavailable (slot changed)");
 }
@@ -1405,6 +1466,9 @@ void takeCameraDeltaSource(ID3D11DeviceContext* context, unsigned long long fram
     if (desc.ByteWidth != 5376 || desc.Usage != D3D11_USAGE_DYNAMIC) {
         buffer->Release();
         return;
+    }
+    if (!scene_map_target.load(std::memory_order_acquire)) {
+        scene_map_target.store(buffer, std::memory_order_release);
     }
     camera_delta_source.Attach(buffer);
     camera_delta_source_frame = frame;
@@ -2224,10 +2288,37 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             patched_table = table;
             observed_swap_chain = swap_chain;
             EdpeLog(L"EDPE: OMSetRenderTargets DSV census armed");
+
+            auto map_forward = reinterpret_cast<MapFn>(table[kMap]);
+            auto unmap_forward = reinterpret_cast<UnmapFn>(table[kUnmap]);
+            if (map_forward) original_map.store(map_forward, std::memory_order_release);
+            if (unmap_forward) original_unmap.store(unmap_forward, std::memory_order_release);
+
+            bool map_ok = map_forward && patchSlot(table, kMap,
+                reinterpret_cast<void*>(map_forward), reinterpret_cast<void*>(&observedMap));
+            bool unmap_ok = unmap_forward && patchSlot(table, kUnmap,
+                reinterpret_cast<void*>(unmap_forward), reinterpret_cast<void*>(&observedUnmap));
+            map_hook_active.store(map_ok, std::memory_order_release);
+            unmap_hook_active.store(unmap_ok, std::memory_order_release);
+            wchar_t hook_msg[128];
+            swprintf_s(hook_msg, L"EDPE: Map/Unmap hooks armed map=%u unmap=%u", map_ok, unmap_ok);
+            EdpeLog(hook_msg);
         } else {
             observed_context.store(nullptr, std::memory_order_release);
             context->Release();
             EdpeLog(L"EDPE: OMSetRenderTargets DSV census unavailable");
+        }
+    }
+    if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
+        DXGI_SWAP_CHAIN_DESC sc_desc{};
+        if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
+            active_render_width = sc_desc.BufferDesc.Width;
+            active_render_height = sc_desc.BufferDesc.Height;
+        }
+        if (active_render_width && active_render_height) {
+            std::lock_guard lock(jitter_mutex);
+            active_projection_jitter = edpe::projectionJitter(frame, active_render_width, active_render_height);
+            jitter_frame_index.store(frame, std::memory_order_relaxed);
         }
     }
     if (frame % 1024 == 0 && observed_swap_chain == swap_chain) {
@@ -2562,12 +2653,90 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     endVSBufferProbe();
     resetCameraDelta();
     if (patched_table) {
+        if (map_hook_active.exchange(false, std::memory_order_acq_rel)) {
+            patchSlot(patched_table, kMap,
+                reinterpret_cast<void*>(&observedMap),
+                reinterpret_cast<void*>(original_map.load(std::memory_order_acquire)));
+        }
+        if (unmap_hook_active.exchange(false, std::memory_order_acq_rel)) {
+            patchSlot(patched_table, kUnmap,
+                reinterpret_cast<void*>(&observedUnmap),
+                reinterpret_cast<void*>(original_unmap.load(std::memory_order_acquire)));
+        }
         patchSlot(patched_table, kOMSetRenderTargets,
             reinterpret_cast<void*>(&observedOMSetRenderTargets),
             reinterpret_cast<void*>(original.load(std::memory_order_acquire)));
     }
+    scene_map_target.store(nullptr, std::memory_order_release);
+    scene_mapped_data.store(nullptr, std::memory_order_release);
     observed_context.exchange(nullptr, std::memory_order_acq_rel)->Release();
     patched_table = nullptr;
     observed_swap_chain = nullptr;
     last_present_frame.store(0, std::memory_order_relaxed);
 }
+
+void ContextCensusSetJitterEnabled(bool enabled) {
+    jitter_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool ContextCensusGetJitterEnabled() {
+    return jitter_enabled.load(std::memory_order_relaxed);
+}
+
+void ContextCensusSetJitterTestOverride(bool override) {
+    jitter_test_override.store(override, std::memory_order_relaxed);
+}
+
+bool ContextCensusGetJitterTestOverride() {
+    return jitter_test_override.load(std::memory_order_relaxed);
+}
+
+bool ContextCensusIsJitterActive() {
+    if (!jitter_enabled.load(std::memory_order_relaxed)) return false;
+    if (jitter_test_override.load(std::memory_order_relaxed)) return true;
+    return edpe::UpscalerManager::instance().isReconstructionActive();
+}
+
+void ContextCensusGetActiveJitter(float* pixelX, float* pixelY, float* ndcX, float* ndcY,
+    unsigned long long* frameIndex) {
+    std::lock_guard lock(jitter_mutex);
+    if (pixelX) *pixelX = active_projection_jitter.pixelX;
+    if (pixelY) *pixelY = active_projection_jitter.pixelY;
+    if (ndcX) *ndcX = active_projection_jitter.ndcX;
+    if (ndcY) *ndcY = active_projection_jitter.ndcY;
+    if (frameIndex) *frameIndex = jitter_frame_index.load(std::memory_order_relaxed);
+}
+
+unsigned ContextCensusGetJitteredWritesCount() {
+    return jittered_writes_count.load(std::memory_order_relaxed);
+}
+
+unsigned ContextCensusGetJitterRejectionsCount() {
+    return jitter_rejection_count.load(std::memory_order_relaxed);
+}
+
+extern "C" void WINAPI EdpeSetJitterEnabled(BOOL enabled) {
+    ContextCensusSetJitterEnabled(enabled != FALSE);
+}
+
+extern "C" BOOL WINAPI EdpeGetJitterEnabled() {
+    return ContextCensusGetJitterEnabled() ? TRUE : FALSE;
+}
+
+extern "C" void WINAPI EdpeSetJitterTestOverride(BOOL override) {
+    ContextCensusSetJitterTestOverride(override != FALSE);
+}
+
+extern "C" BOOL WINAPI EdpeGetJitterTestOverride() {
+    return ContextCensusGetJitterTestOverride() ? TRUE : FALSE;
+}
+
+extern "C" BOOL WINAPI EdpeIsJitterActive() {
+    return ContextCensusIsJitterActive() ? TRUE : FALSE;
+}
+
+extern "C" void WINAPI EdpeGetActiveJitter(float* pixelX, float* pixelY, float* ndcX, float* ndcY,
+    unsigned long long* frameIndex) {
+    ContextCensusGetActiveJitter(pixelX, pixelY, ndcX, ndcY, frameIndex);
+}
+

@@ -20,3 +20,14 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionDepthSnapshot(UINT* width, UINT
 int ContextCensusSceneDepthCandidate();
 ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index,
     ID3D11RenderTargetView** color_view = nullptr);
+
+// Phase 5: Projection Jitter Injection controls and diagnostics
+void ContextCensusSetJitterEnabled(bool enabled);
+bool ContextCensusGetJitterEnabled();
+void ContextCensusSetJitterTestOverride(bool override);
+bool ContextCensusGetJitterTestOverride();
+bool ContextCensusIsJitterActive();
+void ContextCensusGetActiveJitter(float* pixelX, float* pixelY, float* ndcX, float* ndcY,
+    unsigned long long* frameIndex = nullptr);
+unsigned ContextCensusGetJitteredWritesCount();
+unsigned ContextCensusGetJitterRejectionsCount();

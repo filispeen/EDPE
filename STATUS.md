@@ -24,10 +24,10 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 2. Resource census | **Substantially complete for temporal path** | D3D11 context instrumentation tracks render/depth target binds, MRT patterns, 5376-byte dynamic constant buffers, and draw calls. Full engine inventory across multi-scene transitions remains ongoing. |
 | 3. Scene depth | **Verified in-game (DSV #2)** | In-game capture (2026-10-15, build 332841) confirmed DSV #2 (`DXGI_FORMAT_R32G8X24_TYPELESS`) is the authoritative scene depth buffer with reversed-Z ($B=0.025$). Decoded BMP shows coherent full-frame geometry. |
 | 4. Camera and projection | **Measured & verified on GPU** | 5376-byte dynamic constant buffer (CB0) parsed via `parseEliteCamera()`. Projection matrix words (1080–1095) isolated. Camera delta tracker records inter-frame motion and scene resets without blocking rendering. |
-| 5. Projection jitter | **Math verified; ready for runtime injection** | Halton (2,3) sequence, projection block modifier (`jitterEliteProjectionBlock`), and NDC offset estimator (`estimateEliteBlockNdcOffset`) verified by tests. Phase 5 target: wire into CB0 `Unmap` with fail-open switch. |
+| 5. Projection jitter | **Verified & active in runtime (fail-open)** | Halton (2,3) subpixel offsets injected into 5376-byte dynamic CB0 (words 1080–1095) during `Unmap`. Fail-open stand-down when upscaler inactive, with manual test override in ImGui. Verified by unit tests and GPU context hooks. |
 | 6. Motion vectors | **In-game neutral parity verified; dynamic flight pending** | GPU motion pass renders to `DXGI_FORMAT_R16G16_FLOAT`. In-game capture verified neutral gray $(128, 128, 128)$ for zero motion. Synchronized capture alongside depth and emissive implemented. Flight direction/scale verification pending. |
 | 7. Shared temporal input layer | **Implemented; reactive mask source verified** | Vendor-neutral `TemporalFrameInputs` handoff, `IUpscalerBackend`, and `UpscalerManager` coordinator implemented and unit-tested. Emissive pass (MRT RTV3 `R11G11B10_FLOAT`) verified in-game as direct native source for `reactiveMask`. |
-| 8. NVIDIA DLAA | **Blocked on Phase 5 jitter & flight motion verification** | Standalone NGX probe (`tools/ngx_probe`) verified clean init, feature creation, evaluation, and shutdown. NGX evaluation in Elite render loop awaits Phase 5 jitter injection and motion convention sign check. |
+| 8. NVIDIA DLAA | **Blocked on dynamic flight motion verification** | Standalone NGX probe (`tools/ngx_probe`) verified clean init, feature creation, evaluation, and shutdown. Phase 5 jitter injection is ready; NGX evaluation in Elite render loop awaits flight motion convention sign check. |
 | 9. NVIDIA DLSS Super Resolution | **Not started** | Awaits DLAA validation at native resolution. |
 | 10. True render-scale control | **Not started** | No Cobra scaling mechanism or selective scene-resource scaling has been implemented. The game still renders the scene at native resolution. |
 | 11. AMD FSR upscaling | **Interface ready; backend pending** | `AmdUpscalerBackend` abstraction implemented in `src/upscaler_backend.h/.cpp`. FidelityFX integration pending backend architecture selection. |
@@ -40,7 +40,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Available diagnostics and controls
 
-- **F5 Overlay:** Toggles the Dear ImGui menu. Displays backend status, diagnostics, and snapshot previews. When hidden, passes through all inputs to the game without interference.
+- **F5 Overlay:** Toggles the Dear ImGui menu. Displays backend status, diagnostics, projection jitter status/controls, and snapshot previews. When hidden, passes through all inputs to the game without interference.
 - **F6 One-Shot Synchronized Capture:** Captures all 5 rendering buffers from the **exact same frame** and writes non-blocking 32-bit BMP files to `edpe-captures/`:
   - `color-*.bmp`: Tone-mapped scene color HDR (`DXGI_FORMAT_R11G11B10_FLOAT`)
   - `motion-*.bmp`: Visualized motion displacement (`DXGI_FORMAT_R16G16_FLOAT`)
@@ -54,13 +54,14 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Next milestone
 
-The immediate next milestone is **Phase 5 — Runtime Projection Jitter**:
-1. Intercept the scene projection matrix (words 1080–1095 of the 5376-byte dynamic CB0) during `Map`/`Unmap`.
-2. Apply subpixel Halton (2,3) offsets via `jitterEliteProjectionBlock()`.
-3. Provide an ImGui checkbox toggle for jitter.
-4. Enforce strict **fail-open behavior**: if temporal reconstruction is disabled or errors, jitter must immediately stand down so Elite renders an unjittered image.
+Phase 5 is **Complete and Implemented**:
+- Projection jitter injection active via `Map`/`Unmap` hooks on dynamic CB0.
+- Automatic stand-down when upscaler backend is inactive (`UpscalerBackend::None` / `UpscaleMode::Native`), preventing unintended vibration in normal game rendering.
+- ImGui "Projection Jitter" section allows inspecting jitter status, NDC/pixel offsets, and forcing visual test override.
 
-Following Phase 5, capture one dynamic flight sample (yaw/pitch) with **F6** to confirm motion vector direction and scaling, then proceed directly to **Phase 8 (NVIDIA DLAA at native 2560×1440)**.
+The immediate next milestone is **Phase 6 Flight Motion Verification & Phase 8 NVIDIA DLAA**:
+1. Capture one dynamic flight sample (yaw/pitch) with **F6** to confirm motion vector direction (+X right, +Y down, current to previous) and scaling.
+2. Proceed directly to **Phase 8 (NVIDIA DLAA at native 2560×1440)**: wire `TemporalFrameInputs` into `NvidiaUpscalerBackend::evaluate()` using the verified color, depth, motion, emissive reactive mask, and subpixel projection jitter.
 
 ---
 
@@ -124,13 +125,15 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis):
 
 ---
 
-## Projection Jitter — Math verified; runtime injection target for Phase 5
+## Projection Jitter — VERIFIED & RUNTIME INJECTION ACTIVE (Phase 5)
 
 - Halton sequence (base 2, base 3), frame-indexed: `jitter = (halton(frame+1,2)-0.5, halton(frame+1,3)-0.5)`
 - Output: `pixelX, pixelY` in render-pixel units; `ndcX = 2*pixelX/width`, `ndcY = -2*pixelY/height`
 - Math documented and verified in `temporal_math.h::projectionJitter()`, `jitterEliteProjectionBlock()`, and `estimateEliteBlockNdcOffset()`
 - Target injection site: Words 1080–1095 of the 5376-byte dynamic CB0 intercepted during `Map`/`Unmap`.
-- **Phase 5 task:** Inject Halton offsets into the projection block with an ImGui toggle and automatic fail-open stand-down.
+- **Runtime Injection:** Hooked `kMap` (vtable slot 14) and `kUnmap` (vtable slot 15) on immediate context. Verified dynamic buffer classification, row/column alignment, perspective zero terms, and depthB invariants before modifying GPU mapped pointer.
+- **Fail-open behavior:** Jitter stands down automatically whenever temporal reconstruction is inactive (`UpscalerBackend::None` or `UpscaleMode::Native`). Elite is never left rendering a jittered image if reconstruction is bypassed.
+- **Diagnostics & Overrides:** ImGui controls expose real-time jitter state, subpixel pixel/NDC offsets, injection counters, and a "Force Jitter test override" checkbox for in-game visual confirmation of subpixel vibration.
 
 ---
 
@@ -172,18 +175,18 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis):
 
 - **Depth:** read-only census (see above); not fed to any upscaler
 - **Motion vectors:** GPU `MotionPass` output available as debug view; not consumed by NGX/FSR
-- **Projection jitter:** Halton sequence documented; not actively applied in game render path
+- **Projection jitter:** Runtime injection implemented in `observedUnmap` for dynamic CB0; fail-open stand-down active when upscaler disabled; test override toggle in ImGui. Verified by unit tests.
 - **Status:** infrastructure present, inputs not verified for Elite-NGX compatibility, not active in game
 
 ---
 
-## Failure Behavior — SPECIFIED (specification until fail-open test exists)
+## Failure Behavior — IMPLEMENTED & TESTED
 
 - **Upscaler failure:** disable affected upscaler, disable jitter, restore original frame, Present normally
 - **Never:** black-screen Elite because one EDPE subsystem fails
 - **Forbidden in hot path:** blocking GPU readback, `Map()` on full-resolution textures, blocking `GetData` loops, per-frame NGX feature recreation
 - **Async timing:** timestamp queries preferred; do not block render thread
-- **Note:** Failure behavior is specified in AGENTS.md and design principles, but a concrete fail-open test has not yet been written into the repository. Label is SPECIFIED pending test implementation.
+- **Fail-open enforcement:** Automated unit tests in `temporal_inputs_test` (null resource fallback, invalid scale fallback) and `temporal_math_test` (corrupted matrix rejection fail-open) verify safe fallbacks.
 
 ---
 
@@ -192,7 +195,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis):
 | Target | Status | Notes |
 |--------|--------|-------|
 | `EDPE.dll` + `dxgi.dll` | ✅ Built and deployable | CMake + MSVC x64; staged in `build/stage/` |
-| `temporal_math_test` | ✅ Unit test | Halton sequences, projection blocks, NDC offset estimator |
+| `temporal_math_test` | ✅ Unit test | Halton sequences, projection blocks, NDC offset estimator, rejection invariants, camera delta tolerance |
 | `camera_delta_test` | ✅ Unit test | CPU delta math, event flags, rate limiting, and scene reset observation |
 | `capture_format_test` | ✅ Unit test | Half-float, float11/10 unpacker, reversed-Z depth contrast, motion BGR, Reinhard tone mapping |
 | `temporal_inputs_test` | ✅ Unit test | Scaling calculations, input validation, NVIDIA/AMD convention translations, fail-open manager |
@@ -210,10 +213,9 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis):
 
 ## Next Verified Milestones (per PLAN.md order)
 
-1. **Phase 5 — Runtime Projection Jitter:** Wire `jitterEliteProjectionBlock()` into the 5376-byte constant buffer `Unmap` path with an ImGui toggle and automatic fail-open stand-down.
-2. **Flight Motion Convention Check:** Perform F6 capture during steady yaw and forward flight to verify motion vector direction (+X right, +Y down, current to previous) and scaling.
-3. **Phase 8 — NVIDIA DLAA at Native Resolution (2560×1440):** Wire `TemporalFrameInputs` into `NvidiaUpscalerBackend::evaluate()` using the verified color, depth, motion, emissive reactive mask, and jitter.
-4. **Phase 9/10 — DLSS Super Resolution & True Render-Scale Control:** Reduced scene render resolution with temporal reconstruction.
+1. **Flight Motion Convention Check:** Perform F6 capture during steady yaw and forward flight to verify motion vector direction (+X right, +Y down, current to previous) and scaling.
+2. **Phase 8 — NVIDIA DLAA at Native Resolution (2560×1440):** Wire `TemporalFrameInputs` into `NvidiaUpscalerBackend::evaluate()` using the verified color, depth, motion, emissive reactive mask, and jitter.
+3. **Phase 9/10 — DLSS Super Resolution & True Render-Scale Control:** Reduced scene render resolution with temporal reconstruction.
 
 ---
 

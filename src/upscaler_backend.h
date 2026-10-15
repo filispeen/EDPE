@@ -148,6 +148,10 @@ public:
     bool isBackendAvailable(UpscalerBackend backend) const;
     const wchar_t* getBackendUnavailableReason(UpscalerBackend backend) const;
 
+    bool isReconstructionActive() const {
+        return currentBackendType_ != UpscalerBackend::None && currentMode_ != UpscaleMode::Native;
+    }
+
     // Dispatches temporal reconstruction. Fails open on any error.
     bool evaluate(ID3D11DeviceContext* context,
         const TemporalFrameInputs& inputs,
