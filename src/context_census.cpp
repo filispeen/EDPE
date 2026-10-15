@@ -273,6 +273,7 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
 void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud);
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long frame);
+void rearmContextHooks();
 
 bool sameRenderTargetResource(ID3D11RenderTargetView* view,
     ID3D11RenderTargetView* source) {
@@ -1983,7 +1984,17 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long frame) 
     auto& upscaler = edpe::UpscalerManager::instance();
     if (!upscaler.isReconstructionActive() || !context || s_upscale_evaluated_this_frame) return;
 
-    if (!motion_color_source || !scene_depth_source) return;
+    static unsigned long long s_last_missing_log = ~0ull;
+    if (!motion_color_source || !scene_depth_source) {
+        if (s_last_missing_log != frame && frame % 120 == 0) {
+            s_last_missing_log = frame;
+            wchar_t msg[128];
+            swprintf_s(msg, L"EDPE: upscale skipped frame=%llu (colorSource=%p depthSource=%p)",
+                frame, motion_color_source.Get(), scene_depth_source.Get());
+            EdpeLog(msg);
+        }
+        return;
+    }
 
     Microsoft::WRL::ComPtr<ID3D11Resource> colorRes;
     motion_color_source->GetResource(&colorRes);
@@ -1993,6 +2004,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long frame) 
     D3D11_TEXTURE2D_DESC colorDesc{};
     colorTexture->GetDesc(&colorDesc);
     if (!colorDesc.Width || !colorDesc.Height) return;
+
+    static unsigned long long s_last_exec_log = ~0ull;
+    if (s_last_exec_log != frame && (s_last_exec_log == ~0ull || frame % 300 == 0)) {
+        s_last_exec_log = frame;
+        wchar_t msg[160];
+        swprintf_s(msg, L"EDPE: tryTemporalUpscale executing frame=%llu size=%ux%u",
+            frame, colorDesc.Width, colorDesc.Height);
+        EdpeLog(msg);
+    }
 
     D3D11_TEXTURE2D_DESC depthDesc{};
     scene_depth_source->GetDesc(&depthDesc);
@@ -2073,6 +2093,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long frame) 
         s_upscale_evaluated_this_frame = true;
         s_camera_reset = false;
     }
+    rearmContextHooks();
 }
 
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,
@@ -2118,19 +2139,25 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     if (context != observed_context.load(std::memory_order_acquire)) return;
     copyCameraDeltaSource(context);
     rearmHudDrawProbe();
-    if (motion_pair_active && motion_color_source &&
+    const bool reconstruction_active = edpe::UpscalerManager::instance().isReconstructionActive();
+    if ((motion_pair_active || reconstruction_active) && motion_color_source &&
         motion_color_frame == last_present_frame.load(std::memory_order_relaxed)) {
         bool bound = false;
         for (UINT slot = 0; targets && slot < count; ++slot)
             bound |= sameRenderTargetResource(targets[slot], motion_color_source.Get());
-        if (motion_color_bound && !bound && !motion_color_first_exit_logged) {
-            motion_color_first_exit_logged = true;
-            wchar_t message[160];
-            swprintf_s(message,
-                L"EDPE: motion HDR RTV3 first exit frame=%llu nextRTVs=%u nextDSV=%p",
-                motion_color_frame, count, dsv);
-            EdpeLog(message);
-            captureEarlyMotionColor(context, false);
+        if (motion_color_bound && !bound) {
+            if (!motion_color_first_exit_logged) {
+                motion_color_first_exit_logged = true;
+                wchar_t message[160];
+                swprintf_s(message,
+                    L"EDPE: motion HDR RTV3 first exit frame=%llu nextRTVs=%u nextDSV=%p",
+                    motion_color_frame, count, dsv);
+                EdpeLog(message);
+                captureEarlyMotionColor(context, false);
+            }
+            if (reconstruction_active && !s_upscale_evaluated_this_frame) {
+                tryTemporalUpscale(context, motion_color_frame);
+            }
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
         motion_color_bound = bound;
@@ -2154,12 +2181,30 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             views[3].Format == DXGI_FORMAT_R11G11B10_FLOAT;
     }
 
+    bool hud_probe_begin = false;
+    if (scene_mrt && reconstruction_active) {
+        const auto frame = last_present_frame.load(std::memory_order_relaxed);
+        motion_color_source = targets[3];
+        motion_color_frame = frame;
+        motion_color_bound = true;
+        hud_probe_begin = true;
+
+        if (dsv) {
+            ID3D11Resource* dsv_res = nullptr;
+            dsv->GetResource(&dsv_res);
+            if (dsv_res) {
+                dsv_res->QueryInterface(__uuidof(ID3D11Texture2D),
+                    reinterpret_cast<void**>(scene_depth_source.ReleaseAndGetAddressOf()));
+                dsv_res->Release();
+            }
+        }
+    }
+
     size_t index = 0;
     bool first_bind = false;
     bool first_color = false;
     unsigned snapshot_probe_bind = 0;
     unsigned camera_pair_sample = 0;
-    bool hud_probe_begin = false;
     bool camera_delta_take = false;
     {
         std::lock_guard lock(seen_mutex);
@@ -2328,6 +2373,31 @@ bool patchSlot(void** table, size_t slot, void* expected, void* replacement) {
     VirtualProtect(table + slot, sizeof(void*), old_protection, &ignored);
     return replaced == expected;
 }
+
+void rearmContextHooks() {
+    if (!patched_table) return;
+    const auto forward_om = original.load(std::memory_order_acquire);
+    if (forward_om && patched_table[kOMSetRenderTargets] != reinterpret_cast<void*>(&observedOMSetRenderTargets)) {
+        const bool restored = patchSlot(patched_table, kOMSetRenderTargets,
+            patched_table[kOMSetRenderTargets],
+            reinterpret_cast<void*>(&observedOMSetRenderTargets));
+        if (restored) EdpeLog(L"EDPE: DSV observer restored after context-state swap");
+    }
+    const auto forward_map = original_map.load(std::memory_order_acquire);
+    if (forward_map && map_hook_active.load(std::memory_order_acquire) &&
+        patched_table[kMap] != reinterpret_cast<void*>(&observedMap)) {
+        patchSlot(patched_table, kMap,
+            patched_table[kMap],
+            reinterpret_cast<void*>(&observedMap));
+    }
+    const auto forward_unmap = original_unmap.load(std::memory_order_acquire);
+    if (forward_unmap && unmap_hook_active.load(std::memory_order_acquire) &&
+        patched_table[kUnmap] != reinterpret_cast<void*>(&observedUnmap)) {
+        patchSlot(patched_table, kUnmap,
+            patched_table[kUnmap],
+            reinterpret_cast<void*>(&observedUnmap));
+    }
+}
 } // namespace
 
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags) {
@@ -2451,11 +2521,13 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
+        rearmContextHooks();
         auto* context = observed_context.load(std::memory_order_acquire);
         if (edpe::UpscalerManager::instance().isReconstructionActive() && !s_upscale_evaluated_this_frame && context) {
             tryTemporalUpscale(context, frame);
         }
         s_upscale_evaluated_this_frame = false;
+        motion_color_first_exit_logged = false;
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         DXGI_SWAP_CHAIN_DESC sc_desc{};
@@ -2563,24 +2635,8 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
 }
 
 void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags) {
-    if ((flags & DXGI_PRESENT_TEST) || observed_swap_chain != swap_chain ||
-        !motion_hook_watch || !patched_table) return;
-    // A WARP and Elite run observed this slot reverting after the motion pass.
-    // Restore only our known original slot; leave any other hook untouched.
-    --motion_hook_watch;
-    const auto forward = original.load(std::memory_order_acquire);
-    auto* current = patched_table[kOMSetRenderTargets];
-    if (current == reinterpret_cast<void*>(forward)) {
-        const bool restored = patchSlot(patched_table, kOMSetRenderTargets,
-            reinterpret_cast<void*>(forward),
-            reinterpret_cast<void*>(&observedOMSetRenderTargets));
-        EdpeLog(restored ? L"EDPE: DSV observer restored after context-state swap"
-                         : L"EDPE: DSV observer unavailable after context-state swap");
-        motion_hook_watch = 0;
-    } else if (current != reinterpret_cast<void*>(&observedOMSetRenderTargets)) {
-        EdpeLog(L"EDPE: DSV observer changed unexpectedly after motion pass");
-        motion_hook_watch = 0;
-    }
+    if ((flags & DXGI_PRESENT_TEST) || observed_swap_chain != swap_chain || !patched_table) return;
+    rearmContextHooks();
 }
 
 bool ContextCensusRequestBindSequence() {

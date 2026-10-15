@@ -2,6 +2,7 @@
 #include "log.h"
 #include "ngx_context.h"
 
+#include <chrono>
 #include <cwchar>
 
 namespace edpe {
@@ -357,7 +358,10 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         backend->resetHistory();
     }
 
+    auto t0 = std::chrono::high_resolution_clock::now();
     const bool evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    diagnostics_.gpuTimeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
     diagnostics_.success = evalSuccess;
 
     if (!evalSuccess) {
@@ -370,8 +374,18 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         return false;
     }
 
-    swprintf_s(diagnostics_.statusMessage, L"Reconstructed (%ux%u -> %ux%u)",
-        inputs.renderWidth, inputs.renderHeight, inputs.outputWidth, inputs.outputHeight);
+    static unsigned s_eval_log_count = 0;
+    if (++s_eval_log_count == 1 || s_eval_log_count % 300 == 0) {
+        wchar_t message[256];
+        swprintf_s(message, L"EDPE: %ls reconstructed %ux%u -> %ux%u in %.3f ms (#%u)",
+            backend->name(), inputs.renderWidth, inputs.renderHeight,
+            inputs.outputWidth, inputs.outputHeight, diagnostics_.gpuTimeMs, s_eval_log_count);
+        EdpeLog(message);
+    }
+
+    swprintf_s(diagnostics_.statusMessage, L"Reconstructed (%ux%u -> %ux%u) %.3f ms",
+        inputs.renderWidth, inputs.renderHeight, inputs.outputWidth, inputs.outputHeight,
+        diagnostics_.gpuTimeMs);
     pendingReset_ = false;
     return true;
 }

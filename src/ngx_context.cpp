@@ -276,7 +276,15 @@ bool NgxContext::evaluateDlaa(ID3D11DeviceContext* context,
     NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(context, g_dlaa_feature, g_ngx_params, &ep);
     if (r != NVSDK_NGX_Result_Success) {
         swprintf_s(g_status_msg, L"NGX_D3D11_EVALUATE_DLSS_EXT failed: 0x%08X", static_cast<unsigned>(r));
+        EdpeLog(g_status_msg);
         return false;
+    }
+
+    static unsigned s_ngx_eval_count = 0;
+    if (++s_ngx_eval_count == 1 || s_ngx_eval_count % 300 == 0) {
+        wchar_t msg[160];
+        swprintf_s(msg, L"EDPE: NGX DLAA evaluated successfully #%u (%ux%u)", s_ngx_eval_count, width, height);
+        EdpeLog(msg);
     }
 
     if (ep.InReset) {
