@@ -2,8 +2,8 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-v0.3.5-blue.svg)](STATUS.md)
-[![Status](https://img.shields.io/badge/status-FSR%20%26%20DLSS%20Verified%20In--Game-success.svg)](STATUS.md)
+[![Version](https://img.shields.io/badge/version-v0.4.0-blue.svg)](STATUS.md)
+[![Status](https://img.shields.io/badge/status-TAA%2C%20FSR%20%26%20DLSS%20Verified%20In--Game-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
 [![Tests](https://img.shields.io/badge/tests-10%2F10%20Passing-brightgreen.svg)]()
 
@@ -15,9 +15,9 @@ Elite Dangerous natively lacks modern temporal reconstruction technologies in it
 
 ---
 
-## Current Status: Milestone `v0.3.5` (AMD FSR 3.1.2 & NVIDIA DLSS Verified In-Game)
+## Current Status: Milestone `v0.4.0` (Native TAA, AMD FSR 3.1.2 & NVIDIA DLSS Verified In-Game)
 
-As of **October 2026 (`v0.3.5`)**, EDPE has achieved:
+As of **October 2026 (`v0.4.0`)**, EDPE has achieved:
 
 * **Non-invasive D3D11 / DXGI Proxy:** Hooks device creation and swapchain presentation without black screens, crashes, or rendering artifacts.
 * **Scene Depth Discovery:** Successfully isolated authoritative reversed-Z scene depth buffer (`DSV #2`, `DXGI_FORMAT_R32G8X24_TYPELESS`, $B=0.025$).
@@ -25,13 +25,14 @@ As of **October 2026 (`v0.3.5`)**, EDPE has achieved:
 * **Projection Jitter Injection:** Generates Halton (2,3) subpixel projection jitter and injects it into dynamic CB0 projection matrix words (1080–1095) with **automatic fail-open stand-down** when reconstruction is disabled.
 * **Camera-Depth Motion Vectors:** Real-time GPU motion pass generates per-pixel current→previous screen-space motion vectors (`DXGI_FORMAT_R16G16_FLOAT`).
 * **Vendor-Neutral Temporal Input Layer:** Abstracted `TemporalFrameInputs` structure decoupling engine state from vendor reconstruction SDKs.
+* **Native D3D11 TAA (Temporal Anti-Aliasing):** Vendor-neutral native temporal anti-aliasing reconstruction pass utilizing Halton (2,3) projection jitter accumulation, camera-depth motion reprojection, and 3x3 YCoCg variance clipping with zero external SDK dependencies.
 * **NVIDIA DLAA Evaluation:** Official NVIDIA NGX SDK integrated with EDPE-owned Project ID (`48d353f3-d07b-4048-876b-09f8622f5a27`). DLAA runs on the finished swapchain backbuffer at `Present` prior to overlay rendering, achieving **rock-solid temporal anti-aliasing with ~0.3 ms GPU overhead** and zero subpixel image vibration.
 * **NVIDIA DLSS Super Resolution:** Reconstructs true sub-native 3D scenes (via Cobra in-game Supersampling < 1.0x) into native resolution, supporting Quality, Balanced, Performance, and Ultra Performance with DLSS Presets (Auto, J, K, L, M).
 * **AMD FSR 3.1.2 Verified In-Game:** Verified in Elite Dangerous Odyssey for both FSR Native AA at 1.0x SSAA and FSR Super Resolution at sub-native render scales (< 1.0x SSAA) via native D3D11 compute path.
-* **Real-Time Performance HUD Overlay (`F7` / `F5`):** Built-in heads-up display showing live FPS, game frametime, upscaler frametime, total frametime, active GPU adapter name, GPU usage %, and dedicated VRAM usage (used/total and %). Configurable corner position, toggleable in F5 menu or via F7 hotkey with transparent click-through.
-* **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA / FSR Native AA (at 1.0x) or DLSS / FSR Super Resolution (at < 1.0x).
+* **Real-Time Performance HUD Overlay (`F7` / `F5`):** Built-in heads-up display showing live FPS, game frametime, upscaler frametime, total frametime, active GPU adapter name, GPU usage %, and dedicated VRAM usage (used/total and %). Features scaling slider (0.5x–2.0x), interactive mouse dragging in F5 menu, persistent screen positioning in `edpe.ini`, and complete transparent click-through protection against input leaks.
+* **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA / FSR Native AA / TAA (at 1.0x) or DLSS / FSR Super Resolution (at < 1.0x).
 * **Native UI Protection & Composite:** Dedicated shader pass (`UiCompositePass`) preserves native-resolution HUD, text, cockpits, and menus, seamlessly compositing them over reconstructed DLSS/FSR frames.
-* **Before / After Comparison Captures:** Dedicated in-game button capturing synchronized pairs of 32-bit BMP screenshots (`before` and `after` DLAA/DLSS/FSR) in `edpe-captures/`.
+* **Before / After Comparison Captures:** Dedicated in-game button capturing synchronized pairs of 32-bit BMP screenshots (`before` and `after` DLAA/DLSS/FSR/TAA) in `edpe-captures/`.
 * **Dear ImGui In-Game Overlay (`F5`):** Runtime control surface displaying live GPU timings, jitter/motion diagnostics, and temporal tuning controls. Passes all inputs through to the game when closed.
 * **Synchronized 5-Buffer GPU Capture (`F6`):** One-shot capture of all 5 engine buffers (`color`, `motion`, `depth`, `early-color` emissive, `frame`) from the exact same frame using non-blocking asynchronous GPU readback (`D3D11_MAP_FLAG_DO_NOT_WAIT`), saved to `edpe-captures/`.
 * **Automated Test Suite:** 10 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy hooks, GPU motion passes, and UI composition.
