@@ -56,3 +56,5 @@ void ContextCensusGetSceneRenderSize(UINT* outWidth, UINT* outHeight);
 void ContextCensusRequestComparisonCapture();
 bool ContextCensusIsComparisonCapturePending();
 bool ContextCensusConsumeComparisonCaptureRequest();
+ID3D11Texture2D* ContextCensusGetBackbufferCopyTexture();
+ID3D11RenderTargetView* ContextCensusGetBackbufferCopyRtv();

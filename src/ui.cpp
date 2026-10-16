@@ -123,17 +123,15 @@ bool isInputMessage(UINT message) {
 LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
         wparam == VK_F5 && !(lparam & (1LL << 30))) {
-        menu_visible.store(!menu_visible.load());
+        const bool new_visible = !menu_visible.load();
+        menu_visible.store(new_visible);
+        if (new_visible) {
+            ClipCursor(nullptr);
+            while (ShowCursor(TRUE) < 0) {}
+        }
         return 0;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F5) return 0;
-    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-        wparam == VK_F6 && !(lparam & (1LL << 30))) {
-        all_captures_requested.store(true, std::memory_order_release);
-        EdpeLog(L"EDPE: F6 pressed — requesting full capture (color, motion, depth, emission, frame)");
-        return 0;
-    }
-    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F6) return 0;
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
         wparam == VK_F7 && !(lparam & (1LL << 30))) {
         auto& cfg = edpe::Config::instance();
@@ -144,7 +142,14 @@ LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F7) return 0;
     if (menu_visible.load()) {
-        if (message == WM_INPUT) return DefWindowProcW(window, message, wparam, lparam);
+        if (message == WM_INPUT) return 0;
+        if (message == WM_SETCURSOR) {
+            SetCursor(LoadCursor(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+        if (message == WM_MOUSEACTIVATE) {
+            return MA_ACTIVATE;
+        }
         if (isInputMessage(message)) {
             std::lock_guard lock(input_mutex);
             const InputMessage input{window, message, wparam, lparam};
@@ -155,7 +160,7 @@ LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 if (pending_input.size() == 256) pending_input.erase(pending_input.begin());
                 pending_input.push_back(input);
             }
-            return 1;
+            return 0;
         }
     }
     return ui.original_wndproc ? CallWindowProcW(ui.original_wndproc, window, message, wparam, lparam)
@@ -960,10 +965,10 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             releaseEarlyColorSnapshot();
             releaseDepthSnapshot();
             wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: F6 all-captures armed on DSV #%d", candidate);
+            swprintf_s(msg, L"EDPE: all-captures armed on DSV #%d", candidate);
             EdpeLog(msg);
         } else {
-            EdpeLog(L"EDPE: F6 all-captures armed backbuffer only (no depth candidate yet)");
+            EdpeLog(L"EDPE: all-captures armed backbuffer only (no depth candidate yet)");
             ui.pending_backbuffer_capture = true;
         }
     }
@@ -1041,10 +1046,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
 
     auto& cfg = edpe::Config::instance();
+    const bool comparison_pending = ContextCensusIsComparisonCapturePending();
     const bool show_menu = menu_visible.load();
-    const bool show_perf = cfg.showPerfOverlay;
+    const bool show_perf = cfg.showPerfOverlay || comparison_pending;
 
-    if (!show_menu && !show_perf) {
+    if (!show_menu && !show_perf && !comparison_pending) {
         std::lock_guard lock(input_mutex);
         pending_input.clear();
         return;
@@ -1057,7 +1063,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGuiContext* previous = ImGui::GetCurrentContext();
     ImGui::SetCurrentContext(ui.imgui);
 
-    if (show_menu) {
+    const bool draw_menu = show_menu && !comparison_pending;
+    if (draw_menu) {
         std::lock_guard lock(input_mutex);
         pending_input.swap(render_input);
         if (!render_input.empty() && !ui.input_logged) {
@@ -1078,11 +1085,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::NewFrame();
 
     if (show_perf) {
-        edpe::PerfTracker::instance().renderOverlay(show_menu, cfg.perfOverlayCorner);
+        edpe::PerfTracker::instance().renderOverlay(draw_menu, cfg.perfOverlayCorner, cfg.perfOverlayScale);
     }
 
     bool window_open = true;
-    if (show_menu) {
+    if (draw_menu) {
         ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced", &window_open);
         ImGui::Text("Version: %s", edpe::kVersion);
         auto& upscaler = edpe::UpscalerManager::instance();
@@ -1100,6 +1107,19 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     const char* hud_corners[] = { "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right" };
     if (ImGui::Combo("HUD Position", &cfg.perfOverlayCorner, hud_corners, IM_ARRAYSIZE(hud_corners))) {
+        cfg.perfOverlayPosX = -1.0f;
+        cfg.perfOverlayPosY = -1.0f;
+        cfg.save();
+    }
+    if (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset Dragged Position")) {
+            cfg.perfOverlayPosX = -1.0f;
+            cfg.perfOverlayPosY = -1.0f;
+            cfg.save();
+        }
+    }
+    if (ImGui::SliderFloat("HUD Scale", &cfg.perfOverlayScale, 0.5f, 2.5f, "%.2fx")) {
         cfg.save();
     }
 
@@ -1400,7 +1420,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::Text("Jittered Writes: %u | Rejections: %u | Frame: %llu",
         ContextCensusGetJitteredWritesCount(), ContextCensusGetJitterRejectionsCount(), jframe);
     ImGui::Separator();
-    if (ImGui::Button("Capture ALL buffers (F6)")) {
+    if (ImGui::Button("Capture ALL buffers (diagnostic dump)")) {
         all_captures_requested.store(true, std::memory_order_release);
     }
     ImGui::SameLine();
@@ -1408,9 +1428,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
         ui.pending_backbuffer_capture = true;
     }
-    ImGui::TextUnformatted("F5: toggle menu | F6: capture buffers | F7: toggle performance HUD");
+    ImGui::TextUnformatted("F5: toggle menu | F7: toggle performance HUD");
     ImGui::End();
-    if (show_menu && ui.depth_srv && ui.depth_window_open) {
+    if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);
         if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
             ImGui::Text("DSV #%d (%ux%u)",
@@ -1440,7 +1460,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
         ImGui::End();
     }
-    if (show_menu && ui.color_srv && ui.color_window_open) {
+    if (draw_menu && ui.color_srv && ui.color_window_open) {
         placeSnapshotWindow(2);
         if (ImGui::Begin("EDPE Scene Color Snapshot", &ui.color_window_open)) {
             if (ui.color_snapshot_index >= 0)
@@ -1469,7 +1489,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
         ImGui::End();
     }
-    if (show_menu && ui.early_color_srv && ui.early_color_window_open) {
+    if (draw_menu && ui.early_color_srv && ui.early_color_window_open) {
         placeSnapshotWindow(0);
         if (ImGui::Begin("EDPE Emissive / Glow (Early HDR) Snapshot", &ui.early_color_window_open)) {
             ImGui::TextUnformatted("Emissive / illumination pass: lamps, dials, lights");
@@ -1488,7 +1508,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
         ImGui::End();
     }
-    if (show_menu && ui.motion_srv && ui.motion_window_open) {
+    if (draw_menu && ui.motion_srv && ui.motion_window_open) {
         placeSnapshotWindow(1);
         if (ImGui::Begin("EDPE Motion Snapshot", &ui.motion_window_open)) {
             ImGui::TextUnformatted("Camera + depth motion; HUD is not represented");
@@ -1513,15 +1533,34 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
         ImGui::End();
     }
-    } // if (show_menu)
-    if (show_menu && !window_open) menu_visible.store(false);
+    } // if (draw_menu)
+    if (draw_menu && !window_open) menu_visible.store(false);
     ImGui::Render();
 
     ID3D11RenderTargetView* previous_rtv = nullptr;
     ID3D11DepthStencilView* previous_dsv = nullptr;
     ui.context->OMGetRenderTargets(1, &previous_rtv, &previous_dsv);
+
+    ID3D11Texture2D* copy_tex = ContextCensusGetBackbufferCopyTexture();
+    ID3D11RenderTargetView* copy_rtv = ContextCensusGetBackbufferCopyRtv();
+
+    if (comparison_pending && copy_rtv && copy_tex) {
+        ui.context->OMSetRenderTargets(1, &copy_rtv, nullptr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    }
+
     ui.context->OMSetRenderTargets(1, &ui.backbuffer_rtv, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+    if (comparison_pending && copy_tex) {
+        ID3D11Texture2D* backbuffer = nullptr;
+        if (SUCCEEDED(swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer)))) {
+            ContextCensusConsumeComparisonCaptureRequest();
+            UiQueueComparisonCapture(ui.context, copy_tex, backbuffer);
+            backbuffer->Release();
+        }
+    }
+
     ui.context->OMSetRenderTargets(1, &previous_rtv, previous_dsv);
     if (previous_rtv) previous_rtv->Release();
     if (previous_dsv) previous_dsv->Release();

@@ -2,6 +2,7 @@
 #include "upscaler_backend.h"
 #include "context_census.h"
 #include "ngx_context.h"
+#include "config.h"
 #include "log.h"
 
 #include <imgui.h>
@@ -164,7 +165,8 @@ void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
     }
 }
 
-void PerfTracker::renderOverlay(bool isMenuOpen, int corner) {
+void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
+    auto& cfg = edpe::Config::instance();
     const float PAD = 10.0f;
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const ImVec2 work_pos = viewport->WorkPos;
@@ -191,7 +193,11 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner) {
         break;
     }
 
-    ImGui::SetNextWindowPos(window_pos, isMenuOpen ? ImGuiCond_Appearing : ImGuiCond_Always, window_pos_pivot);
+    if (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f) {
+        ImGui::SetNextWindowPos(ImVec2(cfg.perfOverlayPosX, cfg.perfOverlayPosY), isMenuOpen ? ImGuiCond_Appearing : ImGuiCond_Always);
+    } else {
+        ImGui::SetNextWindowPos(window_pos, isMenuOpen ? ImGuiCond_Appearing : ImGuiCond_Always, window_pos_pivot);
+    }
     ImGui::SetNextWindowBgAlpha(0.70f);
 
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoDecoration |
@@ -203,7 +209,43 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner) {
         window_flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs;
     }
 
+    const bool customScale = (scale > 0.49f && std::fabs(scale - 1.0f) > 0.01f);
+    if (customScale) {
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * scale);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * scale, 8.0f * scale));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * scale, 3.0f * scale));
+    }
+
     if (ImGui::Begin("##EDPE_PerfOverlay", nullptr, window_flags)) {
+        if (isMenuOpen) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.45f, 0.85f, 0.65f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.55f, 0.95f, 0.85f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.4f, 0.65f, 1.0f, 1.0f));
+            ImGui::Button(":: [Drag to Move HUD] ::", ImVec2(-1.0f, 0.0f));
+            if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
+                const ImVec2 delta = ImGui::GetIO().MouseDelta;
+                ImVec2 pos = ImGui::GetWindowPos();
+                pos.x += delta.x;
+                pos.y += delta.y;
+                ImGui::SetWindowPos(pos);
+                cfg.perfOverlayPosX = pos.x;
+                cfg.perfOverlayPosY = pos.y;
+                cfg.save();
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::Separator();
+        }
+
+        if (isMenuOpen && ImGui::IsWindowHovered() && ImGui::IsMouseDragging(0) && !ImGui::IsAnyItemActive()) {
+            const ImVec2 delta = ImGui::GetIO().MouseDelta;
+            ImVec2 pos = ImGui::GetWindowPos();
+            pos.x += delta.x;
+            pos.y += delta.y;
+            ImGui::SetWindowPos(pos);
+            cfg.perfOverlayPosX = pos.x;
+            cfg.perfOverlayPosY = pos.y;
+            cfg.save();
+        }
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "EDPE Performance HUD");
         ImGui::Separator();
 
@@ -295,6 +337,11 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner) {
         }
     }
     ImGui::End();
+
+    if (customScale) {
+        ImGui::PopStyleVar(2);
+        ImGui::PopFont();
+    }
 }
 
 } // namespace edpe

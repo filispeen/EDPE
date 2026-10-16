@@ -52,6 +52,15 @@ public:
         showPerfOverlay = GetPrivateProfileIntW(L"Overlay", L"ShowPerfOverlay", 0, path.c_str()) != 0;
         perfOverlayCorner = GetPrivateProfileIntW(L"Overlay", L"Corner", 0, path.c_str());
         if (perfOverlayCorner < 0 || perfOverlayCorner > 3) perfOverlayCorner = 0;
+
+        GetPrivateProfileStringW(L"Overlay", L"Scale", L"1.0", buf, 64, path.c_str());
+        perfOverlayScale = static_cast<float>(_wtof(buf));
+        if (perfOverlayScale < 0.5f || perfOverlayScale > 3.0f) perfOverlayScale = 1.0f;
+
+        GetPrivateProfileStringW(L"Overlay", L"PosX", L"-1.0", buf, 64, path.c_str());
+        perfOverlayPosX = static_cast<float>(_wtof(buf));
+        GetPrivateProfileStringW(L"Overlay", L"PosY", L"-1.0", buf, 64, path.c_str());
+        perfOverlayPosY = static_cast<float>(_wtof(buf));
     }
 
     void save() {
@@ -80,6 +89,12 @@ public:
 
         WritePrivateProfileStringW(L"Overlay", L"ShowPerfOverlay", showPerfOverlay ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Overlay", L"Corner", std::to_wstring(perfOverlayCorner).c_str(), path.c_str());
+        swprintf_s(buf, L"%.2f", perfOverlayScale);
+        WritePrivateProfileStringW(L"Overlay", L"Scale", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", perfOverlayPosX);
+        WritePrivateProfileStringW(L"Overlay", L"PosX", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", perfOverlayPosY);
+        WritePrivateProfileStringW(L"Overlay", L"PosY", buf, path.c_str());
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -184,6 +199,9 @@ public:
 
     bool showPerfOverlay = false;
     int perfOverlayCorner = 0; // 0=Top-Left, 1=Top-Right, 2=Bottom-Left, 3=Bottom-Right
+    float perfOverlayScale = 1.0f;
+    float perfOverlayPosX = -1.0f;
+    float perfOverlayPosY = -1.0f;
 };
 
 } // namespace edpe

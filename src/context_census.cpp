@@ -2024,6 +2024,9 @@ DXGI_FORMAT concreteLdrColorFormat(DXGI_FORMAT fmt) {
 
 // Runs at Present, before the EDPE overlay.
 static std::atomic<bool> s_comparison_capture_requested{false};
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_backbuffer_copy;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_backbuffer_copy_srv;
+static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_copy_rtv;
 
 // - When render resolution == output resolution (DLAA), evaluates on the finished
 //   LDR backbuffer (tone mapped, HUD included).
@@ -2237,8 +2240,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
     static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
     static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
-    static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_backbuffer_copy;
-    static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_backbuffer_copy_srv;
     static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
     static ID3D11Texture2D* s_cached_backbuffer_ptr = nullptr;
 
@@ -2273,18 +2274,21 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             cur.Format != outFormat) {
             s_backbuffer_copy.Reset();
             s_backbuffer_copy_srv.Reset();
+            s_backbuffer_copy_rtv.Reset();
         }
     }
     if (!s_backbuffer_copy) {
         D3D11_TEXTURE2D_DESC td = backbufferDesc;
         td.Format = outFormat;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         td.CPUAccessFlags = td.MiscFlags = 0;
         if (FAILED(device->CreateTexture2D(&td, nullptr, &s_backbuffer_copy)) ||
-            FAILED(device->CreateShaderResourceView(s_backbuffer_copy.Get(), nullptr, &s_backbuffer_copy_srv))) {
+            FAILED(device->CreateShaderResourceView(s_backbuffer_copy.Get(), nullptr, &s_backbuffer_copy_srv)) ||
+            FAILED(device->CreateRenderTargetView(s_backbuffer_copy.Get(), nullptr, &s_backbuffer_copy_rtv))) {
             s_backbuffer_copy.Reset();
             s_backbuffer_copy_srv.Reset();
+            s_backbuffer_copy_rtv.Reset();
         }
     }
 
@@ -2340,10 +2344,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             }
         } else if (evalDestination == s_dlss_output_texture.Get()) {
             context->CopyResource(backbuffer, s_dlss_output_texture.Get());
-        }
-
-        if (ContextCensusConsumeComparisonCaptureRequest()) {
-            UiQueueComparisonCapture(context, s_backbuffer_copy.Get(), backbuffer);
         }
     }
     rearmContextHooks();
@@ -3395,6 +3395,14 @@ bool ContextCensusIsComparisonCapturePending() {
 
 bool ContextCensusConsumeComparisonCaptureRequest() {
     return s_comparison_capture_requested.exchange(false, std::memory_order_acq_rel);
+}
+
+ID3D11Texture2D* ContextCensusGetBackbufferCopyTexture() {
+    return s_backbuffer_copy.Get();
+}
+
+ID3D11RenderTargetView* ContextCensusGetBackbufferCopyRtv() {
+    return s_backbuffer_copy_rtv.Get();
 }
 
 

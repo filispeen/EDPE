@@ -34,7 +34,7 @@ public:
 
     const PerfTelemetry& getTelemetry() const { return telemetry_; }
 
-    void renderOverlay(bool isMenuOpen, int corner);
+    void renderOverlay(bool isMenuOpen, int corner, float scale = 1.0f);
 
 private:
     PerfTracker();
