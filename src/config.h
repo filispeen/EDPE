@@ -98,7 +98,7 @@ public:
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
-        if (backend == 0 || mode <= 1) return 1.000000f;
+        if (backend == 0 || backend == 3 || mode <= 1) return 1.000000f;
         switch (mode) {
         case 2: return 0.666667f; // Quality (66.7%)
         case 3: return 0.580000f; // Balanced (58.0%)

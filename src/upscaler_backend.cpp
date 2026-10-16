@@ -457,6 +457,72 @@ void AmdUpscalerBackend::resetHistory() {
 }
 
 // -------------------------------------------------------------------------
+// TaaUpscalerBackend
+// -------------------------------------------------------------------------
+
+bool TaaUpscalerBackend::isAvailable() const {
+    return pass_.isInitialized();
+}
+
+const wchar_t* TaaUpscalerBackend::unavailableReason() const {
+    return pass_.isInitialized() ? L"" : L"D3D11 TAA pass not initialized";
+}
+
+bool TaaUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
+    return pass_.initialize(device, context);
+}
+
+void TaaUpscalerBackend::shutdown() {
+    pass_.shutdown();
+}
+
+bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
+    const TemporalFrameInputs& inputs,
+    ID3D11RenderTargetView* destinationRtv,
+    ID3D11Texture2D* destinationTexture) {
+    if (!pass_.isInitialized() || !context || !inputs.color || !destinationTexture) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return false;
+
+    // Resolve color SRV
+    ID3D11ShaderResourceView* colorSrv = inputs.colorSrv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> localColorSrv;
+    if (!colorSrv && inputs.color) {
+        if (FAILED(device->CreateShaderResourceView(inputs.color, nullptr, &localColorSrv))) {
+            return false;
+        }
+        colorSrv = localColorSrv.Get();
+    }
+
+    // Resolve motion SRV
+    ID3D11ShaderResourceView* motionSrv = inputs.motionSrv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> localMotionSrv;
+    if (!motionSrv && inputs.motionVectors) {
+        device->CreateShaderResourceView(inputs.motionVectors, nullptr, &localMotionSrv);
+        motionSrv = localMotionSrv.Get();
+    }
+
+    return pass_.render(context,
+        colorSrv,
+        motionSrv,
+        destinationRtv,
+        destinationTexture,
+        inputs.outputWidth,
+        inputs.outputHeight,
+        inputs.jitterX,
+        inputs.jitterY,
+        inputs.reset);
+}
+
+void TaaUpscalerBackend::resetHistory() {
+    pass_.resetHistory();
+}
+
+// -------------------------------------------------------------------------
 // UpscalerManager
 // -------------------------------------------------------------------------
 
@@ -478,6 +544,7 @@ bool UpscalerManager::initialize(ID3D11Device* device, ID3D11DeviceContext* cont
     nullBackend_.initialize(device, context);
     nvidiaBackend_.initialize(device, context);
     amdBackend_.initialize(device, context);
+    taaBackend_.initialize(device, context);
 
     if (device) {
         D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
@@ -498,6 +565,7 @@ void UpscalerManager::shutdown() {
     nullBackend_.shutdown();
     nvidiaBackend_.shutdown();
     amdBackend_.shutdown();
+    taaBackend_.shutdown();
 
     for (auto& slot : timingRing_) {
         slot = {};
@@ -521,6 +589,8 @@ IUpscalerBackend* UpscalerManager::getBackendInstance(UpscalerBackend backend) {
         return &nvidiaBackend_;
     case UpscalerBackend::AmdFsr:
         return &amdBackend_;
+    case UpscalerBackend::Taa:
+        return &taaBackend_;
     default:
         return &nullBackend_;
     }
@@ -534,6 +604,8 @@ bool UpscalerManager::isBackendAvailable(UpscalerBackend backend) const {
         return nvidiaBackend_.isAvailable();
     case UpscalerBackend::AmdFsr:
         return amdBackend_.isAvailable();
+    case UpscalerBackend::Taa:
+        return taaBackend_.isAvailable();
     default:
         return false;
     }
@@ -547,6 +619,8 @@ const wchar_t* UpscalerManager::getBackendUnavailableReason(UpscalerBackend back
         return nvidiaBackend_.unavailableReason();
     case UpscalerBackend::AmdFsr:
         return amdBackend_.unavailableReason();
+    case UpscalerBackend::Taa:
+        return taaBackend_.unavailableReason();
     default:
         return L"Unknown backend";
     }

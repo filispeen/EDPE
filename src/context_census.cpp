@@ -2222,8 +2222,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
     edpe::TemporalFrameInputs inputs{};
     inputs.color = s_dlaa_input.Get();
+    inputs.colorSrv = s_dlaa_input_srv.Get();
     inputs.depth = motion_depth.Get();
+    inputs.depthSrv = motion_depth_view.Get();
     inputs.motionVectors = motionTexture.Get();
+    inputs.motionSrv = motion_pass->output();
     inputs.renderWidth = depthDesc.Width;
     inputs.renderHeight = depthDesc.Height;
     inputs.outputWidth = backbufferDesc.Width;

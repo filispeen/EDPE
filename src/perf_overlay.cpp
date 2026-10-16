@@ -251,7 +251,8 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
         const bool upscalerActive = upscaler.isReconstructionActive();
 
         if (upscalerActive && telemetry_.upscalerFrametimeMs > 0.0f) {
-            const char* backendShort = (upscaler.getBackend() == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
+            const char* backendShort = (upscaler.getBackend() == UpscalerBackend::Taa) ? "TAA" :
+                                       (upscaler.getBackend() == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
             ImGui::Text("Upscaler Frametime: ");
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.85f, 1.0f), "%.2f ms (%s)",
@@ -267,13 +268,17 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
         // 3. Upscaler & Resolution Info
         if (upscalerActive) {
             const bool isAmd = (upscaler.getBackend() == UpscalerBackend::AmdFsr);
+            const bool isTaa = (upscaler.getBackend() == UpscalerBackend::Taa);
             const bool isSr = (telemetry_.renderWidth < telemetry_.outputWidth || telemetry_.renderHeight < telemetry_.outputHeight);
 
-            const char* upscalerName = isAmd ? (isSr ? "AMD FSR SR" : "AMD FSR Native AA")
+            const char* upscalerName = isTaa ? "TAA" :
+                                       isAmd ? (isSr ? "AMD FSR SR" : "AMD FSR Native AA")
                                              : (isSr ? "NVIDIA DLSS" : "NVIDIA DLAA");
 
             char presetBuf[64]{};
-            if (!isAmd) {
+            if (isTaa) {
+                snprintf(presetBuf, sizeof(presetBuf), "(Native AA)");
+            } else if (!isAmd) {
                 const uint32_t p = NgxContext::get_preset();
                 const char* pName = (p == 10) ? "Preset J" :
                                     (p == 11) ? "Preset K" :

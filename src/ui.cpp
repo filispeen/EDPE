@@ -933,6 +933,10 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::AmdFsr);
             const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
             edpe::UpscalerManager::instance().setMode(static_cast<edpe::UpscaleMode>(m));
+        } else if (cfg.upscalerBackend == 3 &&
+            edpe::UpscalerManager::instance().isBackendAvailable(edpe::UpscalerBackend::Taa)) {
+            edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::Taa);
+            edpe::UpscalerManager::instance().setMode(edpe::UpscaleMode::NativeAA);
         }
     }
     EdpeLog(L"EDPE: Dear ImGui ready; F5 toggles menu");
@@ -1178,10 +1182,12 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     const char* upscaler_items[] = {
         "Native (Bypass)",
         nvidia_available ? "NVIDIA DLSS / DLAA" : "NVIDIA DLSS / DLAA (unavailable)",
-        amd_available ? "AMD FSR (Native AA / SR)" : "AMD FSR (unavailable)"
+        amd_available ? "AMD FSR (Native AA / SR)" : "AMD FSR (unavailable)",
+        "TAA (Temporal Anti-Aliasing)"
     };
     int current_backend_idx = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) ? 1 :
-                              (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) ? 2 : 0;
+                              (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) ? 2 :
+                              (upscaler.getBackend() == edpe::UpscalerBackend::Taa) ? 3 : 0;
 
     if (ImGui::Combo("Upscaler Backend", &current_backend_idx, upscaler_items, IM_ARRAYSIZE(upscaler_items))) {
         if (current_backend_idx == 1) {
@@ -1198,6 +1204,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 cfg.upscalerBackend = 2;
                 cfg.save();
             }
+        } else if (current_backend_idx == 3) {
+            upscaler.setBackend(edpe::UpscalerBackend::Taa);
+            upscaler.setMode(edpe::UpscaleMode::NativeAA);
+            cfg.upscalerBackend = 3;
+            cfg.save();
         } else {
             upscaler.setBackend(edpe::UpscalerBackend::None);
             upscaler.setMode(edpe::UpscaleMode::Native);

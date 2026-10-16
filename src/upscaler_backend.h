@@ -1,6 +1,8 @@
 #pragma once
 
 #include "temporal_inputs.h"
+#include "taa_pass.h"
+
 
 #include <cstdint>
 #include <d3d11.h>
@@ -142,6 +144,35 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Native Direct3D 11 Temporal Anti-Aliasing (TAA) backend.
+// Evaluates 1:1 subpixel Halton (2,3) jitter accumulation, YCoCg variance clipping,
+// and camera-depth motion reprojection without external vendor SDK dependencies.
+class TaaUpscalerBackend : public IUpscalerBackend {
+public:
+    UpscalerBackend backendType() const override { return UpscalerBackend::Taa; }
+    const wchar_t* name() const override { return L"TAA"; }
+
+    bool isAvailable() const override;
+    const wchar_t* unavailableReason() const override;
+
+    bool isModeSupported(UpscaleMode mode) const override {
+        return mode == UpscaleMode::Native || mode == UpscaleMode::NativeAA;
+    }
+
+    bool initialize(ID3D11Device* device, ID3D11DeviceContext* context) override;
+    void shutdown() override;
+
+    bool evaluate(ID3D11DeviceContext* context,
+        const TemporalFrameInputs& inputs,
+        ID3D11RenderTargetView* destinationRtv,
+        ID3D11Texture2D* destinationTexture) override;
+
+    void resetHistory() override;
+
+private:
+    TaaPass pass_;
+};
+
 // Central coordinator for temporal upscaling in EDPE.
 // Manages backend selection, mode configuration, fail-open fallback, and diagnostics.
 class UpscalerManager {
@@ -190,6 +221,7 @@ private:
     NullUpscalerBackend nullBackend_;
     NvidiaUpscalerBackend nvidiaBackend_;
     AmdUpscalerBackend amdBackend_;
+    TaaUpscalerBackend taaBackend_;
 
     struct GpuTimingSlot {
         Microsoft::WRL::ComPtr<ID3D11Query> disjoint;

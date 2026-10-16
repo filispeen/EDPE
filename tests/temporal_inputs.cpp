@@ -233,5 +233,22 @@ int main() {
     // Without D3D11 device initialized, evaluate should fail open safely
     if (amdBackend.evaluate(nullptr, inputs, nullptr, nullptr)) return 71;
 
+    // -------------------------------------------------------------------------
+    // Test 9: TAA backend interface and validation
+    // -------------------------------------------------------------------------
+    edpe::TaaUpscalerBackend taaBackend;
+    if (taaBackend.backendType() != edpe::UpscalerBackend::Taa) return 72;
+    if (std::wcscmp(taaBackend.name(), L"TAA") != 0) return 73;
+    if (!taaBackend.isModeSupported(edpe::UpscaleMode::NativeAA)) return 74;
+    if (taaBackend.isModeSupported(edpe::UpscaleMode::Quality)) return 75; // TAA is strictly NativeAA
+    if (taaBackend.evaluate(nullptr, inputs, nullptr, nullptr)) return 76; // Uninitialized fails open safely
+
+    if (std::wcscmp(edpe::getUpscalerBackendName(edpe::UpscalerBackend::Taa), L"TAA") != 0) return 77;
+    if (std::fabs(edpe::Config::getTargetSsaaMultiplier(3, 1) - 1.0f) > 1e-5f) return 78;
+
+    // Manager should know about TAA
+    const wchar_t* taaReason = manager.getBackendUnavailableReason(edpe::UpscalerBackend::Taa);
+    if (!taaReason) return 79;
+
     return 0; // All temporal input layer tests passed
 }

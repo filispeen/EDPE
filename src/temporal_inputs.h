@@ -13,13 +13,14 @@ namespace edpe {
 enum class UpscalerBackend : uint32_t {
     None = 0,
     NvidiaDlss = 1,
-    AmdFsr = 2
+    AmdFsr = 2,
+    Taa = 3
 };
 
 // Target reconstruction mode.
 enum class UpscaleMode : uint32_t {
     Native = 0,           // 1:1 bypass / original game presentation
-    NativeAA = 1,         // 1:1 native-resolution temporal AA (DLAA / FSR Native AA)
+    NativeAA = 1,         // 1:1 native-resolution temporal AA (DLAA / FSR Native AA / TAA)
     Quality = 2,          // ~1.5x scaling per dimension (66.7% resolution)
     Balanced = 3,         // ~1.7x scaling per dimension (58.8% resolution)
     Performance = 4,      // 2.0x scaling per dimension (50.0% resolution)
@@ -31,6 +32,7 @@ inline const wchar_t* getUpscalerBackendName(UpscalerBackend backend) {
     case UpscalerBackend::None: return L"None (Bypass)";
     case UpscalerBackend::NvidiaDlss: return L"NVIDIA DLSS / DLAA";
     case UpscalerBackend::AmdFsr: return L"AMD FSR";
+    case UpscalerBackend::Taa: return L"TAA";
     default: return L"Unknown";
     }
 }
