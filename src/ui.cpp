@@ -5,6 +5,7 @@
 #include "ngx_context.h"
 #include "capture_format.h"
 #include "config.h"
+#include "perf_overlay.h"
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -133,6 +134,15 @@ LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         return 0;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F6) return 0;
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        wparam == VK_F7 && !(lparam & (1LL << 30))) {
+        auto& cfg = edpe::Config::instance();
+        cfg.showPerfOverlay = !cfg.showPerfOverlay;
+        cfg.save();
+        EdpeLog(cfg.showPerfOverlay ? L"EDPE: F7 pressed — Performance HUD enabled" : L"EDPE: F7 pressed — Performance HUD disabled");
+        return 0;
+    }
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F7) return 0;
     if (menu_visible.load()) {
         if (message == WM_INPUT) return DefWindowProcW(window, message, wparam, lparam);
         if (isInputMessage(message)) {
@@ -1030,7 +1040,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
     }
 
-    if (!menu_visible.load()) {
+    auto& cfg = edpe::Config::instance();
+    const bool show_menu = menu_visible.load();
+    const bool show_perf = cfg.showPerfOverlay;
+
+    if (!show_menu && !show_perf) {
         std::lock_guard lock(input_mutex);
         pending_input.clear();
         return;
@@ -1042,28 +1056,65 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     ImGuiContext* previous = ImGui::GetCurrentContext();
     ImGui::SetCurrentContext(ui.imgui);
-    {
+
+    if (show_menu) {
         std::lock_guard lock(input_mutex);
         pending_input.swap(render_input);
+        if (!render_input.empty() && !ui.input_logged) {
+            EdpeLog(L"EDPE: queued input routed to Dear ImGui");
+            ui.input_logged = true;
+        }
+        for (const auto& input : render_input) {
+            ImGui_ImplWin32_WndProcHandler(input.window, input.message, input.wparam, input.lparam);
+        }
+        render_input.clear();
+    } else {
+        std::lock_guard lock(input_mutex);
+        pending_input.clear();
     }
-    if (!render_input.empty() && !ui.input_logged) {
-        EdpeLog(L"EDPE: queued input routed to Dear ImGui");
-        ui.input_logged = true;
-    }
-    for (const auto& input : render_input) {
-        ImGui_ImplWin32_WndProcHandler(input.window, input.message, input.wparam, input.lparam);
-    }
-    render_input.clear();
+
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
+
+    if (show_perf) {
+        edpe::PerfTracker::instance().renderOverlay(show_menu, cfg.perfOverlayCorner);
+    }
+
     bool window_open = true;
-    ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced", &window_open);
-    ImGui::Text("Version: %s", edpe::kVersion);
-    auto& upscaler = edpe::UpscalerManager::instance();
-    auto& cfg = edpe::Config::instance();
-    const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);
-    const bool amd_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::AmdFsr);
+    if (show_menu) {
+        ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced", &window_open);
+        ImGui::Text("Version: %s", edpe::kVersion);
+        auto& upscaler = edpe::UpscalerManager::instance();
+        const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);
+        const bool amd_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::AmdFsr);
+
+    // Performance HUD Controls
+    ImGui::Separator();
+    ImGui::TextUnformatted("Performance HUD Overlay");
+    if (ImGui::Checkbox("Show Performance HUD (FPS, Frametimes, GPU, VRAM)", &cfg.showPerfOverlay)) {
+        cfg.save();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Hotkey: F7)");
+
+    const char* hud_corners[] = { "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right" };
+    if (ImGui::Combo("HUD Position", &cfg.perfOverlayCorner, hud_corners, IM_ARRAYSIZE(hud_corners))) {
+        cfg.save();
+    }
+
+    const auto& live_tel = edpe::PerfTracker::instance().getTelemetry();
+    ImGui::Text("Stats: %.1f FPS | Total: %.2f ms (Game: %.2f ms, Upscaler: %.2f ms)",
+        live_tel.fps, live_tel.totalFrametimeMs, live_tel.gameFrametimeMs, live_tel.upscalerFrametimeMs);
+    ImGui::Text("Hardware: %ls | Load: %u%%",
+        live_tel.gpuName.empty() ? L"Direct3D 11 Adapter" : live_tel.gpuName.c_str(), live_tel.gpuUsagePct);
+    if (live_tel.vramTotalBytes > 0) {
+        ImGui::Text("VRAM: %.2f / %.2f GB (%u%%)",
+            static_cast<double>(live_tel.vramUsedBytes) / (1024.0 * 1024.0 * 1024.0),
+            static_cast<double>(live_tel.vramTotalBytes) / (1024.0 * 1024.0 * 1024.0),
+            static_cast<unsigned>(100.0 * live_tel.vramUsedBytes / live_tel.vramTotalBytes));
+    }
+    ImGui::Separator();
 
     // Upscaler backend selector
     const char* upscaler_items[] = {
@@ -1333,9 +1384,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
         ui.pending_backbuffer_capture = true;
     }
-    ImGui::TextUnformatted("F5: toggle menu | F6: capture all 5 buffers");
+    ImGui::TextUnformatted("F5: toggle menu | F6: capture buffers | F7: toggle performance HUD");
     ImGui::End();
-    if (ui.depth_srv && ui.depth_window_open) {
+    if (show_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);
         if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
             ImGui::Text("DSV #%d (%ux%u)",
@@ -1365,7 +1416,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
         ImGui::End();
     }
-    if (ui.color_srv && ui.color_window_open) {
+    if (show_menu && ui.color_srv && ui.color_window_open) {
         placeSnapshotWindow(2);
         if (ImGui::Begin("EDPE Scene Color Snapshot", &ui.color_window_open)) {
             if (ui.color_snapshot_index >= 0)
@@ -1394,7 +1445,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
         ImGui::End();
     }
-    if (ui.early_color_srv && ui.early_color_window_open) {
+    if (show_menu && ui.early_color_srv && ui.early_color_window_open) {
         placeSnapshotWindow(0);
         if (ImGui::Begin("EDPE Emissive / Glow (Early HDR) Snapshot", &ui.early_color_window_open)) {
             ImGui::TextUnformatted("Emissive / illumination pass: lamps, dials, lights");
@@ -1413,7 +1464,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
         ImGui::End();
     }
-    if (ui.motion_srv && ui.motion_window_open) {
+    if (show_menu && ui.motion_srv && ui.motion_window_open) {
         placeSnapshotWindow(1);
         if (ImGui::Begin("EDPE Motion Snapshot", &ui.motion_window_open)) {
             ImGui::TextUnformatted("Camera + depth motion; HUD is not represented");
@@ -1438,7 +1489,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
         ImGui::End();
     }
-    if (!window_open) menu_visible.store(false);
+    } // if (show_menu)
+    if (show_menu && !window_open) menu_visible.store(false);
     ImGui::Render();
 
     ID3D11RenderTargetView* previous_rtv = nullptr;

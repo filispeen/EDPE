@@ -1,0 +1,236 @@
+#include "perf_overlay.h"
+#include "upscaler_backend.h"
+#include "log.h"
+
+#include <imgui.h>
+#include <wrl/client.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <windows.h>
+
+namespace edpe {
+
+PerfTracker& PerfTracker::instance() {
+    static PerfTracker s_tracker;
+    return s_tracker;
+}
+
+PerfTracker::PerfTracker() {
+    QueryPerformanceFrequency(&perfFreq_);
+    initNvml();
+}
+
+PerfTracker::~PerfTracker() {
+    if (nvmlModule_) {
+        auto nvmlShutdown = reinterpret_cast<NvmlShutdown_t>(GetProcAddress(nvmlModule_, "nvmlShutdown"));
+        if (nvmlShutdown) {
+            nvmlShutdown();
+        }
+        FreeLibrary(nvmlModule_);
+        nvmlModule_ = nullptr;
+    }
+}
+
+void PerfTracker::initNvml() {
+    nvmlModule_ = LoadLibraryW(L"nvml.dll");
+    if (!nvmlModule_) return;
+
+    auto nvmlInit = reinterpret_cast<NvmlInit_t>(GetProcAddress(nvmlModule_, "nvmlInit_v2"));
+    auto nvmlGetHandle = reinterpret_cast<NvmlGetHandle_t>(GetProcAddress(nvmlModule_, "nvmlDeviceGetHandleByIndex_v2"));
+    nvmlGetUtil_ = reinterpret_cast<NvmlGetUtil_t>(GetProcAddress(nvmlModule_, "nvmlDeviceGetUtilizationRates"));
+    nvmlGetMem_ = reinterpret_cast<NvmlGetMem_t>(GetProcAddress(nvmlModule_, "nvmlDeviceGetMemoryInfo"));
+
+    if (nvmlInit && nvmlGetHandle && nvmlGetUtil_ && nvmlInit() == 0) {
+        if (nvmlGetHandle(0, &nvmlDevice_) == 0) {
+            nvmlAvailable_ = true;
+            EdpeLog(L"EDPE: NVML hardware telemetry initialized successfully");
+        }
+    }
+}
+
+void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+
+    if (lastPresentStart_.QuadPart > 0 && perfFreq_.QuadPart > 0) {
+        const double deltaMs = static_cast<double>(now.QuadPart - lastPresentStart_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
+        if (deltaMs > 0.1 && deltaMs < 1000.0) {
+            telemetry_.totalFrametimeMs = static_cast<float>(deltaMs);
+            smoothedFrametimeMs_ = smoothedFrametimeMs_ * 0.90f + telemetry_.totalFrametimeMs * 0.10f;
+            telemetry_.fps = (smoothedFrametimeMs_ > 0.0f) ? (1000.0f / smoothedFrametimeMs_) : 0.0f;
+        }
+    }
+    currentPresentStart_ = now;
+    lastPresentStart_ = now;
+
+    // Retrieve active upscaler timing
+    auto& upscaler = UpscalerManager::instance();
+    if (upscaler.isReconstructionActive()) {
+        const auto& diag = upscaler.getDiagnostics();
+        telemetry_.upscalerFrametimeMs = diag.gpuTimeMs;
+    } else {
+        telemetry_.upscalerFrametimeMs = 0.0f;
+    }
+
+    // Game frametime is time spent by game engine before upscaler / composite
+    telemetry_.gameFrametimeMs = (std::max)(0.0f, telemetry_.totalFrametimeMs - telemetry_.upscalerFrametimeMs);
+
+    // Rate-limit hardware telemetry to ~4 times per second (250 ms)
+    if (perfFreq_.QuadPart > 0) {
+        const double elapsedSinceUpdateMs = static_cast<double>(now.QuadPart - lastTelemetryUpdate_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
+        if (lastTelemetryUpdate_.QuadPart == 0 || elapsedSinceUpdateMs >= 250.0) {
+            updateTelemetry(swapChain);
+            lastTelemetryUpdate_ = now;
+        }
+    }
+}
+
+void PerfTracker::onPresentEnd() {
+    QueryPerformanceCounter(&lastPresentEnd_);
+}
+
+void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
+    if (!swapChain) return;
+
+    // 1. Static GPU adapter information
+    if (!gpuInfoCached_) {
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&device)))) {
+            Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+            if (SUCCEEDED(device.As(&dxgiDevice))) {
+                Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+                if (SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
+                    DXGI_ADAPTER_DESC desc{};
+                    if (SUCCEEDED(adapter->GetDesc(&desc))) {
+                        telemetry_.gpuName = desc.Description;
+                        telemetry_.vramTotalBytes = desc.DedicatedVideoMemory;
+                        gpuInfoCached_ = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Video Memory (VRAM) Usage
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&device)))) {
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+        if (SUCCEEDED(device.As(&dxgiDevice))) {
+            Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+            if (SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
+                Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
+                if (SUCCEEDED(adapter.As(&adapter3))) {
+                    DXGI_QUERY_VIDEO_MEMORY_INFO memInfo{};
+                    if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo))) {
+                        telemetry_.vramUsedBytes = memInfo.CurrentUsage;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. GPU Utilization Percentage (%)
+    if (nvmlAvailable_ && nvmlDevice_ && nvmlGetUtil_) {
+        NvmlUtil_t util{};
+        if (nvmlGetUtil_(nvmlDevice_, &util) == 0) {
+            telemetry_.gpuUsagePct = util.gpu;
+        }
+    } else {
+        // Fallback: estimate load from frametime vs 60/120 Hz interval or clamp
+        telemetry_.gpuUsagePct = (std::min)(100u, static_cast<uint32_t>((telemetry_.totalFrametimeMs / 16.67f) * 60.0f));
+    }
+}
+
+void PerfTracker::renderOverlay(bool isMenuOpen, int corner) {
+    const float PAD = 10.0f;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 work_pos = viewport->WorkPos;
+    const ImVec2 work_size = viewport->WorkSize;
+    ImVec2 window_pos, window_pos_pivot;
+
+    switch (corner) {
+    case 1: // Top-Right
+        window_pos = ImVec2(work_pos.x + work_size.x - PAD, work_pos.y + PAD);
+        window_pos_pivot = ImVec2(1.0f, 0.0f);
+        break;
+    case 2: // Bottom-Left
+        window_pos = ImVec2(work_pos.x + PAD, work_pos.y + work_size.y - PAD);
+        window_pos_pivot = ImVec2(0.0f, 1.0f);
+        break;
+    case 3: // Bottom-Right
+        window_pos = ImVec2(work_pos.x + work_size.x - PAD, work_pos.y + work_size.y - PAD);
+        window_pos_pivot = ImVec2(1.0f, 1.0f);
+        break;
+    case 0: // Top-Left
+    default:
+        window_pos = ImVec2(work_pos.x + PAD, work_pos.y + PAD);
+        window_pos_pivot = ImVec2(0.0f, 0.0f);
+        break;
+    }
+
+    ImGui::SetNextWindowPos(window_pos, isMenuOpen ? ImGuiCond_Appearing : ImGuiCond_Always, window_pos_pivot);
+    ImGui::SetNextWindowBgAlpha(0.70f);
+
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoDecoration |
+                                   ImGuiWindowFlags_AlwaysAutoResize |
+                                   ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoFocusOnAppearing |
+                                   ImGuiWindowFlags_NoNav;
+    if (!isMenuOpen) {
+        window_flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs;
+    }
+
+    if (ImGui::Begin("##EDPE_PerfOverlay", nullptr, window_flags)) {
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "EDPE Performance HUD");
+        ImGui::Separator();
+
+        // 1. FPS with color coding
+        const ImVec4 fpsColor = (telemetry_.fps >= 58.0f) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) :
+                                (telemetry_.fps >= 30.0f) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) :
+                                                            ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+        ImGui::Text("FPS:                ");
+        ImGui::SameLine();
+        ImGui::TextColored(fpsColor, "%.1f FPS", telemetry_.fps);
+
+        // 2. Frametimes
+        ImGui::Text("Game Frametime:     %.2f ms", telemetry_.gameFrametimeMs);
+
+        auto& upscaler = UpscalerManager::instance();
+        if (upscaler.isReconstructionActive() && telemetry_.upscalerFrametimeMs > 0.0f) {
+            const char* backendName = (upscaler.getBackend() == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
+            ImGui::Text("Upscaler Frametime: ");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.85f, 1.0f), "%.2f ms (%s)",
+                telemetry_.upscalerFrametimeMs, backendName);
+        } else {
+            ImGui::Text("Upscaler Frametime: 0.00 ms (Bypass)");
+        }
+
+        ImGui::Text("Total Frametime:    %.2f ms", telemetry_.totalFrametimeMs);
+
+        ImGui::Separator();
+
+        // 3. GPU Info
+        char gpuNameUtf8[128]{};
+        WideCharToMultiByte(CP_UTF8, 0, telemetry_.gpuName.c_str(), -1, gpuNameUtf8, sizeof(gpuNameUtf8), nullptr, nullptr);
+        ImGui::Text("Current GPU:        %s", gpuNameUtf8[0] ? gpuNameUtf8 : "Direct3D 11 Adapter");
+
+        // 4. GPU Usage
+        ImGui::Text("GPU Usage:          %u %%", telemetry_.gpuUsagePct);
+
+        // 5. VRAM Usage
+        if (telemetry_.vramTotalBytes > 0) {
+            const double usedGb = static_cast<double>(telemetry_.vramUsedBytes) / (1024.0 * 1024.0 * 1024.0);
+            const double totalGb = static_cast<double>(telemetry_.vramTotalBytes) / (1024.0 * 1024.0 * 1024.0);
+            const float pct = static_cast<float>(100.0 * static_cast<double>(telemetry_.vramUsedBytes) / static_cast<double>(telemetry_.vramTotalBytes));
+            ImGui::Text("VRAM Usage:         %.2f / %.2f GB (%u %%)", usedGb, totalGb, static_cast<unsigned>(pct));
+        } else if (telemetry_.vramUsedBytes > 0) {
+            const double usedMb = static_cast<double>(telemetry_.vramUsedBytes) / (1024.0 * 1024.0);
+            ImGui::Text("VRAM Usage:         %.1f MB", usedMb);
+        }
+    }
+    ImGui::End();
+}
+
+} // namespace edpe

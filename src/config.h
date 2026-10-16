@@ -48,6 +48,10 @@ public:
         GetPrivateProfileStringW(L"Motion", L"Scale", L"1.0", buf, 64, path.c_str());
         motionScale = static_cast<float>(_wtof(buf));
         if (motionScale < 0.0f || motionScale > 2.0f) motionScale = 1.0f;
+
+        showPerfOverlay = GetPrivateProfileIntW(L"Overlay", L"ShowPerfOverlay", 0, path.c_str()) != 0;
+        perfOverlayCorner = GetPrivateProfileIntW(L"Overlay", L"Corner", 0, path.c_str());
+        if (perfOverlayCorner < 0 || perfOverlayCorner > 3) perfOverlayCorner = 0;
     }
 
     void save() {
@@ -73,6 +77,9 @@ public:
         WritePrivateProfileStringW(L"Motion", L"InvertY", motionInvertY ? L"1" : L"0", path.c_str());
         swprintf_s(buf, L"%.2f", motionScale);
         WritePrivateProfileStringW(L"Motion", L"Scale", buf, path.c_str());
+
+        WritePrivateProfileStringW(L"Overlay", L"ShowPerfOverlay", showPerfOverlay ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"Overlay", L"Corner", std::to_wstring(perfOverlayCorner).c_str(), path.c_str());
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -174,6 +181,9 @@ public:
     bool motionInvertX = false;
     bool motionInvertY = false;
     float motionScale = 1.0f;
+
+    bool showPerfOverlay = false;
+    int perfOverlayCorner = 0; // 0=Top-Left, 1=Top-Right, 2=Bottom-Left, 3=Bottom-Right
 };
 
 } // namespace edpe

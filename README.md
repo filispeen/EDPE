@@ -27,7 +27,8 @@ As of **October 2026 (`v0.2.1`)**, EDPE has achieved:
 * **Vendor-Neutral Temporal Input Layer:** Abstracted `TemporalFrameInputs` structure decoupling engine state from vendor reconstruction SDKs.
 * **NVIDIA DLAA Evaluation:** Official NVIDIA NGX SDK integrated with EDPE-owned Project ID (`48d353f3-d07b-4048-876b-09f8622f5a27`). DLAA runs on the finished swapchain backbuffer at `Present` prior to overlay rendering, achieving **rock-solid temporal anti-aliasing with ~0.3 ms GPU overhead** and zero subpixel image vibration.
 * **NVIDIA DLSS Super Resolution:** Reconstructs true sub-native 3D scenes (via Cobra in-game Supersampling < 1.0x) into native resolution, supporting Quality, Balanced, Performance, and Ultra Performance with DLSS Presets (Auto, J, K, L, M).
-* **AMD FSR 3.1.2 (Native AA & Super Resolution):** Integrated native Direct3D 11 backend (`FidelityFX-SDK-DX11`, commit `9b04fa4`). Supports both FSR Native AA at 1.0x SSAA and FSR Super Resolution at < 1.0x SSAA with reversed-Z, auto-exposure, and fail-open lifecycle.
+* **AMD FSR 3.1.2 Verified In-Game:** Verified in Elite Dangerous Odyssey for both FSR Native AA at 1.0x SSAA and FSR Super Resolution at sub-native render scales (< 1.0x SSAA) via native D3D11 compute path.
+* **Real-Time Performance HUD Overlay (`F7` / `F5`):** Built-in heads-up display showing live FPS, game frametime, upscaler frametime, total frametime, active GPU adapter name, GPU usage %, and dedicated VRAM usage (used/total and %). Configurable corner position, toggleable in F5 menu or via F7 hotkey with transparent click-through.
 * **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA / FSR Native AA (at 1.0x) or DLSS / FSR Super Resolution (at < 1.0x).
 * **Native UI Protection & Composite:** Dedicated shader pass (`UiCompositePass`) preserves native-resolution HUD, text, cockpits, and menus, seamlessly compositing them over reconstructed DLSS/FSR frames.
 * **Before / After Comparison Captures:** Dedicated in-game button capturing synchronized pairs of 32-bit BMP screenshots (`before` and `after` DLAA/DLSS/FSR) in `edpe-captures/`.
@@ -49,7 +50,7 @@ As of **October 2026 (`v0.2.1`)**, EDPE has achieved:
 | **7** | **Shared Temporal Input Layer** | ✅ **Verified** | Backend-neutral `TemporalFrameInputs` and `IUpscalerBackend` architecture implemented. |
 | **8** | **NVIDIA DLAA** | ✅ **Verified** | Official NGX DLAA evaluated at native resolution; ~0.3 ms GPU time, pristine anti-aliasing. |
 | **9–10** | **True Render Scale & NVIDIA DLSS SR** | ✅ **Verified** | Lower 3D scene render resolution via Cobra SSAA (< 1.0x) with full DLSS SR reconstruction and zero-configuration auto-scaling. |
-| **11** | **AMD FSR Super Resolution & Native AA** | 🟢 **Implemented** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated; supports FSR Native AA & FSR Super Resolution with fail-open fallback. |
+| **11** | **AMD FSR Super Resolution & Native AA** | ✅ **Verified** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated and verified in-game; supports FSR Native AA & FSR Super Resolution with fail-open fallback. |
 | **12** | **Native-Resolution HUD Separation** | 🟢 **Operational** | Native-res HUD composited over upscaled DLSS/FSR 3D scene (`UiCompositePass`), protecting cockpit/UI crispness. |
 | **13–15** | **D3D11/D3D12 Interop & Frame Generation** | 🔬 **Research** | NVIDIA DLSS Frame Generation (Streamline) & AMD FSR Frame Generation via interop bridge. |
 

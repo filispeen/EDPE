@@ -30,7 +30,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 8. NVIDIA DLAA | **Verified & working in-game** | Official NVIDIA NGX SDK linked. `NgxContext` evaluates DLAA at native 2560×1440 (`MVLowRes | DepthInverted`, Preset K, LDR mode) on the finished swapchain backbuffer at `Present` before ImGui overlay rendering. Verified in-game: clean, rock-solid temporal anti-aliasing (~0.3 ms GPU time) with zero image vibration. |
 | 9. NVIDIA DLSS Super Resolution | **Verified & working in-game** | `NgxContext` and `NvidiaUpscalerBackend` reconstruct low-res LDR scene target (`scene_ldr_source`) into native backbuffer with verified temporal inputs and presets (`Auto`, `J`, `K`, `L`, `M`). Reconstructed 3D world is composited under native-resolution HUD. |
 | 10. True render-scale control | **Verified & working in-game** | Cobra's native Supersampling (SSAA < 1.0x) delivers true rendering workload reduction. Automatically detected via scene depth dimensions with zero manual configuration. |
-| 11. AMD FSR upscaling | **Implemented & unit-tested; ready for in-game verification** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated in `AmdUpscalerBackend`. Supports FSR Native AA (1.0x SSAA) and FSR Super Resolution (<1.0x SSAA) with auto-exposure, inverted reversed-Z, and fail-open lifecycle. |
+| 11. AMD FSR upscaling | **Verified & working in-game** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated in `AmdUpscalerBackend`. Verified in-game: supports FSR Native AA (1.0x SSAA) and FSR Super Resolution (<1.0x SSAA) with auto-exposure, inverted reversed-Z, and fail-open lifecycle. |
 | 12. Native-resolution HUD | **Operational for DLSS & FSR SR** | `UiCompositePass` composites native-resolution UI/cockpit elements from pre-upscale backbuffer copy over reconstructed DLSS/FSR frames. Reactive mask generation planned for fine holographic elements. |
 | 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
@@ -41,6 +41,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 ## Available diagnostics and controls
 
 - **F5 Overlay:** Toggles the Dear ImGui menu. Exposes Upscaler Backend (`Native`, `NVIDIA DLSS / DLAA`, `AMD FSR (Native AA / SR)`), Quality Mode (`Native AA`, `Quality`, `Balanced`, `Performance`, `Ultra Performance`), NVIDIA DLSS Preset (`Auto`, `J`, `K`, `L`, `M`), Elite `Custom.4.4.fxcfg` `<SSAAMultiplier>` auto-sync, asynchronous GPU timings, projection jitter status/controls, runtime temporal tuning overrides, and snapshot previews. When hidden, passes through all inputs to the game without interference.
+- **Performance Telemetry HUD (F7 / F5):** Real-time on-screen HUD displaying FPS, game frametime, upscaler frametime, total frametime, current GPU adapter name, GPU usage %, and dedicated VRAM usage (GB & %). Configurable corner position (Top-Left, Top-Right, Bottom-Left, Bottom-Right), toggleable in F5 menu or via F7 hotkey, persisted in `edpe.ini`.
 - **F6 One-Shot Synchronized Capture:** Captures all 5 rendering buffers from the **exact same frame** and writes non-blocking 32-bit BMP files to `edpe-captures/`:
   - `color-*.bmp`: Tone-mapped scene color HDR (`DXGI_FORMAT_R11G11B10_FLOAT`)
   - `motion-*.bmp`: Visualized motion displacement (`DXGI_FORMAT_R16G16_FLOAT`)
@@ -54,14 +55,14 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Next milestone
 
-Phase 11 (AMD FSR 3.1.2 Upscaling) is **Implemented and Ready for In-Game Verification**:
-- `AmdUpscalerBackend` links native D3D11 FidelityFX FSR 3.1.2 libraries, supporting both FSR Native AA and Super Resolution.
-- In-game scaling automatically chooses between FSR Native AA (1.0x SSAA) and FSR Super Resolution (< 1.0x SSAA).
+Phase 11 (AMD FSR 3.1.2 Upscaling) is **Verified In-Game**:
+- `AmdUpscalerBackend` verified in Elite Dangerous Odyssey for both FSR Native AA (1.0x SSAA) and Super Resolution (< 1.0x SSAA).
 - UI composites native HUD over the reconstructed FSR image.
+- Performance telemetry HUD tracks frame pacing, engine/upscaler times, and GPU/VRAM load.
 
 The immediate next steps are:
-1. Verify AMD FSR Native AA and Super Resolution in-game in Elite Dangerous Odyssey.
-2. Proceed to **Phase 12 (Reactive Mask refinements)** and **Phase 13 (D3D11/D3D12 presentation bridge research)**.
+1. Proceed to **Phase 12 (Reactive Mask refinements for HUD/cockpit glow)**.
+2. Proceed to **Phase 13 (D3D11/D3D12 presentation bridge research for Frame Generation)**.
 
 ---
 
@@ -145,7 +146,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 ---
 
-## AMD FidelityFX FSR 3.1.2 — IMPLEMENTED & TESTED (Phase 11)
+## AMD FidelityFX FSR 3.1.2 — VERIFIED IN-GAME (Phase 11)
 
 - **SDK:** AMD FidelityFX FSR 3.1.2 Direct3D 11 native backend (`FidelityFX-SDK-DX11`, pinned commit `9b04fa4`, dynamic CRT `/MD`). Fetched and built via `tools/fetch_ffx_dx11.py`.
 - **Backend Architecture:** `AmdUpscalerBackend` implements `IUpscalerBackend` with PIMPL isolation (`Impl`) so FidelityFX host headers are not leaked to external compilation units.
@@ -189,9 +190,8 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 ## Next Verified Milestones (per PLAN.md order)
 
-1. **Phase 11 — AMD FSR Upscaling Verification:** In-game verification of AMD FSR Native AA (1.0x SSAA) and Super Resolution (< 1.0x SSAA) via native D3D11 compute backend.
-2. **Phase 12 — Native-Resolution HUD Separation:** Fine reactive mask generation and refinement for cockpit holographic elements and emissive UI.
-3. **Phase 13–15 — D3D11/D3D12 Interop & Frame Generation:** Presentation bridge prototyping for AMD FSR & NVIDIA DLSS Frame Generation.
+1. **Phase 12 — Native-Resolution HUD Separation:** Fine reactive mask generation and refinement for cockpit holographic elements and emissive UI.
+2. **Phase 13–15 — D3D11/D3D12 Interop & Frame Generation:** Presentation bridge prototyping for AMD FSR & NVIDIA DLSS Frame Generation.
 
 ---
 
