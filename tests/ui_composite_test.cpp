@@ -105,5 +105,23 @@ int main() {
     if (g0 < 200 || r0 > 50 || b0 > 50) return 8; // world pixel mismatch
     if (r3 < 200 || g3 < 200 || b3 < 200) return 9; // UI pixel mismatch
 
+    // Test 2: Native resolution composite (renderSize == outputSize == 4x4)
+    // Low-res world is 4x4 pure green (dlssSrv), game backbuffer has UI on bottom rows
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), dlssSrv.Get(),
+        targetRtv.Get(), 4, 4, 4, 4);
+    if (!ok) return 10;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 11;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t nr0 = rows[0], ng0 = rows[1], nb0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t nr3 = lastRow[0], ng3 = lastRow[1], nb3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    if (ng0 < 200 || nr0 > 50 || nb0 > 50) return 12; // native world pixel mismatch
+    if (nr3 < 200 || ng3 < 200 || nb3 < 200) return 13; // native UI pixel mismatch
+
     return 0;
 }
