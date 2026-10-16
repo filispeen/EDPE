@@ -1106,6 +1106,30 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     const auto& live_tel = edpe::PerfTracker::instance().getTelemetry();
     ImGui::Text("Stats: %.1f FPS | Total: %.2f ms (Game: %.2f ms, Upscaler: %.2f ms)",
         live_tel.fps, live_tel.totalFrametimeMs, live_tel.gameFrametimeMs, live_tel.upscalerFrametimeMs);
+
+    if (upscaler.isReconstructionActive()) {
+        const bool isAmd = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
+        const bool isSr = (live_tel.renderWidth < live_tel.outputWidth || live_tel.renderHeight < live_tel.outputHeight);
+        const char* uName = isAmd ? (isSr ? "AMD FSR SR" : "AMD FSR Native AA")
+                                  : (isSr ? "NVIDIA DLSS" : "NVIDIA DLAA");
+        char pBuf[64]{};
+        if (!isAmd) {
+            const uint32_t p = edpe::NgxContext::get_preset();
+            const char* pName = (p == 10) ? "Preset J" :
+                                (p == 11) ? "Preset K" :
+                                (p == 12) ? "Preset L" :
+                                (p == 13) ? "Preset M" : "Auto (Preset K)";
+            snprintf(pBuf, sizeof(pBuf), "(%s)", pName);
+        } else {
+            snprintf(pBuf, sizeof(pBuf), "(%s)", isSr ? "Super Resolution" : "Native AA");
+        }
+        ImGui::Text("Reconstruction: %s %s [%ux%u -> %ux%u]",
+            uName, pBuf, live_tel.renderWidth, live_tel.renderHeight, live_tel.outputWidth, live_tel.outputHeight);
+    } else {
+        ImGui::Text("Reconstruction: Bypass (Native) [%ux%u -> %ux%u]",
+            live_tel.outputWidth, live_tel.outputHeight, live_tel.outputWidth, live_tel.outputHeight);
+    }
+
     ImGui::Text("Hardware: %ls | Load: %u%%",
         live_tel.gpuName.empty() ? L"Direct3D 11 Adapter" : live_tel.gpuName.c_str(), live_tel.gpuUsagePct);
     if (live_tel.vramTotalBytes > 0) {

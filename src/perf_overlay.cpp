@@ -1,5 +1,7 @@
 #include "perf_overlay.h"
 #include "upscaler_backend.h"
+#include "context_census.h"
+#include "ngx_context.h"
 #include "log.h"
 
 #include <imgui.h>
@@ -72,6 +74,26 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
     } else {
         telemetry_.upscalerFrametimeMs = 0.0f;
     }
+
+    // Resolution dimensions
+    UINT outW = 0, outH = 0;
+    if (swapChain) {
+        DXGI_SWAP_CHAIN_DESC scDesc{};
+        if (SUCCEEDED(swapChain->GetDesc(&scDesc))) {
+            outW = scDesc.BufferDesc.Width;
+            outH = scDesc.BufferDesc.Height;
+        }
+    }
+    UINT sceneW = 0, sceneH = 0;
+    ContextCensusGetSceneRenderSize(&sceneW, &sceneH);
+    if (!sceneW || !sceneH) {
+        sceneW = outW;
+        sceneH = outH;
+    }
+    telemetry_.renderWidth = sceneW;
+    telemetry_.renderHeight = sceneH;
+    telemetry_.outputWidth = outW;
+    telemetry_.outputHeight = outH;
 
     // Game frametime is time spent by game engine before upscaler / composite
     telemetry_.gameFrametimeMs = (std::max)(0.0f, telemetry_.totalFrametimeMs - telemetry_.upscalerFrametimeMs);
@@ -197,12 +219,14 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner) {
         ImGui::Text("Game Frametime:     %.2f ms", telemetry_.gameFrametimeMs);
 
         auto& upscaler = UpscalerManager::instance();
-        if (upscaler.isReconstructionActive() && telemetry_.upscalerFrametimeMs > 0.0f) {
-            const char* backendName = (upscaler.getBackend() == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
+        const bool upscalerActive = upscaler.isReconstructionActive();
+
+        if (upscalerActive && telemetry_.upscalerFrametimeMs > 0.0f) {
+            const char* backendShort = (upscaler.getBackend() == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
             ImGui::Text("Upscaler Frametime: ");
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.85f, 1.0f), "%.2f ms (%s)",
-                telemetry_.upscalerFrametimeMs, backendName);
+                telemetry_.upscalerFrametimeMs, backendShort);
         } else {
             ImGui::Text("Upscaler Frametime: 0.00 ms (Bypass)");
         }
@@ -211,15 +235,55 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner) {
 
         ImGui::Separator();
 
-        // 3. GPU Info
+        // 3. Upscaler & Resolution Info
+        if (upscalerActive) {
+            const bool isAmd = (upscaler.getBackend() == UpscalerBackend::AmdFsr);
+            const bool isSr = (telemetry_.renderWidth < telemetry_.outputWidth || telemetry_.renderHeight < telemetry_.outputHeight);
+
+            const char* upscalerName = isAmd ? (isSr ? "AMD FSR SR" : "AMD FSR Native AA")
+                                             : (isSr ? "NVIDIA DLSS" : "NVIDIA DLAA");
+
+            char presetBuf[64]{};
+            if (!isAmd) {
+                const uint32_t p = NgxContext::get_preset();
+                const char* pName = (p == 10) ? "Preset J" :
+                                    (p == 11) ? "Preset K" :
+                                    (p == 12) ? "Preset L" :
+                                    (p == 13) ? "Preset M" : "Auto (Preset K)";
+                snprintf(presetBuf, sizeof(presetBuf), "(%s)", pName);
+            } else {
+                snprintf(presetBuf, sizeof(presetBuf), "(%s)", isSr ? "Super Resolution" : "Native AA");
+            }
+
+            ImGui::Text("Upscaler:           ");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "%s %s", upscalerName, presetBuf);
+
+            const float scalePct = telemetry_.outputWidth > 0
+                ? (100.0f * static_cast<float>(telemetry_.renderWidth) / static_cast<float>(telemetry_.outputWidth))
+                : 100.0f;
+
+            ImGui::Text("Resolution:         %ux%u -> %ux%u (%.1f%%)",
+                telemetry_.renderWidth, telemetry_.renderHeight,
+                telemetry_.outputWidth, telemetry_.outputHeight, scalePct);
+        } else {
+            ImGui::Text("Upscaler:           Bypass (Native)");
+            ImGui::Text("Resolution:         %ux%u -> %ux%u (100.0%%)",
+                telemetry_.outputWidth, telemetry_.outputHeight,
+                telemetry_.outputWidth, telemetry_.outputHeight);
+        }
+
+        ImGui::Separator();
+
+        // 4. GPU Info
         char gpuNameUtf8[128]{};
         WideCharToMultiByte(CP_UTF8, 0, telemetry_.gpuName.c_str(), -1, gpuNameUtf8, sizeof(gpuNameUtf8), nullptr, nullptr);
         ImGui::Text("Current GPU:        %s", gpuNameUtf8[0] ? gpuNameUtf8 : "Direct3D 11 Adapter");
 
-        // 4. GPU Usage
+        // 5. GPU Usage
         ImGui::Text("GPU Usage:          %u %%", telemetry_.gpuUsagePct);
 
-        // 5. VRAM Usage
+        // 6. VRAM Usage
         if (telemetry_.vramTotalBytes > 0) {
             const double usedGb = static_cast<double>(telemetry_.vramUsedBytes) / (1024.0 * 1024.0 * 1024.0);
             const double totalGb = static_cast<double>(telemetry_.vramTotalBytes) / (1024.0 * 1024.0 * 1024.0);

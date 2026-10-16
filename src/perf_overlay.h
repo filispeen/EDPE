@@ -13,6 +13,11 @@ struct PerfTelemetry {
     float gameFrametimeMs = 0.0f;
     float upscalerFrametimeMs = 0.0f;
 
+    uint32_t renderWidth = 0;
+    uint32_t renderHeight = 0;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
+
     std::wstring gpuName;
     uint32_t gpuUsagePct = 0;
 
