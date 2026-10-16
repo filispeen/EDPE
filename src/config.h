@@ -12,7 +12,7 @@
 
 namespace edpe {
 
-inline constexpr const char* kVersion = "v0.4.0";
+inline constexpr const char* kVersion = "v0.4.1";
 
 class Config {
 public:
