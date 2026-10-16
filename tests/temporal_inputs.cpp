@@ -201,5 +201,18 @@ int main() {
     if (std::fabs(edpe::Config::getTargetSsaaMultiplier(1, 4) - 0.500000f) > 1e-5f) return 53;
     if (std::fabs(edpe::Config::getTargetSsaaMultiplier(1, 5) - 0.333333f) > 1e-5f) return 54;
 
+    // -------------------------------------------------------------------------
+    // Test 7: selectModeByRatio validation
+    // -------------------------------------------------------------------------
+    if (edpe::selectModeByRatio(2560, 2560) != edpe::UpscaleMode::NativeAA) return 55;
+    if (edpe::selectModeByRatio(3840, 2560) != edpe::UpscaleMode::NativeAA) return 56;
+    if (edpe::selectModeByRatio(0, 2560) != edpe::UpscaleMode::UltraPerformance) return 57;
+
+    if (edpe::selectModeByRatio(1707, 2560) != edpe::UpscaleMode::Quality) return 58;
+    if (edpe::selectModeByRatio(1664, 2560) != edpe::UpscaleMode::Quality) return 59; // 0.65x
+    if (edpe::selectModeByRatio(1485, 2560) != edpe::UpscaleMode::Balanced) return 60; // 0.58x
+    if (edpe::selectModeByRatio(1280, 2560) != edpe::UpscaleMode::Performance) return 61; // 0.50x
+    if (edpe::selectModeByRatio(853, 2560) != edpe::UpscaleMode::UltraPerformance) return 62; // 0.33x
+
     return 0; // All temporal input layer tests passed
 }

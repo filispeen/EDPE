@@ -10,6 +10,7 @@
 #include "ngx_context.h"
 #include "config.h"
 #include "ui_composite_pass.h"
+#include "ui.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -2022,6 +2023,8 @@ DXGI_FORMAT concreteLdrColorFormat(DXGI_FORMAT fmt) {
 }
 
 // Runs at Present, before the EDPE overlay.
+static std::atomic<bool> s_comparison_capture_requested{false};
+
 // - When render resolution == output resolution (DLAA), evaluates on the finished
 //   LDR backbuffer (tone mapped, HUD included).
 // - When render resolution < output resolution (DLSS Super Resolution via Cobra's
@@ -2064,6 +2067,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
     const bool isSubNative = (depthDesc.Width < backbufferDesc.Width ||
                               depthDesc.Height < backbufferDesc.Height);
+    upscaler.setMode(isSubNative ? edpe::selectModeByRatio(depthDesc.Width, backbufferDesc.Width)
+                                 : edpe::UpscaleMode::NativeAA);
     ID3D11Texture2D* colorSource = nullptr;
     if (scene_ldr_source && scene_ldr_frame == rendered) {
         colorSource = scene_ldr_source.Get();
@@ -2335,6 +2340,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             }
         } else if (evalDestination == s_dlss_output_texture.Get()) {
             context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+        }
+
+        if (ContextCensusConsumeComparisonCaptureRequest()) {
+            UiQueueComparisonCapture(context, s_backbuffer_copy.Get(), backbuffer);
         }
     }
     rearmContextHooks();
@@ -3374,6 +3383,18 @@ float ContextCensusGetMotionScale() {
 void ContextCensusGetSceneRenderSize(UINT* outWidth, UINT* outHeight) {
     if (outWidth) *outWidth = s_observed_scene_width.load(std::memory_order_relaxed);
     if (outHeight) *outHeight = s_observed_scene_height.load(std::memory_order_relaxed);
+}
+
+void ContextCensusRequestComparisonCapture() {
+    s_comparison_capture_requested.store(true, std::memory_order_release);
+}
+
+bool ContextCensusIsComparisonCapturePending() {
+    return s_comparison_capture_requested.load(std::memory_order_acquire);
+}
+
+bool ContextCensusConsumeComparisonCaptureRequest() {
+    return s_comparison_capture_requested.exchange(false, std::memory_order_acq_rel);
 }
 
 

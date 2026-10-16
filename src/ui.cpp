@@ -38,7 +38,9 @@ struct UiState {
         Motion,
         SceneColor,
         EarlyHdr,
-        Backbuffer
+        Backbuffer,
+        ComparisonBefore,
+        ComparisonAfter
     };
 
     struct TextureCaptureRequest {
@@ -49,6 +51,7 @@ struct UiState {
         unsigned attempts = 0;
         CaptureKind kind = CaptureKind::Depth;
         int index = -1;
+        SYSTEMTIME timestamp{};
     };
 
     IDXGISwapChain* swap_chain = nullptr; // Weak: the game's Release owns its lifetime.
@@ -102,6 +105,7 @@ struct UiState {
     WNDPROC original_wndproc = nullptr;
     bool failed = false;
     bool input_logged = false;
+    wchar_t last_comparison_saved[128]{};
 } ui;
 std::atomic<bool> menu_visible{false};
 std::atomic<bool> all_captures_requested{false};
@@ -185,7 +189,8 @@ void releaseMotionSnapshot() {
     ui.motion_srv = nullptr;
 }
 
-void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int index = -1) {
+void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int index = -1,
+    const SYSTEMTIME* customTime = nullptr) {
     if (!source || !ui.device || !ui.context) return;
     D3D11_TEXTURE2D_DESC desc{};
     source->GetDesc(&desc);
@@ -208,13 +213,21 @@ void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int
     ID3D11Texture2D* staging = nullptr;
     if (SUCCEEDED(ui.device->CreateTexture2D(&staging_desc, nullptr, &staging))) {
         ui.context->CopyResource(staging, source);
-        ui.pending_captures.push_back({staging, desc.Format, desc.Width, desc.Height, 0, kind, index});
+        SYSTEMTIME t{};
+        if (customTime) {
+            t = *customTime;
+        } else {
+            GetLocalTime(&t);
+        }
+        ui.pending_captures.push_back({staging, desc.Format, desc.Width, desc.Height, 0, kind, index, t});
         wchar_t msg[128];
         swprintf_s(msg, L"EDPE: queued %ls capture %ux%u format=%u",
             kind == UiState::CaptureKind::Depth ? L"depth" :
             kind == UiState::CaptureKind::Motion ? L"motion" :
             kind == UiState::CaptureKind::SceneColor ? L"scene color" :
-            kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" : L"backbuffer",
+            kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" :
+            kind == UiState::CaptureKind::ComparisonBefore ? L"comparison before" :
+            kind == UiState::CaptureKind::ComparisonAfter ? L"comparison after" : L"backbuffer",
             desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
         EdpeLog(msg);
     } else {
@@ -234,6 +247,21 @@ void queueTextureCaptureFromSrv(ID3D11ShaderResourceView* srv, UiState::CaptureK
         }
         resource->Release();
     }
+}
+
+void queueComparisonCaptureInternal(ID3D11DeviceContext* context, ID3D11Texture2D* beforeTex, ID3D11Texture2D* afterTex) {
+    if (!beforeTex || !afterTex || !context) return;
+    if (!ui.device) {
+        context->GetDevice(&ui.device);
+    }
+    if (!ui.context) {
+        ui.context = context;
+        ui.context->AddRef();
+    }
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    queueTextureCapture(beforeTex, UiState::CaptureKind::ComparisonBefore, -1, &now);
+    queueTextureCapture(afterTex, UiState::CaptureKind::ComparisonAfter, -1, &now);
 }
 
 void pollFrameCapture() {
@@ -265,45 +293,53 @@ void pollFrameCapture() {
 
         if (SUCCEEDED(result)) {
             if (!folder.empty()) {
-                SYSTEMTIME now{};
-                GetLocalTime(&now);
                 wchar_t name[128];
                 switch (req.kind) {
                 case UiState::CaptureKind::Depth:
                     if (req.index >= 0)
                         swprintf_s(name, L"depth-dsv%d-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
-                            req.index, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
-                            now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                            req.index, req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay, req.timestamp.wHour, req.timestamp.wMinute,
+                            req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
                     else
                         swprintf_s(name, L"depth-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
-                            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
-                            now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                            req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay, req.timestamp.wHour, req.timestamp.wMinute,
+                            req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
                     break;
                 case UiState::CaptureKind::Motion:
                     swprintf_s(name, L"motion-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
-                        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
-                        now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                        req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay, req.timestamp.wHour, req.timestamp.wMinute,
+                        req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
                     break;
                 case UiState::CaptureKind::SceneColor:
                     if (req.index >= 0)
                         swprintf_s(name, L"color-dsv%d-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
-                            req.index, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
-                            now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                            req.index, req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay, req.timestamp.wHour, req.timestamp.wMinute,
+                            req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
                     else
                         swprintf_s(name, L"color-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
-                            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
-                            now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                            req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay, req.timestamp.wHour, req.timestamp.wMinute,
+                            req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
                     break;
                 case UiState::CaptureKind::EarlyHdr:
                     swprintf_s(name, L"early-color-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
-                        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
-                        now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                        req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay, req.timestamp.wHour, req.timestamp.wMinute,
+                        req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
+                    break;
+                case UiState::CaptureKind::ComparisonBefore:
+                    swprintf_s(name, L"capture-%04u%02u%02u-%02u%02u%02u-before.bmp",
+                        req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay,
+                        req.timestamp.wHour, req.timestamp.wMinute, req.timestamp.wSecond);
+                    break;
+                case UiState::CaptureKind::ComparisonAfter:
+                    swprintf_s(name, L"capture-%04u%02u%02u-%02u%02u%02u-after.bmp",
+                        req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay,
+                        req.timestamp.wHour, req.timestamp.wMinute, req.timestamp.wSecond);
                     break;
                 case UiState::CaptureKind::Backbuffer:
                 default:
                     swprintf_s(name, L"frame-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
-                        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
-                        now.wSecond, now.wMilliseconds, ++ui.capture_serial);
+                        req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay, req.timestamp.wHour, req.timestamp.wMinute,
+                        req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
                     break;
                 }
 
@@ -413,13 +449,22 @@ void pollFrameCapture() {
                                 row[4 * x + 3] = 255;
                             }
                         }
-                    } else { // Backbuffer
+                    } else { // Backbuffer, ComparisonBefore, ComparisonAfter
                         for (UINT x = 0; x < req.width; ++x) {
-                            const auto* pixel = source + 4 * x;
-                            row[4 * x + 0] = req.format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[2] : pixel[0];
-                            row[4 * x + 1] = pixel[1];
-                            row[4 * x + 2] = req.format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[0] : pixel[2];
-                            row[4 * x + 3] = 255;
+                            if (req.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                                uint32_t val = 0;
+                                std::memcpy(&val, source + 4 * x, sizeof(val));
+                                row[4 * x + 0] = static_cast<unsigned char>(((val >> 20) & 0x3FF) >> 2);
+                                row[4 * x + 1] = static_cast<unsigned char>(((val >> 10) & 0x3FF) >> 2);
+                                row[4 * x + 2] = static_cast<unsigned char>((val & 0x3FF) >> 2);
+                                row[4 * x + 3] = 255;
+                            } else {
+                                const auto* pixel = source + 4 * x;
+                                row[4 * x + 0] = req.format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[2] : pixel[0];
+                                row[4 * x + 1] = pixel[1];
+                                row[4 * x + 2] = req.format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[0] : pixel[2];
+                                row[4 * x + 3] = 255;
+                            }
                         }
                     }
                     file.write(reinterpret_cast<const char*>(row.data()), row.size());
@@ -431,9 +476,14 @@ void pollFrameCapture() {
                         req.kind == UiState::CaptureKind::Depth ? L"depth" :
                         req.kind == UiState::CaptureKind::Motion ? L"motion" :
                         req.kind == UiState::CaptureKind::SceneColor ? L"scene color" :
-                        req.kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" : L"frame",
+                        req.kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" :
+                        req.kind == UiState::CaptureKind::ComparisonBefore ? L"comparison before" :
+                        req.kind == UiState::CaptureKind::ComparisonAfter ? L"comparison after" : L"frame",
                         path.wstring().c_str());
                     EdpeLog(log_msg);
+                    if (req.kind == UiState::CaptureKind::ComparisonAfter) {
+                        swprintf_s(ui.last_comparison_saved, L"Saved %ls", name);
+                    }
                 } else {
                     EdpeLog(L"EDPE: capture file write failed");
                 }
@@ -850,7 +900,6 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
             edpe::UpscalerManager::instance().setMode(static_cast<edpe::UpscaleMode>(m));
         }
-        cfg.syncEliteGraphicsConfig();
     }
     EdpeLog(L"EDPE: Dear ImGui ready; F5 toggles menu");
     return true;
@@ -1019,43 +1068,20 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (current_backend_idx == 1) {
             if (nvidia_available) {
                 upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
-                const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
-                upscaler.setMode(static_cast<edpe::UpscaleMode>(m));
+                upscaler.setMode(edpe::UpscaleMode::NativeAA);
                 cfg.upscalerBackend = 1;
-                cfg.upscaleMode = m;
                 cfg.save();
-                cfg.syncEliteGraphicsConfig();
             }
         } else {
             upscaler.setBackend(edpe::UpscalerBackend::None);
             upscaler.setMode(edpe::UpscaleMode::Native);
             cfg.upscalerBackend = 0;
-            cfg.upscaleMode = 0;
             cfg.save();
-            cfg.syncEliteGraphicsConfig();
         }
     }
 
-    // Quality Mode selector (Phase 9 & 10)
     const bool backend_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
     if (!backend_active) ImGui::BeginDisabled();
-    const char* quality_items[] = {
-        "Native AA (DLAA 100%)",
-        "Quality (66.7% scale)",
-        "Balanced (58.0% scale)",
-        "Performance (50.0% scale)",
-        "Ultra Performance (33.3% scale)"
-    };
-    int mode_idx = static_cast<int>(upscaler.getMode()) - 1;
-    if (mode_idx < 0 || mode_idx > 4) mode_idx = 0;
-    if (ImGui::Combo("Quality Mode", &mode_idx, quality_items, IM_ARRAYSIZE(quality_items))) {
-        const auto newMode = static_cast<edpe::UpscaleMode>(mode_idx + 1);
-        if (upscaler.setMode(newMode)) {
-            cfg.upscaleMode = mode_idx + 1;
-            cfg.save();
-            cfg.syncEliteGraphicsConfig();
-        }
-    }
 
     // NVIDIA DLSS Preset selector
     const char* preset_items[] = {
@@ -1075,13 +1101,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     if (!backend_active) ImGui::EndDisabled();
 
-    bool auto_sync = cfg.autoSyncEliteConfig;
-    if (ImGui::Checkbox("Auto-sync Elite Custom.4.4.fxcfg (<SSAAMultiplier>)", &auto_sync)) {
-        cfg.autoSyncEliteConfig = auto_sync;
-        cfg.save();
-        if (auto_sync) cfg.syncEliteGraphicsConfig();
-    }
-
     DXGI_SWAP_CHAIN_DESC scDesc{};
     swap_chain->GetDesc(&scDesc);
     const UINT outW = scDesc.BufferDesc.Width;
@@ -1093,41 +1112,51 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         sceneH = outH;
     }
     const float activeScalePct = outW ? (100.0f * static_cast<float>(sceneW) / static_cast<float>(outW)) : 100.0f;
+    const bool isSr = (sceneW < outW || sceneH < outH);
 
     const auto& diag = upscaler.getDiagnostics();
-    if (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) {
-        const bool isSr = (sceneW < outW || sceneH < outH);
+    if (backend_active) {
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-            "Reconstruction: NVIDIA %s Active (%ux%u -> %ux%u, %.1f%%)",
-            isSr ? "DLSS Super Resolution" : "DLAA",
+            "Reconstruction: NVIDIA %s Active",
+            isSr ? "DLSS Super Resolution" : "DLAA");
+        ImGui::Text("Resolution: Scene %ux%u -> Output %ux%u (%.1f%%)",
             sceneW, sceneH, outW, outH, activeScalePct);
+        ImGui::Text("Active Mode: %ls",
+            edpe::getUpscaleModeName(upscaler.getMode()));
+        if (isSr) {
+            ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
+                "Scaling is automatically driven by game Supersampling (< 1.0x).");
+        } else {
+            ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
+                "Native 1:1 render detected -> DLAA antialiasing active.");
+        }
     } else {
         ImGui::Text("Reconstruction: Inactive (Scene %ux%u -> Output %ux%u)",
             sceneW, sceneH, outW, outH);
     }
 
-    edpe::DlssOptimalSettings optSettings{};
-    if (backend_active && edpe::NgxContext::queryOptimalSettings(outW, outH, upscaler.getMode(), &optSettings)) {
-        const float targetMult = edpe::Config::getTargetSsaaMultiplier(cfg.upscalerBackend, cfg.upscaleMode);
-        ImGui::Text("NGX Mode Target: %ux%u (range %ux%u .. %ux%u) | Config SSAA: %.2fx",
-            optSettings.optimalWidth, optSettings.optimalHeight,
-            optSettings.minWidth, optSettings.minHeight,
-            optSettings.maxWidth, optSettings.maxHeight,
-            targetMult);
-        if (upscaler.getMode() >= edpe::UpscaleMode::Quality && sceneW == outW) {
-            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
-                "Tip: Set Elite Graphics -> Supersampling < 1.0x (e.g. 0.65x/0.50x) or restart game to apply %.2fx render scale.",
-                targetMult);
-        }
-    }
-
-    ImGui::Text("Backend: %ls | Mode: %ls",
-        edpe::getUpscalerBackendName(upscaler.getBackend()),
-        edpe::getUpscaleModeName(upscaler.getMode()));
     ImGui::Text("Status: %ls", diag.statusMessage);
     if (diag.didRun) {
         ImGui::Text("GPU Reconstruction Time: %.3f ms", diag.gpuTimeMs);
     }
+
+    // Comparison Screenshot Button
+    ImGui::Separator();
+    ImGui::TextUnformatted("DLAA / DLSS Screenshot Comparison");
+    const bool can_compare = backend_active && upscaler.isReconstructionActive();
+    if (!can_compare) ImGui::BeginDisabled();
+    if (ImGui::Button("Capture Before & After DLAA/DLSS (2x BMP)")) {
+        ContextCensusRequestComparisonCapture();
+    }
+    if (!can_compare) {
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("Enable DLSS or DLAA to capture comparison");
+    } else if (ContextCensusIsComparisonCapturePending()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Comparison capture queued for next frame...");
+    } else if (ui.last_comparison_saved[0] != L'\0') {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%ls (and -before.bmp)", ui.last_comparison_saved);
+    }
+
     if (!nvidia_available) {
         ImGui::TextDisabled("NVIDIA DLSS/DLAA reason: %ls",
             upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
@@ -1412,3 +1441,7 @@ void UiOnRelease(IUnknown* object) {
 }
 
 bool UiMenuVisible() { return menu_visible.load(); }
+
+void UiQueueComparisonCapture(ID3D11DeviceContext* context, ID3D11Texture2D* beforeTex, ID3D11Texture2D* afterTex) {
+    queueComparisonCaptureInternal(context, beforeTex, afterTex);
+}

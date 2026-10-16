@@ -53,3 +53,6 @@ bool ContextCensusGetMotionInvertY();
 void ContextCensusSetMotionScale(float scale);
 float ContextCensusGetMotionScale();
 void ContextCensusGetSceneRenderSize(UINT* outWidth, UINT* outHeight);
+void ContextCensusRequestComparisonCapture();
+bool ContextCensusIsComparisonCapturePending();
+bool ContextCensusConsumeComparisonCaptureRequest();

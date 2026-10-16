@@ -93,6 +93,16 @@ inline bool calculateRenderResolution(uint32_t outputWidth, uint32_t outputHeigh
     return true;
 }
 
+// Automatically selects the closest UpscaleMode based on actual render vs output resolution.
+inline UpscaleMode selectModeByRatio(uint32_t renderWidth, uint32_t outputWidth) {
+    if (!outputWidth || renderWidth >= outputWidth) return UpscaleMode::NativeAA;
+    const float ratio = static_cast<float>(renderWidth) / static_cast<float>(outputWidth);
+    if (ratio >= 0.62f) return UpscaleMode::Quality;
+    if (ratio >= 0.54f) return UpscaleMode::Balanced;
+    if (ratio >= 0.42f) return UpscaleMode::Performance;
+    return UpscaleMode::UltraPerformance;
+}
+
 // Vendor-neutral temporal inputs owned by EDPE (AGENTS.md & PLAN.md section 4/27).
 // Represents the unified handoff boundary to any upscaler backend.
 struct TemporalFrameInputs {
