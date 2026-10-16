@@ -27,9 +27,10 @@ As of **October 2026 (`v0.2.1`)**, EDPE has achieved:
 * **Vendor-Neutral Temporal Input Layer:** Abstracted `TemporalFrameInputs` structure decoupling engine state from vendor reconstruction SDKs.
 * **NVIDIA DLAA Evaluation:** Official NVIDIA NGX SDK integrated with EDPE-owned Project ID (`48d353f3-d07b-4048-876b-09f8622f5a27`). DLAA runs on the finished swapchain backbuffer at `Present` prior to overlay rendering, achieving **rock-solid temporal anti-aliasing with ~0.3 ms GPU overhead** and zero subpixel image vibration.
 * **NVIDIA DLSS Super Resolution:** Reconstructs true sub-native 3D scenes (via Cobra in-game Supersampling < 1.0x) into native resolution, supporting Quality, Balanced, Performance, and Ultra Performance with DLSS Presets (Auto, J, K, L, M).
-* **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA (at 1.0x) or DLSS SR (at < 1.0x).
-* **Native UI Protection & Composite:** Dedicated shader pass (`UiCompositePass`) preserves native-resolution HUD, text, cockpits, and menus, seamlessly compositing them over reconstructed DLSS frames.
-* **Before / After Comparison Captures:** Dedicated in-game button capturing synchronized pairs of 32-bit BMP screenshots (`before` and `after` DLAA/DLSS) in `edpe-captures/`.
+* **AMD FSR 3.1.2 (Native AA & Super Resolution):** Integrated native Direct3D 11 backend (`FidelityFX-SDK-DX11`, commit `9b04fa4`). Supports both FSR Native AA at 1.0x SSAA and FSR Super Resolution at < 1.0x SSAA with reversed-Z, auto-exposure, and fail-open lifecycle.
+* **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA / FSR Native AA (at 1.0x) or DLSS / FSR Super Resolution (at < 1.0x).
+* **Native UI Protection & Composite:** Dedicated shader pass (`UiCompositePass`) preserves native-resolution HUD, text, cockpits, and menus, seamlessly compositing them over reconstructed DLSS/FSR frames.
+* **Before / After Comparison Captures:** Dedicated in-game button capturing synchronized pairs of 32-bit BMP screenshots (`before` and `after` DLAA/DLSS/FSR) in `edpe-captures/`.
 * **Dear ImGui In-Game Overlay (`F5`):** Runtime control surface displaying live GPU timings, jitter/motion diagnostics, and temporal tuning controls. Passes all inputs through to the game when closed.
 * **Synchronized 5-Buffer GPU Capture (`F6`):** One-shot capture of all 5 engine buffers (`color`, `motion`, `depth`, `early-color` emissive, `frame`) from the exact same frame using non-blocking asynchronous GPU readback (`D3D11_MAP_FLAG_DO_NOT_WAIT`), saved to `edpe-captures/`.
 * **Automated Test Suite:** 10 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy hooks, GPU motion passes, and UI composition.
@@ -48,8 +49,8 @@ As of **October 2026 (`v0.2.1`)**, EDPE has achieved:
 | **7** | **Shared Temporal Input Layer** | ✅ **Verified** | Backend-neutral `TemporalFrameInputs` and `IUpscalerBackend` architecture implemented. |
 | **8** | **NVIDIA DLAA** | ✅ **Verified** | Official NGX DLAA evaluated at native resolution; ~0.3 ms GPU time, pristine anti-aliasing. |
 | **9–10** | **True Render Scale & NVIDIA DLSS SR** | ✅ **Verified** | Lower 3D scene render resolution via Cobra SSAA (< 1.0x) with full DLSS SR reconstruction and zero-configuration auto-scaling. |
-| **11** | **AMD FSR Super Resolution & Native AA** | 🟡 **Next Up** | `AmdUpscalerBackend` interface defined; FidelityFX integration pending backend selection. |
-| **12** | **Native-Resolution HUD Separation** | 🟢 **Operational** | Native-res HUD composited over upscaled DLSS 3D scene (`UiCompositePass`), protecting cockpit/UI crispness. |
+| **11** | **AMD FSR Super Resolution & Native AA** | 🟢 **Implemented** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated; supports FSR Native AA & FSR Super Resolution with fail-open fallback. |
+| **12** | **Native-Resolution HUD Separation** | 🟢 **Operational** | Native-res HUD composited over upscaled DLSS/FSR 3D scene (`UiCompositePass`), protecting cockpit/UI crispness. |
 | **13–15** | **D3D11/D3D12 Interop & Frame Generation** | 🔬 **Research** | NVIDIA DLSS Frame Generation (Streamline) & AMD FSR Frame Generation via interop bridge. |
 
 See [STATUS.md](STATUS.md) for verified facts and [PLAN.md](PLAN.md) for the complete roadmap.

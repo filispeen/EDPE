@@ -4,6 +4,12 @@
 
 #include <chrono>
 #include <cwchar>
+#include <vector>
+
+#if defined(EDPE_ENABLE_FSR)
+#include <FidelityFX/host/ffx_fsr3upscaler.h>
+#include <FidelityFX/host/backends/dx11/ffx_dx11.h>
+#endif
 
 namespace edpe {
 
@@ -158,15 +164,155 @@ void NvidiaUpscalerBackend::resetHistory() {
 // AmdUpscalerBackend
 // -------------------------------------------------------------------------
 
+struct AmdUpscalerBackend::Impl {
+    bool initialized = false;
+    bool contextCreated = false;
+    bool resetRequested = false;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> outputTexture;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> outputUav;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
+    DXGI_FORMAT outputFormat = DXGI_FORMAT_UNKNOWN;
+
+    uint32_t maxRenderWidth = 0;
+    uint32_t maxRenderHeight = 0;
+    uint32_t maxOutputWidth = 0;
+    uint32_t maxOutputHeight = 0;
+
+#if defined(EDPE_ENABLE_FSR)
+    std::vector<uint8_t> scratchBuffer;
+    FfxInterface ffxInterface{};
+    FfxFsr3UpscalerContext fsrContext{};
+#endif
+
+    bool ensureOutputTexture(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format) {
+        if (outputTexture && outputWidth == width && outputHeight == height && outputFormat == format) {
+            return true;
+        }
+        outputTexture.Reset();
+        outputUav.Reset();
+        outputWidth = 0;
+        outputHeight = 0;
+        outputFormat = DXGI_FORMAT_UNKNOWN;
+
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = format;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET;
+
+        HRESULT hr = device->CreateTexture2D(&desc, nullptr, &outputTexture);
+        if (FAILED(hr)) {
+            EdpeLog(L"EDPE: Failed to create AMD output texture");
+            return false;
+        }
+
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+        uavDesc.Format = format;
+        uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        uavDesc.Texture2D.MipSlice = 0;
+        hr = device->CreateUnorderedAccessView(outputTexture.Get(), &uavDesc, &outputUav);
+        if (FAILED(hr)) {
+            EdpeLog(L"EDPE: Failed to create AMD output UAV");
+            outputTexture.Reset();
+            return false;
+        }
+
+        outputWidth = width;
+        outputHeight = height;
+        outputFormat = format;
+        return true;
+    }
+
+    void destroyFsrContext() {
+#if defined(EDPE_ENABLE_FSR)
+        if (contextCreated) {
+            ffxFsr3UpscalerContextDestroy(&fsrContext);
+            contextCreated = false;
+        }
+#endif
+    }
+
+    bool ensureFsrContext(ID3D11Device* /*device*/, uint32_t renderW, uint32_t renderH,
+                          uint32_t outputW, uint32_t outputH) {
+#if defined(EDPE_ENABLE_FSR)
+        if (contextCreated && renderW <= maxRenderWidth && renderH <= maxRenderHeight &&
+            outputW == maxOutputWidth && outputH == maxOutputHeight) {
+            return true;
+        }
+
+        destroyFsrContext();
+
+        maxRenderWidth = renderW;
+        maxRenderHeight = renderH;
+        maxOutputWidth = outputW;
+        maxOutputHeight = outputH;
+
+        FfxFsr3UpscalerContextDescription desc{};
+        desc.flags = FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE |
+                     FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED |
+                     FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE |
+                     FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE;
+        desc.maxRenderSize.width = maxRenderWidth;
+        desc.maxRenderSize.height = maxRenderHeight;
+        desc.maxUpscaleSize.width = maxOutputWidth;
+        desc.maxUpscaleSize.height = maxOutputHeight;
+        desc.backendInterface = ffxInterface;
+        desc.fpMessage = [](FfxMsgType type, const wchar_t* msg) {
+            if (type == FFX_MESSAGE_TYPE_ERROR) {
+                wchar_t buf[512];
+                swprintf_s(buf, L"EDPE FSR Error: %ls", msg ? msg : L"unknown");
+                EdpeLog(buf);
+            }
+        };
+
+        FfxErrorCode err = ffxFsr3UpscalerContextCreate(&fsrContext, &desc);
+        if (err != FFX_OK) {
+            wchar_t buf[256];
+            swprintf_s(buf, L"EDPE: ffxFsr3UpscalerContextCreate failed (%d)", err);
+            EdpeLog(buf);
+            return false;
+        }
+        contextCreated = true;
+        return true;
+#else
+        return false;
+#endif
+    }
+};
+
+AmdUpscalerBackend::AmdUpscalerBackend()
+    : impl_(std::make_unique<Impl>()) {}
+
+AmdUpscalerBackend::~AmdUpscalerBackend() {
+    shutdown();
+}
+
 bool AmdUpscalerBackend::isAvailable() const {
-    return false; // Official backend investigation pending.
+#if defined(EDPE_ENABLE_FSR)
+    return impl_ && impl_->initialized;
+#else
+    return false;
+#endif
 }
 
 const wchar_t* AmdUpscalerBackend::unavailableReason() const {
-    return L"AMD FidelityFX backend pending D3D11/D3D12 interop architecture selection (PLAN.md section 12)";
+#if defined(EDPE_ENABLE_FSR)
+    if (isAvailable()) return L"";
+    return L"AMD FidelityFX SDK D3D11 backend not initialized";
+#else
+    return L"AMD FidelityFX SDK not compiled into EDPE";
+#endif
 }
 
 bool AmdUpscalerBackend::isModeSupported(UpscaleMode mode) const {
+    if (!isAvailable()) return false;
     return mode == UpscaleMode::NativeAA ||
            mode == UpscaleMode::Quality ||
            mode == UpscaleMode::Balanced ||
@@ -174,22 +320,48 @@ bool AmdUpscalerBackend::isModeSupported(UpscaleMode mode) const {
            mode == UpscaleMode::UltraPerformance;
 }
 
-bool AmdUpscalerBackend::initialize(ID3D11Device* /*device*/, ID3D11DeviceContext* /*context*/) {
-    initialized_ = false;
+bool AmdUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* /*context*/) {
+#if defined(EDPE_ENABLE_FSR)
+    if (!impl_) impl_ = std::make_unique<Impl>();
+    if (!device) return false;
+
+    size_t scratchSize = ffxGetScratchMemorySizeDX11(FFX_FSR3UPSCALER_CONTEXT_COUNT);
+    impl_->scratchBuffer.resize(scratchSize);
+    FfxDevice ffxDevice = ffxGetDeviceDX11_Fsr31(device);
+    FfxErrorCode err = ffxGetInterfaceDX11(&impl_->ffxInterface, ffxDevice,
+        impl_->scratchBuffer.data(), scratchSize, FFX_FSR3UPSCALER_CONTEXT_COUNT);
+    if (err != FFX_OK) {
+        wchar_t buf[256];
+        swprintf_s(buf, L"EDPE: ffxGetInterfaceDX11 failed (%d)", err);
+        EdpeLog(buf);
+        return false;
+    }
+    impl_->initialized = true;
+    EdpeLog(L"EDPE: AMD FSR 3.1 D3D11 backend initialized successfully");
+    return true;
+#else
     return false;
+#endif
 }
 
 void AmdUpscalerBackend::shutdown() {
-    initialized_ = false;
+    if (!impl_) return;
+    impl_->destroyFsrContext();
+    impl_->outputTexture.Reset();
+    impl_->outputUav.Reset();
+#if defined(EDPE_ENABLE_FSR)
+    impl_->scratchBuffer.clear();
+#endif
+    impl_->initialized = false;
 }
 
-bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* /*context*/,
+bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     const TemporalFrameInputs& inputs,
-    ID3D11RenderTargetView* /*destinationRtv*/,
-    ID3D11Texture2D* /*destinationTexture*/) {
-    if (!isAvailable()) return false;
+    ID3D11RenderTargetView* destinationRtv,
+    ID3D11Texture2D* destinationTexture) {
+#if defined(EDPE_ENABLE_FSR)
+    if (!isAvailable() || !context || !impl_) return false;
 
-    // Translate EDPE temporal conventions to AMD FidelityFX expectations.
     AmdFsrInputParams params{};
     const wchar_t* reason = nullptr;
     if (!translateToAmd(inputs, &params, &reason)) {
@@ -199,10 +371,90 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* /*context*/,
         return false;
     }
 
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+
+    D3D11_TEXTURE2D_DESC outDesc{};
+    if (destinationTexture) {
+        destinationTexture->GetDesc(&outDesc);
+    } else {
+        inputs.color->GetDesc(&outDesc);
+    }
+
+    if (!impl_->ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
+        return false;
+    }
+
+    if (!impl_->ensureFsrContext(device.Get(), inputs.renderWidth, inputs.renderHeight,
+                                 inputs.outputWidth, inputs.outputHeight)) {
+        return false;
+    }
+
+    FfxFsr3UpscalerDispatchDescription dispatchDesc{};
+    dispatchDesc.commandList = ffxGetCommandListDX11(context);
+
+    // Resources
+    dispatchDesc.color = ffxGetResourceDX11_Fsr31(inputs.color,
+        GetFfxResourceDescriptionDX11(inputs.color), L"FSR3_Color", FFX_RESOURCE_STATE_COMPUTE_READ);
+    dispatchDesc.depth = ffxGetResourceDX11_Fsr31(inputs.depth,
+        GetFfxResourceDescriptionDX11(inputs.depth), L"FSR3_Depth", FFX_RESOURCE_STATE_COMPUTE_READ);
+    dispatchDesc.motionVectors = ffxGetResourceDX11_Fsr31(inputs.motionVectors,
+        GetFfxResourceDescriptionDX11(inputs.motionVectors), L"FSR3_MotionVectors", FFX_RESOURCE_STATE_COMPUTE_READ);
+
+    if (inputs.reactiveMask) {
+        dispatchDesc.reactive = ffxGetResourceDX11_Fsr31(inputs.reactiveMask,
+            GetFfxResourceDescriptionDX11(inputs.reactiveMask), L"FSR3_Reactive", FFX_RESOURCE_STATE_COMPUTE_READ);
+    }
+
+    dispatchDesc.output = ffxGetResourceDX11_Fsr31(impl_->outputTexture.Get(),
+        GetFfxResourceDescriptionDX11(impl_->outputTexture.Get()), L"FSR3_Output", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    // Jitter & Motion parameters
+    dispatchDesc.jitterOffset.x = params.jitterX;
+    dispatchDesc.jitterOffset.y = params.jitterY;
+    dispatchDesc.motionVectorScale.x = params.motionVectorScaleX;
+    dispatchDesc.motionVectorScale.y = params.motionVectorScaleY;
+    dispatchDesc.renderSize.width = inputs.renderWidth;
+    dispatchDesc.renderSize.height = inputs.renderHeight;
+    dispatchDesc.upscaleSize.width = inputs.outputWidth;
+    dispatchDesc.upscaleSize.height = inputs.outputHeight;
+
+    dispatchDesc.enableSharpening = false;
+    dispatchDesc.sharpness = 0.0f;
+    dispatchDesc.frameTimeDelta = params.frameTimeDeltaMs > 0.0f ? params.frameTimeDeltaMs : 16.6f;
+    dispatchDesc.preExposure = 1.0f;
+    dispatchDesc.reset = params.reset || impl_->resetRequested;
+    impl_->resetRequested = false;
+
+    // Camera parameters (Elite Odyssey infinite reversed-Z)
+    dispatchDesc.cameraNear = 0.1f;
+    dispatchDesc.cameraFar = 10000.0f;
+    dispatchDesc.cameraFovAngleVertical = 1.0f;
+    dispatchDesc.viewSpaceToMetersFactor = 1.0f;
+
+    FfxErrorCode err = ffxFsr3UpscalerContextDispatch(&impl_->fsrContext, &dispatchDesc);
+    if (err != FFX_OK) {
+        wchar_t buf[256];
+        swprintf_s(buf, L"EDPE: ffxFsr3UpscalerContextDispatch failed (%d)", err);
+        EdpeLog(buf);
+        return false;
+    }
+
+    ID3D11Texture2D* dest = destinationTexture ? destinationTexture : inputs.color;
+    if (dest) {
+        context->CopyResource(dest, impl_->outputTexture.Get());
+    }
+    return true;
+#else
     return false;
+#endif
 }
 
-void AmdUpscalerBackend::resetHistory() {}
+void AmdUpscalerBackend::resetHistory() {
+    if (impl_) {
+        impl_->resetRequested = true;
+    }
+}
 
 // -------------------------------------------------------------------------
 // UpscalerManager

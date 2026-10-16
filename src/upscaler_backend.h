@@ -116,6 +116,9 @@ private:
 // Governed by safety constraints in amd-fsr-input-contract.md.
 class AmdUpscalerBackend : public IUpscalerBackend {
 public:
+    AmdUpscalerBackend();
+    ~AmdUpscalerBackend() override;
+
     UpscalerBackend backendType() const override { return UpscalerBackend::AmdFsr; }
     const wchar_t* name() const override { return L"AMD FSR"; }
 
@@ -135,7 +138,8 @@ public:
     void resetHistory() override;
 
 private:
-    bool initialized_ = false;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 // Central coordinator for temporal upscaling in EDPE.

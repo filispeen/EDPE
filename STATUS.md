@@ -30,8 +30,8 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 8. NVIDIA DLAA | **Verified & working in-game** | Official NVIDIA NGX SDK linked. `NgxContext` evaluates DLAA at native 2560×1440 (`MVLowRes | DepthInverted`, Preset K, LDR mode) on the finished swapchain backbuffer at `Present` before ImGui overlay rendering. Verified in-game: clean, rock-solid temporal anti-aliasing (~0.3 ms GPU time) with zero image vibration. |
 | 9. NVIDIA DLSS Super Resolution | **Verified & working in-game** | `NgxContext` and `NvidiaUpscalerBackend` reconstruct low-res LDR scene target (`scene_ldr_source`) into native backbuffer with verified temporal inputs and presets (`Auto`, `J`, `K`, `L`, `M`). Reconstructed 3D world is composited under native-resolution HUD. |
 | 10. True render-scale control | **Verified & working in-game** | Cobra's native Supersampling (SSAA < 1.0x) delivers true rendering workload reduction. Automatically detected via scene depth dimensions with zero manual configuration. |
-| 11. AMD FSR upscaling | **Interface ready; backend pending** | `AmdUpscalerBackend` abstraction implemented in `src/upscaler_backend.h/.cpp`. FidelityFX integration pending backend architecture selection. |
-| 12. Native-resolution HUD | **Operational for DLSS SR** | `UiCompositePass` composites native-resolution UI/cockpit elements from pre-upscale backbuffer copy over reconstructed DLSS frames. Reactive mask generation planned for fine holographic elements. |
+| 11. AMD FSR upscaling | **Implemented & unit-tested; ready for in-game verification** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated in `AmdUpscalerBackend`. Supports FSR Native AA (1.0x SSAA) and FSR Super Resolution (<1.0x SSAA) with auto-exposure, inverted reversed-Z, and fail-open lifecycle. |
+| 12. Native-resolution HUD | **Operational for DLSS & FSR SR** | `UiCompositePass` composites native-resolution UI/cockpit elements from pre-upscale backbuffer copy over reconstructed DLSS/FSR frames. Reactive mask generation planned for fine holographic elements. |
 | 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
@@ -40,7 +40,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Available diagnostics and controls
 
-- **F5 Overlay:** Toggles the Dear ImGui menu. Exposes Upscaler Backend (`Native`, `NVIDIA DLSS / DLAA`), Quality Mode (`Native AA`, `Quality`, `Balanced`, `Performance`, `Ultra Performance`), NVIDIA DLSS Preset (`Auto`, `J`, `K`, `L`, `M`), Elite `Custom.4.4.fxcfg` `<SSAAMultiplier>` auto-sync, asynchronous GPU timings, projection jitter status/controls, runtime temporal tuning overrides, and snapshot previews. When hidden, passes through all inputs to the game without interference.
+- **F5 Overlay:** Toggles the Dear ImGui menu. Exposes Upscaler Backend (`Native`, `NVIDIA DLSS / DLAA`, `AMD FSR (Native AA / SR)`), Quality Mode (`Native AA`, `Quality`, `Balanced`, `Performance`, `Ultra Performance`), NVIDIA DLSS Preset (`Auto`, `J`, `K`, `L`, `M`), Elite `Custom.4.4.fxcfg` `<SSAAMultiplier>` auto-sync, asynchronous GPU timings, projection jitter status/controls, runtime temporal tuning overrides, and snapshot previews. When hidden, passes through all inputs to the game without interference.
 - **F6 One-Shot Synchronized Capture:** Captures all 5 rendering buffers from the **exact same frame** and writes non-blocking 32-bit BMP files to `edpe-captures/`:
   - `color-*.bmp`: Tone-mapped scene color HDR (`DXGI_FORMAT_R11G11B10_FLOAT`)
   - `motion-*.bmp`: Visualized motion displacement (`DXGI_FORMAT_R16G16_FLOAT`)
@@ -54,13 +54,14 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Next milestone
 
-Phases 9 & 10 (NVIDIA DLSS Super Resolution & True Render-Scale Control) are **Implemented and Ready for In-Game Verification**:
-- `NgxContext` supports all 5 modes (`Native AA`, `Quality`, `Balanced`, `Performance`, `Ultra Performance`), queries `NGX_DLSS_GET_OPTIMAL_SETTINGS`, and supports runtime selection of NVIDIA DLSS presets (`Auto`, `J`, `K`, `L`, `M`).
-- `Config::syncEliteGraphicsConfig()` automatically synchronizes `<SSAAMultiplier>`, `<UpscalingQuality>0</UpscalingQuality>`, and `<AAMode>0</AAMode>` in Elite's `Custom.4.4.fxcfg`, and `context_census` tracks the low-resolution tone-mapped LDR scene target (`scene_ldr_source`) and scales Halton jitter NDC offsets and phase count to the active scene render resolution.
+Phase 11 (AMD FSR 3.1.2 Upscaling) is **Implemented and Ready for In-Game Verification**:
+- `AmdUpscalerBackend` links native D3D11 FidelityFX FSR 3.1.2 libraries, supporting both FSR Native AA and Super Resolution.
+- In-game scaling automatically chooses between FSR Native AA (1.0x SSAA) and FSR Super Resolution (< 1.0x SSAA).
+- UI composites native HUD over the reconstructed FSR image.
 
 The immediate next steps are:
-1. Verify NVIDIA DLSS Super Resolution (`Quality`, `Balanced`, `Performance`, `Ultra Performance`) in-game in Elite Dangerous Odyssey.
-2. Proceed to **Phase 11 (AMD FSR Upscaling)** and **Phase 12 (Native-Resolution HUD separation)**.
+1. Verify AMD FSR Native AA and Super Resolution in-game in Elite Dangerous Odyssey.
+2. Proceed to **Phase 12 (Reactive Mask refinements)** and **Phase 13 (D3D11/D3D12 presentation bridge research)**.
 
 ---
 
@@ -144,6 +145,16 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 ---
 
+## AMD FidelityFX FSR 3.1.2 — IMPLEMENTED & TESTED (Phase 11)
+
+- **SDK:** AMD FidelityFX FSR 3.1.2 Direct3D 11 native backend (`FidelityFX-SDK-DX11`, pinned commit `9b04fa4`, dynamic CRT `/MD`). Fetched and built via `tools/fetch_ffx_dx11.py`.
+- **Backend Architecture:** `AmdUpscalerBackend` implements `IUpscalerBackend` with PIMPL isolation (`Impl`) so FidelityFX host headers are not leaked to external compilation units.
+- **Feature Configuration:** Supports both FSR Native AA (`input == output`) and Super Resolution (`input < output`). Configured with `FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE`, `FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED`, `FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE`, and `FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE`.
+- **Execution & Dispatch:** Scratch memory managed via `ffxGetScratchMemorySizeDX11` and `ffxGetInterfaceDX11`. Dispatches compute pass to internal staging UAV texture, then copied to backbuffer before UI composite pass.
+- **Fail-Open Behavior:** Reverts safely to native presentation if FFX initialization or dispatch fails. Cleanly resets history and destroys context on resolution resize or shutdown. Unit tested in `temporal_inputs_test`.
+
+---
+
 ## Failure Behavior — IMPLEMENTED & TESTED
 
 - **Upscaler failure:** disable affected upscaler, disable jitter, restore original frame, Present normally
@@ -178,9 +189,9 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 ## Next Verified Milestones (per PLAN.md order)
 
-1. **Phase 9 & 10 — True Render-Scale Control & NVIDIA DLSS Super Resolution:** Render the 3D scene below output resolution (`input < output`) via Cobra's scaling mechanism / selective resource scaling and reconstruct to native resolution using `Quality`, `Balanced`, `Performance`, and `Ultra Performance`.
-2. **Phase 11 — AMD FSR Upscaling:** Integrate AMD FSR Native AA and Super Resolution behind `AmdUpscalerBackend` consuming `TemporalFrameInputs`.
-3. **Phase 12 — Native-Resolution HUD:** Separate HUD rendering over the upscaled 3D world for lower-resolution SR modes and future Frame Generation.
+1. **Phase 11 — AMD FSR Upscaling Verification:** In-game verification of AMD FSR Native AA (1.0x SSAA) and Super Resolution (< 1.0x SSAA) via native D3D11 compute backend.
+2. **Phase 12 — Native-Resolution HUD Separation:** Fine reactive mask generation and refinement for cockpit holographic elements and emissive UI.
+3. **Phase 13–15 — D3D11/D3D12 Interop & Frame Generation:** Presentation bridge prototyping for AMD FSR & NVIDIA DLSS Frame Generation.
 
 ---
 

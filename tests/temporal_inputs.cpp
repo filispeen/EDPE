@@ -214,5 +214,24 @@ int main() {
     if (edpe::selectModeByRatio(1280, 2560) != edpe::UpscaleMode::Performance) return 61; // 0.50x
     if (edpe::selectModeByRatio(853, 2560) != edpe::UpscaleMode::UltraPerformance) return 62; // 0.33x
 
+    // -------------------------------------------------------------------------
+    // Test 8: AMD FSR backend interface and translation contract
+    // -------------------------------------------------------------------------
+    edpe::AmdFsrInputParams amdParams8{};
+    const wchar_t* amdReason8 = nullptr;
+    if (!edpe::translateToAmd(inputs, &amdParams8, &amdReason8)) return 63;
+    if (std::fabs(amdParams8.jitterX - inputs.jitterX) > 1e-6f) return 64;
+    if (std::fabs(amdParams8.jitterY - inputs.jitterY) > 1e-6f) return 65;
+    if (std::fabs(amdParams8.motionVectorScaleX - inputs.motionScaleX) > 1e-6f) return 66;
+    if (std::fabs(amdParams8.motionVectorScaleY - inputs.motionScaleY) > 1e-6f) return 67;
+    if (!amdParams8.depthInverted || !amdParams8.depthInfinite) return 68;
+
+    // AmdUpscalerBackend instantiation and lifecycle
+    edpe::AmdUpscalerBackend amdBackend;
+    if (amdBackend.backendType() != edpe::UpscalerBackend::AmdFsr) return 69;
+    if (std::wcscmp(amdBackend.name(), L"AMD FSR") != 0) return 70;
+    // Without D3D11 device initialized, evaluate should fail open safely
+    if (amdBackend.evaluate(nullptr, inputs, nullptr, nullptr)) return 71;
+
     return 0; // All temporal input layer tests passed
 }

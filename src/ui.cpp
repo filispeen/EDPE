@@ -899,6 +899,11 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::NvidiaDlss);
             const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
             edpe::UpscalerManager::instance().setMode(static_cast<edpe::UpscaleMode>(m));
+        } else if (cfg.upscalerBackend == 2 &&
+            edpe::UpscalerManager::instance().isBackendAvailable(edpe::UpscalerBackend::AmdFsr)) {
+            edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::AmdFsr);
+            const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
+            edpe::UpscalerManager::instance().setMode(static_cast<edpe::UpscaleMode>(m));
         }
     }
     EdpeLog(L"EDPE: Dear ImGui ready; F5 toggles menu");
@@ -1058,9 +1063,14 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     auto& upscaler = edpe::UpscalerManager::instance();
     auto& cfg = edpe::Config::instance();
     const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);
+    const bool amd_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::AmdFsr);
 
     // Upscaler backend selector
-    const char* upscaler_items[] = { "Native (Bypass)", "NVIDIA DLSS / DLAA", "AMD FSR (unavailable)" };
+    const char* upscaler_items[] = {
+        "Native (Bypass)",
+        nvidia_available ? "NVIDIA DLSS / DLAA" : "NVIDIA DLSS / DLAA (unavailable)",
+        amd_available ? "AMD FSR (Native AA / SR)" : "AMD FSR (unavailable)"
+    };
     int current_backend_idx = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) ? 1 :
                               (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) ? 2 : 0;
 
@@ -1072,6 +1082,13 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 cfg.upscalerBackend = 1;
                 cfg.save();
             }
+        } else if (current_backend_idx == 2) {
+            if (amd_available) {
+                upscaler.setBackend(edpe::UpscalerBackend::AmdFsr);
+                upscaler.setMode(edpe::UpscaleMode::NativeAA);
+                cfg.upscalerBackend = 2;
+                cfg.save();
+            }
         } else {
             upscaler.setBackend(edpe::UpscalerBackend::None);
             upscaler.setMode(edpe::UpscaleMode::Native);
@@ -1080,8 +1097,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
     }
 
-    const bool backend_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
-    if (!backend_active) ImGui::BeginDisabled();
+    const bool backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
+    const bool nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
+    const bool amd_active = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
+
+    if (!nvidia_active) ImGui::BeginDisabled();
 
     // NVIDIA DLSS Preset selector
     const char* preset_items[] = {
@@ -1099,7 +1119,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         cfg.dlssPreset = static_cast<int>(newPreset);
         cfg.save();
     }
-    if (!backend_active) ImGui::EndDisabled();
+    if (!nvidia_active) ImGui::EndDisabled();
 
     DXGI_SWAP_CHAIN_DESC scDesc{};
     swap_chain->GetDesc(&scDesc);
@@ -1116,9 +1136,13 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     const auto& diag = upscaler.getDiagnostics();
     if (backend_active) {
+        const char* backendName = amd_active ? "AMD" : "NVIDIA";
+        const char* techName = amd_active
+            ? (isSr ? "FSR Super Resolution" : "FSR Native AA")
+            : (isSr ? "DLSS Super Resolution" : "DLAA");
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-            "Reconstruction: NVIDIA %s Active",
-            isSr ? "DLSS Super Resolution" : "DLAA");
+            "Reconstruction: %s %s Active",
+            backendName, techName);
         ImGui::Text("Resolution: Scene %ux%u -> Output %ux%u (%.1f%%)",
             sceneW, sceneH, outW, outH, activeScalePct);
         ImGui::Text("Active Mode: %ls",
@@ -1128,7 +1152,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 "Scaling is automatically driven by game Supersampling (< 1.0x).");
         } else {
             ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
-                "Native 1:1 render detected -> DLAA antialiasing active.");
+                "Native 1:1 render detected -> %s antialiasing active.",
+                amd_active ? "FSR Native AA" : "DLAA");
         }
     } else {
         ImGui::Text("Reconstruction: Inactive (Scene %ux%u -> Output %ux%u)",
@@ -1142,15 +1167,15 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     // Comparison Screenshot Button
     ImGui::Separator();
-    ImGui::TextUnformatted("DLAA / DLSS Screenshot Comparison");
+    ImGui::TextUnformatted("Reconstruction Screenshot Comparison");
     const bool can_compare = backend_active && upscaler.isReconstructionActive();
     if (!can_compare) ImGui::BeginDisabled();
-    if (ImGui::Button("Capture Before & After DLAA/DLSS (2x BMP)")) {
+    if (ImGui::Button("Capture Before & After Reconstruction (2x BMP)")) {
         ContextCensusRequestComparisonCapture();
     }
     if (!can_compare) {
         ImGui::EndDisabled();
-        ImGui::TextDisabled("Enable DLSS or DLAA to capture comparison");
+        ImGui::TextDisabled("Enable DLSS, DLAA or FSR to capture comparison");
     } else if (ContextCensusIsComparisonCapturePending()) {
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Comparison capture queued for next frame...");
     } else if (ui.last_comparison_saved[0] != L'\0') {
@@ -1161,9 +1186,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::TextDisabled("NVIDIA DLSS/DLAA reason: %ls",
             upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
     }
+    if (!amd_available) {
+        ImGui::TextDisabled("AMD FSR reason: %ls",
+            upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::AmdFsr));
+    }
     ImGui::BeginDisabled();
-    ImGui::Text("AMD FSR: %ls",
-        upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::AmdFsr));
     ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
     ImGui::EndDisabled();
     const bool sequence_available = ContextCensusBindSequenceAvailable();

@@ -12,6 +12,13 @@ else()
     set(EDPE_HAVE_NGX FALSE)
 endif()
 
+set(FFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/ffx-dx11")
+if(EXISTS "${FFX_SDK_DIR}/include/FidelityFX/host/ffx_fsr3upscaler.h")
+    set(EDPE_HAVE_FSR TRUE)
+else()
+    set(EDPE_HAVE_FSR FALSE)
+endif()
+
 add_library(EDPE SHARED src/dllmain.cpp src/log.cpp src/d3d11_proxy.cpp src/d3d11_proxy.def)
 target_compile_features(EDPE PRIVATE cxx_std_20)
 target_compile_definitions(EDPE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -44,6 +51,14 @@ if(EDPE_HAVE_NGX)
             "${NGX_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$<TARGET_FILE_DIR:EDPE_DXGI>/")
 endif()
 
+if(EDPE_HAVE_FSR)
+    target_include_directories(EDPE_DXGI PRIVATE "${FFX_SDK_DIR}/include")
+    target_compile_definitions(EDPE_DXGI PRIVATE EDPE_ENABLE_FSR=1)
+    target_link_libraries(EDPE_DXGI PRIVATE
+        "${FFX_SDK_DIR}/lib/ffx_fsr3upscaler_x64.lib"
+        "${FFX_SDK_DIR}/lib/ffx_backend_dx11_x64.lib")
+endif()
+
 enable_testing()
 add_executable(temporal_math_test tests/temporal_math.cpp)
 target_compile_features(temporal_math_test PRIVATE cxx_std_20)
@@ -67,6 +82,13 @@ if(EDPE_HAVE_NGX)
     target_link_libraries(temporal_inputs_test PRIVATE
         "$<IF:$<CONFIG:Debug>,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib>"
         version)
+endif()
+if(EDPE_HAVE_FSR)
+    target_include_directories(temporal_inputs_test PRIVATE "${FFX_SDK_DIR}/include")
+    target_compile_definitions(temporal_inputs_test PRIVATE EDPE_ENABLE_FSR=1)
+    target_link_libraries(temporal_inputs_test PRIVATE
+        "${FFX_SDK_DIR}/lib/ffx_fsr3upscaler_x64.lib"
+        "${FFX_SDK_DIR}/lib/ffx_backend_dx11_x64.lib")
 endif()
 add_test(NAME temporal_inputs COMMAND temporal_inputs_test)
 add_executable(motion_gpu_test tests/motion_gpu.cpp src/motion_pass.cpp)
