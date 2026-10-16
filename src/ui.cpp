@@ -992,7 +992,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::NewFrame();
     bool window_open = true;
     ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced", &window_open);
-    ImGui::TextUnformatted("Version: unreleased");
+    ImGui::Text("Version: %s", edpe::kVersion);
     ImGui::TextUnformatted("Rendering: original game output");
     auto& upscaler = edpe::UpscalerManager::instance();
     const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);

@@ -7,6 +7,8 @@
 
 namespace edpe {
 
+inline constexpr const char* kVersion = "v0.1.0";
+
 class Config {
 public:
     static Config& instance() {
