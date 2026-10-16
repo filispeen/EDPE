@@ -47,6 +47,42 @@ inline bool cameraDepthMotion(const CameraProjection& now, const CameraProjectio
     return true;
 }
 
+// Current-to-previous rotational motion for skybox/stars at infinity, +Y downward.
+// Pixel coordinates name pixel centres by integer index; jitter is excluded.
+inline bool cameraSkyboxMotion(const CameraProjection& now, const CameraProjection& previous,
+    unsigned width, unsigned height, float pixelX, float pixelY,
+    float* motionX, float* motionY) {
+    if (!motionX || !motionY || !width || !height ||
+        !(now.scaleX > 0.0f && now.scaleY > 0.0f &&
+          previous.scaleX > 0.0f && previous.scaleY > 0.0f) ||
+        !std::isfinite(pixelX) || !std::isfinite(pixelY)) return false;
+
+    const double ndcX = 2.0 * (pixelX + 0.5) / width - 1.0;
+    const double ndcY = 1.0 - 2.0 * (pixelY + 0.5) / height;
+    const double vx = ndcX / now.scaleX;
+    const double vy = ndcY / now.scaleY;
+    constexpr double vz = 1.0;
+
+    const auto* n = now.worldFromView;
+    const double wx = n[0] * vx + n[1] * vy + n[2] * vz;
+    const double wy = n[4] * vx + n[5] * vy + n[6] * vz;
+    const double wz = n[8] * vx + n[9] * vy + n[10] * vz;
+
+    const auto* p = previous.worldFromView;
+    const double px = p[0] * wx + p[4] * wy + p[8] * wz;
+    const double py = p[1] * wx + p[5] * wy + p[9] * wz;
+    const double pz = p[2] * wx + p[6] * wy + p[10] * wz;
+
+    if (!(pz > 0.0) || !std::isfinite(pz)) return false;
+
+    const double dx = (previous.scaleX * px / pz + 1.0) * width * 0.5 - 0.5 - pixelX;
+    const double dy = (1.0 - previous.scaleY * py / pz) * height * 0.5 - 0.5 - pixelY;
+    if (!std::isfinite(dx) || !std::isfinite(dy)) return false;
+    *motionX = static_cast<float>(dx);
+    *motionY = static_cast<float>(dy);
+    return true;
+}
+
 struct ProjectionJitter {
     float pixelX, pixelY;
     float ndcX, ndcY;

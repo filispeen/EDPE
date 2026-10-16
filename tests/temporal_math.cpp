@@ -35,6 +35,16 @@ int main() {
     if (edpe::cameraDepthMotion(now, previous, 100, 100, 49.5f, 49.5f, 0, &dx, &dy)) return 5;
     if (edpe::cameraDepthMotion(now, previous, 0, 100, 49.5f, 49.5f, depth, &dx, &dy)) return 6;
 
+    // Skybox / infinity motion tests:
+    auto trans_only = previous;
+    trans_only.worldFromView[3] = 100.0f;
+    trans_only.worldFromView[7] = -50.0f;
+    if (!edpe::cameraSkyboxMotion(trans_only, previous, 100, 100, 49.5f, 49.5f, &dx, &dy) ||
+        std::fabs(dx) >= 0.0001f || std::fabs(dy) >= 0.0001f) return 101;
+
+    if (!edpe::cameraSkyboxMotion(now, previous, 100, 100, 49.5f, 49.5f, &dx, &dy) ||
+        std::fabs(dx - 50.0f * std::tan(angle)) >= 0.0001f) return 102;
+
     // Rounded fields from a user-confirmed Odyssey 332841 scene capture.
     std::array<float, 1344> scene{};
     const float rows[]{-.965338f, -.0708149f, -.251214f, 19.5594f,

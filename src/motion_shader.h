@@ -23,10 +23,36 @@ float4 vs(uint id : SV_VertexID) : SV_POSITION {
 float2 reproject(float4 pixel, float4 current0, float4 current1,
     float4 current2, float4 prior0, float4 prior1, float4 prior2,
     float4 projection, float depthB) {
+    if (info.y <= 0 || info.z <= 0 || projection.x <= 0 || projection.y <= 0) return 0;
     float depth = sceneDepth.Load(int3(int2(pixel.xy), 0));
-    if (depth <= 0 || depth > 1) return 0;
+
+    // 1. Skybox, distant stars, nebula, celestial background, and star bloom:
+    // When depth <= 0.0 or depth > 1.0 (reversed-Z clear/invalid) or at extreme
+    // astronomical distance (z >= 50,000m, rawDepth < depthB / 50000.0),
+    // translation is negligible (T / infinity = 0). Pure analytical ray rotation
+    // prevents star erasure, eliminates float32 precision loss, and perfectly matches
+    // star glow/bloom with the star body.
+    float celestialDepthThresh = (depthB > 0.0) ? (depthB / 50000.0) : 1e-6;
+    if (depth <= 0.0 || depth > 1.0 || depth < celestialDepthThresh) {
+        float2 ndc = float2(2.0 * pixel.x / info.y - 1.0, 1.0 - 2.0 * pixel.y / info.z);
+        float3 viewRay = float3(ndc.x / projection.x, ndc.y / projection.y, 1.0);
+        float3 worldRay = float3(dot(current0.xyz, viewRay),
+                                 dot(current1.xyz, viewRay),
+                                 dot(current2.xyz, viewRay));
+        float3 priorRay = float3(prior0.x * worldRay.x + prior1.x * worldRay.y + prior2.x * worldRay.z,
+                                 prior0.y * worldRay.x + prior1.y * worldRay.y + prior2.y * worldRay.z,
+                                 prior0.z * worldRay.x + prior1.z * worldRay.y + prior2.z * worldRay.z);
+        if (priorRay.z <= 0.0) return 0.0;
+        float2 priorNdc = projection.zw * priorRay.xy / priorRay.z;
+        float2 priorPixel = float2((priorNdc.x + 1.0) * info.y * 0.5,
+                                   (1.0 - priorNdc.y) * info.z * 0.5);
+        return priorPixel - pixel.xy;
+    }
+
+    // 2. Dynamic world geometry (space stations, ships, asteroids, terrain):
+    // Standard camera-depth reprojection including both camera translation and rotation.
     float z = depthB / depth;
-    float2 ndc = float2(2 * pixel.x / info.y - 1, 1 - 2 * pixel.y / info.z);
+    float2 ndc = float2(2.0 * pixel.x / info.y - 1.0, 1.0 - 2.0 * pixel.y / info.z);
     float3 view = float3(ndc.x * z / projection.x, ndc.y * z / projection.y, z);
     float3 world = float3(dot(current0.xyz, view) + current0.w,
                           dot(current1.xyz, view) + current1.w,
@@ -35,10 +61,10 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
     float3 prior = float3(prior0.x * world.x + prior1.x * world.y + prior2.x * world.z,
                           prior0.y * world.x + prior1.y * world.y + prior2.y * world.z,
                           prior0.z * world.x + prior1.z * world.y + prior2.z * world.z);
-    if (prior.z <= 0) return 0;
+    if (prior.z <= 0.0) return 0.0;
     float2 priorNdc = projection.zw * prior.xy / prior.z;
-    float2 priorPixel = float2((priorNdc.x + 1) * info.y * 0.5,
-                               (1 - priorNdc.y) * info.z * 0.5);
+    float2 priorPixel = float2((priorNdc.x + 1.0) * info.y * 0.5,
+                               (1.0 - priorNdc.y) * info.z * 0.5);
     return priorPixel - pixel.xy;
 }
 
