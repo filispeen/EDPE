@@ -2,8 +2,8 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-v0.2.1-blue.svg)](STATUS.md)
-[![Status](https://img.shields.io/badge/status-DLAA%20%26%20DLSS%20Verified%20In--Game-success.svg)](STATUS.md)
+[![Version](https://img.shields.io/badge/version-v0.3.5-blue.svg)](STATUS.md)
+[![Status](https://img.shields.io/badge/status-FSR%20%26%20DLSS%20Verified%20In--Game-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
 [![Tests](https://img.shields.io/badge/tests-10%2F10%20Passing-brightgreen.svg)]()
 
@@ -15,9 +15,9 @@ Elite Dangerous natively lacks modern temporal reconstruction technologies in it
 
 ---
 
-## Current Status: Milestone `v0.2.1` (NVIDIA DLAA & DLSS Super Resolution Verified In-Game)
+## Current Status: Milestone `v0.3.5` (AMD FSR 3.1.2 & NVIDIA DLSS Verified In-Game)
 
-As of **October 2026 (`v0.2.1`)**, EDPE has achieved:
+As of **October 2026 (`v0.3.5`)**, EDPE has achieved:
 
 * **Non-invasive D3D11 / DXGI Proxy:** Hooks device creation and swapchain presentation without black screens, crashes, or rendering artifacts.
 * **Scene Depth Discovery:** Successfully isolated authoritative reversed-Z scene depth buffer (`DSV #2`, `DXGI_FORMAT_R32G8X24_TYPELESS`, $B=0.025$).

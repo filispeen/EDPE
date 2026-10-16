@@ -8,7 +8,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Repository
 
-- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling, comparison screenshots)
+- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling), `v0.3.5` (verified in-game AMD FSR 3.1.2 Native AA & SR, Performance HUD, input leak isolation)
 - **Build artifacts:** `EDPE.dll`, `dxgi.dll`, and `d3d11.dll` deployed beside `EliteDangerous64.exe`; staged in `build/stage/`
 - **Source:** `src/` contains 12 C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, etc.); `tools/` contains standalone NGX probe
 - **Test suite:** 10 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `dxbc_fanout`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
