@@ -13,9 +13,12 @@ Primary planned technologies:
 ```text
 NVIDIA DLAA
 NVIDIA DLSS Super Resolution
+NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)
 
 AMD FSR Native AA
 AMD FSR Super Resolution
+
+Native D3D11 TAA
 
 Experimental later phases:
 NVIDIA DLSS Frame Generation

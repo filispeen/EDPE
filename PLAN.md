@@ -8,7 +8,9 @@ The initial focus is temporal upscaling and anti-aliasing:
 
 * NVIDIA DLSS Super Resolution;
 * NVIDIA DLAA;
+* NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising);
 * AMD FSR temporal upscaling / Native AA;
+* native D3D11 TAA;
 * vendor-neutral reconstruction infrastructure.
 
 The architecture must also leave a clean path for later experimental Frame Generation support:
@@ -1644,7 +1646,38 @@ MFG multiplier
 
 ---
 
-# 36. Frame pacing
+# 36. Phase 16 — NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)
+
+Investigate and prototype NVIDIA DLSS Ray Reconstruction / Neural Radiance Denoiser (DLSS-NR / DLSS-RR) support via NVIDIA NGX (`NVSDK_NGX_Feature_RayReconstruction`) or Streamline (`SL_FEATURE_DLSS_RR`).
+
+DLSS-NR replaces traditional handcrafted temporal/spatial denoisers by feeding noisy diffuse/specular signals into an AI neural model that reconstructs higher-quality lighting, specular reflections, and ambient occlusion while simultaneously performing temporal super-resolution.
+
+Required investigation and inputs:
+
+```text
+Cobra G-Buffer surface normals (world or view space)
+Cobra G-Buffer roughness / specular material parameters
+Noisy radiance render targets (SSR reflections / ambient lighting)
+Scene depth (DSV #2 reversed-Z)
+Screen-space motion vectors
+Subpixel projection jitter
+Camera matrices and exposure
+```
+
+Goals:
+
+1. **G-Buffer Discovery in Cobra:**
+   Identify and isolate render-target binds containing view/world normals and surface roughness during the deferred G-Buffer lighting pass.
+2. **NGX Ray Reconstruction Dispatch:**
+   Initialize and dispatch `NVSDK_NGX_D3D11_CreateFeature` with `NVSDK_NGX_Feature_RayReconstruction` (or through the D3D12/Streamline bridge).
+3. **Fail-Open Fallback:**
+   If normal/roughness buffers are unavailable or if the active GPU lacks required Tensor Core capabilities, safely fall back to standard DLSS Super Resolution or DLAA.
+4. **Validation:**
+   Verify elimination of reflection smearing, ghosting, and noise on cockpit canopies, planetary ice/water surfaces, and station interior metallic structures.
+
+---
+
+# 37. Frame pacing
 
 Frame Generation requires its own diagnostics.
 
@@ -1667,7 +1700,7 @@ A generated frame is not a new simulation frame.
 
 ---
 
-# 37. Latency controls
+# 38. Latency controls
 
 FG must be paired with vendor-appropriate latency handling.
 
@@ -1696,7 +1729,7 @@ status fields.
 
 ---
 
-# 38. Runtime compatibility matrix
+# 39. Runtime compatibility matrix
 
 EDPE should construct capability state dynamically.
 
@@ -1705,6 +1738,7 @@ Example:
 ```text
 NVIDIA DLSS SR       Available
 NVIDIA DLAA          Available
+NVIDIA DLSS-NR       Experimental / Capability-gated
 AMD FSR              Available
 NVIDIA Frame Gen     Unavailable: D3D12 bridge disabled
 AMD Frame Gen        Experimental
@@ -1718,7 +1752,7 @@ Explain the reason in Dear ImGui.
 
 ---
 
-# 39. Diagnostics
+# 40. Diagnostics
 
 Log:
 
@@ -1760,7 +1794,7 @@ Never block the render thread waiting for GPU queries.
 
 ---
 
-# 40. Failure behavior
+# 41. Failure behavior
 
 Every feature must fail open.
 
@@ -1786,7 +1820,7 @@ Do not black-screen the game because a vendor SDK rejects an input.
 
 ---
 
-# 41. Performance rules
+# 42. Performance rules
 
 Avoid:
 
@@ -1815,14 +1849,14 @@ stable backend contexts
 
 ---
 
-# 42. Scope exclusions for initial versions
+# 43. Scope exclusions for initial versions
 
 Not initial-release requirements:
 
 ```text
 Frame Generation
 Multi Frame Generation
-Ray Reconstruction
+Ray Reconstruction (DLSS-NR)
 Ray Regeneration
 Vulkan game renderer
 gameplay modifications
@@ -1830,13 +1864,13 @@ network modifications
 anti-cheat bypassing
 ```
 
-Unlike the previous plan, **Frame Generation is no longer excluded from the overall EDPE roadmap**.
+Unlike earlier development revisions, **Frame Generation and DLSS-NR (Ray Reconstruction) are no longer excluded from the overall EDPE roadmap**.
 
-It is an explicitly planned experimental later phase.
+They are explicitly planned experimental later phases (Phases 13–16).
 
 ---
 
-# 43. Development philosophy
+# 44. Development philosophy
 
 Every significant graphics claim must be labelled:
 
@@ -1869,7 +1903,7 @@ guess
 
 ---
 
-# 44. Initial serious milestone
+# 45. Initial serious milestone
 
 First major temporal milestone:
 
@@ -1889,7 +1923,7 @@ Elite Dangerous 2D
 
 ---
 
-# 45. Multi-upscaler milestone
+# 46. Multi-upscaler milestone
 
 Next major target:
 
@@ -1915,7 +1949,7 @@ It is a **vendor-neutral Elite Dangerous temporal reconstruction framework**.
 
 ---
 
-# 46. Frame Generation milestone
+# 47. Frame Generation milestone
 
 Only after:
 
@@ -1949,7 +1983,7 @@ capability detection
 
 ---
 
-# 47. Final target
+# 48. Final target
 
 A mature EDPE UI may look approximately like:
 

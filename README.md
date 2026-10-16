@@ -54,6 +54,7 @@ As of **October 2026 (`v0.4.0`)**, EDPE has achieved:
 | **11** | **AMD FSR Super Resolution & Native AA** | ✅ **Verified** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated and verified in-game; supports FSR Native AA & FSR Super Resolution with fail-open fallback. |
 | **12** | **Native-Resolution HUD Separation** | 🟢 **Operational** | Native-res HUD composited over upscaled DLSS/FSR 3D scene (`UiCompositePass`), protecting cockpit/UI crispness. |
 | **13–15** | **D3D11/D3D12 Interop & Frame Generation** | 🔬 **Research** | NVIDIA DLSS Frame Generation (Streamline) & AMD FSR Frame Generation via interop bridge. |
+| **16** | **NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)** | 🔬 **Research** | AI-driven Ray Reconstruction / neural denoising replacing hand-tuned temporal filters for reflections and lighting via NGX Ray Reconstruction. |
 
 See [STATUS.md](STATUS.md) for verified facts and [PLAN.md](PLAN.md) for the complete roadmap.
 

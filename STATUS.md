@@ -35,6 +35,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
+| 16. NVIDIA DLSS-NR | **Not started** | Research phase for G-buffer normal/roughness extraction and NGX Ray Reconstruction / neural denoising integration. |
 
 ---
 
