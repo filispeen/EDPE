@@ -4,6 +4,9 @@
 *.log
 .*/
 .*
+!.github/
+!.github/**
+!.gitignore
 /external/
 CODER_PROMPT.md
 ngx_probe_log.txt
