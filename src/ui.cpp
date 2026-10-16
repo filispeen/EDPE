@@ -131,6 +131,8 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         if (new_visible) {
             ClipCursor(nullptr);
             while (ShowCursor(TRUE) < 0) {}
+        } else {
+            while (ShowCursor(FALSE) >= 0) {}
         }
         return true;
     }
@@ -877,7 +879,8 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     ui.imgui = ImGui::CreateContext();
     if (!ui.imgui) return false;
     ImGui::GetIO().IniFilename = nullptr;
-    ImGui::GetIO().MouseDrawCursor = true;
+    ImGui::GetIO().MouseDrawCursor = false;
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     const bool win32_ready = ImGui_ImplWin32_Init(ui.window);
     const bool dx11_ready = win32_ready && ImGui_ImplDX11_Init(ui.device, ui.context);
     ImGui::SetCurrentContext(previous);
@@ -1082,6 +1085,13 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::SetCurrentContext(ui.imgui);
 
     const bool draw_menu = show_menu && !comparison_pending;
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = draw_menu;
+    if (draw_menu) {
+        io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+    } else {
+        io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    }
     if (draw_menu) {
         std::lock_guard lock(input_mutex);
         pending_input.swap(render_input);
@@ -1559,7 +1569,10 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::End();
     }
     } // if (draw_menu)
-    if (draw_menu && !window_open) menu_visible.store(false);
+    if (draw_menu && !window_open) {
+        menu_visible.store(false);
+        while (ShowCursor(FALSE) >= 0) {}
+    }
     ImGui::Render();
 
     ID3D11RenderTargetView* previous_rtv = nullptr;

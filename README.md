@@ -2,8 +2,8 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-v0.4.4-blue.svg)](STATUS.md)
-[![Status](https://img.shields.io/badge/status-Skybox%20%26%20Bloom%20Reprojection%20Verified-success.svg)](STATUS.md)
+[![Version](https://img.shields.io/badge/version-v0.4.6-blue.svg)](STATUS.md)
+[![Status](https://img.shields.io/badge/status-Canopy%20Reflection%20Filtered%20%26%20Cursor%20Isolated-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
 [![Tests](https://img.shields.io/badge/tests-10%2F10%20Passing-brightgreen.svg)]()
 
@@ -15,9 +15,9 @@ Elite Dangerous natively lacks modern temporal reconstruction technologies in it
 
 ---
 
-## Current Status: Milestone `v0.4.4` (Skybox Rotational Motion, Star Bloom Stability & Multi-Upscaler Tuning)
+## Current Status: Milestone `v0.4.6` (Canopy Reflection Filter, TAA Station Stabilization & Perf HUD Cursor Isolation)
 
-As of **October 2026 (`v0.4.4`)**, EDPE has achieved:
+As of **October 2026 (`v0.4.6`)**, EDPE has achieved:
 
 * **Non-invasive D3D11 / DXGI Proxy:** Hooks device creation and swapchain presentation without black screens, crashes, or rendering artifacts.
 * **Scene Depth Discovery:** Successfully isolated authoritative reversed-Z scene depth buffer (`DSV #2`, `DXGI_FORMAT_R32G8X24_TYPELESS`, $B=0.025$).
