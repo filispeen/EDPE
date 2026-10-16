@@ -218,33 +218,20 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
 
     if (ImGui::Begin("##EDPE_PerfOverlay", nullptr, window_flags)) {
         if (isMenuOpen) {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.45f, 0.85f, 0.65f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.55f, 0.95f, 0.85f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.4f, 0.65f, 1.0f, 1.0f));
-            ImGui::Button(":: [Drag to Move HUD] ::", ImVec2(-1.0f, 0.0f));
-            if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
-                const ImVec2 delta = ImGui::GetIO().MouseDelta;
-                ImVec2 pos = ImGui::GetWindowPos();
-                pos.x += delta.x;
-                pos.y += delta.y;
-                ImGui::SetWindowPos(pos);
-                cfg.perfOverlayPosX = pos.x;
-                cfg.perfOverlayPosY = pos.y;
-                cfg.save();
+            const ImVec2 curPos = ImGui::GetWindowPos();
+            if ((ImGui::IsWindowHovered() || ImGui::IsWindowFocused()) && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                if (std::fabs(curPos.x - cfg.perfOverlayPosX) > 0.5f || std::fabs(curPos.y - cfg.perfOverlayPosY) > 0.5f) {
+                    cfg.perfOverlayPosX = curPos.x;
+                    cfg.perfOverlayPosY = curPos.y;
+                    cfg.save();
+                }
+            } else if (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f) {
+                if (std::fabs(curPos.x - cfg.perfOverlayPosX) > 0.5f || std::fabs(curPos.y - cfg.perfOverlayPosY) > 0.5f) {
+                    cfg.perfOverlayPosX = curPos.x;
+                    cfg.perfOverlayPosY = curPos.y;
+                    cfg.save();
+                }
             }
-            ImGui::PopStyleColor(3);
-            ImGui::Separator();
-        }
-
-        if (isMenuOpen && ImGui::IsWindowHovered() && ImGui::IsMouseDragging(0) && !ImGui::IsAnyItemActive()) {
-            const ImVec2 delta = ImGui::GetIO().MouseDelta;
-            ImVec2 pos = ImGui::GetWindowPos();
-            pos.x += delta.x;
-            pos.y += delta.y;
-            ImGui::SetWindowPos(pos);
-            cfg.perfOverlayPosX = pos.x;
-            cfg.perfOverlayPosY = pos.y;
-            cfg.save();
         }
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "EDPE Performance HUD");
         ImGui::Separator();

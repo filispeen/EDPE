@@ -6,6 +6,8 @@
 #include "capture_format.h"
 #include "config.h"
 #include "perf_overlay.h"
+#include "input_hook.h"
+
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -119,8 +121,9 @@ bool isInputMessage(UINT message) {
     if (message >= WM_KEYFIRST && message <= WM_KEYLAST) return true;
     return message == WM_INPUT;
 }
+} // namespace
 
-LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
         wparam == VK_F5 && !(lparam & (1LL << 30))) {
         const bool new_visible = !menu_visible.load();
@@ -129,26 +132,26 @@ LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             ClipCursor(nullptr);
             while (ShowCursor(TRUE) < 0) {}
         }
-        return 0;
+        return true;
     }
-    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F5) return 0;
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F5) return true;
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
         wparam == VK_F7 && !(lparam & (1LL << 30))) {
         auto& cfg = edpe::Config::instance();
         cfg.showPerfOverlay = !cfg.showPerfOverlay;
         cfg.save();
         EdpeLog(cfg.showPerfOverlay ? L"EDPE: F7 pressed — Performance HUD enabled" : L"EDPE: F7 pressed — Performance HUD disabled");
-        return 0;
+        return true;
     }
-    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F7) return 0;
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F7) return true;
     if (menu_visible.load()) {
-        if (message == WM_INPUT) return 0;
+        if (message == WM_INPUT) return true;
         if (message == WM_SETCURSOR) {
             SetCursor(LoadCursor(nullptr, IDC_ARROW));
-            return TRUE;
+            return true;
         }
         if (message == WM_MOUSEACTIVATE) {
-            return MA_ACTIVATE;
+            return true;
         }
         if (isInputMessage(message)) {
             std::lock_guard lock(input_mutex);
@@ -160,8 +163,18 @@ LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 if (pending_input.size() == 256) pending_input.erase(pending_input.begin());
                 pending_input.push_back(input);
             }
-            return 0;
+            return true;
         }
+    }
+    return false;
+}
+
+namespace {
+LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (UiProcessInput(window, message, wparam, lparam)) {
+        if (message == WM_SETCURSOR) return TRUE;
+        if (message == WM_MOUSEACTIVATE) return MA_ACTIVATE;
+        return 0;
     }
     return ui.original_wndproc ? CallWindowProcW(ui.original_wndproc, window, message, wparam, lparam)
                                : DefWindowProcW(window, message, wparam, lparam);
@@ -905,6 +918,7 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     if (context1) context1->Release();
     if (device1) device1->Release();
     edpe::UpscalerManager::instance().initialize(ui.device, ui.context);
+    edpe::installInputHooks();
     {
         auto& cfg = edpe::Config::instance();
         cfg.load();
