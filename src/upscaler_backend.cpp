@@ -506,9 +506,22 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         motionSrv = localMotionSrv.Get();
     }
 
+    // Resolve depth SRV
+    ID3D11ShaderResourceView* depthSrv = inputs.depthSrv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> localDepthSrv;
+    if (!depthSrv && inputs.depth) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(inputs.depth, &srvDesc, &localDepthSrv);
+        depthSrv = localDepthSrv.Get();
+    }
+
     return pass_.render(context,
         colorSrv,
         motionSrv,
+        depthSrv,
         destinationRtv,
         destinationTexture,
         inputs.outputWidth,

@@ -18,6 +18,7 @@ public:
     bool render(ID3D11DeviceContext* context,
         ID3D11ShaderResourceView* currentFrameSrv,
         ID3D11ShaderResourceView* motionVectorsSrv,
+        ID3D11ShaderResourceView* depthSrv,
         ID3D11RenderTargetView* destinationRtv,
         ID3D11Texture2D* destinationTexture,
         uint32_t width,

@@ -147,6 +147,7 @@ bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT forma
 bool TaaPass::render(ID3D11DeviceContext* context,
     ID3D11ShaderResourceView* currentFrameSrv,
     ID3D11ShaderResourceView* motionVectorsSrv,
+    ID3D11ShaderResourceView* depthSrv,
     ID3D11RenderTargetView* destinationRtv,
     ID3D11Texture2D* destinationTexture,
     uint32_t width,
@@ -202,8 +203,8 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     context->VSSetShader(vertexShader_.Get(), nullptr, 0);
     context->PSSetShader(pixelShader_.Get(), nullptr, 0);
 
-    ID3D11ShaderResourceView* srvs[3] = { currentFrameSrv, historySrv_.Get(), motionVectorsSrv };
-    context->PSSetShaderResources(0, 3, srvs);
+    ID3D11ShaderResourceView* srvs[4] = { currentFrameSrv, historySrv_.Get(), motionVectorsSrv, depthSrv };
+    context->PSSetShaderResources(0, 4, srvs);
 
     ID3D11SamplerState* samplers[2] = { linearSampler_.Get(), pointSampler_.Get() };
     context->PSSetSamplers(0, 2, samplers);
@@ -214,8 +215,8 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     context->Draw(3, 0);
 
     // Unbind resources before copy to prevent pipeline hazards
-    ID3D11ShaderResourceView* nullSrvs[3] = { nullptr, nullptr, nullptr };
-    context->PSSetShaderResources(0, 3, nullSrvs);
+    ID3D11ShaderResourceView* nullSrvs[4] = { nullptr, nullptr, nullptr, nullptr };
+    context->PSSetShaderResources(0, 4, nullSrvs);
     ID3D11RenderTargetView* nullRtv = nullptr;
     context->OMSetRenderTargets(1, &nullRtv, nullptr);
 
