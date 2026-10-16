@@ -8,7 +8,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Repository
 
-- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.1.3` (DLSS SR, native UI protection, auto render scaling, comparison screenshots)
+- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling, comparison screenshots)
 - **Build artifacts:** `EDPE.dll`, `dxgi.dll`, and `d3d11.dll` deployed beside `EliteDangerous64.exe`; staged in `build/stage/`
 - **Source:** `src/` contains 12 C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, etc.); `tools/` contains standalone NGX probe
 - **Test suite:** 10 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `dxbc_fanout`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
@@ -28,10 +28,10 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 6. Motion vectors | **Verified in-game (flight motion)** | GPU motion pass renders to `DXGI_FORMAT_R16G16_FLOAT`. In-game flight capture confirmed 64.8% horizontal and 63.5% vertical active motion across frame, matching reversed-Z depth and camera motion. |
 | 7. Shared temporal input layer | **Implemented & verified** | Vendor-neutral `TemporalFrameInputs` handoff, `IUpscalerBackend`, and `UpscalerManager` coordinator implemented and unit-tested. |
 | 8. NVIDIA DLAA | **Verified & working in-game** | Official NVIDIA NGX SDK linked. `NgxContext` evaluates DLAA at native 2560×1440 (`MVLowRes | DepthInverted`, Preset K, LDR mode) on the finished swapchain backbuffer at `Present` before ImGui overlay rendering. Verified in-game: clean, rock-solid temporal anti-aliasing (~0.3 ms GPU time) with zero image vibration. |
-| 9. NVIDIA DLSS Super Resolution | **Implemented; ready for in-game test** | `NgxContext` and `NvidiaUpscalerBackend` support `NativeAA`, `Quality` (66.7%), `Balanced` (58.0%), `Performance` (50.0%), and `Ultra Performance` (33.3%), `NGX_DLSS_GET_OPTIMAL_SETTINGS` range validation, and DLSS presets (`Auto`, `J`, `K`, `L`, `M`). Reconstructs low-res LDR scene target (`scene_ldr_source`) + low-res depth/motion/jitter into native 2560×1440 backbuffer. |
-| 10. True render-scale control | **Implemented; ready for in-game test** | Uses Cobra's native `<SSAAMultiplier>` (`Custom.4.4.fxcfg` auto-sync at startup + live in-game `Supersampling` 0.50x–0.85x). Tracks `scene_depth_source` and post-tonemap `scene_ldr_source` at true lower render resolution (`render < output`) and scales Halton jitter NDC offsets and phase count `(output/render)^2`. |
+| 9. NVIDIA DLSS Super Resolution | **Verified & working in-game** | `NgxContext` and `NvidiaUpscalerBackend` reconstruct low-res LDR scene target (`scene_ldr_source`) into native backbuffer with verified temporal inputs and presets (`Auto`, `J`, `K`, `L`, `M`). Reconstructed 3D world is composited under native-resolution HUD. |
+| 10. True render-scale control | **Verified & working in-game** | Cobra's native Supersampling (SSAA < 1.0x) delivers true rendering workload reduction. Automatically detected via scene depth dimensions with zero manual configuration. |
 | 11. AMD FSR upscaling | **Interface ready; backend pending** | `AmdUpscalerBackend` abstraction implemented in `src/upscaler_backend.h/.cpp`. FidelityFX integration pending backend architecture selection. |
-| 12. Native-resolution HUD | **Candidate site identified; separation pending for SR/FG** | HUD shader pair (VS `0xB7790CBFC6554097`, PS `0x8DEF46452FA459F5`) identified. Full native-res HUD composition over upscaled low-res world is the next enhancement after verifying DLSS SR in-game. |
+| 12. Native-resolution HUD | **Operational for DLSS SR** | `UiCompositePass` composites native-resolution UI/cockpit elements from pre-upscale backbuffer copy over reconstructed DLSS frames. Reactive mask generation planned for fine holographic elements. |
 | 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
