@@ -119,7 +119,6 @@ EDPE enforces a strict separation: Elite-specific engine reverse-engineering bel
 | Hotkey | Action | Description |
 |:---:|:---|:---|
 | **`F5`** | **Toggle EDPE Menu** | Opens/closes the Dear ImGui control panel. When closed, all mouse and keyboard inputs pass freely to the game. |
-| **`F6`** | **One-Shot Synchronized Capture** | Captures all 5 rendering buffers from the **exact same frame** without GPU stalling, saving BMPs to `edpe-captures/`. |
 | **`Insert`** | **Game Pass-Through** | Configured to pass transparently to the original game window procedure. |
 
 ### Dear ImGui Control Panel Features
