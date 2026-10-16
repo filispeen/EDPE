@@ -28,6 +28,7 @@ struct NgxFeatureState {
     uint32_t render_height = 0;
     uint32_t output_width = 0;
     uint32_t output_height = 0;
+    bool is_hdr = false;
     bool reset_requested = false;
 };
 
@@ -192,15 +193,19 @@ void NgxContext::set_reset_requested(bool reset) {
     g_ngx_state.reset_requested = reset;
 }
 
-bool NgxContext::ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height) {
+bool NgxContext::ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height, bool isHdr) {
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     if (!g_ngx_state.initialized || !g_ngx_params || !context) return false;
 
-    if (g_dlaa_feature && g_ngx_state.render_width == width && g_ngx_state.render_height == height) {
+    if (g_dlaa_feature && g_ngx_state.render_width == width && g_ngx_state.render_height == height &&
+        g_ngx_state.is_hdr == isHdr) {
         return true;
     }
 
     releaseFeature();
+
+    // Hint DLAA to Preset K (11), matching EDVR's validated DLAA preset.
+    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, 11u);
 
     NVSDK_NGX_DLSS_Create_Params cp{};
     cp.Feature.InWidth = width;
@@ -209,9 +214,11 @@ bool NgxContext::ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width,
     cp.Feature.InTargetHeight = height;
     cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                              NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
-                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
-                              NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+    if (isHdr) {
+        cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
+                                   NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    }
 
     NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &g_dlaa_feature, g_ngx_params, &cp);
     if (r != NVSDK_NGX_Result_Success || !g_dlaa_feature) {
@@ -224,11 +231,13 @@ bool NgxContext::ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width,
     g_ngx_state.render_height = height;
     g_ngx_state.output_width = width;
     g_ngx_state.output_height = height;
-    swprintf_s(g_status_msg, L"NVIDIA DLAA feature active (%ux%u)", width, height);
+    g_ngx_state.is_hdr = isHdr;
+    g_ngx_state.reset_requested = true;
+    swprintf_s(g_status_msg, L"NVIDIA DLAA feature active (%ux%u %ls)", width, height, isHdr ? L"HDR" : L"LDR");
     EdpeLog(g_status_msg);
     return true;
 #else
-    (void)context; (void)width; (void)height;
+    (void)context; (void)width; (void)height; (void)isHdr;
     return false;
 #endif
 }
@@ -257,7 +266,7 @@ bool NgxContext::evaluateDlaa(ID3D11DeviceContext* context,
     uint32_t height) {
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     if (!context || !colorIn || !outputUav || !depthIn || !motionIn) return false;
-    if (!ensureDlaaFeature(context, width, height)) return false;
+    if (!ensureDlaaFeature(context, width, height, params.isHdr)) return false;
 
     NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
     ep.Feature.pInColor = colorIn;

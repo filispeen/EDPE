@@ -143,6 +143,7 @@ struct TemporalFrameInputs {
     // Motion vector format convention: EDPE writes current->previous displacement in render pixels.
     bool motionJittered = false; // EDPE motion excludes subpixel projection jitter
     bool motionIsLowRes = true;  // Motion generated at render resolution
+    bool colorIsHdr = true;      // True for linear HDR scene targets, false for tone-mapped LDR backbuffer
     float motionScaleX = 1.0f;   // Motion scale multiplier (supports sign inversion for debug/tuning)
     float motionScaleY = 1.0f;
 
@@ -221,7 +222,7 @@ inline bool translateToNvidia(const TemporalFrameInputs& inputs,
     // Feature flags:
     outParams->motionLowRes = inputs.motionIsLowRes;
     outParams->motionJittered = inputs.motionJittered;
-    outParams->isHdr = true; // Elite scene HDR
+    outParams->isHdr = inputs.colorIsHdr;
     outParams->inReset = inputs.reset;
     outParams->frameTimeMs = inputs.frameTimeMs;
     return true;

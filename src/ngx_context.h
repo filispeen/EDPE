@@ -81,7 +81,7 @@ public:
     static void set_reset_requested(bool reset);
 
     // Feature lifecycle
-    static bool ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height);
+    static bool ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height, bool isHdr = false);
     static void releaseFeature();
 
     // Evaluation
