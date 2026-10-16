@@ -1,9 +1,13 @@
 # EDPE — Elite Dangerous Performance Enhanced
 
+<div align="center">
+
 [![Version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](STATUS.md)
 [![Status](https://img.shields.io/badge/status-DLAA%20Verified%20In--Game-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-9%2F9%20Passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-10%2F10%20Passing-brightgreen.svg)]()
+
+</div>
 
 **EDPE (Elite Dangerous Performance Enhanced)** is a standalone graphics enhancement proxy mod targeting the **2D Direct3D 11 renderer of Elite Dangerous** (Cobra engine).
 

@@ -9,6 +9,7 @@
 #include "upscaler_backend.h"
 #include "ngx_context.h"
 #include "config.h"
+#include "ui_composite_pass.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -141,6 +142,8 @@ unsigned long long scene_ldr_frame = ~0ull;
 std::array<ID3D11Resource*, 4> s_gbuffer_resources{}; // Weak; compared within current frame only.
 std::atomic<UINT> s_observed_scene_width{0};
 std::atomic<UINT> s_observed_scene_height{0};
+std::atomic<UINT> s_swapchain_width{0};
+std::atomic<UINT> s_swapchain_height{0};
 unsigned long long motion_depth_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
@@ -186,6 +189,7 @@ unsigned hud_draw_rearmed_mask = 0;
 unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
+std::unique_ptr<edpe::UiCompositePass> ui_composite_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
 UINT motion_snapshot_width = 0;
 UINT motion_snapshot_height = 0;
@@ -963,8 +967,24 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             // writes cannot overwrite it.
             edpe::CameraProjection parsed_camera{};
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
-            if (s_camera_frame != cur_frame &&
-                edpe::parseEliteCamera(static_cast<const float*>(mapped_ptr), 5376 / sizeof(float), &parsed_camera)) {
+            const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+            const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+            const float targetAspect = (outW > 0 && outH > 0)
+                ? (static_cast<float>(outW) / static_cast<float>(outH))
+                : (16.0f / 9.0f);
+
+            bool valid_main_camera = false;
+            if (edpe::parseEliteCamera(static_cast<const float*>(mapped_ptr), 5376 / sizeof(float), &parsed_camera)) {
+                if (parsed_camera.depthB >= 0.005f && parsed_camera.depthB <= 0.1f &&
+                    parsed_camera.scaleX > 0.01f && parsed_camera.scaleY > 0.01f) {
+                    const float camAspect = parsed_camera.scaleY / parsed_camera.scaleX;
+                    if (std::fabs(camAspect - targetAspect) <= 0.05f) {
+                        valid_main_camera = true;
+                    }
+                }
+            }
+
+            if (valid_main_camera && s_camera_frame != cur_frame) {
                 s_camera_previous = s_camera_now;
                 s_camera_previous_frame = s_camera_frame;
                 s_camera_now = parsed_camera;
@@ -972,7 +992,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             }
 
             // Phase 5: Projection jitter injection into words 1080..1095
-            if (ContextCensusIsJitterActive()) {
+            // ONLY inject into the main scene camera before scene tone mapping (scene_ldr_frame != cur_frame)
+            if (ContextCensusIsJitterActive() && scene_ldr_frame != cur_frame) {
                 float* words = static_cast<float*>(mapped_ptr);
                 bool valid_projection = true;
                 for (size_t i = 1080; i < 1096; ++i) {
@@ -983,11 +1004,23 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 }
                 if (valid_projection) {
                     const float depthB = words[1094];
-                    if (depthB <= 0.0f || depthB > 1.0f ||
+                    if (depthB < 0.005f || depthB > 0.1f ||
                         std::fabs(words[1092]) > 0.002f ||
                         std::fabs(words[1093]) > 0.002f ||
-                        std::fabs(words[1095]) > 0.002f) {
+                        std::fabs(words[1095]) > 0.002f ||
+                        words[1080] <= 0.01f || words[1085] <= 0.01f) {
                         valid_projection = false;
+                    } else {
+                        const float projAspect = words[1085] / words[1080];
+                        if (std::fabs(projAspect - targetAspect) > 0.05f) {
+                            valid_projection = false;
+                        } else if (s_camera_frame == cur_frame) {
+                            if (std::fabs(words[1080] - s_camera_now.scaleX) > 0.005f ||
+                                std::fabs(words[1085] - s_camera_now.scaleY) > 0.005f ||
+                                std::fabs(words[1094] - s_camera_now.depthB) > 0.005f) {
+                                valid_projection = false;
+                            }
+                        }
                     }
                 }
                 if (valid_projection) {
@@ -2100,11 +2133,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     // NGX needs a shader-readable input that is not also the output, and swap-chain
     // or typeless post-process buffers may fail NGX's internal default SRV creation.
     static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlaa_input;
+    static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlaa_input_srv;
     if (s_dlaa_input) {
         D3D11_TEXTURE2D_DESC cur{};
         s_dlaa_input->GetDesc(&cur);
         if (cur.Width != depthDesc.Width || cur.Height != depthDesc.Height ||
-            cur.Format != inputFormat) s_dlaa_input.Reset();
+            cur.Format != inputFormat) {
+            s_dlaa_input.Reset();
+            s_dlaa_input_srv.Reset();
+        }
     }
     if (!s_dlaa_input) {
         D3D11_TEXTURE2D_DESC inDesc{};
@@ -2116,6 +2153,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         inDesc.Usage = D3D11_USAGE_DEFAULT;
         inDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input))) return;
+        device->CreateShaderResourceView(s_dlaa_input.Get(), nullptr, &s_dlaa_input_srv);
         s_camera_reset = true;
         wchar_t msg[160];
         swprintf_s(msg, L"EDPE: temporal color input created %ux%u format=%u (%ls)",
@@ -2210,8 +2248,103 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.motionIsLowRes = true;
     inputs.colorIsHdr = false; // tone-mapped LDR scene or backbuffer
 
-    if (upscaler.evaluate(context, inputs, nullptr, backbuffer)) {
-        s_camera_reset = false;
+    if (isSubNative) {
+        static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
+        static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
+        static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_backbuffer_copy;
+        static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_backbuffer_copy_srv;
+        static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
+        static ID3D11Texture2D* s_cached_backbuffer_ptr = nullptr;
+
+        const DXGI_FORMAT outFormat = concreteLdrColorFormat(backbufferDesc.Format);
+
+        if (s_dlss_output_texture) {
+            D3D11_TEXTURE2D_DESC cur{};
+            s_dlss_output_texture->GetDesc(&cur);
+            if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height ||
+                cur.Format != outFormat) {
+                s_dlss_output_texture.Reset();
+                s_dlss_output_srv.Reset();
+            }
+        }
+        if (!s_dlss_output_texture) {
+            D3D11_TEXTURE2D_DESC td = backbufferDesc;
+            td.Format = outFormat;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            td.CPUAccessFlags = td.MiscFlags = 0;
+            if (FAILED(device->CreateTexture2D(&td, nullptr, &s_dlss_output_texture)) ||
+                FAILED(device->CreateShaderResourceView(s_dlss_output_texture.Get(), nullptr, &s_dlss_output_srv))) {
+                s_dlss_output_texture.Reset();
+                s_dlss_output_srv.Reset();
+            }
+        }
+
+        if (s_backbuffer_copy) {
+            D3D11_TEXTURE2D_DESC cur{};
+            s_backbuffer_copy->GetDesc(&cur);
+            if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height ||
+                cur.Format != outFormat) {
+                s_backbuffer_copy.Reset();
+                s_backbuffer_copy_srv.Reset();
+            }
+        }
+        if (!s_backbuffer_copy) {
+            D3D11_TEXTURE2D_DESC td = backbufferDesc;
+            td.Format = outFormat;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            td.CPUAccessFlags = td.MiscFlags = 0;
+            if (FAILED(device->CreateTexture2D(&td, nullptr, &s_backbuffer_copy)) ||
+                FAILED(device->CreateShaderResourceView(s_backbuffer_copy.Get(), nullptr, &s_backbuffer_copy_srv))) {
+                s_backbuffer_copy.Reset();
+                s_backbuffer_copy_srv.Reset();
+            }
+        }
+
+        if (s_cached_backbuffer_ptr != backbuffer || !s_backbuffer_rtv) {
+            s_cached_backbuffer_ptr = backbuffer;
+            s_backbuffer_rtv.Reset();
+            device->CreateRenderTargetView(backbuffer, nullptr, &s_backbuffer_rtv);
+        }
+
+        ID3D11Texture2D* evalDestination = s_dlss_output_texture ? s_dlss_output_texture.Get() : backbuffer;
+
+        // Copy backbuffer (containing native UI drawn by Cobra) to s_backbuffer_copy BEFORE any modification
+        if (s_backbuffer_copy) {
+            context->CopyResource(s_backbuffer_copy.Get(), backbuffer);
+        }
+
+        if (upscaler.evaluate(context, inputs, nullptr, evalDestination)) {
+            s_camera_reset = false;
+
+            if (evalDestination == s_dlss_output_texture.Get() && s_dlss_output_srv &&
+                s_backbuffer_copy_srv && s_dlaa_input_srv && s_backbuffer_rtv) {
+                if (!ui_composite_pass) {
+                    auto comp = std::make_unique<edpe::UiCompositePass>();
+                    if (comp->initialize(device.Get(), context)) {
+                        ui_composite_pass = std::move(comp);
+                    }
+                }
+                bool compOk = false;
+                if (ui_composite_pass) {
+                    compOk = ui_composite_pass->composite(context,
+                        s_dlss_output_srv.Get(),
+                        s_backbuffer_copy_srv.Get(),
+                        s_dlaa_input_srv.Get(),
+                        s_backbuffer_rtv.Get(),
+                        backbufferDesc.Width, backbufferDesc.Height,
+                        depthDesc.Width, depthDesc.Height);
+                }
+                if (!compOk) {
+                    context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                }
+            }
+        }
+    } else {
+        if (upscaler.evaluate(context, inputs, nullptr, backbuffer)) {
+            s_camera_reset = false;
+        }
     }
     rearmContextHooks();
 }
@@ -2246,6 +2379,20 @@ void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT coun
             texture_desc.Width, texture_desc.Height, texture_desc.BindFlags);
         EdpeLog(message);
     }
+}
+
+bool isMainSceneMrtDepth(const D3D11_TEXTURE2D_DESC& dd, UINT outW, UINT outH) {
+    if (dd.Format != DXGI_FORMAT_R32G8X24_TYPELESS || dd.SampleDesc.Count != 1) return false;
+    if (!dd.Width || !dd.Height) return false;
+    if (outW > 0 && outH > 0) {
+        if (dd.Width > outW || dd.Height > outH) return false;
+        if (outW > outH && dd.Width == dd.Height) return false;
+        const float dsvAspect = static_cast<float>(dd.Width) / static_cast<float>(dd.Height);
+        const float outAspect = static_cast<float>(outW) / static_cast<float>(outH);
+        if (std::fabs(dsvAspect - outAspect) > 0.05f) return false;
+        if (outW >= 640 && (dd.Width < outW / 3 || dd.Height < outH / 3)) return false;
+    }
+    return true;
 }
 
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
@@ -2332,17 +2479,9 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             views[3].Format == DXGI_FORMAT_R11G11B10_FLOAT;
     }
 
+    bool is_main_scene = false;
     bool hud_probe_begin = false;
     if (scene_mrt) {
-        for (UINT slot = 0; slot < 4; ++slot) {
-            ID3D11Resource* gbRes = nullptr;
-            targets[slot]->GetResource(&gbRes);
-            s_gbuffer_resources[slot] = gbRes;
-            if (gbRes) gbRes->Release();
-        }
-        scene_ldr_source.Reset();
-        scene_ldr_frame = ~0ull;
-
         ID3D11Resource* dsv_res = nullptr;
         dsv->GetResource(&dsv_res);
         if (dsv_res) {
@@ -2351,7 +2490,10 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                     reinterpret_cast<void**>(depthTex.GetAddressOf())))) {
                 D3D11_TEXTURE2D_DESC dd{};
                 depthTex->GetDesc(&dd);
-                if (dd.Format == DXGI_FORMAT_R32G8X24_TYPELESS && dd.SampleDesc.Count == 1) {
+                const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+                const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+                if (isMainSceneMrtDepth(dd, outW, outH)) {
+                    is_main_scene = true;
                     scene_depth_source = depthTex;
                     s_observed_scene_width.store(dd.Width, std::memory_order_relaxed);
                     s_observed_scene_height.store(dd.Height, std::memory_order_relaxed);
@@ -2360,10 +2502,21 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             dsv_res->Release();
         }
 
-        if (reconstruction_active) {
-            motion_color_source = targets[3];
-            motion_color_frame = current_frame;
-            motion_color_bound = true;
+        if (is_main_scene) {
+            for (UINT slot = 0; slot < 4; ++slot) {
+                ID3D11Resource* gbRes = nullptr;
+                targets[slot]->GetResource(&gbRes);
+                s_gbuffer_resources[slot] = gbRes;
+                if (gbRes) gbRes->Release();
+            }
+            scene_ldr_source.Reset();
+            scene_ldr_frame = ~0ull;
+
+            if (reconstruction_active) {
+                motion_color_source = targets[3];
+                motion_color_frame = current_frame;
+                motion_color_bound = true;
+            }
         }
     }
 
@@ -2392,12 +2545,12 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 seen[index].mrt_hdr_view = nullptr;
                 seen[index].mrt_frame = frame;
             }
-            if (scene_mrt) {
+            if (is_main_scene) {
                 seen[index].mrt_hdr_view = targets[3];
             } else if (seen[index].mrt_hdr_view && count && targets &&
                 targets[0] == seen[index].mrt_hdr_view)
                 seen[index].scene_match_frame = frame;
-            camera_delta_take = scene_mrt;
+            camera_delta_take = is_main_scene;
         }
         if (sequence_active.load(std::memory_order_acquire)) recordBind(static_cast<int>(index));
         if (snapshot_active == static_cast<int>(index) && !snapshot_view) {
@@ -2427,7 +2580,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                     camera_pair_bind_frame = frame;
                     camera_pair_bind_count = 0;
                 }
-                if (++camera_pair_bind_count == 3 && scene_mrt &&
+                if (++camera_pair_bind_count == 3 && is_main_scene &&
                     seen[index].mrt_frame == frame && seen[index].mrt_hdr_view)
                     camera_pair_sample = frame == camera_pair_armed_after
                         ? kPairFirstSample : kPairSecondSample;
@@ -2534,7 +2687,11 @@ void rearmContextHooks() {
         const bool restored = patchSlot(patched_table, kOMSetRenderTargets,
             patched_table[kOMSetRenderTargets],
             reinterpret_cast<void*>(&observedOMSetRenderTargets));
-        if (restored) EdpeLog(L"EDPE: DSV observer restored after context-state swap");
+        static bool s_swap_logged = false;
+        if (restored && !s_swap_logged) {
+            s_swap_logged = true;
+            EdpeLog(L"EDPE: DSV observer restored after context-state swap");
+        }
     }
     const auto forward_map = original_map.load(std::memory_order_acquire);
     if (forward_map && map_hook_active.load(std::memory_order_acquire) &&
@@ -2676,6 +2833,11 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 reinterpret_cast<void*>(&observedOMSetRenderTargets))) {
             patched_table = table;
             observed_swap_chain = swap_chain;
+            DXGI_SWAP_CHAIN_DESC sc_init{};
+            if (SUCCEEDED(swap_chain->GetDesc(&sc_init))) {
+                s_swapchain_width.store(sc_init.BufferDesc.Width, std::memory_order_relaxed);
+                s_swapchain_height.store(sc_init.BufferDesc.Height, std::memory_order_relaxed);
+            }
             EdpeLog(L"EDPE: OMSetRenderTargets DSV census armed");
 
             auto map_forward = reinterpret_cast<MapFn>(table[kMap]);
@@ -2717,6 +2879,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
             outW = sc_desc.BufferDesc.Width;
             outH = sc_desc.BufferDesc.Height;
+            s_swapchain_width.store(outW, std::memory_order_relaxed);
+            s_swapchain_height.store(outH, std::memory_order_relaxed);
         }
         const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
         const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
