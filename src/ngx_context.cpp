@@ -24,6 +24,9 @@ struct NgxFeatureState {
     bool dlss_available = false;
     bool dlaa_available = false;
     uint32_t quality_mode = 0; // 0=Unknown, 1=Quality, 2=Balanced, 3=Performance, 4=UltraPerformance
+    uint32_t preset = 0;       // 0=Auto(K), 10=J, 11=K, 12=L, 13=M
+    uint32_t active_perf_quality = 0;
+    uint32_t active_preset = 0;
     uint32_t render_width = 0;
     uint32_t render_height = 0;
     uint32_t output_width = 0;
@@ -59,6 +62,32 @@ static std::wstring getModuleDir() {
         if (slash != std::wstring::npos) return p.substr(0, slash);
     }
     return L".";
+}
+
+static NVSDK_NGX_PerfQuality_Value mapModeToNgxPerfQuality(UpscaleMode mode) {
+    switch (mode) {
+    case UpscaleMode::Quality:
+        return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    case UpscaleMode::Balanced:
+        return NVSDK_NGX_PerfQuality_Value_Balanced;
+    case UpscaleMode::Performance:
+        return NVSDK_NGX_PerfQuality_Value_MaxPerf;
+    case UpscaleMode::UltraPerformance:
+        return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+    case UpscaleMode::NativeAA:
+    case UpscaleMode::Native:
+    default:
+        return NVSDK_NGX_PerfQuality_Value_DLAA;
+    }
+}
+
+static NVSDK_NGX_PerfQuality_Value selectPerfQualityByRatio(uint32_t renderWidth, uint32_t outputWidth) {
+    if (!outputWidth || renderWidth >= outputWidth) return NVSDK_NGX_PerfQuality_Value_DLAA;
+    const float ratio = static_cast<float>(renderWidth) / static_cast<float>(outputWidth);
+    if (ratio >= 0.62f) return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    if (ratio >= 0.54f) return NVSDK_NGX_PerfQuality_Value_Balanced;
+    if (ratio >= 0.42f) return NVSDK_NGX_PerfQuality_Value_MaxPerf;
+    return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
 }
 #endif
 
@@ -123,7 +152,7 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
 
     if (r == NVSDK_NGX_Result_Success) {
         g_ngx_state.dlaa_available = true;
-        swprintf_s(g_status_msg, L"NVIDIA DLAA available (optimal %ux%u)", ow, oh);
+        swprintf_s(g_status_msg, L"NVIDIA DLSS / DLAA available (DLAA optimal %ux%u)", ow, oh);
     } else {
         swprintf_s(g_status_msg, L"NGX initialized, but DLAA mode unavailable: 0x%08X", static_cast<unsigned>(r));
     }
@@ -169,6 +198,14 @@ void NgxContext::set_quality_mode(uint32_t mode) {
     g_ngx_state.quality_mode = mode;
 }
 
+uint32_t NgxContext::get_preset() {
+    return g_ngx_state.preset;
+}
+
+void NgxContext::set_preset(uint32_t preset) {
+    g_ngx_state.preset = preset;
+}
+
 uint32_t NgxContext::get_render_width() {
     return g_ngx_state.render_width;
 }
@@ -193,26 +230,96 @@ void NgxContext::set_reset_requested(bool reset) {
     g_ngx_state.reset_requested = reset;
 }
 
-bool NgxContext::ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height, bool isHdr) {
+bool NgxContext::queryOptimalSettings(uint32_t outputWidth, uint32_t outputHeight,
+    UpscaleMode mode, DlssOptimalSettings* outSettings) {
+    if (!outSettings) return false;
+    *outSettings = {};
+    if (!outputWidth || !outputHeight) return false;
+
+#if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
+    if (!g_ngx_state.initialized || !g_ngx_params) return false;
+
+    const NVSDK_NGX_PerfQuality_Value pq = mapModeToNgxPerfQuality(mode);
+    unsigned ow = 0, oh = 0, maxw = 0, maxh = 0, minw = 0, minh = 0;
+    float sharp = 0.0f;
+    const NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(
+        g_ngx_params, outputWidth, outputHeight, pq,
+        &ow, &oh, &maxw, &maxh, &minw, &minh, &sharp);
+    if (r != NVSDK_NGX_Result_Success || !ow || !oh) return false;
+
+    outSettings->optimalWidth = ow;
+    outSettings->optimalHeight = oh;
+    outSettings->minWidth = minw ? minw : ow;
+    outSettings->minHeight = minh ? minh : oh;
+    outSettings->maxWidth = maxw ? maxw : ow;
+    outSettings->maxHeight = maxh ? maxh : oh;
+    outSettings->supported = true;
+    return true;
+#else
+    (void)outputWidth; (void)outputHeight; (void)mode;
+    return false;
+#endif
+}
+
+bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
+    uint32_t renderWidth, uint32_t renderHeight,
+    uint32_t outputWidth, uint32_t outputHeight,
+    UpscaleMode mode, bool isHdr, uint32_t preset) {
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     if (!g_ngx_state.initialized || !g_ngx_params || !context) return false;
+    if (!renderWidth || !renderHeight || !outputWidth || !outputHeight) return false;
+    if (renderWidth > outputWidth || renderHeight > outputHeight) return false;
 
-    if (g_dlaa_feature && g_ngx_state.render_width == width && g_ngx_state.render_height == height &&
+    NVSDK_NGX_PerfQuality_Value perfQuality = NVSDK_NGX_PerfQuality_Value_DLAA;
+    if (renderWidth < outputWidth || renderHeight < outputHeight) {
+        perfQuality = mapModeToNgxPerfQuality(mode);
+        if (perfQuality == NVSDK_NGX_PerfQuality_Value_DLAA) {
+            perfQuality = selectPerfQualityByRatio(renderWidth, outputWidth);
+        } else {
+            unsigned ow = 0, oh = 0, maxw = 0, maxh = 0, minw = 0, minh = 0;
+            float sharp = 0.0f;
+            if (NGX_DLSS_GET_OPTIMAL_SETTINGS(g_ngx_params, outputWidth, outputHeight, perfQuality,
+                    &ow, &oh, &maxw, &maxh, &minw, &minh, &sharp) == NVSDK_NGX_Result_Success) {
+                const uint32_t loW = minw ? minw : ow;
+                const uint32_t hiW = maxw ? maxw : ow;
+                const uint32_t loH = minh ? minh : oh;
+                const uint32_t hiH = maxh ? maxh : oh;
+                if (renderWidth < loW || renderWidth > hiW || renderHeight < loH || renderHeight > hiH) {
+                    perfQuality = selectPerfQualityByRatio(renderWidth, outputWidth);
+                }
+            }
+        }
+    }
+
+    const uint32_t effectivePreset = (preset >= 10u && preset <= 13u) ? preset : 11u;
+    const uint32_t perfQualityInt = static_cast<uint32_t>(perfQuality);
+
+    if (g_dlaa_feature &&
+        g_ngx_state.render_width == renderWidth &&
+        g_ngx_state.render_height == renderHeight &&
+        g_ngx_state.output_width == outputWidth &&
+        g_ngx_state.output_height == outputHeight &&
+        g_ngx_state.active_perf_quality == perfQualityInt &&
+        g_ngx_state.active_preset == effectivePreset &&
         g_ngx_state.is_hdr == isHdr) {
         return true;
     }
 
     releaseFeature();
 
-    // Hint DLAA to Preset K (11), matching EDVR's validated DLAA preset.
-    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, 11u);
+    // Apply selected DLSS Transformer/CNN preset (defaulting to Preset K = 11).
+    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, effectivePreset);
+    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, effectivePreset);
+    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, effectivePreset);
+    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, effectivePreset);
+    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, effectivePreset);
 
     NVSDK_NGX_DLSS_Create_Params cp{};
-    cp.Feature.InWidth = width;
-    cp.Feature.InHeight = height;
-    cp.Feature.InTargetWidth = width;
-    cp.Feature.InTargetHeight = height;
-    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.Feature.InWidth = renderWidth;
+    cp.Feature.InHeight = renderHeight;
+    cp.Feature.InTargetWidth = outputWidth;
+    cp.Feature.InTargetHeight = outputHeight;
+    cp.Feature.InPerfQualityValue = perfQuality;
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                               NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (isHdr) {
@@ -222,24 +329,41 @@ bool NgxContext::ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width,
 
     NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &g_dlaa_feature, g_ngx_params, &cp);
     if (r != NVSDK_NGX_Result_Success || !g_dlaa_feature) {
-        swprintf_s(g_status_msg, L"NGX_D3D11_CREATE_DLSS_EXT failed: 0x%08X", static_cast<unsigned>(r));
+        swprintf_s(g_status_msg, L"NGX_D3D11_CREATE_DLSS_EXT (%ux%u -> %ux%u) failed: 0x%08X",
+            renderWidth, renderHeight, outputWidth, outputHeight, static_cast<unsigned>(r));
         EdpeLog(g_status_msg);
         return false;
     }
 
-    g_ngx_state.render_width = width;
-    g_ngx_state.render_height = height;
-    g_ngx_state.output_width = width;
-    g_ngx_state.output_height = height;
+    g_ngx_state.render_width = renderWidth;
+    g_ngx_state.render_height = renderHeight;
+    g_ngx_state.output_width = outputWidth;
+    g_ngx_state.output_height = outputHeight;
+    g_ngx_state.active_perf_quality = perfQualityInt;
+    g_ngx_state.active_preset = effectivePreset;
     g_ngx_state.is_hdr = isHdr;
     g_ngx_state.reset_requested = true;
-    swprintf_s(g_status_msg, L"NVIDIA DLAA feature active (%ux%u %ls)", width, height, isHdr ? L"HDR" : L"LDR");
+
+    const wchar_t* presetName =
+        effectivePreset == 10u ? L"J" :
+        effectivePreset == 11u ? L"K" :
+        effectivePreset == 12u ? L"L" :
+        effectivePreset == 13u ? L"M" : L"Auto";
+    swprintf_s(g_status_msg, L"NVIDIA %ls feature active (%ux%u -> %ux%u, Preset %ls, %ls)",
+        (renderWidth == outputWidth && renderHeight == outputHeight) ? L"DLAA" : L"DLSS SR",
+        renderWidth, renderHeight, outputWidth, outputHeight,
+        presetName, isHdr ? L"HDR" : L"LDR");
     EdpeLog(g_status_msg);
     return true;
 #else
-    (void)context; (void)width; (void)height; (void)isHdr;
+    (void)context; (void)renderWidth; (void)renderHeight;
+    (void)outputWidth; (void)outputHeight; (void)mode; (void)isHdr; (void)preset;
     return false;
 #endif
+}
+
+bool NgxContext::ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height, bool isHdr) {
+    return ensureDlssFeature(context, width, height, width, height, UpscaleMode::NativeAA, isHdr, g_ngx_state.preset);
 }
 
 void NgxContext::releaseFeature() {
@@ -253,20 +377,29 @@ void NgxContext::releaseFeature() {
     g_ngx_state.render_height = 0;
     g_ngx_state.output_width = 0;
     g_ngx_state.output_height = 0;
+    g_ngx_state.active_perf_quality = 0;
+    g_ngx_state.active_preset = 0;
 }
 
-bool NgxContext::evaluateDlaa(ID3D11DeviceContext* context,
+bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     const NvidiaDlssInputParams& params,
     ID3D11Resource* colorIn,
     ID3D11Resource* outputUav,
     ID3D11Resource* depthIn,
     ID3D11Resource* motionIn,
     ID3D11Resource* reactiveMaskIn,
-    uint32_t width,
-    uint32_t height) {
+    uint32_t renderWidth,
+    uint32_t renderHeight,
+    uint32_t outputWidth,
+    uint32_t outputHeight,
+    UpscaleMode mode,
+    uint32_t preset) {
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     if (!context || !colorIn || !outputUav || !depthIn || !motionIn) return false;
-    if (!ensureDlaaFeature(context, width, height, params.isHdr)) return false;
+    const uint32_t usePreset = preset ? preset : g_ngx_state.preset;
+    if (!ensureDlssFeature(context, renderWidth, renderHeight, outputWidth, outputHeight, mode, params.isHdr, usePreset)) {
+        return false;
+    }
 
     NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
     ep.Feature.pInColor = colorIn;
@@ -275,8 +408,8 @@ bool NgxContext::evaluateDlaa(ID3D11DeviceContext* context,
     ep.pInMotionVectors = motionIn;
     ep.InJitterOffsetX = params.jitterX;
     ep.InJitterOffsetY = params.jitterY;
-    ep.InRenderSubrectDimensions.Width = width;
-    ep.InRenderSubrectDimensions.Height = height;
+    ep.InRenderSubrectDimensions.Width = renderWidth;
+    ep.InRenderSubrectDimensions.Height = renderHeight;
     ep.InReset = (params.inReset || g_ngx_state.reset_requested) ? 1 : 0;
     ep.InMVScaleX = params.motionScaleX;
     ep.InMVScaleY = params.motionScaleY;
@@ -291,8 +424,10 @@ bool NgxContext::evaluateDlaa(ID3D11DeviceContext* context,
 
     static unsigned s_ngx_eval_count = 0;
     if (++s_ngx_eval_count == 1 || s_ngx_eval_count % 300 == 0) {
-        wchar_t msg[160];
-        swprintf_s(msg, L"EDPE: NGX DLAA evaluated successfully #%u (%ux%u)", s_ngx_eval_count, width, height);
+        wchar_t msg[192];
+        swprintf_s(msg, L"EDPE: NGX %ls evaluated successfully #%u (%ux%u -> %ux%u)",
+            (renderWidth == outputWidth && renderHeight == outputHeight) ? L"DLAA" : L"DLSS SR",
+            s_ngx_eval_count, renderWidth, renderHeight, outputWidth, outputHeight);
         EdpeLog(msg);
     }
 
@@ -302,9 +437,24 @@ bool NgxContext::evaluateDlaa(ID3D11DeviceContext* context,
     return true;
 #else
     (void)context; (void)params; (void)colorIn; (void)outputUav;
-    (void)depthIn; (void)motionIn; (void)reactiveMaskIn; (void)width; (void)height;
+    (void)depthIn; (void)motionIn; (void)reactiveMaskIn;
+    (void)renderWidth; (void)renderHeight; (void)outputWidth; (void)outputHeight;
+    (void)mode; (void)preset;
     return false;
 #endif
+}
+
+bool NgxContext::evaluateDlaa(ID3D11DeviceContext* context,
+    const NvidiaDlssInputParams& params,
+    ID3D11Resource* colorIn,
+    ID3D11Resource* outputUav,
+    ID3D11Resource* depthIn,
+    ID3D11Resource* motionIn,
+    ID3D11Resource* reactiveMaskIn,
+    uint32_t width,
+    uint32_t height) {
+    return evaluateDlss(context, params, colorIn, outputUav, depthIn, motionIn, reactiveMaskIn,
+        width, height, width, height, UpscaleMode::NativeAA, g_ngx_state.preset);
 }
 
 const wchar_t* NgxContext::get_status_message() {

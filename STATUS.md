@@ -28,10 +28,10 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 6. Motion vectors | **Verified in-game (flight motion)** | GPU motion pass renders to `DXGI_FORMAT_R16G16_FLOAT`. In-game flight capture confirmed 64.8% horizontal and 63.5% vertical active motion across frame, matching reversed-Z depth and camera motion. |
 | 7. Shared temporal input layer | **Implemented & verified** | Vendor-neutral `TemporalFrameInputs` handoff, `IUpscalerBackend`, and `UpscalerManager` coordinator implemented and unit-tested. |
 | 8. NVIDIA DLAA | **Verified & working in-game** | Official NVIDIA NGX SDK linked. `NgxContext` evaluates DLAA at native 2560×1440 (`MVLowRes | DepthInverted`, Preset K, LDR mode) on the finished swapchain backbuffer at `Present` before ImGui overlay rendering. Verified in-game: clean, rock-solid temporal anti-aliasing (~0.3 ms GPU time) with zero image vibration. |
-| 9. NVIDIA DLSS Super Resolution | **Ready to begin** | Next milestone: implement Cobra render scaling / selective scene render-target scaling below native 2560×1440 (`input < output`). |
-| 10. True render-scale control | **Ready to begin** | Investigate Cobra scaling mechanism / Elite configuration / selective scene-resource scaling so Elite renders the 3D scene below output resolution. |
+| 9. NVIDIA DLSS Super Resolution | **Implemented; ready for in-game test** | `NgxContext` and `NvidiaUpscalerBackend` support `NativeAA`, `Quality` (66.7%), `Balanced` (58.0%), `Performance` (50.0%), and `Ultra Performance` (33.3%), `NGX_DLSS_GET_OPTIMAL_SETTINGS` range validation, and DLSS presets (`Auto`, `J`, `K`, `L`, `M`). Reconstructs low-res LDR scene target (`scene_ldr_source`) + low-res depth/motion/jitter into native 2560×1440 backbuffer. |
+| 10. True render-scale control | **Implemented; ready for in-game test** | Uses Cobra's native `<SSAAMultiplier>` (`Custom.4.4.fxcfg` auto-sync at startup + live in-game `Supersampling` 0.50x–0.85x). Tracks `scene_depth_source` and post-tonemap `scene_ldr_source` at true lower render resolution (`render < output`) and scales Halton jitter NDC offsets and phase count `(output/render)^2`. |
 | 11. AMD FSR upscaling | **Interface ready; backend pending** | `AmdUpscalerBackend` abstraction implemented in `src/upscaler_backend.h/.cpp`. FidelityFX integration pending backend architecture selection. |
-| 12. Native-resolution HUD | **Candidate site identified; separation pending for SR/FG** | HUD shader pair (VS `0xB7790CBFC6554097`, PS `0x8DEF46452FA459F5`) identified. Full native-res HUD composition over upscaled low-res world required for Phase 9/10 SR and Frame Generation. |
+| 12. Native-resolution HUD | **Candidate site identified; separation pending for SR/FG** | HUD shader pair (VS `0xB7790CBFC6554097`, PS `0x8DEF46452FA459F5`) identified. Full native-res HUD composition over upscaled low-res world is the next enhancement after verifying DLSS SR in-game. |
 | 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
@@ -40,7 +40,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Available diagnostics and controls
 
-- **F5 Overlay:** Toggles the Dear ImGui menu. Displays backend status, GPU timings (~0.3 ms for DLAA), projection jitter status/controls, runtime temporal tuning overrides, and snapshot previews. When hidden, passes through all inputs to the game without interference.
+- **F5 Overlay:** Toggles the Dear ImGui menu. Exposes Upscaler Backend (`Native`, `NVIDIA DLSS / DLAA`), Quality Mode (`Native AA`, `Quality`, `Balanced`, `Performance`, `Ultra Performance`), NVIDIA DLSS Preset (`Auto`, `J`, `K`, `L`, `M`), Elite `Custom.4.4.fxcfg` `<SSAAMultiplier>` auto-sync, asynchronous GPU timings, projection jitter status/controls, runtime temporal tuning overrides, and snapshot previews. When hidden, passes through all inputs to the game without interference.
 - **F6 One-Shot Synchronized Capture:** Captures all 5 rendering buffers from the **exact same frame** and writes non-blocking 32-bit BMP files to `edpe-captures/`:
   - `color-*.bmp`: Tone-mapped scene color HDR (`DXGI_FORMAT_R11G11B10_FLOAT`)
   - `motion-*.bmp`: Visualized motion displacement (`DXGI_FORMAT_R16G16_FLOAT`)
@@ -54,20 +54,19 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Next milestone
 
-Phase 8 (NVIDIA DLAA) is **Verified In-Game**:
-- Official NVIDIA NGX SDK linked and initialized with project ID `48d353f3-d07b-4048-876b-09f8622f5a27`.
-- DLAA feature evaluated once per frame at `Present` on the finished `R8G8B8A8_UNORM` backbuffer before Dear ImGui overlay rendering (`MVLowRes | DepthInverted`, Preset K).
-- Subpixel Halton (2,3) jitter injected into the 5376-byte CB0 (words 1080–1095) and accurately resolved by NGX DLAA with zero screen vibration and crisp anti-aliasing (~0.3 ms GPU cost).
+Phases 9 & 10 (NVIDIA DLSS Super Resolution & True Render-Scale Control) are **Implemented and Ready for In-Game Verification**:
+- `NgxContext` supports all 5 modes (`Native AA`, `Quality`, `Balanced`, `Performance`, `Ultra Performance`), queries `NGX_DLSS_GET_OPTIMAL_SETTINGS`, and supports runtime selection of NVIDIA DLSS presets (`Auto`, `J`, `K`, `L`, `M`).
+- `Config::syncEliteGraphicsConfig()` automatically synchronizes `<SSAAMultiplier>`, `<UpscalingQuality>0</UpscalingQuality>`, and `<AAMode>0</AAMode>` in Elite's `Custom.4.4.fxcfg`, and `context_census` tracks the low-resolution tone-mapped LDR scene target (`scene_ldr_source`) and scales Halton jitter NDC offsets and phase count to the active scene render resolution.
 
-The immediate next milestone is **Phases 9 & 10 — True Render-Scale Control & NVIDIA DLSS Super Resolution**:
-1. Investigate Cobra's internal render scaling (`Supersampling` / `DisplaySettings.xml` / selective scene MRT & depth scaling) so the expensive 3D world renders below 2560×1440 while the swapchain remains at native 2560×1440.
-2. Enable `Quality`, `Balanced`, `Performance`, and `Ultra Performance` modes in `NgxContext` using `NGX_DLSS_GET_OPTIMAL_SETTINGS` and reconstruct the lower-resolution scene to native output resolution.
+The immediate next steps are:
+1. Verify NVIDIA DLSS Super Resolution (`Quality`, `Balanced`, `Performance`, `Ultra Performance`) in-game in Elite Dangerous Odyssey.
+2. Proceed to **Phase 11 (AMD FSR Upscaling)** and **Phase 12 (Native-Resolution HUD separation)**.
 
 ---
 
 ## Not yet demonstrated
 
-EDPE has not yet demonstrated lower scene render resolution (`render < output`), DLSS Super Resolution performance gains, AMD FSR reconstruction, or Frame Generation. These remain roadmap goals for Phases 9–15.
+EDPE has implemented Phases 9 & 10 (`render < output` DLSS Super Resolution and Cobra `<SSAAMultiplier>` render-scale integration); in-game verification of DLSS SR performance gains, AMD FSR reconstruction, native-resolution HUD separation, and Frame Generation remain to be demonstrated.
 
 ---
 

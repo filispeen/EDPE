@@ -2,7 +2,12 @@
 
 #include <string>
 #include <filesystem>
+#include <fstream>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <cwchar>
+#include <cwctype>
 #include <windows.h>
 
 namespace edpe {
@@ -22,6 +27,8 @@ public:
 
         upscalerBackend = GetPrivateProfileIntW(L"Upscaler", L"Backend", 0, path.c_str());
         upscaleMode = GetPrivateProfileIntW(L"Upscaler", L"Mode", 0, path.c_str());
+        dlssPreset = GetPrivateProfileIntW(L"Upscaler", L"Preset", 0, path.c_str());
+        autoSyncEliteConfig = GetPrivateProfileIntW(L"Upscaler", L"AutoSyncEliteConfig", 1, path.c_str()) != 0;
 
         jitterInvertX = GetPrivateProfileIntW(L"Jitter", L"InvertX", 0, path.c_str()) != 0;
         jitterInvertY = GetPrivateProfileIntW(L"Jitter", L"InvertY", 0, path.c_str()) != 0;
@@ -49,6 +56,8 @@ public:
 
         WritePrivateProfileStringW(L"Upscaler", L"Backend", std::to_wstring(upscalerBackend).c_str(), path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"Mode", std::to_wstring(upscaleMode).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"Upscaler", L"Preset", std::to_wstring(dlssPreset).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"Upscaler", L"AutoSyncEliteConfig", autoSyncEliteConfig ? L"1" : L"0", path.c_str());
 
         WritePrivateProfileStringW(L"Jitter", L"InvertX", jitterInvertX ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"InvertY", jitterInvertY ? L"1" : L"0", path.c_str());
@@ -66,6 +75,82 @@ public:
         WritePrivateProfileStringW(L"Motion", L"Scale", buf, path.c_str());
     }
 
+    static float getTargetSsaaMultiplier(int backend, int mode) {
+        if (backend == 0 || mode <= 1) return 1.000000f;
+        switch (mode) {
+        case 2: return 0.666667f; // Quality (66.7%)
+        case 3: return 0.580000f; // Balanced (58.0%)
+        case 4: return 0.500000f; // Performance (50.0%)
+        case 5: return 0.333333f; // Ultra Performance (33.3%)
+        default: return 1.000000f;
+        }
+    }
+
+    bool isRunningInEliteProcess() const {
+        wchar_t modulePath[MAX_PATH]{};
+        const DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+        if (!len || len >= MAX_PATH) return false;
+        std::wstring filename = std::filesystem::path(modulePath).filename().wstring();
+        for (auto& ch : filename) ch = static_cast<wchar_t>(towlower(ch));
+        return filename.find(L"elitedangerous") != std::wstring::npos;
+    }
+
+    // Synchronizes Elite Dangerous's Custom.4.4.fxcfg <SSAAMultiplier> with the selected
+    // EDPE UpscaleMode so Cobra renders the 3D scene at true lower internal resolution.
+    bool syncEliteGraphicsConfig() const {
+        if (!autoSyncEliteConfig || !isRunningInEliteProcess()) return false;
+
+        wchar_t localAppData[MAX_PATH]{};
+        const DWORD envLen = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+        if (!envLen || envLen >= MAX_PATH) return false;
+
+        std::filesystem::path gfxDir = std::filesystem::path(localAppData) /
+            L"Frontier Developments" / L"Elite Dangerous" / L"Options" / L"Graphics";
+        std::filesystem::path cfgPath = gfxDir / L"Custom.4.4.fxcfg";
+        std::error_code ec;
+        if (!std::filesystem::exists(cfgPath, ec)) {
+            cfgPath = gfxDir / L"Custom.4.0.fxcfg";
+            if (!std::filesystem::exists(cfgPath, ec)) return false;
+        }
+
+        std::ifstream inFile(cfgPath, std::ios::binary);
+        if (!inFile) return false;
+        std::string content((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
+        inFile.close();
+        if (content.empty()) return false;
+
+        const float mult = getTargetSsaaMultiplier(upscalerBackend, upscaleMode);
+        char ssaaTag[64]{};
+        std::snprintf(ssaaTag, sizeof(ssaaTag), "<SSAAMultiplier>%.6f</SSAAMultiplier>", mult);
+
+        bool modified = false;
+        auto replaceTag = [&](const char* openTag, const char* closeTag, const char* newFullTag) {
+            const size_t start = content.find(openTag);
+            if (start == std::string::npos) return;
+            const size_t end = content.find(closeTag, start);
+            if (end == std::string::npos) return;
+            const size_t fullLen = (end - start) + std::strlen(closeTag);
+            if (content.compare(start, fullLen, newFullTag) != 0) {
+                content.replace(start, fullLen, newFullTag);
+                modified = true;
+            }
+        };
+
+        replaceTag("<SSAAMultiplier>", "</SSAAMultiplier>", ssaaTag);
+        if (upscalerBackend != 0 && upscaleMode >= 1) {
+            // Ensure Cobra's internal FSR1/CAS upscaler and SMAA/FXAA are off when EDPE reconstructs.
+            replaceTag("<UpscalingQuality>", "</UpscalingQuality>", "<UpscalingQuality>0</UpscalingQuality>");
+            replaceTag("<AAMode>", "</AAMode>", "<AAMode>0</AAMode>");
+        }
+
+        if (!modified) return true;
+
+        std::ofstream outFile(cfgPath, std::ios::binary | std::ios::trunc);
+        if (!outFile) return false;
+        outFile.write(content.data(), static_cast<std::streamsize>(content.size()));
+        return outFile.good();
+    }
+
     std::wstring getIniPath() const {
         wchar_t modulePath[MAX_PATH]{};
         const DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
@@ -76,6 +161,8 @@ public:
 
     int upscalerBackend = 0;
     int upscaleMode = 0;
+    int dlssPreset = 0; // 0=Auto(K), 10=J, 11=K, 12=L, 13=M
+    bool autoSyncEliteConfig = true;
 
     bool jitterInvertX = false;
     bool jitterInvertY = false;

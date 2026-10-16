@@ -114,12 +114,16 @@ bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
 
     if (!inputs.color) return false;
 
-    D3D11_TEXTURE2D_DESC colorDesc{};
-    inputs.color->GetDesc(&colorDesc);
+    D3D11_TEXTURE2D_DESC outDesc{};
+    if (destinationTexture) {
+        destinationTexture->GetDesc(&outDesc);
+    } else {
+        inputs.color->GetDesc(&outDesc);
+    }
 
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
-    if (!ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, colorDesc.Format)) {
+    if (!ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
         return false;
     }
 
@@ -128,9 +132,12 @@ bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     ID3D11Resource* motionIn = inputs.motionVectors;
     ID3D11Resource* reactiveIn = inputs.reactiveMask;
 
-    bool evalOk = NgxContext::evaluateDlaa(context, params,
+    const UpscaleMode mode = UpscalerManager::instance().getMode();
+    bool evalOk = NgxContext::evaluateDlss(context, params,
         colorIn, outputTexture_.Get(), depthIn, motionIn, reactiveIn,
-        inputs.renderWidth, inputs.renderHeight);
+        inputs.renderWidth, inputs.renderHeight,
+        inputs.outputWidth, inputs.outputHeight,
+        mode, NgxContext::get_preset());
 
     if (!evalOk) {
         return false;
@@ -220,6 +227,17 @@ bool UpscalerManager::initialize(ID3D11Device* device, ID3D11DeviceContext* cont
     nvidiaBackend_.initialize(device, context);
     amdBackend_.initialize(device, context);
 
+    if (device) {
+        D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+        D3D11_QUERY_DESC tsDesc{ D3D11_QUERY_TIMESTAMP, 0 };
+        for (auto& slot : timingRing_) {
+            slot = {};
+            device->CreateQuery(&disjointDesc, &slot.disjoint);
+            device->CreateQuery(&tsDesc, &slot.start);
+            device->CreateQuery(&tsDesc, &slot.end);
+        }
+    }
+
     EdpeLog(L"EDPE: UpscalerManager initialized");
     return true;
 }
@@ -228,6 +246,12 @@ void UpscalerManager::shutdown() {
     nullBackend_.shutdown();
     nvidiaBackend_.shutdown();
     amdBackend_.shutdown();
+
+    for (auto& slot : timingRing_) {
+        slot = {};
+    }
+    timingWriteIndex_ = 0;
+    lastGpuTimeMs_ = 0.0f;
 
     device_ = nullptr;
     context_ = nullptr;
@@ -358,10 +382,41 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         backend->resetHistory();
     }
 
+    // Poll oldest GPU timestamp slot non-blockingly before reusing it.
+    auto& slot = timingRing_[timingWriteIndex_];
+    if (context && slot.inFlight && slot.disjoint && slot.start && slot.end) {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
+        UINT64 tStart = 0, tEnd = 0;
+        if (context->GetData(slot.disjoint.Get(), &disjointData, sizeof(disjointData), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            context->GetData(slot.start.Get(), &tStart, sizeof(tStart), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            context->GetData(slot.end.Get(), &tEnd, sizeof(tEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
+            if (!disjointData.Disjoint && disjointData.Frequency > 0 && tEnd >= tStart) {
+                lastGpuTimeMs_ = static_cast<float>(static_cast<double>(tEnd - tStart) * 1000.0 /
+                    static_cast<double>(disjointData.Frequency));
+            }
+            slot.inFlight = false;
+        }
+    }
+
+    const bool canQueryGpu = context && !slot.inFlight && slot.disjoint && slot.start && slot.end;
+    if (canQueryGpu) {
+        context->Begin(slot.disjoint.Get());
+        context->End(slot.start.Get());
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
     const bool evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
     auto t1 = std::chrono::high_resolution_clock::now();
-    diagnostics_.gpuTimeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+
+    if (canQueryGpu) {
+        context->End(slot.end.Get());
+        context->End(slot.disjoint.Get());
+        slot.inFlight = true;
+        timingWriteIndex_ = (timingWriteIndex_ + 1) % kTimingRingSize;
+    }
+
+    const float cpuTimeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+    diagnostics_.gpuTimeMs = (lastGpuTimeMs_ > 0.0f) ? lastGpuTimeMs_ : cpuTimeMs;
     diagnostics_.success = evalSuccess;
 
     if (!evalSuccess) {

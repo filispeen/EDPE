@@ -2,6 +2,7 @@
 #include "log.h"
 #include "context_census.h"
 #include "upscaler_backend.h"
+#include "ngx_context.h"
 #include "capture_format.h"
 #include "config.h"
 
@@ -839,6 +840,18 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     if (context1) context1->Release();
     if (device1) device1->Release();
     edpe::UpscalerManager::instance().initialize(ui.device, ui.context);
+    {
+        auto& cfg = edpe::Config::instance();
+        cfg.load();
+        edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
+        if (cfg.upscalerBackend == 1 &&
+            edpe::UpscalerManager::instance().isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss)) {
+            edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::NvidiaDlss);
+            const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
+            edpe::UpscalerManager::instance().setMode(static_cast<edpe::UpscaleMode>(m));
+        }
+        cfg.syncEliteGraphicsConfig();
+    }
     EdpeLog(L"EDPE: Dear ImGui ready; F5 toggles menu");
     return true;
 }
@@ -993,8 +1006,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     bool window_open = true;
     ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced", &window_open);
     ImGui::Text("Version: %s", edpe::kVersion);
-    ImGui::TextUnformatted("Rendering: original game output");
     auto& upscaler = edpe::UpscalerManager::instance();
+    auto& cfg = edpe::Config::instance();
     const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);
 
     // Upscaler backend selector
@@ -1006,27 +1019,108 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (current_backend_idx == 1) {
             if (nvidia_available) {
                 upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
-                upscaler.setMode(edpe::UpscaleMode::NativeAA);
-                edpe::Config::instance().upscalerBackend = 1;
-                edpe::Config::instance().upscaleMode = 1;
-                edpe::Config::instance().save();
+                const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
+                upscaler.setMode(static_cast<edpe::UpscaleMode>(m));
+                cfg.upscalerBackend = 1;
+                cfg.upscaleMode = m;
+                cfg.save();
+                cfg.syncEliteGraphicsConfig();
             }
         } else {
             upscaler.setBackend(edpe::UpscalerBackend::None);
             upscaler.setMode(edpe::UpscaleMode::Native);
-            edpe::Config::instance().upscalerBackend = 0;
-            edpe::Config::instance().upscaleMode = 0;
-            edpe::Config::instance().save();
+            cfg.upscalerBackend = 0;
+            cfg.upscaleMode = 0;
+            cfg.save();
+            cfg.syncEliteGraphicsConfig();
         }
     }
 
-    if (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) {
-        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "Reconstruction: NVIDIA DLAA Active (Native 2560x1440)");
-    } else {
-        ImGui::TextUnformatted("Reconstruction: Inactive (Original game output)");
+    // Quality Mode selector (Phase 9 & 10)
+    const bool backend_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
+    if (!backend_active) ImGui::BeginDisabled();
+    const char* quality_items[] = {
+        "Native AA (DLAA 100%)",
+        "Quality (66.7% scale)",
+        "Balanced (58.0% scale)",
+        "Performance (50.0% scale)",
+        "Ultra Performance (33.3% scale)"
+    };
+    int mode_idx = static_cast<int>(upscaler.getMode()) - 1;
+    if (mode_idx < 0 || mode_idx > 4) mode_idx = 0;
+    if (ImGui::Combo("Quality Mode", &mode_idx, quality_items, IM_ARRAYSIZE(quality_items))) {
+        const auto newMode = static_cast<edpe::UpscaleMode>(mode_idx + 1);
+        if (upscaler.setMode(newMode)) {
+            cfg.upscaleMode = mode_idx + 1;
+            cfg.save();
+            cfg.syncEliteGraphicsConfig();
+        }
     }
 
+    // NVIDIA DLSS Preset selector
+    const char* preset_items[] = {
+        "Auto (Preset K)",
+        "Preset J (Transformer)",
+        "Preset K (Transformer)",
+        "Preset L",
+        "Preset M"
+    };
+    const uint32_t curPreset = edpe::NgxContext::get_preset();
+    int preset_idx = (curPreset >= 10u && curPreset <= 13u) ? static_cast<int>(curPreset - 9u) : 0;
+    if (ImGui::Combo("NVIDIA DLSS Preset", &preset_idx, preset_items, IM_ARRAYSIZE(preset_items))) {
+        const uint32_t newPreset = (preset_idx == 0) ? 0u : static_cast<uint32_t>(preset_idx + 9);
+        edpe::NgxContext::set_preset(newPreset);
+        cfg.dlssPreset = static_cast<int>(newPreset);
+        cfg.save();
+    }
+    if (!backend_active) ImGui::EndDisabled();
+
+    bool auto_sync = cfg.autoSyncEliteConfig;
+    if (ImGui::Checkbox("Auto-sync Elite Custom.4.4.fxcfg (<SSAAMultiplier>)", &auto_sync)) {
+        cfg.autoSyncEliteConfig = auto_sync;
+        cfg.save();
+        if (auto_sync) cfg.syncEliteGraphicsConfig();
+    }
+
+    DXGI_SWAP_CHAIN_DESC scDesc{};
+    swap_chain->GetDesc(&scDesc);
+    const UINT outW = scDesc.BufferDesc.Width;
+    const UINT outH = scDesc.BufferDesc.Height;
+    UINT sceneW = 0, sceneH = 0;
+    ContextCensusGetSceneRenderSize(&sceneW, &sceneH);
+    if (!sceneW || !sceneH) {
+        sceneW = outW;
+        sceneH = outH;
+    }
+    const float activeScalePct = outW ? (100.0f * static_cast<float>(sceneW) / static_cast<float>(outW)) : 100.0f;
+
     const auto& diag = upscaler.getDiagnostics();
+    if (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) {
+        const bool isSr = (sceneW < outW || sceneH < outH);
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
+            "Reconstruction: NVIDIA %s Active (%ux%u -> %ux%u, %.1f%%)",
+            isSr ? "DLSS Super Resolution" : "DLAA",
+            sceneW, sceneH, outW, outH, activeScalePct);
+    } else {
+        ImGui::Text("Reconstruction: Inactive (Scene %ux%u -> Output %ux%u)",
+            sceneW, sceneH, outW, outH);
+    }
+
+    edpe::DlssOptimalSettings optSettings{};
+    if (backend_active && edpe::NgxContext::queryOptimalSettings(outW, outH, upscaler.getMode(), &optSettings)) {
+        const float targetMult = edpe::Config::getTargetSsaaMultiplier(cfg.upscalerBackend, cfg.upscaleMode);
+        ImGui::Text("NGX Mode Target: %ux%u (range %ux%u .. %ux%u) | Config SSAA: %.2fx",
+            optSettings.optimalWidth, optSettings.optimalHeight,
+            optSettings.minWidth, optSettings.minHeight,
+            optSettings.maxWidth, optSettings.maxHeight,
+            targetMult);
+        if (upscaler.getMode() >= edpe::UpscaleMode::Quality && sceneW == outW) {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+                "Tip: Set Elite Graphics -> Supersampling < 1.0x (e.g. 0.65x/0.50x) or restart game to apply %.2fx render scale.",
+                targetMult);
+        }
+    }
+
     ImGui::Text("Backend: %ls | Mode: %ls",
         edpe::getUpscalerBackendName(upscaler.getBackend()),
         edpe::getUpscaleModeName(upscaler.getMode()));
@@ -1035,7 +1129,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::Text("GPU Reconstruction Time: %.3f ms", diag.gpuTimeMs);
     }
     if (!nvidia_available) {
-        ImGui::TextDisabled("NVIDIA DLAA reason: %ls",
+        ImGui::TextDisabled("NVIDIA DLSS/DLAA reason: %ls",
             upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
     }
     ImGui::BeginDisabled();

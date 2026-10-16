@@ -1,5 +1,7 @@
 #include "temporal_inputs.h"
 #include "upscaler_backend.h"
+#include "ngx_context.h"
+#include "config.h"
 
 #include <cmath>
 #include <cstring>
@@ -179,6 +181,25 @@ int main() {
     // Evaluate with invalid inputs fails open (returns false so caller falls back to original frame)
     if (manager.evaluate(nullptr, invalidInputs, nullptr, nullptr)) return 43;
     if (manager.getDiagnostics().success) return 44;
+
+    // -------------------------------------------------------------------------
+    // Test 6: DLSS SR presets, optimal settings safety, and Elite SSAA multipliers
+    // -------------------------------------------------------------------------
+    edpe::NgxContext::set_preset(11u);
+    if (edpe::NgxContext::get_preset() != 11u) return 45;
+    edpe::NgxContext::set_preset(0u);
+    if (edpe::NgxContext::get_preset() != 0u) return 46;
+
+    edpe::DlssOptimalSettings opt{};
+    if (edpe::NgxContext::queryOptimalSettings(2560, 1440, edpe::UpscaleMode::Quality, &opt)) return 47;
+    if (opt.supported) return 48;
+
+    if (std::fabs(edpe::Config::getTargetSsaaMultiplier(0, 2) - 1.0f) > 1e-5f) return 49;
+    if (std::fabs(edpe::Config::getTargetSsaaMultiplier(1, 1) - 1.0f) > 1e-5f) return 50;
+    if (std::fabs(edpe::Config::getTargetSsaaMultiplier(1, 2) - 0.666667f) > 1e-5f) return 51;
+    if (std::fabs(edpe::Config::getTargetSsaaMultiplier(1, 3) - 0.580000f) > 1e-5f) return 52;
+    if (std::fabs(edpe::Config::getTargetSsaaMultiplier(1, 4) - 0.500000f) > 1e-5f) return 53;
+    if (std::fabs(edpe::Config::getTargetSsaaMultiplier(1, 5) - 0.333333f) > 1e-5f) return 54;
 
     return 0; // All temporal input layer tests passed
 }

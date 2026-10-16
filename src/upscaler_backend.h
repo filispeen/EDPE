@@ -187,6 +187,17 @@ private:
     NvidiaUpscalerBackend nvidiaBackend_;
     AmdUpscalerBackend amdBackend_;
 
+    struct GpuTimingSlot {
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
+        Microsoft::WRL::ComPtr<ID3D11Query> start;
+        Microsoft::WRL::ComPtr<ID3D11Query> end;
+        bool inFlight = false;
+    };
+    static constexpr size_t kTimingRingSize = 4;
+    GpuTimingSlot timingRing_[kTimingRingSize]{};
+    size_t timingWriteIndex_ = 0;
+    float lastGpuTimeMs_ = 0.0f;
+
     UpscalerDiagnostics diagnostics_{};
 };
 

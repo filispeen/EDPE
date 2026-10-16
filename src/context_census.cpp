@@ -7,6 +7,7 @@
 #include "shader_probe.h"
 #include "temporal_math.h"
 #include "upscaler_backend.h"
+#include "ngx_context.h"
 #include "config.h"
 
 #include <DirectXPackedVector.h>
@@ -135,6 +136,11 @@ static bool s_camera_reset = false;
 static unsigned long long s_camera_frame = ~0ull;
 static unsigned long long s_camera_previous_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_depth_source;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_ldr_source;
+unsigned long long scene_ldr_frame = ~0ull;
+std::array<ID3D11Resource*, 4> s_gbuffer_resources{}; // Weak; compared within current frame only.
+std::atomic<UINT> s_observed_scene_width{0};
+std::atomic<UINT> s_observed_scene_height{0};
 unsigned long long motion_depth_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
@@ -1985,11 +1991,39 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
 
 static bool s_upscale_evaluated_this_frame = false;
 
-// Runs at Present, before the EDPE overlay, on the game's finished LDR
-// backbuffer (tone mapped, HUD included). Evaluating on MRT RTV3 at its first
-// unbind was wrong: RTV3 then only holds the emissive pass, and lighting is
-// composited into it later from the jittered G-buffer, so the presented image
-// was raw jittered output. See docs/render-pipeline-observations.md.
+bool isLdrSceneColorFormat(DXGI_FORMAT fmt) {
+    return fmt == DXGI_FORMAT_R8G8B8A8_UNORM ||
+           fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+           fmt == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+           fmt == DXGI_FORMAT_B8G8R8A8_UNORM ||
+           fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+           fmt == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+           fmt == DXGI_FORMAT_R10G10B10A2_UNORM ||
+           fmt == DXGI_FORMAT_R10G10B10A2_TYPELESS;
+}
+
+DXGI_FORMAT concreteLdrColorFormat(DXGI_FORMAT fmt) {
+    switch (fmt) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    default:
+        return fmt;
+    }
+}
+
+// Runs at Present, before the EDPE overlay.
+// - When render resolution == output resolution (DLAA), evaluates on the finished
+//   LDR backbuffer (tone mapped, HUD included).
+// - When render resolution < output resolution (DLSS Super Resolution via Cobra's
+//   SSAAMultiplier / Supersampling < 1.0), evaluates on the tone-mapped low-res LDR
+//   scene target (scene_ldr_source, renderWidth x renderHeight) and reconstructs
+//   into the native-resolution backbuffer (outputWidth x outputHeight).
 // `rendered` is the last_present_frame value seen while this frame rendered.
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered,
     ID3D11Texture2D* backbuffer) {
@@ -2007,59 +2041,89 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (s_last_missing_log == ~0ull || frame >= s_last_missing_log + 300) {
             s_last_missing_log = frame;
             wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: DLAA skipped frame=%llu (%ls)", frame, skip);
+            swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu (%ls)", frame, skip);
             EdpeLog(msg);
         }
         return;
     }
 
-    D3D11_TEXTURE2D_DESC colorDesc{};
-    backbuffer->GetDesc(&colorDesc);
-    if (!colorDesc.Width || !colorDesc.Height || colorDesc.SampleDesc.Count != 1) return;
+    D3D11_TEXTURE2D_DESC backbufferDesc{};
+    backbuffer->GetDesc(&backbufferDesc);
+    if (!backbufferDesc.Width || !backbufferDesc.Height || backbufferDesc.SampleDesc.Count != 1) return;
+
+    D3D11_TEXTURE2D_DESC depthDesc{};
+    scene_depth_source->GetDesc(&depthDesc);
+    if (!depthDesc.Width || !depthDesc.Height ||
+        depthDesc.Width > backbufferDesc.Width || depthDesc.Height > backbufferDesc.Height) {
+        return;
+    }
+
+    const bool isSubNative = (depthDesc.Width < backbufferDesc.Width ||
+                              depthDesc.Height < backbufferDesc.Height);
+    ID3D11Texture2D* colorSource = backbuffer;
+    if (isSubNative) {
+        if (!scene_ldr_source || scene_ldr_frame != rendered) {
+            s_camera_reset = true;
+            static unsigned long long s_last_ldr_log = ~0ull;
+            if (s_last_ldr_log == ~0ull || frame >= s_last_ldr_log + 300) {
+                s_last_ldr_log = frame;
+                wchar_t msg[192];
+                swprintf_s(msg, L"EDPE: DLSS SR skipped frame=%llu (low-res LDR scene target %ux%u not observed)",
+                    frame, depthDesc.Width, depthDesc.Height);
+                EdpeLog(msg);
+            }
+            return;
+        }
+        colorSource = scene_ldr_source.Get();
+    }
+
+    D3D11_TEXTURE2D_DESC srcColorDesc{};
+    colorSource->GetDesc(&srcColorDesc);
+    if (srcColorDesc.Width != depthDesc.Width || srcColorDesc.Height != depthDesc.Height) return;
 
     static unsigned long long s_last_exec_log = ~0ull;
     if (s_last_exec_log != frame && (s_last_exec_log == ~0ull || frame % 300 == 0)) {
         s_last_exec_log = frame;
-        wchar_t msg[160];
-        swprintf_s(msg, L"EDPE: tryTemporalUpscale executing frame=%llu size=%ux%u",
-            frame, colorDesc.Width, colorDesc.Height);
+        wchar_t msg[192];
+        swprintf_s(msg, L"EDPE: tryTemporalUpscale executing frame=%llu render=%ux%u output=%ux%u",
+            frame, depthDesc.Width, depthDesc.Height, backbufferDesc.Width, backbufferDesc.Height);
         EdpeLog(msg);
     }
-
-    D3D11_TEXTURE2D_DESC depthDesc{};
-    scene_depth_source->GetDesc(&depthDesc);
-    if (depthDesc.Width != colorDesc.Width || depthDesc.Height != colorDesc.Height) return;
 
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
     if (!device) return;
 
-    // Persistent copy of the backbuffer: NGX needs a shader-readable input that
-    // is not also the output, and swap-chain buffers may lack SHADER_INPUT.
+    const DXGI_FORMAT inputFormat = concreteLdrColorFormat(srcColorDesc.Format);
+
+    // Persistent copy of the input color texture with a concrete typed SRV format:
+    // NGX needs a shader-readable input that is not also the output, and swap-chain
+    // or typeless post-process buffers may fail NGX's internal default SRV creation.
     static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlaa_input;
     if (s_dlaa_input) {
         D3D11_TEXTURE2D_DESC cur{};
         s_dlaa_input->GetDesc(&cur);
-        if (cur.Width != colorDesc.Width || cur.Height != colorDesc.Height ||
-            cur.Format != colorDesc.Format) s_dlaa_input.Reset();
+        if (cur.Width != depthDesc.Width || cur.Height != depthDesc.Height ||
+            cur.Format != inputFormat) s_dlaa_input.Reset();
     }
     if (!s_dlaa_input) {
         D3D11_TEXTURE2D_DESC inDesc{};
-        inDesc.Width = colorDesc.Width;
-        inDesc.Height = colorDesc.Height;
+        inDesc.Width = depthDesc.Width;
+        inDesc.Height = depthDesc.Height;
         inDesc.MipLevels = inDesc.ArraySize = 1;
-        inDesc.Format = colorDesc.Format;
+        inDesc.Format = inputFormat;
         inDesc.SampleDesc.Count = 1;
         inDesc.Usage = D3D11_USAGE_DEFAULT;
         inDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input))) return;
         s_camera_reset = true;
-        wchar_t msg[128];
-        swprintf_s(msg, L"EDPE: DLAA input created %ux%u format=%u (backbuffer path)",
-            colorDesc.Width, colorDesc.Height, static_cast<unsigned>(colorDesc.Format));
+        wchar_t msg[160];
+        swprintf_s(msg, L"EDPE: temporal color input created %ux%u format=%u (%ls)",
+            depthDesc.Width, depthDesc.Height, static_cast<unsigned>(inputFormat),
+            isSubNative ? L"low-res LDR scene target" : L"native backbuffer");
         EdpeLog(msg);
     }
-    context->CopyResource(s_dlaa_input.Get(), backbuffer);
+    context->CopyResource(s_dlaa_input.Get(), colorSource);
 
     if (motion_depth) {
         D3D11_TEXTURE2D_DESC curDesc{};
@@ -2095,9 +2159,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
         motion_pass->clear(context);
     } else {
-        // Render motion vectors using current and previous camera projections
+        // Render motion vectors at render resolution using current and previous camera projections
         motion_pass->render(motion_depth_view.Get(),
-            s_camera_now, s_camera_previous, colorDesc.Width, colorDesc.Height);
+            s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height);
     }
 
     if (!motion_pass->output()) return;
@@ -2106,9 +2170,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     motion_pass->output()->GetResource(&motionRes);
     Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
     if (!motionRes || FAILED(motionRes.As(&motionTexture))) return;
-
-    // No bias mask: the emissive RTV3 copy is unbounded HDR, not the [0,1]
-    // current-colour bias NGX expects; using it made lights bypass history.
 
     float jx = 0.0f, jy = 0.0f, ndcx = 0.0f, ndcy = 0.0f;
     ContextCensusGetActiveJitter(&jx, &jy, &ndcx, &ndcy);
@@ -2135,10 +2196,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.color = s_dlaa_input.Get();
     inputs.depth = motion_depth.Get();
     inputs.motionVectors = motionTexture.Get();
-    inputs.renderWidth = colorDesc.Width;
-    inputs.renderHeight = colorDesc.Height;
-    inputs.outputWidth = colorDesc.Width;
-    inputs.outputHeight = colorDesc.Height;
+    inputs.renderWidth = depthDesc.Width;
+    inputs.renderHeight = depthDesc.Height;
+    inputs.outputWidth = backbufferDesc.Width;
+    inputs.outputHeight = backbufferDesc.Height;
     inputs.jitterX = jx;
     inputs.jitterY = jy;
     inputs.motionScaleX = mScaleX;
@@ -2147,7 +2208,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.reset = s_camera_reset || camera_gap;
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
-    inputs.colorIsHdr = false; // finished, tone-mapped backbuffer
+    inputs.colorIsHdr = false; // tone-mapped LDR scene or backbuffer
 
     if (upscaler.evaluate(context, inputs, nullptr, backbuffer)) {
         s_camera_reset = false;
@@ -2199,13 +2260,14 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     copyCameraDeltaSource(context);
     rearmHudDrawProbe();
     const bool reconstruction_active = edpe::UpscalerManager::instance().isReconstructionActive();
+    const auto current_frame = last_present_frame.load(std::memory_order_relaxed);
     if ((motion_pair_active || reconstruction_active) && motion_color_source &&
-        motion_color_frame == last_present_frame.load(std::memory_order_relaxed)) {
+        motion_color_frame == current_frame) {
         bool bound = false;
         for (UINT slot = 0; targets && slot < count; ++slot)
             bound |= sameRenderTargetResource(targets[slot], motion_color_source.Get());
         if (motion_color_bound && !bound) {
-            if (!motion_color_first_exit_logged) {
+            if (motion_pair_active && !motion_color_first_exit_logged) {
                 motion_color_first_exit_logged = true;
                 wchar_t message[160];
                 swprintf_s(message,
@@ -2217,6 +2279,39 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
         motion_color_bound = bound;
+
+        if (bound) {
+            scene_ldr_source.Reset();
+            scene_ldr_frame = ~0ull;
+        } else if (count >= 1 && targets && targets[0]) {
+            const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
+            const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
+            if (sceneW > 0 && sceneH > 0) {
+                ID3D11Resource* res0 = nullptr;
+                targets[0]->GetResource(&res0);
+                if (res0) {
+                    const bool isGbuffer =
+                        res0 == s_gbuffer_resources[0] ||
+                        res0 == s_gbuffer_resources[1] ||
+                        res0 == s_gbuffer_resources[2] ||
+                        res0 == s_gbuffer_resources[3];
+                    if (!isGbuffer) {
+                        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex0;
+                        if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D),
+                                reinterpret_cast<void**>(tex0.GetAddressOf())))) {
+                            D3D11_TEXTURE2D_DESC td{};
+                            tex0->GetDesc(&td);
+                            if (td.Width == sceneW && td.Height == sceneH &&
+                                td.SampleDesc.Count == 1 && isLdrSceneColorFormat(td.Format)) {
+                                scene_ldr_source = tex0;
+                                scene_ldr_frame = current_frame;
+                            }
+                        }
+                    }
+                    res0->Release();
+                }
+            }
+        }
     }
     if (!dsv) {
         if (sequence_active.load(std::memory_order_acquire)) {
@@ -2238,21 +2333,37 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
 
     bool hud_probe_begin = false;
-    if (scene_mrt && reconstruction_active) {
-        const auto frame = last_present_frame.load(std::memory_order_relaxed);
-        motion_color_source = targets[3];
-        motion_color_frame = frame;
-        motion_color_bound = true;
-        hud_probe_begin = true;
+    if (scene_mrt) {
+        for (UINT slot = 0; slot < 4; ++slot) {
+            ID3D11Resource* gbRes = nullptr;
+            targets[slot]->GetResource(&gbRes);
+            s_gbuffer_resources[slot] = gbRes;
+            if (gbRes) gbRes->Release();
+        }
+        scene_ldr_source.Reset();
+        scene_ldr_frame = ~0ull;
 
-        if (dsv) {
-            ID3D11Resource* dsv_res = nullptr;
-            dsv->GetResource(&dsv_res);
-            if (dsv_res) {
-                dsv_res->QueryInterface(__uuidof(ID3D11Texture2D),
-                    reinterpret_cast<void**>(scene_depth_source.ReleaseAndGetAddressOf()));
-                dsv_res->Release();
+        ID3D11Resource* dsv_res = nullptr;
+        dsv->GetResource(&dsv_res);
+        if (dsv_res) {
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> depthTex;
+            if (SUCCEEDED(dsv_res->QueryInterface(__uuidof(ID3D11Texture2D),
+                    reinterpret_cast<void**>(depthTex.GetAddressOf())))) {
+                D3D11_TEXTURE2D_DESC dd{};
+                depthTex->GetDesc(&dd);
+                if (dd.Format == DXGI_FORMAT_R32G8X24_TYPELESS && dd.SampleDesc.Count == 1) {
+                    scene_depth_source = depthTex;
+                    s_observed_scene_width.store(dd.Width, std::memory_order_relaxed);
+                    s_observed_scene_height.store(dd.Height, std::memory_order_relaxed);
+                }
             }
+            dsv_res->Release();
+        }
+
+        if (reconstruction_active) {
+            motion_color_source = targets[3];
+            motion_color_frame = current_frame;
+            motion_color_bound = true;
         }
     }
 
@@ -2276,27 +2387,13 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         ++seen[index].interval_binds;
         if (seen[index].texture_format == DXGI_FORMAT_R32G8X24_TYPELESS &&
             seen[index].samples == 1) {
-            const auto frame = last_present_frame.load(std::memory_order_relaxed);
+            const auto frame = current_frame;
             if (seen[index].mrt_frame != frame) {
                 seen[index].mrt_hdr_view = nullptr;
                 seen[index].mrt_frame = frame;
             }
             if (scene_mrt) {
                 seen[index].mrt_hdr_view = targets[3];
-                if (edpe::UpscalerManager::instance().isReconstructionActive()) {
-                    motion_color_source = targets[3];
-                    motion_color_frame = frame;
-                    motion_color_bound = true;
-                    hud_probe_begin = true;
-
-                    ID3D11Resource* dsv_res = nullptr;
-                    dsv->GetResource(&dsv_res);
-                    if (dsv_res) {
-                        dsv_res->QueryInterface(__uuidof(ID3D11Texture2D),
-                            reinterpret_cast<void**>(scene_depth_source.ReleaseAndGetAddressOf()));
-                        dsv_res->Release();
-                    }
-                }
             } else if (seen[index].mrt_hdr_view && count && targets &&
                 targets[0] == seen[index].mrt_hdr_view)
                 seen[index].scene_match_frame = frame;
@@ -2470,12 +2567,14 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_motion_invert_x.store(cfg.motionInvertX, std::memory_order_relaxed);
         s_motion_invert_y.store(cfg.motionInvertY, std::memory_order_relaxed);
         s_motion_scale.store(cfg.motionScale, std::memory_order_relaxed);
+        edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
 
         if (cfg.upscalerBackend == 1) {
             auto& upscaler = edpe::UpscalerManager::instance();
             if (upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss)) {
                 upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
-                upscaler.setMode(edpe::UpscaleMode::NativeAA);
+                const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
+                upscaler.setMode(static_cast<edpe::UpscaleMode>(m));
             }
         }
     }
@@ -2613,14 +2712,25 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         motion_color_first_exit_logged = false;
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
+        UINT outW = 0, outH = 0;
         DXGI_SWAP_CHAIN_DESC sc_desc{};
         if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
-            active_render_width = sc_desc.BufferDesc.Width;
-            active_render_height = sc_desc.BufferDesc.Height;
+            outW = sc_desc.BufferDesc.Width;
+            outH = sc_desc.BufferDesc.Height;
         }
+        const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
+        const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
+        active_render_width = (sceneW > 0 && (!outW || sceneW <= outW)) ? sceneW : outW;
+        active_render_height = (sceneH > 0 && (!outH || sceneH <= outH)) ? sceneH : outH;
         if (active_render_width && active_render_height) {
             std::lock_guard lock(jitter_mutex);
-            const unsigned phases = s_jitter_phase_count.load(std::memory_order_relaxed);
+            const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
+            unsigned phases = base_phases;
+            if (outW > active_render_width && active_render_width > 0) {
+                const float upscaleRatio = static_cast<float>(outW) / static_cast<float>(active_render_width);
+                phases = static_cast<unsigned>(std::clamp(
+                    std::lround(static_cast<float>(base_phases) * upscaleRatio * upscaleRatio), 8l, 256l));
+            }
             auto jitter = edpe::projectionJitter(frame, active_render_width, active_render_height, phases);
             const float scale = s_jitter_scale.load(std::memory_order_relaxed);
             jitter.pixelX *= scale;
@@ -2906,6 +3016,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_depth.Reset();
         motion_depth_view.Reset();
         scene_depth_source.Reset();
+        scene_ldr_source.Reset();
+        scene_ldr_frame = ~0ull;
+        s_gbuffer_resources = {};
+        s_observed_scene_width.store(0, std::memory_order_relaxed);
+        s_observed_scene_height.store(0, std::memory_order_relaxed);
         motion_color_source.Reset();
         motion_color_view.Reset();
         motion_color_snapshot.Reset();
@@ -3099,6 +3214,11 @@ void ContextCensusSetMotionScale(float scale) {
 }
 float ContextCensusGetMotionScale() {
     return s_motion_scale.load(std::memory_order_relaxed);
+}
+
+void ContextCensusGetSceneRenderSize(UINT* outWidth, UINT* outHeight) {
+    if (outWidth) *outWidth = s_observed_scene_width.load(std::memory_order_relaxed);
+    if (outHeight) *outHeight = s_observed_scene_height.load(std::memory_order_relaxed);
 }
 
 

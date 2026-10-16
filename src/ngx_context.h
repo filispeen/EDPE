@@ -57,6 +57,17 @@ namespace edpe {
 //   (b) All Elite input conventions are verified (see nvidia-dlaa-input-contract.md).
 
 struct NvidiaDlssInputParams;
+enum class UpscaleMode : uint32_t;
+
+struct DlssOptimalSettings {
+    uint32_t optimalWidth = 0;
+    uint32_t optimalHeight = 0;
+    uint32_t minWidth = 0;
+    uint32_t minHeight = 0;
+    uint32_t maxWidth = 0;
+    uint32_t maxHeight = 0;
+    bool supported = false;
+};
 
 // NGX context management.
 // Handles NVIDIA DLSS Super Resolution and DLAA initialization, evaluation,
@@ -72,6 +83,10 @@ public:
     static uint32_t get_quality_mode();
     static void set_quality_mode(uint32_t mode);
 
+    // Preset values: 0 = Auto (Preset K), 10 = Preset J, 11 = Preset K, 12 = Preset L, 13 = Preset M
+    static uint32_t get_preset();
+    static void set_preset(uint32_t preset);
+
     static uint32_t get_render_width();
     static uint32_t get_render_height();
     static uint32_t get_output_width();
@@ -80,11 +95,32 @@ public:
     static bool reset_requested();
     static void set_reset_requested(bool reset);
 
+    static bool queryOptimalSettings(uint32_t outputWidth, uint32_t outputHeight,
+        UpscaleMode mode, DlssOptimalSettings* outSettings);
+
     // Feature lifecycle
+    static bool ensureDlssFeature(ID3D11DeviceContext* context,
+        uint32_t renderWidth, uint32_t renderHeight,
+        uint32_t outputWidth, uint32_t outputHeight,
+        UpscaleMode mode, bool isHdr = false, uint32_t preset = 0);
     static bool ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height, bool isHdr = false);
     static void releaseFeature();
 
     // Evaluation
+    static bool evaluateDlss(ID3D11DeviceContext* context,
+        const NvidiaDlssInputParams& params,
+        ID3D11Resource* colorIn,
+        ID3D11Resource* outputUav,
+        ID3D11Resource* depthIn,
+        ID3D11Resource* motionIn,
+        ID3D11Resource* reactiveMaskIn,
+        uint32_t renderWidth,
+        uint32_t renderHeight,
+        uint32_t outputWidth,
+        uint32_t outputHeight,
+        UpscaleMode mode,
+        uint32_t preset = 0);
+
     static bool evaluateDlaa(ID3D11DeviceContext* context,
         const NvidiaDlssInputParams& params,
         ID3D11Resource* colorIn,

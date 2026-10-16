@@ -1,3 +1,4 @@
+#include "config.h"
 #include "log.h"
 #include "shader_probe.h"
 #include "system_dll.h"
@@ -116,6 +117,13 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
     ID3D11Device** device,
     D3D_FEATURE_LEVEL* feature_level,
     ID3D11DeviceContext** context) {
+    static bool s_synced = false;
+    if (!s_synced) {
+        s_synced = true;
+        auto& cfg = edpe::Config::instance();
+        cfg.load();
+        cfg.syncEliteGraphicsConfig();
+    }
     static const HMODULE system_d3d11 = LoadSystemDll(L"d3d11.dll");
     if (!system_d3d11) return HRESULT_FROM_WIN32(GetLastError());
 

@@ -52,3 +52,4 @@ void ContextCensusSetMotionInvertY(bool invert);
 bool ContextCensusGetMotionInvertY();
 void ContextCensusSetMotionScale(float scale);
 float ContextCensusGetMotionScale();
+void ContextCensusGetSceneRenderSize(UINT* outWidth, UINT* outHeight);

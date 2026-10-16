@@ -1,3 +1,4 @@
+#include "config.h"
 #include "log.h"
 #include "system_dll.h"
 
@@ -6,7 +7,24 @@
 
 void ObserveDxgiFactory(REFIID iid, void* factory);
 
+namespace {
+void syncConfigOnce() {
+    static bool s_synced = false;
+    if (s_synced) return;
+    s_synced = true;
+    auto& cfg = edpe::Config::instance();
+    cfg.load();
+    if (cfg.syncEliteGraphicsConfig()) {
+        wchar_t msg[160]{};
+        swprintf_s(msg, L"EDPE: synced Elite graphics config (SSAAMultiplier=%.6f)",
+            edpe::Config::getTargetSsaaMultiplier(cfg.upscalerBackend, cfg.upscaleMode));
+        EdpeLog(msg);
+    }
+}
+} // namespace
+
 extern "C" HRESULT WINAPI EdpeCreateDXGIFactory1(REFIID iid, void** factory) {
+    syncConfigOnce();
     static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
     if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());
 
@@ -22,6 +40,7 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory1(REFIID iid, void** factory) {
 }
 
 extern "C" HRESULT WINAPI EdpeCreateDXGIFactory2(UINT flags, REFIID iid, void** factory) {
+    syncConfigOnce();
     static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
     if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());
 
