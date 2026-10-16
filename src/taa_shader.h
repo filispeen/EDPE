@@ -140,13 +140,6 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 mean = m1 / totalW;
     float3 sigma = sqrt(max(0.0, m2 / totalW - mean * mean));
 
-    // Gamma = 1.75 allows subpixel temporal integration without choking/pulsing on edges
-    float3 varMin = mean - 1.75 * sigma;
-    float3 varMax = mean + 1.75 * sigma;
-
-    float3 finalMin = max(boxMin, varMin);
-    float3 finalMax = min(boxMax, varMax);
-
     // 3. Motion vector and depth evaluation
     float rawDepth = sceneDepth.SampleLevel(pointSampler, uv, 0).r;
     float2 mvPixels = motionVectors.SampleLevel(pointSampler, uv, 0).xy;
@@ -160,6 +153,18 @@ float4 ps_main(VSOutput pin) : SV_Target {
     if (isCockpit) {
         mvPixels = float2(0.0, 0.0);
     }
+    float speed = length(mvPixels);
+
+    // Dynamic variance box scale:
+    // When stationary (speed near 0), gamma = 2.25 allows subpixel Halton jitter phases
+    // to accumulate cleanly into temporal history without clipping fine station geometry or stars.
+    // When moving, gamma smoothly tightens to 1.5 to aggressively prevent ghosting.
+    float gamma = lerp(2.25, 1.5, saturate(speed * 0.25));
+    float3 varMin = mean - gamma * sigma;
+    float3 varMax = mean + gamma * sigma;
+
+    float3 finalMin = max(boxMin, varMin);
+    float3 finalMax = min(boxMax, varMax);
 
     float2 priorUv = uv + mvPixels * resolution.zw;
     bool isOffscreen = (priorUv.x < 0.0 || priorUv.x > 1.0 || priorUv.y < 0.0 || priorUv.y > 1.0);
@@ -180,17 +185,16 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // 6. Velocity / Disocclusion / UI Confidence
     // If the reprojected history differed drastically from the current neighborhood
     // (e.g. holographic UI drawn over moving space, or an occluded edge),
-    // clampDistance is large. Drop history weight to 0 to preserve the crisp UI!
+    // clampDistance is large. Scale history confidence smoothly without harsh cliff-drops.
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
-    float historyConfidence = 1.0 / (1.0 + clampDistance * 6.0);
+    float historyConfidence = 1.0 / (1.0 + clampDistance * 4.0);
 
     // Base blend weight: 0.90 for static/smooth, lower when high speed
     float blendWeight = clamp(params.z, 0.0, 0.95);
-    float speed = length(mvPixels);
     blendWeight = lerp(blendWeight, 0.70, saturate(speed * 0.05));
 
-    // Dynamic blend weight drops to 0 when history confidence is low
-    float dynamicBlend = blendWeight * (historyConfidence * historyConfidence);
+    // Dynamic blend weight
+    float dynamicBlend = blendWeight * historyConfidence;
 
     // 7. Karis luma weighting during accumulation
     // Suppresses high-contrast specular pulsing on stars and glowing lights

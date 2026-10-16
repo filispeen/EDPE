@@ -137,6 +137,35 @@ static edpe::CameraProjection s_camera_now{};
 static bool s_camera_reset = false;
 static unsigned long long s_camera_frame = ~0ull;
 static unsigned long long s_camera_previous_frame = ~0ull;
+static edpe::CameraProjection s_latest_unmapped_camera{};
+static unsigned long long s_latest_unmapped_camera_frame = ~0ull;
+static bool s_latest_unmapped_camera_valid = false;
+static std::atomic<bool> s_inside_main_scene{false};
+
+inline bool isCanopyReflectionCamera(const edpe::CameraProjection& candidate, const edpe::CameraProjection& baseline) {
+    if (baseline.scaleX <= 0.0f) return false;
+    const float* c = candidate.worldFromView;
+    const float* b = baseline.worldFromView;
+    const float dx = c[3] - b[3];
+    const float dy = c[7] - b[7];
+    const float dz = c[11] - b[11];
+    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    // In Elite Dangerous Odyssey, the cockpit canopy planar reflection camera
+    // is consistently positioned at an offset of ~0.1364m (13.6 cm) relative to the player eye camera.
+    return std::fabs(dist - 0.136392f) < 0.02f;
+}
+
+inline void updateMainCamera(const edpe::CameraProjection& camera, unsigned long long cur_frame) {
+    if (s_camera_frame == ~0ull) {
+        s_camera_previous = camera;
+        s_camera_previous_frame = cur_frame;
+    } else {
+        s_camera_previous = s_camera_now;
+        s_camera_previous_frame = s_camera_frame;
+    }
+    s_camera_now = camera;
+    s_camera_frame = cur_frame;
+}
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_depth_source;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_ldr_source;
 unsigned long long scene_ldr_frame = ~0ull;
@@ -964,20 +993,28 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             scene_last_projection_hash.store(projection, std::memory_order_relaxed);
 
             // Track the unjittered main-view camera for the motion pass.
-            // Latch the first valid camera per frame so later sub-view/panel
-            // writes cannot overwrite it.
+            // Filter out canopy planar reflection sub-cameras (13.6 cm offset) and only latch
+            // authoritative primary scene cameras.
             edpe::CameraProjection parsed_camera{};
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
-            if (s_camera_frame != cur_frame &&
-                edpe::parseEliteCamera(static_cast<const float*>(mapped_ptr), 5376 / sizeof(float), &parsed_camera)) {
-                s_camera_previous = s_camera_now;
-                s_camera_previous_frame = s_camera_frame;
-                s_camera_now = parsed_camera;
-                s_camera_frame = cur_frame;
+            bool is_reflection = false;
+            if (edpe::parseEliteCamera(static_cast<const float*>(mapped_ptr), 5376 / sizeof(float), &parsed_camera)) {
+                is_reflection = isCanopyReflectionCamera(parsed_camera, s_camera_now);
+                if (!is_reflection) {
+                    s_latest_unmapped_camera = parsed_camera;
+                    s_latest_unmapped_camera_frame = cur_frame;
+                    s_latest_unmapped_camera_valid = true;
+
+                    // If main scene G-buffer pass is actively bound, latch immediately
+                    if (s_inside_main_scene.load(std::memory_order_acquire) && s_camera_frame != cur_frame) {
+                        updateMainCamera(parsed_camera, cur_frame);
+                    }
+                }
             }
 
             // Phase 5: Projection jitter injection into words 1080..1095
-            if (ContextCensusIsJitterActive()) {
+            // Only inject jitter into primary scene camera projections; do not jitter reflection probes!
+            if (!is_reflection && ContextCensusIsJitterActive()) {
                 float* words = static_cast<float*>(mapped_ptr);
                 bool valid_projection = true;
                 for (size_t i = 1080; i < 1096; ++i) {
@@ -2044,7 +2081,13 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const wchar_t* skip = nullptr;
     if (!motion_color_source || !scene_depth_source) skip = L"scene color/depth not observed";
     else if (motion_color_frame != rendered) skip = L"no scene MRT pass this frame";
-    else if (s_camera_frame != rendered) skip = L"no main camera latched this frame";
+    else if (s_camera_frame != rendered) {
+        if (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered) {
+            updateMainCamera(s_latest_unmapped_camera, rendered);
+        } else {
+            skip = L"no main camera latched this frame";
+        }
+    }
     if (skip) {
         s_camera_reset = true; // history is stale once a frame is missed
         static unsigned long long s_last_missing_log = ~0ull;
@@ -2506,6 +2549,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         }
 
         if (is_main_scene) {
+            s_inside_main_scene.store(true, std::memory_order_release);
             for (UINT slot = 0; slot < 4; ++slot) {
                 ID3D11Resource* gbRes = nullptr;
                 targets[slot]->GetResource(&gbRes);
@@ -2520,6 +2564,13 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 motion_color_frame = current_frame;
                 motion_color_bound = true;
             }
+
+            if (s_camera_frame != current_frame && s_latest_unmapped_camera_valid &&
+                s_latest_unmapped_camera_frame == current_frame) {
+                updateMainCamera(s_latest_unmapped_camera, current_frame);
+            }
+        } else {
+            s_inside_main_scene.store(false, std::memory_order_release);
         }
     }
 
@@ -2738,6 +2789,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             }
         }
     }
+    s_inside_main_scene.store(false, std::memory_order_release);
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         auto* context = observed_context.load(std::memory_order_acquire);
         endHudDrawProbe();
