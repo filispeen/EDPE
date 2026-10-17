@@ -31,6 +31,11 @@ public:
         autoSyncEliteConfig = GetPrivateProfileIntW(L"Upscaler", L"AutoSyncEliteConfig", 1, path.c_str()) != 0;
         preserveNativeUi = GetPrivateProfileIntW(L"Upscaler", L"PreserveNativeUi", 1, path.c_str()) != 0;
 
+        wchar_t sharpnessBuf[64]{};
+        GetPrivateProfileStringW(L"Upscaler", L"Sharpness", L"0.0", sharpnessBuf, 64, path.c_str());
+        sharpness = static_cast<float>(_wtof(sharpnessBuf));
+        if (sharpness < 0.0f || sharpness > 1.0f) sharpness = 0.0f;
+
         jitterInvertX = GetPrivateProfileIntW(L"Jitter", L"InvertX", 0, path.c_str()) != 0;
         jitterInvertY = GetPrivateProfileIntW(L"Jitter", L"InvertY", 0, path.c_str()) != 0;
         jitterSwapXY = GetPrivateProfileIntW(L"Jitter", L"SwapXY", 0, path.c_str()) != 0;
@@ -73,6 +78,10 @@ public:
         WritePrivateProfileStringW(L"Upscaler", L"Preset", std::to_wstring(dlssPreset).c_str(), path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"AutoSyncEliteConfig", autoSyncEliteConfig ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"PreserveNativeUi", preserveNativeUi ? L"1" : L"0", path.c_str());
+
+        wchar_t sharpnessBuf[64]{};
+        swprintf_s(sharpnessBuf, L"%.2f", sharpness);
+        WritePrivateProfileStringW(L"Upscaler", L"Sharpness", sharpnessBuf, path.c_str());
 
         WritePrivateProfileStringW(L"Jitter", L"InvertX", jitterInvertX ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"InvertY", jitterInvertY ? L"1" : L"0", path.c_str());
@@ -186,6 +195,7 @@ public:
     int upscalerBackend = 0;
     int upscaleMode = 0;
     int dlssPreset = 0; // 0=Auto(K), 10=J, 11=K, 12=L, 13=M
+    float sharpness = 0.0f;
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;
 

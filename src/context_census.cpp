@@ -2434,6 +2434,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.reset = s_camera_reset || scene_cut;
     inputs.cameraNow = s_camera_now;
     inputs.cameraPrevious = s_camera_previous;
+    inputs.sharpness = edpe::Config::instance().sharpness;
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
     inputs.colorIsHdr = false;

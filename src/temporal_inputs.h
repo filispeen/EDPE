@@ -140,8 +140,7 @@ struct TemporalFrameInputs {
 
     // Elapsed frame delta time in milliseconds.
     float frameTimeMs = 0.0f;
-
-    // Camera discontinuity / scene cut / history invalidation flag.
+    float sharpness = 0.0f;
     bool reset = false;
 
     // Camera projection states (current and previous frame).
@@ -246,6 +245,7 @@ struct AmdFsrInputParams {
     float jitterY = 0.0f;
     float motionVectorScaleX = 1.0f;  // Screen pixel scale
     float motionVectorScaleY = 1.0f;
+    float sharpness = 0.0f;
     bool depthInverted = true;        // FFX_FSR_ENABLE_DEPTH_INVERTED
     bool depthInfinite = true;        // FFX_FSR_ENABLE_DEPTH_INFINITE
     bool reset = false;               // reset flag on camera jump
@@ -275,6 +275,7 @@ inline bool translateToAmd(const TemporalFrameInputs& inputs,
 
     outParams->reset = inputs.reset;
     outParams->frameTimeDeltaMs = inputs.frameTimeMs;
+    outParams->sharpness = inputs.sharpness;
     return true;
 }
 

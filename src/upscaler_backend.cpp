@@ -427,8 +427,8 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.upscaleSize.width = inputs.outputWidth;
     dispatchDesc.upscaleSize.height = inputs.outputHeight;
 
-    dispatchDesc.enableSharpening = false;
-    dispatchDesc.sharpness = 0.0f;
+    dispatchDesc.enableSharpening = params.sharpness > 0.0f;
+    dispatchDesc.sharpness = std::clamp(params.sharpness, 0.0f, 1.0f);
     dispatchDesc.frameTimeDelta = params.frameTimeDeltaMs > 0.0f ? params.frameTimeDeltaMs : 16.6f;
     dispatchDesc.preExposure = 1.0f;
     dispatchDesc.reset = params.reset || impl_->resetRequested;
