@@ -138,10 +138,17 @@ static edpe::CameraProjection s_camera_now{};
 static bool s_camera_reset = false;
 static unsigned long long s_camera_frame = ~0ull;
 static unsigned long long s_camera_previous_frame = ~0ull;
+static unsigned long long s_in_scene_camera_latched_frame = ~0ull;
+static unsigned long long s_hdr_slot0_seen_frame = ~0ull;
+static unsigned s_consecutive_skipped_frames = 0;
+static unsigned s_auxiliary_rejection_streak = 0;
+static edpe::CameraProjection s_fallback_unmapped_camera{};
+static unsigned long long s_fallback_unmapped_camera_frame = ~0ull;
 static edpe::CameraProjection s_latest_unmapped_camera{};
 static unsigned long long s_latest_unmapped_camera_frame = ~0ull;
 static bool s_latest_unmapped_camera_valid = false;
 static std::atomic<bool> s_inside_main_scene{false};
+static std::atomic<bool> s_in_edpe_present{false};
 static edpe::ProjectionJitter s_injected_jitter{};
 static unsigned long long s_jitter_injected_frame = ~0ull;
 static edpe::ProjectionJitter s_last_rendered_jitter{};
@@ -173,9 +180,15 @@ inline bool isReflectionOrAuxiliaryCamera(const edpe::CameraProjection& candidat
     const float det = cameraRotationDeterminant(candidate);
     if (det < 0.5f) return true;
 
-    if (baseline.scaleX <= 0.0f) return false;
+    if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) return false;
 
-    // 2. Proximity to active baseline with abrupt orientation difference:
+    // 2. Projection FOV / scale mismatch against active main camera:
+    if (std::fabs(candidate.scaleX - baseline.scaleX) > 0.01f * baseline.scaleX ||
+        std::fabs(candidate.scaleY - baseline.scaleY) > 0.01f * baseline.scaleY) {
+        return true;
+    }
+
+    // 3. Discontinuous single-frame orientation or probe offset relative to active baseline:
     const float* c = candidate.worldFromView;
     const float* b = baseline.worldFromView;
     const float dx = c[3] - b[3];
@@ -184,8 +197,13 @@ inline bool isReflectionOrAuxiliaryCamera(const edpe::CameraProjection& candidat
     const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
     const float rotTrace = cameraRotationTrace(candidate, baseline);
 
-    // Auxiliary mirror / panel camera near baseline with abrupt orientation difference (> 45 deg):
-    if (dist < 5.0f && rotTrace < 2.40f) {
+    // Abrupt single-frame orientation jump (> 45 deg, rotTrace < 2.40) at any distance is an auxiliary/probe camera:
+    if (rotTrace < 2.40f) {
+        return true;
+    }
+
+    // Auxiliary mirror / panel / probe camera with combined orientation (> 18 deg) and position jump:
+    if (dist > 0.05f && rotTrace < 2.90f) {
         return true;
     }
 
@@ -196,7 +214,7 @@ inline void updateMainCamera(const edpe::CameraProjection& camera, unsigned long
     if (s_camera_frame == ~0ull) {
         s_camera_previous = camera;
         s_camera_previous_frame = cur_frame;
-    } else {
+    } else if (s_camera_frame != cur_frame) {
         s_camera_previous = s_camera_now;
         s_camera_previous_frame = s_camera_frame;
     }
@@ -352,7 +370,8 @@ std::atomic<bool> s_jitter_invert_x{false};
 std::atomic<bool> s_jitter_invert_y{false};
 std::atomic<bool> s_jitter_swap_xy{false};
 std::atomic<float> s_jitter_scale{1.0f};
-std::atomic<unsigned> s_jitter_phase_count{8};
+std::atomic<unsigned> s_jitter_phase_count{32};
+std::atomic<unsigned> s_active_jitter_phases{32};
 std::atomic<bool> s_preserve_native_ui{true};
 
 std::atomic<bool> s_zero_motion_vectors{false};
@@ -969,6 +988,7 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
     UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
     const HRESULT result = original_map.load(std::memory_order_acquire)(
         context, resource, subresource, type, flags, mapped);
+    if (s_in_edpe_present.load(std::memory_order_acquire)) return result;
     if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
         resource && map_hook_active.load(std::memory_order_acquire)) {
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
@@ -1009,7 +1029,8 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
 
 void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource) {
-    if (context == observed_context.load(std::memory_order_acquire) &&
+    if (!s_in_edpe_present.load(std::memory_order_acquire) &&
+        context == observed_context.load(std::memory_order_acquire) &&
         resource == scene_map_target.load(std::memory_order_acquire) &&
         unmap_hook_active.load(std::memory_order_acquire)) {
         scene_unmaps.fetch_add(1, std::memory_order_relaxed);
@@ -1036,9 +1057,10 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
 
             // Track the unjittered main-view camera for the motion pass.
             // Filter out canopy planar reflections and auxiliary sub-cameras,
-            // latching only authoritative primary scene cameras.
+            // latching only authoritative primary scene cameras once per frame.
             edpe::CameraProjection parsed_camera{};
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+            const bool in_main_scene = s_inside_main_scene.load(std::memory_order_acquire);
             bool is_reflection = false;
             bool is_main_camera = false;
             bool aspect_ok = false;
@@ -1047,34 +1069,31 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
                 aspect_ok = isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH);
                 is_reflection = isReflectionOrAuxiliaryCamera(parsed_camera, s_camera_now);
-                if (is_reflection) {
-                    static unsigned long long s_last_refl_log = ~0ull;
-                    if (s_last_refl_log == ~0ull || cur_frame >= s_last_refl_log + 120) {
-                        s_last_refl_log = cur_frame;
-                        wchar_t rmsg[192];
-                        swprintf_s(rmsg, L"EDPE: camera filtered as reflection/auxiliary frame=%llu pos=(%.4f,%.4f,%.4f)",
-                            cur_frame, parsed_camera.worldFromView[3], parsed_camera.worldFromView[7], parsed_camera.worldFromView[11]);
-                        EdpeLog(rmsg);
-                    }
-                }
                 if (aspect_ok) {
-                    if (s_inside_main_scene.load(std::memory_order_acquire)) {
+                    if (!is_reflection) {
                         is_main_camera = true;
-                        updateMainCamera(parsed_camera, cur_frame);
-                    } else if (!is_reflection) {
-                        is_main_camera = true;
-                        if (s_camera_frame != cur_frame) {
+                        s_auxiliary_rejection_streak = 0;
+                        if (in_main_scene) {
+                            if (s_in_scene_camera_latched_frame != cur_frame) {
+                                updateMainCamera(parsed_camera, cur_frame);
+                                s_in_scene_camera_latched_frame = cur_frame;
+                            }
+                        } else if (s_camera_frame != cur_frame) {
                             s_latest_unmapped_camera = parsed_camera;
                             s_latest_unmapped_camera_frame = cur_frame;
                             s_latest_unmapped_camera_valid = true;
                         }
+                    } else if (cameraRotationDeterminant(parsed_camera) >= 0.5f && in_main_scene) {
+                        s_fallback_unmapped_camera = parsed_camera;
+                        s_fallback_unmapped_camera_frame = cur_frame;
                     }
                 }
             }
 
             // Phase 5: Projection jitter injection into words 1080..1095
-            // Inject jitter into all scene camera projections matching the display aspect ratio
-            if ((is_main_camera || aspect_ok) && ContextCensusIsJitterActive()) {
+            // Inject jitter into all non-reflection scene camera projections matching the display aspect ratio
+            const bool is_planar_reflection = aspect_ok && (cameraRotationDeterminant(parsed_camera) < 0.5f);
+            if ((is_main_camera || (aspect_ok && !is_planar_reflection)) && ContextCensusIsJitterActive()) {
                 float* words = static_cast<float*>(mapped_ptr);
                 bool valid_projection = true;
                 for (size_t i = 1080; i < 1096; ++i) {
@@ -1104,7 +1123,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         s_injected_jitter = jitter;
                         s_jitter_injected_frame = cur_frame;
                         const unsigned count = jittered_writes_count.fetch_add(1, std::memory_order_relaxed) + 1;
-                        if (count == 1 || count % 1024 == 0) {
+                        if (count == 1) {
                             edpe::NdcOffset verified_offset{};
                             edpe::estimateEliteBlockNdcOffset(&words[1080], &verified_offset);
                             wchar_t msg[256];
@@ -1600,6 +1619,7 @@ void logCameraDelta(unsigned long long frame, bool parsed, const edpe::CameraPro
 
 // Called at the first scene-MRT bind of a frame: retain the VS slot-1 buffer.
 void takeCameraDeltaSource(ID3D11DeviceContext* context, unsigned long long frame) {
+    if (edpe::UpscalerManager::instance().isReconstructionActive()) return;
     if (camera_delta_disabled || camera_delta_source || camera_delta_taken_frame == frame) return;
     camera_delta_taken_frame = frame;
     ID3D11Buffer* buffer = nullptr;
@@ -2146,9 +2166,13 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     else if (s_camera_frame != rendered) {
         if (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered) {
             updateMainCamera(s_latest_unmapped_camera, rendered);
+        } else if (s_fallback_unmapped_camera_frame == rendered && ++s_auxiliary_rejection_streak >= 3) {
+            // Genuine camera cut persisted across >= 3 frames (e.g. external camera switch):
+            updateMainCamera(s_fallback_unmapped_camera, rendered);
+            s_auxiliary_rejection_streak = 0;
         } else if (s_camera_now.scaleX > 0.0f) {
-            // Camera was not unmapped this frame (e.g. stationary cockpit).
-            // Retain previous camera smoothly without resetting DLSS temporal history!
+            // Camera was not unmapped or only a 1-frame auxiliary probe ran this frame.
+            // Retain previous camera smoothly without resetting temporal history!
             s_camera_previous = s_camera_now;
             s_camera_previous_frame = s_camera_frame;
             s_camera_frame = rendered;
@@ -2157,13 +2181,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
     }
     if (skip) {
-        s_camera_reset = true; // history is stale once a frame is missed
-        static unsigned long long s_last_missing_log = ~0ull;
-        if (s_last_missing_log == ~0ull || frame >= s_last_missing_log + 300) {
-            s_last_missing_log = frame;
-            wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu (%ls)", frame, skip);
-            EdpeLog(msg);
+        if (++s_consecutive_skipped_frames > 2) {
+            s_camera_reset = true;
         }
         return;
     }
@@ -2184,22 +2203,17 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     upscaler.setMode(isSubNative ? edpe::selectModeByRatio(depthDesc.Width, backbufferDesc.Width)
                                  : edpe::UpscaleMode::NativeAA);
     ID3D11Texture2D* colorSource = nullptr;
-    if (isSubNative && scene_ldr_source && scene_ldr_frame == rendered) {
+    if (isSubNative && scene_ldr_source) {
         colorSource = scene_ldr_source.Get();
     } else if (!isSubNative) {
         colorSource = backbuffer;
     } else {
-        s_camera_reset = true;
-        static unsigned long long s_last_ldr_log = ~0ull;
-        if (s_last_ldr_log == ~0ull || frame >= s_last_ldr_log + 300) {
-            s_last_ldr_log = frame;
-            wchar_t msg[192];
-            swprintf_s(msg, L"EDPE: DLSS SR skipped frame=%llu (low-res LDR scene target %ux%u not observed)",
-                frame, depthDesc.Width, depthDesc.Height);
-            EdpeLog(msg);
+        if (++s_consecutive_skipped_frames > 2) {
+            s_camera_reset = true;
         }
         return;
     }
+    s_consecutive_skipped_frames = 0;
 
     D3D11_TEXTURE2D_DESC srcColorDesc{};
     colorSource->GetDesc(&srcColorDesc);
@@ -2215,9 +2229,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
     }
 
-    static unsigned long long s_last_exec_log = ~0ull;
-    if (s_last_exec_log != frame && (s_last_exec_log == ~0ull || frame % 300 == 0)) {
-        s_last_exec_log = frame;
+    static bool s_first_exec_logged = false;
+    if (!s_first_exec_logged) {
+        s_first_exec_logged = true;
         wchar_t msg[192];
         swprintf_s(msg, L"EDPE: tryTemporalUpscale executing frame=%llu render=%ux%u output=%ux%u",
             frame, depthDesc.Width, depthDesc.Height, backbufferDesc.Width, backbufferDesc.Height);
@@ -2286,6 +2300,30 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         srvDesc.Texture2D.MipLevels = 1;
         if (FAILED(device->CreateShaderResourceView(motion_depth.Get(), &srvDesc, &motion_depth_view))) return;
     }
+
+    ID3D11RenderTargetView* savedRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    ID3D11DepthStencilView* savedDsv = nullptr;
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, &savedDsv);
+    if (savedDsv) {
+        if (const auto rawSet = original.load(std::memory_order_acquire)) {
+            rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, nullptr);
+        }
+    }
+    struct RestoreTargetsGuard {
+        ID3D11DeviceContext* ctx;
+        OMSetRenderTargetsFn setFn;
+        ID3D11RenderTargetView** rtvs;
+        ID3D11DepthStencilView* dsv;
+        ~RestoreTargetsGuard() {
+            if (dsv && setFn) {
+                setFn(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
+            }
+            for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+                if (rtvs[i]) rtvs[i]->Release();
+            }
+            if (dsv) dsv->Release();
+        }
+    } restoreTargets{context, original.load(std::memory_order_acquire), savedRtvs, savedDsv};
 
     context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
 
@@ -2362,16 +2400,20 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const bool translation_cut = (moveDist > 50.0f && rotTrace < 2.85f);
     const bool scene_cut = (s_camera_previous_frame == ~0ull) || orientation_cut || teleport_cut || translation_cut;
 
-    if (s_camera_reset || scene_cut) {
-        static unsigned long long s_last_reset_log = ~0ull;
-        if (s_last_reset_log == ~0ull || frame >= s_last_reset_log + 60) {
-            s_last_reset_log = frame;
-            wchar_t rmsg[192];
-            swprintf_s(rmsg, L"EDPE: reconstruction history reset frame=%llu (camera_reset=%u cut=%u move=%.2f rotTrace=%.3f)",
-                frame, s_camera_reset ? 1 : 0, scene_cut ? 1 : 0, moveDist, rotTrace);
-            EdpeLog(rmsg);
+    static LARGE_INTEGER s_last_upscale_qpc{};
+    static LARGE_INTEGER s_upscale_freq{};
+    if (s_upscale_freq.QuadPart == 0) QueryPerformanceFrequency(&s_upscale_freq);
+    LARGE_INTEGER now_qpc;
+    QueryPerformanceCounter(&now_qpc);
+    float dt_ms = 16.667f;
+    if (s_last_upscale_qpc.QuadPart > 0 && s_upscale_freq.QuadPart > 0) {
+        const double measured_ms = static_cast<double>(now_qpc.QuadPart - s_last_upscale_qpc.QuadPart) * 1000.0 /
+                                   static_cast<double>(s_upscale_freq.QuadPart);
+        if (measured_ms >= 0.5 && measured_ms <= 250.0) {
+            dt_ms = static_cast<float>(measured_ms);
         }
     }
+    s_last_upscale_qpc = now_qpc;
 
     edpe::TemporalFrameInputs inputs{};
     inputs.color = s_dlaa_input.Get();
@@ -2388,7 +2430,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.jitterY = jy;
     inputs.motionScaleX = mScaleX;
     inputs.motionScaleY = mScaleY;
-    inputs.frameTimeMs = 16.667f;
+    inputs.frameTimeMs = dt_ms;
     inputs.reset = s_camera_reset || scene_cut;
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
@@ -2487,17 +2529,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     backbufferDesc.Width, backbufferDesc.Height,
                     depthDesc.Width, depthDesc.Height);
             }
-            if (compOk) {
-                static unsigned long long s_comp_log = ~0ull;
-                if (s_comp_log != frame && (s_comp_log == ~0ull || frame % 300 == 0)) {
-                    s_comp_log = frame;
-                    wchar_t cmsg[160];
-                    swprintf_s(cmsg, L"EDPE: UI composited frame=%llu render=%ux%u output=%ux%u (%ls)",
-                        frame, depthDesc.Width, depthDesc.Height, backbufferDesc.Width, backbufferDesc.Height,
-                        isSubNative ? L"DLSS SR" : L"DLAA");
-                    EdpeLog(cmsg);
-                }
-            } else {
+            if (!compOk) {
                 context->CopyResource(backbuffer, s_dlss_output_texture.Get());
             }
         } else if (evalDestination == s_dlss_output_texture.Get()) {
@@ -2507,29 +2539,18 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
     // Push frame jitter diagnostics and log entry to asynchronous JitterLogger
     {
-        static LARGE_INTEGER s_last_upscale_qpc{};
-        static LARGE_INTEGER s_upscale_freq{};
-        if (s_upscale_freq.QuadPart == 0) QueryPerformanceFrequency(&s_upscale_freq);
-        LARGE_INTEGER now_qpc;
-        QueryPerformanceCounter(&now_qpc);
-        float dt_ms = 16.67f;
-        if (s_last_upscale_qpc.QuadPart > 0 && s_upscale_freq.QuadPart > 0) {
-            dt_ms = static_cast<float>((now_qpc.QuadPart - s_last_upscale_qpc.QuadPart) * 1000.0 / s_upscale_freq.QuadPart);
-        }
-        s_last_upscale_qpc = now_qpc;
-
         static unsigned s_last_writes = 0;
         const unsigned cur_writes = jittered_writes_count.load(std::memory_order_relaxed);
         const unsigned writes_this_frame = cur_writes - s_last_writes;
         s_last_writes = cur_writes;
 
-        const unsigned phases = s_jitter_phase_count.load(std::memory_order_relaxed);
+        const unsigned phases = s_active_jitter_phases.load(std::memory_order_relaxed);
 
         edpe::JitterFrameLog jlog{};
         jlog.frame = rendered;
         jlog.deltaMs = dt_ms;
-        jlog.phase = static_cast<unsigned>(rendered % (phases ? phases : 8));
-        jlog.totalPhases = phases ? phases : 8;
+        jlog.phase = static_cast<unsigned>(rendered % (phases ? phases : 32));
+        jlog.totalPhases = phases ? phases : 32;
         jlog.pixelX = s_injected_jitter.pixelX;
         jlog.pixelY = s_injected_jitter.pixelY;
         jlog.ndcX = s_injected_jitter.ndcX;
@@ -2602,6 +2623,10 @@ bool isMainSceneMrtDepth(const D3D11_TEXTURE2D_DESC& dd, UINT outW, UINT outH) {
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
     const auto forward = original.load(std::memory_order_acquire);
+    if (s_in_edpe_present.load(std::memory_order_acquire)) {
+        forward(context, count, targets, dsv);
+        return;
+    }
     if (context == observed_context.load(std::memory_order_acquire)) {
         endVSBufferProbe();
         endPipelineSample(context);
@@ -2629,6 +2654,10 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 EdpeLog(message);
                 captureEarlyMotionColor(context, false);
             }
+        } else if (bound && count < 4) {
+            // Transitioned from 4-MRT G-buffer (Binds 1-3) to RTV0 deferred lighting/HUD (Binds 4-7)
+            s_inside_main_scene.store(false, std::memory_order_release);
+            s_hdr_slot0_seen_frame = current_frame;
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
         motion_color_bound = bound;
@@ -2688,24 +2717,31 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     bool is_main_scene = false;
     bool hud_probe_begin = false;
     if (scene_mrt) {
-        ID3D11Resource* dsv_res = nullptr;
-        dsv->GetResource(&dsv_res);
-        if (dsv_res) {
-            Microsoft::WRL::ComPtr<ID3D11Texture2D> depthTex;
-            if (SUCCEEDED(dsv_res->QueryInterface(__uuidof(ID3D11Texture2D),
-                    reinterpret_cast<void**>(depthTex.GetAddressOf())))) {
-                D3D11_TEXTURE2D_DESC dd{};
-                depthTex->GetDesc(&dd);
-                const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
-                const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
-                if (isMainSceneMrtDepth(dd, outW, outH)) {
-                    is_main_scene = true;
-                    scene_depth_source = depthTex;
-                    s_observed_scene_width.store(dd.Width, std::memory_order_relaxed);
-                    s_observed_scene_height.store(dd.Height, std::memory_order_relaxed);
+        // Once the main 3D scene has already transitioned from 4-MRT (Binds 1-3) to RTV0 lighting (Binds 4-7)
+        // in this frame, ignore any late 1-second auxiliary 4-MRT pass so it cannot clobber depth/color/LDR targets.
+        const bool main_gbuffer_already_finished =
+            (s_hdr_slot0_seen_frame == current_frame && scene_depth_source &&
+             motion_color_source && motion_color_frame == current_frame);
+        if (!main_gbuffer_already_finished) {
+            ID3D11Resource* dsv_res = nullptr;
+            dsv->GetResource(&dsv_res);
+            if (dsv_res) {
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> depthTex;
+                if (SUCCEEDED(dsv_res->QueryInterface(__uuidof(ID3D11Texture2D),
+                        reinterpret_cast<void**>(depthTex.GetAddressOf())))) {
+                    D3D11_TEXTURE2D_DESC dd{};
+                    depthTex->GetDesc(&dd);
+                    const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+                    const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+                    if (isMainSceneMrtDepth(dd, outW, outH)) {
+                        is_main_scene = true;
+                        scene_depth_source = depthTex;
+                        s_observed_scene_width.store(dd.Width, std::memory_order_relaxed);
+                        s_observed_scene_height.store(dd.Height, std::memory_order_relaxed);
+                    }
                 }
+                dsv_res->Release();
             }
-            dsv_res->Release();
         }
 
         if (is_main_scene) {
@@ -2951,6 +2987,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
     }
     s_inside_main_scene.store(false, std::memory_order_release);
+    s_in_edpe_present.store(true, std::memory_order_release);
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         auto* context = observed_context.load(std::memory_order_acquire);
         endHudDrawProbe();
@@ -3113,6 +3150,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 phases = static_cast<unsigned>(std::clamp(
                     std::lround(static_cast<float>(base_phases) * upscaleRatio * upscaleRatio), 8l, 256l));
             }
+            s_active_jitter_phases.store(phases ? phases : 32, std::memory_order_relaxed);
             auto jitter = edpe::projectionJitter(frame, active_render_width, active_render_height, phases);
             const float scale = s_jitter_scale.load(std::memory_order_relaxed);
             jitter.pixelX *= scale;
@@ -3161,7 +3199,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             edpe::JitterLogger::instance().pushFrame(jlog);
         }
     }
-    if (frame % 1024 == 0 && observed_swap_chain == swap_chain) {
+    if (frame % 1024 == 0 && observed_swap_chain == swap_chain &&
+        !edpe::UpscalerManager::instance().isReconstructionActive()) {
         size_t distinct = 0;
         std::array<unsigned long long, 32> counts{};
         {
@@ -3255,6 +3294,7 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
 }
 
 void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags) {
+    s_in_edpe_present.store(false, std::memory_order_release);
     if ((flags & DXGI_PRESENT_TEST) || observed_swap_chain != swap_chain || !patched_table) return;
     rearmContextHooks();
 }
@@ -3438,6 +3478,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         scene_depth_source.Reset();
         scene_ldr_source.Reset();
         scene_ldr_frame = ~0ull;
+        s_in_scene_camera_latched_frame = ~0ull;
+        s_hdr_slot0_seen_frame = ~0ull;
+        s_consecutive_skipped_frames = 0;
+        s_auxiliary_rejection_streak = 0;
+        s_fallback_unmapped_camera_frame = ~0ull;
         s_gbuffer_resources = {};
         s_observed_scene_width.store(0, std::memory_order_relaxed);
         s_observed_scene_height.store(0, std::memory_order_relaxed);
@@ -3668,5 +3713,3 @@ ID3D11Texture2D* ContextCensusGetBackbufferCopyTexture() {
 ID3D11RenderTargetView* ContextCensusGetBackbufferCopyRtv() {
     return s_backbuffer_copy_rtv.Get();
 }
-
-

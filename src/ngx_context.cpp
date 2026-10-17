@@ -424,7 +424,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     }
 
     static unsigned s_ngx_eval_count = 0;
-    if (++s_ngx_eval_count == 1 || s_ngx_eval_count % 300 == 0) {
+    if (++s_ngx_eval_count == 1) {
         wchar_t msg[192];
         swprintf_s(msg, L"EDPE: NGX %ls evaluated successfully #%u (%ux%u -> %ux%u)",
             (renderWidth == outputWidth && renderHeight == outputHeight) ? L"DLAA" : L"DLSS SR",

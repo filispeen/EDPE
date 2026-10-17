@@ -774,7 +774,7 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     }
 
     static unsigned s_eval_log_count = 0;
-    if (++s_eval_log_count == 1 || s_eval_log_count % 300 == 0) {
+    if (++s_eval_log_count == 1) {
         wchar_t message[256];
         swprintf_s(message, L"EDPE: %ls reconstructed %ux%u -> %ux%u in %.3f ms (#%u)",
             backend->name(), inputs.renderWidth, inputs.renderHeight,
