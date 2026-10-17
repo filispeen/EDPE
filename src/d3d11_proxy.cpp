@@ -3,9 +3,11 @@
 #include "shader_probe.h"
 #include "system_dll.h"
 
-#include <d3d11.h>
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cwchar>
+#include <d3d11.h>
 #include <windows.h>
 
 namespace {
@@ -13,8 +15,11 @@ using CreateVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const vo
     SIZE_T, ID3D11ClassLinkage*, ID3D11VertexShader**);
 using CreatePixelShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*,
     SIZE_T, ID3D11ClassLinkage*, ID3D11PixelShader**);
+using CreateSamplerStateFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*,
+    const D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
 std::atomic<CreateVertexShaderFn> original_create_vertex_shader{nullptr};
 std::atomic<CreatePixelShaderFn> original_create_pixel_shader{nullptr};
+std::atomic<CreateSamplerStateFn> original_create_sampler_state{nullptr};
 std::atomic<void**> hooked_device_table{nullptr};
 std::atomic<bool> retain_vertex_bytecode{false};
 
@@ -43,6 +48,38 @@ HRESULT STDMETHODCALLTYPE observedCreatePixelShader(ID3D11Device* device,
         (*shader)->SetPrivateData(kEdpePixelBytecodeGuid, static_cast<UINT>(size), bytecode);
     }
     return result;
+}
+
+HRESULT STDMETHODCALLTYPE observedCreateSamplerState(ID3D11Device* device,
+    const D3D11_SAMPLER_DESC* desc, ID3D11SamplerState** sampler) {
+    if (!desc) {
+        return original_create_sampler_state.load(std::memory_order_acquire)(device, desc, sampler);
+    }
+
+    static std::atomic<unsigned> s_sampler_log_count{0};
+    if (s_sampler_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+        wchar_t msg[160];
+        swprintf_s(msg, L"EDPE: CreateSamplerState filter=%u mipBias=%.2f minLOD=%.2f maxLOD=%.2f",
+            desc->Filter, desc->MipLODBias, desc->MinLOD, desc->MaxLOD);
+        EdpeLog(msg);
+    }
+
+    D3D11_SAMPLER_DESC mod_desc = *desc;
+    const bool is_comparison = D3D11_DECODE_IS_COMPARISON_FILTER(desc->Filter);
+    const bool is_linear_mip = (D3D11_DECODE_MIP_FILTER(desc->Filter) == D3D11_FILTER_TYPE_LINEAR) ||
+                               D3D11_DECODE_IS_ANISOTROPIC_FILTER(desc->Filter);
+    const bool has_mipmaps = desc->MaxLOD > 0.5f;
+
+    if (!is_comparison && is_linear_mip && has_mipmaps) {
+        auto& cfg = edpe::Config::instance();
+        const float ratio = edpe::Config::getTargetSsaaMultiplier(cfg.upscalerBackend, cfg.upscaleMode);
+        if (ratio > 0.0f && ratio < 1.0f) {
+            const float bias = std::log2(ratio) - 1.0f;
+            mod_desc.MipLODBias = std::clamp(desc->MipLODBias + bias, -15.99f, 15.99f);
+        }
+    }
+
+    return original_create_sampler_state.load(std::memory_order_acquire)(device, &mod_desc, sampler);
 }
 
 bool armShaderProbe() {
@@ -97,9 +134,26 @@ void hookShaderCreation(ID3D11Device* device) {
                 pixel_hooked = replaced == reinterpret_cast<void*>(pixel_forward);
             }
         }
+        constexpr size_t sampler_slot = 23;
+        bool sampler_hooked = false;
+        auto sampler_forward = reinterpret_cast<CreateSamplerStateFn>(table[sampler_slot]);
+        if (sampler_forward && sampler_forward != &observedCreateSamplerState) {
+            original_create_sampler_state.store(sampler_forward, std::memory_order_release);
+            if (VirtualProtect(table + sampler_slot, sizeof(void*), PAGE_READWRITE, &old_protection)) {
+                replaced = InterlockedCompareExchangePointer(
+                    reinterpret_cast<PVOID volatile*>(table + sampler_slot),
+                    reinterpret_cast<void*>(&observedCreateSamplerState),
+                    reinterpret_cast<void*>(sampler_forward));
+                VirtualProtect(table + sampler_slot, sizeof(void*), old_protection, &ignored);
+                sampler_hooked = replaced == reinterpret_cast<void*>(sampler_forward);
+            }
+        }
         EdpeLog(pixel_hooked
             ? L"EDPE: vertex/pixel shader signatures available"
             : L"EDPE: vertex shader signatures available; pixel shader hook unavailable");
+        EdpeLog(sampler_hooked
+            ? L"EDPE: sampler state hook available"
+            : L"EDPE: sampler state hook unavailable");
         if (retain_vertex_bytecode.load(std::memory_order_relaxed))
             EdpeLog(L"EDPE: one-run vertex shader bytecode probe armed");
     } else EdpeLog(L"EDPE: vertex shader bytecode probe unavailable (slot changed)");
