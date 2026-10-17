@@ -7,6 +7,7 @@
 #include "config.h"
 #include "perf_overlay.h"
 #include "input_hook.h"
+#include "jitter_logger.h"
 
 
 #include <d3d11_1.h>
@@ -146,6 +147,14 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         return true;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F7) return true;
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        wparam == VK_F8 && !(lparam & (1LL << 30))) {
+        const bool active = !edpe::JitterLogger::instance().isOverlayVisible();
+        edpe::JitterLogger::instance().setOverlayVisible(active);
+        EdpeLog(active ? L"EDPE: F8 pressed — Jitter Monitor enabled" : L"EDPE: F8 pressed — Jitter Monitor disabled");
+        return true;
+    }
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F8) return true;
     if (menu_visible.load()) {
         if (message == WM_INPUT) return true;
         if (message == WM_SETCURSOR) {
@@ -1115,6 +1124,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (show_perf) {
         edpe::PerfTracker::instance().renderOverlay(draw_menu, cfg.perfOverlayCorner, cfg.perfOverlayScale);
     }
+    edpe::JitterLogger::instance().renderOverlay(draw_menu);
 
     bool window_open = true;
     if (draw_menu) {
@@ -1404,14 +1414,20 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
 
     float j_scale = ContextCensusGetJitterScale();
-    if (ImGui::SliderFloat("Jitter Scale (0.0 = disable jitter)", &j_scale, 0.0f, 2.0f, "%.2f")) {
+    if (ImGui::SliderFloat("Jitter Scale (1.0 = standard, 0.0 = disable)", &j_scale, 0.0f, 2.0f, "%.2f")) {
         ContextCensusSetJitterScale(j_scale);
         edpe::Config::instance().save();
     }
 
     int j_phases = static_cast<int>(ContextCensusGetJitterPhaseCount());
-    if (ImGui::SliderInt("Jitter Phase Cycle (DLAA default: 32)", &j_phases, 2, 64)) {
+    if (ImGui::SliderInt("Jitter Phase Cycle (default: 8, standard Halton)", &j_phases, 0, 128)) {
         ContextCensusSetJitterPhaseCount(static_cast<unsigned>(j_phases));
+        edpe::Config::instance().save();
+    }
+
+    bool preserve_ui = ContextCensusGetPreserveNativeUi();
+    if (ImGui::Checkbox("Preserve Native UI (Composite in Super Resolution)", &preserve_ui)) {
+        ContextCensusSetPreserveNativeUi(preserve_ui);
         edpe::Config::instance().save();
     }
 
@@ -1442,18 +1458,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Save Tuning to edpe.ini")) {
         edpe::Config::instance().save();
     }
-    const bool jitter_active = ContextCensusIsJitterActive();
-    if (jitter_active) {
-        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "Jitter Status: ACTIVE (Injected into CB0)");
-    } else {
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Jitter Status: STAND-DOWN (Bypass)");
-    }
-    float jx = 0, jy = 0, jndcx = 0, jndcy = 0;
-    unsigned long long jframe = 0;
-    ContextCensusGetActiveJitter(&jx, &jy, &jndcx, &jndcy, &jframe);
-    ImGui::Text("Jitter: Pixel (%.3f, %.3f) | NDC (%.6f, %.6f)", jx, jy, jndcx, jndcy);
-    ImGui::Text("Jittered Writes: %u | Rejections: %u | Frame: %llu",
-        ContextCensusGetJitteredWritesCount(), ContextCensusGetJitterRejectionsCount(), jframe);
+    ImGui::Separator();
+    edpe::JitterLogger::instance().renderScopeWidget();
+
     ImGui::Separator();
     if (ImGui::Button("Capture ALL buffers (diagnostic dump)")) {
         all_captures_requested.store(true, std::memory_order_release);
@@ -1463,7 +1470,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
         ui.pending_backbuffer_capture = true;
     }
-    ImGui::TextUnformatted("F5: toggle menu | F7: toggle performance HUD");
+    ImGui::TextUnformatted("F5: toggle menu | F7: toggle performance HUD | F8: toggle jitter monitor");
     ImGui::End();
     if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);

@@ -179,6 +179,7 @@ struct AmdUpscalerBackend::Impl {
     uint32_t maxRenderHeight = 0;
     uint32_t maxOutputWidth = 0;
     uint32_t maxOutputHeight = 0;
+    bool currentIsHdr = false;
 
 #if defined(EDPE_ENABLE_FSR)
     std::vector<uint8_t> scratchBuffer;
@@ -240,10 +241,11 @@ struct AmdUpscalerBackend::Impl {
     }
 
     bool ensureFsrContext(ID3D11Device* /*device*/, uint32_t renderW, uint32_t renderH,
-                          uint32_t outputW, uint32_t outputH) {
+                          uint32_t outputW, uint32_t outputH, bool isHdr) {
 #if defined(EDPE_ENABLE_FSR)
         if (contextCreated && renderW <= maxRenderWidth && renderH <= maxRenderHeight &&
-            outputW == maxOutputWidth && outputH == maxOutputHeight) {
+            outputW == maxOutputWidth && outputH == maxOutputHeight &&
+            currentIsHdr == isHdr) {
             return true;
         }
 
@@ -253,12 +255,15 @@ struct AmdUpscalerBackend::Impl {
         maxRenderHeight = renderH;
         maxOutputWidth = outputW;
         maxOutputHeight = outputH;
+        currentIsHdr = isHdr;
 
         FfxFsr3UpscalerContextDescription desc{};
-        desc.flags = FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE |
-                     FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED |
+        desc.flags = FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED |
                      FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE |
                      FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE;
+        if (isHdr) {
+            desc.flags |= FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE;
+        }
         desc.maxRenderSize.width = maxRenderWidth;
         desc.maxRenderSize.height = maxRenderHeight;
         desc.maxUpscaleSize.width = maxOutputWidth;
@@ -386,7 +391,7 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     }
 
     if (!impl_->ensureFsrContext(device.Get(), inputs.renderWidth, inputs.renderHeight,
-                                 inputs.outputWidth, inputs.outputHeight)) {
+                                 inputs.outputWidth, inputs.outputHeight, inputs.colorIsHdr)) {
         return false;
     }
 

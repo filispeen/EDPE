@@ -29,6 +29,7 @@ public:
         upscaleMode = GetPrivateProfileIntW(L"Upscaler", L"Mode", 0, path.c_str());
         dlssPreset = GetPrivateProfileIntW(L"Upscaler", L"Preset", 0, path.c_str());
         autoSyncEliteConfig = GetPrivateProfileIntW(L"Upscaler", L"AutoSyncEliteConfig", 1, path.c_str()) != 0;
+        preserveNativeUi = GetPrivateProfileIntW(L"Upscaler", L"PreserveNativeUi", 1, path.c_str()) != 0;
 
         jitterInvertX = GetPrivateProfileIntW(L"Jitter", L"InvertX", 0, path.c_str()) != 0;
         jitterInvertY = GetPrivateProfileIntW(L"Jitter", L"InvertY", 0, path.c_str()) != 0;
@@ -39,7 +40,7 @@ public:
         jitterScale = static_cast<float>(_wtof(buf));
         if (jitterScale < 0.0f || jitterScale > 2.0f) jitterScale = 1.0f;
 
-        jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 32, path.c_str());
+        jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 8, path.c_str());
 
         zeroMotionVectors = GetPrivateProfileIntW(L"Motion", L"ZeroMotion", 0, path.c_str()) != 0;
         motionInvertX = GetPrivateProfileIntW(L"Motion", L"InvertX", 0, path.c_str()) != 0;
@@ -71,6 +72,7 @@ public:
         WritePrivateProfileStringW(L"Upscaler", L"Mode", std::to_wstring(upscaleMode).c_str(), path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"Preset", std::to_wstring(dlssPreset).c_str(), path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"AutoSyncEliteConfig", autoSyncEliteConfig ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"Upscaler", L"PreserveNativeUi", preserveNativeUi ? L"1" : L"0", path.c_str());
 
         WritePrivateProfileStringW(L"Jitter", L"InvertX", jitterInvertX ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"InvertY", jitterInvertY ? L"1" : L"0", path.c_str());
@@ -185,12 +187,13 @@ public:
     int upscaleMode = 0;
     int dlssPreset = 0; // 0=Auto(K), 10=J, 11=K, 12=L, 13=M
     bool autoSyncEliteConfig = true;
+    bool preserveNativeUi = true;
 
     bool jitterInvertX = false;
     bool jitterInvertY = false;
     bool jitterSwapXY = false;
     float jitterScale = 1.0f;
-    unsigned jitterPhaseCount = 32;
+    unsigned jitterPhaseCount = 8;
 
     bool zeroMotionVectors = false;
     bool motionInvertX = false;

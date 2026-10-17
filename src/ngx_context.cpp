@@ -321,10 +321,10 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     cp.Feature.InTargetHeight = outputHeight;
     cp.Feature.InPerfQualityValue = perfQuality;
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
+                              NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     if (isHdr) {
-        cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
-                                   NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+        cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     }
 
     NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &g_dlaa_feature, g_ngx_params, &cp);
@@ -414,6 +414,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ep.InMVScaleX = params.motionScaleX;
     ep.InMVScaleY = params.motionScaleY;
     ep.pInBiasCurrentColorMask = reactiveMaskIn;
+    ep.InExposureScale = 1.0f;
 
     NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(context, g_dlaa_feature, g_ngx_params, &ep);
     if (r != NVSDK_NGX_Result_Success) {

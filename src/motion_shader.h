@@ -49,9 +49,14 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
         return priorPixel - pixel.xy;
     }
 
-    // 2. Dynamic world geometry (space stations, ships, asteroids, terrain):
-    // Standard camera-depth reprojection including both camera translation and rotation.
+    // 2. Cockpit interior (pilot dashboard, controls, instruments, cockpit lights):
+    // In Elite Dangerous, the cockpit interior (z < 3.5m) is rigidly attached to the ship camera.
+    // Its screen-space motion relative to the camera is zero!
     float z = depthB / depth;
+    if (z < 3.5) return 0.0;
+
+    // 3. Dynamic world geometry (space stations, ships, asteroids, terrain):
+    // Standard camera-depth reprojection including both camera translation and rotation.
     float2 ndc = float2(2.0 * pixel.x / info.y - 1.0, 1.0 - 2.0 * pixel.y / info.z);
     float3 view = float3(ndc.x * z / projection.x, ndc.y * z / projection.y, z);
     float3 world = float3(dot(current0.xyz, view) + current0.w,

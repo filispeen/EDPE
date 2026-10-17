@@ -101,21 +101,20 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // 1. Subpixel de-jittering for the current frame
     // In EDPE, projection jitter offsets are in pixel units: params.x, params.y.
     // The projection shifted geometry by +jitter in screen pixels.
-    // To sample the unjittered nominal pixel center, we sample with linearSampler at uv + jitterUv.
+    // To sample the unjittered nominal pixel center, we sample with linearSampler at uv - jitterUv.
     float2 jitterUv = float2(params.x * resolution.z, params.y * resolution.w);
-    float2 centerUv = uv + jitterUv;
+    float2 centerUv = uv - jitterUv;
 
     // Center sample evaluated with high-quality bilinear reconstruction
     float4 centerSample = currentFrame.SampleLevel(linearSampler, centerUv, 0);
     float3 current = centerSample.rgb;
     float3 currentY = RGBToYCoCg(current);
 
-    // 2. 3x3 Cross-weighted Neighborhood Statistics in YCoCg
-    // Using cross-shaped weighting (center: 2.0, cross: 1.0, corners: 0.5)
-    // stabilizes variance estimation against subpixel phase vibration.
+    // 2. 3x3 Neighborhood Statistics in YCoCg
+    // Plain 3x3 neighborhood (as proven in EDVR temporal_shader_source.h:1126)
+    // prevents artificial AABB box narrowing and specular clipping shimmer.
     float3 m1 = 0;
     float3 m2 = 0;
-    float totalW = 0.0;
     float3 boxMin = currentY;
     float3 boxMax = currentY;
 
@@ -127,18 +126,16 @@ float4 ps_main(VSOutput pin) : SV_Target {
             float3 c = currentFrame.SampleLevel(pointSampler, sampleUv, 0).rgb;
             float3 cY = RGBToYCoCg(c);
 
-            float w = (x == 0 && y == 0) ? 2.0 : ((x == 0 || y == 0) ? 1.0 : 0.5);
-            m1 += cY * w;
-            m2 += cY * cY * w;
-            totalW += w;
+            m1 += cY;
+            m2 += cY * cY;
 
             boxMin = min(boxMin, cY);
             boxMax = max(boxMax, cY);
         }
     }
 
-    float3 mean = m1 / totalW;
-    float3 sigma = sqrt(max(0.0, m2 / totalW - mean * mean));
+    float3 mean = m1 / 9.0;
+    float3 sigma = sqrt(max(0.0, m2 / 9.0 - mean * mean));
 
     // 3. Motion vector and depth evaluation
     float rawDepth = sceneDepth.SampleLevel(pointSampler, uv, 0).r;
@@ -164,7 +161,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 varMax = mean + gamma * sigma;
 
     float3 finalMin = max(boxMin, varMin);
-    float3 finalMax = min(boxMax, varMax);
+    // For high-luminance specular highlights/lamps, widen varMax towards boxMax when stationary
+    // to prevent subpixel Karis clipping shimmer across frame phases:
+    float3 finalMax = min(boxMax, max(varMax, boxMax * (1.0 - saturate(speed * 0.5))));
 
     float2 priorUv = uv + mvPixels * resolution.zw;
     bool isOffscreen = (priorUv.x < 0.0 || priorUv.x > 1.0 || priorUv.y < 0.0 || priorUv.y > 1.0);
@@ -185,9 +184,12 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // 6. Velocity / Disocclusion / UI Confidence
     // If the reprojected history differed drastically from the current neighborhood
     // (e.g. holographic UI drawn over moving space, or an occluded edge),
-    // clampDistance is large. Scale history confidence smoothly without harsh cliff-drops.
+    // clampDistance is large. Scale history confidence smoothly when moving.
+    // When stationary (speed near 0), preserve full history confidence so subpixel
+    // jitter integrates specular highlights, stars and lamps without flickering!
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
-    float historyConfidence = 1.0 / (1.0 + clampDistance * 4.0);
+    float speedFactor = saturate(speed * 0.25);
+    float historyConfidence = lerp(1.0, 1.0 / (1.0 + clampDistance * 4.0), speedFactor);
 
     // Base blend weight: 0.90 for static/smooth, lower when high speed
     float blendWeight = clamp(params.z, 0.0, 0.95);
