@@ -2,7 +2,10 @@
 #include "log.h"
 #include "ngx_context.h"
 
+#include <algorithm>
+#include <cfloat>
 #include <chrono>
+#include <cmath>
 #include <cwchar>
 #include <vector>
 
@@ -431,10 +434,13 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.reset = params.reset || impl_->resetRequested;
     impl_->resetRequested = false;
 
-    // Camera parameters (Elite Odyssey infinite reversed-Z)
-    dispatchDesc.cameraNear = 0.1f;
-    dispatchDesc.cameraFar = 10000.0f;
-    dispatchDesc.cameraFovAngleVertical = 1.0f;
+    dispatchDesc.cameraFovAngleVertical = (inputs.cameraNow.scaleY > 0.0f)
+        ? (2.0f * std::atan(1.0f / inputs.cameraNow.scaleY))
+        : 1.0f;
+    dispatchDesc.cameraNear = (inputs.cameraNow.depthB > 0.0f)
+        ? inputs.cameraNow.depthB
+        : 0.1f;
+    dispatchDesc.cameraFar = FLT_MAX;
     dispatchDesc.viewSpaceToMetersFactor = 1.0f;
 
     FfxErrorCode err = ffxFsr3UpscalerContextDispatch(&impl_->fsrContext, &dispatchDesc);

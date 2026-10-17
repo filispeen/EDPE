@@ -2432,9 +2432,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.motionScaleY = mScaleY;
     inputs.frameTimeMs = dt_ms;
     inputs.reset = s_camera_reset || scene_cut;
+    inputs.cameraNow = s_camera_now;
+    inputs.cameraPrevious = s_camera_previous;
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
-    inputs.colorIsHdr = false; // tone-mapped LDR scene or backbuffer
+    inputs.colorIsHdr = false;
 
     static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
     static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
