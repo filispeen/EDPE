@@ -226,7 +226,7 @@ int main() {
     if (std::fabs(amdParams8.motionVectorScaleY - inputs.motionScaleY) > 1e-6f) return 67;
     if (!amdParams8.depthInverted || !amdParams8.depthInfinite) return 68;
     inputs.sharpness = 0.75f;
-    if (!edpe::translateToAmd(inputs, &amdParams8, &amdReason8) || std::fabs(amdParams8.sharpness - 0.75f) > 1e-6f) return 68;
+    if (!edpe::translateToAmd(inputs, &amdParams8, &amdReason8) || std::fabs(amdParams8.sharpness - 0.75f) > 1e-6f) return 80;
 
     // AmdUpscalerBackend instantiation and lifecycle
     edpe::AmdUpscalerBackend amdBackend;
