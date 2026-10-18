@@ -8,6 +8,9 @@
 #include <cmath>
 #include <cwchar>
 #include <d3d11.h>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <windows.h>
 
 namespace {
@@ -56,12 +59,21 @@ HRESULT STDMETHODCALLTYPE observedCreateSamplerState(ID3D11Device* device,
         return original_create_sampler_state.load(std::memory_order_acquire)(device, desc, sampler);
     }
 
-    static std::atomic<unsigned> s_sampler_log_count{0};
-    if (s_sampler_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
-        wchar_t msg[160];
-        swprintf_s(msg, L"EDPE: CreateSamplerState filter=%u mipBias=%.2f minLOD=%.2f maxLOD=%.2f",
-            desc->Filter, desc->MipLODBias, desc->MinLOD, desc->MaxLOD);
-        EdpeLog(msg);
+    static std::set<std::tuple<UINT, int, int, int>> s_seen_samplers;
+    static std::mutex s_sampler_mutex;
+    {
+        const auto key = std::make_tuple(
+            static_cast<UINT>(desc->Filter),
+            static_cast<int>(std::lround(desc->MipLODBias * 100.0f)),
+            static_cast<int>(std::lround(desc->MinLOD * 100.0f)),
+            static_cast<int>(std::lround(std::min(desc->MaxLOD, 1000.0f) * 100.0f)));
+        std::lock_guard<std::mutex> lock(s_sampler_mutex);
+        if (s_seen_samplers.size() < 128 && s_seen_samplers.insert(key).second) {
+            wchar_t msg[160];
+            swprintf_s(msg, L"EDPE: CreateSamplerState filter=%u mipBias=%.2f minLOD=%.2f maxLOD=%.2f",
+                desc->Filter, desc->MipLODBias, desc->MinLOD, desc->MaxLOD);
+            EdpeLog(msg);
+        }
     }
 
     D3D11_SAMPLER_DESC mod_desc = *desc;
