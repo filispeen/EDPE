@@ -19,7 +19,12 @@ public:
                 float sensitivity = 1.5f,
                 float threshold = 0.02f,
                 int mode = 0,
-                ID3D11ShaderResourceView* motionSrv = nullptr);
+                ID3D11ShaderResourceView* motionSrv = nullptr,
+                ID3D11ShaderResourceView* depthSrv = nullptr,
+                UINT renderWidth = 0,
+                UINT renderHeight = 0,
+                bool reset = false,
+                bool isHdr = false);
 
     void resetHistory() { resetRequested_ = true; }
 

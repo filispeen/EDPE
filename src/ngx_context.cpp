@@ -415,6 +415,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ep.InMVScaleY = params.motionScaleY;
     ep.pInBiasCurrentColorMask = reactiveMaskIn;
     ep.InExposureScale = 1.0f;
+    ep.InFrameTimeDeltaInMsec = params.frameTimeMs;
 
     NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(context, g_dlaa_feature, g_ngx_params, &ep);
     if (r != NVSDK_NGX_Result_Success) {

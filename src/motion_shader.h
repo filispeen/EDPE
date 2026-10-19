@@ -22,7 +22,7 @@ float4 vs(uint id : SV_VertexID) : SV_POSITION {
 
 float2 reproject(float4 pixel, float4 current0, float4 current1,
     float4 current2, float4 prior0, float4 prior1, float4 prior2,
-    float4 projection, float depthB) {
+    float4 projection, float depthB, bool clampCockpit) {
     if (info.y <= 0 || info.z <= 0 || projection.x <= 0 || projection.y <= 0) return 0;
     float depth = sceneDepth.Load(int3(int2(pixel.xy), 0));
 
@@ -53,7 +53,7 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
     // In Elite Dangerous, the cockpit interior (z < 3.5m) is rigidly attached to the ship camera.
     // Its screen-space motion relative to the camera is zero!
     float z = depthB / depth;
-    if (z < 3.5) return 0.0;
+    if (clampCockpit && z < 3.5) return 0.0;
 
     // 3. Dynamic world geometry (space stations, ships, asteroids, terrain):
     // Standard camera-depth reprojection including both camera translation and rotation.
@@ -74,7 +74,7 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
 }
 
 float2 ps(float4 pixel : SV_POSITION) : SV_Target {
-    return reproject(pixel, now0, now1, now2, prev0, prev1, prev2, scales, info.x);
+    return reproject(pixel, now0, now1, now2, prev0, prev1, prev2, scales, info.x, true);
 }
 
 float2 ps_gpu(float4 pixel : SV_POSITION) : SV_Target {
@@ -99,7 +99,7 @@ float2 ps_gpu(float4 pixel : SV_POSITION) : SV_Target {
     float4 prior2 = float4(previousWords[272].x / projection.z,
         previousWords[272].y / projection.w, previousWords[272].w, previousWords[235].w);
     return reproject(pixel, current0, current1, current2, prior0, prior1,
-        prior2, projection, depthB);
+        prior2, projection, depthB, false);
 }
 )";
 

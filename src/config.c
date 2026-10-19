@@ -30,6 +30,7 @@ public:
         dlssPreset = GetPrivateProfileIntW(L"Upscaler", L"Preset", 0, path.c_str());
         autoSyncEliteConfig = GetPrivateProfileIntW(L"Upscaler", L"AutoSyncEliteConfig", 1, path.c_str()) != 0;
         preserveNativeUi = GetPrivateProfileIntW(L"Upscaler", L"PreserveNativeUi", 1, path.c_str()) != 0;
+        hdrInput = GetPrivateProfileIntW(L"Upscaler", L"HdrInput", 1, path.c_str()) != 0;
 
         wchar_t sharpnessBuf[64]{};
         GetPrivateProfileStringW(L"Upscaler", L"Sharpness", L"0.0", sharpnessBuf, 64, path.c_str());
@@ -88,6 +89,7 @@ public:
         WritePrivateProfileStringW(L"Upscaler", L"Preset", std::to_wstring(dlssPreset).c_str(), path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"AutoSyncEliteConfig", autoSyncEliteConfig ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"PreserveNativeUi", preserveNativeUi ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"Upscaler", L"HdrInput", hdrInput ? L"1" : L"0", path.c_str());
 
         wchar_t sharpnessBuf[64]{};
         swprintf_s(sharpnessBuf, L"%.2f", sharpness);
@@ -215,6 +217,7 @@ public:
     float sharpness = 0.0f;
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;
+    bool hdrInput = true;
 
     bool jitterInvertX = false;
     bool jitterInvertY = false;

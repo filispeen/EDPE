@@ -167,6 +167,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // For high-luminance specular highlights/lamps, widen varMax towards boxMax when stationary
     // to prevent subpixel Karis clipping shimmer across frame phases:
     float3 finalMax = min(boxMax, max(varMax, boxMax * (1.0 - saturate(speed * 0.5))));
+    float subpixelSlack = lerp(0.12, 0.0, saturate(speed * 0.5));
+    finalMin -= subpixelSlack;
+    finalMax += subpixelSlack;
 
     float2 priorUv = uv + mvPixels * resolution.zw;
     bool isOffscreen = (priorUv.x < 0.0 || priorUv.x > 1.0 || priorUv.y < 0.0 || priorUv.y > 1.0);
@@ -194,9 +197,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float speedFactor = saturate(speed * 0.25);
     float historyConfidence = lerp(1.0, 1.0 / (1.0 + clampDistance * 4.0), speedFactor);
 
-    // Base blend weight: 0.90 for static/smooth, lower when high speed
+    // Base blend weight: 0.95 for static/smooth, lower when high speed
     float blendWeight = clamp(params.z, 0.0, 0.95);
-    blendWeight = lerp(blendWeight, 0.70, saturate(speed * 0.05));
+    blendWeight = lerp(max(blendWeight, 0.95), 0.70, saturate(speed * 0.05));
 
     // Dynamic blend weight
     float dynamicBlend = blendWeight * historyConfidence;

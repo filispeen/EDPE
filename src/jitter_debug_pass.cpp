@@ -162,7 +162,12 @@ bool JitterDebugPass::render(ID3D11DeviceContext* context,
     float sensitivity,
     float threshold,
     int mode,
-    ID3D11ShaderResourceView* motionSrv) {
+    ID3D11ShaderResourceView* motionSrv,
+    ID3D11ShaderResourceView* depthSrv,
+    UINT renderWidth,
+    UINT renderHeight,
+    bool reset,
+    bool isHdr) {
     if (!device_ || !context_ || !inputColorSrv || !targetRtv || width == 0 || height == 0) {
         return false;
     }
@@ -171,25 +176,38 @@ bool JitterDebugPass::render(ID3D11DeviceContext* context,
     inputColorSrv->GetResource(&colorRes);
     Microsoft::WRL::ComPtr<ID3D11Texture2D> colorTex;
     DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    UINT texWidth = width;
+    UINT texHeight = height;
     if (colorRes && SUCCEEDED(colorRes.As(&colorTex))) {
         D3D11_TEXTURE2D_DESC cd{};
         colorTex->GetDesc(&cd);
         colorFormat = cd.Format;
+        if (cd.Width > 0 && cd.Height > 0) {
+            texWidth = cd.Width;
+            texHeight = cd.Height;
+        }
     }
 
-    ensureHistory(width, height, colorFormat);
+    const UINT inWidth = renderWidth ? renderWidth : texWidth;
+    const UINT inHeight = renderHeight ? renderHeight : texHeight;
+
+    ensureHistory(texWidth, texHeight, colorFormat);
+
+    const bool performReset = reset || resetRequested_;
 
     JitterDebugConstantBufferData cbData{};
-    cbData.resolution[0] = static_cast<float>(width);
-    cbData.resolution[1] = static_cast<float>(height);
-    cbData.resolution[2] = 1.0f / static_cast<float>(width);
-    cbData.resolution[3] = 1.0f / static_cast<float>(height);
+    cbData.resolution[0] = static_cast<float>(inWidth);
+    cbData.resolution[1] = static_cast<float>(inHeight);
+    cbData.resolution[2] = 1.0f / static_cast<float>(inWidth);
+    cbData.resolution[3] = 1.0f / static_cast<float>(inHeight);
     cbData.jitterParams[0] = jitterPixelX;
     cbData.jitterParams[1] = jitterPixelY;
     cbData.jitterParams[2] = sensitivity;
     cbData.jitterParams[3] = threshold;
     cbData.debugMode[0] = static_cast<float>(mode);
-    cbData.debugMode[1] = resetRequested_ ? 1.0f : 0.0f;
+    cbData.debugMode[1] = performReset ? 1.0f : 0.0f;
+    cbData.debugMode[2] = isHdr ? 1.0f : 0.0f;
+    cbData.debugMode[3] = 0.0f;
 
     context_->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cbData, 0, 0);
 
@@ -199,7 +217,7 @@ bool JitterDebugPass::render(ID3D11DeviceContext* context,
     }
 
     ID3D11RenderTargetView* rtv = targetRtv;
-    ID3D11ShaderResourceView* srvs[3] = { inputColorSrv, historySrv_.Get(), motionSrv };
+    ID3D11ShaderResourceView* srvs[4] = { inputColorSrv, historySrv_.Get(), motionSrv, depthSrv };
     ID3D11SamplerState* samplers[2] = { linearSampler_.Get(), pointSampler_.Get() };
     ID3D11Buffer* cb = constantBuffer_.Get();
 
@@ -215,14 +233,14 @@ bool JitterDebugPass::render(ID3D11DeviceContext* context,
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
     context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
-    context_->PSSetShaderResources(0, 3, srvs);
+    context_->PSSetShaderResources(0, 4, srvs);
     context_->PSSetSamplers(0, 2, samplers);
     context_->PSSetConstantBuffers(0, 1, &cb);
 
     context_->Draw(3, 0);
 
-    ID3D11ShaderResourceView* nullSrvs[3] = { nullptr, nullptr, nullptr };
-    context_->PSSetShaderResources(0, 3, nullSrvs);
+    ID3D11ShaderResourceView* nullSrvs[4] = { nullptr, nullptr, nullptr, nullptr };
+    context_->PSSetShaderResources(0, 4, nullSrvs);
     ID3D11RenderTargetView* nullRtv = nullptr;
     context_->OMSetRenderTargets(1, &nullRtv, nullptr);
 
@@ -230,7 +248,6 @@ bool JitterDebugPass::render(ID3D11DeviceContext* context,
         context_->SwapDeviceContextState(prior.Get(), nullptr);
     }
 
-    // Update history texture with current frame color for temporal pulse detection next frame
     if (historyTexture_ && colorTex) {
         context->CopyResource(historyTexture_.Get(), colorTex.Get());
         resetRequested_ = false;

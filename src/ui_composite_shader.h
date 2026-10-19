@@ -80,9 +80,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 edgeDiff = wMax - wMin;
     float edgeRange = max(edgeDiff.r, max(edgeDiff.g, edgeDiff.b));
 
-    float dUi = max(dBox * 2.0, dLinear - 0.20 * edgeRange);
-    float uiMask = smoothstep(0.010, 0.035, dUi);
-    float alphaUi = smoothstep(0.04, 0.35, dLinear);
+    float dUi = max(dBox * 2.0, dLinear - 0.75 * edgeRange);
+    float uiMask = smoothstep(0.025, 0.080, dUi);
+    float alphaUi = smoothstep(0.35, 0.75, dBox);
 
     float3 deltaUi = (cGame - cLow) - alphaUi * (cDlss - cLow);
     float3 finalColor = cDlss + uiMask * deltaUi;

@@ -94,6 +94,7 @@ Following the nvidia-dlaa-input-contract.md implications and PLAN.md expected or
 
 ## Documentation to create/update
 
+- `docs/render-passes.md` - Complete reference of all observed engine passes and custom EDPE render passes.
 - `docs/nvidia-dlaa-input-contract.md` - Already exists with measured conventions; keep updated as Elite inputs are verified.
 - `docs/render-pipeline-observations.md` - This file (currently being updated).
 - Consider: `docs/dlss-implementation-plan.md` - High-level plan for DLSS SR after DLAA validation.
