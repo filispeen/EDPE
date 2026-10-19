@@ -225,6 +225,8 @@ inline void updateMainCamera(const edpe::CameraProjection& camera, unsigned long
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_depth_source;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_ldr_source;
 unsigned long long scene_ldr_frame = ~0ull;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_hdr_color_source;
+unsigned long long scene_hdr_color_frame = ~0ull;
 std::array<ID3D11Resource*, 4> s_gbuffer_resources{}; // Weak; compared within current frame only.
 std::atomic<UINT> s_observed_scene_width{0};
 std::atomic<UINT> s_observed_scene_height{0};
@@ -2210,10 +2212,14 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     upscaler.setMode(isSubNative ? edpe::selectModeByRatio(depthDesc.Width, backbufferDesc.Width)
                                  : edpe::UpscaleMode::NativeAA);
     ID3D11Texture2D* colorSource = nullptr;
-    if (isSubNative && scene_ldr_source) {
+    if (scene_hdr_color_source && scene_hdr_color_frame == rendered) {
+        colorSource = scene_hdr_color_source.Get();
+    } else if (scene_ldr_source && scene_ldr_frame == rendered) {
+        colorSource = scene_ldr_source.Get();
+    } else if (isSubNative && scene_ldr_source) {
         colorSource = scene_ldr_source.Get();
     } else if (!isSubNative) {
-        colorSource = backbuffer;
+        colorSource = scene_hdr_color_source ? scene_hdr_color_source.Get() : backbuffer;
     } else {
         if (++s_consecutive_skipped_frames > 2) {
             s_camera_reset = true;
@@ -2280,7 +2286,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         wchar_t msg[160];
         swprintf_s(msg, L"EDPE: temporal color input created %ux%u format=%u (%ls)",
             depthDesc.Width, depthDesc.Height, static_cast<unsigned>(inputFormat),
-            isSubNative ? L"low-res LDR scene target" : L"native backbuffer");
+            colorSource == scene_hdr_color_source.Get() ? L"HDR scene color (no UI)" :
+            (isSubNative ? L"low-res LDR scene target" : L"native backbuffer"));
         EdpeLog(msg);
     }
     context->CopyResource(s_dlaa_input.Get(), colorSource);
@@ -2444,14 +2451,17 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.sharpness = edpe::Config::instance().sharpness;
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
-    inputs.colorIsHdr = false;
+    const bool isHdrColor = (srcColorDesc.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
+                             srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                             srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
+    inputs.colorIsHdr = isHdrColor;
 
     static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
     static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
     static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
     static ID3D11Texture2D* s_cached_backbuffer_ptr = nullptr;
 
-    const DXGI_FORMAT outFormat = concreteLdrColorFormat(backbufferDesc.Format);
+    const DXGI_FORMAT outFormat = isHdrColor ? srcColorDesc.Format : concreteLdrColorFormat(backbufferDesc.Format);
 
     if (s_dlss_output_texture) {
         D3D11_TEXTURE2D_DESC cur{};
@@ -2516,8 +2526,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (upscaler.evaluate(context, inputs, nullptr, evalDestination)) {
         s_camera_reset = false;
 
-        const bool canCompositeUi = (isSubNative &&
-                                     s_preserve_native_ui.load(std::memory_order_relaxed) &&
+        const bool canCompositeUi = (s_preserve_native_ui.load(std::memory_order_relaxed) &&
                                      evalDestination == s_dlss_output_texture.Get() &&
                                      s_dlss_output_srv && s_backbuffer_copy_srv &&
                                      s_dlaa_input_srv && s_backbuffer_rtv &&
@@ -2537,13 +2546,44 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     s_dlaa_input_srv.Get(),
                     s_backbuffer_rtv.Get(),
                     backbufferDesc.Width, backbufferDesc.Height,
-                    depthDesc.Width, depthDesc.Height);
+                    depthDesc.Width, depthDesc.Height,
+                    isHdrColor);
             }
-            if (!compOk) {
+            if (compOk) {
+                static unsigned long long s_comp_log = ~0ull;
+                if (s_comp_log != frame && (s_comp_log == ~0ull || frame % 300 == 0)) {
+                    s_comp_log = frame;
+                    wchar_t cmsg[192];
+                    swprintf_s(cmsg, L"EDPE: UI composited frame=%llu render=%ux%u output=%ux%u (%ls, %ls)",
+                        frame, depthDesc.Width, depthDesc.Height, backbufferDesc.Width, backbufferDesc.Height,
+                        isSubNative ? L"Super Resolution" : L"Native Resolution",
+                        isHdrColor ? L"HDR" : L"LDR");
+                    EdpeLog(cmsg);
+                }
+            } else if (!isHdrColor) {
                 context->CopyResource(backbuffer, s_dlss_output_texture.Get());
             }
         } else if (evalDestination == s_dlss_output_texture.Get()) {
-            context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+            if (!isHdrColor) {
+                context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+            } else {
+                if (!ui_composite_pass) {
+                    auto comp = std::make_unique<edpe::UiCompositePass>();
+                    if (comp->initialize(device.Get(), context)) {
+                        ui_composite_pass = std::move(comp);
+                    }
+                }
+                if (ui_composite_pass) {
+                    ui_composite_pass->composite(context,
+                        s_dlss_output_srv.Get(),
+                        s_backbuffer_copy_srv.Get(),
+                        s_dlaa_input_srv.Get(),
+                        s_backbuffer_rtv.Get(),
+                        backbufferDesc.Width, backbufferDesc.Height,
+                        depthDesc.Width, depthDesc.Height,
+                        true);
+                }
+            }
         }
     }
 
@@ -2889,11 +2929,34 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 seen[index].mrt_hdr_view = nullptr;
                 seen[index].mrt_frame = frame;
             }
+            ID3D11RenderTargetView* hdrRtv = nullptr;
             if (is_main_scene) {
                 seen[index].mrt_hdr_view = targets[3];
+                hdrRtv = targets[3];
             } else if (seen[index].mrt_hdr_view && count && targets &&
-                targets[0] == seen[index].mrt_hdr_view)
+                targets[0] == seen[index].mrt_hdr_view) {
                 seen[index].scene_match_frame = frame;
+                hdrRtv = targets[0];
+            } else if (count && targets && targets[0]) {
+                D3D11_RENDER_TARGET_VIEW_DESC rtvd{};
+                targets[0]->GetDesc(&rtvd);
+                if (rtvd.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                    hdrRtv = targets[0];
+                }
+            }
+            if (hdrRtv) {
+                ID3D11Resource* res = nullptr;
+                hdrRtv->GetResource(&res);
+                if (res) {
+                    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+                    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
+                            reinterpret_cast<void**>(tex.GetAddressOf())))) {
+                        scene_hdr_color_source = tex;
+                        scene_hdr_color_frame = frame;
+                    }
+                    res->Release();
+                }
+            }
             camera_delta_take = is_main_scene;
         }
         if (sequence_active.load(std::memory_order_acquire)) recordBind(static_cast<int>(index));
@@ -3581,6 +3644,8 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         scene_depth_source.Reset();
         scene_ldr_source.Reset();
         scene_ldr_frame = ~0ull;
+        scene_hdr_color_source.Reset();
+        scene_hdr_color_frame = ~0ull;
         s_in_scene_camera_latched_frame = ~0ull;
         s_hdr_slot0_seen_frame = ~0ull;
         s_consecutive_skipped_frames = 0;

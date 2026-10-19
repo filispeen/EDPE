@@ -123,5 +123,22 @@ int main() {
     if (ng0 < 200 || nr0 > 50 || nb0 > 50) return 12; // native world pixel mismatch
     if (nr3 < 200 || ng3 < 200 || nb3 < 200) return 13; // native UI pixel mismatch
 
+    // Test 3: HDR native resolution composite (isHdr = true)
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), dlssSrv.Get(),
+        targetRtv.Get(), 4, 4, 4, 4, true);
+    if (!ok) return 14;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 15;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t hr0 = rows[0], hg0 = rows[1], hb0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t hr3 = lastRow[0], hg3 = lastRow[1], hb3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    if (hg0 < 150 || hr0 > 50 || hb0 > 50) return 16; // HDR world pixel mismatch
+    if (hr3 < 150 || hg3 < 150 || hb3 < 150) return 17; // HDR UI pixel mismatch
+
     return 0;
 }

@@ -13,7 +13,13 @@ cbuffer CompositeParams : register(b0) {
     float2 renderTexel;
     float2 outputSize;
     float2 outputTexel;
+    float4 flags; // x: isHdr (1.0 = HDR inputs, 0.0 = LDR inputs)
 };
+
+float3 toLdr(float3 c) {
+    float3 mapped = max(c, 0.0) / (1.0 + max(c, 0.0));
+    return pow(mapped, 1.0 / 2.2);
+}
 
 struct VSOutput {
     float4 pos : SV_Position;
@@ -34,6 +40,11 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 cGame = tGame.Load(pixelPos).rgb;
     float3 cLow  = tLowWorld.SampleLevel(sLinear, pin.uv, 0).rgb;
 
+    if (flags.x > 0.5) {
+        cDlss = toLdr(cDlss);
+        cLow  = toLdr(cLow);
+    }
+
     float2 lowPos = pin.uv * renderSize - float2(0.5, 0.5);
     int2 lowBase = (int2)floor(lowPos);
     int maxW = (int)renderSize.x - 1;
@@ -47,6 +58,13 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 w10 = tLowWorld.Load(int3(p10, 0)).rgb;
     float3 w01 = tLowWorld.Load(int3(p01, 0)).rgb;
     float3 w11 = tLowWorld.Load(int3(p11, 0)).rgb;
+
+    if (flags.x > 0.5) {
+        w00 = toLdr(w00);
+        w10 = toLdr(w10);
+        w01 = toLdr(w01);
+        w11 = toLdr(w11);
+    }
 
     float3 wMin = min(min(w00, w10), min(w01, w11));
     float3 wMax = max(max(w00, w10), max(w01, w11));

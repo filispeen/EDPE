@@ -14,7 +14,8 @@ public:
                    ID3D11ShaderResourceView* lowResWorld,
                    ID3D11RenderTargetView* targetBackbufferRtv,
                    UINT outputWidth, UINT outputHeight,
-                   UINT renderWidth, UINT renderHeight);
+                   UINT renderWidth, UINT renderHeight,
+                   bool isHdr = false);
 
 private:
     Microsoft::WRL::ComPtr<ID3D11Device> device_;

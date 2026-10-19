@@ -12,6 +12,7 @@ struct CompositeParams {
     float renderTexel[2];
     float outputSize[2];
     float outputTexel[2];
+    float flags[4]; // x: isHdr (1.0f = HDR, 0.0f = LDR)
 };
 
 } // namespace
@@ -79,7 +80,8 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     ID3D11ShaderResourceView* lowResWorld,
     ID3D11RenderTargetView* targetBackbufferRtv,
     UINT outputWidth, UINT outputHeight,
-    UINT renderWidth, UINT renderHeight) {
+    UINT renderWidth, UINT renderHeight,
+    bool isHdr) {
     if (!device_ || !context_ || !dlssReconstruction || !gameBackbufferWithUi ||
         !lowResWorld || !targetBackbufferRtv || !outputWidth || !outputHeight ||
         !renderWidth || !renderHeight) {
@@ -95,6 +97,7 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     params.outputSize[1] = static_cast<float>(outputHeight);
     params.outputTexel[0] = 1.0f / static_cast<float>(outputWidth);
     params.outputTexel[1] = 1.0f / static_cast<float>(outputHeight);
+    params.flags[0] = isHdr ? 1.0f : 0.0f;
 
     context_->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &params, 0, 0);
 
