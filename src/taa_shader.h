@@ -106,8 +106,8 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float2 centerUv = uv - jitterUv;
 
     // Center sample evaluated with high-quality bilinear reconstruction
-    float4 centerSample = currentFrame.SampleLevel(linearSampler, centerUv, 0);
-    float3 current = centerSample.rgb;
+        float4 centerSample = SampleCatmullRom5(currentFrame, linearSampler, centerUv, resolution.xy, resolution.zw);
+    float3 current = max(centerSample.rgb, 0.0);
     float3 currentY = RGBToYCoCg(current);
 
     // 2. 3x3 Neighborhood Statistics in YCoCg
@@ -115,8 +115,8 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // prevents artificial AABB box narrowing and specular clipping shimmer.
     float3 m1 = 0;
     float3 m2 = 0;
-    float3 boxMin = currentY;
-    float3 boxMax = currentY;
+    float3 boxMin = float3(1e9, 1e9, 1e9);
+    float3 boxMax = float3(-1e9, -1e9, -1e9);
 
     [unroll]
     for (int y = -1; y <= 1; ++y) {
@@ -133,6 +133,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
             boxMax = max(boxMax, cY);
         }
     }
+
+    currentY = clamp(currentY, boxMin, boxMax);
+    current = YCoCgToRGB(currentY);
 
     float3 mean = m1 / 9.0;
     float3 sigma = sqrt(max(0.0, m2 / 9.0 - mean * mean));
