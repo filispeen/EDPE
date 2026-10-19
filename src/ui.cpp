@@ -149,9 +149,12 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F7) return true;
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
         wparam == VK_F8 && !(lparam & (1LL << 30))) {
-        const bool active = !edpe::JitterLogger::instance().isOverlayVisible();
-        edpe::JitterLogger::instance().setOverlayVisible(active);
-        EdpeLog(active ? L"EDPE: F8 pressed — Jitter Monitor enabled" : L"EDPE: F8 pressed — Jitter Monitor disabled");
+        ContextCensusToggleJitterDebugView();
+        const bool active = ContextCensusGetJitterDebugView();
+        auto& cfg = edpe::Config::instance();
+        cfg.jitterDebugView = active;
+        cfg.save();
+        EdpeLog(active ? L"EDPE: F8 pressed — Jitter Debug View enabled" : L"EDPE: F8 pressed — Jitter Debug View disabled");
         return true;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F8) return true;
@@ -1124,7 +1127,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (show_perf) {
         edpe::PerfTracker::instance().renderOverlay(draw_menu, cfg.perfOverlayCorner, cfg.perfOverlayScale);
     }
-    edpe::JitterLogger::instance().renderOverlay(draw_menu);
 
     bool window_open = true;
     if (draw_menu) {
@@ -1459,7 +1461,44 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         edpe::Config::instance().save();
     }
     ImGui::Separator();
-    edpe::JitterLogger::instance().renderScopeWidget();
+    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Subpixel Jitter Debug View (Hotkey: F8)");
+    bool debug_view = ContextCensusGetJitterDebugView();
+    if (ImGui::Checkbox("Enable Jitter Debug View (Grayscale Scene + Green Jitter Pixels)", &debug_view)) {
+        ContextCensusSetJitterDebugView(debug_view);
+        auto& cfg = edpe::Config::instance();
+        cfg.jitterDebugView = debug_view;
+        cfg.save();
+    }
+    if (debug_view) {
+        float sens = ContextCensusGetJitterDebugSensitivity();
+        if (ImGui::SliderFloat("Jitter Sensitivity", &sens, 0.1f, 5.0f, "%.2fx")) {
+            ContextCensusSetJitterDebugSensitivity(sens);
+            auto& cfg = edpe::Config::instance();
+            cfg.jitterDebugSensitivity = sens;
+            cfg.save();
+        }
+        float thresh = ContextCensusGetJitterDebugThreshold();
+        if (ImGui::SliderFloat("Jitter Threshold", &thresh, 0.002f, 0.1f, "%.3f")) {
+            ContextCensusSetJitterDebugThreshold(thresh);
+            auto& cfg = edpe::Config::instance();
+            cfg.jitterDebugThreshold = thresh;
+            cfg.save();
+        }
+        int mode = ContextCensusGetJitterDebugMode();
+        const char* const modes[] = {
+            "Hybrid (Spatial Shift + Temporal Pulse)",
+            "Spatial Jitter Shift Only",
+            "Temporal Pulse Only",
+            "Binary Mask Only"
+        };
+        if (ImGui::Combo("Debug Mode", &mode, modes, IM_ARRAYSIZE(modes))) {
+            ContextCensusSetJitterDebugMode(mode);
+            auto& cfg = edpe::Config::instance();
+            cfg.jitterDebugMode = mode;
+            cfg.save();
+        }
+        ImGui::TextDisabled("Grayscale = game scene  |  Green pixels = subpixel jitter affected");
+    }
 
     ImGui::Separator();
     if (ImGui::Button("Capture ALL buffers (diagnostic dump)")) {
@@ -1470,7 +1509,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
         ui.pending_backbuffer_capture = true;
     }
-    ImGui::TextUnformatted("F5: toggle menu | F7: toggle performance HUD | F8: toggle jitter monitor");
+    ImGui::TextUnformatted("F5: toggle menu | F7: toggle performance HUD | F8: toggle jitter debug view");
     ImGui::End();
     if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);

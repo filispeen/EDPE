@@ -47,6 +47,16 @@ public:
 
         jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 32, path.c_str());
 
+        jitterDebugView = GetPrivateProfileIntW(L"Jitter", L"DebugView", 0, path.c_str()) != 0;
+        GetPrivateProfileStringW(L"Jitter", L"DebugSensitivity", L"1.5", buf, 64, path.c_str());
+        jitterDebugSensitivity = static_cast<float>(_wtof(buf));
+        if (jitterDebugSensitivity < 0.1f || jitterDebugSensitivity > 10.0f) jitterDebugSensitivity = 1.5f;
+        GetPrivateProfileStringW(L"Jitter", L"DebugThreshold", L"0.02", buf, 64, path.c_str());
+        jitterDebugThreshold = static_cast<float>(_wtof(buf));
+        if (jitterDebugThreshold < 0.001f || jitterDebugThreshold > 0.5f) jitterDebugThreshold = 0.02f;
+        jitterDebugMode = GetPrivateProfileIntW(L"Jitter", L"DebugMode", 0, path.c_str());
+        if (jitterDebugMode < 0 || jitterDebugMode > 3) jitterDebugMode = 0;
+
         zeroMotionVectors = GetPrivateProfileIntW(L"Motion", L"ZeroMotion", 0, path.c_str()) != 0;
         motionInvertX = GetPrivateProfileIntW(L"Motion", L"InvertX", 0, path.c_str()) != 0;
         motionInvertY = GetPrivateProfileIntW(L"Motion", L"InvertY", 0, path.c_str()) != 0;
@@ -91,6 +101,13 @@ public:
         swprintf_s(buf, L"%.2f", jitterScale);
         WritePrivateProfileStringW(L"Jitter", L"Scale", buf, path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"PhaseCount", std::to_wstring(jitterPhaseCount).c_str(), path.c_str());
+
+        WritePrivateProfileStringW(L"Jitter", L"DebugView", jitterDebugView ? L"1" : L"0", path.c_str());
+        swprintf_s(buf, L"%.2f", jitterDebugSensitivity);
+        WritePrivateProfileStringW(L"Jitter", L"DebugSensitivity", buf, path.c_str());
+        swprintf_s(buf, L"%.3f", jitterDebugThreshold);
+        WritePrivateProfileStringW(L"Jitter", L"DebugThreshold", buf, path.c_str());
+        WritePrivateProfileStringW(L"Jitter", L"DebugMode", std::to_wstring(jitterDebugMode).c_str(), path.c_str());
 
         WritePrivateProfileStringW(L"Motion", L"ZeroMotion", zeroMotionVectors ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Motion", L"InvertX", motionInvertX ? L"1" : L"0", path.c_str());
@@ -204,6 +221,11 @@ public:
     bool jitterSwapXY = false;
     float jitterScale = 1.0f;
     unsigned jitterPhaseCount = 32;
+
+    bool jitterDebugView = false;
+    float jitterDebugSensitivity = 1.5f;
+    float jitterDebugThreshold = 0.02f;
+    int jitterDebugMode = 0;
 
     bool zeroMotionVectors = false;
     bool motionInvertX = false;

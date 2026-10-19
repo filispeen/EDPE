@@ -40,9 +40,6 @@ public:
     void setLoggingEnabled(bool enabled);
     bool isLoggingEnabled() const;
 
-    void setOverlayVisible(bool visible);
-    bool isOverlayVisible() const;
-
     // Fast push called on Present thread (< 20ns, never blocks on disk I/O)
     void pushFrame(const JitterFrameLog& log);
 
@@ -61,10 +58,6 @@ public:
 
     JitterFrameLog getLatest();
 
-    // Dear ImGui UI Rendering
-    void renderScopeWidget();
-    void renderOverlay(bool isMenuOpen);
-
     void shutdown();
 
 private:
@@ -80,7 +73,6 @@ private:
     std::atomic<uint32_t> readIdx_{0};
     std::atomic<uint32_t> writtenRows_{0};
     std::atomic<bool> enabled_{true};
-    std::atomic<bool> overlayVisible_{false};
     std::atomic<bool> running_{true};
     std::atomic<bool> flushRequested_{false};
 

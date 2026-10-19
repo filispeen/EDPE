@@ -60,3 +60,14 @@ bool ContextCensusIsComparisonCapturePending();
 bool ContextCensusConsumeComparisonCaptureRequest();
 ID3D11Texture2D* ContextCensusGetBackbufferCopyTexture();
 ID3D11RenderTargetView* ContextCensusGetBackbufferCopyRtv();
+
+// Subpixel Jitter Debug View (Full-screen grayscale game scene + green jitter pixels)
+void ContextCensusSetJitterDebugView(bool enable);
+bool ContextCensusGetJitterDebugView();
+void ContextCensusToggleJitterDebugView();
+void ContextCensusSetJitterDebugSensitivity(float sensitivity);
+float ContextCensusGetJitterDebugSensitivity();
+void ContextCensusSetJitterDebugThreshold(float threshold);
+float ContextCensusGetJitterDebugThreshold();
+void ContextCensusSetJitterDebugMode(int mode);
+int ContextCensusGetJitterDebugMode();

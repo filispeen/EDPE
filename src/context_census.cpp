@@ -12,6 +12,7 @@
 #include "ui_composite_pass.h"
 #include "ui.h"
 #include "jitter_logger.h"
+#include "jitter_debug_pass.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -374,6 +375,11 @@ std::atomic<unsigned> s_jitter_phase_count{32};
 std::atomic<unsigned> s_active_jitter_phases{32};
 std::atomic<bool> s_preserve_native_ui{true};
 
+std::atomic<bool> s_jitter_debug_view{false};
+std::atomic<float> s_jitter_debug_sensitivity{1.5f};
+std::atomic<float> s_jitter_debug_threshold{0.02f};
+std::atomic<int> s_jitter_debug_mode{0};
+
 std::atomic<bool> s_zero_motion_vectors{false};
 std::atomic<bool> s_motion_invert_x{false};
 std::atomic<bool> s_motion_invert_y{false};
@@ -384,6 +390,7 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
 void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud);
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
+void renderJitterDebugView(ID3D11DeviceContext* context, ID3D11Texture2D* backbuffer);
 void rearmContextHooks();
 
 bool sameRenderTargetResource(ID3D11RenderTargetView* view,
@@ -2574,6 +2581,90 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     rearmContextHooks();
 }
 
+void renderJitterDebugView(ID3D11DeviceContext* context, ID3D11Texture2D* backbuffer) {
+    if (!context || !backbuffer) return;
+
+    D3D11_TEXTURE2D_DESC bbDesc{};
+    backbuffer->GetDesc(&bbDesc);
+    if (!bbDesc.Width || !bbDesc.Height || bbDesc.SampleDesc.Count != 1) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return;
+
+    const DXGI_FORMAT typedFormat = concreteLdrColorFormat(bbDesc.Format);
+
+    static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_debug_input_copy;
+    static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_debug_input_srv;
+    static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_debug_backbuffer_rtv;
+    static ID3D11Texture2D* s_debug_cached_backbuffer = nullptr;
+
+    if (s_debug_input_copy) {
+        D3D11_TEXTURE2D_DESC cur{};
+        s_debug_input_copy->GetDesc(&cur);
+        if (cur.Width != bbDesc.Width || cur.Height != bbDesc.Height || cur.Format != typedFormat) {
+            s_debug_input_copy.Reset();
+            s_debug_input_srv.Reset();
+        }
+    }
+
+    if (!s_debug_input_copy) {
+        D3D11_TEXTURE2D_DESC td = bbDesc;
+        td.Format = typedFormat;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = td.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&td, nullptr, &s_debug_input_copy)) ||
+            FAILED(device->CreateShaderResourceView(s_debug_input_copy.Get(), nullptr, &s_debug_input_srv))) {
+            s_debug_input_copy.Reset();
+            s_debug_input_srv.Reset();
+            return;
+        }
+    }
+
+    if (s_debug_cached_backbuffer != backbuffer || !s_debug_backbuffer_rtv) {
+        s_debug_cached_backbuffer = backbuffer;
+        s_debug_backbuffer_rtv.Reset();
+        if (FAILED(device->CreateRenderTargetView(backbuffer, nullptr, &s_debug_backbuffer_rtv))) {
+            return;
+        }
+    }
+
+    context->CopyResource(s_debug_input_copy.Get(), backbuffer);
+
+    static std::unique_ptr<edpe::JitterDebugPass> s_jitter_debug_pass;
+    if (!s_jitter_debug_pass) {
+        auto pass = std::make_unique<edpe::JitterDebugPass>();
+        if (!pass->initialize(device.Get(), context)) {
+            return;
+        }
+        s_jitter_debug_pass = std::move(pass);
+    }
+
+    float jx = 0.0f, jy = 0.0f;
+    if (edpe::UpscalerManager::instance().isReconstructionActive()) {
+        jx = s_last_rendered_jitter.pixelX;
+        jy = s_last_rendered_jitter.pixelY;
+        if (s_jitter_swap_xy.load(std::memory_order_relaxed)) std::swap(jx, jy);
+        if (s_jitter_invert_x.load(std::memory_order_relaxed)) jx = -jx;
+        if (s_jitter_invert_y.load(std::memory_order_relaxed)) jy = -jy;
+    }
+
+    const float sensitivity = s_jitter_debug_sensitivity.load(std::memory_order_relaxed);
+    const float threshold = s_jitter_debug_threshold.load(std::memory_order_relaxed);
+    const int mode = s_jitter_debug_mode.load(std::memory_order_relaxed);
+
+    ID3D11ShaderResourceView* motionSrv = motion_pass ? motion_pass->output() : nullptr;
+
+    s_jitter_debug_pass->render(context,
+        s_debug_input_srv.Get(),
+        s_debug_backbuffer_rtv.Get(),
+        bbDesc.Width, bbDesc.Height,
+        jx, jy,
+        sensitivity, threshold, mode,
+        motionSrv);
+}
+
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,
     ID3D11RenderTargetView* const* targets) {
     wchar_t message[192];
@@ -2974,6 +3065,10 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_jitter_scale.store(cfg.jitterScale, std::memory_order_relaxed);
         s_jitter_phase_count.store(cfg.jitterPhaseCount, std::memory_order_relaxed);
         s_preserve_native_ui.store(cfg.preserveNativeUi, std::memory_order_relaxed);
+        s_jitter_debug_view.store(cfg.jitterDebugView, std::memory_order_relaxed);
+        s_jitter_debug_sensitivity.store(cfg.jitterDebugSensitivity, std::memory_order_relaxed);
+        s_jitter_debug_threshold.store(cfg.jitterDebugThreshold, std::memory_order_relaxed);
+        s_jitter_debug_mode.store(cfg.jitterDebugMode, std::memory_order_relaxed);
         s_zero_motion_vectors.store(cfg.zeroMotionVectors, std::memory_order_relaxed);
         s_motion_invert_x.store(cfg.motionInvertX, std::memory_order_relaxed);
         s_motion_invert_y.store(cfg.motionInvertY, std::memory_order_relaxed);
@@ -3119,11 +3214,16 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         rearmContextHooks();
         auto* context = observed_context.load(std::memory_order_acquire);
-        if (edpe::UpscalerManager::instance().isReconstructionActive() && context) {
+        if (context) {
             Microsoft::WRL::ComPtr<ID3D11Texture2D> backbuffer;
             if (SUCCEEDED(swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D),
                     reinterpret_cast<void**>(backbuffer.GetAddressOf())))) {
-                tryTemporalUpscale(context, rendered_frame, backbuffer.Get());
+                if (edpe::UpscalerManager::instance().isReconstructionActive()) {
+                    tryTemporalUpscale(context, rendered_frame, backbuffer.Get());
+                }
+                if (s_jitter_debug_view.load(std::memory_order_relaxed)) {
+                    renderJitterDebugView(context, backbuffer.Get());
+                }
             }
         }
         s_upscale_evaluated_this_frame = false;
@@ -3715,4 +3815,45 @@ ID3D11Texture2D* ContextCensusGetBackbufferCopyTexture() {
 
 ID3D11RenderTargetView* ContextCensusGetBackbufferCopyRtv() {
     return s_backbuffer_copy_rtv.Get();
+}
+
+void ContextCensusSetJitterDebugView(bool enable) {
+    s_jitter_debug_view.store(enable, std::memory_order_relaxed);
+    edpe::Config::instance().jitterDebugView = enable;
+}
+
+bool ContextCensusGetJitterDebugView() {
+    return s_jitter_debug_view.load(std::memory_order_relaxed);
+}
+
+void ContextCensusToggleJitterDebugView() {
+    const bool current = s_jitter_debug_view.load(std::memory_order_relaxed);
+    ContextCensusSetJitterDebugView(!current);
+}
+
+void ContextCensusSetJitterDebugSensitivity(float sensitivity) {
+    s_jitter_debug_sensitivity.store(sensitivity, std::memory_order_relaxed);
+    edpe::Config::instance().jitterDebugSensitivity = sensitivity;
+}
+
+float ContextCensusGetJitterDebugSensitivity() {
+    return s_jitter_debug_sensitivity.load(std::memory_order_relaxed);
+}
+
+void ContextCensusSetJitterDebugThreshold(float threshold) {
+    s_jitter_debug_threshold.store(threshold, std::memory_order_relaxed);
+    edpe::Config::instance().jitterDebugThreshold = threshold;
+}
+
+float ContextCensusGetJitterDebugThreshold() {
+    return s_jitter_debug_threshold.load(std::memory_order_relaxed);
+}
+
+void ContextCensusSetJitterDebugMode(int mode) {
+    s_jitter_debug_mode.store(mode, std::memory_order_relaxed);
+    edpe::Config::instance().jitterDebugMode = mode;
+}
+
+int ContextCensusGetJitterDebugMode() {
+    return s_jitter_debug_mode.load(std::memory_order_relaxed);
 }
