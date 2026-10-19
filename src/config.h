@@ -45,7 +45,7 @@ public:
         jitterScale = static_cast<float>(_wtof(buf));
         if (jitterScale < 0.0f || jitterScale > 2.0f) jitterScale = 1.0f;
 
-        jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 8, path.c_str());
+        jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 32, path.c_str());
 
         zeroMotionVectors = GetPrivateProfileIntW(L"Motion", L"ZeroMotion", 0, path.c_str()) != 0;
         motionInvertX = GetPrivateProfileIntW(L"Motion", L"InvertX", 0, path.c_str()) != 0;
@@ -203,7 +203,7 @@ public:
     bool jitterInvertY = false;
     bool jitterSwapXY = false;
     float jitterScale = 1.0f;
-    unsigned jitterPhaseCount = 8;
+    unsigned jitterPhaseCount = 32;
 
     bool zeroMotionVectors = false;
     bool motionInvertX = false;

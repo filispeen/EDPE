@@ -210,39 +210,7 @@ inline bool isReflectionOrAuxiliaryCamera(const edpe::CameraProjection& candidat
     return false;
 }
 
-inline bool sameCamera(const edpe::CameraProjection& a, const edpe::CameraProjection& b) {
-    for (int i = 0; i < 12; ++i) {
-        if (std::fabs(a.worldFromView[i] - b.worldFromView[i]) > 1e-5f) return false;
-    }
-    return std::fabs(a.scaleX - b.scaleX) < 1e-5f && std::fabs(a.scaleY - b.scaleY) < 1e-5f;
-}
-
-inline bool isRevisitedCamera(const edpe::CameraProjection& camera) {
-    static std::array<edpe::CameraProjection, 8> recent{};
-    static unsigned count = 0;
-    static unsigned head = 0;
-    if (s_camera_now.scaleX > 0.0f && sameCamera(camera, s_camera_now)) return false;
-    const unsigned stored = count < 8 ? count : 8;
-    for (unsigned i = 0; i < stored; ++i) {
-        if (sameCamera(camera, recent[i])) return true;
-    }
-    recent[head] = camera;
-    head = (head + 1) % 8;
-    if (count < 8) ++count;
-    return false;
-}
-
 inline void updateMainCamera(const edpe::CameraProjection& camera, unsigned long long cur_frame) {
-    static unsigned s_revisit_rejected = 0;
-    if (isRevisitedCamera(camera)) {
-        if (++s_revisit_rejected <= 8 || (s_revisit_rejected % 512) == 0) {
-            wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: ignored revisited camera sample #%u frame=%llu",
-                s_revisit_rejected, cur_frame);
-            EdpeLog(msg);
-        }
-        return;
-    }
     if (s_camera_frame == ~0ull) {
         s_camera_previous = camera;
         s_camera_previous_frame = cur_frame;
@@ -1123,9 +1091,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             }
 
             // Phase 5: Projection jitter injection into words 1080..1095
-            // Inject jitter into all non-reflection scene camera projections matching the display aspect ratio
-            const bool is_planar_reflection = aspect_ok && (cameraRotationDeterminant(parsed_camera) < 0.5f);
-            if ((is_main_camera || (aspect_ok && !is_planar_reflection)) && ContextCensusIsJitterActive()) {
+            // Inject jitter strictly into the authoritative main scene camera projection
+            if (is_main_camera && ContextCensusIsJitterActive()) {
                 float* words = static_cast<float*>(mapped_ptr);
                 bool valid_projection = true;
                 for (size_t i = 1080; i < 1096; ++i) {

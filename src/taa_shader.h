@@ -101,9 +101,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // 1. Subpixel de-jittering for the current frame
     // In EDPE, projection jitter offsets are in pixel units: params.x, params.y.
     // The projection shifted geometry by +jitter in screen pixels.
-    // To sample the unjittered nominal pixel center, we sample with linearSampler at uv - jitterUv.
+    // To sample the feature that corresponds to the nominal unjittered pixel center, we sample at uv + jitterUv.
     float2 jitterUv = float2(params.x * resolution.z, params.y * resolution.w);
-    float2 centerUv = uv - jitterUv;
+    float2 centerUv = uv + jitterUv;
 
     // Center sample evaluated with high-quality bilinear reconstruction
         float4 centerSample = SampleCatmullRom5(currentFrame, linearSampler, centerUv, resolution.xy, resolution.zw);
