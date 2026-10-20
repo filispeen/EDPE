@@ -539,7 +539,9 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.outputHeight,
         inputs.jitterX,
         inputs.jitterY,
-        inputs.reset);
+        inputs.reset,
+        inputs.renderWidth,
+        inputs.renderHeight);
 }
 
 void TaaUpscalerBackend::resetHistory() {

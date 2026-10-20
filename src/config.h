@@ -30,7 +30,7 @@ public:
         dlssPreset = GetPrivateProfileIntW(L"Upscaler", L"Preset", 0, path.c_str());
         autoSyncEliteConfig = GetPrivateProfileIntW(L"Upscaler", L"AutoSyncEliteConfig", 1, path.c_str()) != 0;
         preserveNativeUi = GetPrivateProfileIntW(L"Upscaler", L"PreserveNativeUi", 1, path.c_str()) != 0;
-        hdrInput = GetPrivateProfileIntW(L"Upscaler", L"HdrInput", 1, path.c_str()) != 0;
+        hdrInput = GetPrivateProfileIntW(L"Upscaler", L"HdrInput", 0, path.c_str()) != 0;
 
         wchar_t sharpnessBuf[64]{};
         GetPrivateProfileStringW(L"Upscaler", L"Sharpness", L"0.0", sharpnessBuf, 64, path.c_str());
@@ -217,7 +217,7 @@ public:
     float sharpness = 0.0f;
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;
-    bool hdrInput = true;
+    bool hdrInput = false;
 
     bool jitterInvertX = false;
     bool jitterInvertY = false;

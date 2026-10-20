@@ -1169,19 +1169,21 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     if (upscaler.isReconstructionActive()) {
         const bool isAmd = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
+        const bool isTaa = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
         const bool isSr = (live_tel.renderWidth < live_tel.outputWidth || live_tel.renderHeight < live_tel.outputHeight);
-        const char* uName = isAmd ? (isSr ? "AMD FSR SR" : "AMD FSR Native AA")
+        const char* uName = isTaa ? "TAA" :
+                            isAmd ? (isSr ? "AMD FSR SR" : "AMD FSR Native AA")
                                   : (isSr ? "NVIDIA DLSS" : "NVIDIA DLAA");
         char pBuf[64]{};
-        if (!isAmd) {
+        if (isTaa || isAmd) {
+            snprintf(pBuf, sizeof(pBuf), "(%s)", isSr ? "Super Resolution" : "Native AA");
+        } else {
             const uint32_t p = edpe::NgxContext::get_preset();
             const char* pName = (p == 10) ? "Preset J" :
                                 (p == 11) ? "Preset K" :
                                 (p == 12) ? "Preset L" :
                                 (p == 13) ? "Preset M" : "Auto (Preset K)";
             snprintf(pBuf, sizeof(pBuf), "(%s)", pName);
-        } else {
-            snprintf(pBuf, sizeof(pBuf), "(%s)", isSr ? "Super Resolution" : "Native AA");
         }
         ImGui::Text("Reconstruction: %s %s [%ux%u -> %ux%u]",
             uName, pBuf, live_tel.renderWidth, live_tel.renderHeight, live_tel.outputWidth, live_tel.outputHeight);
@@ -1276,12 +1278,14 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     const float activeScalePct = outW ? (100.0f * static_cast<float>(sceneW) / static_cast<float>(outW)) : 100.0f;
     const bool isSr = (sceneW < outW || sceneH < outH);
 
+    const bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
     const auto& diag = upscaler.getDiagnostics();
     if (backend_active) {
-        const char* backendName = amd_active ? "AMD" : "NVIDIA";
-        const char* techName = amd_active
-            ? (isSr ? "FSR Super Resolution" : "FSR Native AA")
-            : (isSr ? "DLSS Super Resolution" : "DLAA");
+        const char* backendName = taa_active ? "Native D3D11" : (amd_active ? "AMD" : "NVIDIA");
+        const char* techName = taa_active
+            ? (isSr ? "TAA Super Resolution" : "TAA Native AA")
+            : (amd_active ? (isSr ? "FSR Super Resolution" : "FSR Native AA")
+                          : (isSr ? "DLSS Super Resolution" : "DLAA"));
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
             "Reconstruction: %s %s Active",
             backendName, techName);
@@ -1295,7 +1299,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         } else {
             ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
                 "Native 1:1 render detected -> %s antialiasing active.",
-                amd_active ? "FSR Native AA" : "DLAA");
+                taa_active ? "TAA" : (amd_active ? "FSR Native AA" : "DLAA"));
         }
     } else {
         ImGui::Text("Reconstruction: Inactive (Scene %ux%u -> Output %ux%u)",

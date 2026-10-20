@@ -277,7 +277,7 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
 
             char presetBuf[64]{};
             if (isTaa) {
-                snprintf(presetBuf, sizeof(presetBuf), "(Native AA)");
+                snprintf(presetBuf, sizeof(presetBuf), "(%s)", isSr ? "Super Resolution" : "Native AA");
             } else if (!isAmd) {
                 const uint32_t p = NgxContext::get_preset();
                 const char* pName = (p == 10) ? "Preset J" :

@@ -8,8 +8,9 @@ namespace edpe {
 // history reconstruction, cockpit interior stabilization, and velocity/UI confidence protection.
 inline constexpr char kTaaShader[] = R"(
 cbuffer TaaConstants : register(b0) {
-    float4 resolution; // x: width, y: height, z: 1/width, w: 1/height
-    float4 params;     // x: jitterX, y: jitterY, z: blendWeight, w: resetFlag
+    float4 resolution;       // x: outputWidth, y: outputHeight, z: 1/outputWidth, w: 1/outputHeight
+    float4 renderResolution; // x: renderWidth, y: renderHeight, z: 1/renderWidth, w: 1/renderHeight
+    float4 params;           // x: jitterX, y: jitterY, z: blendWeight, w: resetFlag
 };
 
 Texture2D<float4> currentFrame  : register(t0);
@@ -102,11 +103,11 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // In EDPE, projection jitter offsets are in pixel units: params.x, params.y.
     // The projection shifted geometry by +jitter in screen pixels.
     // To sample the feature that corresponds to the nominal unjittered pixel center, we sample at uv + jitterUv.
-    float2 jitterUv = float2(params.x * resolution.z, params.y * resolution.w);
+    float2 jitterUv = float2(params.x * renderResolution.z, params.y * renderResolution.w);
     float2 centerUv = uv + jitterUv;
 
-    // Center sample evaluated with high-quality bilinear reconstruction
-        float4 centerSample = SampleCatmullRom5(currentFrame, linearSampler, centerUv, resolution.xy, resolution.zw);
+    // Center sample evaluated with high-quality Catmull-Rom reconstruction at render resolution
+    float4 centerSample = SampleCatmullRom5(currentFrame, linearSampler, centerUv, renderResolution.xy, renderResolution.zw);
     float3 current = max(centerSample.rgb, 0.0);
     float3 currentY = RGBToYCoCg(current);
 
@@ -122,7 +123,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     for (int y = -1; y <= 1; ++y) {
         [unroll]
         for (int x = -1; x <= 1; ++x) {
-            float2 sampleUv = centerUv + float2(x, y) * resolution.zw;
+            float2 sampleUv = centerUv + float2(x, y) * renderResolution.zw;
             float3 c = currentFrame.SampleLevel(pointSampler, sampleUv, 0).rgb;
             float3 cY = RGBToYCoCg(c);
 
@@ -167,11 +168,8 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // For high-luminance specular highlights/lamps, widen varMax towards boxMax when stationary
     // to prevent subpixel Karis clipping shimmer across frame phases:
     float3 finalMax = min(boxMax, max(varMax, boxMax * (1.0 - saturate(speed * 0.5))));
-    float subpixelSlack = lerp(0.12, 0.0, saturate(speed * 0.5));
-    finalMin -= subpixelSlack;
-    finalMax += subpixelSlack;
 
-    float2 priorUv = uv + mvPixels * resolution.zw;
+    float2 priorUv = uv + mvPixels * renderResolution.zw;
     bool isOffscreen = (priorUv.x < 0.0 || priorUv.x > 1.0 || priorUv.y < 0.0 || priorUv.y > 1.0);
     bool isReset = (params.w > 0.5) || isOffscreen;
 
@@ -197,9 +195,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float speedFactor = saturate(speed * 0.25);
     float historyConfidence = lerp(1.0, 1.0 / (1.0 + clampDistance * 4.0), speedFactor);
 
-    // Base blend weight: 0.95 for static/smooth, lower when high speed
+    // Base blend weight: 0.90 for static/smooth, lower when high speed
     float blendWeight = clamp(params.z, 0.0, 0.95);
-    blendWeight = lerp(max(blendWeight, 0.95), 0.70, saturate(speed * 0.05));
+    blendWeight = lerp(blendWeight, 0.70, saturate(speed * 0.05));
 
     // Dynamic blend weight
     float dynamicBlend = blendWeight * historyConfidence;

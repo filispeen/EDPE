@@ -25,7 +25,9 @@ public:
         uint32_t height,
         float jitterX,
         float jitterY,
-        bool reset);
+        bool reset,
+        uint32_t renderWidth = 0,
+        uint32_t renderHeight = 0);
 
     void resetHistory() { resetRequested_ = true; }
     bool isInitialized() const { return device_ != nullptr; }

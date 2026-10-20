@@ -10,8 +10,9 @@ namespace edpe {
 namespace {
 
 struct TaaConstantBufferData {
-    float resolution[4]; // width, height, 1/width, 1/height
-    float params[4];     // jitterX, jitterY, blendWeight, resetFlag
+    float resolution[4];       // outputWidth, outputHeight, 1/outputWidth, 1/outputHeight
+    float renderResolution[4]; // renderWidth, renderHeight, 1/renderWidth, 1/renderHeight
+    float params[4];           // jitterX, jitterY, blendWeight, resetFlag
 };
 
 } // namespace
@@ -154,7 +155,9 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     uint32_t height,
     float jitterX,
     float jitterY,
-    bool reset) {
+    bool reset,
+    uint32_t renderWidth,
+    uint32_t renderHeight) {
     if (!device_ || !context || !currentFrameSrv || !destinationTexture || width == 0 || height == 0) {
         return false;
     }
@@ -178,11 +181,18 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     const bool performReset = reset || resetRequested_;
     resetRequested_ = false;
 
+    const uint32_t rW = (renderWidth > 0) ? renderWidth : width;
+    const uint32_t rH = (renderHeight > 0) ? renderHeight : height;
+
     TaaConstantBufferData cb{};
     cb.resolution[0] = static_cast<float>(width);
     cb.resolution[1] = static_cast<float>(height);
     cb.resolution[2] = 1.0f / static_cast<float>(width);
     cb.resolution[3] = 1.0f / static_cast<float>(height);
+    cb.renderResolution[0] = static_cast<float>(rW);
+    cb.renderResolution[1] = static_cast<float>(rH);
+    cb.renderResolution[2] = 1.0f / static_cast<float>(rW);
+    cb.renderResolution[3] = 1.0f / static_cast<float>(rH);
     cb.params[0] = jitterX;
     cb.params[1] = jitterY;
     cb.params[2] = 0.90f; // 90% history weight
