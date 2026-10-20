@@ -33,6 +33,10 @@ DXGI_FORMAT toConcreteLdrFormat(DXGI_FORMAT fmt) {
 struct StatsConstantBufferData {
     uint32_t width;
     uint32_t height;
+    uint32_t sceneWidth;
+    uint32_t sceneHeight;
+    uint32_t isHdr;
+    uint32_t hasScene;
     uint32_t pad[2];
 };
 
@@ -190,7 +194,7 @@ bool JitterViewRecorder::ensureResources(ID3D11Device* device, ID3D11DeviceConte
         }
 
         D3D11_BUFFER_DESC gpuBufDesc{};
-        gpuBufDesc.ByteWidth = static_cast<UINT>(kJitterViewGridTiles * sizeof(uint32_t));
+        gpuBufDesc.ByteWidth = static_cast<UINT>(2 * kJitterViewGridTiles * sizeof(uint32_t));
         gpuBufDesc.Usage = D3D11_USAGE_DEFAULT;
         gpuBufDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         gpuBufDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
@@ -204,14 +208,14 @@ bool JitterViewRecorder::ensureResources(ID3D11Device* device, ID3D11DeviceConte
         uavDesc.Format = DXGI_FORMAT_UNKNOWN;
         uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
         uavDesc.Buffer.FirstElement = 0;
-        uavDesc.Buffer.NumElements = kJitterViewGridTiles;
+        uavDesc.Buffer.NumElements = 2 * kJitterViewGridTiles;
         if (FAILED(device->CreateUnorderedAccessView(gpuBuffer_.Get(), &uavDesc, &gpuUav_))) {
             releaseResources();
             return false;
         }
 
         D3D11_BUFFER_DESC stgDesc{};
-        stgDesc.ByteWidth = static_cast<UINT>(kJitterViewGridTiles * sizeof(uint32_t));
+        stgDesc.ByteWidth = static_cast<UINT>(2 * kJitterViewGridTiles * sizeof(uint32_t));
         stgDesc.Usage = D3D11_USAGE_STAGING;
         stgDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         for (size_t i = 0; i < kRingSize; ++i) {
@@ -397,7 +401,13 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
 
                 context->CopyResource(inputCopy_.Get(), backbuffer);
 
-                const StatsConstantBufferData cbData{ width, height, {0, 0} };
+                StatsConstantBufferData cbData{};
+                cbData.width = width;
+                cbData.height = height;
+                cbData.sceneWidth = passInfo.inW;
+                cbData.sceneHeight = passInfo.inH;
+                cbData.isHdr = isHdr ? 1 : 0;
+                cbData.hasScene = (inputColorSrv != nullptr && passInfo.inW > 0 && passInfo.inH > 0) ? 1 : 0;
                 context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cbData, 0, 0);
 
                 const UINT clearVals[4] = { 0, 0, 0, 0 };
@@ -408,19 +418,22 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                     context1_->SwapDeviceContextState(stateObject_.Get(), &prior);
                 }
 
-                ID3D11ShaderResourceView* srv = inputSrv_.Get();
+                ID3D11ShaderResourceView* srvs[2] = {
+                    inputSrv_.Get(),
+                    cbData.hasScene ? inputColorSrv : nullptr
+                };
                 ID3D11UnorderedAccessView* uav = gpuUav_.Get();
                 ID3D11Buffer* cb = constantBuffer_.Get();
 
                 context1_->CSSetShader(computeShader_.Get(), nullptr, 0);
                 context1_->CSSetConstantBuffers(0, 1, &cb);
-                context1_->CSSetShaderResources(0, 1, &srv);
+                context1_->CSSetShaderResources(0, 2, srvs);
                 context1_->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 
                 context1_->Dispatch(64, 36, 1);
 
-                ID3D11ShaderResourceView* nullSrv = nullptr;
-                context1_->CSSetShaderResources(0, 1, &nullSrv);
+                ID3D11ShaderResourceView* nullSrvs[2] = { nullptr, nullptr };
+                context1_->CSSetShaderResources(0, 2, nullSrvs);
                 ID3D11UnorderedAccessView* nullUav = nullptr;
                 context1_->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
 
@@ -521,10 +534,22 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                     frameData.meta.mode = s.mode;
                     frameData.meta.sceneW = s.sceneW;
                     frameData.meta.sceneH = s.sceneH;
-                    frameData.meta.lumaSumQ10 = 0;
-                    frameData.meta.lumaMean = -1.0;
 
-                    std::memcpy(frameData.tiles.data(), mapped.pData, kJitterViewGridTiles * sizeof(uint32_t));
+                    const uint32_t* mappedData = static_cast<const uint32_t*>(mapped.pData);
+                    std::memcpy(frameData.tiles.data(), mappedData, kJitterViewGridTiles * sizeof(uint32_t));
+
+                    if (s.hasLuma && s.sceneW > 0 && s.sceneH > 0) {
+                        uint64_t lumaSum = 0;
+                        for (uint32_t ti = 0; ti < kJitterViewGridTiles; ++ti) {
+                            lumaSum += mappedData[kJitterViewGridTiles + ti];
+                        }
+                        frameData.meta.lumaSumQ10 = lumaSum;
+                        frameData.meta.lumaMean = static_cast<double>(lumaSum) / (1023.0 * static_cast<double>(s.sceneW) * static_cast<double>(s.sceneH));
+                    } else {
+                        frameData.meta.lumaSumQ10 = 0;
+                        frameData.meta.lumaMean = -1.0;
+                    }
+
                     context->Unmap(stagingBuffers_[readSlot_].Get(), 0);
                     slots_[readSlot_].inFlight = false;
                     recordedFrames_.push_back(std::move(frameData));
@@ -576,10 +601,22 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                 frameData.meta.mode = s.mode;
                 frameData.meta.sceneW = s.sceneW;
                 frameData.meta.sceneH = s.sceneH;
-                frameData.meta.lumaSumQ10 = 0;
-                frameData.meta.lumaMean = -1.0;
 
-                std::memcpy(frameData.tiles.data(), mapped.pData, kJitterViewGridTiles * sizeof(uint32_t));
+                const uint32_t* mappedData = static_cast<const uint32_t*>(mapped.pData);
+                std::memcpy(frameData.tiles.data(), mappedData, kJitterViewGridTiles * sizeof(uint32_t));
+
+                if (s.hasLuma && s.sceneW > 0 && s.sceneH > 0) {
+                    uint64_t lumaSum = 0;
+                    for (uint32_t ti = 0; ti < kJitterViewGridTiles; ++ti) {
+                        lumaSum += mappedData[kJitterViewGridTiles + ti];
+                    }
+                    frameData.meta.lumaSumQ10 = lumaSum;
+                    frameData.meta.lumaMean = static_cast<double>(lumaSum) / (1023.0 * static_cast<double>(s.sceneW) * static_cast<double>(s.sceneH));
+                } else {
+                    frameData.meta.lumaSumQ10 = 0;
+                    frameData.meta.lumaMean = -1.0;
+                }
+
                 context->Unmap(stagingBuffers_[readSlot_].Get(), 0);
                 slots_[readSlot_].inFlight = false;
                 recordedFrames_.push_back(std::move(frameData));
