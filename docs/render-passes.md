@@ -248,3 +248,31 @@ For the comprehensive draw-by-draw and pass-by-pass census derived from RenderDo
 4. **Cockpit Holographic HUD (Gameplay Pass 35)**: **32 draws** directly into `Tex#6888` (`R11G11B10_FLOAT`) prior to Bloom downsampling.
 5. **Reactive Mask Architecture**: G-Buffer `RTV3` (Pass 10 exit) + Cockpit HUD (Pass 35) provide the complete data needed for `TemporalFrameInputs::reactiveMask`.
 
+---
+
+## 6. Jitter View Diagnostic Recorder & Luminance Analysis (`jitter_view.log`)
+
+The Subpixel Jitter Debug View recorder (`F9`, [`edpe::JitterViewRecorder`](file:///F:/Code/%D0%A1++/EDPE/src/jitter_view_recorder.h)) records temporal jitter response and input state across 5-second bursts into `jitter_view.log`.
+
+### Per-Frame Input State Tracking
+Each recorded frame logs its upstream renderer input state at the end of the line:
+- `luma_mean`: Mean normalized scene luminance before debug view processing.
+- `in_fmt`: Upstream scene color texture format (`DXGI_FORMAT`).
+- `scene_w`, `scene_h`: Dimensions of the scene color texture.
+- `mv_null`: True if motion vectors SRV was null during the frame.
+- `depth_null`: True if scene depth SRV was null during the frame.
+- `hist_realloc`: True if history buffer was reallocated (format/resolution change).
+- `sens`, `thr`, `mode`: Active debug pass sensitivity, threshold, and algorithm mode.
+
+### Scene Luminance Sampling & Exposure Correlation
+To verify whether periodic full-screen flickering in debug view is driven by dynamic exposure (eye adaptation) from in-frame lamps, [`kJitterViewStatsShader`](file:///F:/Code/%D0%A1++/EDPE/src/jitter_view_stats_shader.h) samples the pristine scene input (`inputColorSrv` at `t1`) concurrently with output green pixels.
+Luminance is calculated as `dot(norm(c), float3(0.299, 0.587, 0.114))` with HDR tone-mapping `c / (1 + c)` or LDR saturation, and accumulated per-tile in fixed-point Q10.
+
+The report summary calculates:
+- `luma_min`, `luma_avg`, `luma_max`: Scene brightness bounds across the recording.
+- `luma_dominant_period_frames`, `luma_dominant_freq_hz`: Dominant periodicity of scene luminance via autocorrelation.
+- `pearson_green_vs_luma`: Pearson correlation between green pixel percentage and instantaneous scene brightness.
+- `pearson_green_vs_abs_dluma`: Pearson correlation between green pixel percentage and exposure jump magnitude `|luma[i] - luma[i-1]|`.
+- `mv_null_frames`, `depth_null_frames`, `hist_realloc_frames`, `unique_in_fmt`: Input stability tallies.
+
+
