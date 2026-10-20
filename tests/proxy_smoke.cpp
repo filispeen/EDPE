@@ -515,6 +515,9 @@ int wmain(int argc, wchar_t** argv) {
     SendMessageW(window, WM_KEYUP, VK_F5, 0);
     SendMessageW(window, WM_KEYDOWN, 'A', 0);
     const bool hidden_input_restored = forwarded_keys == 2;
+    // Exercise OMSetRenderTargets with NumViews=8 and null in unused slots (matching Cobra Odyssey lighting pass)
+    ID3D11RenderTargetView* cobra_views[8]{second_color_view, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    context->OMSetRenderTargets(8, cobra_views, nullptr);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     ID3D11Buffer* no_buffer = nullptr;
     context->VSSetConstantBuffers(1, 1, &no_buffer);

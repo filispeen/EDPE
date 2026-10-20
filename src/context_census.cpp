@@ -2280,6 +2280,14 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             if (++s_consecutive_skipped_frames > 2) {
                 s_camera_reset = true;
             }
+            static unsigned long long s_last_ldr_log = ~0ull;
+            if (s_last_ldr_log == ~0ull || frame >= s_last_ldr_log + 300) {
+                s_last_ldr_log = frame;
+                wchar_t msg[192];
+                swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu (low-res LDR scene target %ux%u not observed)",
+                    frame, depthDesc.Width, depthDesc.Height);
+                EdpeLog(msg);
+            }
             return;
         }
     }
@@ -2295,6 +2303,14 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 return;
             }
         } else {
+            static unsigned long long s_last_dim_log = ~0ull;
+            if (s_last_dim_log == ~0ull || frame >= s_last_dim_log + 300) {
+                s_last_dim_log = frame;
+                wchar_t msg[192];
+                swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu (color %ux%u != depth %ux%u)",
+                    frame, srcColorDesc.Width, srcColorDesc.Height, depthDesc.Width, depthDesc.Height);
+                EdpeLog(msg);
+            }
             return;
         }
     }
@@ -2890,8 +2906,19 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     if ((motion_pair_active || reconstruction_active) && motion_color_source &&
         motion_color_frame == current_frame) {
         bool bound = false;
-        for (UINT slot = 0; targets && slot < count; ++slot)
-            bound |= sameRenderTargetResource(targets[slot], motion_color_source.Get());
+        UINT non_null_count = 0;
+        for (UINT slot = 0; targets && slot < count; ++slot) {
+            if (targets[slot]) {
+                ++non_null_count;
+                bound |= sameRenderTargetResource(targets[slot], motion_color_source.Get());
+            }
+        }
+        // Cobra transitions the HDR color target from MRT RTV3 (Binds 1-3) to RTV0 (Binds 4-7).
+        // In Cobra Odyssey, OMSetRenderTargets is called with NumViews=8 and null in unused slots.
+        const bool is_hdr_slot0 = count >= 1 && targets && targets[0] &&
+            sameRenderTargetResource(targets[0], motion_color_source.Get()) &&
+            (non_null_count < 4 || (count > 3 && targets[3] == nullptr));
+
         if (motion_color_bound && !bound) {
             // Main scene G-buffer pass has completed and unbound!
             s_inside_main_scene.store(false, std::memory_order_release);
@@ -2904,7 +2931,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 EdpeLog(message);
                 captureEarlyMotionColor(context, false);
             }
-        } else if (bound && count < 4) {
+        } else if (is_hdr_slot0) {
             // Transitioned from 4-MRT G-buffer (Binds 1-3) to RTV0 deferred lighting/HUD (Binds 4-7)
             s_inside_main_scene.store(false, std::memory_order_release);
             s_hdr_slot0_seen_frame = current_frame;
