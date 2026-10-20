@@ -414,6 +414,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ep.InMVScaleX = params.motionScaleX;
     ep.InMVScaleY = params.motionScaleY;
     ep.pInBiasCurrentColorMask = reactiveMaskIn;
+    ep.pInTransparencyMask = reactiveMaskIn;
     ep.InExposureScale = 1.0f;
     ep.InFrameTimeDeltaInMsec = params.frameTimeMs;
 

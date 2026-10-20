@@ -14,6 +14,7 @@
 #include "jitter_logger.h"
 #include "jitter_debug_pass.h"
 #include "jitter_view_recorder.h"
+#include "reactive_mask_pass.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -313,6 +314,23 @@ unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 std::unique_ptr<edpe::UiCompositePass> ui_composite_pass;
+std::unique_ptr<edpe::ReactiveMaskPass> s_reactive_mask_pass;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> s_emissive_texture;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_emissive_srv;
+unsigned long long s_emissive_latched_frame = ~0ull;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> s_pre_hud_texture;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_pre_hud_srv;
+unsigned long long s_pre_hud_latched_frame = ~0ull;
+bool s_hud_first_match_seen_this_frame = false;
+unsigned s_hud_draw_count = 0;
+unsigned s_last_frame_hud_draw_count = 0;
+bool s_last_frame_has_emissive = false;
+bool s_last_frame_has_hud = false;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_reactive_mask_snapshot;
+UINT s_reactive_mask_snapshot_width = 0;
+UINT s_reactive_mask_snapshot_height = 0;
+void latchPreHudColor(ID3D11DeviceContext* context);
+void latchEmissiveBuffer(ID3D11DeviceContext* context);
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
 UINT motion_snapshot_width = 0;
 UINT motion_snapshot_height = 0;
@@ -720,12 +738,19 @@ bool observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
                      (vs_hash == 0xE508648660A352B2ull &&
                       ps_hash == 0x63ABD86359B57D01ull);
     if (!hud) return false;
-    wchar_t message[160];
-    swprintf_s(message, L"EDPE: HUD draw on HDR target VS=%016llX PS=%016llX frame=%llu",
-        vs_hash, ps_hash, motion_color_frame);
-    EdpeLog(message);
-    hud_first_match_seen = true;
-    captureEarlyMotionColor(context, true);
+    if (!s_hud_first_match_seen_this_frame) {
+        s_hud_first_match_seen_this_frame = true;
+        latchPreHudColor(context);
+    }
+    ++s_hud_draw_count;
+    if (!hud_first_match_seen) {
+        wchar_t message[160];
+        swprintf_s(message, L"EDPE: HUD draw on HDR target VS=%016llX PS=%016llX frame=%llu",
+            vs_hash, ps_hash, motion_color_frame);
+        EdpeLog(message);
+        hud_first_match_seen = true;
+        captureEarlyMotionColor(context, true);
+    }
     return false;
 }
 
@@ -1970,6 +1995,84 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
                        L"EDPE: early HDR color copied at first RTV3 exit");
 }
 
+void latchEmissiveBuffer(ID3D11DeviceContext* context) {
+    if (!motion_color_source) return;
+    Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+    motion_color_source->GetResource(&resource);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+    if (!resource || FAILED(resource.As(&source))) return;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_R11G11B10_FLOAT || !desc.Width || !desc.Height) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return;
+
+    if (s_emissive_texture) {
+        D3D11_TEXTURE2D_DESC curDesc{};
+        s_emissive_texture->GetDesc(&curDesc);
+        if (curDesc.Width != desc.Width || curDesc.Height != desc.Height || curDesc.Format != desc.Format) {
+            s_emissive_texture.Reset();
+            s_emissive_srv.Reset();
+        }
+    }
+    if (!s_emissive_texture) {
+        D3D11_TEXTURE2D_DESC copyDesc = desc;
+        copyDesc.Usage = D3D11_USAGE_DEFAULT;
+        copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        copyDesc.CPUAccessFlags = copyDesc.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &s_emissive_texture)) ||
+            FAILED(device->CreateShaderResourceView(s_emissive_texture.Get(), nullptr, &s_emissive_srv))) {
+            s_emissive_texture.Reset();
+            s_emissive_srv.Reset();
+            return;
+        }
+    }
+    context->CopyResource(s_emissive_texture.Get(), source.Get());
+    s_emissive_latched_frame = last_present_frame.load(std::memory_order_relaxed);
+}
+
+void latchPreHudColor(ID3D11DeviceContext* context) {
+    if (!motion_color_source) return;
+    Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+    motion_color_source->GetResource(&resource);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+    if (!resource || FAILED(resource.As(&source))) return;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    if (!desc.Width || !desc.Height) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return;
+
+    if (s_pre_hud_texture) {
+        D3D11_TEXTURE2D_DESC curDesc{};
+        s_pre_hud_texture->GetDesc(&curDesc);
+        if (curDesc.Width != desc.Width || curDesc.Height != desc.Height || curDesc.Format != desc.Format) {
+            s_pre_hud_texture.Reset();
+            s_pre_hud_srv.Reset();
+        }
+    }
+    if (!s_pre_hud_texture) {
+        D3D11_TEXTURE2D_DESC copyDesc = desc;
+        copyDesc.Usage = D3D11_USAGE_DEFAULT;
+        copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        copyDesc.CPUAccessFlags = copyDesc.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &s_pre_hud_texture)) ||
+            FAILED(device->CreateShaderResourceView(s_pre_hud_texture.Get(), nullptr, &s_pre_hud_srv))) {
+            s_pre_hud_texture.Reset();
+            s_pre_hud_srv.Reset();
+            return;
+        }
+    }
+    context->CopyResource(s_pre_hud_texture.Get(), source.Get());
+    s_pre_hud_latched_frame = last_present_frame.load(std::memory_order_relaxed);
+}
+
 void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
     for (auto& sample : camera_pair_depth) {
         ID3D11DepthStencilView* view = nullptr;
@@ -2177,6 +2280,24 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
     motion_snapshot = motion_pass->output();
     motion_snapshot_width = desc.Width;
     motion_snapshot_height = desc.Height;
+    s_reactive_mask_snapshot.Reset();
+    s_reactive_mask_snapshot_width = 0;
+    s_reactive_mask_snapshot_height = 0;
+    if (s_reactive_mask_pass && s_reactive_mask_pass->outputTexture()) {
+        D3D11_TEXTURE2D_DESC rDesc{};
+        s_reactive_mask_pass->outputTexture()->GetDesc(&rDesc);
+        rDesc.Usage = D3D11_USAGE_DEFAULT;
+        rDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        rDesc.CPUAccessFlags = rDesc.MiscFlags = 0;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> rCopy;
+        if (SUCCEEDED(device->CreateTexture2D(&rDesc, nullptr, &rCopy)) &&
+            SUCCEEDED(device->CreateShaderResourceView(rCopy.Get(), nullptr, &s_reactive_mask_snapshot))) {
+            context->CopyResource(rCopy.Get(), s_reactive_mask_pass->outputTexture());
+            s_reactive_mask_snapshot_width = rDesc.Width;
+            s_reactive_mask_snapshot_height = rDesc.Height;
+            EdpeLog(L"EDPE: reactive mask snapshot retained on GPU");
+        }
+    }
     Microsoft::WRL::ComPtr<ID3D11Resource> output;
     motion_pass->output()->GetResource(&output);
     D3D11_TEXTURE2D_DESC read_desc{};
@@ -2578,6 +2699,41 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                              srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
     inputs.colorIsHdr = isHdrColor;
 
+    ID3D11Texture2D* reactiveMaskTex = nullptr;
+    ID3D11ShaderResourceView* reactiveMaskSrv = nullptr;
+
+    const bool enableReactiveMask = edpe::Config::instance().reactiveMask;
+    if (enableReactiveMask) {
+        if (!s_reactive_mask_pass) {
+            auto candidate = std::make_unique<edpe::ReactiveMaskPass>();
+            if (candidate->initialize(device.Get(), context)) {
+                s_reactive_mask_pass = std::move(candidate);
+            }
+        }
+        if (s_reactive_mask_pass) {
+            ID3D11ShaderResourceView* emissiveSrv =
+                (s_emissive_latched_frame == rendered) ? s_emissive_srv.Get() : nullptr;
+            ID3D11ShaderResourceView* preHudSrv =
+                (s_pre_hud_latched_frame == rendered && s_hud_draw_count > 0) ? s_pre_hud_srv.Get() : nullptr;
+            ID3D11ShaderResourceView* postHudSrv = s_dlaa_input_srv.Get();
+
+            const auto& cfg = edpe::Config::instance();
+            if (s_reactive_mask_pass->render(context, emissiveSrv, preHudSrv, postHudSrv,
+                    depthDesc.Width, depthDesc.Height,
+                    cfg.reactiveEmissiveWeight, cfg.reactiveHudWeight,
+                    cfg.reactiveEmissiveThreshold, cfg.reactiveHudThreshold)) {
+                reactiveMaskTex = s_reactive_mask_pass->outputTexture();
+                reactiveMaskSrv = s_reactive_mask_pass->outputSrv();
+                s_last_frame_has_emissive = (emissiveSrv != nullptr);
+                s_last_frame_has_hud = (preHudSrv != nullptr);
+                s_last_frame_hud_draw_count = s_hud_draw_count;
+            }
+        }
+    }
+
+    inputs.reactiveMask = reactiveMaskTex;
+    inputs.reactiveMaskSrv = reactiveMaskSrv;
+
     s_last_temporal_inputs = inputs;
     s_last_temporal_inputs_frame = rendered;
 
@@ -2977,6 +3133,9 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         if (motion_color_bound && !bound) {
             // Main scene G-buffer pass has completed and unbound!
             s_inside_main_scene.store(false, std::memory_order_release);
+            if (reconstruction_active || motion_pair_active) {
+                latchEmissiveBuffer(context);
+            }
             if (motion_pair_active && !motion_color_first_exit_logged) {
                 motion_color_first_exit_logged = true;
                 wchar_t message[160];
@@ -3096,6 +3255,9 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 motion_color_source = targets[3];
                 motion_color_frame = current_frame;
                 motion_color_bound = true;
+                if (!hud_draw_hook_mask) {
+                    beginHudDrawProbe();
+                }
             }
 
             if (s_camera_frame != current_frame && s_latest_unmapped_camera_valid &&
@@ -3760,6 +3922,26 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionDepthSnapshot(UINT* width, UINT
     return motion_depth_snapshot.Detach();
 }
 
+ID3D11ShaderResourceView* ContextCensusTakeReactiveMaskSnapshot(UINT* width, UINT* height) {
+    if (!s_reactive_mask_snapshot) return nullptr;
+    if (width) *width = s_reactive_mask_snapshot_width;
+    if (height) *height = s_reactive_mask_snapshot_height;
+    return s_reactive_mask_snapshot.Detach();
+}
+
+ID3D11ShaderResourceView* ContextCensusGetReactiveMaskSrv() {
+    return s_reactive_mask_pass ? s_reactive_mask_pass->outputSrv() : nullptr;
+}
+
+bool ContextCensusGetReactiveMaskStats(bool* hasEmissive, bool* hasHud, unsigned* hudDrawCount, UINT* width, UINT* height) {
+    if (hasEmissive) *hasEmissive = s_last_frame_has_emissive;
+    if (hasHud) *hasHud = s_last_frame_has_hud;
+    if (hudDrawCount) *hudDrawCount = s_last_frame_hud_draw_count;
+    if (width) *width = s_reactive_mask_pass ? s_reactive_mask_pass->width() : 0;
+    if (height) *height = s_reactive_mask_pass ? s_reactive_mask_pass->height() : 0;
+    return (s_reactive_mask_pass != nullptr && s_reactive_mask_pass->outputSrv() != nullptr);
+}
+
 int ContextCensusSceneDepthCandidate() {
     std::lock_guard lock(seen_mutex);
     const auto frame = last_present_frame.load(std::memory_order_relaxed);
@@ -3886,6 +4068,14 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_grid_readback.Reset();
         motion_snapshot.Reset();
         motion_pass.reset();
+        s_reactive_mask_pass.reset();
+        s_emissive_texture.Reset();
+        s_emissive_srv.Reset();
+        s_pre_hud_texture.Reset();
+        s_pre_hud_srv.Reset();
+        s_reactive_mask_snapshot.Reset();
+        s_emissive_latched_frame = ~0ull;
+        s_pre_hud_latched_frame = ~0ull;
         motion_camera_frames = {~0ull, ~0ull};
         gpu_camera_pair = {};
         motion_depth_frame = ~0ull;

@@ -78,6 +78,20 @@ public:
         perfOverlayPosX = static_cast<float>(_wtof(buf));
         GetPrivateProfileStringW(L"Overlay", L"PosY", L"-1.0", buf, 64, path.c_str());
         perfOverlayPosY = static_cast<float>(_wtof(buf));
+
+        reactiveMask = GetPrivateProfileIntW(L"ReactiveMask", L"Enable", 1, path.c_str()) != 0;
+        GetPrivateProfileStringW(L"ReactiveMask", L"EmissiveWeight", L"1.0", buf, 64, path.c_str());
+        reactiveEmissiveWeight = static_cast<float>(_wtof(buf));
+        if (reactiveEmissiveWeight < 0.0f || reactiveEmissiveWeight > 10.0f) reactiveEmissiveWeight = 1.0f;
+        GetPrivateProfileStringW(L"ReactiveMask", L"HudWeight", L"1.5", buf, 64, path.c_str());
+        reactiveHudWeight = static_cast<float>(_wtof(buf));
+        if (reactiveHudWeight < 0.0f || reactiveHudWeight > 10.0f) reactiveHudWeight = 1.5f;
+        GetPrivateProfileStringW(L"ReactiveMask", L"EmissiveThreshold", L"0.010", buf, 64, path.c_str());
+        reactiveEmissiveThreshold = static_cast<float>(_wtof(buf));
+        if (reactiveEmissiveThreshold < 0.0f || reactiveEmissiveThreshold > 1.0f) reactiveEmissiveThreshold = 0.01f;
+        GetPrivateProfileStringW(L"ReactiveMask", L"HudThreshold", L"0.005", buf, 64, path.c_str());
+        reactiveHudThreshold = static_cast<float>(_wtof(buf));
+        if (reactiveHudThreshold < 0.0f || reactiveHudThreshold > 1.0f) reactiveHudThreshold = 0.005f;
     }
 
     void save() {
@@ -125,6 +139,16 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"PosX", buf, path.c_str());
         swprintf_s(buf, L"%.1f", perfOverlayPosY);
         WritePrivateProfileStringW(L"Overlay", L"PosY", buf, path.c_str());
+
+        WritePrivateProfileStringW(L"ReactiveMask", L"Enable", reactiveMask ? L"1" : L"0", path.c_str());
+        swprintf_s(buf, L"%.2f", reactiveEmissiveWeight);
+        WritePrivateProfileStringW(L"ReactiveMask", L"EmissiveWeight", buf, path.c_str());
+        swprintf_s(buf, L"%.2f", reactiveHudWeight);
+        WritePrivateProfileStringW(L"ReactiveMask", L"HudWeight", buf, path.c_str());
+        swprintf_s(buf, L"%.3f", reactiveEmissiveThreshold);
+        WritePrivateProfileStringW(L"ReactiveMask", L"EmissiveThreshold", buf, path.c_str());
+        swprintf_s(buf, L"%.3f", reactiveHudThreshold);
+        WritePrivateProfileStringW(L"ReactiveMask", L"HudThreshold", buf, path.c_str());
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -240,6 +264,12 @@ public:
     float perfOverlayScale = 1.0f;
     float perfOverlayPosX = -1.0f;
     float perfOverlayPosY = -1.0f;
+
+    bool reactiveMask = true;
+    float reactiveEmissiveWeight = 1.0f;
+    float reactiveHudWeight = 1.5f;
+    float reactiveEmissiveThreshold = 0.01f;
+    float reactiveHudThreshold = 0.005f;
 };
 
 } // namespace edpe

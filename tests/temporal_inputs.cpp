@@ -252,5 +252,15 @@ int main() {
     const wchar_t* taaReason = manager.getBackendUnavailableReason(edpe::UpscalerBackend::Taa);
     if (!taaReason) return 79;
 
+    // -------------------------------------------------------------------------
+    // Test 10: Reactive mask presence in TemporalFrameInputs and fail-open validation
+    // -------------------------------------------------------------------------
+    inputs.reactiveMask = dummyTexture();
+    inputs.reactiveMaskSrv = dummySrv();
+    if (!inputs.isValid(&reason)) return 81;
+    inputs.reactiveMask = nullptr;
+    inputs.reactiveMaskSrv = nullptr;
+    if (!inputs.isValid(&reason)) return 82;
+
     return 0; // All temporal input layer tests passed
 }
