@@ -93,7 +93,7 @@ PFN_ClipCursor orig_ClipCursor = nullptr;
 PFN_SetCursorPos orig_SetCursorPos = nullptr;
 
 SHORT WINAPI Hooked_GetAsyncKeyState(int vKey) {
-    if (vKey == VK_F5 || vKey == VK_F6 || vKey == VK_F7 || vKey == VK_F8 || vKey == VK_F9) {
+    if (vKey == VK_F5 || vKey == VK_F6 || vKey == VK_F7 || vKey == VK_F8 || vKey == VK_F9 || vKey == VK_F11) {
         return orig_GetAsyncKeyState ? orig_GetAsyncKeyState(vKey) : GetAsyncKeyState(vKey);
     }
     if (UiMenuVisible()) {
@@ -103,7 +103,7 @@ SHORT WINAPI Hooked_GetAsyncKeyState(int vKey) {
 }
 
 SHORT WINAPI Hooked_GetKeyState(int vKey) {
-    if (vKey == VK_F5 || vKey == VK_F6 || vKey == VK_F7 || vKey == VK_F8 || vKey == VK_F9) {
+    if (vKey == VK_F5 || vKey == VK_F6 || vKey == VK_F7 || vKey == VK_F8 || vKey == VK_F9 || vKey == VK_F11) {
         return orig_GetKeyState ? orig_GetKeyState(vKey) : GetKeyState(vKey);
     }
     if (UiMenuVisible()) {
@@ -124,7 +124,7 @@ void filterInputMessage(LPMSG lpMsg, UINT wRemoveMsg) {
                            msg == WM_KEYUP || msg == WM_SYSKEYUP) &&
                           (lpMsg->wParam == VK_F5 || lpMsg->wParam == VK_F6 ||
                            lpMsg->wParam == VK_F7 || lpMsg->wParam == VK_F8 ||
-                           lpMsg->wParam == VK_F9);
+                           lpMsg->wParam == VK_F9 || lpMsg->wParam == VK_F11);
     if (isHotkey) return;
 
     if (wRemoveMsg & PM_REMOVE) {

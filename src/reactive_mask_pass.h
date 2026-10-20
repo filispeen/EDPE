@@ -23,6 +23,12 @@ public:
         float emissiveWeight, float hudWeight,
         float emissiveThreshold, float hudThreshold);
 
+    bool renderDebugView(ID3D11DeviceContext* context,
+        ID3D11ShaderResourceView* sceneColorSrv,
+        ID3D11RenderTargetView* targetRtv,
+        uint32_t width, uint32_t height,
+        int mode = 0, float boost = 1.0f, bool isHdr = false);
+
     void clear(ID3D11DeviceContext* context);
 
     ID3D11Texture2D* outputTexture() const { return outputTexture_.Get(); }
@@ -42,6 +48,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vertexShader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixelShader_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constantBuffer_;
+
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> debugPixelShader_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> debugConstantBuffer_;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> pointSampler_;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> linearSampler_;
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> outputTexture_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> outputRtv_;

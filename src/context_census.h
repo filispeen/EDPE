@@ -74,3 +74,12 @@ void ContextCensusSetJitterDebugThreshold(float threshold);
 float ContextCensusGetJitterDebugThreshold();
 void ContextCensusSetJitterDebugMode(int mode);
 int ContextCensusGetJitterDebugMode();
+
+// Reactive Mask Debug View (Full-screen reactive mask visualization)
+void ContextCensusSetReactiveMaskDebugView(bool enable);
+bool ContextCensusGetReactiveMaskDebugView();
+void ContextCensusToggleReactiveMaskDebugView();
+void ContextCensusSetReactiveMaskDebugMode(int mode);
+int ContextCensusGetReactiveMaskDebugMode();
+void ContextCensusSetReactiveMaskDebugBoost(float boost);
+float ContextCensusGetReactiveMaskDebugBoost();

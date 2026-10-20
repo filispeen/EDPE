@@ -61,6 +61,30 @@ bool ReactiveMaskPass::initialize(ID3D11Device* device, ID3D11DeviceContext* con
         return false;
     }
 
+    // Compile Debug View Pixel Shader
+    Microsoft::WRL::ComPtr<ID3DBlob> debugPsCode;
+    if (SUCCEEDED(D3DCompile(kReactiveMaskDebugShader, sizeof(kReactiveMaskDebugShader) - 1, nullptr, nullptr,
+            nullptr, "ps_main", "ps_5_0", 0, 0, &debugPsCode, nullptr))) {
+        device->CreatePixelShader(debugPsCode->GetBufferPointer(),
+            debugPsCode->GetBufferSize(), nullptr, &debugPixelShader_);
+    }
+
+    D3D11_BUFFER_DESC dbgBufDesc{};
+    dbgBufDesc.ByteWidth = 16; // float4
+    dbgBufDesc.Usage = D3D11_USAGE_DEFAULT;
+    dbgBufDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    device->CreateBuffer(&dbgBufDesc, nullptr, &debugConstantBuffer_);
+
+    D3D11_SAMPLER_DESC sampDesc{};
+    sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    device->CreateSamplerState(&sampDesc, &pointSampler_);
+
+    sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    device->CreateSamplerState(&sampDesc, &linearSampler_);
+
     device_ = device;
     return true;
 }
@@ -72,6 +96,10 @@ void ReactiveMaskPass::shutdown() {
     constantBuffer_.Reset();
     vertexShader_.Reset();
     pixelShader_.Reset();
+    debugPixelShader_.Reset();
+    debugConstantBuffer_.Reset();
+    pointSampler_.Reset();
+    linearSampler_.Reset();
     state_.Reset();
     context_.Reset();
     device_ = nullptr;
@@ -158,6 +186,58 @@ bool ReactiveMaskPass::render(ID3D11DeviceContext* context,
 
     ID3D11ShaderResourceView* nullSrvs[3] = {nullptr, nullptr, nullptr};
     context_->PSSetShaderResources(0, 3, nullSrvs);
+    ID3D11RenderTargetView* nullRtv = nullptr;
+    context_->OMSetRenderTargets(1, &nullRtv, nullptr);
+
+    context_->SwapDeviceContextState(prior.Get(), nullptr);
+    return true;
+}
+
+bool ReactiveMaskPass::renderDebugView(ID3D11DeviceContext* context,
+    ID3D11ShaderResourceView* sceneColorSrv,
+    ID3D11RenderTargetView* targetRtv,
+    uint32_t width, uint32_t height,
+    int mode, float boost, bool isHdr) {
+    if (!context || !device_ || !context_ || !targetRtv || !outputSrv_ || !width || !height || !debugPixelShader_) {
+        return false;
+    }
+
+    struct DebugParams {
+        float mode;
+        float boost;
+        float isHdr;
+        float pad;
+    } params{};
+    params.mode = static_cast<float>(mode);
+    params.boost = boost;
+    params.isHdr = isHdr ? 1.0f : 0.0f;
+
+    context_->UpdateSubresource(debugConstantBuffer_.Get(), 0, nullptr, &params, 0, 0);
+
+    Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
+    context_->SwapDeviceContextState(state_.Get(), &prior);
+
+    auto* rtv = targetRtv;
+    ID3D11ShaderResourceView* srvs[2] = {outputSrv_.Get(), sceneColorSrv};
+    ID3D11Buffer* cb = debugConstantBuffer_.Get();
+    ID3D11SamplerState* samplers[2] = {pointSampler_.Get(), linearSampler_.Get()};
+
+    const D3D11_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+
+    context_->OMSetRenderTargets(1, &rtv, nullptr);
+    context_->RSSetViewports(1, &viewport);
+    context_->IASetInputLayout(nullptr);
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
+    context_->PSSetShader(debugPixelShader_.Get(), nullptr, 0);
+    context_->PSSetShaderResources(0, 2, srvs);
+    context_->PSSetSamplers(0, 2, samplers);
+    context_->PSSetConstantBuffers(0, 1, &cb);
+
+    context_->Draw(3, 0);
+
+    ID3D11ShaderResourceView* nullSrvs[2] = {nullptr, nullptr};
+    context_->PSSetShaderResources(0, 2, nullSrvs);
     ID3D11RenderTargetView* nullRtv = nullptr;
     context_->OMSetRenderTargets(1, &nullRtv, nullptr);
 

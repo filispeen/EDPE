@@ -178,5 +178,81 @@ int main() {
         return 16;
     }
 
+    // -------------------------------------------------------------------------
+    // Test renderDebugView (Mode 0: Pure Grayscale Mask, Mode 1: Overlay)
+    // -------------------------------------------------------------------------
+    D3D11_TEXTURE2D_DESC dbgTargetDesc{};
+    dbgTargetDesc.Width = dbgTargetDesc.Height = 4;
+    dbgTargetDesc.MipLevels = dbgTargetDesc.ArraySize = 1;
+    dbgTargetDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dbgTargetDesc.SampleDesc.Count = 1;
+    dbgTargetDesc.Usage = D3D11_USAGE_DEFAULT;
+    dbgTargetDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    ComPtr<ID3D11Texture2D> dbgTargetTex;
+    ComPtr<ID3D11RenderTargetView> dbgTargetRtv;
+    if (FAILED(device->CreateTexture2D(&dbgTargetDesc, nullptr, &dbgTargetTex)) ||
+        FAILED(device->CreateRenderTargetView(dbgTargetTex.Get(), nullptr, &dbgTargetRtv))) {
+        std::cerr << "Failed to create debug view target RTV\n";
+        return 17;
+    }
+
+    const bool dbgOk = pass.renderDebugView(context.Get(), postHudSrv.Get(), dbgTargetRtv.Get(), 4, 4, 0, 1.0f, false);
+    if (!dbgOk) {
+        std::cerr << "renderDebugView Mode 0 failed\n";
+        return 18;
+    }
+
+    // Read back debug target texture
+    D3D11_TEXTURE2D_DESC dbgStagingDesc = dbgTargetDesc;
+    dbgStagingDesc.Usage = D3D11_USAGE_STAGING;
+    dbgStagingDesc.BindFlags = 0;
+    dbgStagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> dbgStaging;
+    if (FAILED(device->CreateTexture2D(&dbgStagingDesc, nullptr, &dbgStaging))) {
+        std::cerr << "Failed to create debug staging texture\n";
+        return 19;
+    }
+
+    context->CopyResource(dbgStaging.Get(), dbgTargetTex.Get());
+    D3D11_MAPPED_SUBRESOURCE dbgMapped{};
+    if (FAILED(context->Map(dbgStaging.Get(), 0, D3D11_MAP_READ, 0, &dbgMapped))) {
+        std::cerr << "Failed to map debug staging texture\n";
+        return 20;
+    }
+
+    const auto* dbgRows = static_cast<const uint8_t*>(dbgMapped.pData);
+    // In Mode 0 (Pure Grayscale): (0,0) and (2,2) must be bright (> 0), (1,1) and (3,3) must be 0
+    const uint8_t dbg_0_0 = dbgRows[0]; // R channel
+    const uint8_t dbg_1_1 = dbgRows[dbgMapped.RowPitch + 4];
+    const uint8_t dbg_2_2 = dbgRows[2 * dbgMapped.RowPitch + 8];
+    const uint8_t dbg_3_3 = dbgRows[3 * dbgMapped.RowPitch + 12];
+    context->Unmap(dbgStaging.Get(), 0);
+
+    if (dbg_0_0 == 0 || dbg_2_2 == 0) {
+        std::cerr << "Debug view Mode 0 failed to highlight reactive pixels\n";
+        return 21;
+    }
+    if (dbg_1_1 != 0 || dbg_3_3 != 0) {
+        std::cerr << "Debug view Mode 0 produced non-zero for background pixels\n";
+        return 22;
+    }
+
+    // Verify Mode 1 (Overlay) runs cleanly
+    if (!pass.renderDebugView(context.Get(), postHudSrv.Get(), dbgTargetRtv.Get(), 4, 4, 1, 1.0f, false)) {
+        std::cerr << "renderDebugView Mode 1 failed\n";
+        return 23;
+    }
+
+    // Verify fail-open for renderDebugView
+    if (pass.renderDebugView(nullptr, postHudSrv.Get(), dbgTargetRtv.Get(), 4, 4, 0, 1.0f, false)) {
+        std::cerr << "renderDebugView with null context should fail open\n";
+        return 24;
+    }
+    if (pass.renderDebugView(context.Get(), postHudSrv.Get(), nullptr, 4, 4, 0, 1.0f, false)) {
+        std::cerr << "renderDebugView with null RTV should fail open\n";
+        return 25;
+    }
+
     return 0; // All reactive mask tests passed
 }

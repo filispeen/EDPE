@@ -476,6 +476,10 @@ std::atomic<float> s_jitter_debug_sensitivity{1.5f};
 std::atomic<float> s_jitter_debug_threshold{0.02f};
 std::atomic<int> s_jitter_debug_mode{0};
 
+std::atomic<bool> s_reactive_mask_debug_view{false};
+std::atomic<int> s_reactive_mask_debug_mode{0};
+std::atomic<float> s_reactive_mask_debug_boost{1.0f};
+
 std::atomic<bool> s_zero_motion_vectors{false};
 std::atomic<bool> s_motion_invert_x{false};
 std::atomic<bool> s_motion_invert_y{false};
@@ -487,6 +491,7 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
 void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud);
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
+void renderReactiveMaskDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void rearmContextHooks();
 
 bool sameRenderTargetResource(ID3D11RenderTargetView* view,
@@ -2376,7 +2381,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     auto& upscaler = edpe::UpscalerManager::instance();
     const bool upscale_active = upscaler.isReconstructionActive();
     const bool debug_view_active = s_jitter_debug_view.load(std::memory_order_relaxed);
-    if ((!upscale_active && !debug_view_active) || !context || !backbuffer) return;
+    const bool reactive_debug_view_active = s_reactive_mask_debug_view.load(std::memory_order_relaxed);
+    if ((!upscale_active && !debug_view_active && !reactive_debug_view_active) || !context || !backbuffer) return;
 
     const wchar_t* skip = nullptr;
     if (!motion_color_source || !scene_depth_source) skip = L"scene color/depth not observed";
@@ -2702,7 +2708,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     ID3D11Texture2D* reactiveMaskTex = nullptr;
     ID3D11ShaderResourceView* reactiveMaskSrv = nullptr;
 
-    const bool enableReactiveMask = edpe::Config::instance().reactiveMask;
+    const bool enableReactiveMask = edpe::Config::instance().reactiveMask ||
+                                    s_reactive_mask_debug_view.load(std::memory_order_relaxed);
     if (enableReactiveMask) {
         if (!s_reactive_mask_pass) {
             auto candidate = std::make_unique<edpe::ReactiveMaskPass>();
@@ -3046,6 +3053,46 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
     }
 }
 
+void renderReactiveMaskDebugView(ID3D11DeviceContext* context, unsigned long long rendered,
+    ID3D11Texture2D* backbuffer) {
+    if (!context || !backbuffer || !s_reactive_mask_pass || !s_reactive_mask_pass->outputSrv()) return;
+
+    D3D11_TEXTURE2D_DESC bbDesc{};
+    backbuffer->GetDesc(&bbDesc);
+    if (!bbDesc.Width || !bbDesc.Height || bbDesc.SampleDesc.Count != 1) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return;
+
+    static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_reactive_debug_backbuffer_rtv;
+    static ID3D11Texture2D* s_reactive_debug_cached_backbuffer = nullptr;
+
+    if (s_reactive_debug_cached_backbuffer != backbuffer || !s_reactive_debug_backbuffer_rtv) {
+        s_reactive_debug_cached_backbuffer = backbuffer;
+        s_reactive_debug_backbuffer_rtv.Reset();
+        if (FAILED(device->CreateRenderTargetView(backbuffer, nullptr, &s_reactive_debug_backbuffer_rtv))) {
+            return;
+        }
+    }
+
+    ID3D11ShaderResourceView* sceneColorSrv = nullptr;
+    bool isHdr = false;
+    if (s_last_temporal_inputs_frame == rendered && s_last_temporal_inputs.colorSrv != nullptr) {
+        sceneColorSrv = s_last_temporal_inputs.colorSrv;
+        isHdr = s_last_temporal_inputs.colorIsHdr;
+    }
+
+    const int mode = s_reactive_mask_debug_mode.load(std::memory_order_relaxed);
+    const float boost = s_reactive_mask_debug_boost.load(std::memory_order_relaxed);
+
+    s_reactive_mask_pass->renderDebugView(context,
+        sceneColorSrv,
+        s_reactive_debug_backbuffer_rtv.Get(),
+        bbDesc.Width, bbDesc.Height,
+        mode, boost, isHdr);
+}
+
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,
     ID3D11RenderTargetView* const* targets) {
     wchar_t message[192];
@@ -3112,7 +3159,8 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     rearmHudDrawProbe();
     const bool reconstruction_active =
         edpe::UpscalerManager::instance().isReconstructionActive() ||
-        s_jitter_debug_view.load(std::memory_order_relaxed);
+        s_jitter_debug_view.load(std::memory_order_relaxed) ||
+        s_reactive_mask_debug_view.load(std::memory_order_relaxed);
     const auto current_frame = last_present_frame.load(std::memory_order_relaxed);
     if ((motion_pair_active || reconstruction_active) && motion_color_source &&
         motion_color_frame == current_frame) {
@@ -3497,6 +3545,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_jitter_debug_sensitivity.store(cfg.jitterDebugSensitivity, std::memory_order_relaxed);
         s_jitter_debug_threshold.store(cfg.jitterDebugThreshold, std::memory_order_relaxed);
         s_jitter_debug_mode.store(cfg.jitterDebugMode, std::memory_order_relaxed);
+        s_reactive_mask_debug_view.store(cfg.reactiveMaskDebugView, std::memory_order_relaxed);
+        s_reactive_mask_debug_mode.store(cfg.reactiveMaskDebugMode, std::memory_order_relaxed);
+        s_reactive_mask_debug_boost.store(cfg.reactiveMaskDebugBoost, std::memory_order_relaxed);
         s_zero_motion_vectors.store(cfg.zeroMotionVectors, std::memory_order_relaxed);
         s_motion_invert_x.store(cfg.motionInvertX, std::memory_order_relaxed);
         s_motion_invert_y.store(cfg.motionInvertY, std::memory_order_relaxed);
@@ -3654,10 +3705,13 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     reinterpret_cast<void**>(backbuffer.GetAddressOf())))) {
                 s_swapchain_backbuffer.store(backbuffer.Get(), std::memory_order_relaxed);
                 const bool debug_view_active = s_jitter_debug_view.load(std::memory_order_relaxed);
-                if (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active) {
+                const bool reactive_debug_view_active = s_reactive_mask_debug_view.load(std::memory_order_relaxed);
+                if (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active || reactive_debug_view_active) {
                     tryTemporalUpscale(context, rendered_frame, backbuffer.Get());
                 }
-                if (debug_view_active) {
+                if (reactive_debug_view_active) {
+                    renderReactiveMaskDebugView(context, rendered_frame, backbuffer.Get());
+                } else if (debug_view_active) {
                     renderJitterDebugView(context, rendered_frame, backbuffer.Get());
                 }
             }
@@ -3702,7 +3756,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
 
         if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
-            !s_jitter_debug_view.load(std::memory_order_relaxed)) {
+            !s_jitter_debug_view.load(std::memory_order_relaxed) &&
+            !s_reactive_mask_debug_view.load(std::memory_order_relaxed)) {
             static LARGE_INTEGER s_last_present_qpc{};
             static LARGE_INTEGER s_present_freq{};
             if (s_present_freq.QuadPart == 0) QueryPerformanceFrequency(&s_present_freq);
@@ -4332,4 +4387,36 @@ void ContextCensusSetJitterDebugMode(int mode) {
 
 int ContextCensusGetJitterDebugMode() {
     return s_jitter_debug_mode.load(std::memory_order_relaxed);
+}
+
+void ContextCensusSetReactiveMaskDebugView(bool enable) {
+    s_reactive_mask_debug_view.store(enable, std::memory_order_relaxed);
+    edpe::Config::instance().reactiveMaskDebugView = enable;
+}
+
+bool ContextCensusGetReactiveMaskDebugView() {
+    return s_reactive_mask_debug_view.load(std::memory_order_relaxed);
+}
+
+void ContextCensusToggleReactiveMaskDebugView() {
+    const bool current = s_reactive_mask_debug_view.load(std::memory_order_relaxed);
+    ContextCensusSetReactiveMaskDebugView(!current);
+}
+
+void ContextCensusSetReactiveMaskDebugMode(int mode) {
+    s_reactive_mask_debug_mode.store(mode, std::memory_order_relaxed);
+    edpe::Config::instance().reactiveMaskDebugMode = mode;
+}
+
+int ContextCensusGetReactiveMaskDebugMode() {
+    return s_reactive_mask_debug_mode.load(std::memory_order_relaxed);
+}
+
+void ContextCensusSetReactiveMaskDebugBoost(float boost) {
+    s_reactive_mask_debug_boost.store(boost, std::memory_order_relaxed);
+    edpe::Config::instance().reactiveMaskDebugBoost = boost;
+}
+
+float ContextCensusGetReactiveMaskDebugBoost() {
+    return s_reactive_mask_debug_boost.load(std::memory_order_relaxed);
 }

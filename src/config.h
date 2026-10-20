@@ -92,6 +92,12 @@ public:
         GetPrivateProfileStringW(L"ReactiveMask", L"HudThreshold", L"0.005", buf, 64, path.c_str());
         reactiveHudThreshold = static_cast<float>(_wtof(buf));
         if (reactiveHudThreshold < 0.0f || reactiveHudThreshold > 1.0f) reactiveHudThreshold = 0.005f;
+
+        reactiveMaskDebugView = GetPrivateProfileIntW(L"ReactiveMask", L"DebugView", 0, path.c_str()) != 0;
+        reactiveMaskDebugMode = GetPrivateProfileIntW(L"ReactiveMask", L"DebugMode", 0, path.c_str());
+        GetPrivateProfileStringW(L"ReactiveMask", L"DebugBoost", L"1.0", buf, 64, path.c_str());
+        reactiveMaskDebugBoost = static_cast<float>(_wtof(buf));
+        if (reactiveMaskDebugBoost < 0.1f || reactiveMaskDebugBoost > 10.0f) reactiveMaskDebugBoost = 1.0f;
     }
 
     void save() {
@@ -149,6 +155,11 @@ public:
         WritePrivateProfileStringW(L"ReactiveMask", L"EmissiveThreshold", buf, path.c_str());
         swprintf_s(buf, L"%.3f", reactiveHudThreshold);
         WritePrivateProfileStringW(L"ReactiveMask", L"HudThreshold", buf, path.c_str());
+
+        WritePrivateProfileStringW(L"ReactiveMask", L"DebugView", reactiveMaskDebugView ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"ReactiveMask", L"DebugMode", std::to_wstring(reactiveMaskDebugMode).c_str(), path.c_str());
+        swprintf_s(buf, L"%.2f", reactiveMaskDebugBoost);
+        WritePrivateProfileStringW(L"ReactiveMask", L"DebugBoost", buf, path.c_str());
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -270,6 +281,10 @@ public:
     float reactiveHudWeight = 1.5f;
     float reactiveEmissiveThreshold = 0.01f;
     float reactiveHudThreshold = 0.005f;
+
+    bool reactiveMaskDebugView = false;
+    int reactiveMaskDebugMode = 0;
+    float reactiveMaskDebugBoost = 1.0f;
 };
 
 } // namespace edpe

@@ -181,6 +181,17 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         return true;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F9) return true;
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        wparam == VK_F11 && !(lparam & (1LL << 30))) {
+        ContextCensusToggleReactiveMaskDebugView();
+        const bool active = ContextCensusGetReactiveMaskDebugView();
+        auto& cfg = edpe::Config::instance();
+        cfg.reactiveMaskDebugView = active;
+        cfg.save();
+        EdpeLog(active ? L"EDPE: F11 pressed — Reactive Mask Debug View enabled" : L"EDPE: F11 pressed — Reactive Mask Debug View disabled");
+        return true;
+    }
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F11) return true;
     if (menu_visible.load()) {
         if (message == WM_INPUT) return true;
         if (message == WM_SETCURSOR) {
@@ -1565,7 +1576,37 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             if (ImGui::SliderFloat("HUD Threshold", &cfg.reactiveHudThreshold, 0.0f, 0.05f, "%.3f")) {
                 cfg.save();
             }
-            ImGui::Checkbox("Show Live Reactive Mask (60+ FPS preview)", &ui.live_reactive_mask_open);
+            ImGui::Checkbox("Show Live Reactive Mask (Window)", &ui.live_reactive_mask_open);
+
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.9f, 0.4f, 1.0f, 1.0f), "Fullscreen Reactive Mask Debug View (Hotkey: F11)");
+            bool rm_debug = ContextCensusGetReactiveMaskDebugView();
+            if (ImGui::Checkbox("Enable Fullscreen Reactive Mask View", &rm_debug)) {
+                ContextCensusSetReactiveMaskDebugView(rm_debug);
+                cfg.reactiveMaskDebugView = rm_debug;
+                cfg.save();
+            }
+            if (rm_debug) {
+                int mode = ContextCensusGetReactiveMaskDebugMode();
+                const char* const modes[] = {
+                    "Pure Grayscale Mask (0: Black, 1: White)",
+                    "Magenta Overlay on Dimmed Game Scene",
+                    "Thermal Heatmap (Rainbow)",
+                    "Cyan Overlay on Dimmed Game Scene"
+                };
+                if (ImGui::Combo("View Mode##Reactive", &mode, modes, IM_ARRAYSIZE(modes))) {
+                    ContextCensusSetReactiveMaskDebugMode(mode);
+                    cfg.reactiveMaskDebugMode = mode;
+                    cfg.save();
+                }
+                float boost = ContextCensusGetReactiveMaskDebugBoost();
+                if (ImGui::SliderFloat("Brightness Boost##Reactive", &boost, 0.5f, 5.0f, "%.1fx")) {
+                    ContextCensusSetReactiveMaskDebugBoost(boost);
+                    cfg.reactiveMaskDebugBoost = boost;
+                    cfg.save();
+                }
+                ImGui::TextDisabled("Displays the reactive mask directly on the game screen before UI.");
+            }
         }
     }
     ImGui::Separator();
@@ -1636,7 +1677,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
         ui.pending_backbuffer_capture = true;
     }
-    ImGui::TextUnformatted("F5: toggle menu | F6: one-shot capture (all buffers) | F7: toggle performance HUD | F8: toggle jitter debug view | F9: record jitter view");
+    ImGui::TextUnformatted("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter | F11: reactive mask view");
     ImGui::End();
     if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);
