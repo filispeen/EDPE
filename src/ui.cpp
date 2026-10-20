@@ -8,6 +8,7 @@
 #include "perf_overlay.h"
 #include "input_hook.h"
 #include "jitter_logger.h"
+#include "jitter_view_recorder.h"
 
 
 #include <d3d11_1.h>
@@ -158,6 +159,15 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         return true;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F8) return true;
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        wparam == VK_F9 && !(lparam & (1LL << 30))) {
+        if (edpe::JitterViewRecorder::instance().isIdle()) {
+            EdpeLog(L"EDPE: F9 pressed - Jitter View recording started");
+            edpe::JitterViewRecorder::instance().startRecording();
+        }
+        return true;
+    }
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F9) return true;
     if (menu_visible.load()) {
         if (message == WM_INPUT) return true;
         if (message == WM_SETCURSOR) {
@@ -1501,6 +1511,25 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             cfg.jitterDebugMode = mode;
             cfg.save();
         }
+
+        auto& recorder = edpe::JitterViewRecorder::instance();
+        const bool can_record = recorder.isIdle();
+        if (!can_record) ImGui::BeginDisabled();
+        if (ImGui::Button("Record Jitter View (5s)")) {
+            recorder.startRecording();
+        }
+        if (!can_record) ImGui::EndDisabled();
+
+        if (recorder.isRecording()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+                "Recording %.1f / 5.0 s", recorder.getRecordingElapsedSeconds());
+        } else if (recorder.isDraining() || recorder.isWriting()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Recording 5.0 / 5.0 s");
+        } else if (recorder.hasSavedLog()) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
+                "Saved jitter_view.log (%zu frames)", recorder.getLastSavedFrameCount());
+        }
+
         ImGui::TextDisabled("Grayscale = game scene  |  Green pixels = subpixel jitter affected");
     }
 
@@ -1513,7 +1542,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
         ui.pending_backbuffer_capture = true;
     }
-    ImGui::TextUnformatted("F5: toggle menu | F7: toggle performance HUD | F8: toggle jitter debug view");
+    ImGui::TextUnformatted("F5: toggle menu | F7: toggle performance HUD | F8: toggle jitter debug view | F9: record jitter view");
     ImGui::End();
     if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);

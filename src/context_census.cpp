@@ -13,6 +13,7 @@
 #include "ui.h"
 #include "jitter_logger.h"
 #include "jitter_debug_pass.h"
+#include "jitter_view_recorder.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -2833,6 +2834,12 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         renderW, renderH,
         reset,
         isHdr);
+
+    auto& recorder = edpe::JitterViewRecorder::instance();
+    if (recorder.isActive()) {
+        recorder.onFrame(context, backbuffer, bbDesc.Width, bbDesc.Height,
+            renderW, renderH, isHdr, reset);
+    }
 }
 
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,

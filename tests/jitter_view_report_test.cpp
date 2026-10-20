@@ -1,0 +1,126 @@
+#include "jitter_view_report.h"
+
+#include <cmath>
+#include <string>
+#include <vector>
+
+int main() {
+    if (edpe::getJitterViewAsciiChar(0.0) != ' ') return 1;
+    if (edpe::getJitterViewAsciiChar(-0.5) != ' ') return 2;
+    if (edpe::getJitterViewAsciiChar(1.0) != '@') return 3;
+    if (edpe::getJitterViewAsciiChar(2.0) != '@') return 4;
+    if (edpe::getJitterViewAsciiChar(0.02) != '.') return 5;
+
+    const uint32_t w = 2560;
+    const uint32_t h = 1440;
+    uint32_t totalPixelsSum = 0;
+    for (uint32_t ty = 0; ty < edpe::kJitterViewGridRows; ++ty) {
+        for (uint32_t tx = 0; tx < edpe::kJitterViewGridCols; ++tx) {
+            totalPixelsSum += edpe::getTilePixelCount(tx, ty, w, h);
+        }
+    }
+    if (totalPixelsSum != w * h) return 6;
+
+    const uint32_t w2 = 1920;
+    const uint32_t h2 = 1080;
+    uint32_t totalPixelsSum2 = 0;
+    for (uint32_t ty = 0; ty < edpe::kJitterViewGridRows; ++ty) {
+        for (uint32_t tx = 0; tx < edpe::kJitterViewGridCols; ++tx) {
+            totalPixelsSum2 += edpe::getTilePixelCount(tx, ty, w2, h2);
+        }
+    }
+    if (totalPixelsSum2 != w2 * h2) return 7;
+
+    edpe::JitterViewFrameData emptyFrame{};
+    std::array<bool, edpe::kJitterViewGridTiles> active0{};
+    edpe::JitterViewFrameStats s0 = edpe::computeFrameStats(emptyFrame, w, h, nullptr, active0);
+    if (s0.greenPx != 0 || s0.greenPct != 0.0 || s0.tilesActive != 0 || s0.tilesFlip != 0) return 8;
+    if (s0.centroidX != 0.0 || s0.centroidY != 0.0) return 9;
+    if (s0.bboxX0 != 0.0 || s0.bboxY0 != 0.0 || s0.bboxX1 != 0.0 || s0.bboxY1 != 0.0) return 10;
+
+    edpe::JitterViewFrameData frame1{};
+    const uint32_t targetTx = 16;
+    const uint32_t targetTy = 9;
+    const uint32_t targetIdx = targetTy * edpe::kJitterViewGridCols + targetTx;
+    const uint32_t tilePix = edpe::getTilePixelCount(targetTx, targetTy, w, h);
+    const uint32_t greenCount = static_cast<uint32_t>(tilePix * 0.05);
+    frame1.tiles[targetIdx] = greenCount;
+
+    std::array<bool, edpe::kJitterViewGridTiles> active1{};
+    edpe::JitterViewFrameStats s1 = edpe::computeFrameStats(frame1, w, h, nullptr, active1);
+    if (s1.greenPx != greenCount) return 11;
+    if (s1.tilesActive != 1) return 12;
+    if (s1.tilesFlip != 0) return 13;
+    if (!active1[targetIdx]) return 14;
+
+    const double expectedCx = (targetTx + 0.5) * (100.0 / 64.0);
+    const double expectedCy = (targetTy + 0.5) * (100.0 / 36.0);
+    if (std::abs(s1.centroidX - expectedCx) > 1e-4) return 15;
+    if (std::abs(s1.centroidY - expectedCy) > 1e-4) return 16;
+
+    const double expectedX0 = targetTx * (100.0 / 64.0);
+    const double expectedX1 = (targetTx + 1) * (100.0 / 64.0);
+    const double expectedY0 = targetTy * (100.0 / 36.0);
+    const double expectedY1 = (targetTy + 1) * (100.0 / 36.0);
+    if (std::abs(s1.bboxX0 - expectedX0) > 1e-4) return 17;
+    if (std::abs(s1.bboxX1 - expectedX1) > 1e-4) return 18;
+    if (std::abs(s1.bboxY0 - expectedY0) > 1e-4) return 19;
+    if (std::abs(s1.bboxY1 - expectedY1) > 1e-4) return 20;
+
+    edpe::JitterViewFrameData frame2{};
+    const uint32_t otherTx = 32;
+    const uint32_t otherTy = 18;
+    const uint32_t otherIdx = otherTy * edpe::kJitterViewGridCols + otherTx;
+    const uint32_t otherPix = edpe::getTilePixelCount(otherTx, otherTy, w, h);
+    frame2.tiles[otherIdx] = static_cast<uint32_t>(otherPix * 0.05);
+
+    std::array<bool, edpe::kJitterViewGridTiles> active2{};
+    edpe::JitterViewFrameStats s2 = edpe::computeFrameStats(frame2, w, h, &active1, active2);
+    if (s2.tilesActive != 1) return 21;
+    if (s2.tilesFlip != 2) return 22;
+
+    edpe::JitterViewHeaderInfo header{};
+    header.edpeVersion = "v0.4.6";
+    header.date = "2026-10-20 17:00:00";
+    header.mode = 0;
+    header.modeName = "Hybrid";
+    header.sensitivity = 1.5f;
+    header.threshold = 0.02f;
+    header.renderWidth = w;
+    header.renderHeight = h;
+    header.outputWidth = w;
+    header.outputHeight = h;
+    header.upscalerBackend = "None";
+    header.upscaleMode = "Native";
+    header.isHdr = false;
+
+    std::vector<edpe::JitterViewFrameData> frames(35);
+    for (size_t i = 0; i < frames.size(); ++i) {
+        frames[i].meta.frame = i;
+        frames[i].meta.timeMs = static_cast<float>(i * 16.666);
+        frames[i].meta.deltaMs = 16.666f;
+        frames[i].meta.phase = static_cast<unsigned>(i % 8);
+        frames[i].meta.totalPhases = 8;
+        frames[i].meta.cameraValid = true;
+        if (i % 2 == 0) {
+            frames[i].tiles[targetIdx] = greenCount;
+        }
+    }
+
+    const std::string report = edpe::generateJitterViewReport(header, frames);
+    if (report.find("# edpe_version: v0.4.6") == std::string::npos) return 23;
+    if (report.find("# grid: 64x36") == std::string::npos) return 24;
+    if (report.find("# green_rule: g - max(r, b) > 0.04") == std::string::npos) return 25;
+    if (report.find("# frame, t_ms, delta_ms, phase, phases, jx, jy") == std::string::npos) return 26;
+    if (report.find("# MAP frame=0\n") == std::string::npos) return 27;
+    if (report.find("# MAP frame=30\n") == std::string::npos) return 28;
+    if (report.find("# PERSISTENCE MAP\n") == std::string::npos) return 29;
+    if (report.find("# FLICKER MAP\n") == std::string::npos) return 30;
+    if (report.find("# SUMMARY\n") == std::string::npos) return 31;
+    if (report.find("phase=0 avg_green_pct=") == std::string::npos) return 32;
+    if (report.find("# reset_frames: 0") == std::string::npos) return 33;
+    if (report.find("# scene_cut_frames: 0") == std::string::npos) return 34;
+    if (report.find("# held_jitter_frames: 0") == std::string::npos) return 35;
+
+    return 0;
+}
