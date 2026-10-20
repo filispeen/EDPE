@@ -243,6 +243,49 @@ inline uint32_t computeDominantPeriod(const std::vector<double>& series, uint32_
     return prominent.empty() ? 0 : prominent[0].lag;
 }
 
+inline const char* getDxgiFormatName(uint32_t fmt) {
+    switch (fmt) {
+    case 10: return "R16G16B16A16_FLOAT";
+    case 24: return "R10G10B10A2_UNORM";
+    case 26: return "R11G11B10_FLOAT";
+    case 28: return "R8G8B8A8_UNORM";
+    case 29: return "R8G8B8A8_UNORM_SRGB";
+    case 87: return "B8G8R8A8_UNORM";
+    case 91: return "B8G8R8A8_UNORM_SRGB";
+    default: return nullptr;
+    }
+}
+
+inline double pearson(const std::vector<double>& x, const std::vector<double>& y) {
+    const size_t n = x.size();
+    if (n < 2 || n != y.size()) return 0.0;
+
+    double sumX = 0.0;
+    double sumY = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        sumX += x[i];
+        sumY += y[i];
+    }
+    const double meanX = sumX / static_cast<double>(n);
+    const double meanY = sumY / static_cast<double>(n);
+
+    double varX = 0.0;
+    double varY = 0.0;
+    double covXY = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double dx = x[i] - meanX;
+        const double dy = y[i] - meanY;
+        varX += dx * dx;
+        varY += dy * dy;
+        covXY += dx * dy;
+    }
+
+    if (varX <= 1e-12 || varY <= 1e-12) return 0.0;
+
+    const double r = covXY / std::sqrt(varX * varY);
+    return std::clamp(r, -1.0, 1.0);
+}
+
 inline std::string generateJitterViewReport(
     const JitterViewHeaderInfo& header,
     const std::vector<JitterViewFrameData>& frames) {
@@ -250,7 +293,7 @@ inline std::string generateJitterViewReport(
     std::string out;
     out.reserve(90000);
 
-    char buf[512];
+    char buf[1024];
     std::snprintf(buf, sizeof(buf),
         "# edpe_version: %s\n"
         "# date: %s\n"
@@ -263,7 +306,8 @@ inline std::string generateJitterViewReport(
         "# upscale_mode: %s\n"
         "# is_hdr: %s\n"
         "# grid: %ux%u\n"
-        "# green_rule: g - max(r, b) > 0.04\n",
+        "# green_rule: g - max(r, b) > 0.04\n"
+        "# luma_rule: dot(norm(c), float3(0.299, 0.587, 0.114)), HDR: c/(1+c), LDR: saturate, Q10 clamped sum\n",
         header.edpeVersion.c_str(),
         header.date.c_str(),
         header.mode,
@@ -281,7 +325,7 @@ inline std::string generateJitterViewReport(
         kJitterViewGridRows);
     out.append(buf);
 
-    out.append("# frame, rendered_frame_id, t_ms, delta_ms, phase, phases, jx, jy, green_pct, green_px, centroid_x, centroid_y, bbox_x0, bbox_y0, bbox_x1, bbox_y1, tiles_active, tiles_flip, cam_move_m, cam_rot_deg, cam_valid, held, scene_cut\n");
+    out.append("# frame, rendered_frame_id, t_ms, delta_ms, phase, phases, jx, jy, green_pct, green_px, centroid_x, centroid_y, bbox_x0, bbox_y0, bbox_x1, bbox_y1, tiles_active, tiles_flip, cam_move_m, cam_rot_deg, cam_valid, held, scene_cut, luma_mean, in_fmt, scene_w, scene_h, mv_null, depth_null, hist_realloc, sens, thr, mode\n");
 
     std::vector<JitterViewFrameStats> allStats;
     allStats.reserve(frames.size());
@@ -314,13 +358,16 @@ inline std::string generateJitterViewReport(
 
         const auto& m = frames[i].meta;
         std::snprintf(buf, sizeof(buf),
-            "%llu, %llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6f, %u, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %u, %u, %.4f, %.3f, %d, %d, %d\n",
+            "%llu, %llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6f, %u, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %u, %u, %.4f, %.3f, %d, %d, %d, %.6f, %u, %u, %u, %d, %d, %d, %.2f, %.3f, %d\n",
             m.frame, m.renderedFrameId, m.timeMs, m.deltaMs, m.phase, m.totalPhases, m.pixelX, m.pixelY,
             s.greenPct, s.greenPx, s.centroidX, s.centroidY,
             s.bboxX0, s.bboxY0, s.bboxX1, s.bboxY1,
             s.tilesActive, s.tilesFlip,
             m.camMoveDist, m.camRotDeg,
-            m.cameraValid ? 1 : 0, m.heldJitter ? 1 : 0, m.sceneCut ? 1 : 0);
+            m.cameraValid ? 1 : 0, m.heldJitter ? 1 : 0, m.sceneCut ? 1 : 0,
+            m.lumaMean, m.inputFormat, m.sceneW, m.sceneH,
+            m.motionNull ? 1 : 0, m.depthNull ? 1 : 0, m.historyRecreated ? 1 : 0,
+            m.sensitivity, m.threshold, m.mode);
         out.append(buf);
     }
 
@@ -553,13 +600,101 @@ inline std::string generateJitterViewReport(
         out.append(buf);
     }
 
+    size_t mvNullCount = 0;
+    size_t depthNullCount = 0;
+    size_t histReallocCount = 0;
+    std::set<uint32_t> uniqueFormats;
+
+    std::vector<double> validGreen;
+    std::vector<double> validLuma;
+    validGreen.reserve(frames.size());
+    validLuma.reserve(frames.size());
+
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const auto& m = frames[i].meta;
+        if (m.motionNull) mvNullCount++;
+        if (m.depthNull) depthNullCount++;
+        if (m.historyRecreated) histReallocCount++;
+        uniqueFormats.insert(m.inputFormat);
+
+        if (m.lumaMean >= 0.0) {
+            validGreen.push_back(allStats[i].greenPct);
+            validLuma.push_back(m.lumaMean);
+        }
+    }
+
+    std::vector<double> pairGreen;
+    std::vector<double> pairAbsDluma;
+    for (size_t i = 1; i < frames.size(); ++i) {
+        if (frames[i].meta.lumaMean >= 0.0 && frames[i - 1].meta.lumaMean >= 0.0) {
+            pairGreen.push_back(allStats[i].greenPct);
+            pairAbsDluma.push_back(std::abs(frames[i].meta.lumaMean - frames[i - 1].meta.lumaMean));
+        }
+    }
+
+    double lumaMin = -1.0;
+    double lumaMax = -1.0;
+    double lumaAvg = -1.0;
+    if (!validLuma.empty()) {
+        lumaMin = validLuma[0];
+        lumaMax = validLuma[0];
+        double lumaSum = 0.0;
+        for (double v : validLuma) {
+            if (v < lumaMin) lumaMin = v;
+            if (v > lumaMax) lumaMax = v;
+            lumaSum += v;
+        }
+        lumaAvg = lumaSum / static_cast<double>(validLuma.size());
+    }
+
+    const uint32_t lumaDominantPeriodFrames = (!validLuma.empty()) ? computeDominantPeriod(validLuma, 2, 240) : 0;
+    const double lumaDominantPeriodS = (avgFps > 0.0 && lumaDominantPeriodFrames > 0) ? (static_cast<double>(lumaDominantPeriodFrames) / avgFps) : 0.0;
+    const double lumaDominantFreqHz = (lumaDominantPeriodS > 0.0) ? (1.0 / lumaDominantPeriodS) : 0.0;
+
+    const double pearsonGreenLuma = pearson(validGreen, validLuma);
+    const double pearsonGreenAbsDluma = pearson(pairGreen, pairAbsDluma);
+
+    std::string uniqueInFmtStr;
+    for (uint32_t fmt : uniqueFormats) {
+        if (!uniqueInFmtStr.empty()) uniqueInFmtStr += ", ";
+        const char* name = getDxgiFormatName(fmt);
+        if (name) {
+            uniqueInFmtStr += std::to_string(fmt) + " (" + name + ")";
+        } else {
+            uniqueInFmtStr += std::to_string(fmt);
+        }
+    }
+    if (uniqueInFmtStr.empty()) uniqueInFmtStr = "none";
+
     std::snprintf(buf, sizeof(buf),
         "# reset_frames: %zu\n"
         "# scene_cut_frames: %zu\n"
-        "# held_jitter_frames: %zu\n",
+        "# held_jitter_frames: %zu\n"
+        "# mv_null_frames: %zu\n"
+        "# depth_null_frames: %zu\n"
+        "# hist_realloc_frames: %zu\n"
+        "# unique_in_fmt: %s\n"
+        "# luma_min: %.6f\n"
+        "# luma_avg: %.6f\n"
+        "# luma_max: %.6f\n"
+        "# luma_dominant_period_frames: %u\n"
+        "# luma_dominant_freq_hz: %.2f\n"
+        "# pearson_green_vs_luma: %.4f\n"
+        "# pearson_green_vs_abs_dluma: %.4f\n",
         resetCount,
         sceneCutCount,
-        heldCount);
+        heldCount,
+        mvNullCount,
+        depthNullCount,
+        histReallocCount,
+        uniqueInFmtStr.c_str(),
+        lumaMin,
+        lumaAvg,
+        lumaMax,
+        lumaDominantPeriodFrames,
+        lumaDominantFreqHz,
+        pearsonGreenLuma,
+        pearsonGreenAbsDluma);
     out.append(buf);
 
     return out;
