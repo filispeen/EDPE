@@ -13,7 +13,9 @@ void syncConfigOnce() {
     static bool s_synced = false;
     if (s_synced) return;
     s_synced = true;
-    edpe::installInputHooks();
+    if (edpe::isRunningInEliteProcess()) {
+        edpe::installInputHooks();
+    }
     auto& cfg = edpe::Config::instance();
     cfg.load();
     if (cfg.syncEliteGraphicsConfig()) {

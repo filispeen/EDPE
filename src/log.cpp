@@ -1,6 +1,7 @@
 #include "log.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <cwchar>
 #include <windows.h>
 
@@ -33,31 +34,67 @@ HANDLE beginLogSession(const wchar_t* path) {
     CloseHandle(mutex);
     return marker; // Retained until process exit, including across proxy DLL unloads.
 }
+
+struct ProcessInfo {
+    wchar_t exeName[MAX_PATH];
+    DWORD pid;
+    wchar_t logPath[MAX_PATH];
+    bool valid;
+
+    ProcessInfo() : pid(GetCurrentProcessId()), valid(false) {
+        exeName[0] = L'\0';
+        logPath[0] = L'\0';
+        wchar_t path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (length > 0 && length < MAX_PATH) {
+            wchar_t* name = wcsrchr(path, L'\\');
+            if (name) {
+                wcscpy_s(exeName, name + 1);
+                const size_t prefix = name + 1 - path;
+                if (prefix + sizeof(L"edpe.log") / sizeof(wchar_t) <= MAX_PATH) {
+                    wcscpy_s(name + 1, MAX_PATH - prefix, L"edpe.log");
+                    wcscpy_s(logPath, path);
+                    valid = true;
+                }
+            } else {
+                wcscpy_s(exeName, path);
+            }
+        }
+        if (exeName[0] == L'\0') {
+            wcscpy_s(exeName, L"unknown");
+        }
+    }
+};
+
+const ProcessInfo& getProcessInfo() {
+    static const ProcessInfo s_info;
+    return s_info;
 }
+} // namespace
 
 void EdpeLog(const wchar_t* message) {
-    OutputDebugStringW(message);
+    const auto& info = getProcessInfo();
+
+    wchar_t formatted[2048];
+    _snwprintf_s(formatted, sizeof(formatted) / sizeof(wchar_t), _TRUNCATE,
+        L"[%ls:%lu] %ls", info.exeName, info.pid, message);
+
+    OutputDebugStringW(formatted);
     OutputDebugStringW(L"\n");
 
-    wchar_t path[MAX_PATH];
-    const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    if (!length || length >= MAX_PATH) return;
-    wchar_t* name = wcsrchr(path, L'\\');
-    if (!name) return;
-    const size_t prefix = name + 1 - path;
-    if (prefix + sizeof(L"edpe.log") / sizeof(wchar_t) > MAX_PATH) return;
-    wcscpy_s(name + 1, MAX_PATH - prefix, L"edpe.log");
-    static const HANDLE session = beginLogSession(path);
+    if (!info.valid) return;
+
+    static const HANDLE session = beginLogSession(info.logPath);
     (void)session;
 
-    char line[1024];
-    const int bytes = WideCharToMultiByte(CP_UTF8, 0, message, -1, line,
+    char line[4096];
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, formatted, -1, line,
         static_cast<int>(sizeof(line) - 2), nullptr, nullptr);
     if (!bytes) return;
     line[bytes - 1] = '\r';
     line[bytes] = '\n';
 
-    const HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
+    const HANDLE file = CreateFileW(info.logPath, FILE_APPEND_DATA,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return;
     DWORD written;

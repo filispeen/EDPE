@@ -14,6 +14,15 @@ namespace edpe {
 
 inline constexpr const char* kVersion = "v0.4.6";
 
+inline bool isRunningInEliteProcess() {
+    wchar_t modulePath[MAX_PATH]{};
+    const DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    if (!len || len >= MAX_PATH) return false;
+    std::wstring filename = std::filesystem::path(modulePath).filename().wstring();
+    for (auto& ch : filename) ch = static_cast<wchar_t>(towlower(ch));
+    return filename.find(L"elitedangerous") != std::wstring::npos;
+}
+
 class Config {
 public:
     static Config& instance() {
@@ -139,12 +148,7 @@ public:
     }
 
     bool isRunningInEliteProcess() const {
-        wchar_t modulePath[MAX_PATH]{};
-        const DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
-        if (!len || len >= MAX_PATH) return false;
-        std::wstring filename = std::filesystem::path(modulePath).filename().wstring();
-        for (auto& ch : filename) ch = static_cast<wchar_t>(towlower(ch));
-        return filename.find(L"elitedangerous") != std::wstring::npos;
+        return edpe::isRunningInEliteProcess();
     }
 
     // Synchronizes Elite Dangerous's Custom.4.4.fxcfg <SSAAMultiplier> with the selected
