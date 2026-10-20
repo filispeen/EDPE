@@ -8,6 +8,16 @@ namespace edpe {
 
 class JitterDebugPass {
 public:
+    struct FrameInfo {
+        DXGI_FORMAT inputFormat = DXGI_FORMAT_UNKNOWN;
+        uint32_t texW = 0;
+        uint32_t texH = 0;
+        uint32_t inW = 0;
+        uint32_t inH = 0;
+        bool historyRecreated = false;
+        bool performReset = false;
+    };
+
     bool initialize(ID3D11Device* device, ID3D11DeviceContext* context);
     void shutdown();
 
@@ -27,6 +37,7 @@ public:
                 bool isHdr = false);
 
     void resetHistory() { resetRequested_ = true; }
+    const FrameInfo& getLastFrameInfo() const { return lastFrameInfo_; }
 
 private:
     bool ensureHistory(uint32_t width, uint32_t height, DXGI_FORMAT format);
@@ -46,6 +57,8 @@ private:
     uint32_t historyHeight_ = 0;
     DXGI_FORMAT historyFormat_ = DXGI_FORMAT_UNKNOWN;
     bool resetRequested_ = true;
+    bool historyRecreated_ = false;
+    FrameInfo lastFrameInfo_{};
 };
 
 } // namespace edpe

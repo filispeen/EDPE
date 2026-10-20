@@ -100,6 +100,8 @@ void JitterDebugPass::shutdown() {
     historyHeight_ = 0;
     historyFormat_ = DXGI_FORMAT_UNKNOWN;
     resetRequested_ = true;
+    historyRecreated_ = false;
+    lastFrameInfo_ = {};
 }
 
 bool JitterDebugPass::ensureHistory(uint32_t width, uint32_t height, DXGI_FORMAT format) {
@@ -149,6 +151,7 @@ bool JitterDebugPass::ensureHistory(uint32_t width, uint32_t height, DXGI_FORMAT
         historyHeight_ = height;
         historyFormat_ = format;
         resetRequested_ = true;
+        historyRecreated_ = true;
     }
 
     return true;
@@ -191,9 +194,18 @@ bool JitterDebugPass::render(ID3D11DeviceContext* context,
     const UINT inWidth = renderWidth ? renderWidth : texWidth;
     const UINT inHeight = renderHeight ? renderHeight : texHeight;
 
+    historyRecreated_ = false;
     ensureHistory(texWidth, texHeight, colorFormat);
 
     const bool performReset = reset || resetRequested_;
+
+    lastFrameInfo_.inputFormat = colorFormat;
+    lastFrameInfo_.texW = texWidth;
+    lastFrameInfo_.texH = texHeight;
+    lastFrameInfo_.inW = inWidth;
+    lastFrameInfo_.inH = inHeight;
+    lastFrameInfo_.historyRecreated = historyRecreated_;
+    lastFrameInfo_.performReset = performReset;
 
     JitterDebugConstantBufferData cbData{};
     cbData.resolution[0] = static_cast<float>(inWidth);

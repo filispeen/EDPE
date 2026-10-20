@@ -50,6 +50,22 @@ struct JitterViewFrameMeta {
     bool heldJitter = false;
     bool sceneCut = false;
     bool reset = false;
+    uint32_t inputFormat = 0;
+    uint32_t texW = 0;
+    uint32_t texH = 0;
+    uint32_t inW = 0;
+    uint32_t inH = 0;
+    bool historyRecreated = false;
+    bool performReset = false;
+    bool motionNull = false;
+    bool depthNull = false;
+    float sensitivity = 0.0f;
+    float threshold = 0.0f;
+    int mode = 0;
+    uint32_t sceneW = 0;
+    uint32_t sceneH = 0;
+    uint64_t lumaSumQ10 = 0;
+    double lumaMean = -1.0;
 };
 
 struct JitterViewFrameData {

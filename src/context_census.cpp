@@ -3048,8 +3048,12 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
 
     auto& recorder = edpe::JitterViewRecorder::instance();
     if (recorder.isActive()) {
+        const auto& passInfo = s_jitter_debug_pass->getLastFrameInfo();
+        const bool motionNull = (motionSrv == nullptr);
+        const bool depthNull = (depthSrv == nullptr);
         recorder.onFrame(context, backbuffer, rendered, bbDesc.Width, bbDesc.Height,
-            renderW, renderH, jx, jy, isHdr, reset);
+            renderW, renderH, jx, jy, isHdr, reset,
+            passInfo, motionNull, depthNull, sensitivity, threshold, mode, inputColorSrv);
     }
 }
 

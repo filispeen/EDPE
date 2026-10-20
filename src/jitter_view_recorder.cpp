@@ -348,7 +348,11 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                                  UINT width, UINT height,
                                  UINT renderWidth, UINT renderHeight,
                                  float jx, float jy,
-                                 bool isHdr, bool reset) {
+                                 bool isHdr, bool reset,
+                                 const JitterDebugPass::FrameInfo& passInfo,
+                                 bool motionNull, bool depthNull,
+                                 float sensitivity, float threshold, int mode,
+                                 ID3D11ShaderResourceView* inputColorSrv) {
     if (!context || !backbuffer || width == 0 || height == 0) return;
 
     const State curState = state_.load(std::memory_order_relaxed);
@@ -459,6 +463,21 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                 slot.heldJitter = heldJitter;
                 slot.sceneCut = sceneCut;
                 slot.reset = reset;
+                slot.inputFormat = passInfo.inputFormat;
+                slot.texW = passInfo.texW;
+                slot.texH = passInfo.texH;
+                slot.inW = passInfo.inW;
+                slot.inH = passInfo.inH;
+                slot.historyRecreated = passInfo.historyRecreated;
+                slot.performReset = passInfo.performReset;
+                slot.motionNull = motionNull;
+                slot.depthNull = depthNull;
+                slot.sensitivity = sensitivity;
+                slot.threshold = threshold;
+                slot.mode = mode;
+                slot.sceneW = passInfo.inW;
+                slot.sceneH = passInfo.inH;
+                slot.hasLuma = (inputColorSrv != nullptr && passInfo.inW > 0 && passInfo.inH > 0);
                 slot.inFlight = true;
 
                 writeSlot_ = (writeSlot_ + 1) % kRingSize;
@@ -488,6 +507,22 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                     frameData.meta.heldJitter = s.heldJitter;
                     frameData.meta.sceneCut = s.sceneCut;
                     frameData.meta.reset = s.reset;
+                    frameData.meta.inputFormat = static_cast<uint32_t>(s.inputFormat);
+                    frameData.meta.texW = s.texW;
+                    frameData.meta.texH = s.texH;
+                    frameData.meta.inW = s.inW;
+                    frameData.meta.inH = s.inH;
+                    frameData.meta.historyRecreated = s.historyRecreated;
+                    frameData.meta.performReset = s.performReset;
+                    frameData.meta.motionNull = s.motionNull;
+                    frameData.meta.depthNull = s.depthNull;
+                    frameData.meta.sensitivity = s.sensitivity;
+                    frameData.meta.threshold = s.threshold;
+                    frameData.meta.mode = s.mode;
+                    frameData.meta.sceneW = s.sceneW;
+                    frameData.meta.sceneH = s.sceneH;
+                    frameData.meta.lumaSumQ10 = 0;
+                    frameData.meta.lumaMean = -1.0;
 
                     std::memcpy(frameData.tiles.data(), mapped.pData, kJitterViewGridTiles * sizeof(uint32_t));
                     context->Unmap(stagingBuffers_[readSlot_].Get(), 0);
@@ -527,6 +562,22 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                 frameData.meta.heldJitter = s.heldJitter;
                 frameData.meta.sceneCut = s.sceneCut;
                 frameData.meta.reset = s.reset;
+                frameData.meta.inputFormat = static_cast<uint32_t>(s.inputFormat);
+                frameData.meta.texW = s.texW;
+                frameData.meta.texH = s.texH;
+                frameData.meta.inW = s.inW;
+                frameData.meta.inH = s.inH;
+                frameData.meta.historyRecreated = s.historyRecreated;
+                frameData.meta.performReset = s.performReset;
+                frameData.meta.motionNull = s.motionNull;
+                frameData.meta.depthNull = s.depthNull;
+                frameData.meta.sensitivity = s.sensitivity;
+                frameData.meta.threshold = s.threshold;
+                frameData.meta.mode = s.mode;
+                frameData.meta.sceneW = s.sceneW;
+                frameData.meta.sceneH = s.sceneH;
+                frameData.meta.lumaSumQ10 = 0;
+                frameData.meta.lumaMean = -1.0;
 
                 std::memcpy(frameData.tiles.data(), mapped.pData, kJitterViewGridTiles * sizeof(uint32_t));
                 context->Unmap(stagingBuffers_[readSlot_].Get(), 0);

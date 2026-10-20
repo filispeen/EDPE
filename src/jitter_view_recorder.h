@@ -1,6 +1,7 @@
 #pragma once
 
 #include "jitter_view_report.h"
+#include "jitter_debug_pass.h"
 
 #include <d3d11_1.h>
 #include <wrl/client.h>
@@ -32,6 +33,22 @@ struct JitterViewRingSlot {
     bool sceneCut = false;
     bool reset = false;
     bool inFlight = false;
+    DXGI_FORMAT inputFormat = DXGI_FORMAT_UNKNOWN;
+    uint32_t texW = 0;
+    uint32_t texH = 0;
+    uint32_t inW = 0;
+    uint32_t inH = 0;
+    bool historyRecreated = false;
+    bool performReset = false;
+    bool motionNull = false;
+    bool depthNull = false;
+    float sensitivity = 0.0f;
+    float threshold = 0.0f;
+    int mode = 0;
+    uint32_t sceneW = 0;
+    uint32_t sceneH = 0;
+    uint64_t lumaSumQ10 = 0;
+    bool hasLuma = false;
 };
 
 class JitterViewRecorder {
@@ -64,7 +81,11 @@ public:
                  UINT width, UINT height,
                  UINT renderWidth, UINT renderHeight,
                  float jx, float jy,
-                 bool isHdr, bool reset);
+                 bool isHdr, bool reset,
+                 const JitterDebugPass::FrameInfo& passInfo,
+                 bool motionNull, bool depthNull,
+                 float sensitivity, float threshold, int mode,
+                 ID3D11ShaderResourceView* inputColorSrv);
 
 private:
     JitterViewRecorder();
