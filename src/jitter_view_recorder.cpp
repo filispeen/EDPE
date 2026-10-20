@@ -110,8 +110,12 @@ void JitterViewRecorder::startRecording() {
     }
 
     recordedFrames_.clear();
-    writeIndex_ = 0;
-    readIndex_ = 0;
+    for (size_t i = 0; i < kRingSize; ++i) {
+        slots_[i] = JitterViewRingSlot{};
+    }
+    writeSlot_ = 0;
+    readSlot_ = 0;
+    droppedFrames_ = 0;
     drainingFramesLeft_ = 8;
     elapsedSeconds_.store(0.0f, std::memory_order_relaxed);
     hasSavedLog_.store(false, std::memory_order_relaxed);
@@ -275,7 +279,7 @@ std::wstring JitterViewRecorder::getLogFilePath() const {
 
 void JitterViewRecorder::triggerBackgroundWrite(UINT renderWidth, UINT renderHeight,
                                                 UINT outputWidth, UINT outputHeight,
-                                                bool isHdr) {
+                                                bool isHdr, uint64_t droppedFrames) {
     JitterViewHeaderInfo header{};
     header.edpeVersion = kVersion;
 
@@ -310,6 +314,7 @@ void JitterViewRecorder::triggerBackgroundWrite(UINT renderWidth, UINT renderHei
     header.upscalerBackend = wideToUtf8(getUpscalerBackendName(upscaler.getBackend()));
     header.upscaleMode = wideToUtf8(getUpscaleModeName(upscaler.getMode()));
     header.isHdr = isHdr;
+    header.droppedFrames = droppedFrames;
 
     auto framesCopy = std::move(recordedFrames_);
     const std::wstring logPath = getLogFilePath();
@@ -339,138 +344,198 @@ void JitterViewRecorder::triggerBackgroundWrite(UINT renderWidth, UINT renderHei
 
 void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                                  ID3D11Texture2D* backbuffer,
+                                 unsigned long long rendered,
                                  UINT width, UINT height,
                                  UINT renderWidth, UINT renderHeight,
+                                 float jx, float jy,
                                  bool isHdr, bool reset) {
     if (!context || !backbuffer || width == 0 || height == 0) return;
 
     const State curState = state_.load(std::memory_order_relaxed);
     if (curState == State::Idle || curState == State::Writing) return;
 
-    if (curState == State::Recording) {
-        LARGE_INTEGER qpcNow;
-        QueryPerformanceCounter(&qpcNow);
-        const double elapsed = static_cast<double>(qpcNow.QuadPart - qpcStart_.QuadPart) /
-                               static_cast<double>(qpcFreq_.QuadPart);
-        elapsedSeconds_.store(static_cast<float>(elapsed), std::memory_order_relaxed);
+    LARGE_INTEGER qpcNow;
+    QueryPerformanceCounter(&qpcNow);
+    const double elapsedSec = (qpcFreq_.QuadPart > 0)
+        ? static_cast<double>(qpcNow.QuadPart - qpcStart_.QuadPart) / static_cast<double>(qpcFreq_.QuadPart)
+        : 0.0;
+    elapsedSeconds_.store(static_cast<float>(elapsedSec), std::memory_order_relaxed);
 
-        if (elapsed >= 5.0) {
+    const double tMs = (qpcFreq_.QuadPart > 0)
+        ? static_cast<double>(qpcNow.QuadPart - qpcStart_.QuadPart) * 1000.0 / static_cast<double>(qpcFreq_.QuadPart)
+        : 0.0;
+
+    if (curState == State::Recording) {
+        if (elapsedSec >= 5.0) {
             state_.store(State::Draining, std::memory_order_release);
             drainingFramesLeft_ = 8;
         } else {
-            Microsoft::WRL::ComPtr<ID3D11Device> device;
-            context->GetDevice(&device);
-            if (!device) return;
+            if (slots_[writeSlot_].inFlight) {
+                droppedFrames_++;
+            } else {
+                Microsoft::WRL::ComPtr<ID3D11Device> device;
+                context->GetDevice(&device);
+                if (!device) return;
 
-            D3D11_TEXTURE2D_DESC bbDesc{};
-            backbuffer->GetDesc(&bbDesc);
-            const DXGI_FORMAT concreteFormat = toConcreteLdrFormat(bbDesc.Format);
+                D3D11_TEXTURE2D_DESC bbDesc{};
+                backbuffer->GetDesc(&bbDesc);
+                const DXGI_FORMAT concreteFormat = toConcreteLdrFormat(bbDesc.Format);
 
-            if (!ensureResources(device.Get(), context, width, height, concreteFormat)) {
-                EdpeLog(L"EDPE: JitterViewRecorder failed to allocate GPU resources - recording stopped");
-                state_.store(State::Idle, std::memory_order_release);
-                if (restoreDebugView_) {
-                    ContextCensusSetJitterDebugView(false);
-                    restoreDebugView_ = false;
+                if (!ensureResources(device.Get(), context, width, height, concreteFormat)) {
+                    EdpeLog(L"EDPE: JitterViewRecorder failed to allocate GPU resources - recording stopped");
+                    state_.store(State::Idle, std::memory_order_release);
+                    if (restoreDebugView_) {
+                        ContextCensusSetJitterDebugView(false);
+                        restoreDebugView_ = false;
+                    }
+                    return;
                 }
-                return;
+
+                context->CopyResource(inputCopy_.Get(), backbuffer);
+
+                const StatsConstantBufferData cbData{ width, height, {0, 0} };
+                context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cbData, 0, 0);
+
+                const UINT clearVals[4] = { 0, 0, 0, 0 };
+                context->ClearUnorderedAccessViewUint(gpuUav_.Get(), clearVals);
+
+                Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
+                if (stateObject_) {
+                    context1_->SwapDeviceContextState(stateObject_.Get(), &prior);
+                }
+
+                ID3D11ShaderResourceView* srv = inputSrv_.Get();
+                ID3D11UnorderedAccessView* uav = gpuUav_.Get();
+                ID3D11Buffer* cb = constantBuffer_.Get();
+
+                context1_->CSSetShader(computeShader_.Get(), nullptr, 0);
+                context1_->CSSetConstantBuffers(0, 1, &cb);
+                context1_->CSSetShaderResources(0, 1, &srv);
+                context1_->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+
+                context1_->Dispatch(64, 36, 1);
+
+                ID3D11ShaderResourceView* nullSrv = nullptr;
+                context1_->CSSetShaderResources(0, 1, &nullSrv);
+                ID3D11UnorderedAccessView* nullUav = nullptr;
+                context1_->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+
+                if (stateObject_ && prior) {
+                    context1_->SwapDeviceContextState(prior.Get(), nullptr);
+                }
+
+                context->CopyResource(stagingBuffers_[writeSlot_].Get(), gpuBuffer_.Get());
+
+                const auto jl = JitterLogger::instance().getLatest();
+                unsigned totalPhases = ContextCensusGetJitterPhaseCount();
+                if (totalPhases == 0) totalPhases = 32;
+                unsigned phase = 0;
+                float camMove = jl.camMoveDist;
+                float camRot = jl.camRotDeg;
+                bool cameraValid = jl.cameraValid;
+                bool heldJitter = jl.heldJitter;
+                bool sceneCut = jl.sceneCut;
+
+                if (jl.frame == rendered) {
+                    phase = jl.phase;
+                    if (jl.totalPhases > 0) totalPhases = jl.totalPhases;
+                } else {
+                    phase = static_cast<unsigned>(rendered % totalPhases);
+                }
+
+                auto& slot = slots_[writeSlot_];
+                slot.renderedFrameId = rendered;
+                slot.logFrameId = jl.frame;
+                slot.qpcTicks = qpcNow.QuadPart;
+                slot.tMs = static_cast<float>(tMs);
+                slot.deltaMs = 0.0f;
+                slot.jx = jx;
+                slot.jy = jy;
+                slot.phase = phase;
+                slot.totalPhases = totalPhases;
+                slot.camMove = camMove;
+                slot.camRot = camRot;
+                slot.cameraValid = cameraValid;
+                slot.heldJitter = heldJitter;
+                slot.sceneCut = sceneCut;
+                slot.reset = reset;
+                slot.inFlight = true;
+
+                writeSlot_ = (writeSlot_ + 1) % kRingSize;
             }
 
-            context->CopyResource(inputCopy_.Get(), backbuffer);
-
-            const StatsConstantBufferData cbData{ width, height, {0, 0} };
-            context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cbData, 0, 0);
-
-            const UINT clearVals[4] = { 0, 0, 0, 0 };
-            context->ClearUnorderedAccessViewUint(gpuUav_.Get(), clearVals);
-
-            Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
-            if (stateObject_) {
-                context1_->SwapDeviceContextState(stateObject_.Get(), &prior);
-            }
-
-            ID3D11ShaderResourceView* srv = inputSrv_.Get();
-            ID3D11UnorderedAccessView* uav = gpuUav_.Get();
-            ID3D11Buffer* cb = constantBuffer_.Get();
-
-            context1_->CSSetShader(computeShader_.Get(), nullptr, 0);
-            context1_->CSSetConstantBuffers(0, 1, &cb);
-            context1_->CSSetShaderResources(0, 1, &srv);
-            context1_->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-
-            context1_->Dispatch(64, 36, 1);
-
-            ID3D11ShaderResourceView* nullSrv = nullptr;
-            context1_->CSSetShaderResources(0, 1, &nullSrv);
-            ID3D11UnorderedAccessView* nullUav = nullptr;
-            context1_->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
-
-            if (stateObject_ && prior) {
-                context1_->SwapDeviceContextState(prior.Get(), nullptr);
-            }
-
-            const uint32_t slot = writeIndex_ % kRingSize;
-            context->CopyResource(stagingBuffers_[slot].Get(), gpuBuffer_.Get());
-
-            const auto latest = JitterLogger::instance().getLatest();
-            JitterViewFrameMeta meta{};
-            meta.frame = latest.frame;
-            meta.timeMs = latest.timeMs;
-            meta.deltaMs = latest.deltaMs;
-            meta.phase = latest.phase;
-            meta.totalPhases = latest.totalPhases;
-            meta.pixelX = latest.pixelX;
-            meta.pixelY = latest.pixelY;
-            meta.camMoveDist = latest.camMoveDist;
-            meta.camRotDeg = latest.camRotDeg;
-            meta.cameraValid = latest.cameraValid;
-            meta.heldJitter = latest.heldJitter;
-            meta.sceneCut = latest.sceneCut;
-            meta.reset = reset;
-
-            slotMeta_[slot] = meta;
-            writeIndex_++;
-
-            while (readIndex_ < writeIndex_) {
-                const uint32_t readSlot = readIndex_ % kRingSize;
+            while (slots_[readSlot_].inFlight) {
                 D3D11_MAPPED_SUBRESOURCE mapped{};
-                const HRESULT hr = context->Map(stagingBuffers_[readSlot].Get(), 0, D3D11_MAP_READ,
+                const HRESULT hr = context->Map(stagingBuffers_[readSlot_].Get(), 0, D3D11_MAP_READ,
                                                 D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
                 if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
                     break;
                 }
                 if (SUCCEEDED(hr)) {
                     JitterViewFrameData frameData{};
-                    frameData.meta = slotMeta_[readSlot];
+                    const auto& s = slots_[readSlot_];
+                    frameData.meta.frame = s.logFrameId;
+                    frameData.meta.renderedFrameId = s.renderedFrameId;
+                    frameData.meta.timeMs = s.tMs;
+                    frameData.meta.deltaMs = (!recordedFrames_.empty()) ? (s.tMs - recordedFrames_.back().meta.timeMs) : 0.0f;
+                    frameData.meta.phase = s.phase;
+                    frameData.meta.totalPhases = s.totalPhases;
+                    frameData.meta.pixelX = s.jx;
+                    frameData.meta.pixelY = s.jy;
+                    frameData.meta.camMoveDist = s.camMove;
+                    frameData.meta.camRotDeg = s.camRot;
+                    frameData.meta.cameraValid = s.cameraValid;
+                    frameData.meta.heldJitter = s.heldJitter;
+                    frameData.meta.sceneCut = s.sceneCut;
+                    frameData.meta.reset = s.reset;
+
                     std::memcpy(frameData.tiles.data(), mapped.pData, kJitterViewGridTiles * sizeof(uint32_t));
-                    context->Unmap(stagingBuffers_[readSlot].Get(), 0);
+                    context->Unmap(stagingBuffers_[readSlot_].Get(), 0);
+                    slots_[readSlot_].inFlight = false;
                     recordedFrames_.push_back(std::move(frameData));
-                    readIndex_++;
+                    readSlot_ = (readSlot_ + 1) % kRingSize;
                 } else {
-                    readIndex_++;
+                    slots_[readSlot_].inFlight = false;
+                    readSlot_ = (readSlot_ + 1) % kRingSize;
                 }
             }
         }
     }
 
     if (state_.load(std::memory_order_relaxed) == State::Draining) {
-        while (readIndex_ < writeIndex_) {
-            const uint32_t readSlot = readIndex_ % kRingSize;
+        while (slots_[readSlot_].inFlight) {
             D3D11_MAPPED_SUBRESOURCE mapped{};
-            const HRESULT hr = context->Map(stagingBuffers_[readSlot].Get(), 0, D3D11_MAP_READ,
+            const HRESULT hr = context->Map(stagingBuffers_[readSlot_].Get(), 0, D3D11_MAP_READ,
                                             D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
             if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
                 break;
             }
             if (SUCCEEDED(hr)) {
                 JitterViewFrameData frameData{};
-                frameData.meta = slotMeta_[readSlot];
+                const auto& s = slots_[readSlot_];
+                frameData.meta.frame = s.logFrameId;
+                frameData.meta.renderedFrameId = s.renderedFrameId;
+                frameData.meta.timeMs = s.tMs;
+                frameData.meta.deltaMs = (!recordedFrames_.empty()) ? (s.tMs - recordedFrames_.back().meta.timeMs) : 0.0f;
+                frameData.meta.phase = s.phase;
+                frameData.meta.totalPhases = s.totalPhases;
+                frameData.meta.pixelX = s.jx;
+                frameData.meta.pixelY = s.jy;
+                frameData.meta.camMoveDist = s.camMove;
+                frameData.meta.camRotDeg = s.camRot;
+                frameData.meta.cameraValid = s.cameraValid;
+                frameData.meta.heldJitter = s.heldJitter;
+                frameData.meta.sceneCut = s.sceneCut;
+                frameData.meta.reset = s.reset;
+
                 std::memcpy(frameData.tiles.data(), mapped.pData, kJitterViewGridTiles * sizeof(uint32_t));
-                context->Unmap(stagingBuffers_[readSlot].Get(), 0);
+                context->Unmap(stagingBuffers_[readSlot_].Get(), 0);
+                slots_[readSlot_].inFlight = false;
                 recordedFrames_.push_back(std::move(frameData));
-                readIndex_++;
+                readSlot_ = (readSlot_ + 1) % kRingSize;
             } else {
-                readIndex_++;
+                slots_[readSlot_].inFlight = false;
+                readSlot_ = (readSlot_ + 1) % kRingSize;
             }
         }
 
@@ -478,13 +543,21 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
             drainingFramesLeft_--;
         }
 
-        if (readIndex_ == writeIndex_ || drainingFramesLeft_ == 0) {
+        bool anyInFlight = false;
+        for (size_t i = 0; i < kRingSize; ++i) {
+            if (slots_[i].inFlight) {
+                anyInFlight = true;
+                break;
+            }
+        }
+
+        if (!anyInFlight || drainingFramesLeft_ == 0) {
             state_.store(State::Writing, std::memory_order_release);
             if (restoreDebugView_) {
                 ContextCensusSetJitterDebugView(false);
                 restoreDebugView_ = false;
             }
-            triggerBackgroundWrite(renderWidth, renderHeight, width, height, isHdr);
+            triggerBackgroundWrite(renderWidth, renderHeight, width, height, isHdr, droppedFrames_);
         }
     }
 }

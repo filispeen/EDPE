@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -31,10 +32,12 @@ struct JitterViewHeaderInfo {
     std::string upscalerBackend;
     std::string upscaleMode;
     bool isHdr = false;
+    uint64_t droppedFrames = 0;
 };
 
 struct JitterViewFrameMeta {
     unsigned long long frame = 0;
+    unsigned long long renderedFrameId = 0;
     float timeMs = 0.0f;
     float deltaMs = 0.0f;
     unsigned phase = 0;
@@ -167,12 +170,69 @@ inline JitterViewFrameStats computeFrameStats(
     return stats;
 }
 
+inline uint32_t computeDominantPeriod(const std::vector<double>& series, uint32_t minLag = 2, uint32_t maxLag = 240) {
+    const size_t n = series.size();
+    if (n < minLag + 2) return 0;
+
+    double sum = 0.0;
+    for (double v : series) sum += v;
+    const double mean = sum / static_cast<double>(n);
+
+    double var = 0.0;
+    for (double v : series) {
+        const double d = v - mean;
+        var += d * d;
+    }
+    if (var <= 1e-12) return 0;
+
+    const uint32_t upperLag = static_cast<uint32_t>(std::min<size_t>(maxLag, n - 2));
+    if (upperLag < minLag) return 0;
+
+    std::vector<double> r(upperLag + 2, 0.0);
+    for (uint32_t k = 1; k <= upperLag + 1; ++k) {
+        double c = 0.0;
+        for (size_t i = 0; i < n - k; ++i) {
+            c += (series[i] - mean) * (series[i + k] - mean);
+        }
+        r[k] = c / (static_cast<double>(n - k) * (var / static_cast<double>(n)));
+    }
+
+    struct Peak {
+        double rVal;
+        uint32_t lag;
+    };
+    std::vector<Peak> peaks;
+    for (uint32_t k = minLag; k <= upperLag; ++k) {
+        if (r[k] > r[k - 1] && r[k] >= r[k + 1] && r[k] > 0.0) {
+            peaks.push_back({ r[k], k });
+        }
+    }
+    if (peaks.empty()) return 0;
+
+    double maxR = peaks[0].rVal;
+    for (const auto& p : peaks) {
+        if (p.rVal > maxR) maxR = p.rVal;
+    }
+
+    std::vector<Peak> prominent;
+    for (const auto& p : peaks) {
+        if (p.rVal >= 0.7 * maxR) {
+            prominent.push_back(p);
+        }
+    }
+    std::sort(prominent.begin(), prominent.end(), [](const Peak& a, const Peak& b) {
+        return a.lag < b.lag;
+    });
+
+    return prominent.empty() ? 0 : prominent[0].lag;
+}
+
 inline std::string generateJitterViewReport(
     const JitterViewHeaderInfo& header,
     const std::vector<JitterViewFrameData>& frames) {
 
     std::string out;
-    out.reserve(70000);
+    out.reserve(90000);
 
     char buf[512];
     std::snprintf(buf, sizeof(buf),
@@ -205,7 +265,7 @@ inline std::string generateJitterViewReport(
         kJitterViewGridRows);
     out.append(buf);
 
-    out.append("# frame, t_ms, delta_ms, phase, phases, jx, jy, green_pct, green_px, centroid_x, centroid_y, bbox_x0, bbox_y0, bbox_x1, bbox_y1, tiles_active, tiles_flip, cam_move_m, cam_rot_deg, cam_valid, held, scene_cut\n");
+    out.append("# frame, rendered_frame_id, t_ms, delta_ms, phase, phases, jx, jy, green_pct, green_px, centroid_x, centroid_y, bbox_x0, bbox_y0, bbox_x1, bbox_y1, tiles_active, tiles_flip, cam_move_m, cam_rot_deg, cam_valid, held, scene_cut\n");
 
     std::vector<JitterViewFrameStats> allStats;
     allStats.reserve(frames.size());
@@ -214,10 +274,14 @@ inline std::string generateJitterViewReport(
     std::array<uint32_t, kJitterViewGridTiles> tileFlipsTotal{};
     std::array<double, kJitterViewGridTiles> tileFractionSum{};
 
+    std::vector<double> greenPctSeries;
+    greenPctSeries.reserve(frames.size());
+
     for (size_t i = 0; i < frames.size(); ++i) {
         const auto* prev = (i > 0) ? &frameActive[i - 1] : nullptr;
         JitterViewFrameStats s = computeFrameStats(frames[i], header.renderWidth, header.renderHeight, prev, frameActive[i]);
         allStats.push_back(s);
+        greenPctSeries.push_back(s.greenPct);
 
         for (uint32_t ty = 0; ty < kJitterViewGridRows; ++ty) {
             for (uint32_t tx = 0; tx < kJitterViewGridCols; ++tx) {
@@ -234,8 +298,8 @@ inline std::string generateJitterViewReport(
 
         const auto& m = frames[i].meta;
         std::snprintf(buf, sizeof(buf),
-            "%llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6f, %u, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %u, %u, %.4f, %.3f, %d, %d, %d\n",
-            m.frame, m.timeMs, m.deltaMs, m.phase, m.totalPhases, m.pixelX, m.pixelY,
+            "%llu, %llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6f, %u, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %u, %u, %.4f, %.3f, %d, %d, %d\n",
+            m.frame, m.renderedFrameId, m.timeMs, m.deltaMs, m.phase, m.totalPhases, m.pixelX, m.pixelY,
             s.greenPct, s.greenPx, s.centroidX, s.centroidY,
             s.bboxX0, s.bboxY0, s.bboxX1, s.bboxY1,
             s.tilesActive, s.tilesFlip,
@@ -245,7 +309,8 @@ inline std::string generateJitterViewReport(
     }
 
     for (size_t i = 0; i < frames.size(); i += 30) {
-        std::snprintf(buf, sizeof(buf), "# MAP frame=%llu\n", frames[i].meta.frame);
+        const unsigned long long fid = frames[i].meta.renderedFrameId ? frames[i].meta.renderedFrameId : frames[i].meta.frame;
+        std::snprintf(buf, sizeof(buf), "# MAP frame=%llu\n", fid);
         out.append(buf);
         for (uint32_t ty = 0; ty < kJitterViewGridRows; ++ty) {
             char rowBuf[kJitterViewGridCols + 2];
@@ -289,23 +354,6 @@ inline std::string generateJitterViewReport(
         out.append(rowBuf);
     }
 
-    out.append("# SUMMARY\n");
-    double durationS = 0.0;
-    if (frames.size() > 1) {
-        const float t0 = frames.front().meta.timeMs;
-        const float t1 = frames.back().meta.timeMs;
-        if (t1 > t0) {
-            durationS = (t1 - t0) * 0.001;
-        } else {
-            double totalDelta = 0.0;
-            for (size_t i = 1; i < frames.size(); ++i) {
-                totalDelta += frames[i].meta.deltaMs;
-            }
-            durationS = totalDelta * 0.001;
-        }
-    }
-    const double avgFps = (durationS > 0.0) ? (static_cast<double>(frames.size()) / durationS) : 0.0;
-
     double greenMin = 0.0;
     double greenMax = 0.0;
     double greenSum = 0.0;
@@ -326,9 +374,23 @@ inline std::string generateJitterViewReport(
         greenMax = allStats[0].greenPct;
     }
 
+    std::set<unsigned long long> uniqueFrameIds;
+    size_t duplicateFrames = 0;
+    std::set<unsigned> phasesSeen;
+    unsigned long long frameIdMin = 0;
+    unsigned long long frameIdMax = 0;
+
     for (size_t i = 0; i < frames.size(); ++i) {
         const auto& s = allStats[i];
         const auto& m = frames[i].meta;
+
+        const unsigned long long fid = m.renderedFrameId ? m.renderedFrameId : m.frame;
+        if (uniqueFrameIds.count(fid)) {
+            duplicateFrames++;
+        } else {
+            uniqueFrameIds.insert(fid);
+        }
+        phasesSeen.insert(m.phase);
 
         if (s.greenPct < greenMin) greenMin = s.greenPct;
         if (s.greenPct > greenMax) greenMax = s.greenPct;
@@ -346,13 +408,104 @@ inline std::string generateJitterViewReport(
         pa.count++;
     }
 
+    if (!uniqueFrameIds.empty()) {
+        frameIdMin = *uniqueFrameIds.begin();
+        frameIdMax = *uniqueFrameIds.rbegin();
+    }
+    const size_t uniqueFrames = uniqueFrameIds.size();
+
     const double greenAvg = allStats.empty() ? 0.0 : (greenSum / static_cast<double>(allStats.size()));
     const double flipsAvg = allStats.empty() ? 0.0 : (flipsSum / static_cast<double>(allStats.size()));
+
+    double varSum = 0.0;
+    for (const auto& s : allStats) {
+        const double diff = s.greenPct - greenAvg;
+        varSum += diff * diff;
+    }
+    const double greenStddev = allStats.empty() ? 0.0 : std::sqrt(varSum / static_cast<double>(allStats.size()));
+    const double spikeThreshold = greenAvg + 2.0 * greenStddev;
+
+    out.append("# SPIKES\n");
+    out.append("# t_ms, frame, phase, green_pct\n");
+    size_t spikeCount = 0;
+    for (size_t i = 0; i < frames.size() && spikeCount < 100; ++i) {
+        if (allStats[i].greenPct > spikeThreshold) {
+            const unsigned long long fid = frames[i].meta.renderedFrameId ? frames[i].meta.renderedFrameId : frames[i].meta.frame;
+            std::snprintf(buf, sizeof(buf), "%.2f, %llu, %u, %.6f\n",
+                frames[i].meta.timeMs, fid, frames[i].meta.phase, allStats[i].greenPct);
+            out.append(buf);
+            spikeCount++;
+        }
+    }
+
+    float maxTMs = 0.0f;
+    for (const auto& f : frames) {
+        if (f.meta.timeMs > maxTMs) maxTMs = f.meta.timeMs;
+    }
+    const size_t numBuckets = (frames.empty()) ? 0 : (static_cast<size_t>(maxTMs / 500.0f) + 1);
+
+    struct SecondBucket {
+        double greenSum = 0.0;
+        double greenMax = 0.0;
+        size_t count = 0;
+    };
+    std::vector<SecondBucket> buckets(numBuckets);
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const float t = frames[i].meta.timeMs;
+        size_t bIdx = static_cast<size_t>(t / 500.0f);
+        if (bIdx >= numBuckets) bIdx = numBuckets - 1;
+        buckets[bIdx].greenSum += allStats[i].greenPct;
+        if (buckets[bIdx].count == 0 || allStats[i].greenPct > buckets[bIdx].greenMax) {
+            buckets[bIdx].greenMax = allStats[i].greenPct;
+        }
+        buckets[bIdx].count++;
+    }
+
+    out.append("# SECOND BUCKETS\n");
+    out.append("# bucket_start_s, bucket_end_s, avg_green_pct, max_green_pct, frames\n");
+    for (size_t b = 0; b < buckets.size(); ++b) {
+        const double bStart = static_cast<double>(b) * 0.5;
+        const double bEnd = static_cast<double>(b + 1) * 0.5;
+        const double bAvg = (buckets[b].count > 0) ? (buckets[b].greenSum / static_cast<double>(buckets[b].count)) : 0.0;
+        std::snprintf(buf, sizeof(buf), "%.1f, %.1f, %.6f, %.6f, %zu\n",
+            bStart, bEnd, bAvg, buckets[b].greenMax, buckets[b].count);
+        out.append(buf);
+    }
+
+    out.append("# SUMMARY\n");
+    double durationS = 0.0;
+    if (frames.size() > 1) {
+        const float t0 = frames.front().meta.timeMs;
+        const float t1 = frames.back().meta.timeMs;
+        if (t1 > t0) {
+            durationS = (t1 - t0) * 0.001;
+        } else {
+            double totalDelta = 0.0;
+            for (size_t i = 1; i < frames.size(); ++i) {
+                totalDelta += frames[i].meta.deltaMs;
+            }
+            durationS = totalDelta * 0.001;
+        }
+    }
+    const double avgFps = (durationS > 0.0) ? (static_cast<double>(frames.size()) / durationS) : 0.0;
+
+    const uint32_t dominantPeriodFrames = computeDominantPeriod(greenPctSeries, 2, 240);
+    const double dominantPeriodS = (avgFps > 0.0 && dominantPeriodFrames > 0) ? (static_cast<double>(dominantPeriodFrames) / avgFps) : 0.0;
+    const double dominantFreqHz = (dominantPeriodS > 0.0) ? (1.0 / dominantPeriodS) : 0.0;
 
     std::snprintf(buf, sizeof(buf),
         "# frames: %zu\n"
         "# duration_s: %.3f\n"
         "# avg_fps: %.2f\n"
+        "# unique_frames: %zu\n"
+        "# duplicate_frames: %zu\n"
+        "# dropped_frames: %llu\n"
+        "# frame_id_min: %llu\n"
+        "# frame_id_max: %llu\n"
+        "# phases_seen: %zu\n"
+        "# dominant_period_frames: %u\n"
+        "# dominant_period_s: %.3f\n"
+        "# dominant_freq_hz: %.2f\n"
         "# green_pct_min: %.6f\n"
         "# green_pct_avg: %.6f\n"
         "# green_pct_max: %.6f\n"
@@ -361,6 +514,15 @@ inline std::string generateJitterViewReport(
         frames.size(),
         durationS,
         avgFps,
+        uniqueFrames,
+        duplicateFrames,
+        header.droppedFrames,
+        frameIdMin,
+        frameIdMax,
+        phasesSeen.size(),
+        dominantPeriodFrames,
+        dominantPeriodS,
+        dominantFreqHz,
         greenMin,
         greenAvg,
         greenMax,

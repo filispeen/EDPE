@@ -15,6 +15,25 @@
 
 namespace edpe {
 
+struct JitterViewRingSlot {
+    unsigned long long renderedFrameId = 0;
+    unsigned long long logFrameId = 0;
+    int64_t qpcTicks = 0;
+    float tMs = 0.0f;
+    float deltaMs = 0.0f;
+    float jx = 0.0f;
+    float jy = 0.0f;
+    unsigned phase = 0;
+    unsigned totalPhases = 0;
+    float camMove = 0.0f;
+    float camRot = 0.0f;
+    bool cameraValid = false;
+    bool heldJitter = false;
+    bool sceneCut = false;
+    bool reset = false;
+    bool inFlight = false;
+};
+
 class JitterViewRecorder {
 public:
     enum class State {
@@ -41,8 +60,10 @@ public:
 
     void onFrame(ID3D11DeviceContext* context,
                  ID3D11Texture2D* backbuffer,
+                 unsigned long long rendered,
                  UINT width, UINT height,
                  UINT renderWidth, UINT renderHeight,
+                 float jx, float jy,
                  bool isHdr, bool reset);
 
 private:
@@ -54,7 +75,7 @@ private:
     void releaseResources();
     void triggerBackgroundWrite(UINT renderWidth, UINT renderHeight,
                                 UINT outputWidth, UINT outputHeight,
-                                bool isHdr);
+                                bool isHdr, uint64_t droppedFrames);
     std::wstring getLogFilePath() const;
 
     mutable std::mutex mutex_;
@@ -69,9 +90,10 @@ private:
     uint32_t drainingFramesLeft_ = 0;
 
     static constexpr size_t kRingSize = 4;
-    uint32_t writeIndex_ = 0;
-    uint32_t readIndex_ = 0;
-    std::array<JitterViewFrameMeta, kRingSize> slotMeta_{};
+    std::array<JitterViewRingSlot, kRingSize> slots_{};
+    uint32_t writeSlot_ = 0;
+    uint32_t readSlot_ = 0;
+    uint64_t droppedFrames_ = 0;
 
     std::vector<JitterViewFrameData> recordedFrames_;
 

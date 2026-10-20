@@ -2837,8 +2837,8 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
 
     auto& recorder = edpe::JitterViewRecorder::instance();
     if (recorder.isActive()) {
-        recorder.onFrame(context, backbuffer, bbDesc.Width, bbDesc.Height,
-            renderW, renderH, isHdr, reset);
+        recorder.onFrame(context, backbuffer, rendered, bbDesc.Width, bbDesc.Height,
+            renderW, renderH, jx, jy, isHdr, reset);
     }
 }
 

@@ -93,34 +93,47 @@ int main() {
     header.upscalerBackend = "None";
     header.upscaleMode = "Native";
     header.isHdr = false;
+    header.droppedFrames = 0;
 
-    std::vector<edpe::JitterViewFrameData> frames(35);
-    for (size_t i = 0; i < frames.size(); ++i) {
-        frames[i].meta.frame = i;
-        frames[i].meta.timeMs = static_cast<float>(i * 16.666);
-        frames[i].meta.deltaMs = 16.666f;
-        frames[i].meta.phase = static_cast<unsigned>(i % 8);
-        frames[i].meta.totalPhases = 8;
-        frames[i].meta.cameraValid = true;
-        if (i % 2 == 0) {
-            frames[i].tiles[targetIdx] = greenCount;
-        }
+    std::vector<edpe::JitterViewFrameData> frames200(200);
+    float prevT = -1.0f;
+    for (size_t i = 0; i < frames200.size(); ++i) {
+        frames200[i].meta.frame = 1000 + i;
+        frames200[i].meta.renderedFrameId = 1000 + i;
+        frames200[i].meta.timeMs = static_cast<float>(i * 16.666);
+        frames200[i].meta.deltaMs = (i > 0) ? 16.666f : 0.0f;
+        frames200[i].meta.phase = static_cast<unsigned>(i % 32);
+        frames200[i].meta.totalPhases = 32;
+        frames200[i].meta.cameraValid = true;
+
+        if (frames200[i].meta.timeMs <= prevT) return 23;
+        prevT = frames200[i].meta.timeMs;
+
+        const double wave = (std::sin(2.0 * 3.14159265358979323846 * static_cast<double>(i) / 50.0) + 1.0) * 0.5;
+        const double frac = 0.01 + 0.05 * wave;
+        frames200[i].tiles[targetIdx] = static_cast<uint32_t>(tilePix * frac);
     }
 
-    const std::string report = edpe::generateJitterViewReport(header, frames);
-    if (report.find("# edpe_version: v0.4.6") == std::string::npos) return 23;
-    if (report.find("# grid: 64x36") == std::string::npos) return 24;
-    if (report.find("# green_rule: g - max(r, b) > 0.04") == std::string::npos) return 25;
-    if (report.find("# frame, t_ms, delta_ms, phase, phases, jx, jy") == std::string::npos) return 26;
-    if (report.find("# MAP frame=0\n") == std::string::npos) return 27;
-    if (report.find("# MAP frame=30\n") == std::string::npos) return 28;
-    if (report.find("# PERSISTENCE MAP\n") == std::string::npos) return 29;
-    if (report.find("# FLICKER MAP\n") == std::string::npos) return 30;
-    if (report.find("# SUMMARY\n") == std::string::npos) return 31;
-    if (report.find("phase=0 avg_green_pct=") == std::string::npos) return 32;
-    if (report.find("# reset_frames: 0") == std::string::npos) return 33;
-    if (report.find("# scene_cut_frames: 0") == std::string::npos) return 34;
-    if (report.find("# held_jitter_frames: 0") == std::string::npos) return 35;
+    const std::string report = edpe::generateJitterViewReport(header, frames200);
+    if (report.find("# edpe_version: v0.4.6") == std::string::npos) return 24;
+    if (report.find("# grid: 64x36") == std::string::npos) return 25;
+    if (report.find("# green_rule: g - max(r, b) > 0.04") == std::string::npos) return 26;
+    if (report.find("# frame, rendered_frame_id, t_ms, delta_ms") == std::string::npos) return 27;
+    if (report.find("# MAP frame=1000\n") == std::string::npos) return 28;
+    if (report.find("# MAP frame=1030\n") == std::string::npos) return 29;
+    if (report.find("# PERSISTENCE MAP\n") == std::string::npos) return 30;
+    if (report.find("# FLICKER MAP\n") == std::string::npos) return 31;
+    if (report.find("# SPIKES\n") == std::string::npos) return 32;
+    if (report.find("# SECOND BUCKETS\n") == std::string::npos) return 33;
+    if (report.find("# SUMMARY\n") == std::string::npos) return 34;
+    if (report.find("# unique_frames: 200") == std::string::npos) return 35;
+    if (report.find("# duplicate_frames: 0") == std::string::npos) return 36;
+    if (report.find("# dominant_period_frames: 50") == std::string::npos) return 37;
+    if (report.find("# dominant_period_s:") == std::string::npos) return 38;
+    if (report.find("# dominant_freq_hz:") == std::string::npos) return 39;
+    if (report.find("# reset_frames: 0") == std::string::npos) return 40;
+    if (report.find("# scene_cut_frames: 0") == std::string::npos) return 41;
+    if (report.find("# held_jitter_frames: 0") == std::string::npos) return 42;
 
     return 0;
 }
