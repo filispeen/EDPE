@@ -1,0 +1,116 @@
+name: Experimental Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Publish Experimental
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Cache NVIDIA DLSS SDK
+        id: cache-dlss
+        uses: actions/cache@v4
+        with:
+          path: external/DLSS
+          key: dlss-sdk-${{ runner.os }}-v1
+          restore-keys: |
+            dlss-sdk-${{ runner.os }}-
+
+      - name: Clone NVIDIA DLSS SDK
+        if: steps.cache-dlss.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "external/DLSS/include/nvsdk_ngx.h")) {
+            Write-Host "Cloning official NVIDIA DLSS SDK (sparse)..."
+            git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+            Push-Location external/DLSS
+            git sparse-checkout set include lib/Windows_x86_64
+            Pop-Location
+            # Remove .git metadata to keep cache size minimal (~370MB vs ~1.4GB)
+            Remove-Item -Recurse -Force external/DLSS/.git
+          } else {
+            Write-Host "NVIDIA DLSS SDK found in cache."
+          }
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64
+
+      - name: Build EDPE (Release)
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+
+      - name: Run Tests
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+
+      - name: Prepare Experimental Package
+        id: package
+        shell: pwsh
+        run: |
+          $buildNum = "${{ github.run_number }}"
+          $tag = "experimental-build-$buildNum"
+          $pkgDir = "EDPE-package"
+          New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+
+          # Copy staged binaries
+          Copy-Item "build/stage/d3d11.dll" -Destination "$pkgDir/" -Force
+          Copy-Item "build/stage/dxgi.dll" -Destination "$pkgDir/" -Force
+          if (Test-Path "build/stage/nvngx_dlss.dll") {
+              Copy-Item "build/stage/nvngx_dlss.dll" -Destination "$pkgDir/" -Force
+          }
+
+          # Copy documentation and default configuration
+          Copy-Item "README.md" -Destination "$pkgDir/" -Force
+          if (Test-Path "edpe.ini") {
+              Copy-Item "edpe.ini" -Destination "$pkgDir/" -Force
+          }
+
+          $archiveName = "EDPE-$tag-windows-x64.zip"
+          Compress-Archive -Path "$pkgDir/*" -DestinationPath $archiveName -Force
+
+          # Generate SHA256 checksum
+          $sha256 = (Get-FileHash -Path $archiveName -Algorithm SHA256).Hash
+          "$sha256  $archiveName" | Set-Content -Path "$archiveName.sha256" -Encoding utf8
+
+          Write-Host "Created archive: $archiveName (SHA-256: $sha256)"
+
+          "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha256_name=$archiveName.sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EDPE-experimental-build-${{ github.run_number }}-windows-x64
+          path: |
+            ${{ steps.package.outputs.archive_name }}
+            ${{ steps.package.outputs.sha256_name }}
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: exp-build-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: EDPE Experimental Build #${{ github.run_number }}
+          files: |
+            ${{ steps.package.outputs.archive_name }}
+            ${{ steps.package.outputs.sha256_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: true
