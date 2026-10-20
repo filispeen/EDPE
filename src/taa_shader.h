@@ -123,7 +123,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     for (int y = -1; y <= 1; ++y) {
         [unroll]
         for (int x = -1; x <= 1; ++x) {
-            float2 sampleUv = centerUv + float2(x, y) * renderResolution.zw;
+            float2 sampleUv = uv + float2(x, y) * renderResolution.zw;
             float3 c = currentFrame.SampleLevel(pointSampler, sampleUv, 0).rgb;
             float3 cY = RGBToYCoCg(c);
 

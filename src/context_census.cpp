@@ -378,6 +378,47 @@ std::atomic<bool> draw_hook_active{false};
 std::atomic<bool> draw_indexed_instanced_hook_active{false};
 std::atomic<bool> draw_instanced_hook_active{false};
 std::atomic<ID3D11Buffer*> scene_map_target{nullptr}; // Weak; valid only for this bind interval.
+struct MappedBufferEntry {
+    ID3D11Resource* resource = nullptr;
+    void* mapped_ptr = nullptr;
+};
+static constexpr size_t kMaxTrackedMappedBuffers = 16;
+static MappedBufferEntry s_tracked_mapped_buffers[kMaxTrackedMappedBuffers]{};
+static std::mutex s_tracked_mapped_buffers_mutex;
+
+inline void trackMappedBuffer(ID3D11Resource* resource, void* ptr) {
+    if (!resource) return;
+    std::lock_guard lock(s_tracked_mapped_buffers_mutex);
+    for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
+        if (s_tracked_mapped_buffers[i].resource == resource || s_tracked_mapped_buffers[i].resource == nullptr) {
+            s_tracked_mapped_buffers[i].resource = resource;
+            s_tracked_mapped_buffers[i].mapped_ptr = ptr;
+            return;
+        }
+    }
+}
+
+inline void* popMappedBuffer(ID3D11Resource* resource) {
+    if (!resource) return nullptr;
+    std::lock_guard lock(s_tracked_mapped_buffers_mutex);
+    for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
+        if (s_tracked_mapped_buffers[i].resource == resource) {
+            void* ptr = s_tracked_mapped_buffers[i].mapped_ptr;
+            s_tracked_mapped_buffers[i].resource = nullptr;
+            s_tracked_mapped_buffers[i].mapped_ptr = nullptr;
+            return ptr;
+        }
+    }
+    return nullptr;
+}
+
+inline void clearTrackedMappedBuffers() {
+    std::lock_guard lock(s_tracked_mapped_buffers_mutex);
+    for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
+        s_tracked_mapped_buffers[i].resource = nullptr;
+        s_tracked_mapped_buffers[i].mapped_ptr = nullptr;
+    }
+}
 std::atomic<bool> map_hook_active{false};
 std::atomic<bool> unmap_hook_active{false};
 std::atomic<unsigned> scene_maps{0};
@@ -1036,7 +1077,8 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
     if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
         resource && map_hook_active.load(std::memory_order_acquire)) {
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
-        if (resource != target) {
+        bool is_scene_cb = (resource == target);
+        if (!is_scene_cb) {
             D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
             resource->GetType(&dimension);
             if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
@@ -1049,6 +1091,7 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
                         (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
                         scene_map_target.store(buffer, std::memory_order_release);
                         target = buffer;
+                        is_scene_cb = true;
                         if (!scene_maps_before_bind.load(std::memory_order_relaxed)) {
                             scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
                             EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
@@ -1058,7 +1101,8 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
                 }
             }
         }
-        if (resource == target) {
+        if (is_scene_cb) {
+            trackMappedBuffer(resource, mapped ? mapped->pData : nullptr);
             scene_maps.fetch_add(1, std::memory_order_relaxed);
             scene_mapped_data.store(mapped ? mapped->pData : nullptr, std::memory_order_release);
             if (draw_indexed_calls.load(std::memory_order_relaxed) ||
@@ -1075,11 +1119,14 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
     UINT subresource) {
     if (!s_in_edpe_present.load(std::memory_order_acquire) &&
         context == observed_context.load(std::memory_order_acquire) &&
-        resource == scene_map_target.load(std::memory_order_acquire) &&
+        resource &&
         unmap_hook_active.load(std::memory_order_acquire)) {
-        scene_unmaps.fetch_add(1, std::memory_order_relaxed);
-        void* mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
+        void* mapped_ptr = popMappedBuffer(resource);
+        if (!mapped_ptr && resource == scene_map_target.load(std::memory_order_acquire)) {
+            mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
+        }
         if (mapped_ptr) {
+            scene_unmaps.fetch_add(1, std::memory_order_relaxed);
             unsigned long long camera = 14695981039346656037ull;
             unsigned long long projection = camera;
             const auto* data = static_cast<const unsigned char*>(mapped_ptr);
@@ -1135,8 +1182,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             }
 
             // Phase 5: Projection jitter injection into words 1080..1095
-            // Inject jitter strictly into the authoritative main scene camera projection
-            if (is_main_camera && ContextCensusIsJitterActive()) {
+            // Inject jitter into all non-reflection scene/cockpit camera projections matching the display aspect ratio
+            const bool is_planar_reflection = aspect_ok && (cameraRotationDeterminant(parsed_camera) < 0.5f);
+            if ((is_main_camera || (aspect_ok && !is_planar_reflection)) && ContextCensusIsJitterActive()) {
                 float* words = static_cast<float*>(mapped_ptr);
                 bool valid_projection = true;
                 for (size_t i = 1080; i < 1096; ++i) {
@@ -3456,6 +3504,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         motion_color_first_exit_logged = false;
         s_latest_unmapped_camera_valid = false;
         s_jitter_injected_frame = ~0ull;
+        clearTrackedMappedBuffers();
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         UINT outW = 0, outH = 0;
@@ -3883,6 +3932,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     }
     scene_map_target.store(nullptr, std::memory_order_release);
     scene_mapped_data.store(nullptr, std::memory_order_release);
+    clearTrackedMappedBuffers();
     observed_context.exchange(nullptr, std::memory_order_acq_rel)->Release();
     patched_table = nullptr;
     observed_swap_chain = nullptr;
