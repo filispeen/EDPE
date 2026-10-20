@@ -134,6 +134,62 @@ int main() {
     if (report.find("# reset_frames: 0") == std::string::npos) return 40;
     if (report.find("# scene_cut_frames: 0") == std::string::npos) return 41;
     if (report.find("# held_jitter_frames: 0") == std::string::npos) return 42;
+    if (report.find("# luma_rule:") == std::string::npos) return 43;
+    if (report.find("luma_mean, in_fmt, scene_w, scene_h, mv_null, depth_null, hist_realloc, sens, thr, mode") == std::string::npos) return 44;
+    if (report.find("-1.000000, 0, 0, 0, 0, 0, 0, 0.00, 0.000, 0") == std::string::npos) return 45;
+    if (report.find("# mv_null_frames:") == std::string::npos) return 46;
+    if (report.find("# depth_null_frames:") == std::string::npos) return 47;
+    if (report.find("# hist_realloc_frames:") == std::string::npos) return 48;
+    if (report.find("# unique_in_fmt:") == std::string::npos) return 49;
+    if (report.find("# luma_min: -1.000000") == std::string::npos) return 50;
+    if (report.find("# luma_avg: -1.000000") == std::string::npos) return 51;
+    if (report.find("# luma_max: -1.000000") == std::string::npos) return 52;
+    if (report.find("# luma_dominant_period_frames: 0") == std::string::npos) return 53;
+    if (report.find("# luma_dominant_freq_hz: 0.00") == std::string::npos) return 54;
+    if (report.find("# pearson_green_vs_luma: 0.0000") == std::string::npos) return 55;
+    if (report.find("# pearson_green_vs_abs_dluma: 0.0000") == std::string::npos) return 56;
+
+    std::vector<double> px = { 1.0, 2.0, 3.0, 4.0, 5.0 };
+    std::vector<double> py = { 2.0, 4.0, 6.0, 8.0, 10.0 };
+    if (std::abs(edpe::pearson(px, py) - 1.0) > 1e-4) return 57;
+
+    std::vector<double> pny = { 10.0, 8.0, 6.0, 4.0, 2.0 };
+    if (std::abs(edpe::pearson(px, pny) - (-1.0)) > 1e-4) return 58;
+
+    std::vector<double> pconst = { 3.0, 3.0, 3.0, 3.0, 3.0 };
+    if (edpe::pearson(px, pconst) != 0.0) return 59;
+    if (edpe::pearson(pconst, py) != 0.0) return 60;
+
+    std::vector<double> pempty;
+    std::vector<double> pone = { 1.0 };
+    if (edpe::pearson(pempty, pempty) != 0.0) return 61;
+    if (edpe::pearson(pone, pone) != 0.0) return 62;
+
+    std::vector<edpe::JitterViewFrameData> framesLuma(100);
+    for (size_t i = 0; i < framesLuma.size(); ++i) {
+        framesLuma[i].meta.frame = 2000 + i;
+        framesLuma[i].meta.renderedFrameId = 2000 + i;
+        framesLuma[i].meta.timeMs = static_cast<float>(i * 16.666);
+        framesLuma[i].meta.deltaMs = (i > 0) ? 16.666f : 0.0f;
+        framesLuma[i].meta.lumaMean = 0.2 + 0.1 * std::sin(2.0 * 3.14159265358979323846 * static_cast<double>(i) / 20.0);
+        framesLuma[i].meta.inputFormat = 26;
+        framesLuma[i].meta.sceneW = 1920;
+        framesLuma[i].meta.sceneH = 1080;
+        framesLuma[i].meta.sensitivity = 1.5f;
+        framesLuma[i].meta.threshold = 0.02f;
+        framesLuma[i].meta.mode = 1;
+        framesLuma[i].meta.motionNull = (i % 10 == 0);
+        framesLuma[i].meta.depthNull = false;
+        framesLuma[i].meta.historyRecreated = (i == 0);
+        framesLuma[i].tiles[targetIdx] = static_cast<uint32_t>(tilePix * (0.01 + 0.05 * std::abs(framesLuma[i].meta.lumaMean)));
+    }
+
+    const std::string repLuma = edpe::generateJitterViewReport(header, framesLuma);
+    if (repLuma.find("26 (R11G11B10_FLOAT)") == std::string::npos) return 63;
+    if (repLuma.find("# hist_realloc_frames: 1") == std::string::npos) return 64;
+    if (repLuma.find("# mv_null_frames: 10") == std::string::npos) return 65;
+    if (repLuma.find("# luma_dominant_period_frames: 20") == std::string::npos) return 66;
+    if (repLuma.find(", 26, 1920, 1080, 0, 0, 0, 1.50, 0.020, 1") == std::string::npos) return 67;
 
     return 0;
 }
