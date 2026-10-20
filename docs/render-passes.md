@@ -234,3 +234,17 @@ edpe::PerfTracker::instance().onPresentEnd();
 | **Native UI Composition** | Present (`tryTemporalUpscale`) | EDPE Pass | Upscaled SRV, Backbuffer SRV, Low-res SRV | Backbuffer RTV | `kUiCompositeShader` (`vs_main`, `ps_main`) | [`UiCompositePass::composite`](file:///F:/Code/%D0%A1++/EDPE/src/ui_composite_pass.cpp#L77) |
 | **Subpixel Jitter Debug View** | Present (`renderJitterDebugView`) | EDPE Pass | Backbuffer copy, History SRV, Motion SRV | Backbuffer RTV | `kJitterDebugShader` (`vs_main`, `ps_main`) | [`JitterDebugPass::render`](file:///F:/Code/%D0%A1++/EDPE/src/jitter_debug_pass.cpp#L157) |
 | **Dear ImGui & Perf Overlay** | Present (`UiOnPresent`) | EDPE Pass | ImGui draw lists, font atlas | Backbuffer RTV | ImGui DX11 vertex/pixel shaders | [`UiOnPresent`](file:///F:/Code/%D0%A1++/EDPE/src/ui.cpp#L971), [`ImGui_ImplDX11_RenderDrawData`](file:///F:/Code/%D0%A1++/EDPE/src/ui.cpp#L1637) |
+
+---
+
+## 5. Empirical RenderDoc Frame Census: Menu vs Gameplay
+
+For the comprehensive draw-by-draw and pass-by-pass census derived from RenderDoc runtime captures (`menu.rdc` and `gameplay.rdc`), see [docs/renderdoc-pipeline-analysis.md](file:///f:/Code/С++/EDPE/docs/renderdoc-pipeline-analysis.md).
+
+### Key Takeaways:
+1. **Total Passes**: Main Menu executes **49 passes** (5,935 API calls); active Gameplay executes **55 passes** (9,412 API calls).
+2. **Cascaded Directional Shadows (Gameplay Pass 06)**: 3 cascades on a single `3072×1024 D16_UNORM` texture with **386 draws**; absent in the menu.
+3. **Cockpit Radar Sub-Renders (Gameplay Passes 25–26)**: Two isolated `512×512` passes with auxiliary cameras; confirmed immune from main projection jitter via [`isReflectionOrAuxiliaryCamera`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L179).
+4. **Cockpit Holographic HUD (Gameplay Pass 35)**: **32 draws** directly into `Tex#6888` (`R11G11B10_FLOAT`) prior to Bloom downsampling.
+5. **Reactive Mask Architecture**: G-Buffer `RTV3` (Pass 10 exit) + Cockpit HUD (Pass 35) provide the complete data needed for `TemporalFrameInputs::reactiveMask`.
+
