@@ -553,7 +553,7 @@ int wmain(int argc, wchar_t** argv) {
     const HANDLE log = CreateFileW(argv[3], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (log == INVALID_HANDLE_VALUE) return 11;
-    char contents[32768]{};
+    char contents[65536]{};
     DWORD bytes_read = 0;
     const BOOL read = ReadFile(log, contents, sizeof(contents) - 1, &bytes_read, nullptr);
     CloseHandle(log);

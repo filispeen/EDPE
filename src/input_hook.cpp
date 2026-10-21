@@ -1,4 +1,5 @@
 #include "input_hook.h"
+#include "config.h"
 #include "log.h"
 #include "ui.h"
 
@@ -245,6 +246,8 @@ HRESULT WINAPI Hooked_DirectInput8Create(HINSTANCE hinst, DWORD dwVersion, REFII
 namespace edpe {
 
 void installInputHooks() {
+    if (!isRunningInEliteProcess()) return;
+
     static std::atomic<bool> s_installed{false};
     if (s_installed.exchange(true)) return;
 

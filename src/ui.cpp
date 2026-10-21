@@ -995,7 +995,9 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     if (context1) context1->Release();
     if (device1) device1->Release();
     edpe::UpscalerManager::instance().initialize(ui.device, ui.context);
-    edpe::installInputHooks();
+    if (edpe::isRunningInEliteProcess()) {
+        edpe::installInputHooks();
+    }
     {
         auto& cfg = edpe::Config::instance();
         cfg.load();
