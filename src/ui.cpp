@@ -6,7 +6,6 @@
 #include "capture_format.h"
 #include "config.h"
 #include "perf_overlay.h"
-#include "input_hook.h"
 #include "jitter_logger.h"
 #include "jitter_view_recorder.h"
 
@@ -138,9 +137,14 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         menu_visible.store(new_visible);
         if (new_visible) {
             ClipCursor(nullptr);
-            while (ShowCursor(TRUE) < 0) {}
+            ReleaseCapture();
+            if (ui.original_wndproc) {
+                CallWindowProcW(ui.original_wndproc, window, WM_KILLFOCUS, 0, 0);
+            }
         } else {
-            while (ShowCursor(FALSE) >= 0) {}
+            if (ui.original_wndproc) {
+                CallWindowProcW(ui.original_wndproc, window, WM_SETFOCUS, 0, 0);
+            }
         }
         return true;
     }
@@ -995,9 +999,6 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     if (context1) context1->Release();
     if (device1) device1->Release();
     edpe::UpscalerManager::instance().initialize(ui.device, ui.context);
-    if (edpe::isRunningInEliteProcess()) {
-        edpe::installInputHooks();
-    }
     {
         auto& cfg = edpe::Config::instance();
         cfg.load();
@@ -1829,7 +1830,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     } // if (draw_menu)
     if (draw_menu && !window_open) {
         menu_visible.store(false);
-        while (ShowCursor(FALSE) >= 0) {}
+        if (ui.original_wndproc && ui.window) {
+            CallWindowProcW(ui.original_wndproc, ui.window, WM_SETFOCUS, 0, 0);
+        }
     }
     ImGui::Render();
 
