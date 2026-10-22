@@ -6,6 +6,7 @@
 #include "capture_format.h"
 #include "config.h"
 #include "perf_overlay.h"
+#include "input_hook.h"
 #include "jitter_logger.h"
 #include "jitter_view_recorder.h"
 
@@ -138,12 +139,14 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         if (new_visible) {
             ClipCursor(nullptr);
             ReleaseCapture();
-            if (ui.original_wndproc) {
-                CallWindowProcW(ui.original_wndproc, window, WM_KILLFOCUS, 0, 0);
-            }
         } else {
-            if (ui.original_wndproc) {
-                CallWindowProcW(ui.original_wndproc, window, WM_SETFOCUS, 0, 0);
+            if (ui.imgui) {
+                ImGuiContext* prev = ImGui::GetCurrentContext();
+                ImGui::SetCurrentContext(ui.imgui);
+                ImGuiIO& io = ImGui::GetIO();
+                io.ClearInputKeys();
+                io.ClearInputMouse();
+                if (prev) ImGui::SetCurrentContext(prev);
             }
         }
         return true;
@@ -205,6 +208,10 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         if (message == WM_MOUSEACTIVATE) {
             return true;
         }
+        if (message == WM_CHAR || message == WM_SYSCHAR ||
+            message == WM_DEADCHAR || message == WM_SYSDEADCHAR) {
+            return true;
+        }
         if (isInputMessage(message)) {
             std::lock_guard lock(input_mutex);
             const InputMessage input{window, message, wparam, lparam};
@@ -226,6 +233,9 @@ LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     if (UiProcessInput(window, message, wparam, lparam)) {
         if (message == WM_SETCURSOR) return TRUE;
         if (message == WM_MOUSEACTIVATE) return MA_ACTIVATE;
+        if (message == WM_INPUT) {
+            return DefWindowProcW(window, message, wparam, lparam);
+        }
         return 0;
     }
     return ui.original_wndproc ? CallWindowProcW(ui.original_wndproc, window, message, wparam, lparam)
@@ -999,6 +1009,9 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     if (context1) context1->Release();
     if (device1) device1->Release();
     edpe::UpscalerManager::instance().initialize(ui.device, ui.context);
+    if (edpe::isRunningInEliteProcess()) {
+        edpe::installInputHooks();
+    }
     {
         auto& cfg = edpe::Config::instance();
         cfg.load();
@@ -1830,9 +1843,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     } // if (draw_menu)
     if (draw_menu && !window_open) {
         menu_visible.store(false);
-        if (ui.original_wndproc && ui.window) {
-            CallWindowProcW(ui.original_wndproc, ui.window, WM_SETFOCUS, 0, 0);
-        }
+        io.ClearInputKeys();
+        io.ClearInputMouse();
     }
     ImGui::Render();
 

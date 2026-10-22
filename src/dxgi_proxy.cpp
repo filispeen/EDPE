@@ -1,6 +1,7 @@
 #include "config.h"
 #include "log.h"
 #include "system_dll.h"
+#include "input_hook.h"
 
 #include <dxgi1_3.h>
 #include <windows.h>
@@ -12,6 +13,9 @@ void syncConfigOnce() {
     static bool s_synced = false;
     if (s_synced) return;
     s_synced = true;
+    if (edpe::isRunningInEliteProcess()) {
+        edpe::installInputHooks();
+    }
     auto& cfg = edpe::Config::instance();
     cfg.load();
     if (cfg.syncEliteGraphicsConfig()) {
