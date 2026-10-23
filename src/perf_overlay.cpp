@@ -3,11 +3,13 @@
 #include "context_census.h"
 #include "ngx_context.h"
 #include "config.h"
+#include "profiler.h"
 #include "log.h"
 
 #include <imgui.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <windows.h>
@@ -25,6 +27,13 @@ PerfTracker::PerfTracker() {
 }
 
 PerfTracker::~PerfTracker() {
+    if (nvmlRunning_.load(std::memory_order_relaxed)) {
+        nvmlRunning_.store(false, std::memory_order_relaxed);
+        nvmlCv_.notify_all();
+        if (nvmlWorkerThread_.joinable()) {
+            nvmlWorkerThread_.join();
+        }
+    }
     if (nvmlModule_) {
         auto nvmlShutdown = reinterpret_cast<NvmlShutdown_t>(GetProcAddress(nvmlModule_, "nvmlShutdown"));
         if (nvmlShutdown) {
@@ -47,6 +56,22 @@ void PerfTracker::initNvml() {
     if (nvmlInit && nvmlGetHandle && nvmlGetUtil_ && nvmlInit() == 0) {
         if (nvmlGetHandle(0, &nvmlDevice_) == 0) {
             nvmlAvailable_ = true;
+            nvmlRunning_.store(true, std::memory_order_relaxed);
+            nvmlWorkerThread_ = std::thread([this]() {
+                while (nvmlRunning_.load(std::memory_order_relaxed)) {
+                    {
+                        ScopedProfileTimer timer(ProfileZone::NvmlPoll);
+                        NvmlUtil_t util{};
+                        if (nvmlGetUtil_ && nvmlDevice_ && nvmlGetUtil_(nvmlDevice_, &util) == 0) {
+                            cachedGpuUsage_.store(util.gpu, std::memory_order_relaxed);
+                        }
+                    }
+                    std::unique_lock<std::mutex> lock(nvmlMutex_);
+                    nvmlCv_.wait_for(lock, std::chrono::milliseconds(500), [this]() {
+                        return !nvmlRunning_.load(std::memory_order_relaxed);
+                    });
+                }
+            });
             EdpeLog(L"EDPE: NVML hardware telemetry initialized successfully");
         }
     }
@@ -154,13 +179,9 @@ void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
     }
 
     // 3. GPU Utilization Percentage (%)
-    if (nvmlAvailable_ && nvmlDevice_ && nvmlGetUtil_) {
-        NvmlUtil_t util{};
-        if (nvmlGetUtil_(nvmlDevice_, &util) == 0) {
-            telemetry_.gpuUsagePct = util.gpu;
-        }
+    if (nvmlAvailable_ && nvmlDevice_) {
+        telemetry_.gpuUsagePct = cachedGpuUsage_.load(std::memory_order_relaxed);
     } else {
-        // Fallback: estimate load from frametime vs 60/120 Hz interval or clamp
         telemetry_.gpuUsagePct = (std::min)(100u, static_cast<uint32_t>((telemetry_.totalFrametimeMs / 16.67f) * 60.0f));
     }
 }
@@ -326,6 +347,16 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
         } else if (telemetry_.vramUsedBytes > 0) {
             const double usedMb = static_cast<double>(telemetry_.vramUsedBytes) / (1024.0 * 1024.0);
             ImGui::Text("VRAM Usage:         %.1f MB", usedMb);
+        }
+
+        if (cfg.enableProfiler) {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Profiler (120f avg):");
+            ImGui::Text("  Map/Unmap (CB/Jitter): %.3f ms", Profiler::instance().getAvgMs(ProfileZone::MapUnmap));
+            ImGui::Text("  OMSet / DSV Census:    %.3f ms", Profiler::instance().getAvgMs(ProfileZone::OMSetRenderTargets));
+            ImGui::Text("  HUD Draw Probe:        %.3f ms", Profiler::instance().getAvgMs(ProfileZone::DrawProbe));
+            ImGui::Text("  Upscale Prep & Eval:   %.3f ms", Profiler::instance().getAvgMs(ProfileZone::TemporalUpscale));
+            ImGui::Text("  NVML Telemetry (bg):   %.3f ms", Profiler::instance().getAvgMs(ProfileZone::NvmlPoll));
         }
     }
     ImGui::End();

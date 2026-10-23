@@ -4,6 +4,10 @@
 #include <dxgi1_4.h>
 #include <string>
 #include <cstdint>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 namespace edpe {
 
@@ -72,6 +76,11 @@ private:
 
     // Telemetry rate limiting
     LARGE_INTEGER lastTelemetryUpdate_{};
+    std::thread nvmlWorkerThread_;
+    std::atomic<bool> nvmlRunning_{false};
+    std::atomic<uint32_t> cachedGpuUsage_{0};
+    std::condition_variable nvmlCv_;
+    std::mutex nvmlMutex_;
 };
 
 } // namespace edpe

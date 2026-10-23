@@ -15,6 +15,7 @@
 #include "jitter_debug_pass.h"
 #include "jitter_view_recorder.h"
 #include "reactive_mask_pass.h"
+#include "profiler.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -669,6 +670,7 @@ void probeWorldShaderFanout(ID3D11DeviceContext* context,
 bool observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
         !motion_color_source || !motion_color_bound) return false;
+    edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::DrawProbe);
     ++hud_target_draws;
     ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
@@ -1107,8 +1109,9 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
     if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
         resource && map_hook_active.load(std::memory_order_acquire)) {
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
+        edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
         bool is_scene_cb = (resource == target);
-        if (!is_scene_cb) {
+        if (!is_scene_cb && !target) {
             D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
             resource->GetType(&dimension);
             if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
@@ -1151,6 +1154,12 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
         context == observed_context.load(std::memory_order_acquire) &&
         resource &&
         unmap_hook_active.load(std::memory_order_acquire)) {
+        ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
+        if (target && resource != target) {
+            original_unmap.load(std::memory_order_acquire)(context, resource, subresource);
+            return;
+        }
+        edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
         void* mapped_ptr = popMappedBuffer(resource);
         if (!mapped_ptr && resource == scene_map_target.load(std::memory_order_acquire)) {
             mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
@@ -1245,7 +1254,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         s_last_rendered_jitter = jitter;
                         s_jitter_injected_frame = cur_frame;
                         const unsigned count = jittered_writes_count.fetch_add(1, std::memory_order_relaxed) + 1;
-                        if (count == 1) {
+                        if (count == 1 || s_jitter_debug_view.load(std::memory_order_relaxed)) {
                             edpe::NdcOffset verified_offset{};
                             edpe::estimateEliteBlockNdcOffset(&words[1080], &verified_offset);
                             wchar_t msg[256];
@@ -2377,6 +2386,7 @@ static unsigned long long s_last_temporal_inputs_frame = ~0ull;
 // `rendered` is the last_present_frame value seen while this frame rendered.
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered,
     ID3D11Texture2D* backbuffer) {
+    edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::TemporalUpscale);
     const auto frame = rendered;
     auto& upscaler = edpe::UpscalerManager::instance();
     const bool upscale_active = upscaler.isReconstructionActive();
@@ -3159,6 +3169,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
     forward(context, count, targets, dsv);
     if (context != observed_context.load(std::memory_order_acquire)) return;
+    edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::OMSetRenderTargets);
     copyCameraDeltaSource(context);
     rearmHudDrawProbe();
     const bool reconstruction_active =
@@ -3307,7 +3318,20 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 motion_color_source = targets[3];
                 motion_color_frame = current_frame;
                 motion_color_bound = true;
-                if (!hud_draw_hook_mask) {
+                ID3D11Resource* hdrRes = nullptr;
+                targets[3]->GetResource(&hdrRes);
+                if (hdrRes) {
+                    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+                    if (SUCCEEDED(hdrRes->QueryInterface(__uuidof(ID3D11Texture2D),
+                            reinterpret_cast<void**>(tex.GetAddressOf())))) {
+                        scene_hdr_color_source = tex;
+                        scene_hdr_color_frame = current_frame;
+                    }
+                    hdrRes->Release();
+                }
+                static bool s_hud_probe_armed_once = false;
+                if (!s_hud_probe_armed_once && !hud_draw_hook_mask) {
+                    s_hud_probe_armed_once = true;
                     beginHudDrawProbe();
                 }
             }
@@ -3320,6 +3344,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             s_inside_main_scene.store(false, std::memory_order_release);
         }
     }
+
 
     size_t index = 0;
     bool first_bind = false;
@@ -3833,6 +3858,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             busiest[2], binds[2], busiest[3], binds[3]);
         EdpeLog(message);
     }
+    edpe::Profiler::instance().onFrameEnd();
 }
 
 void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
