@@ -188,5 +188,39 @@ int main() {
         if (!edpe::parseEliteCamera(scene.data(), scene.size(), &jittered_cam)) return 27;
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 6: Linear depth camera motion equivalence and validation
+    // -------------------------------------------------------------------------
+    // Given rawDepth = 0.0025f and depthB = 0.025f, linearZ = depthB / rawDepth = 10.0f.
+    const float raw_d = 0.0025f;
+    const float lin_z = 0.025f / raw_d; // 10.0m
+    float dx_raw = 0, dy_raw = 0;
+    float dx_lin = 0, dy_lin = 0;
+
+    auto cam_a = previous;
+    auto cam_b = previous;
+    cam_b.worldFromView[3] = 1.0f; // translation X
+    cam_b.worldFromView[7] = 2.0f; // translation Y
+    cam_b.worldFromView[11] = -0.5f; // translation Z
+
+    if (!edpe::cameraDepthMotion(cam_b, cam_a, 100, 100, 49.5f, 49.5f, raw_d, &dx_raw, &dy_raw)) return 28;
+    if (!edpe::cameraLinearDepthMotion(cam_b, cam_a, 100, 100, 49.5f, 49.5f, lin_z, &dx_lin, &dy_lin)) return 29;
+    if (std::fabs(dx_raw - dx_lin) > 1e-5f || std::fabs(dy_raw - dy_lin) > 1e-5f) return 30;
+
+    // Rotation test
+    cam_b = cam_a;
+    cam_b.worldFromView[0] = cam_b.worldFromView[10] = std::cos(0.05f);
+    cam_b.worldFromView[2] = std::sin(0.05f);
+    cam_b.worldFromView[8] = -std::sin(0.05f);
+    if (!edpe::cameraDepthMotion(cam_b, cam_a, 100, 100, 25.0f, 75.0f, raw_d, &dx_raw, &dy_raw)) return 31;
+    if (!edpe::cameraLinearDepthMotion(cam_b, cam_a, 100, 100, 25.0f, 75.0f, lin_z, &dx_lin, &dy_lin)) return 32;
+    if (std::fabs(dx_raw - dx_lin) > 1e-5f || std::fabs(dy_raw - dy_lin) > 1e-5f) return 33;
+
+    // Fail-open validation for cameraLinearDepthMotion
+    if (edpe::cameraLinearDepthMotion(cam_b, cam_a, 100, 100, 49.5f, 49.5f, 0.0f, &dx_lin, &dy_lin)) return 34;
+    if (edpe::cameraLinearDepthMotion(cam_b, cam_a, 100, 100, 49.5f, 49.5f, -5.0f, &dx_lin, &dy_lin)) return 35;
+    if (edpe::cameraLinearDepthMotion(cam_b, cam_a, 0, 100, 49.5f, 49.5f, lin_z, &dx_lin, &dy_lin)) return 36;
+    if (edpe::cameraLinearDepthMotion(cam_b, cam_a, 100, 100, 49.5f, 49.5f, std::numeric_limits<float>::quiet_NaN(), &dx_lin, &dy_lin)) return 37;
+
     return 0; // All temporal math tests passed
 }

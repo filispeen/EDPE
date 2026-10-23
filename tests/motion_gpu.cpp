@@ -235,6 +235,46 @@ int main() {
     const float turned_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
     const float turned_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
     context->Unmap(readback.Get(), 0);
-    return std::fabs(turned_x - expected_x) < .01f &&
-        std::fabs(turned_y - expected_y) < .01f ? 0 : 33;
+    if (std::fabs(turned_x - expected_x) >= .01f ||
+        std::fabs(turned_y - expected_y) >= .01f) return 33;
+
+    // Test linear depth R32_FLOAT motion generation
+    previous = {{-.965338f,-.0708149f,-.251214f,19.5594f,
+                 -.00114341f,.963628f,-.267244f,-39.2084f,
+                 .261002f,-.257694f,-.930307f,-99.7282f},
+                .974278629f,1.73205078f,.0250000004f};
+    now = previous;
+    now.worldFromView[3] += 2.5f;
+    now.worldFromView[7] -= 1.25f;
+    if (!edpe::cameraLinearDepthMotion(now, previous, 4, 4, 1, 1, 10.0f,
+            &expected_x, &expected_y)) return 34;
+
+    D3D11_TEXTURE2D_DESC lin_desc{};
+    lin_desc.Width = lin_desc.Height = 4;
+    lin_desc.MipLevels = lin_desc.ArraySize = 1;
+    lin_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    lin_desc.SampleDesc.Count = 1;
+    lin_desc.Usage = D3D11_USAGE_DEFAULT;
+    lin_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    std::array<float, 16> lin_depths{};
+    lin_depths.fill(10.0f); // 10.0m corresponding to raw depth 0.0025f with depthB 0.025f
+    lin_depths[0] = 0.0f; // invalid/skybox
+    D3D11_SUBRESOURCE_DATA lin_initial{lin_depths.data(), 4 * sizeof(float), 0};
+    ComPtr<ID3D11Texture2D> lin_depth_tex;
+    ComPtr<ID3D11ShaderResourceView> lin_depth_srv;
+    if (FAILED(device->CreateTexture2D(&lin_desc, &lin_initial, &lin_depth_tex)) ||
+        FAILED(device->CreateShaderResourceView(lin_depth_tex.Get(), nullptr, &lin_depth_srv))) return 35;
+
+    if (!pass.render(lin_depth_srv.Get(), now, previous, 4, 4, true /* isLinearDepth */)) return 36;
+    context->CopyResource(readback.Get(), output.Get());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 37;
+    valid = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch + 4);
+    const float lin_actual_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
+    const float lin_actual_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(lin_actual_x - expected_x) >= .01f ||
+        std::fabs(lin_actual_y - expected_y) >= .01f) return 38;
+
+    return 0;
 }

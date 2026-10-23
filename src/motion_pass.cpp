@@ -46,7 +46,7 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
 }
 
 bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection& now,
-    const CameraProjection& previous, UINT width, UINT height) {
+    const CameraProjection& previous, UINT width, UINT height, bool isLinearDepth) {
     if (!device_ || !depth || !width || !height ||
         !(now.scaleX > 0 && now.scaleY > 0 && now.depthB > 0 &&
           previous.scaleX > 0 && previous.scaleY > 0) ||
@@ -67,6 +67,7 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     values[28] = now.depthB;
     values[29] = static_cast<float>(width);
     values[30] = static_cast<float>(height);
+    values[31] = isLinearDepth ? 1.0f : 0.0f;
     return renderInternal(depth, values, nullptr, nullptr, width, height);
 }
 
@@ -94,8 +95,9 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     if (!device_ || !depth || !width || !height) return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     depth->GetDesc(&srv_desc);
-    if (srv_desc.Format != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
-        srv_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) return false;
+    const bool srv_ok = (srv_desc.Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
+                         srv_desc.Format == DXGI_FORMAT_R32_FLOAT);
+    if (!srv_ok || srv_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) return false;
     Microsoft::WRL::ComPtr<ID3D11Resource> resource;
     depth->GetResource(&resource);
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
@@ -107,8 +109,11 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     texture->GetDesc(&depth_desc);
     if (depth_desc.Width != width || depth_desc.Height != height ||
         depth_desc.SampleDesc.Count != 1 || depth_desc.MipLevels != 1 ||
-        depth_desc.ArraySize != 1 ||
-        depth_desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS) return false;
+        depth_desc.ArraySize != 1) return false;
+    const bool tex_ok = (depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+                         depth_desc.Format == DXGI_FORMAT_R32_TYPELESS ||
+                         depth_desc.Format == DXGI_FORMAT_R32_FLOAT);
+    if (!tex_ok) return false;
     ID3D11DepthStencilView* bound_dsv = nullptr;
     context_->OMGetRenderTargets(0, nullptr, &bound_dsv);
     if (bound_dsv) { bound_dsv->Release(); return false; }

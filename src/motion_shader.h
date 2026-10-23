@@ -3,13 +3,14 @@
 namespace edpe {
 
 // Experimental current-to-previous motion in render pixels, +Y downward.
-// Camera rows match CameraProjection; depth is reversed Z: depthB / viewZ.
+// Camera rows match CameraProjection; depth can be linear view Z or reversed Z (depthB / viewZ).
+// Dynamic objects are treated as static with camera reprojection (noting the ghosting risk).
 inline constexpr char kMotionShader[] = R"(
 cbuffer Camera : register(b0) {
     float4 now0, now1, now2;
     float4 prev0, prev1, prev2;
     float4 scales; // current X/Y, previous X/Y
-    float4 info;   // depthB, width, height, unused
+    float4 info;   // depthB, width, height, isLinearDepth (1.0 = linear depth, 0.0 = raw reversed-Z)
 };
 Texture2D<float> sceneDepth : register(t0);
 cbuffer EliteNow : register(b1) { float4 currentWords[336]; };
@@ -24,16 +25,22 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
     float4 current2, float4 prior0, float4 prior1, float4 prior2,
     float4 projection, float depthB, bool clampCockpit) {
     if (info.y <= 0 || info.z <= 0 || projection.x <= 0 || projection.y <= 0) return 0;
-    float depth = sceneDepth.Load(int3(int2(pixel.xy), 0));
+    float depthVal = sceneDepth.Load(int3(int2(pixel.xy), 0));
+    bool isLinear = (info.w > 0.5);
 
     // 1. Skybox, distant stars, nebula, celestial background, and star bloom:
-    // When depth <= 0.0 or depth > 1.0 (reversed-Z clear/invalid) or at extreme
-    // astronomical distance (z >= 50,000m, rawDepth < depthB / 50000.0),
-    // translation is negligible (T / infinity = 0). Pure analytical ray rotation
+    // When depth is at celestial distance (z >= 50,000m):
+    // In linear depth: values >= 50000m or invalid/negative represent celestial background.
+    // In raw reversed-Z depth: values <= 0 or < depthB / 50000m represent celestial background.
+    // Translation is negligible (T / infinity = 0). Pure analytical ray rotation
     // prevents star erasure, eliminates float32 precision loss, and perfectly matches
     // star glow/bloom with the star body.
     float celestialDepthThresh = (depthB > 0.0) ? (depthB / 50000.0) : 1e-6;
-    if (depth <= 0.0 || depth > 1.0 || depth < celestialDepthThresh) {
+    bool isCelestial = isLinear ?
+        (depthVal <= 0.0 || depthVal >= 50000.0 || isnan(depthVal) || isinf(depthVal)) :
+        (depthVal <= 0.0 || depthVal > 1.0 || depthVal < celestialDepthThresh);
+
+    if (isCelestial) {
         float2 ndc = float2(2.0 * pixel.x / info.y - 1.0, 1.0 - 2.0 * pixel.y / info.z);
         float3 viewRay = float3(ndc.x / projection.x, ndc.y / projection.y, 1.0);
         float3 worldRay = float3(dot(current0.xyz, viewRay),
@@ -50,13 +57,17 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
     }
 
     // 2. Cockpit interior (pilot dashboard, controls, instruments, cockpit lights):
+    // In linear depth: depthVal is already view-space Z in meters.
+    // In raw reversed-Z depth: z = depthB / depthVal.
     // In Elite Dangerous, the cockpit interior (z < 3.5m) is rigidly attached to the ship camera.
     // Its screen-space motion relative to the camera is zero!
-    float z = depthB / depth;
+    float z = isLinear ? depthVal : (depthB / depthVal);
     if (clampCockpit && z < 3.5) return 0.0;
 
     // 3. Dynamic world geometry (space stations, ships, asteroids, terrain):
     // Standard camera-depth reprojection including both camera translation and rotation.
+    // NOTE: Dynamic objects (e.g. moving ships) are treated as static geometry, carrying
+    // a slight ghosting risk since Cobra D3D11 does not output a velocity buffer.
     float2 ndc = float2(2.0 * pixel.x / info.y - 1.0, 1.0 - 2.0 * pixel.y / info.z);
     float3 view = float3(ndc.x * z / projection.x, ndc.y * z / projection.y, z);
     float3 world = float3(dot(current0.xyz, view) + current0.w,
