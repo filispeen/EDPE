@@ -1777,8 +1777,8 @@ void takeCameraDeltaSource(ID3D11DeviceContext* context, unsigned long long fram
 
 // Called when the scene-MRT interval ends: queue a 5376-byte GPU copy.
 void copyCameraDeltaSource(ID3D11DeviceContext* context) {
-    edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::CameraDeltaCopy);
     if (!camera_delta_source) return;
+    edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::CameraDeltaCopy);
     const auto source = std::move(camera_delta_source);
     if (camera_delta_count == kCameraDeltaRing) {
         ++camera_delta_dropped;
@@ -3579,12 +3579,17 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         static unsigned s_watchdog_last_jitter_writes = 0;
         static unsigned s_watchdog_no_jitter_frames = 0;
         const unsigned cur_writes = jittered_writes_count.load(std::memory_order_relaxed);
-        if (cur_writes == s_watchdog_last_jitter_writes) {
-            if (scene_map_target.load(std::memory_order_relaxed) != nullptr) {
-                if (++s_watchdog_no_jitter_frames >= 120) {
-                    scene_map_target.store(nullptr, std::memory_order_release);
-                    s_watchdog_no_jitter_frames = 0;
+        if (edpe::UpscalerManager::instance().isReconstructionActive()) {
+            if (cur_writes == s_watchdog_last_jitter_writes) {
+                if (scene_map_target.load(std::memory_order_relaxed) != nullptr) {
+                    if (++s_watchdog_no_jitter_frames >= 120) {
+                        scene_map_target.store(nullptr, std::memory_order_release);
+                        s_watchdog_no_jitter_frames = 0;
+                    }
                 }
+            } else {
+                s_watchdog_last_jitter_writes = cur_writes;
+                s_watchdog_no_jitter_frames = 0;
             }
         } else {
             s_watchdog_last_jitter_writes = cur_writes;

@@ -47,9 +47,14 @@ void PerfTracker::shutdown() {
         FreeLibrary(nvmlModule_);
         nvmlModule_ = nullptr;
     }
+    nvmlAvailable_ = false;
+    nvmlDevice_ = nullptr;
+    nvmlGetUtil_ = nullptr;
+    nvmlGetMem_ = nullptr;
 }
 
 void PerfTracker::initNvml() {
+    if (nvmlModule_) return;
     nvmlModule_ = LoadLibraryW(L"nvml.dll");
     if (!nvmlModule_) return;
 

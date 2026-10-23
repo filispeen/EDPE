@@ -915,6 +915,7 @@ void shutdownUi() {
 }
 
 bool initializeUi(IDXGISwapChain* swap_chain) {
+    edpe::PerfTracker::instance().initNvml();
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(swap_chain->GetDesc(&desc)) || !desc.OutputWindow ||
         FAILED(swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&ui.device)))) return false;

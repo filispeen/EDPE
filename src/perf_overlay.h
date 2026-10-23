@@ -39,6 +39,7 @@ public:
     const PerfTelemetry& getTelemetry() const { return telemetry_; }
 
     void renderOverlay(bool isMenuOpen, int corner, float scale = 1.0f);
+    void initNvml();
     void shutdown();
 
 private:
@@ -46,7 +47,6 @@ private:
     ~PerfTracker();
 
     void updateTelemetry(IDXGISwapChain* swapChain);
-    void initNvml();
 
     PerfTelemetry telemetry_{};
     LARGE_INTEGER perfFreq_{};
