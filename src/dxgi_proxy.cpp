@@ -5,26 +5,27 @@
 #include "input_hook.h"
 
 #include <dxgi1_3.h>
+#include <mutex>
 #include <windows.h>
 
 void ObserveDxgiFactory(REFIID iid, void* factory);
 
 void syncConfigOnce() {
-    static bool s_synced = false;
-    if (s_synced) return;
-    s_synced = true;
-    edpe::installD3D11Hooks();
-    if (edpe::isRunningInEliteProcess()) {
-        edpe::installInputHooks();
-    }
-    auto& cfg = edpe::Config::instance();
-    cfg.load();
-    if (cfg.syncEliteGraphicsConfig()) {
-        wchar_t msg[160]{};
-        swprintf_s(msg, L"EDPE: synced Elite graphics config (SSAAMultiplier=%.6f)",
-            edpe::Config::getTargetSsaaMultiplier(cfg.upscalerBackend, cfg.upscaleMode));
-        EdpeLog(msg);
-    }
+    static std::once_flag s_once;
+    std::call_once(s_once, [] {
+        edpe::installD3D11Hooks();
+        if (edpe::isRunningInEliteProcess()) {
+            edpe::installInputHooks();
+        }
+        auto& cfg = edpe::Config::instance();
+        cfg.load();
+        if (cfg.syncEliteGraphicsConfig()) {
+            wchar_t msg[160]{};
+            swprintf_s(msg, L"EDPE: synced Elite graphics config (SSAAMultiplier=%.6f)",
+                edpe::Config::getTargetSsaaMultiplier(cfg.upscalerBackend, cfg.upscaleMode));
+            EdpeLog(msg);
+        }
+    });
 }
 
 extern "C" HRESULT WINAPI EdpeCreateDXGIFactory(REFIID iid, void** factory) {

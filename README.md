@@ -201,10 +201,8 @@ cmake --build build --config Release
 ```
 
 The build produces:
-* `build/EDPE.dll`: Core D3D11 device hook library.
-* `build/dxgi.dll`: DXGI swapchain observer and Present hook library.
+* `build/dxgi.dll`: Consolidated proxy library (DXGI swapchain observer, D3D11 device hooks, upscalers, ImGui overlay).
 * `build/stage/`: Pre-staged directory containing:
-  * `d3d11.dll` (copy of `EDPE.dll` ready for game injection)
   * `dxgi.dll`
   * `nvngx_dlss.dll` (if NGX SDK is present)
 
@@ -228,15 +226,15 @@ All 9 automated unit and integration tests should pass:
 1. Build the project or obtain a release package.
 2. Locate your Elite Dangerous installation folder (the directory containing `EliteDangerous64.exe`, typically under `Products\elite-dangerous-odyssey-64` or `Products\elite-dangerous-64`).
 3. Copy the staged proxy libraries into the game folder:
-   * Copy `build/stage/d3d11.dll` $\rightarrow$ `EliteDangerous64.exe` directory
    * Copy `build/stage/dxgi.dll` $\rightarrow$ `EliteDangerous64.exe` directory
    * *(For NVIDIA DLAA/DLSS)* Copy `build/stage/nvngx_dlss.dll` $\rightarrow$ `EliteDangerous64.exe` directory
+   * Якщо в теці гри лишився `d3d11.dll` від попередньої версії EDPE, його потрібно видалити.
 4. Launch Elite Dangerous normally through the Frontier Launcher or Steam.
 5. In game, press **`F5`** to toggle the EDPE overlay and verify that NVIDIA DLAA is running.
 6. Check `edpe.log` beside `EliteDangerous64.exe` for detailed diagnostic logs.
 
 ### Uninstallation
-To remove EDPE, simply delete or rename `d3d11.dll`, `dxgi.dll`, and `nvngx_dlss.dll` from the game directory. Elite Dangerous will immediately revert to standard engine rendering.
+To remove EDPE, simply delete or rename `dxgi.dll` and `nvngx_dlss.dll` from the game directory. Elite Dangerous will immediately revert to standard engine rendering.
 
 ---
 

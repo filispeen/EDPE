@@ -9,7 +9,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 ## Repository
 
 - **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling), `v0.3.5` (verified in-game AMD FSR 3.1.2 Native AA & SR, Performance HUD, input leak isolation), `v0.4.0` (verified in-game native D3D11 TAA reconstruction backend, HUD scaling and mouse dragging), `v0.4.1` (verified in-game native TAA stabilization, subpixel de-jittering, Karis clipping, cockpit depth stabilization), `v0.4.4` (verified in-game analytical skybox/star rotational motion vectors at infinity, elimination of star erasure during ship maneuvers, star bloom/corona motion coherence and artifact resolution across all reconstruction backends), `v0.4.6` (verified in-game canopy reflection sub-camera filtering, elimination of TAA docked station pulsing, adaptive stationary variance scaling, Performance HUD mouse cursor isolation when overlay is closed)
-- **Build artifacts:** `EDPE.dll`, `dxgi.dll`, and `d3d11.dll` deployed beside `EliteDangerous64.exe`; staged in `build/stage/`
+- **Build artifacts:** Consolidated `dxgi.dll` deployed beside `EliteDangerous64.exe`; staged in `build/stage/`
 - **Source:** `src/` contains 12 C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, etc.); `tools/` contains standalone NGX probe
 - **Test suite:** 10 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `dxbc_fanout`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
 
@@ -20,7 +20,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | Phase | Status | Current state |
 |-------|--------|---------------|
 | 0. Reconnaissance | **Substantially complete; ongoing** | Target is Elite Dangerous Odyssey's 2D D3D11 path. Executable imports, swapchain (2560×1440, R8G8B8A8_UNORM), proxy behavior, MRT layout, and render resources investigated and documented. |
-| 1. D3D11 injection | **Working prototype; verified in-game** | `EDPE.dll` forwards D3D11 device creation; `dxgi.dll` shim observes factories, swapchains, and `Present`. F5 ImGui overlay and F6 one-shot capture fully operational in-game without black screens or crashes. |
+| 1. D3D11 injection | **Working prototype; verified in-game** | Consolidated `dxgi.dll` proxies DXGI factories, swapchains, and `Present`, and hooks D3D11 device creation. F5 ImGui overlay and F6 one-shot capture fully operational in-game without black screens or crashes. |
 | 2. Resource census | **Substantially complete for temporal path** | D3D11 context instrumentation tracks render/depth target binds, MRT patterns, 5376-byte dynamic constant buffers, and draw calls. Full engine inventory across multi-scene transitions remains ongoing. |
 | 3. Scene depth | **Verified in-game (DSV #2)** | In-game capture (2026-10-15, build 332841) confirmed DSV #2 (`DXGI_FORMAT_R32G8X24_TYPELESS`) is the authoritative scene depth buffer with reversed-Z ($B=0.025$). Decoded BMP shows coherent full-frame geometry. |
 | 4. Camera and projection | **Measured & verified on GPU** | 5376-byte dynamic constant buffer (CB0) parsed via `parseEliteCamera()`. Projection matrix words (1080–1095) isolated; primary scene camera latched once per frame on first valid CB0 map. |
@@ -75,7 +75,7 @@ EDPE has implemented Phases 9 & 10 (`render < output` DLSS Super Resolution and 
 
 ## D3D11 / DXGI Injection — VERIFIED
 
-- `EDPE.dll` exports `EdpeD3D11CreateDevice` and `EdpeCreateDXGIFactory1`/`EdpeCreateDXGIFactory2`
+- `dxgi.dll` exports `EdpeCreateDXGIFactory`, `EdpeCreateDXGIFactory1`, `EdpeCreateDXGIFactory2`, and `EdpeD3D11CreateDevice`
 - `dxgi.dll` shim observes `IDXGIFactory::CreateSwapChain` and `IDXGISwapChain::Present`
 - Present hook logs first-Present (2560×1440, `R8G8B8A8_UNORM`), device/context pointers
 - `Insert` key reaches original WndProc when menu hidden; `F5` toggles Dear ImGui overlay
@@ -171,7 +171,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 | Target | Status | Notes |
 |--------|--------|-------|
-| `EDPE.dll` + `dxgi.dll` | ✅ Built and deployable | CMake + MSVC x64; staged in `build/stage/` |
+| `dxgi.dll` | ✅ Built and deployable | CMake + MSVC x64; staged in `build/stage/` |
 | `temporal_math_test` | ✅ Unit test | Halton sequences, projection blocks, NDC offset estimator, rejection invariants, camera delta tolerance |
 | `camera_delta_test` | ✅ Unit test | CPU delta math, event flags, rate limiting, and scene reset observation |
 | `capture_format_test` | ✅ Unit test | Half-float, float11/10 unpacker, reversed-Z depth contrast, motion BGR, Reinhard tone mapping |
@@ -180,7 +180,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 | `dxbc_fanout_test` | ✅ DXBC fanout probe | Shader hash analysis |
 | `proxy_smoke` | ✅ Integration test | Verifies DLL load, Present hook, and input pass-through |
 | `proxy_shader_probe` | ✅ Integration test | Shader bytecode interception verification |
-| `proxy_alias_smoke` | ✅ Integration test | Verifies staged `d3d11.dll` and `dxgi.dll` alias loading |
+| `proxy_alias_smoke` | ✅ Integration test | Verifies staged `dxgi.dll` loading |
 | In-game captures (2026-10-15) | ✅ MEASURED IN-GAME | Full 2560×1440 captures of depth (DSV #2), emissive (RTV3), motion, color, and clean frame |
 | In-game NVIDIA DLAA (2026-10-16) | ✅ VERIFIED IN-GAME | Stable 2560×1440 DLAA evaluation (~0.3 ms GPU time) with Halton (2,3) jitter, depth, and motion |
 | Standalone NGX probe | ✅ MEASURED | `tools/ngx_probe/` V1-V5 clean, 2 runs each |
