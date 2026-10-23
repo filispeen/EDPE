@@ -19,15 +19,31 @@ else()
     set(EDPE_HAVE_FSR FALSE)
 endif()
 
-add_library(EDPE SHARED src/dllmain.cpp src/log.cpp src/d3d11_proxy.cpp src/d3d11_proxy.def)
-target_compile_features(EDPE PRIVATE cxx_std_20)
-target_compile_definitions(EDPE PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-set_target_properties(EDPE PROPERTIES OUTPUT_NAME EDPE)
-
-add_library(EDPE_DXGI SHARED src/dllmain.cpp src/log.cpp src/dxgi_proxy.cpp src/dxgi_observer.cpp src/context_census.cpp src/dxbc_hash.cpp src/ui.cpp src/perf_overlay.cpp src/input_hook.cpp src/motion_pass.cpp src/ui_composite_pass.cpp src/ngx_context.cpp src/upscaler_backend.cpp src/taa_pass.cpp src/jitter_logger.cpp src/jitter_debug_pass.cpp src/jitter_view_recorder.cpp src/dxgi_proxy.def)
+add_library(EDPE_DXGI SHARED
+    src/dllmain.cpp
+    src/log.cpp
+    src/d3d11_proxy.cpp
+    src/dxgi_proxy.cpp
+    src/dxgi_observer.cpp
+    src/context_census.cpp
+    src/dxbc_hash.cpp
+    src/ui.cpp
+    src/perf_overlay.cpp
+    src/input_hook.cpp
+    src/motion_pass.cpp
+    src/ui_composite_pass.cpp
+    src/ngx_context.cpp
+    src/upscaler_backend.cpp
+    src/taa_pass.cpp
+    src/jitter_logger.cpp
+    src/jitter_debug_pass.cpp
+    src/jitter_view_recorder.cpp
+    src/dxgi_proxy.def
+)
 target_compile_features(EDPE_DXGI PRIVATE cxx_std_20)
 target_compile_definitions(EDPE_DXGI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(EDPE_DXGI PROPERTIES OUTPUT_NAME dxgi)
+add_library(EDPE ALIAS EDPE_DXGI)
 
 add_library(EDPE_IMGUI STATIC
     external/imgui/imgui.cpp
@@ -117,24 +133,23 @@ add_test(NAME jitter_view_report COMMAND jitter_view_report_test)
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)
 target_link_libraries(proxy_smoke PRIVATE d3dcompiler)
-add_test(NAME proxy_smoke COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log)
-add_test(NAME proxy_shader_probe COMMAND proxy_smoke $<TARGET_FILE:EDPE> $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log shader-probe)
+add_test(NAME proxy_smoke COMMAND proxy_smoke $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log)
+add_test(NAME proxy_shader_probe COMMAND proxy_smoke $<TARGET_FILE:EDPE_DXGI> $<TARGET_FILE_DIR:proxy_smoke>/edpe.log shader-probe)
 set_tests_properties(proxy_smoke proxy_shader_probe PROPERTIES RUN_SERIAL TRUE)
 
 set(EDPE_STAGE "${CMAKE_CURRENT_BINARY_DIR}/stage")
 add_custom_target(proxy_stage ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory "${EDPE_STAGE}"
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:EDPE> "${EDPE_STAGE}/d3d11.dll"
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:EDPE_DXGI> "${EDPE_STAGE}/dxgi.dll"
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:proxy_smoke> "${EDPE_STAGE}/proxy_smoke.exe"
-    DEPENDS EDPE EDPE_DXGI proxy_smoke)
+    DEPENDS EDPE_DXGI proxy_smoke)
 if(EDPE_HAVE_NGX)
     add_custom_command(TARGET proxy_stage POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${NGX_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "${EDPE_STAGE}/nvngx_dlss.dll")
 endif()
 add_test(NAME proxy_alias_smoke COMMAND "${EDPE_STAGE}/proxy_smoke.exe"
-    "${EDPE_STAGE}/d3d11.dll" "${EDPE_STAGE}/dxgi.dll" "${EDPE_STAGE}/edpe.log")
+    "${EDPE_STAGE}/dxgi.dll" "${EDPE_STAGE}/edpe.log")
 
 # === NGX PROBE (standalone, never part of EDPE.dll or the proxy) ===
 # ngx_probe       child: real NGX SDK calls on a hardware adapter, one log line per stage

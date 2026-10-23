@@ -1,3 +1,4 @@
+#include "d3d11_proxy.h"
 #include "config.h"
 #include "log.h"
 #include "system_dll.h"
@@ -8,11 +9,11 @@
 
 void ObserveDxgiFactory(REFIID iid, void* factory);
 
-namespace {
 void syncConfigOnce() {
     static bool s_synced = false;
     if (s_synced) return;
     s_synced = true;
+    edpe::installD3D11Hooks();
     if (edpe::isRunningInEliteProcess()) {
         edpe::installInputHooks();
     }
@@ -25,7 +26,22 @@ void syncConfigOnce() {
         EdpeLog(msg);
     }
 }
-} // namespace
+
+extern "C" HRESULT WINAPI EdpeCreateDXGIFactory(REFIID iid, void** factory) {
+    syncConfigOnce();
+    static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
+    if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());
+
+    static const auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory)>(
+        GetProcAddress(system_dxgi, "CreateDXGIFactory"));
+    if (!create_factory) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+
+    const HRESULT result = create_factory(iid, factory);
+    if (SUCCEEDED(result) && factory && *factory) ObserveDxgiFactory(iid, *factory);
+    EdpeLog(SUCCEEDED(result) ? L"EDPE: DXGI factory created"
+                              : L"EDPE: DXGI factory creation failed");
+    return result;
+}
 
 extern "C" HRESULT WINAPI EdpeCreateDXGIFactory1(REFIID iid, void** factory) {
     syncConfigOnce();

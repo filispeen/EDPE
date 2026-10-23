@@ -17,9 +17,19 @@ LRESULT CALLBACK testWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 }
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 4 && argc != 5) return 1;
-    const bool shader_probe = argc == 5 && wcscmp(argv[4], L"shader-probe") == 0;
-    if (argc == 5 && !shader_probe) return 1;
+    const bool single_dll = (argc == 3 || (argc == 4 && wcscmp(argv[3], L"shader-probe") == 0));
+    const bool dual_dll = (argc == 4 && wcscmp(argv[3], L"shader-probe") != 0) ||
+                          (argc == 5 && wcscmp(argv[4], L"shader-probe") == 0);
+    if (!single_dll && !dual_dll) return 1;
+
+    const bool shader_probe = single_dll
+        ? (argc == 4 && wcscmp(argv[3], L"shader-probe") == 0)
+        : (argc == 5 && wcscmp(argv[4], L"shader-probe") == 0);
+
+    const wchar_t* d3d11_path = argv[1];
+    const wchar_t* dxgi_path = single_dll ? argv[1] : argv[2];
+    const wchar_t* log_path = single_dll ? argv[2] : argv[3];
+
     if (shader_probe) {
         wchar_t marker[MAX_PATH];
         const DWORD length = GetModuleFileNameW(nullptr, marker, MAX_PATH);
@@ -32,7 +42,7 @@ int wmain(int argc, wchar_t** argv) {
         if (file == INVALID_HANDLE_VALUE) return 12;
         CloseHandle(file);
     }
-    const HANDLE stale_log = CreateFileW(argv[3], GENERIC_WRITE,
+    const HANDLE stale_log = CreateFileW(log_path, GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (stale_log == INVALID_HANDLE_VALUE) return 11;
@@ -41,9 +51,11 @@ int wmain(int argc, wchar_t** argv) {
     const BOOL seed_ok = WriteFile(stale_log, stale_line, sizeof(stale_line) - 1, &seeded, nullptr);
     CloseHandle(stale_log);
     if (!seed_ok || seeded != sizeof(stale_line) - 1) return 11;
-    const HMODULE dxgi_proxy = LoadLibraryW(argv[2]);
+    const HMODULE dxgi_proxy = LoadLibraryW(dxgi_path);
     if (!dxgi_proxy) return 5;
-    const HMODULE proxy = LoadLibraryW(argv[1]);
+    const HMODULE proxy = (dxgi_proxy && wcscmp(d3d11_path, dxgi_path) == 0)
+        ? dxgi_proxy
+        : LoadLibraryW(d3d11_path);
     if (!proxy) return 2;
     const auto create_device = reinterpret_cast<decltype(&D3D11CreateDevice)>(
         GetProcAddress(proxy, "D3D11CreateDevice"));
@@ -53,7 +65,7 @@ int wmain(int argc, wchar_t** argv) {
     ID3D11DeviceContext* context = nullptr;
     const HRESULT result = create_device(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context);
-    if (!shader_probe) FreeLibrary(proxy);
+    if (!shader_probe && proxy != dxgi_proxy) FreeLibrary(proxy);
     if (FAILED(result) || !device || !context) return 4;
     void* original_om_set = (*reinterpret_cast<void***>(context))[33];
     void* original_draws[]{(*reinterpret_cast<void***>(context))[12],
@@ -548,9 +560,9 @@ int wmain(int argc, wchar_t** argv) {
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
     context->Release();
     device->Release();
-    if (shader_probe) FreeLibrary(proxy);
+    if (shader_probe && proxy != dxgi_proxy) FreeLibrary(proxy);
     FreeLibrary(dxgi_proxy);
-    const HANDLE log = CreateFileW(argv[3], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    const HANDLE log = CreateFileW(log_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (log == INVALID_HANDLE_VALUE) return 11;
     char contents[65536]{};

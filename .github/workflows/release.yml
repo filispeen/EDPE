@@ -70,7 +70,6 @@ jobs:
           New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
 
           # Copy staged binaries
-          Copy-Item "build/stage/d3d11.dll" -Destination "$pkgDir/" -Force
           Copy-Item "build/stage/dxgi.dll" -Destination "$pkgDir/" -Force
           if (Test-Path "build/stage/nvngx_dlss.dll") {
               Copy-Item "build/stage/nvngx_dlss.dll" -Destination "$pkgDir/" -Force

@@ -35,17 +35,15 @@ cmake -S . -B build -G "NMake Makefiles" "-DCMAKE_MAKE_PROGRAM=$((Get-Command nm
 cmake --build build
 ```
 
-The main DLLs are:
+The main DLL is:
 
 ```text
-build/EDPE.dll
-build/dxgi.dll
+build/Release/dxgi.dll
 ```
 
 The `proxy_stage` target is built along with the other default targets and stages runtime files here:
 
 ```text
-build/stage/d3d11.dll       # copy of EDPE.dll under the proxy filename
 build/stage/dxgi.dll
 build/stage/proxy_smoke.exe
 ```

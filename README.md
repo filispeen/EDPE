@@ -69,7 +69,7 @@ EDPE enforces a strict separation: Elite-specific engine reverse-engineering bel
                                 |
                                 v
                       EDPE Proxy Injection
-                     (d3d11.dll / dxgi.dll)
+                     (dxgi.dll)
                                 |
         +-----------------------+-----------------------+
         |                                               |
