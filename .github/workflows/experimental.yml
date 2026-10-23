@@ -80,7 +80,7 @@ jobs:
               Copy-Item "edpe.ini" -Destination "$pkgDir/" -Force
           }
 
-          $archiveName = "EDPE-$tag-windows-x64.zip"
+          $archiveName = "EDPE($tag).zip"
           Compress-Archive -Path "$pkgDir/*" -DestinationPath $archiveName -Force
 
           # Generate SHA256 checksum
