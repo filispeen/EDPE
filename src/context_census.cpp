@@ -61,6 +61,18 @@ using DrawInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
 bool patchSlot(void** table, size_t slot, void* expected, void* replacement);
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv);
+void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
+    UINT start, INT base);
+void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start);
+void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
+    UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
+    UINT start_instance);
+void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
+    UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance);
+void armPipelineDrawHooks();
+void disarmPipelineDrawHooks();
+void onBeforeDraw(ID3D11DeviceContext* context, char drawType);
+void executeUpscaleAtBloomStart(ID3D11DeviceContext* context);
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
@@ -267,6 +279,34 @@ unsigned long long s_observed_scene_frame = ~0ull;
 std::atomic<UINT> s_swapchain_width{0};
 std::atomic<UINT> s_swapchain_height{0};
 std::atomic<ID3D11Resource*> s_swapchain_backbuffer{nullptr};
+
+// Per-frame pipeline milestones and draw classification
+static std::atomic<unsigned> s_frame_draw_index{0};
+static unsigned s_detected_gbuffer_start_draw = 0;
+static unsigned s_detected_linear_depth_draw = 0;
+static unsigned s_detected_scene_finish_draw = 0;
+static unsigned s_detected_bloom_start_draw = 0;
+static unsigned s_detected_tonemap_draw = 0;
+static unsigned s_detected_backbuffer_blit_draw = 0;
+static unsigned s_detected_overlay_draw = 0;
+
+static std::atomic<bool> s_current_is_gbuffer_mrt{false};
+static std::atomic<bool> s_current_is_linear_depth{false};
+static std::atomic<bool> s_current_is_scene_geometry{false};
+static std::atomic<bool> s_current_is_bloom_target{false};
+static std::atomic<bool> s_current_is_tonemap_target{false};
+static std::atomic<bool> s_current_is_backbuffer_target{false};
+
+static std::atomic<bool> s_inside_scene_passes{false};
+static std::atomic<bool> s_jitter_locked_for_frame{false};
+
+static bool s_upscale_evaluated_this_frame = false;
+
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_scene_linear_depth;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_scene_linear_depth_srv;
+static ID3D11Texture2D* s_cached_linear_depth_tex = nullptr;
+static unsigned long long s_scene_linear_depth_frame = ~0ull;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_bloom_upscale_output;
 unsigned long long motion_depth_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
@@ -926,8 +966,134 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
     }
 }
 
+void onBeforeDraw(ID3D11DeviceContext* context, char drawType) {
+    if (!context || context != observed_context.load(std::memory_order_acquire)) return;
+    const unsigned drawIndex = ++s_frame_draw_index;
+
+    // 1. G-buffer MRT start (Capture EID 1507)
+    if (s_current_is_gbuffer_mrt.load(std::memory_order_relaxed)) {
+        if (s_detected_gbuffer_start_draw == 0) {
+            s_detected_gbuffer_start_draw = drawIndex;
+            s_inside_scene_passes.store(true, std::memory_order_release);
+            s_jitter_locked_for_frame.store(true, std::memory_order_release);
+        }
+        s_current_is_gbuffer_mrt.store(false, std::memory_order_relaxed);
+    }
+
+    // 2. Linear depth fullscreen draw (Capture EID 2826)
+    if (s_current_is_linear_depth.load(std::memory_order_relaxed)) {
+        if (s_detected_linear_depth_draw == 0) {
+            s_detected_linear_depth_draw = drawIndex;
+        }
+        s_current_is_linear_depth.store(false, std::memory_order_relaxed);
+    }
+
+    // 3. Scene finish draw (Capture EID 4311):
+    // Draws with RTV0 == scene_hdr_color_source and DSV == scene_depth_source
+    if (s_inside_scene_passes.load(std::memory_order_acquire) &&
+        s_current_is_scene_geometry.load(std::memory_order_relaxed)) {
+        s_detected_scene_finish_draw = drawIndex;
+    }
+
+    // 4. Bloom start & Upscale Point (Capture EID 4334)
+    if (s_current_is_bloom_target.load(std::memory_order_relaxed)) {
+        if (!s_upscale_evaluated_this_frame) {
+            bool is_hdr_input = false;
+            ID3D11ShaderResourceView* ps_srv0 = nullptr;
+            context->PSGetShaderResources(0, 1, &ps_srv0);
+            if (ps_srv0) {
+                ID3D11Resource* srv_res = nullptr;
+                ps_srv0->GetResource(&srv_res);
+                if (srv_res) {
+                    if (srv_res == scene_hdr_color_source.Get()) {
+                        is_hdr_input = true;
+                    }
+                    srv_res->Release();
+                }
+                ps_srv0->Release();
+            }
+
+            if (is_hdr_input || scene_hdr_color_source) {
+                s_detected_bloom_start_draw = drawIndex;
+                s_inside_scene_passes.store(false, std::memory_order_release);
+                s_jitter_locked_for_frame.store(false, std::memory_order_release);
+                s_upscale_evaluated_this_frame = true;
+
+                executeUpscaleAtBloomStart(context);
+            }
+        }
+        s_current_is_bloom_target.store(false, std::memory_order_relaxed);
+    }
+
+    // 5. Tonemap composite draw (Capture EID 4581)
+    if (s_current_is_tonemap_target.load(std::memory_order_relaxed)) {
+        if (s_detected_tonemap_draw == 0) {
+            s_detected_tonemap_draw = drawIndex;
+        }
+        s_current_is_tonemap_target.store(false, std::memory_order_relaxed);
+    }
+
+    // 6 & 7. Backbuffer blit (Capture EID 4598) and 2D overlay (Capture EID 4626)
+    if (s_current_is_backbuffer_target.load(std::memory_order_relaxed)) {
+        if (s_detected_backbuffer_blit_draw == 0) {
+            s_detected_backbuffer_blit_draw = drawIndex;
+        } else {
+            s_detected_overlay_draw = drawIndex;
+        }
+    }
+}
+
+void armPipelineDrawHooks() {
+    if (!patched_table) return;
+    if (vs_buffer_probe_active.load(std::memory_order_acquire) ||
+        draw_probe_active.load(std::memory_order_acquire)) return;
+    auto forward_draw = reinterpret_cast<DrawFn>(patched_table[kDraw]);
+    auto forward_draw_indexed = reinterpret_cast<DrawIndexedFn>(patched_table[kDrawIndexed]);
+    auto forward_indexed_instanced = reinterpret_cast<DrawIndexedInstancedFn>(patched_table[kDrawIndexedInstanced]);
+    auto forward_instanced = reinterpret_cast<DrawInstancedFn>(patched_table[kDrawInstanced]);
+
+    if (forward_draw && forward_draw != &observedDraw) {
+        original_draw.store(forward_draw, std::memory_order_release);
+        patchSlot(patched_table, kDraw, reinterpret_cast<void*>(forward_draw), reinterpret_cast<void*>(&observedDraw));
+    }
+    if (forward_draw_indexed && forward_draw_indexed != &observedDrawIndexed) {
+        original_draw_indexed.store(forward_draw_indexed, std::memory_order_release);
+        patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(forward_draw_indexed), reinterpret_cast<void*>(&observedDrawIndexed));
+    }
+    if (forward_indexed_instanced && forward_indexed_instanced != &observedDrawIndexedInstanced) {
+        original_draw_indexed_instanced.store(forward_indexed_instanced, std::memory_order_release);
+        patchSlot(patched_table, kDrawIndexedInstanced, reinterpret_cast<void*>(forward_indexed_instanced), reinterpret_cast<void*>(&observedDrawIndexedInstanced));
+    }
+    if (forward_instanced && forward_instanced != &observedDrawInstanced) {
+        original_draw_instanced.store(forward_instanced, std::memory_order_release);
+        patchSlot(patched_table, kDrawInstanced, reinterpret_cast<void*>(forward_instanced), reinterpret_cast<void*>(&observedDrawInstanced));
+    }
+}
+
+void disarmPipelineDrawHooks() {
+    if (!patched_table) return;
+    auto orig_draw = original_draw.load(std::memory_order_acquire);
+    auto orig_draw_indexed = original_draw_indexed.load(std::memory_order_acquire);
+    auto orig_indexed_instanced = original_draw_indexed_instanced.load(std::memory_order_acquire);
+    auto orig_instanced = original_draw_instanced.load(std::memory_order_acquire);
+
+    if (orig_draw && patched_table[kDraw] == &observedDraw) {
+        patchSlot(patched_table, kDraw, reinterpret_cast<void*>(&observedDraw), reinterpret_cast<void*>(orig_draw));
+    }
+    if (orig_draw_indexed && patched_table[kDrawIndexed] == &observedDrawIndexed) {
+        patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(&observedDrawIndexed), reinterpret_cast<void*>(orig_draw_indexed));
+    }
+    if (orig_indexed_instanced && patched_table[kDrawIndexedInstanced] == &observedDrawIndexedInstanced) {
+        patchSlot(patched_table, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), reinterpret_cast<void*>(orig_indexed_instanced));
+    }
+    if (orig_instanced && patched_table[kDrawInstanced] == &observedDrawInstanced) {
+        patchSlot(patched_table, kDrawInstanced, reinterpret_cast<void*>(&observedDrawInstanced), reinterpret_cast<void*>(orig_instanced));
+    }
+}
+
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
     UINT start, INT base) {
+    onBeforeDraw(context, 'I');
     if (context == observed_context.load(std::memory_order_acquire))
         observeHudDraw(context, 'I', 1);
     if (context == observed_context.load(std::memory_order_acquire) &&
@@ -937,10 +1103,14 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
             draw_indexed_scene_calls.fetch_add(1, std::memory_order_relaxed);
         observeFirstSceneDraw(context);
     }
-    original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
+    auto orig = original_draw_indexed.load(std::memory_order_acquire);
+    if (orig && orig != &observedDrawIndexed) {
+        orig(context, count, start, base);
+    }
 }
 
 void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start) {
+    onBeforeDraw(context, 'D');
     if (context == observed_context.load(std::memory_order_acquire))
         observeHudDraw(context, 'D', 1);
     if (context == observed_context.load(std::memory_order_acquire) &&
@@ -950,12 +1120,16 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
             draw_scene_calls.fetch_add(1, std::memory_order_relaxed);
         observeFirstSceneDraw(context);
     }
-    original_draw.load(std::memory_order_acquire)(context, count, start);
+    auto orig = original_draw.load(std::memory_order_acquire);
+    if (orig && orig != &observedDraw) {
+        orig(context, count, start);
+    }
 }
 
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
     UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
     UINT start_instance) {
+    onBeforeDraw(context, 'X');
     const bool replay = context == observed_context.load(std::memory_order_acquire) &&
         observeHudDraw(context, 'X', instance_count);
     if (context == observed_context.load(std::memory_order_acquire) &&
@@ -965,14 +1139,17 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
             draw_indexed_instanced_scene_calls.fetch_add(1, std::memory_order_relaxed);
         observeFirstSceneDraw(context);
     }
-    original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
-        index_count, instance_count, start_index, base_vertex, start_instance);
+    auto orig = original_draw_indexed_instanced.load(std::memory_order_acquire);
+    if (orig && orig != &observedDrawIndexedInstanced) {
+        orig(context, index_count, instance_count, start_index, base_vertex, start_instance);
+    }
     if (replay) replayGlassDraw(context, index_count, instance_count,
         start_index, base_vertex, start_instance);
 }
 
 void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
+    onBeforeDraw(context, 'N');
     if (context == observed_context.load(std::memory_order_acquire))
         observeHudDraw(context, 'N', instance_count);
     if (context == observed_context.load(std::memory_order_acquire) &&
@@ -982,8 +1159,10 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
             draw_instanced_scene_calls.fetch_add(1, std::memory_order_relaxed);
         observeFirstSceneDraw(context);
     }
-    original_draw_instanced.load(std::memory_order_acquire)(context,
-        vertex_count, instance_count, start_vertex, start_instance);
+    auto orig = original_draw_instanced.load(std::memory_order_acquire);
+    if (orig && orig != &observedDrawInstanced) {
+        orig(context, vertex_count, instance_count, start_vertex, start_instance);
+    }
 }
 
 void beginHudDrawProbe() {
@@ -991,10 +1170,14 @@ void beginHudDrawProbe() {
         draw_probe_active.load(std::memory_order_acquire)) return;
     auto install = [&](size_t slot, auto& original_fn, auto observer, unsigned bit) {
         auto forward = reinterpret_cast<decltype(observer)>(patched_table[slot]);
-        if (!forward || forward == observer) return;
-        original_fn.store(forward, std::memory_order_release);
-        if (patchSlot(patched_table, slot, reinterpret_cast<void*>(forward),
-                reinterpret_cast<void*>(observer))) hud_draw_hook_mask |= bit;
+        if (!forward) return;
+        if (forward != observer) {
+            original_fn.store(forward, std::memory_order_release);
+            if (patchSlot(patched_table, slot, reinterpret_cast<void*>(forward),
+                    reinterpret_cast<void*>(observer))) hud_draw_hook_mask |= bit;
+        } else {
+            hud_draw_hook_mask |= bit;
+        }
     };
     install(kDrawIndexed, original_draw_indexed, &observedDrawIndexed, 1);
     install(kDraw, original_draw, &observedDraw, 2);
@@ -1312,8 +1495,10 @@ void endDrawProbe() {
 void beginDrawProbe() {
     if (!patched_table || !vs_buffer_probe_active.load(std::memory_order_acquire)) return;
     auto forward = reinterpret_cast<DrawIndexedFn>(patched_table[kDrawIndexed]);
-    if (!forward || forward == &observedDrawIndexed) return;
-    original_draw_indexed.store(forward, std::memory_order_release);
+    if (forward && forward != &observedDrawIndexed) {
+        original_draw_indexed.store(forward, std::memory_order_release);
+    }
+    if (!forward) return;
     draw_indexed_calls.store(0, std::memory_order_relaxed);
     draw_indexed_scene_calls.store(0, std::memory_order_relaxed);
     draw_calls.store(0, std::memory_order_relaxed);
@@ -1344,28 +1529,42 @@ void beginDrawProbe() {
     scene_last_camera_hash.store(0, std::memory_order_relaxed);
     scene_first_projection_hash.store(0, std::memory_order_relaxed);
     scene_last_projection_hash.store(0, std::memory_order_relaxed);
-    if (patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(forward),
-            reinterpret_cast<void*>(&observedDrawIndexed))) {
+    const bool slot_ok = (forward == &observedDrawIndexed) ||
+        patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(forward),
+            reinterpret_cast<void*>(&observedDrawIndexed));
+    if (slot_ok) {
         draw_probe_active.store(true, std::memory_order_release);
         auto draw_forward = reinterpret_cast<DrawFn>(patched_table[kDraw]);
         auto indexed_instanced_forward = reinterpret_cast<DrawIndexedInstancedFn>(
             patched_table[kDrawIndexedInstanced]);
         auto instanced_forward = reinterpret_cast<DrawInstancedFn>(patched_table[kDrawInstanced]);
-        original_draw.store(draw_forward, std::memory_order_release);
-        original_draw_indexed_instanced.store(indexed_instanced_forward,
-            std::memory_order_release);
-        original_draw_instanced.store(instanced_forward, std::memory_order_release);
-        if (draw_forward && patchSlot(patched_table, kDraw,
-                reinterpret_cast<void*>(draw_forward), reinterpret_cast<void*>(&observedDraw)))
+        if (draw_forward && draw_forward != &observedDraw) {
+            original_draw.store(draw_forward, std::memory_order_release);
+            if (patchSlot(patched_table, kDraw,
+                    reinterpret_cast<void*>(draw_forward), reinterpret_cast<void*>(&observedDraw)))
+                draw_hook_active.store(true, std::memory_order_release);
+        } else if (draw_forward == &observedDraw) {
             draw_hook_active.store(true, std::memory_order_release);
-        if (indexed_instanced_forward && patchSlot(patched_table, kDrawIndexedInstanced,
-                reinterpret_cast<void*>(indexed_instanced_forward),
-                reinterpret_cast<void*>(&observedDrawIndexedInstanced)))
+        }
+        if (indexed_instanced_forward && indexed_instanced_forward != &observedDrawIndexedInstanced) {
+            original_draw_indexed_instanced.store(indexed_instanced_forward,
+                std::memory_order_release);
+            if (patchSlot(patched_table, kDrawIndexedInstanced,
+                    reinterpret_cast<void*>(indexed_instanced_forward),
+                    reinterpret_cast<void*>(&observedDrawIndexedInstanced)))
+                draw_indexed_instanced_hook_active.store(true, std::memory_order_release);
+        } else if (indexed_instanced_forward == &observedDrawIndexedInstanced) {
             draw_indexed_instanced_hook_active.store(true, std::memory_order_release);
-        if (instanced_forward && patchSlot(patched_table, kDrawInstanced,
-                reinterpret_cast<void*>(instanced_forward),
-                reinterpret_cast<void*>(&observedDrawInstanced)))
+        }
+        if (instanced_forward && instanced_forward != &observedDrawInstanced) {
+            original_draw_instanced.store(instanced_forward, std::memory_order_release);
+            if (patchSlot(patched_table, kDrawInstanced,
+                    reinterpret_cast<void*>(instanced_forward),
+                    reinterpret_cast<void*>(&observedDrawInstanced)))
+                draw_instanced_hook_active.store(true, std::memory_order_release);
+        } else if (instanced_forward == &observedDrawInstanced) {
             draw_instanced_hook_active.store(true, std::memory_order_release);
+        }
         if (!map_hook_active.load(std::memory_order_acquire)) {
             auto map_forward = reinterpret_cast<MapFn>(patched_table[kMap]);
             if (map_forward) original_map.store(map_forward, std::memory_order_release);
@@ -2205,8 +2404,6 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
     motion_hook_watch = 8;
 }
 
-static bool s_upscale_evaluated_this_frame = false;
-
 bool isLdrSceneColorFormat(DXGI_FORMAT fmt) {
     return fmt == DXGI_FORMAT_R8G8B8A8_UNORM ||
            fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
@@ -2249,8 +2446,206 @@ static unsigned long long s_last_temporal_inputs_frame = ~0ull;
 //   scene target (scene_ldr_source, renderWidth x renderHeight) and reconstructs
 //   into the native-resolution backbuffer (outputWidth x outputHeight).
 // `rendered` is the last_present_frame value seen while this frame rendered.
+void executeUpscaleAtBloomStart(ID3D11DeviceContext* context) {
+    auto& upscaler = edpe::UpscalerManager::instance();
+    const bool upscale_active = upscaler.isReconstructionActive();
+    if (!upscale_active || !context) return;
+    if (!scene_hdr_color_source) return;
+
+    D3D11_TEXTURE2D_DESC hdrDesc{};
+    scene_hdr_color_source->GetDesc(&hdrDesc);
+    const UINT width = hdrDesc.Width;
+    const UINT height = hdrDesc.Height;
+    if (!width || !height) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return;
+
+    const auto rendered = last_present_frame.load(std::memory_order_relaxed);
+    if (s_camera_frame != rendered) {
+        if (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered) {
+            updateMainCamera(s_latest_unmapped_camera, rendered);
+        } else if (s_fallback_unmapped_camera_frame == rendered && ++s_auxiliary_rejection_streak >= 3) {
+            updateMainCamera(s_fallback_unmapped_camera, rendered);
+            s_auxiliary_rejection_streak = 0;
+        } else if (s_camera_now.scaleX > 0.0f) {
+            s_camera_previous = s_camera_now;
+            s_camera_previous_frame = s_camera_frame;
+            s_camera_frame = rendered;
+        }
+    }
+
+    if (s_camera_now.scaleX <= 0.0f) return;
+
+    // 1. Motion Vectors from Linear Depth (or fallback to raw depth)
+    if (!motion_pass) {
+        auto candidate = std::make_unique<edpe::MotionPass>();
+        if (!candidate->initialize(device.Get(), context)) return;
+        motion_pass = std::move(candidate);
+    }
+
+    const bool useLinearDepth = (s_scene_linear_depth_srv != nullptr);
+    ID3D11ShaderResourceView* depthSrv = nullptr;
+
+    if (useLinearDepth) {
+        depthSrv = s_scene_linear_depth_srv.Get();
+    } else if (scene_depth_source) {
+        if (!motion_depth) {
+            D3D11_TEXTURE2D_DESC dd{};
+            scene_depth_source->GetDesc(&dd);
+            dd.Usage = D3D11_USAGE_DEFAULT;
+            dd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            dd.CPUAccessFlags = dd.MiscFlags = 0;
+            if (SUCCEEDED(device->CreateTexture2D(&dd, nullptr, &motion_depth))) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
+                srvD.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+                srvD.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvD.Texture2D.MipLevels = 1;
+                device->CreateShaderResourceView(motion_depth.Get(), &srvD, &motion_depth_view);
+            }
+        }
+        if (motion_depth) {
+            context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
+            depthSrv = motion_depth_view.Get();
+        }
+    }
+
+    if (!depthSrv) return;
+
+    if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
+        motion_pass->clear(context);
+    } else {
+        // Build motion vectors from linear depth + previous and current view-projection
+        // Dynamic objects are treated as static with camera reprojection (noting the ghosting risk).
+        motion_pass->render(depthSrv, s_camera_now, s_camera_previous, width, height, useLinearDepth);
+    }
+
+    if (!motion_pass->output()) return;
+
+    // 2. Prepare Jitter and Scale
+    float jx = s_injected_jitter.pixelX;
+    float jy = s_injected_jitter.pixelY;
+    if (s_jitter_swap_xy.load(std::memory_order_relaxed)) std::swap(jx, jy);
+    if (s_jitter_invert_x.load(std::memory_order_relaxed)) jx = -jx;
+    if (s_jitter_invert_y.load(std::memory_order_relaxed)) jy = -jy;
+
+    const float mScale = s_motion_scale.load(std::memory_order_relaxed);
+    const float mScaleX = (s_motion_invert_x.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
+    const float mScaleY = (s_motion_invert_y.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
+
+    // Delta time
+    static LARGE_INTEGER s_last_upscale_qpc{};
+    static LARGE_INTEGER s_upscale_freq{};
+    if (s_upscale_freq.QuadPart == 0) QueryPerformanceFrequency(&s_upscale_freq);
+    LARGE_INTEGER now_qpc;
+    QueryPerformanceCounter(&now_qpc);
+    float dt_ms = 16.667f;
+    if (s_last_upscale_qpc.QuadPart > 0 && s_upscale_freq.QuadPart > 0) {
+        const double measured_ms = static_cast<double>(now_qpc.QuadPart - s_last_upscale_qpc.QuadPart) * 1000.0 /
+                                   static_cast<double>(s_upscale_freq.QuadPart);
+        if (measured_ms >= 0.5 && measured_ms <= 250.0) dt_ms = static_cast<float>(measured_ms);
+    }
+    s_last_upscale_qpc = now_qpc;
+
+    // Scene cut detection
+    const float* c = s_camera_now.worldFromView;
+    const float* p = s_camera_previous.worldFromView;
+    const float dx = c[3] - p[3];
+    const float dy = c[7] - p[7];
+    const float dz = c[11] - p[11];
+    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float rotTrace = (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
+                           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
+                           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
+    const bool orientation_cut = (rotTrace < 2.0f);
+    const bool teleport_cut = (moveDist > 5000.0f);
+    const bool translation_cut = (moveDist > 50.0f && rotTrace < 2.85f);
+    const bool scene_cut = (s_camera_previous_frame == ~0ull) || orientation_cut || teleport_cut || translation_cut;
+
+    // Color input for upscaler
+    if (!s_dlaa_input) {
+        D3D11_TEXTURE2D_DESC inDesc = hdrDesc;
+        inDesc.Usage = D3D11_USAGE_DEFAULT;
+        inDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        inDesc.CPUAccessFlags = inDesc.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input)) ||
+            FAILED(device->CreateShaderResourceView(s_dlaa_input.Get(), nullptr, &s_dlaa_input_srv))) return;
+    }
+    context->CopyResource(s_dlaa_input.Get(), scene_hdr_color_source.Get());
+
+    // Prepare raw depth copy for backend if needed
+    if (!motion_depth && scene_depth_source) {
+        D3D11_TEXTURE2D_DESC dd{};
+        scene_depth_source->GetDesc(&dd);
+        dd.Usage = D3D11_USAGE_DEFAULT;
+        dd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        dd.CPUAccessFlags = dd.MiscFlags = 0;
+        if (SUCCEEDED(device->CreateTexture2D(&dd, nullptr, &motion_depth))) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
+            srvD.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            srvD.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvD.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(motion_depth.Get(), &srvD, &motion_depth_view);
+        }
+    }
+    if (motion_depth && scene_depth_source) {
+        context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
+    }
+
+    edpe::TemporalFrameInputs inputs{};
+    inputs.color = s_dlaa_input.Get();
+    inputs.colorSrv = s_dlaa_input_srv.Get();
+    inputs.depth = motion_depth ? motion_depth.Get() : s_scene_linear_depth.Get();
+    inputs.depthSrv = motion_depth_view ? motion_depth_view.Get() : s_scene_linear_depth_srv.Get();
+    inputs.motionVectors = motion_pass->outputTexture();
+    inputs.motionSrv = motion_pass->output();
+    inputs.renderWidth = width;
+    inputs.renderHeight = height;
+    inputs.outputWidth = width;
+    inputs.outputHeight = height;
+    inputs.jitterX = jx;
+    inputs.jitterY = jy;
+    inputs.motionScaleX = mScaleX;
+    inputs.motionScaleY = mScaleY;
+    inputs.frameTimeMs = dt_ms;
+    inputs.reset = s_camera_reset || scene_cut;
+    inputs.cameraNow = s_camera_now;
+    inputs.cameraPrevious = s_camera_previous;
+    inputs.sharpness = edpe::Config::instance().sharpness;
+    inputs.depthInverted = true;
+    inputs.motionIsLowRes = false;
+    inputs.colorIsHdr = true;
+
+    // Destination texture for upscaler output
+    if (!s_bloom_upscale_output) {
+        D3D11_TEXTURE2D_DESC outDesc = hdrDesc;
+        outDesc.Usage = D3D11_USAGE_DEFAULT;
+        outDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
+        outDesc.CPUAccessFlags = outDesc.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&outDesc, nullptr, &s_bloom_upscale_output))) return;
+    }
+
+    // Save and temporarily unbind PS SRV 0 to prevent D3D11 resource hazard
+    ID3D11ShaderResourceView* savedPsSrv0 = nullptr;
+    context->PSGetShaderResources(0, 1, &savedPsSrv0);
+    ID3D11ShaderResourceView* nullSrv = nullptr;
+    context->PSSetShaderResources(0, 1, &nullSrv);
+
+    if (upscaler.evaluate(context, inputs, nullptr, s_bloom_upscale_output.Get())) {
+        s_camera_reset = false;
+        // Overwrite the HDR scene color target with the reconstructed image
+        context->CopyResource(scene_hdr_color_source.Get(), s_bloom_upscale_output.Get());
+    }
+
+    // Restore PS SRV 0 so bloom start draw receives the reconstructed HDR scene
+    context->PSSetShaderResources(0, 1, &savedPsSrv0);
+    if (savedPsSrv0) savedPsSrv0->Release();
+}
+
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered,
     ID3D11Texture2D* backbuffer) {
+    if (s_upscale_evaluated_this_frame) return;
     const auto frame = rendered;
     auto& upscaler = edpe::UpscalerManager::instance();
     const bool upscale_active = upscaler.isReconstructionActive();
@@ -2954,6 +3349,171 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     if (context != observed_context.load(std::memory_order_acquire)) return;
     copyCameraDeltaSource(context);
     rearmHudDrawProbe();
+
+    if (!vs_buffer_probe_active.load(std::memory_order_acquire) &&
+        !draw_probe_active.load(std::memory_order_acquire)) {
+        armPipelineDrawHooks();
+    }
+
+    s_current_is_gbuffer_mrt.store(false, std::memory_order_relaxed);
+    s_current_is_linear_depth.store(false, std::memory_order_relaxed);
+    s_current_is_scene_geometry.store(false, std::memory_order_relaxed);
+    s_current_is_bloom_target.store(false, std::memory_order_relaxed);
+    s_current_is_tonemap_target.store(false, std::memory_order_relaxed);
+    s_current_is_backbuffer_target.store(false, std::memory_order_relaxed);
+
+    const auto current_frame_census = last_present_frame.load(std::memory_order_relaxed);
+
+    // 1. Check G-buffer MRT: 4 targets (R10G10B10A2, R8G8B8A8, R8G8B8A8, R11G11B10_FLOAT) with D32S8 depth
+    if (count >= 4 && targets && targets[0] && targets[1] && targets[2] && targets[3] && dsv) {
+        D3D11_RENDER_TARGET_VIEW_DESC views[4]{};
+        for (UINT slot = 0; slot < 4; ++slot) targets[slot]->GetDesc(&views[slot]);
+        if (views[0].Format == DXGI_FORMAT_R10G10B10A2_UNORM &&
+            views[1].Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+            views[2].Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+            views[3].Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+            s_current_is_gbuffer_mrt.store(true, std::memory_order_relaxed);
+            ID3D11Resource* res3 = nullptr;
+            targets[3]->GetResource(&res3);
+            if (res3) {
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> tex3;
+                if (SUCCEEDED(res3->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex3.GetAddressOf())))) {
+                    scene_hdr_color_source = tex3;
+                    scene_hdr_color_frame = current_frame_census;
+                }
+                res3->Release();
+            }
+            ID3D11Resource* dres = nullptr;
+            dsv->GetResource(&dres);
+            if (dres) {
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> dtex;
+                if (SUCCEEDED(dres->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(dtex.GetAddressOf())))) {
+                    scene_depth_source = dtex;
+                    D3D11_TEXTURE2D_DESC dd{};
+                    dtex->GetDesc(&dd);
+                    s_observed_scene_width.store(dd.Width, std::memory_order_relaxed);
+                    s_observed_scene_height.store(dd.Height, std::memory_order_relaxed);
+                    s_observed_scene_frame = current_frame_census;
+                }
+                dres->Release();
+            }
+        }
+    }
+
+    // 2. Check Linear Depth target: 1 RTV of DXGI_FORMAT_R32_FLOAT, full scene size, null DSV
+    if (count >= 1 && targets && targets[0] && !dsv) {
+        D3D11_RENDER_TARGET_VIEW_DESC rdesc{};
+        targets[0]->GetDesc(&rdesc);
+        if (rdesc.Format == DXGI_FORMAT_R32_FLOAT) {
+            ID3D11Resource* res0 = nullptr;
+            targets[0]->GetResource(&res0);
+            if (res0) {
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> tex0;
+                if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex0.GetAddressOf())))) {
+                    D3D11_TEXTURE2D_DESC td{};
+                    tex0->GetDesc(&td);
+                    const UINT sW = s_observed_scene_width.load(std::memory_order_relaxed);
+                    const UINT sH = s_observed_scene_height.load(std::memory_order_relaxed);
+                    if (td.SampleDesc.Count == 1 && (sW == 0 || (td.Width == sW && td.Height == sH))) {
+                        s_current_is_linear_depth.store(true, std::memory_order_relaxed);
+                        s_scene_linear_depth = tex0;
+                        s_scene_linear_depth_frame = current_frame_census;
+                        if (!s_scene_linear_depth_srv || s_cached_linear_depth_tex != tex0.Get()) {
+                            s_cached_linear_depth_tex = tex0.Get();
+                            s_scene_linear_depth_srv.Reset();
+                            Microsoft::WRL::ComPtr<ID3D11Device> dev;
+                            context->GetDevice(&dev);
+                            if (dev) {
+                                D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
+                                srvD.Format = DXGI_FORMAT_R32_FLOAT;
+                                srvD.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                                srvD.Texture2D.MipLevels = 1;
+                                dev->CreateShaderResourceView(tex0.Get(), &srvD, &s_scene_linear_depth_srv);
+                            }
+                        }
+                    }
+                }
+                res0->Release();
+            }
+        }
+    }
+
+    // 3. Check Scene Geometry: Target 0 is scene_hdr_color_source and DSV is scene_depth_source
+    if (count >= 1 && targets && targets[0] && dsv && scene_hdr_color_source && scene_depth_source) {
+        ID3D11Resource* r0 = nullptr;
+        targets[0]->GetResource(&r0);
+        ID3D11Resource* d_res = nullptr;
+        dsv->GetResource(&d_res);
+        if (r0 == scene_hdr_color_source.Get() && d_res == scene_depth_source.Get()) {
+            s_current_is_scene_geometry.store(true, std::memory_order_relaxed);
+        }
+        if (r0) r0->Release();
+        if (d_res) d_res->Release();
+    }
+
+    // 4. Check Bloom start target: 1 RTV of DXGI_FORMAT_R11G11B10_FLOAT, half size (approx sceneW / 2, sceneH / 2), null DSV
+    if (count >= 1 && targets && targets[0] && !dsv) {
+        D3D11_RENDER_TARGET_VIEW_DESC rdesc{};
+        targets[0]->GetDesc(&rdesc);
+        if (rdesc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+            ID3D11Resource* res0 = nullptr;
+            targets[0]->GetResource(&res0);
+            if (res0) {
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> tex0;
+                if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex0.GetAddressOf())))) {
+                    D3D11_TEXTURE2D_DESC td{};
+                    tex0->GetDesc(&td);
+                    const UINT sW = s_observed_scene_width.load(std::memory_order_relaxed);
+                    const UINT sH = s_observed_scene_height.load(std::memory_order_relaxed);
+                    if (sW > 0 && sH > 0 &&
+                        std::abs(static_cast<int>(td.Width) - static_cast<int>(sW / 2)) <= 2 &&
+                        std::abs(static_cast<int>(td.Height) - static_cast<int>(sH / 2)) <= 2) {
+                        s_current_is_bloom_target.store(true, std::memory_order_relaxed);
+                    }
+                }
+                res0->Release();
+            }
+        }
+    }
+
+    // 5. Check Tonemap target: 1 RTV of DXGI_FORMAT_R8G8B8A8_UNORM / TYPELESS, full size, null DSV, not backbuffer
+    if (count >= 1 && targets && targets[0] && !dsv) {
+        D3D11_RENDER_TARGET_VIEW_DESC rdesc{};
+        targets[0]->GetDesc(&rdesc);
+        if (rdesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rdesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+            ID3D11Resource* res0 = nullptr;
+            targets[0]->GetResource(&res0);
+            if (res0) {
+                auto* bb = s_swapchain_backbuffer.load(std::memory_order_relaxed);
+                if (res0 != bb) {
+                    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex0;
+                    if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex0.GetAddressOf())))) {
+                        D3D11_TEXTURE2D_DESC td{};
+                        tex0->GetDesc(&td);
+                        const UINT sW = s_observed_scene_width.load(std::memory_order_relaxed);
+                        const UINT sH = s_observed_scene_height.load(std::memory_order_relaxed);
+                        if (sW > 0 && sH > 0 && td.Width == sW && td.Height == sH) {
+                            s_current_is_tonemap_target.store(true, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                res0->Release();
+            }
+        }
+    }
+
+    // 6 & 7. Check Backbuffer target: targets[0] matches s_swapchain_backbuffer
+    if (count >= 1 && targets && targets[0]) {
+        ID3D11Resource* res0 = nullptr;
+        targets[0]->GetResource(&res0);
+        if (res0) {
+            if (res0 == s_swapchain_backbuffer.load(std::memory_order_relaxed)) {
+                s_current_is_backbuffer_target.store(true, std::memory_order_relaxed);
+            }
+            res0->Release();
+        }
+    }
+
     const bool reconstruction_active =
         edpe::UpscalerManager::instance().isReconstructionActive() ||
         s_jitter_debug_view.load(std::memory_order_relaxed);
@@ -3317,6 +3877,10 @@ void rearmContextHooks() {
             patched_table[kUnmap],
             reinterpret_cast<void*>(&observedUnmap));
     }
+    if (!vs_buffer_probe_active.load(std::memory_order_acquire) &&
+        !draw_probe_active.load(std::memory_order_acquire)) {
+        armPipelineDrawHooks();
+    }
 }
 } // namespace
 
@@ -3500,6 +4064,40 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 }
             }
         }
+
+        if (s_detected_gbuffer_start_draw > 0 || s_detected_bloom_start_draw > 0) {
+            wchar_t eidMsg[512];
+            swprintf_s(eidMsg,
+                L"EDPE: [Frame %llu] Pipeline detection summary: "
+                L"G-buffer start draw #%u (capture EID 1507), "
+                L"Linear depth draw #%u (capture EID 2826), "
+                L"Scene finish draw #%u (capture EID 4311), "
+                L"Bloom start/upscale draw #%u (capture EID 4334), "
+                L"Tonemap draw #%u (capture EID 4581), "
+                L"Backbuffer blit draw #%u (capture EID 4598), "
+                L"2D overlay draw #%u (capture EID 4626), "
+                L"Total frame draws=%u",
+                frame,
+                s_detected_gbuffer_start_draw,
+                s_detected_linear_depth_draw,
+                s_detected_scene_finish_draw,
+                s_detected_bloom_start_draw,
+                s_detected_tonemap_draw,
+                s_detected_backbuffer_blit_draw,
+                s_detected_overlay_draw,
+                s_frame_draw_index.load(std::memory_order_relaxed));
+            EdpeLog(eidMsg);
+        }
+
+        s_detected_gbuffer_start_draw = 0;
+        s_detected_linear_depth_draw = 0;
+        s_detected_scene_finish_draw = 0;
+        s_detected_bloom_start_draw = 0;
+        s_detected_tonemap_draw = 0;
+        s_detected_backbuffer_blit_draw = 0;
+        s_detected_overlay_draw = 0;
+        s_frame_draw_index.store(0, std::memory_order_relaxed);
+
         s_upscale_evaluated_this_frame = false;
         motion_color_first_exit_logged = false;
         s_latest_unmapped_camera_valid = false;
@@ -3835,6 +4433,20 @@ extern "C" BOOL WINAPI EdpeRequestBindSequence() {
 
 void ContextCensusOnSwapChainRelease(IUnknown* object) {
     if (object != observed_swap_chain) return;
+    disarmPipelineDrawHooks();
+    s_scene_linear_depth.Reset();
+    s_scene_linear_depth_srv.Reset();
+    s_cached_linear_depth_tex = nullptr;
+    s_scene_linear_depth_frame = ~0ull;
+    s_bloom_upscale_output.Reset();
+    s_detected_gbuffer_start_draw = 0;
+    s_detected_linear_depth_draw = 0;
+    s_detected_scene_finish_draw = 0;
+    s_detected_bloom_start_draw = 0;
+    s_detected_tonemap_draw = 0;
+    s_detected_backbuffer_blit_draw = 0;
+    s_detected_overlay_draw = 0;
+    s_frame_draw_index.store(0, std::memory_order_relaxed);
     {
         std::lock_guard lock(seen_mutex);
         snapshot_queued = -1;
@@ -3959,7 +4571,12 @@ bool ContextCensusIsJitterActive() {
     if (!jitter_enabled.load(std::memory_order_relaxed)) return false;
     if (jitter_test_override.load(std::memory_order_relaxed)) return true;
     if (s_jitter_debug_view.load(std::memory_order_relaxed)) return true;
-    return edpe::UpscalerManager::instance().isReconstructionActive();
+    if (!edpe::UpscalerManager::instance().isReconstructionActive()) return false;
+    // Jitter is applied consistently across 3D scene passes from G-buffer MRT up to the upscale point
+    if (s_inside_scene_passes.load(std::memory_order_acquire)) return true;
+    // Before bloom start has run, allow main camera projection upload before MRT bind
+    if (!s_upscale_evaluated_this_frame) return true;
+    return false;
 }
 
 void ContextCensusGetActiveJitter(float* pixelX, float* pixelY, float* ndcX, float* ndcY,
