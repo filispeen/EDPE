@@ -9,9 +9,9 @@ namespace edpe {
 enum class ProfileZone : uint32_t {
     MapUnmap = 0,
     OMSetRenderTargets,
+    CameraDeltaCopy,
     DrawProbe,
     TemporalUpscale,
-    NvmlPoll,
     Count
 };
 
@@ -68,7 +68,7 @@ private:
         QueryPerformanceFrequency(&freq_);
     }
 
-    std::atomic<bool> enabled_{true};
+    std::atomic<bool> enabled_{false};
     LARGE_INTEGER freq_{};
     std::atomic<int64_t> currentTicks_[static_cast<uint32_t>(ProfileZone::Count)]{};
     int64_t windowTicks_[static_cast<uint32_t>(ProfileZone::Count)]{};
@@ -78,7 +78,7 @@ private:
 
 class ScopedProfileTimer {
 public:
-    inline ScopedProfileTimer(ProfileZone zone) : zone_(zone) {
+    inline ScopedProfileTimer(ProfileZone zone, int64_t multiplier = 1) : zone_(zone), multiplier_(multiplier) {
         if (Profiler::instance().isEnabled()) {
             QueryPerformanceCounter(&start_);
         }
@@ -88,13 +88,14 @@ public:
         if (start_.QuadPart > 0) {
             LARGE_INTEGER end;
             QueryPerformanceCounter(&end);
-            Profiler::instance().accumulate(zone_, end.QuadPart - start_.QuadPart);
+            Profiler::instance().accumulate(zone_, (end.QuadPart - start_.QuadPart) * multiplier_);
         }
     }
 
 private:
     ProfileZone zone_;
+    int64_t multiplier_{1};
     LARGE_INTEGER start_{};
 };
 
-} // namespace edpe
+}

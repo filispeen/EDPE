@@ -27,12 +27,17 @@ PerfTracker::PerfTracker() {
 }
 
 PerfTracker::~PerfTracker() {
-    if (nvmlRunning_.load(std::memory_order_relaxed)) {
-        nvmlRunning_.store(false, std::memory_order_relaxed);
-        nvmlCv_.notify_all();
-        if (nvmlWorkerThread_.joinable()) {
-            nvmlWorkerThread_.join();
-        }
+    shutdown();
+}
+
+void PerfTracker::shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(nvmlMutex_);
+        nvmlRunning_.store(false, std::memory_order_release);
+    }
+    nvmlCv_.notify_all();
+    if (nvmlWorkerThread_.joinable()) {
+        nvmlWorkerThread_.join();
     }
     if (nvmlModule_) {
         auto nvmlShutdown = reinterpret_cast<NvmlShutdown_t>(GetProcAddress(nvmlModule_, "nvmlShutdown"));
@@ -58,18 +63,18 @@ void PerfTracker::initNvml() {
             nvmlAvailable_ = true;
             nvmlRunning_.store(true, std::memory_order_relaxed);
             nvmlWorkerThread_ = std::thread([this]() {
-                while (nvmlRunning_.load(std::memory_order_relaxed)) {
+                while (true) {
                     {
-                        ScopedProfileTimer timer(ProfileZone::NvmlPoll);
-                        NvmlUtil_t util{};
-                        if (nvmlGetUtil_ && nvmlDevice_ && nvmlGetUtil_(nvmlDevice_, &util) == 0) {
-                            cachedGpuUsage_.store(util.gpu, std::memory_order_relaxed);
-                        }
+                        std::unique_lock<std::mutex> lock(nvmlMutex_);
+                        nvmlCv_.wait_for(lock, std::chrono::milliseconds(500), [this]() {
+                            return !nvmlRunning_.load(std::memory_order_acquire);
+                        });
+                        if (!nvmlRunning_.load(std::memory_order_acquire)) break;
                     }
-                    std::unique_lock<std::mutex> lock(nvmlMutex_);
-                    nvmlCv_.wait_for(lock, std::chrono::milliseconds(500), [this]() {
-                        return !nvmlRunning_.load(std::memory_order_relaxed);
-                    });
+                    NvmlUtil_t util{};
+                    if (nvmlGetUtil_ && nvmlDevice_ && nvmlGetUtil_(nvmlDevice_, &util) == 0) {
+                        cachedGpuUsage_.store(util.gpu, std::memory_order_relaxed);
+                    }
                 }
             });
             EdpeLog(L"EDPE: NVML hardware telemetry initialized successfully");
@@ -352,11 +357,19 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
         if (cfg.enableProfiler) {
             ImGui::Separator();
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Profiler (120f avg):");
-            ImGui::Text("  Map/Unmap (CB/Jitter): %.3f ms", Profiler::instance().getAvgMs(ProfileZone::MapUnmap));
-            ImGui::Text("  OMSet / DSV Census:    %.3f ms", Profiler::instance().getAvgMs(ProfileZone::OMSetRenderTargets));
-            ImGui::Text("  HUD Draw Probe:        %.3f ms", Profiler::instance().getAvgMs(ProfileZone::DrawProbe));
-            ImGui::Text("  Upscale Prep & Eval:   %.3f ms", Profiler::instance().getAvgMs(ProfileZone::TemporalUpscale));
-            ImGui::Text("  NVML Telemetry (bg):   %.3f ms", Profiler::instance().getAvgMs(ProfileZone::NvmlPoll));
+            const float mapMs = Profiler::instance().getAvgMs(ProfileZone::MapUnmap);
+            const float omMs = Profiler::instance().getAvgMs(ProfileZone::OMSetRenderTargets);
+            const float deltaMs = Profiler::instance().getAvgMs(ProfileZone::CameraDeltaCopy);
+            const float drawMs = Profiler::instance().getAvgMs(ProfileZone::DrawProbe);
+            const float upscaleMs = Profiler::instance().getAvgMs(ProfileZone::TemporalUpscale);
+            const float measuredSum = mapMs + omMs + deltaMs + drawMs;
+            const float unaccountedMs = (std::max)(0.0f, telemetry_.gameFrametimeMs - measuredSum);
+            ImGui::Text("  Map/Unmap (CB/Jitter): %.3f ms", mapMs);
+            ImGui::Text("  OMSetRenderTargets:    %.3f ms", omMs);
+            ImGui::Text("  Camera Delta Copy:     %.3f ms", deltaMs);
+            ImGui::Text("  HUD Draw Probe:        %.3f ms", drawMs);
+            ImGui::Text("  Upscale Prep & Eval:   %.3f ms", upscaleMs);
+            ImGui::Text("  Unaccounted (Game):    %.3f ms", unaccountedMs);
         }
     }
     ImGui::End();

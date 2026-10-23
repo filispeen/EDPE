@@ -907,6 +907,7 @@ void shutdownUi() {
     if (ui.context) ui.context->Release();
     if (ui.device) ui.device->Release();
     edpe::UpscalerManager::instance().shutdown();
+    edpe::PerfTracker::instance().shutdown();
     ui = {};
     std::lock_guard lock(input_mutex);
     pending_input.clear();
