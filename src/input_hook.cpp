@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace {
+namespace edpe {
 
 bool patchIatEntry(HMODULE module, const char* targetDll, const char* targetFunction, void* hook, void** orig) {
     if (!module || !targetDll || !targetFunction || !hook) return false;
@@ -64,6 +64,10 @@ bool patchIatEntry(HMODULE module, const char* targetDll, const char* targetFunc
     }
     return false;
 }
+
+} // namespace edpe
+
+namespace {
 
 void hookVtableSlot(void** vtbl, int index, void* newFunc, void** origFunc) {
     if (!vtbl || vtbl[index] == newFunc) return;

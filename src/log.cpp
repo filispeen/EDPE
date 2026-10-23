@@ -3,9 +3,22 @@
 #include <cstddef>
 #include <cstdio>
 #include <cwchar>
+#include <mutex>
+#include <string>
 #include <windows.h>
 
 namespace {
+std::mutex s_logMutex;
+
+struct DedupeState {
+    std::wstring lastMessage;
+    int repeatCount = 0;
+    LONGLONG lastRecordOffset = 0;
+    LONGLONG expectedFileSize = 0;
+};
+
+DedupeState s_dedupe;
+
 HANDLE beginLogSession(const wchar_t* path) {
     const DWORD pid = GetCurrentProcessId();
     wchar_t mutex_name[64], marker_name[64];
@@ -73,11 +86,33 @@ const ProcessInfo& getProcessInfo() {
 } // namespace
 
 void EdpeLog(const wchar_t* message) {
+    if (!message) return;
+
     const auto& info = getProcessInfo();
 
+    std::lock_guard<std::mutex> lock(s_logMutex);
+
+    const bool isRepeat = (s_dedupe.repeatCount > 0 && s_dedupe.lastMessage == message);
+    if (isRepeat && s_dedupe.repeatCount >= 11) {
+        return;
+    }
+
     wchar_t formatted[2048];
-    _snwprintf_s(formatted, sizeof(formatted) / sizeof(wchar_t), _TRUNCATE,
-        L"[%ls:%lu] %ls", info.exeName, info.pid, message);
+    if (isRepeat) {
+        s_dedupe.repeatCount++;
+        if (s_dedupe.repeatCount <= 10) {
+            _snwprintf_s(formatted, sizeof(formatted) / sizeof(wchar_t), _TRUNCATE,
+                L"[%ls:%lu] (X%d) %ls", info.exeName, info.pid, s_dedupe.repeatCount, message);
+        } else {
+            _snwprintf_s(formatted, sizeof(formatted) / sizeof(wchar_t), _TRUNCATE,
+                L"[%ls:%lu] (X10+) %ls", info.exeName, info.pid, message);
+        }
+    } else {
+        s_dedupe.lastMessage = message;
+        s_dedupe.repeatCount = 1;
+        _snwprintf_s(formatted, sizeof(formatted) / sizeof(wchar_t), _TRUNCATE,
+            L"[%ls:%lu] %ls", info.exeName, info.pid, message);
+    }
 
     OutputDebugStringW(formatted);
     OutputDebugStringW(L"\n");
@@ -93,11 +128,78 @@ void EdpeLog(const wchar_t* message) {
     if (!bytes) return;
     line[bytes - 1] = '\r';
     line[bytes] = '\n';
+    const DWORD lineBytes = static_cast<DWORD>(bytes + 1);
 
-    const HANDLE file = CreateFileW(info.logPath, FILE_APPEND_DATA,
+    const HANDLE file = CreateFileW(info.logPath, GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return;
-    DWORD written;
-    WriteFile(file, line, bytes + 1, &written, nullptr);
+
+    LARGE_INTEGER currentSize{};
+    if (!GetFileSizeEx(file, &currentSize)) {
+        CloseHandle(file);
+        return;
+    }
+
+    if (isRepeat) {
+        if (currentSize.QuadPart == s_dedupe.expectedFileSize &&
+            s_dedupe.lastRecordOffset >= 0 &&
+            s_dedupe.lastRecordOffset <= currentSize.QuadPart) {
+
+            LARGE_INTEGER seekPos;
+            seekPos.QuadPart = s_dedupe.lastRecordOffset;
+            if (SetFilePointerEx(file, seekPos, nullptr, FILE_BEGIN)) {
+                DWORD written = 0;
+                if (WriteFile(file, line, lineBytes, &written, nullptr)) {
+                    SetEndOfFile(file);
+                    LARGE_INTEGER newSize{};
+                    if (GetFileSizeEx(file, &newSize)) {
+                        s_dedupe.expectedFileSize = newSize.QuadPart;
+                    } else {
+                        s_dedupe.expectedFileSize = s_dedupe.lastRecordOffset + written;
+                    }
+                    CloseHandle(file);
+                    return;
+                }
+            }
+        }
+
+        s_dedupe.repeatCount = 1;
+        _snwprintf_s(formatted, sizeof(formatted) / sizeof(wchar_t), _TRUNCATE,
+            L"[%ls:%lu] %ls", info.exeName, info.pid, message);
+        const int fallbackBytes = WideCharToMultiByte(CP_UTF8, 0, formatted, -1, line,
+            static_cast<int>(sizeof(line) - 2), nullptr, nullptr);
+        if (fallbackBytes) {
+            line[fallbackBytes - 1] = '\r';
+            line[fallbackBytes] = '\n';
+            const DWORD fallbackLineBytes = static_cast<DWORD>(fallbackBytes + 1);
+
+            LARGE_INTEGER seekEnd;
+            seekEnd.QuadPart = 0;
+            LARGE_INTEGER actualEnd{};
+            if (SetFilePointerEx(file, seekEnd, &actualEnd, FILE_END)) {
+                s_dedupe.lastRecordOffset = actualEnd.QuadPart;
+                DWORD written = 0;
+                if (WriteFile(file, line, fallbackLineBytes, &written, nullptr)) {
+                    SetEndOfFile(file);
+                    s_dedupe.expectedFileSize = s_dedupe.lastRecordOffset + written;
+                }
+            }
+        }
+        CloseHandle(file);
+        return;
+    }
+
+    LARGE_INTEGER seekEnd;
+    seekEnd.QuadPart = 0;
+    LARGE_INTEGER actualEnd{};
+    if (SetFilePointerEx(file, seekEnd, &actualEnd, FILE_END)) {
+        s_dedupe.lastRecordOffset = actualEnd.QuadPart;
+        DWORD written = 0;
+        if (WriteFile(file, line, lineBytes, &written, nullptr)) {
+            SetEndOfFile(file);
+            s_dedupe.expectedFileSize = s_dedupe.lastRecordOffset + written;
+        }
+    }
+
     CloseHandle(file);
 }

@@ -1,4 +1,6 @@
+#include "d3d11_proxy.h"
 #include "config.h"
+#include "input_hook.h"
 #include "log.h"
 #include "shader_probe.h"
 #include "system_dll.h"
@@ -103,14 +105,15 @@ bool armShaderProbe() {
     const size_t prefix = name + 1 - path;
     if (prefix + sizeof(L"edpe_shader_probe.once") / sizeof(wchar_t) > MAX_PATH) return false;
     wcscpy_s(name + 1, MAX_PATH - prefix, L"edpe_shader_probe.once");
-    return DeleteFileW(path) != 0; // Consume the marker before installing any hook.
+    return DeleteFileW(path) != 0;
+}
 }
 
 void hookShaderCreation(ID3D11Device* device) {
+    if (!device) return;
     void** table = *reinterpret_cast<void***>(device);
     if (hooked_device_table.load(std::memory_order_acquire)) return;
     retain_vertex_bytecode.store(armShaderProbe(), std::memory_order_relaxed);
-    // COM vtable callbacks must stay valid even if the caller frees this proxy.
     HMODULE self = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
             GET_MODULE_HANDLE_EX_FLAG_PIN,
@@ -118,8 +121,8 @@ void hookShaderCreation(ID3D11Device* device) {
         EdpeLog(L"EDPE: shader signatures unavailable (proxy lifetime cannot be pinned)");
         return;
     }
-    constexpr size_t slot = 12; // ID3D11Device::CreateVertexShader.
-    constexpr size_t pixel_slot = 15; // ID3D11Device::CreatePixelShader.
+    constexpr size_t slot = 12;
+    constexpr size_t pixel_slot = 15;
     auto forward = reinterpret_cast<CreateVertexShaderFn>(table[slot]);
     if (!forward || forward == &observedCreateVertexShader) return;
     original_create_vertex_shader.store(forward, std::memory_order_release);
@@ -170,6 +173,21 @@ void hookShaderCreation(ID3D11Device* device) {
             EdpeLog(L"EDPE: one-run vertex shader bytecode probe armed");
     } else EdpeLog(L"EDPE: vertex shader bytecode probe unavailable (slot changed)");
 }
+
+namespace edpe {
+void installD3D11Hooks() {
+    static std::atomic<bool> s_installed{false};
+    if (s_installed.exchange(true)) return;
+
+    HMODULE gameExe = GetModuleHandleW(nullptr);
+    if (!gameExe) return;
+
+    static void* s_orig_d3d11 = nullptr;
+    if (patchIatEntry(gameExe, "d3d11.dll", "D3D11CreateDevice",
+            reinterpret_cast<void*>(&EdpeD3D11CreateDevice), &s_orig_d3d11)) {
+        EdpeLog(L"EDPE: D3D11CreateDevice IAT hook installed in main executable");
+    }
+}
 }
 
 extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
@@ -183,13 +201,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
     ID3D11Device** device,
     D3D_FEATURE_LEVEL* feature_level,
     ID3D11DeviceContext** context) {
-    static bool s_synced = false;
-    if (!s_synced) {
-        s_synced = true;
-        auto& cfg = edpe::Config::instance();
-        cfg.load();
-        cfg.syncEliteGraphicsConfig();
-    }
+    syncConfigOnce();
     static const HMODULE system_d3d11 = LoadSystemDll(L"d3d11.dll");
     if (!system_d3d11) return HRESULT_FROM_WIN32(GetLastError());
 

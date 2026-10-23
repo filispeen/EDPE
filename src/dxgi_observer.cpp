@@ -1,3 +1,4 @@
+#include "d3d11_proxy.h"
 #include "log.h"
 #include "ui.h"
 #include "context_census.h"
@@ -13,8 +14,8 @@
 #include <windows.h>
 
 namespace {
-// COM vtable slots and interface lengths come from the Windows SDK DXGI headers.
 constexpr size_t kCreateSwapChain = 10;
+constexpr size_t kCreateSwapChainForHwnd = 15;
 constexpr size_t kPresent = 8;
 constexpr size_t kAddRef = 1;
 constexpr size_t kRelease = 2;
@@ -61,6 +62,8 @@ size_t swapChainMethods(IUnknown* swap_chain) {
 }
 
 using CreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using CreateSwapChainForHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND,
+    const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(IUnknown*);
 using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
@@ -72,8 +75,6 @@ ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
     const ULONG remaining = original(object);
     if (remaining) *reinterpret_cast<void***>(object) = table->methods;
     else {
-        // Tear the overlay down only when the object is really destroyed (the actual
-        // Release returned 0). Other Releases must not shut the UI down mid-frame.
         UiOnRelease(object);
         ContextCensusOnSwapChainRelease(object);
         delete table;
@@ -101,10 +102,30 @@ bool hookObject(IUnknown* object, size_t count, size_t method, void* replacement
 
 void observeSwapChain(IDXGISwapChain* swap_chain);
 
+void hookDeviceIfD3D11(IUnknown* device) {
+    if (!device) return;
+    ID3D11Device* d3d_device = nullptr;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Device), reinterpret_cast<void**>(&d3d_device)))) {
+        hookShaderCreation(d3d_device);
+        d3d_device->Release();
+    }
+}
+
 HRESULT STDMETHODCALLTYPE observedCreateSwapChain(IDXGIFactory* factory, IUnknown* device,
     DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swap_chain) {
+    hookDeviceIfD3D11(device);
     const auto original = reinterpret_cast<CreateSwapChainFn>(tableOf(factory)->original[kCreateSwapChain]);
     const HRESULT result = original(factory, device, desc, swap_chain);
+    if (SUCCEEDED(result) && swap_chain && *swap_chain) observeSwapChain(*swap_chain);
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE observedCreateSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* device, HWND hwnd,
+    const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc,
+    IDXGIOutput* restrict_to_output, IDXGISwapChain1** swap_chain) {
+    hookDeviceIfD3D11(device);
+    const auto original = reinterpret_cast<CreateSwapChainForHwndFn>(tableOf(factory)->original[kCreateSwapChainForHwnd]);
+    const HRESULT result = original(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swap_chain);
     if (SUCCEEDED(result) && swap_chain && *swap_chain) observeSwapChain(*swap_chain);
     return result;
 }
@@ -115,6 +136,7 @@ void logFirstPresent(IDXGISwapChain* swap_chain) {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     if (SUCCEEDED(swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device)))) {
+        hookShaderCreation(device);
         device->GetImmediateContext(&context);
     }
     wchar_t message[256];
@@ -207,9 +229,13 @@ void ObserveDxgiFactory(REFIID iid, void* factory) {
         iid != __uuidof(IDXGIFactory4) && iid != __uuidof(IDXGIFactory5) &&
         iid != __uuidof(IDXGIFactory6) && iid != __uuidof(IDXGIFactory7)) return;
     auto* object = static_cast<IDXGIFactory1*>(factory);
-    if (!hookObject(object, factoryMethods(object), kCreateSwapChain,
+    const size_t method_count = factoryMethods(object);
+    if (!hookObject(object, method_count, kCreateSwapChain,
             reinterpret_cast<void*>(&observedCreateSwapChain))) {
         OutputDebugStringW(L"EDPE: factory observation disabled (allocation failed)\n");
+    } else if (method_count >= 25) {
+        tableOf(object)->methods[kCreateSwapChainForHwnd] =
+            reinterpret_cast<void*>(&observedCreateSwapChainForHwnd);
     }
 }
 

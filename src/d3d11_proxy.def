@@ -1,2 +1,0 @@
-EXPORTS
-    D3D11CreateDevice=EdpeD3D11CreateDevice

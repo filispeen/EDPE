@@ -35,17 +35,15 @@ cmake -S . -B build -G "NMake Makefiles" "-DCMAKE_MAKE_PROGRAM=$((Get-Command nm
 cmake --build build
 ```
 
-The main DLLs are:
+The main DLL is:
 
 ```text
-build/EDPE.dll
-build/dxgi.dll
+build/Release/dxgi.dll
 ```
 
 The `proxy_stage` target is built along with the other default targets and stages runtime files here:
 
 ```text
-build/stage/d3d11.dll       # copy of EDPE.dll under the proxy filename
 build/stage/dxgi.dll
 build/stage/proxy_smoke.exe
 ```
@@ -66,6 +64,6 @@ The current tests cover temporal math, the GPU motion pass, DXBC fanout, and pro
 
 `src/ngx_context.cpp` and `tools/ngx_probe/ngx_probe.cpp` each define `kNgxProjectId`, an EDPE-owned GUID for `NVSDK_NGX_D3D11_Init_with_ProjectID` (not EDVR's ID). `NgxContext` remains a disabled stub: it makes no NGX calls.
 
-## Staging proxies for a local game run
+## Staging proxy for a local game run
 
-The README describes a manual test that copies `EDPE.dll` as `d3d11.dll` and places it alongside `dxgi.dll` next to `EliteDangerous64.exe`. The build and tests do not deploy these files automatically. Use only DLLs produced by a successful build.
+The README describes copying `build/stage/dxgi.dll` next to `EliteDangerous64.exe`. The build and tests do not deploy these files automatically. Use only DLLs produced by a successful build.
