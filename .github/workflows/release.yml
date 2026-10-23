@@ -20,6 +20,17 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Read tag message
+        id: tagmsg
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          git fetch --depth=1 origin "+refs/tags/${tag}:refs/tags/${tag}"
+          $msg = (git tag -l --format='%(contents)' $tag | Out-String).Trim()
+          Set-Content -Path "tag-message.md" -Value $msg -Encoding utf8
+          Write-Host "Tag message:"
+          Write-Host $msg
+
       - name: Cache NVIDIA DLSS SDK
         id: cache-dlss
         uses: actions/cache@v4
@@ -73,13 +84,13 @@ jobs:
           Copy-Item "build/stage/d3d11.dll" -Destination "$pkgDir/" -Force
           Copy-Item "build/stage/dxgi.dll" -Destination "$pkgDir/" -Force
           if (Test-Path "build/stage/nvngx_dlss.dll") {
-              Copy-Item "build/stage/nvngx_dlss.dll" -Destination "$pkgDir/" -Force
+            Copy-Item "build/stage/nvngx_dlss.dll" -Destination "$pkgDir/" -Force
           }
 
           # Copy documentation and default configuration
           Copy-Item "README.md" -Destination "$pkgDir/" -Force
           if (Test-Path "edpe.ini") {
-              Copy-Item "edpe.ini" -Destination "$pkgDir/" -Force
+            Copy-Item "edpe.ini" -Destination "$pkgDir/" -Force
           }
 
           $archiveName = "EDPE-$tag-windows-x64.zip"
@@ -90,7 +101,6 @@ jobs:
           "$sha256  $archiveName" | Set-Content -Path "$archiveName.sha256" -Encoding utf8
 
           Write-Host "Created archive: $archiveName (SHA-256: $sha256)"
-
           "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha256_name=$archiveName.sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
@@ -103,6 +113,7 @@ jobs:
             ${{ steps.package.outputs.archive_name }}
             ${{ steps.package.outputs.sha256_name }}
           name: EDPE ${{ github.ref_name }}
+          body_path: tag-message.md
           generate_release_notes: true
           draft: false
           prerelease: false
