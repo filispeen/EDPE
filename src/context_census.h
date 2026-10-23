@@ -17,9 +17,6 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionSnapshot(UINT* width, UINT* hei
 ID3D11ShaderResourceView* ContextCensusTakeMotionColorSnapshot(UINT* width, UINT* height);
 ID3D11ShaderResourceView* ContextCensusTakeMotionEarlyColorSnapshot(UINT* width, UINT* height);
 ID3D11ShaderResourceView* ContextCensusTakeMotionDepthSnapshot(UINT* width, UINT* height, unsigned* index = nullptr);
-ID3D11ShaderResourceView* ContextCensusTakeReactiveMaskSnapshot(UINT* width, UINT* height);
-ID3D11ShaderResourceView* ContextCensusGetReactiveMaskSrv();
-bool ContextCensusGetReactiveMaskStats(bool* hasEmissive, bool* hasHud, unsigned* hudDrawCount, UINT* width = nullptr, UINT* height = nullptr);
 int ContextCensusSceneDepthCandidate();
 ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index,
     ID3D11RenderTargetView** color_view = nullptr);
@@ -75,11 +72,3 @@ float ContextCensusGetJitterDebugThreshold();
 void ContextCensusSetJitterDebugMode(int mode);
 int ContextCensusGetJitterDebugMode();
 
-// Reactive Mask Debug View (Full-screen reactive mask visualization)
-void ContextCensusSetReactiveMaskDebugView(bool enable);
-bool ContextCensusGetReactiveMaskDebugView();
-void ContextCensusToggleReactiveMaskDebugView();
-void ContextCensusSetReactiveMaskDebugMode(int mode);
-int ContextCensusGetReactiveMaskDebugMode();
-void ContextCensusSetReactiveMaskDebugBoost(float boost);
-float ContextCensusGetReactiveMaskDebugBoost();

@@ -46,7 +46,6 @@ struct UiState {
         Backbuffer,
         ComparisonBefore,
         ComparisonAfter,
-        ReactiveMask
     };
 
     struct TextureCaptureRequest {
@@ -80,11 +79,6 @@ struct UiState {
     bool motion_window_open = true;
     ID3D11PixelShader* motion_preview_shader = nullptr;
     bool motion_shader_failed = false;
-    ID3D11ShaderResourceView* reactive_mask_srv = nullptr;
-    UINT reactive_mask_width = 0;
-    UINT reactive_mask_height = 0;
-    bool reactive_mask_window_open = false;
-    bool live_reactive_mask_open = false;
     UINT color_width = 0;
     UINT color_height = 0;
     int color_snapshot_index = -1;
@@ -188,17 +182,6 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         return true;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F9) return true;
-    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-        wparam == VK_F11 && !(lparam & (1LL << 30))) {
-        ContextCensusToggleReactiveMaskDebugView();
-        const bool active = ContextCensusGetReactiveMaskDebugView();
-        auto& cfg = edpe::Config::instance();
-        cfg.reactiveMaskDebugView = active;
-        cfg.save();
-        EdpeLog(active ? L"EDPE: F11 pressed — Reactive Mask Debug View enabled" : L"EDPE: F11 pressed — Reactive Mask Debug View disabled");
-        return true;
-    }
-    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F11) return true;
     if (menu_visible.load()) {
         if (message == WM_INPUT) return true;
         if (message == WM_SETCURSOR) {
@@ -279,10 +262,6 @@ void releaseMotionSnapshot() {
     ui.motion_srv = nullptr;
 }
 
-void releaseReactiveMaskSnapshot() {
-    if (ui.reactive_mask_srv) ui.reactive_mask_srv->Release();
-    ui.reactive_mask_srv = nullptr;
-}
 
 void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int index = -1,
     const SYSTEMTIME* customTime = nullptr) {
@@ -323,7 +302,7 @@ void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int
             kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" :
             kind == UiState::CaptureKind::ComparisonBefore ? L"comparison before" :
             kind == UiState::CaptureKind::ComparisonAfter ? L"comparison after" :
-            kind == UiState::CaptureKind::ReactiveMask ? L"reactive mask" : L"backbuffer",
+            L"backbuffer",
             desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
         EdpeLog(msg);
     } else {
@@ -430,11 +409,6 @@ void pollFrameCapture() {
                     swprintf_s(name, L"capture-%04u%02u%02u-%02u%02u%02u-after.bmp",
                         req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay,
                         req.timestamp.wHour, req.timestamp.wMinute, req.timestamp.wSecond);
-                    break;
-                case UiState::CaptureKind::ReactiveMask:
-                    swprintf_s(name, L"reactive-mask-%04u%02u%02u-%02u%02u%02u-%03u-%u.bmp",
-                        req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay, req.timestamp.wHour, req.timestamp.wMinute,
-                        req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
                     break;
                 case UiState::CaptureKind::Backbuffer:
                 default:
@@ -549,23 +523,7 @@ void pollFrameCapture() {
                                 row[4 * x + 2] = px[0];
                                 row[4 * x + 3] = 255;
                             }
-                        }
-                    } else if (req.kind == UiState::CaptureKind::ReactiveMask) {
-                        for (UINT x = 0; x < req.width; ++x) {
-                            uint8_t val = 0;
-                            if (req.format == DXGI_FORMAT_R8_UNORM || req.format == DXGI_FORMAT_R8_TYPELESS) {
-                                val = source[x];
-                            } else if (req.format == DXGI_FORMAT_R8G8_UNORM) {
-                                val = source[2 * x];
-                            } else {
-                                val = source[x];
-                            }
-                            row[4 * x + 0] = val;
-                            row[4 * x + 1] = val;
-                            row[4 * x + 2] = val;
-                            row[4 * x + 3] = 255;
-                        }
-                    } else { // Backbuffer, ComparisonBefore, ComparisonAfter
+                        }            } else { // Backbuffer, ComparisonBefore, ComparisonAfter
                         for (UINT x = 0; x < req.width; ++x) {
                             if (req.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
                                 uint32_t val = 0;
@@ -595,7 +553,7 @@ void pollFrameCapture() {
                         req.kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" :
                         req.kind == UiState::CaptureKind::ComparisonBefore ? L"comparison before" :
                         req.kind == UiState::CaptureKind::ComparisonAfter ? L"comparison after" :
-                        req.kind == UiState::CaptureKind::ReactiveMask ? L"reactive mask" : L"frame",
+                        L"frame",
                         path.wstring().c_str());
                     EdpeLog(log_msg);
                     if (req.kind == UiState::CaptureKind::ComparisonAfter) {
@@ -940,7 +898,6 @@ void shutdownUi() {
     releaseColorSnapshot();
     releaseEarlyColorSnapshot();
     releaseMotionSnapshot();
-    releaseReactiveMaskSnapshot();
     for (auto& req : ui.pending_captures) {
         if (req.staging) req.staging->Release();
     }
@@ -1072,7 +1029,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ContextCensusRequestMotionPair(static_cast<unsigned>(candidate));
             ui.pending_backbuffer_capture_on_motion = true;
             releaseMotionSnapshot();
-    releaseReactiveMaskSnapshot();
             releaseColorSnapshot();
             releaseEarlyColorSnapshot();
             releaseDepthSnapshot();
@@ -1128,15 +1084,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ensureDepthContrastShader();
         queueTextureCaptureFromSrv(ui.depth_srv, UiState::CaptureKind::Depth, static_cast<int>(motion_depth_idx));
         EdpeLog(L"EDPE: same-frame depth handed to ImGui");
-    }
-    if (auto* reactive = ContextCensusTakeReactiveMaskSnapshot(
-            &ui.reactive_mask_width, &ui.reactive_mask_height)) {
-        releaseReactiveMaskSnapshot();
-        ui.reactive_mask_srv = reactive;
-        ui.reactive_mask_window_open = true;
-        ui.snapshot_ready = true;
-        queueTextureCaptureFromSrv(ui.reactive_mask_srv, UiState::CaptureKind::ReactiveMask);
-        EdpeLog(L"EDPE: reactive mask snapshot handed to ImGui");
     }
     if (motion_batch_ready && ui.pending_backbuffer_capture_on_motion) {
         ui.pending_backbuffer_capture_on_motion = false;
@@ -1451,7 +1398,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Capture motion candidate (experimental)") &&
         ContextCensusRequestMotionPair(static_cast<unsigned>(scene_candidate))) {
         releaseMotionSnapshot();
-        releaseReactiveMaskSnapshot();
         releaseColorSnapshot();
         releaseEarlyColorSnapshot();
     }
@@ -1478,12 +1424,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ui.motion_width, ui.motion_height);
         if (!ui.motion_window_open && ImGui::Button("Show motion snapshot"))
             ui.motion_window_open = true;
-    }
-    if (ui.reactive_mask_srv) {
-        ImGui::Text("Reactive Mask candidate: %ux%u",
-            ui.reactive_mask_width, ui.reactive_mask_height);
-        if (!ui.reactive_mask_window_open && ImGui::Button("Show reactive mask snapshot"))
-            ui.reactive_mask_window_open = true;
     }
     ImGui::Separator();
     ImGui::TextUnformatted("Projection Jitter & Motion Tuning (DLAA Stability)");
@@ -1558,74 +1498,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     if (ImGui::Button("Save Tuning to edpe.ini")) {
         edpe::Config::instance().save();
-    }
-    ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.3f, 0.9f, 1.0f, 1.0f), "Reactive Mask (Ghosting & Cockpit HUD Stability)");
-    {
-        auto& cfg = edpe::Config::instance();
-        bool rm_enabled = cfg.reactiveMask;
-        if (ImGui::Checkbox("Enable Reactive Mask", &rm_enabled)) {
-            cfg.reactiveMask = rm_enabled;
-            cfg.save();
-        }
-        if (rm_enabled) {
-            bool hasEmissive = false, hasHud = false;
-            unsigned hudDraws = 0;
-            UINT rm_w = 0, rm_h = 0;
-            const bool active = ContextCensusGetReactiveMaskStats(&hasEmissive, &hasHud, &hudDraws, &rm_w, &rm_h);
-            if (active) {
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-                    "Reactive Mask Active: %ux%u (Emissive: %s, HUD draws: %u)",
-                    rm_w, rm_h, hasEmissive ? "yes" : "no", hudDraws);
-            } else {
-                ImGui::TextDisabled("Reactive Mask: Standby (renders when upscaler evaluates)");
-            }
-            if (ImGui::SliderFloat("Emissive Weight", &cfg.reactiveEmissiveWeight, 0.0f, 5.0f, "%.2f")) {
-                cfg.save();
-            }
-            if (ImGui::SliderFloat("Emissive Threshold", &cfg.reactiveEmissiveThreshold, 0.0f, 0.1f, "%.3f")) {
-                cfg.save();
-            }
-            if (ImGui::SliderFloat("HUD Weight", &cfg.reactiveHudWeight, 0.0f, 5.0f, "%.2f")) {
-                cfg.save();
-            }
-            if (ImGui::SliderFloat("HUD Threshold", &cfg.reactiveHudThreshold, 0.0f, 0.05f, "%.3f")) {
-                cfg.save();
-            }
-            ImGui::Checkbox("Show Live Reactive Mask (Window)", &ui.live_reactive_mask_open);
-
-            ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.9f, 0.4f, 1.0f, 1.0f), "Fullscreen Reactive Mask Debug View (Hotkey: F11)");
-            bool rm_debug = ContextCensusGetReactiveMaskDebugView();
-            if (ImGui::Checkbox("Enable Fullscreen Reactive Mask View", &rm_debug)) {
-                ContextCensusSetReactiveMaskDebugView(rm_debug);
-                cfg.reactiveMaskDebugView = rm_debug;
-                cfg.save();
-            }
-            if (rm_debug) {
-                int mode = ContextCensusGetReactiveMaskDebugMode();
-                const char* const modes[] = {
-                    "Pure Grayscale Mask (0: Black, 1: White)",
-                    "Magenta Overlay on Dimmed Game Scene",
-                    "Thermal Heatmap (Rainbow)",
-                    "Cyan Overlay on Dimmed Game Scene"
-                };
-                if (ImGui::Combo("View Mode##Reactive", &mode, modes, IM_ARRAYSIZE(modes))) {
-                    ContextCensusSetReactiveMaskDebugMode(mode);
-                    cfg.reactiveMaskDebugMode = mode;
-                    cfg.save();
-                }
-                float boost = ContextCensusGetReactiveMaskDebugBoost();
-                if (ImGui::SliderFloat("Brightness Boost##Reactive", &boost, 0.5f, 5.0f, "%.1fx")) {
-                    ContextCensusSetReactiveMaskDebugBoost(boost);
-                    cfg.reactiveMaskDebugBoost = boost;
-                    cfg.save();
-                }
-                ImGui::TextDisabled("Displays the reactive mask directly on the game screen before UI.");
-            }
-        }
-    }
-    ImGui::Separator();
+    }    ImGui::Separator();
     ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Subpixel Jitter Debug View (Hotkey: F8)");
     bool debug_view = ContextCensusGetJitterDebugView();
     if (ImGui::Checkbox("Enable Jitter Debug View (Grayscale Scene + Green Jitter Pixels)", &debug_view)) {
@@ -1689,11 +1562,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         all_captures_requested.store(true, std::memory_order_release);
     }
     ImGui::SameLine();
-    ImGui::TextUnformatted("(color, motion, depth, emission, reactive mask, frame)");
+    ImGui::TextUnformatted("(color, motion, depth, emission, frame)");
     if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
         ui.pending_backbuffer_capture = true;
     }
-    ImGui::TextUnformatted("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter | F11: reactive mask view");
+    ImGui::TextUnformatted("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter");
     ImGui::End();
     if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);
@@ -1758,7 +1631,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         placeSnapshotWindow(0);
         if (ImGui::Begin("EDPE Emissive / Glow (Early HDR) Snapshot", &ui.early_color_window_open)) {
             ImGui::TextUnformatted("Emissive / illumination pass: lamps, dials, lights");
-            ImGui::TextUnformatted("Direct native candidate for upscaler Reactive Mask");
             if (ui.early_color_srv && ImGui::Button("Save emissive to BMP")) {
                 queueTextureCaptureFromSrv(ui.early_color_srv, UiState::CaptureKind::EarlyHdr);
             }
@@ -1797,48 +1669,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             }
         }
         ImGui::End();
-    }
-    if (draw_menu && ui.reactive_mask_srv && ui.reactive_mask_window_open) {
-        placeSnapshotWindow(2, 1);
-        if (ImGui::Begin("EDPE Reactive Mask Snapshot", &ui.reactive_mask_window_open)) {
-            ImGui::Text("Reactive Mask Snapshot (%ux%u)", ui.reactive_mask_width, ui.reactive_mask_height);
-            ImGui::TextUnformatted("Combined Emissive (Pass 10) + Cockpit HUD (Pass 35)");
-            if (ui.reactive_mask_srv && ImGui::Button("Save reactive mask to BMP")) {
-                queueTextureCaptureFromSrv(ui.reactive_mask_srv, UiState::CaptureKind::ReactiveMask);
-            }
-            float width = ImGui::GetContentRegionAvail().x;
-            if (width > 640.0f) width = 640.0f;
-            if (width < 1.0f) width = 1.0f;
-            float height = width * static_cast<float>(ui.reactive_mask_height) / ui.reactive_mask_width;
-            if (height > 360.0f) { width *= 360.0f / height; height = 360.0f; }
-            ImGui::Image(reinterpret_cast<ImTextureID>(ui.reactive_mask_srv), ImVec2(width, height));
-        }
-        ImGui::End();
-    }
-    if (draw_menu && ui.live_reactive_mask_open) {
-        if (auto* srv = ContextCensusGetReactiveMaskSrv()) {
-            bool hasEmissive = false, hasHud = false;
-            unsigned hudDraws = 0;
-            UINT rw = 0, rh = 0;
-            ContextCensusGetReactiveMaskStats(&hasEmissive, &hasHud, &hudDraws, &rw, &rh);
-            if (ImGui::Begin("EDPE Live Reactive Mask", &ui.live_reactive_mask_open)) {
-                ImGui::Text("Live Reactive Mask (%ux%u) - Emissive: %s, HUD: %u draws",
-                    rw, rh, hasEmissive ? "yes" : "no", hudDraws);
-                ImGui::TextUnformatted("Real-time GPU preview: bright pixels = high temporal reactivity");
-                float width = ImGui::GetContentRegionAvail().x;
-                if (width > 640.0f) width = 640.0f;
-                if (width < 1.0f) width = 1.0f;
-                float height = (rw > 0 && rh > 0) ? (width * static_cast<float>(rh) / rw) : (width * 9.0f / 16.0f);
-                if (height > 360.0f) { width *= 360.0f / height; height = 360.0f; }
-                ImGui::Image(reinterpret_cast<ImTextureID>(srv), ImVec2(width, height));
-            }
-            ImGui::End();
-        } else {
-            if (ImGui::Begin("EDPE Live Reactive Mask", &ui.live_reactive_mask_open)) {
-                ImGui::TextDisabled("Live Reactive Mask is only allocated when upscaler is active.");
-            }
-            ImGui::End();
-        }
     }
     } // if (draw_menu)
     if (draw_menu && !window_open) {

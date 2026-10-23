@@ -14,7 +14,6 @@
 #include "jitter_logger.h"
 #include "jitter_debug_pass.h"
 #include "jitter_view_recorder.h"
-#include "reactive_mask_pass.h"
 #include "profiler.h"
 
 #include <DirectXPackedVector.h>
@@ -315,23 +314,6 @@ unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 std::unique_ptr<edpe::UiCompositePass> ui_composite_pass;
-std::unique_ptr<edpe::ReactiveMaskPass> s_reactive_mask_pass;
-Microsoft::WRL::ComPtr<ID3D11Texture2D> s_emissive_texture;
-Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_emissive_srv;
-unsigned long long s_emissive_latched_frame = ~0ull;
-Microsoft::WRL::ComPtr<ID3D11Texture2D> s_pre_hud_texture;
-Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_pre_hud_srv;
-unsigned long long s_pre_hud_latched_frame = ~0ull;
-bool s_hud_first_match_seen_this_frame = false;
-unsigned s_hud_draw_count = 0;
-unsigned s_last_frame_hud_draw_count = 0;
-bool s_last_frame_has_emissive = false;
-bool s_last_frame_has_hud = false;
-Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_reactive_mask_snapshot;
-UINT s_reactive_mask_snapshot_width = 0;
-UINT s_reactive_mask_snapshot_height = 0;
-void latchPreHudColor(ID3D11DeviceContext* context);
-void latchEmissiveBuffer(ID3D11DeviceContext* context);
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
 UINT motion_snapshot_width = 0;
 UINT motion_snapshot_height = 0;
@@ -477,9 +459,6 @@ std::atomic<float> s_jitter_debug_sensitivity{1.5f};
 std::atomic<float> s_jitter_debug_threshold{0.02f};
 std::atomic<int> s_jitter_debug_mode{0};
 
-std::atomic<bool> s_reactive_mask_debug_view{false};
-std::atomic<int> s_reactive_mask_debug_mode{0};
-std::atomic<float> s_reactive_mask_debug_boost{1.0f};
 
 std::atomic<bool> s_zero_motion_vectors{false};
 std::atomic<bool> s_motion_invert_x{false};
@@ -492,7 +471,6 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
 void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud);
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
-void renderReactiveMaskDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void rearmContextHooks();
 
 bool sameRenderTargetResource(ID3D11RenderTargetView* view,
@@ -745,11 +723,6 @@ bool observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
                      (vs_hash == 0xE508648660A352B2ull &&
                       ps_hash == 0x63ABD86359B57D01ull);
     if (!hud) return false;
-    if (!s_hud_first_match_seen_this_frame) {
-        s_hud_first_match_seen_this_frame = true;
-        latchPreHudColor(context);
-    }
-    ++s_hud_draw_count;
     if (!hud_first_match_seen) {
         wchar_t message[160];
         swprintf_s(message, L"EDPE: HUD draw on HDR target VS=%016llX PS=%016llX frame=%llu",
@@ -2009,84 +1982,6 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
                        L"EDPE: early HDR color copied at first RTV3 exit");
 }
 
-void latchEmissiveBuffer(ID3D11DeviceContext* context) {
-    if (!motion_color_source) return;
-    Microsoft::WRL::ComPtr<ID3D11Resource> resource;
-    motion_color_source->GetResource(&resource);
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
-    if (!resource || FAILED(resource.As(&source))) return;
-
-    D3D11_TEXTURE2D_DESC desc{};
-    source->GetDesc(&desc);
-    if (desc.Format != DXGI_FORMAT_R11G11B10_FLOAT || !desc.Width || !desc.Height) return;
-
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
-    if (!device) return;
-
-    if (s_emissive_texture) {
-        D3D11_TEXTURE2D_DESC curDesc{};
-        s_emissive_texture->GetDesc(&curDesc);
-        if (curDesc.Width != desc.Width || curDesc.Height != desc.Height || curDesc.Format != desc.Format) {
-            s_emissive_texture.Reset();
-            s_emissive_srv.Reset();
-        }
-    }
-    if (!s_emissive_texture) {
-        D3D11_TEXTURE2D_DESC copyDesc = desc;
-        copyDesc.Usage = D3D11_USAGE_DEFAULT;
-        copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        copyDesc.CPUAccessFlags = copyDesc.MiscFlags = 0;
-        if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &s_emissive_texture)) ||
-            FAILED(device->CreateShaderResourceView(s_emissive_texture.Get(), nullptr, &s_emissive_srv))) {
-            s_emissive_texture.Reset();
-            s_emissive_srv.Reset();
-            return;
-        }
-    }
-    context->CopyResource(s_emissive_texture.Get(), source.Get());
-    s_emissive_latched_frame = last_present_frame.load(std::memory_order_relaxed);
-}
-
-void latchPreHudColor(ID3D11DeviceContext* context) {
-    if (!motion_color_source) return;
-    Microsoft::WRL::ComPtr<ID3D11Resource> resource;
-    motion_color_source->GetResource(&resource);
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
-    if (!resource || FAILED(resource.As(&source))) return;
-
-    D3D11_TEXTURE2D_DESC desc{};
-    source->GetDesc(&desc);
-    if (!desc.Width || !desc.Height) return;
-
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
-    if (!device) return;
-
-    if (s_pre_hud_texture) {
-        D3D11_TEXTURE2D_DESC curDesc{};
-        s_pre_hud_texture->GetDesc(&curDesc);
-        if (curDesc.Width != desc.Width || curDesc.Height != desc.Height || curDesc.Format != desc.Format) {
-            s_pre_hud_texture.Reset();
-            s_pre_hud_srv.Reset();
-        }
-    }
-    if (!s_pre_hud_texture) {
-        D3D11_TEXTURE2D_DESC copyDesc = desc;
-        copyDesc.Usage = D3D11_USAGE_DEFAULT;
-        copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        copyDesc.CPUAccessFlags = copyDesc.MiscFlags = 0;
-        if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &s_pre_hud_texture)) ||
-            FAILED(device->CreateShaderResourceView(s_pre_hud_texture.Get(), nullptr, &s_pre_hud_srv))) {
-            s_pre_hud_texture.Reset();
-            s_pre_hud_srv.Reset();
-            return;
-        }
-    }
-    context->CopyResource(s_pre_hud_texture.Get(), source.Get());
-    s_pre_hud_latched_frame = last_present_frame.load(std::memory_order_relaxed);
-}
-
 void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
     for (auto& sample : camera_pair_depth) {
         ID3D11DepthStencilView* view = nullptr;
@@ -2294,24 +2189,6 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
     motion_snapshot = motion_pass->output();
     motion_snapshot_width = desc.Width;
     motion_snapshot_height = desc.Height;
-    s_reactive_mask_snapshot.Reset();
-    s_reactive_mask_snapshot_width = 0;
-    s_reactive_mask_snapshot_height = 0;
-    if (s_reactive_mask_pass && s_reactive_mask_pass->outputTexture()) {
-        D3D11_TEXTURE2D_DESC rDesc{};
-        s_reactive_mask_pass->outputTexture()->GetDesc(&rDesc);
-        rDesc.Usage = D3D11_USAGE_DEFAULT;
-        rDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        rDesc.CPUAccessFlags = rDesc.MiscFlags = 0;
-        Microsoft::WRL::ComPtr<ID3D11Texture2D> rCopy;
-        if (SUCCEEDED(device->CreateTexture2D(&rDesc, nullptr, &rCopy)) &&
-            SUCCEEDED(device->CreateShaderResourceView(rCopy.Get(), nullptr, &s_reactive_mask_snapshot))) {
-            context->CopyResource(rCopy.Get(), s_reactive_mask_pass->outputTexture());
-            s_reactive_mask_snapshot_width = rDesc.Width;
-            s_reactive_mask_snapshot_height = rDesc.Height;
-            EdpeLog(L"EDPE: reactive mask snapshot retained on GPU");
-        }
-    }
     Microsoft::WRL::ComPtr<ID3D11Resource> output;
     motion_pass->output()->GetResource(&output);
     D3D11_TEXTURE2D_DESC read_desc{};
@@ -2391,8 +2268,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     auto& upscaler = edpe::UpscalerManager::instance();
     const bool upscale_active = upscaler.isReconstructionActive();
     const bool debug_view_active = s_jitter_debug_view.load(std::memory_order_relaxed);
-    const bool reactive_debug_view_active = s_reactive_mask_debug_view.load(std::memory_order_relaxed);
-    if ((!upscale_active && !debug_view_active && !reactive_debug_view_active) || !context || !backbuffer) return;
+    if ((!upscale_active && !debug_view_active) || !context || !backbuffer) return;
 
     const wchar_t* skip = nullptr;
     if (!motion_color_source || !scene_depth_source) skip = L"scene color/depth not observed";
@@ -2715,41 +2591,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                              srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
     inputs.colorIsHdr = isHdrColor;
 
-    ID3D11Texture2D* reactiveMaskTex = nullptr;
-    ID3D11ShaderResourceView* reactiveMaskSrv = nullptr;
-
-    const bool enableReactiveMask = edpe::Config::instance().reactiveMask ||
-                                    s_reactive_mask_debug_view.load(std::memory_order_relaxed);
-    if (enableReactiveMask) {
-        if (!s_reactive_mask_pass) {
-            auto candidate = std::make_unique<edpe::ReactiveMaskPass>();
-            if (candidate->initialize(device.Get(), context)) {
-                s_reactive_mask_pass = std::move(candidate);
-            }
-        }
-        if (s_reactive_mask_pass) {
-            ID3D11ShaderResourceView* emissiveSrv =
-                (s_emissive_latched_frame == rendered) ? s_emissive_srv.Get() : nullptr;
-            ID3D11ShaderResourceView* preHudSrv =
-                (s_pre_hud_latched_frame == rendered && s_hud_draw_count > 0) ? s_pre_hud_srv.Get() : nullptr;
-            ID3D11ShaderResourceView* postHudSrv = s_dlaa_input_srv.Get();
-
-            const auto& cfg = edpe::Config::instance();
-            if (s_reactive_mask_pass->render(context, emissiveSrv, preHudSrv, postHudSrv,
-                    depthDesc.Width, depthDesc.Height,
-                    cfg.reactiveEmissiveWeight, cfg.reactiveHudWeight,
-                    cfg.reactiveEmissiveThreshold, cfg.reactiveHudThreshold)) {
-                reactiveMaskTex = s_reactive_mask_pass->outputTexture();
-                reactiveMaskSrv = s_reactive_mask_pass->outputSrv();
-                s_last_frame_has_emissive = (emissiveSrv != nullptr);
-                s_last_frame_has_hud = (preHudSrv != nullptr);
-                s_last_frame_hud_draw_count = s_hud_draw_count;
-            }
-        }
-    }
-
-    inputs.reactiveMask = reactiveMaskTex;
-    inputs.reactiveMaskSrv = reactiveMaskSrv;
+    inputs.reactiveMask = nullptr;
+    inputs.reactiveMaskSrv = nullptr;
 
     s_last_temporal_inputs = inputs;
     s_last_temporal_inputs_frame = rendered;
@@ -3067,46 +2910,6 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
     }
 }
 
-void renderReactiveMaskDebugView(ID3D11DeviceContext* context, unsigned long long rendered,
-    ID3D11Texture2D* backbuffer) {
-    if (!context || !backbuffer || !s_reactive_mask_pass || !s_reactive_mask_pass->outputSrv()) return;
-
-    D3D11_TEXTURE2D_DESC bbDesc{};
-    backbuffer->GetDesc(&bbDesc);
-    if (!bbDesc.Width || !bbDesc.Height || bbDesc.SampleDesc.Count != 1) return;
-
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
-    if (!device) return;
-
-    static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_reactive_debug_backbuffer_rtv;
-    static ID3D11Texture2D* s_reactive_debug_cached_backbuffer = nullptr;
-
-    if (s_reactive_debug_cached_backbuffer != backbuffer || !s_reactive_debug_backbuffer_rtv) {
-        s_reactive_debug_cached_backbuffer = backbuffer;
-        s_reactive_debug_backbuffer_rtv.Reset();
-        if (FAILED(device->CreateRenderTargetView(backbuffer, nullptr, &s_reactive_debug_backbuffer_rtv))) {
-            return;
-        }
-    }
-
-    ID3D11ShaderResourceView* sceneColorSrv = nullptr;
-    bool isHdr = false;
-    if (s_last_temporal_inputs_frame == rendered && s_last_temporal_inputs.colorSrv != nullptr) {
-        sceneColorSrv = s_last_temporal_inputs.colorSrv;
-        isHdr = s_last_temporal_inputs.colorIsHdr;
-    }
-
-    const int mode = s_reactive_mask_debug_mode.load(std::memory_order_relaxed);
-    const float boost = s_reactive_mask_debug_boost.load(std::memory_order_relaxed);
-
-    s_reactive_mask_pass->renderDebugView(context,
-        sceneColorSrv,
-        s_reactive_debug_backbuffer_rtv.Get(),
-        bbDesc.Width, bbDesc.Height,
-        mode, boost, isHdr);
-}
-
 void logSnapshotColorTarget(size_t depth_index, unsigned bind_ordinal, UINT count,
     ID3D11RenderTargetView* const* targets) {
     wchar_t message[192];
@@ -3174,8 +2977,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     rearmHudDrawProbe();
     const bool reconstruction_active =
         edpe::UpscalerManager::instance().isReconstructionActive() ||
-        s_jitter_debug_view.load(std::memory_order_relaxed) ||
-        s_reactive_mask_debug_view.load(std::memory_order_relaxed);
+        s_jitter_debug_view.load(std::memory_order_relaxed);
     const auto current_frame = last_present_frame.load(std::memory_order_relaxed);
     if ((motion_pair_active || reconstruction_active) && motion_color_source &&
         motion_color_frame == current_frame) {
@@ -3196,9 +2998,6 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         if (motion_color_bound && !bound) {
             // Main scene G-buffer pass has completed and unbound!
             s_inside_main_scene.store(false, std::memory_order_release);
-            if (reconstruction_active || motion_pair_active) {
-                latchEmissiveBuffer(context);
-            }
             if (motion_pair_active && !motion_color_first_exit_logged) {
                 motion_color_first_exit_logged = true;
                 wchar_t message[160];
@@ -3574,9 +3373,6 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_jitter_debug_sensitivity.store(cfg.jitterDebugSensitivity, std::memory_order_relaxed);
         s_jitter_debug_threshold.store(cfg.jitterDebugThreshold, std::memory_order_relaxed);
         s_jitter_debug_mode.store(cfg.jitterDebugMode, std::memory_order_relaxed);
-        s_reactive_mask_debug_view.store(cfg.reactiveMaskDebugView, std::memory_order_relaxed);
-        s_reactive_mask_debug_mode.store(cfg.reactiveMaskDebugMode, std::memory_order_relaxed);
-        s_reactive_mask_debug_boost.store(cfg.reactiveMaskDebugBoost, std::memory_order_relaxed);
         s_zero_motion_vectors.store(cfg.zeroMotionVectors, std::memory_order_relaxed);
         s_motion_invert_x.store(cfg.motionInvertX, std::memory_order_relaxed);
         s_motion_invert_y.store(cfg.motionInvertY, std::memory_order_relaxed);
@@ -3734,13 +3530,10 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     reinterpret_cast<void**>(backbuffer.GetAddressOf())))) {
                 s_swapchain_backbuffer.store(backbuffer.Get(), std::memory_order_relaxed);
                 const bool debug_view_active = s_jitter_debug_view.load(std::memory_order_relaxed);
-                const bool reactive_debug_view_active = s_reactive_mask_debug_view.load(std::memory_order_relaxed);
-                if (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active || reactive_debug_view_active) {
+                if (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active) {
                     tryTemporalUpscale(context, rendered_frame, backbuffer.Get());
                 }
-                if (reactive_debug_view_active) {
-                    renderReactiveMaskDebugView(context, rendered_frame, backbuffer.Get());
-                } else if (debug_view_active) {
+                if (debug_view_active) {
                     renderJitterDebugView(context, rendered_frame, backbuffer.Get());
                 }
             }
@@ -3785,8 +3578,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
 
         if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
-            !s_jitter_debug_view.load(std::memory_order_relaxed) &&
-            !s_reactive_mask_debug_view.load(std::memory_order_relaxed)) {
+            !s_jitter_debug_view.load(std::memory_order_relaxed)) {
             static LARGE_INTEGER s_last_present_qpc{};
             static LARGE_INTEGER s_present_freq{};
             if (s_present_freq.QuadPart == 0) QueryPerformanceFrequency(&s_present_freq);
@@ -4007,26 +3799,6 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionDepthSnapshot(UINT* width, UINT
     return motion_depth_snapshot.Detach();
 }
 
-ID3D11ShaderResourceView* ContextCensusTakeReactiveMaskSnapshot(UINT* width, UINT* height) {
-    if (!s_reactive_mask_snapshot) return nullptr;
-    if (width) *width = s_reactive_mask_snapshot_width;
-    if (height) *height = s_reactive_mask_snapshot_height;
-    return s_reactive_mask_snapshot.Detach();
-}
-
-ID3D11ShaderResourceView* ContextCensusGetReactiveMaskSrv() {
-    return s_reactive_mask_pass ? s_reactive_mask_pass->outputSrv() : nullptr;
-}
-
-bool ContextCensusGetReactiveMaskStats(bool* hasEmissive, bool* hasHud, unsigned* hudDrawCount, UINT* width, UINT* height) {
-    if (hasEmissive) *hasEmissive = s_last_frame_has_emissive;
-    if (hasHud) *hasHud = s_last_frame_has_hud;
-    if (hudDrawCount) *hudDrawCount = s_last_frame_hud_draw_count;
-    if (width) *width = s_reactive_mask_pass ? s_reactive_mask_pass->width() : 0;
-    if (height) *height = s_reactive_mask_pass ? s_reactive_mask_pass->height() : 0;
-    return (s_reactive_mask_pass != nullptr && s_reactive_mask_pass->outputSrv() != nullptr);
-}
-
 int ContextCensusSceneDepthCandidate() {
     std::lock_guard lock(seen_mutex);
     const auto frame = last_present_frame.load(std::memory_order_relaxed);
@@ -4153,14 +3925,6 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_grid_readback.Reset();
         motion_snapshot.Reset();
         motion_pass.reset();
-        s_reactive_mask_pass.reset();
-        s_emissive_texture.Reset();
-        s_emissive_srv.Reset();
-        s_pre_hud_texture.Reset();
-        s_pre_hud_srv.Reset();
-        s_reactive_mask_snapshot.Reset();
-        s_emissive_latched_frame = ~0ull;
-        s_pre_hud_latched_frame = ~0ull;
         motion_camera_frames = {~0ull, ~0ull};
         gpu_camera_pair = {};
         motion_depth_frame = ~0ull;
@@ -4419,34 +4183,3 @@ int ContextCensusGetJitterDebugMode() {
     return s_jitter_debug_mode.load(std::memory_order_relaxed);
 }
 
-void ContextCensusSetReactiveMaskDebugView(bool enable) {
-    s_reactive_mask_debug_view.store(enable, std::memory_order_relaxed);
-    edpe::Config::instance().reactiveMaskDebugView = enable;
-}
-
-bool ContextCensusGetReactiveMaskDebugView() {
-    return s_reactive_mask_debug_view.load(std::memory_order_relaxed);
-}
-
-void ContextCensusToggleReactiveMaskDebugView() {
-    const bool current = s_reactive_mask_debug_view.load(std::memory_order_relaxed);
-    ContextCensusSetReactiveMaskDebugView(!current);
-}
-
-void ContextCensusSetReactiveMaskDebugMode(int mode) {
-    s_reactive_mask_debug_mode.store(mode, std::memory_order_relaxed);
-    edpe::Config::instance().reactiveMaskDebugMode = mode;
-}
-
-int ContextCensusGetReactiveMaskDebugMode() {
-    return s_reactive_mask_debug_mode.load(std::memory_order_relaxed);
-}
-
-void ContextCensusSetReactiveMaskDebugBoost(float boost) {
-    s_reactive_mask_debug_boost.store(boost, std::memory_order_relaxed);
-    edpe::Config::instance().reactiveMaskDebugBoost = boost;
-}
-
-float ContextCensusGetReactiveMaskDebugBoost() {
-    return s_reactive_mask_debug_boost.load(std::memory_order_relaxed);
-}
