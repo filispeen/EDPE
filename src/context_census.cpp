@@ -298,6 +298,18 @@ inline void getExpectedRenderSize(UINT outW, UINT outH, UINT* expW, UINT* expH) 
     }
 }
 
+static unsigned long long s_count_bloom_upscale = 0;
+static unsigned long long s_count_present_ldr = 0;
+static unsigned long long s_count_present_bb = 0;
+enum class TemporalColorPath {
+    Unset,
+    OffscreenLdr,
+    NativeBackbuffer
+};
+constexpr uint32_t kPathSwitchStabilityFrames = 30;
+static TemporalColorPath s_active_color_path = TemporalColorPath::Unset;
+static TemporalColorPath s_pending_color_path = TemporalColorPath::Unset;
+static uint32_t s_pending_path_frames = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_depth_source;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_ldr_source;
 unsigned long long scene_ldr_frame = ~0ull;
@@ -1072,16 +1084,39 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
                                 if (bound_srvs[i].format == DXGI_FORMAT_UNKNOWN) {
                                     bound_srvs[i].format = td.Format;
                                 }
+
+                                const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+                                const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+
+                                if (outW > 0 && outH > 0 &&
+                                    td.Width == outW && td.Height == outH &&
+                                    (td.Format == DXGI_FORMAT_R11G11B10_FLOAT || bound_srvs[i].format == DXGI_FORMAT_R11G11B10_FLOAT)) {
+                                    if (hdr_slot < 0) {
+                                        hdr_slot = static_cast<int>(i);
+                                        if (srv_res != scene_hdr_color_source.Get()) {
+                                            wchar_t updMsg[256];
+                                            swprintf_s(updMsg,
+                                                L"EDPE: HDR scene target updated from bloom PS SRV: old=%p new=%p (slot=%u %ux%u fmt=%u)",
+                                                scene_hdr_color_source.Get(), srv_res, i, td.Width, td.Height,
+                                                static_cast<unsigned>(td.Format));
+                                            EdpeLog(updMsg);
+                                            scene_hdr_color_source = tex;
+                                            scene_hdr_color_frame = last_present_frame.load(std::memory_order_relaxed);
+                                        }
+                                    }
+                                }
                             }
 
-                            if (srv_res == scene_hdr_color_source.Get()) {
-                                hdr_slot = static_cast<int>(i);
-                            } else {
-                                Microsoft::WRL::ComPtr<IUnknown> unkSrv, unkHdr;
-                                if (SUCCEEDED(srv_res->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(unkSrv.GetAddressOf()))) &&
-                                    SUCCEEDED(scene_hdr_color_source.Get()->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(unkHdr.GetAddressOf()))) &&
-                                    unkSrv.Get() == unkHdr.Get()) {
+                            if (hdr_slot < 0 && scene_hdr_color_source) {
+                                if (srv_res == scene_hdr_color_source.Get()) {
                                     hdr_slot = static_cast<int>(i);
+                                } else {
+                                    Microsoft::WRL::ComPtr<IUnknown> unkSrv, unkHdr;
+                                    if (SUCCEEDED(srv_res->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(unkSrv.GetAddressOf()))) &&
+                                        SUCCEEDED(scene_hdr_color_source.Get()->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(unkHdr.GetAddressOf()))) &&
+                                        unkSrv.Get() == unkHdr.Get()) {
+                                        hdr_slot = static_cast<int>(i);
+                                    }
                                 }
                             }
                             srv_res->Release();
@@ -3348,7 +3383,7 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
 
     if (upscaler.evaluate(context, inputs, nullptr, s_bloom_upscale_output.Get())) {
         s_camera_reset = false;
-        
+        ++s_count_bloom_upscale;
         context->CopyResource(scene_hdr_color_source.Get(), s_bloom_upscale_output.Get());
         return true;
     }
@@ -3396,39 +3431,87 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const bool isSubNative = (currentMode != edpe::UpscaleMode::Native && currentMode != edpe::UpscaleMode::NativeAA);
     const bool hdrInput = edpe::Config::instance().hdrInput;
     ID3D11Texture2D* colorSource = nullptr;
-    if (hdrInput) {
-        if (scene_hdr_color_source && scene_hdr_color_frame == rendered) {
-            colorSource = scene_hdr_color_source.Get();
-        } else if (scene_ldr_source && scene_ldr_frame == rendered) {
-            colorSource = scene_ldr_source.Get();
-        } else if (isSubNative && scene_ldr_source) {
-            colorSource = scene_ldr_source.Get();
-        } else if (!isSubNative) {
-            colorSource = scene_hdr_color_source ? scene_hdr_color_source.Get() : backbuffer;
-        } else {
-            if (++s_consecutive_skipped_frames > 2) {
-                s_camera_reset = true;
-            }
-            return;
-        }
+
+
+
+    const bool cond_hdr = (hdrInput && scene_hdr_color_source && scene_hdr_color_frame == rendered);
+    const bool cond_ldr = (scene_ldr_source != nullptr && scene_ldr_frame == rendered);
+    const bool cond_bb = (!isSubNative && backbuffer != nullptr &&
+                          backbufferDesc.Width == depthDesc.Width &&
+                          backbufferDesc.Height == depthDesc.Height);
+
+    if (cond_hdr) {
+        colorSource = scene_hdr_color_source.Get();
     } else {
-        if (scene_ldr_source && scene_ldr_frame == rendered) {
+        if (s_active_color_path == TemporalColorPath::Unset) {
+            if (cond_ldr) {
+                s_active_color_path = TemporalColorPath::OffscreenLdr;
+                wchar_t pmsg[256];
+                swprintf_s(pmsg, L"EDPE: temporal color path initialized to OffscreenLdr (cond_ldr=1, cond_bb=%d, frame=%llu)",
+                    cond_bb ? 1 : 0, frame);
+                EdpeLog(pmsg);
+            } else if (cond_bb) {
+                s_active_color_path = TemporalColorPath::NativeBackbuffer;
+                wchar_t pmsg[256];
+                swprintf_s(pmsg, L"EDPE: temporal color path initialized to NativeBackbuffer (cond_ldr=0, cond_bb=1, frame=%llu)",
+                    frame);
+                EdpeLog(pmsg);
+            }
+        } else if (s_active_color_path == TemporalColorPath::OffscreenLdr) {
+            if (cond_bb && !cond_ldr) {
+                if (s_pending_color_path == TemporalColorPath::NativeBackbuffer) {
+                    ++s_pending_path_frames;
+                } else {
+                    s_pending_color_path = TemporalColorPath::NativeBackbuffer;
+                    s_pending_path_frames = 1;
+                }
+                if (s_pending_path_frames >= kPathSwitchStabilityFrames) {
+                    s_active_color_path = TemporalColorPath::NativeBackbuffer;
+                    s_pending_color_path = TemporalColorPath::Unset;
+                    s_pending_path_frames = 0;
+                    wchar_t pmsg[256];
+                    swprintf_s(pmsg, L"EDPE: temporal color path changed: OffscreenLdr -> NativeBackbuffer (cond_ldr=0, cond_bb=1 for %u frames, frame=%llu)",
+                        kPathSwitchStabilityFrames, frame);
+                    EdpeLog(pmsg);
+                }
+            } else {
+                s_pending_color_path = TemporalColorPath::Unset;
+                s_pending_path_frames = 0;
+            }
+        } else if (s_active_color_path == TemporalColorPath::NativeBackbuffer) {
+            if (cond_ldr) {
+                if (s_pending_color_path == TemporalColorPath::OffscreenLdr) {
+                    ++s_pending_path_frames;
+                } else {
+                    s_pending_color_path = TemporalColorPath::OffscreenLdr;
+                    s_pending_path_frames = 1;
+                }
+                if (s_pending_path_frames >= kPathSwitchStabilityFrames) {
+                    s_active_color_path = TemporalColorPath::OffscreenLdr;
+                    s_pending_color_path = TemporalColorPath::Unset;
+                    s_pending_path_frames = 0;
+                    wchar_t pmsg[256];
+                    swprintf_s(pmsg, L"EDPE: temporal color path changed: NativeBackbuffer -> OffscreenLdr (cond_ldr=1 for %u frames, frame=%llu)",
+                        kPathSwitchStabilityFrames, frame);
+                    EdpeLog(pmsg);
+                }
+            } else {
+                s_pending_color_path = TemporalColorPath::Unset;
+                s_pending_path_frames = 0;
+            }
+        }
+
+        if (s_active_color_path == TemporalColorPath::OffscreenLdr && scene_ldr_source) {
             colorSource = scene_ldr_source.Get();
-        } else if (isSubNative && scene_ldr_source) {
+        } else if (s_active_color_path == TemporalColorPath::NativeBackbuffer) {
+            colorSource = backbuffer;
+        } else if (cond_ldr) {
             colorSource = scene_ldr_source.Get();
-        } else if (!isSubNative) {
+        } else if (cond_bb) {
             colorSource = backbuffer;
         } else {
             if (++s_consecutive_skipped_frames > 2) {
                 s_camera_reset = true;
-            }
-            static unsigned long long s_last_ldr_log = ~0ull;
-            if (s_last_ldr_log == ~0ull || frame >= s_last_ldr_log + 300) {
-                s_last_ldr_log = frame;
-                wchar_t msg[192];
-                swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu (low-res LDR scene target %ux%u not observed)",
-                    frame, depthDesc.Width, depthDesc.Height);
-                EdpeLog(msg);
             }
             return;
         }
@@ -3724,6 +3807,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         bool compOk = false;
         if (upscaler.evaluate(context, inputs, nullptr, evalDestination)) {
             s_camera_reset = false;
+            if (colorSource == backbuffer) {
+                ++s_count_present_bb;
+            } else {
+                ++s_count_present_ldr;
+            }
 
             const bool canCompositeUi = (s_preserve_native_ui.load(std::memory_order_relaxed) &&
                                          evalDestination == s_dlss_output_texture.Get() &&
@@ -4788,20 +4876,21 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             s_frame_draw_index.load(std::memory_order_relaxed)
         };
 
-        const auto now_time = std::chrono::steady_clock::now();
-        if ((cur_m.gbuffer > 0 || cur_m.bloomUpscale > 0) &&
-            !(cur_m == s_last_logged_milestones) &&
-            std::chrono::duration_cast<std::chrono::milliseconds>(now_time - s_last_milestone_log_time).count() >= 1000) {
-            s_last_logged_milestones = cur_m;
-            s_last_milestone_log_time = now_time;
+        static unsigned long long s_last_milestone_log_frame = ~0ull;
+        if (s_last_milestone_log_frame == ~0ull || frame >= s_last_milestone_log_frame + 120) {
+            s_last_milestone_log_frame = frame;
             wchar_t eidMsg[512];
             swprintf_s(eidMsg,
                 L"EDPE: [Frame %llu] Pipeline milestones: G-Buffer #%u, LinearDepth #%u, "
-                L"SceneFinish #%u, BloomUpscale #%u, Tonemap #%u, Blit #%u, Overlay #%u, TotalDraws=%u",
+                L"SceneFinish #%u, BloomUpscale #%u, Tonemap #%u, Blit #%u, Overlay #%u, TotalDraws=%u | "
+                L"Paths: Bloom=%llu PresentLDR=%llu PresentBB=%llu (stickyPath=%ls)",
                 frame,
                 cur_m.gbuffer, cur_m.linearDepth, cur_m.sceneFinish,
                 cur_m.bloomUpscale, cur_m.tonemap, cur_m.blit,
-                cur_m.overlay, cur_m.total);
+                cur_m.overlay, cur_m.total,
+                s_count_bloom_upscale, s_count_present_ldr, s_count_present_bb,
+                s_active_color_path == TemporalColorPath::OffscreenLdr ? L"OffscreenLDR" :
+                s_active_color_path == TemporalColorPath::NativeBackbuffer ? L"NativeBackbuffer" : L"Unset");
             EdpeLog(eidMsg);
         }
 
