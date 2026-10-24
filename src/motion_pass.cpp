@@ -86,6 +86,7 @@ bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
     float values[32]{};
     values[29] = static_cast<float>(width);
     values[30] = static_cast<float>(height);
+    values[31] = 0.0f; // info.w must always be 0.0f for GPU camera raw depth reprojection
     return renderInternal(depth, values, now, previous, width, height);
 }
 

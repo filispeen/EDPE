@@ -11,7 +11,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 - **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling), `v0.3.5` (verified in-game AMD FSR 3.1.2 Native AA & SR, Performance HUD, input leak isolation), `v0.4.0` (verified in-game native D3D11 TAA reconstruction backend, HUD scaling and mouse dragging), `v0.4.1` (verified in-game native TAA stabilization, subpixel de-jittering, Karis clipping, cockpit depth stabilization), `v0.4.4` (verified in-game analytical skybox/star rotational motion vectors at infinity, elimination of star erasure during ship maneuvers, star bloom/corona motion coherence and artifact resolution across all reconstruction backends), `v0.4.6` (verified in-game canopy reflection sub-camera filtering, elimination of TAA docked station pulsing, adaptive stationary variance scaling, Performance HUD mouse cursor isolation when overlay is closed)
 - **Build artifacts:** Consolidated `dxgi.dll` deployed beside `EliteDangerous64.exe`; staged in `build/stage/`
 - **Source:** `src/` contains 12 C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, etc.); `tools/` contains standalone NGX probe
-- **Test suite:** 10 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `dxbc_fanout`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
+- **Test suite:** 11 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `dxbc_fanout`, `jitter_view_report`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
 
 ---
 
@@ -164,6 +164,39 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 - **Forbidden in hot path:** blocking GPU readback, `Map()` on full-resolution textures, blocking `GetData` loops, per-frame NGX feature recreation
 - **Async timing:** disjoint timestamp queries (`D3D11_QUERY_TIMESTAMP_DISJOINT` + start/end timestamps) measure GPU upscale cost without blocking the render thread
 - **Fail-open enforcement:** Automated unit tests in `temporal_inputs_test` (null resource fallback, invalid scale fallback) and `temporal_math_test` (corrupted matrix rejection fail-open) verify safe fallbacks.
+
+---
+
+## Frame Injection Milestones & State Isolation — VERIFIED (2026-10-24)
+
+- **Draw Ordinals vs RenderDoc EIDs:** Draw ordinals logged per frame in `EDPE: [Frame N] Pipeline milestones:` represent sequential D3D11 draw call indices observed by the proxy hooks. They **do not equal** RenderDoc event IDs (which include state changes, dispatches, clears, and resource barriers). Any comparison between EDPE logs and RenderDoc captures must use the action index from RenderDoc `list_actions` or identify draw actions by their target formats, dimensions, and shader resource bindings.
+- **RenderDoc Capture Verification (`F:\Downloads\gameplay.rdc`):**
+  - G-buffer MRT: 4 targets (`R10G10B10A2`, two `R8G8B8A8`, and full-size `R11G11B10_FLOAT` HDR scene target `ResourceId::6321`) with `D32S8` depth (`ResourceId::6316`).
+  - Linear depth pass: fullscreen draw writing linear depth into full-size `R32_FLOAT` RT (`ResourceId::6317`).
+  - Scene finish: last scene draw into HDR scene target at EID 4311 with depth `ResourceId::6316`.
+  - Bloom start: `DrawInstanced` at EID 4334 into half-size 1280×720 `R11G11B10_FLOAT` RT (`ResourceId::47203`), sampling full-size HDR scene RT (`ResourceId::6321`) in PS SRV slot 0.
+  - Tonemap & bloom composite: EID 4581 writing full-size `R8G8B8A8` RT (`ResourceId::6312`), sampling HDR scene RT (`ResourceId::6321`) in PS SRV slot 1.
+  - Presentation blit & 2D overlay: EID 4598 blits to swapchain backbuffer (`ResourceId::44`), followed by 2D HUD overlay draw at EID 4626.
+- **State Isolation & Reentrancy:**
+  - `D3D11ContextStateGuard` RAII guard wraps the injection point, saving and restoring all OM (RTVs, DSV, UAVs), Viewports, Scissors, IA (layout, topology, VBs, IB), VS/PS/CS shaders, constant buffers (0..15), SRVs (0..15), samplers (0..15), blend state, depth-stencil state, and rasterizer state.
+  - Thread-local `s_reentrant_draw` flag prevents injected upscale draws and `replayGlassDraw` from triggering recursive hooks or corrupting draw ordinals.
+- **Fail-Open Upscale Execution:**
+  - `executeUpscaleAtBloomStart` returns `bool`. If upscaling fails or resources are invalid, jitter is disabled for the rest of that frame, failure is throttled to once per second, and `tryTemporalUpscale` remains available as fallback.
+- **Depth & Motion Vector Integrity:**
+  - Raw depth from `scene_depth_source` copy preferred by default (configurable via `[Depth] depthSource = 0`).
+  - R32 linear depth target validated against raw depth ($z = \text{depthB} / \text{rawDepth}$ within 2% error, finite, monotonic) before first use in a frame, caching the verdict per texture.
+  - Motion pass render return status strictly checked; outputs cleared and `inputs.reset = true` on failure.
+  - Camera constant buffer write validated: `renderGpuCameras` explicitly writes `values[31] = 0.0f` (`info.w = 0.0f`).
+  - Celestial skybox motion and cockpit clamp ($z < 3.5$) applied consistently across both raw and linear depth paths in `motion_shader.h`.
+- **Automated Test Suite (11/11 passing):**
+  - `temporal_math_test`: Added absolute hand-computed tests for pure Y translation ($dx=0, dy=+10$) and pure Y rotation ($dx=-50\tan(0.1), dy=0$), rejection of infinite linear depth and zero camera scale; all return codes made unique.
+  - `motion_gpu_test`: Added skybox texel ($0.0$) pure rotation case, celestial depth ($\ge 50000$) pure rotation case, cockpit clamp ($z < 3.5$) zero-motion verification, and post-linear raw pass state-leak test. Added WARP fallback and CMake `SKIP_RETURN_CODE 77` with `gpu` label.
+  - `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`: All pass cleanly in Release build.
+- **CI Workflow (.github/workflows/CI.yml):**
+  - Workflow renamed to `CI`, job to `build-and-test`, permissions set to `contents: read`.
+  - Added triggers for push and pull-request on `master` and `experimental`, with concurrency cancellation.
+  - Pinned official NVIDIA DLSS SDK tag (`v3.7.20`) in cache key without restore-keys.
+  - Binaries and test logs uploaded as workflow artifacts on every run.
 
 ---
 

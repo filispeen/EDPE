@@ -71,8 +71,8 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance);
 void armPipelineDrawHooks();
 void disarmPipelineDrawHooks();
-void onBeforeDraw(ID3D11DeviceContext* context, char drawType);
-void executeUpscaleAtBloomStart(ID3D11DeviceContext* context);
+void onBeforeDraw(ID3D11DeviceContext* context);
+bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot);
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
@@ -82,6 +82,20 @@ std::atomic<MapFn> original_map{nullptr};
 std::atomic<UnmapFn> original_unmap{nullptr};
 std::atomic<DrawIndexedInstancedFn> original_draw_indexed_instanced{nullptr};
 std::atomic<DrawInstancedFn> original_draw_instanced{nullptr};
+// Install-time pristine vtable pointers for draw calls
+static DrawFn s_install_draw = nullptr;
+static DrawIndexedFn s_install_draw_indexed = nullptr;
+static DrawIndexedInstancedFn s_install_draw_indexed_instanced = nullptr;
+static DrawInstancedFn s_install_draw_instanced = nullptr;
+
+static thread_local bool s_reentrant_draw = false;
+struct ReentrancyGuard {
+    bool& flag;
+    bool prev;
+    ReentrancyGuard(bool& f) : flag(f), prev(f) { flag = true; }
+    ~ReentrancyGuard() { flag = prev; }
+};
+
 std::atomic<ID3D11DeviceContext*> observed_context{nullptr};
 IDXGISwapChain* observed_swap_chain = nullptr; // Weak; released by the game.
 void** patched_table = nullptr;
@@ -298,7 +312,7 @@ static std::atomic<bool> s_current_is_tonemap_target{false};
 static std::atomic<bool> s_current_is_backbuffer_target{false};
 
 static std::atomic<bool> s_inside_scene_passes{false};
-static std::atomic<bool> s_jitter_locked_for_frame{false};
+static std::atomic<bool> s_jitter_disabled_for_frame{false};
 
 static bool s_upscale_evaluated_this_frame = false;
 
@@ -306,6 +320,10 @@ static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_scene_linear_depth;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_scene_linear_depth_srv;
 static ID3D11Texture2D* s_cached_linear_depth_tex = nullptr;
 static unsigned long long s_scene_linear_depth_frame = ~0ull;
+
+static D3D11_TEXTURE2D_DESC s_dlaa_input_desc{};
+static D3D11_TEXTURE2D_DESC s_bloom_output_desc{};
+static D3D11_TEXTURE2D_DESC s_motion_depth_desc{};
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_bloom_upscale_output;
 unsigned long long motion_depth_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
@@ -771,6 +789,7 @@ bool observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
 
 void replayGlassDraw(ID3D11DeviceContext* context, UINT index_count,
     UINT instance_count, UINT start_index, INT base_vertex, UINT start_instance) {
+    ReentrancyGuard reentrant(s_reentrant_draw);
     const auto set_targets = original.load(std::memory_order_acquire);
     const auto draw = original_draw_indexed_instanced.load(std::memory_order_acquire);
     if (!set_targets || !draw || !motion_clean_color_target) {
@@ -966,21 +985,20 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
     }
 }
 
-void onBeforeDraw(ID3D11DeviceContext* context, char drawType) {
+void onBeforeDraw(ID3D11DeviceContext* context) {
     if (!context || context != observed_context.load(std::memory_order_acquire)) return;
     const unsigned drawIndex = ++s_frame_draw_index;
 
-    // 1. G-buffer MRT start (Capture EID 1507)
+    // 1. G-buffer MRT start
     if (s_current_is_gbuffer_mrt.load(std::memory_order_relaxed)) {
         if (s_detected_gbuffer_start_draw == 0) {
             s_detected_gbuffer_start_draw = drawIndex;
             s_inside_scene_passes.store(true, std::memory_order_release);
-            s_jitter_locked_for_frame.store(true, std::memory_order_release);
         }
         s_current_is_gbuffer_mrt.store(false, std::memory_order_relaxed);
     }
 
-    // 2. Linear depth fullscreen draw (Capture EID 2826)
+    // 2. Linear depth fullscreen draw
     if (s_current_is_linear_depth.load(std::memory_order_relaxed)) {
         if (s_detected_linear_depth_draw == 0) {
             s_detected_linear_depth_draw = drawIndex;
@@ -988,58 +1006,93 @@ void onBeforeDraw(ID3D11DeviceContext* context, char drawType) {
         s_current_is_linear_depth.store(false, std::memory_order_relaxed);
     }
 
-    // 3. Scene finish draw (Capture EID 4311):
-    // Draws with RTV0 == scene_hdr_color_source and DSV == scene_depth_source
+    // 3. Scene finish draw: RTV0 == scene_hdr_color_source and DSV == scene_depth_source
     if (s_inside_scene_passes.load(std::memory_order_acquire) &&
         s_current_is_scene_geometry.load(std::memory_order_relaxed)) {
         s_detected_scene_finish_draw = drawIndex;
     }
 
-    // 4. Bloom start & Upscale Point (Capture EID 4334)
+    // 4. Bloom start & Upscale Point
     if (s_current_is_bloom_target.load(std::memory_order_relaxed)) {
         if (!s_upscale_evaluated_this_frame) {
-            bool is_hdr_input = false;
-            ID3D11ShaderResourceView* ps_srv0 = nullptr;
-            context->PSGetShaderResources(0, 1, &ps_srv0);
-            if (ps_srv0) {
-                ID3D11Resource* srv_res = nullptr;
-                ps_srv0->GetResource(&srv_res);
-                if (srv_res) {
-                    if (srv_res == scene_hdr_color_source.Get()) {
-                        is_hdr_input = true;
+            int hdr_slot = -1;
+            if (scene_hdr_color_source) {
+                ID3D11ShaderResourceView* ps_srvs[8]{};
+                context->PSGetShaderResources(0, 8, ps_srvs);
+                for (UINT i = 0; i < 8; ++i) {
+                    if (ps_srvs[i]) {
+                        ID3D11Resource* srv_res = nullptr;
+                        ps_srvs[i]->GetResource(&srv_res);
+                        if (srv_res) {
+                            if (srv_res == scene_hdr_color_source.Get()) {
+                                hdr_slot = static_cast<int>(i);
+                            }
+                            srv_res->Release();
+                        }
+                        ps_srvs[i]->Release();
                     }
-                    srv_res->Release();
                 }
-                ps_srv0->Release();
             }
 
-            if (is_hdr_input || scene_hdr_color_source) {
+            if (hdr_slot >= 0) {
                 s_detected_bloom_start_draw = drawIndex;
-                s_inside_scene_passes.store(false, std::memory_order_release);
-                s_jitter_locked_for_frame.store(false, std::memory_order_release);
-                s_upscale_evaluated_this_frame = true;
-
-                executeUpscaleAtBloomStart(context);
+                const bool ok = executeUpscaleAtBloomStart(context, hdr_slot);
+                if (ok) {
+                    s_upscale_evaluated_this_frame = true;
+                    s_inside_scene_passes.store(false, std::memory_order_release);
+                    s_jitter_disabled_for_frame.store(true, std::memory_order_release);
+                } else {
+                    // On failure, leave s_upscale_evaluated_this_frame false for tryTemporalUpscale fallback,
+                    // disable jitter for rest of frame, and throttle failure log to 1/sec.
+                    s_inside_scene_passes.store(false, std::memory_order_release);
+                    s_jitter_disabled_for_frame.store(true, std::memory_order_release);
+                    static auto s_last_eval_fail_log = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+                    auto now_time = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(now_time - s_last_eval_fail_log).count() >= 1000) {
+                        s_last_eval_fail_log = now_time;
+                        EdpeLog(L"EDPE: executeUpscaleAtBloomStart failed; falling back to Present upscale");
+                    }
+                }
             }
         }
         s_current_is_bloom_target.store(false, std::memory_order_relaxed);
     }
 
-    // 5. Tonemap composite draw (Capture EID 4581)
+    // 5. Tonemap composite draw: keep first match after bloom start sampling HDR scene
     if (s_current_is_tonemap_target.load(std::memory_order_relaxed)) {
-        if (s_detected_tonemap_draw == 0) {
-            s_detected_tonemap_draw = drawIndex;
+        if (s_detected_bloom_start_draw > 0 && s_detected_tonemap_draw == 0) {
+            bool samplesHdr = false;
+            ID3D11ShaderResourceView* ps_srvs[8]{};
+            context->PSGetShaderResources(0, 8, ps_srvs);
+            for (UINT i = 0; i < 8; ++i) {
+                if (ps_srvs[i]) {
+                    ID3D11Resource* r = nullptr;
+                    ps_srvs[i]->GetResource(&r);
+                    if (r) {
+                        if (r == scene_hdr_color_source.Get() ||
+                            (s_bloom_upscale_output && r == s_bloom_upscale_output.Get())) {
+                            samplesHdr = true;
+                        }
+                        r->Release();
+                    }
+                    ps_srvs[i]->Release();
+                }
+            }
+            if (samplesHdr) {
+                s_detected_tonemap_draw = drawIndex;
+            }
         }
         s_current_is_tonemap_target.store(false, std::memory_order_relaxed);
     }
 
-    // 6 & 7. Backbuffer blit (Capture EID 4598) and 2D overlay (Capture EID 4626)
+    // 6 & 7. Backbuffer blit and 2D overlay
     if (s_current_is_backbuffer_target.load(std::memory_order_relaxed)) {
         if (s_detected_backbuffer_blit_draw == 0) {
             s_detected_backbuffer_blit_draw = drawIndex;
-        } else {
+        } else if (s_detected_overlay_draw == 0) {
             s_detected_overlay_draw = drawIndex;
         }
+        s_current_is_backbuffer_target.store(false, std::memory_order_relaxed);
     }
 }
 
@@ -1047,24 +1100,32 @@ void armPipelineDrawHooks() {
     if (!patched_table) return;
     if (vs_buffer_probe_active.load(std::memory_order_acquire) ||
         draw_probe_active.load(std::memory_order_acquire)) return;
+
+    if (!s_install_draw) {
+        s_install_draw = reinterpret_cast<DrawFn>(patched_table[kDraw]);
+        s_install_draw_indexed = reinterpret_cast<DrawIndexedFn>(patched_table[kDrawIndexed]);
+        s_install_draw_indexed_instanced = reinterpret_cast<DrawIndexedInstancedFn>(patched_table[kDrawIndexedInstanced]);
+        s_install_draw_instanced = reinterpret_cast<DrawInstancedFn>(patched_table[kDrawInstanced]);
+    }
+
     auto forward_draw = reinterpret_cast<DrawFn>(patched_table[kDraw]);
     auto forward_draw_indexed = reinterpret_cast<DrawIndexedFn>(patched_table[kDrawIndexed]);
     auto forward_indexed_instanced = reinterpret_cast<DrawIndexedInstancedFn>(patched_table[kDrawIndexedInstanced]);
     auto forward_instanced = reinterpret_cast<DrawInstancedFn>(patched_table[kDrawInstanced]);
 
-    if (forward_draw && forward_draw != &observedDraw) {
+    if (forward_draw && forward_draw != reinterpret_cast<DrawFn>(&observedDraw)) {
         original_draw.store(forward_draw, std::memory_order_release);
         patchSlot(patched_table, kDraw, reinterpret_cast<void*>(forward_draw), reinterpret_cast<void*>(&observedDraw));
     }
-    if (forward_draw_indexed && forward_draw_indexed != &observedDrawIndexed) {
+    if (forward_draw_indexed && forward_draw_indexed != reinterpret_cast<DrawIndexedFn>(&observedDrawIndexed)) {
         original_draw_indexed.store(forward_draw_indexed, std::memory_order_release);
         patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(forward_draw_indexed), reinterpret_cast<void*>(&observedDrawIndexed));
     }
-    if (forward_indexed_instanced && forward_indexed_instanced != &observedDrawIndexedInstanced) {
+    if (forward_indexed_instanced && forward_indexed_instanced != reinterpret_cast<DrawIndexedInstancedFn>(&observedDrawIndexedInstanced)) {
         original_draw_indexed_instanced.store(forward_indexed_instanced, std::memory_order_release);
         patchSlot(patched_table, kDrawIndexedInstanced, reinterpret_cast<void*>(forward_indexed_instanced), reinterpret_cast<void*>(&observedDrawIndexedInstanced));
     }
-    if (forward_instanced && forward_instanced != &observedDrawInstanced) {
+    if (forward_instanced && forward_instanced != reinterpret_cast<DrawInstancedFn>(&observedDrawInstanced)) {
         original_draw_instanced.store(forward_instanced, std::memory_order_release);
         patchSlot(patched_table, kDrawInstanced, reinterpret_cast<void*>(forward_instanced), reinterpret_cast<void*>(&observedDrawInstanced));
     }
@@ -1077,23 +1138,32 @@ void disarmPipelineDrawHooks() {
     auto orig_indexed_instanced = original_draw_indexed_instanced.load(std::memory_order_acquire);
     auto orig_instanced = original_draw_instanced.load(std::memory_order_acquire);
 
-    if (orig_draw && patched_table[kDraw] == &observedDraw) {
+    if (orig_draw && reinterpret_cast<void*>(patched_table[kDraw]) == reinterpret_cast<void*>(&observedDraw)) {
         patchSlot(patched_table, kDraw, reinterpret_cast<void*>(&observedDraw), reinterpret_cast<void*>(orig_draw));
     }
-    if (orig_draw_indexed && patched_table[kDrawIndexed] == &observedDrawIndexed) {
+    if (orig_draw_indexed && reinterpret_cast<void*>(patched_table[kDrawIndexed]) == reinterpret_cast<void*>(&observedDrawIndexed)) {
         patchSlot(patched_table, kDrawIndexed, reinterpret_cast<void*>(&observedDrawIndexed), reinterpret_cast<void*>(orig_draw_indexed));
     }
-    if (orig_indexed_instanced && patched_table[kDrawIndexedInstanced] == &observedDrawIndexedInstanced) {
+    if (orig_indexed_instanced && reinterpret_cast<void*>(patched_table[kDrawIndexedInstanced]) == reinterpret_cast<void*>(&observedDrawIndexedInstanced)) {
         patchSlot(patched_table, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), reinterpret_cast<void*>(orig_indexed_instanced));
     }
-    if (orig_instanced && patched_table[kDrawInstanced] == &observedDrawInstanced) {
+    if (orig_instanced && reinterpret_cast<void*>(patched_table[kDrawInstanced]) == reinterpret_cast<void*>(&observedDrawInstanced)) {
         patchSlot(patched_table, kDrawInstanced, reinterpret_cast<void*>(&observedDrawInstanced), reinterpret_cast<void*>(orig_instanced));
     }
 }
 
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
     UINT start, INT base) {
-    onBeforeDraw(context, 'I');
+    if (s_reentrant_draw) {
+        auto orig = original_draw_indexed.load(std::memory_order_acquire);
+        if (orig && orig != reinterpret_cast<DrawIndexedFn>(&observedDrawIndexed)) {
+            orig(context, count, start, base);
+        } else if (s_install_draw_indexed) {
+            s_install_draw_indexed(context, count, start, base);
+        }
+        return;
+    }
+    onBeforeDraw(context);
     if (context == observed_context.load(std::memory_order_acquire))
         observeHudDraw(context, 'I', 1);
     if (context == observed_context.load(std::memory_order_acquire) &&
@@ -1104,13 +1174,30 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
         observeFirstSceneDraw(context);
     }
     auto orig = original_draw_indexed.load(std::memory_order_acquire);
-    if (orig && orig != &observedDrawIndexed) {
+    if (!orig || orig == reinterpret_cast<DrawIndexedFn>(&observedDrawIndexed)) {
+        static bool s_logged_idx = false;
+        if (!s_logged_idx) {
+            s_logged_idx = true;
+            EdpeLog(L"EDPE: observedDrawIndexed invalid orig; falling back to install-time vtable");
+        }
+        orig = s_install_draw_indexed;
+    }
+    if (orig && orig != reinterpret_cast<DrawIndexedFn>(&observedDrawIndexed)) {
         orig(context, count, start, base);
     }
 }
 
 void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start) {
-    onBeforeDraw(context, 'D');
+    if (s_reentrant_draw) {
+        auto orig = original_draw.load(std::memory_order_acquire);
+        if (orig && orig != reinterpret_cast<DrawFn>(&observedDraw)) {
+            orig(context, count, start);
+        } else if (s_install_draw) {
+            s_install_draw(context, count, start);
+        }
+        return;
+    }
+    onBeforeDraw(context);
     if (context == observed_context.load(std::memory_order_acquire))
         observeHudDraw(context, 'D', 1);
     if (context == observed_context.load(std::memory_order_acquire) &&
@@ -1121,7 +1208,15 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
         observeFirstSceneDraw(context);
     }
     auto orig = original_draw.load(std::memory_order_acquire);
-    if (orig && orig != &observedDraw) {
+    if (!orig || orig == reinterpret_cast<DrawFn>(&observedDraw)) {
+        static bool s_logged_draw = false;
+        if (!s_logged_draw) {
+            s_logged_draw = true;
+            EdpeLog(L"EDPE: observedDraw invalid orig; falling back to install-time vtable");
+        }
+        orig = s_install_draw;
+    }
+    if (orig && orig != reinterpret_cast<DrawFn>(&observedDraw)) {
         orig(context, count, start);
     }
 }
@@ -1129,7 +1224,16 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
     UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
     UINT start_instance) {
-    onBeforeDraw(context, 'X');
+    if (s_reentrant_draw) {
+        auto orig = original_draw_indexed_instanced.load(std::memory_order_acquire);
+        if (orig && orig != reinterpret_cast<DrawIndexedInstancedFn>(&observedDrawIndexedInstanced)) {
+            orig(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        } else if (s_install_draw_indexed_instanced) {
+            s_install_draw_indexed_instanced(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        }
+        return;
+    }
+    onBeforeDraw(context);
     const bool replay = context == observed_context.load(std::memory_order_acquire) &&
         observeHudDraw(context, 'X', instance_count);
     if (context == observed_context.load(std::memory_order_acquire) &&
@@ -1140,7 +1244,15 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
         observeFirstSceneDraw(context);
     }
     auto orig = original_draw_indexed_instanced.load(std::memory_order_acquire);
-    if (orig && orig != &observedDrawIndexedInstanced) {
+    if (!orig || orig == reinterpret_cast<DrawIndexedInstancedFn>(&observedDrawIndexedInstanced)) {
+        static bool s_logged_ii = false;
+        if (!s_logged_ii) {
+            s_logged_ii = true;
+            EdpeLog(L"EDPE: observedDrawIndexedInstanced invalid orig; falling back to install-time vtable");
+        }
+        orig = s_install_draw_indexed_instanced;
+    }
+    if (orig && orig != reinterpret_cast<DrawIndexedInstancedFn>(&observedDrawIndexedInstanced)) {
         orig(context, index_count, instance_count, start_index, base_vertex, start_instance);
     }
     if (replay) replayGlassDraw(context, index_count, instance_count,
@@ -1149,7 +1261,16 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
 
 void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
-    onBeforeDraw(context, 'N');
+    if (s_reentrant_draw) {
+        auto orig = original_draw_instanced.load(std::memory_order_acquire);
+        if (orig && orig != reinterpret_cast<DrawInstancedFn>(&observedDrawInstanced)) {
+            orig(context, vertex_count, instance_count, start_vertex, start_instance);
+        } else if (s_install_draw_instanced) {
+            s_install_draw_instanced(context, vertex_count, instance_count, start_vertex, start_instance);
+        }
+        return;
+    }
+    onBeforeDraw(context);
     if (context == observed_context.load(std::memory_order_acquire))
         observeHudDraw(context, 'N', instance_count);
     if (context == observed_context.load(std::memory_order_acquire) &&
@@ -1160,7 +1281,15 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         observeFirstSceneDraw(context);
     }
     auto orig = original_draw_instanced.load(std::memory_order_acquire);
-    if (orig && orig != &observedDrawInstanced) {
+    if (!orig || orig == reinterpret_cast<DrawInstancedFn>(&observedDrawInstanced)) {
+        static bool s_logged_inst = false;
+        if (!s_logged_inst) {
+            s_logged_inst = true;
+            EdpeLog(L"EDPE: observedDrawInstanced invalid orig; falling back to install-time vtable");
+        }
+        orig = s_install_draw_instanced;
+    }
+    if (orig && orig != reinterpret_cast<DrawInstancedFn>(&observedDrawInstanced)) {
         orig(context, vertex_count, instance_count, start_vertex, start_instance);
     }
 }
@@ -2446,64 +2575,409 @@ static unsigned long long s_last_temporal_inputs_frame = ~0ull;
 //   scene target (scene_ldr_source, renderWidth x renderHeight) and reconstructs
 //   into the native-resolution backbuffer (outputWidth x outputHeight).
 // `rendered` is the last_present_frame value seen while this frame rendered.
-void executeUpscaleAtBloomStart(ID3D11DeviceContext* context) {
+// RAII State Guard for complete D3D11 pipeline state isolation (A1)
+class D3D11ContextStateGuard {
+public:
+    explicit D3D11ContextStateGuard(ID3D11DeviceContext* ctx) : context_(ctx) {
+        if (!context_) return;
+        // OM
+        context_->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs_, &saved_dsv_);
+        context_->OMGetBlendState(&saved_blend_, saved_blend_factor_, &saved_sample_mask_);
+        context_->OMGetDepthStencilState(&saved_ds_, &saved_stencil_ref_);
+
+        // RS
+        saved_vp_count_ = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        context_->RSGetViewports(&saved_vp_count_, saved_viewports_);
+        saved_sr_count_ = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        context_->RSGetScissorRects(&saved_sr_count_, saved_scissors_);
+        context_->RSGetState(&saved_rs_);
+
+        // IA
+        context_->IAGetInputLayout(&saved_layout_);
+        context_->IAGetPrimitiveTopology(&saved_topology_);
+        context_->IAGetVertexBuffers(0, 16, saved_vbs_, saved_strides_, saved_offsets_);
+        context_->IAGetIndexBuffer(&saved_ib_, &saved_ib_format_, &saved_ib_offset_);
+
+        // VS
+        context_->VSGetShader(&saved_vs_, nullptr, &saved_vs_instances_);
+        context_->VSGetConstantBuffers(0, 16, saved_vs_cbs_);
+        context_->VSGetShaderResources(0, 16, saved_vs_srvs_);
+        context_->VSGetSamplers(0, 16, saved_vs_samplers_);
+
+        // PS
+        context_->PSGetShader(&saved_ps_, nullptr, &saved_ps_instances_);
+        context_->PSGetConstantBuffers(0, 16, saved_ps_cbs_);
+        context_->PSGetShaderResources(0, 16, saved_ps_srvs_);
+        context_->PSGetSamplers(0, 16, saved_ps_samplers_);
+
+        // CS
+        context_->CSGetShader(&saved_cs_, nullptr, &saved_cs_instances_);
+        context_->CSGetConstantBuffers(0, 16, saved_cs_cbs_);
+        context_->CSGetShaderResources(0, 16, saved_cs_srvs_);
+        context_->CSGetSamplers(0, 16, saved_cs_samplers_);
+        context_->CSGetUnorderedAccessViews(0, 8, saved_cs_uavs_);
+    }
+
+    ~D3D11ContextStateGuard() {
+        if (!context_) return;
+        // Restore IA
+        context_->IASetInputLayout(saved_layout_);
+        context_->IASetPrimitiveTopology(saved_topology_);
+        context_->IASetVertexBuffers(0, 16, saved_vbs_, saved_strides_, saved_offsets_);
+        context_->IASetIndexBuffer(saved_ib_, saved_ib_format_, saved_ib_offset_);
+
+        // Restore VS
+        context_->VSSetShader(saved_vs_, nullptr, 0);
+        context_->VSSetConstantBuffers(0, 16, saved_vs_cbs_);
+        context_->VSSetShaderResources(0, 16, saved_vs_srvs_);
+        context_->VSSetSamplers(0, 16, saved_vs_samplers_);
+
+        // Restore PS
+        context_->PSSetShader(saved_ps_, nullptr, 0);
+        context_->PSSetConstantBuffers(0, 16, saved_ps_cbs_);
+        context_->PSSetShaderResources(0, 16, saved_ps_srvs_);
+        context_->PSSetSamplers(0, 16, saved_ps_samplers_);
+
+        // Restore CS
+        context_->CSSetShader(saved_cs_, nullptr, 0);
+        context_->CSSetConstantBuffers(0, 16, saved_cs_cbs_);
+        context_->CSSetShaderResources(0, 16, saved_cs_srvs_);
+        context_->CSSetSamplers(0, 16, saved_cs_samplers_);
+        UINT init_counts[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+        context_->CSSetUnorderedAccessViews(0, 8, saved_cs_uavs_, init_counts);
+
+        // Restore RS
+        context_->RSSetState(saved_rs_);
+        if (saved_vp_count_ > 0) context_->RSSetViewports(saved_vp_count_, saved_viewports_);
+        if (saved_sr_count_ > 0) context_->RSSetScissorRects(saved_sr_count_, saved_scissors_);
+
+        // Restore OM
+        context_->OMSetBlendState(saved_blend_, saved_blend_factor_, saved_sample_mask_);
+        context_->OMSetDepthStencilState(saved_ds_, saved_stencil_ref_);
+        context_->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs_, saved_dsv_);
+
+        // Release COM references
+        for (auto* rtv : saved_rtvs_) if (rtv) rtv->Release();
+        if (saved_dsv_) saved_dsv_->Release();
+        if (saved_blend_) saved_blend_->Release();
+        if (saved_ds_) saved_ds_->Release();
+        if (saved_rs_) saved_rs_->Release();
+        if (saved_layout_) saved_layout_->Release();
+        for (auto* vb : saved_vbs_) if (vb) vb->Release();
+        if (saved_ib_) saved_ib_->Release();
+        if (saved_vs_) saved_vs_->Release();
+        for (auto* cb : saved_vs_cbs_) if (cb) cb->Release();
+        for (auto* srv : saved_vs_srvs_) if (srv) srv->Release();
+        for (auto* samp : saved_vs_samplers_) if (samp) samp->Release();
+        if (saved_ps_) saved_ps_->Release();
+        for (auto* cb : saved_ps_cbs_) if (cb) cb->Release();
+        for (auto* srv : saved_ps_srvs_) if (srv) srv->Release();
+        for (auto* samp : saved_ps_samplers_) if (samp) samp->Release();
+        if (saved_cs_) saved_cs_->Release();
+        for (auto* cb : saved_cs_cbs_) if (cb) cb->Release();
+        for (auto* srv : saved_cs_srvs_) if (srv) srv->Release();
+        for (auto* samp : saved_cs_samplers_) if (samp) samp->Release();
+        for (auto* uav : saved_cs_uavs_) if (uav) uav->Release();
+    }
+
+private:
+    ID3D11DeviceContext* context_ = nullptr;
+    ID3D11RenderTargetView* saved_rtvs_[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    ID3D11DepthStencilView* saved_dsv_ = nullptr;
+    ID3D11BlendState* saved_blend_ = nullptr;
+    float saved_blend_factor_[4]{};
+    UINT saved_sample_mask_ = 0;
+    ID3D11DepthStencilState* saved_ds_ = nullptr;
+    UINT saved_stencil_ref_ = 0;
+    UINT saved_vp_count_ = 0;
+    D3D11_VIEWPORT saved_viewports_[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT saved_sr_count_ = 0;
+    D3D11_RECT saved_scissors_[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    ID3D11RasterizerState* saved_rs_ = nullptr;
+    ID3D11InputLayout* saved_layout_ = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY saved_topology_ = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11Buffer* saved_vbs_[16]{};
+    UINT saved_strides_[16]{};
+    UINT saved_offsets_[16]{};
+    ID3D11Buffer* saved_ib_ = nullptr;
+    DXGI_FORMAT saved_ib_format_ = DXGI_FORMAT_UNKNOWN;
+    UINT saved_ib_offset_ = 0;
+    ID3D11VertexShader* saved_vs_ = nullptr;
+    UINT saved_vs_instances_ = 0;
+    ID3D11Buffer* saved_vs_cbs_[16]{};
+    ID3D11ShaderResourceView* saved_vs_srvs_[16]{};
+    ID3D11SamplerState* saved_vs_samplers_[16]{};
+    ID3D11PixelShader* saved_ps_ = nullptr;
+    UINT saved_ps_instances_ = 0;
+    ID3D11Buffer* saved_ps_cbs_[16]{};
+    ID3D11ShaderResourceView* saved_ps_srvs_[16]{};
+    ID3D11SamplerState* saved_ps_samplers_[16]{};
+    ID3D11ComputeShader* saved_cs_ = nullptr;
+    UINT saved_cs_instances_ = 0;
+    ID3D11Buffer* saved_cs_cbs_[16]{};
+    ID3D11ShaderResourceView* saved_cs_srvs_[16]{};
+    ID3D11SamplerState* saved_cs_samplers_[16]{};
+    ID3D11UnorderedAccessView* saved_cs_uavs_[8]{};
+};
+
+// C1: Shared helpers for camera update, scene cut detection, and frame delta time
+static void updateFrameCamera(unsigned long long rendered) {
+    if (s_camera_frame == rendered) return;
+    if (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered) {
+        updateMainCamera(s_latest_unmapped_camera, rendered);
+    } else if (s_fallback_unmapped_camera_frame == rendered && ++s_auxiliary_rejection_streak >= 3) {
+        updateMainCamera(s_fallback_unmapped_camera, rendered);
+        s_auxiliary_rejection_streak = 0;
+    } else if (s_camera_now.scaleX > 0.0f) {
+        s_camera_previous = s_camera_now;
+        s_camera_previous_frame = s_camera_frame;
+        s_camera_frame = rendered;
+    }
+}
+
+static bool detectSceneCut(const edpe::CameraProjection& now, const edpe::CameraProjection& prev, unsigned long long prevFrame,
+                           float* outMoveDist = nullptr, float* outRotTrace = nullptr) {
+    if (prevFrame == ~0ull) {
+        if (outMoveDist) *outMoveDist = 0.0f;
+        if (outRotTrace) *outRotTrace = 3.0f;
+        return true;
+    }
+    const float* c = now.worldFromView;
+    const float* p = prev.worldFromView;
+    const float dx = c[3] - p[3];
+    const float dy = c[7] - p[7];
+    const float dz = c[11] - p[11];
+    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float rotTrace = (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
+                           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
+                           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
+    if (outMoveDist) *outMoveDist = moveDist;
+    if (outRotTrace) *outRotTrace = rotTrace;
+    const bool orientation_cut = (rotTrace < 2.0f);
+    const bool teleport_cut = (moveDist > 5000.0f);
+    const bool translation_cut = (moveDist > 50.0f && rotTrace < 2.85f);
+    return orientation_cut || teleport_cut || translation_cut;
+}
+
+static float computeFrameDeltaTimeMs() {
+    static LARGE_INTEGER s_last_qpc{};
+    static LARGE_INTEGER s_freq{};
+    if (s_freq.QuadPart == 0) QueryPerformanceFrequency(&s_freq);
+    LARGE_INTEGER now_qpc;
+    QueryPerformanceCounter(&now_qpc);
+    float dt_ms = 16.667f;
+    if (s_last_qpc.QuadPart > 0 && s_freq.QuadPart > 0) {
+        const double measured_ms = static_cast<double>(now_qpc.QuadPart - s_last_qpc.QuadPart) * 1000.0 /
+                                   static_cast<double>(s_freq.QuadPart);
+        if (measured_ms >= 0.5 && measured_ms <= 250.0) dt_ms = static_cast<float>(measured_ms);
+    }
+    s_last_qpc = now_qpc;
+    return dt_ms;
+}
+
+// B1: Linear depth validation against raw depth copy
+static bool validateLinearDepthTexture(ID3D11Device* device, ID3D11DeviceContext* context,
+    ID3D11Texture2D* linearTex, ID3D11Texture2D* rawDepthTex, float depthB) {
+    if (!device || !context || !linearTex || !rawDepthTex) return false;
+    static ID3D11Texture2D* s_cached_validated_tex = nullptr;
+    static bool s_cached_verdict = false;
+    if (s_cached_validated_tex == linearTex) return s_cached_verdict;
+
+    D3D11_TEXTURE2D_DESC ldesc{}, rdesc{};
+    linearTex->GetDesc(&ldesc);
+    rawDepthTex->GetDesc(&rdesc);
+    if (ldesc.Width != rdesc.Width || ldesc.Height != rdesc.Height || ldesc.Width < 4 || ldesc.Height < 4) {
+        s_cached_validated_tex = linearTex;
+        s_cached_verdict = false;
+        return false;
+    }
+
+    // Read back a 4x4 coarse grid
+    D3D11_TEXTURE2D_DESC stDesc{};
+    stDesc.Width = 4;
+    stDesc.Height = 4;
+    stDesc.MipLevels = 1;
+    stDesc.ArraySize = 1;
+    stDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    stDesc.SampleDesc.Count = 1;
+    stDesc.Usage = D3D11_USAGE_STAGING;
+    stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> linStaging, rawStaging;
+    if (FAILED(device->CreateTexture2D(&stDesc, nullptr, &linStaging))) {
+        s_cached_validated_tex = linearTex;
+        s_cached_verdict = false;
+        return false;
+    }
+
+    stDesc.Format = rdesc.Format;
+    if (FAILED(device->CreateTexture2D(&stDesc, nullptr, &rawStaging))) {
+        s_cached_validated_tex = linearTex;
+        s_cached_verdict = false;
+        return false;
+    }
+
+    for (UINT row = 0; row < 4; ++row) {
+        for (UINT col = 0; col < 4; ++col) {
+            const UINT x = (col * (ldesc.Width - 1)) / 3;
+            const UINT y = (row * (ldesc.Height - 1)) / 3;
+            D3D11_BOX box{x, y, 0, x + 1, y + 1, 1};
+            context->CopySubresourceRegion(linStaging.Get(), 0, col, row, 0, linearTex, 0, &box);
+            context->CopySubresourceRegion(rawStaging.Get(), 0, col, row, 0, rawDepthTex, 0, &box);
+        }
+    }
+
+    D3D11_MAPPED_SUBRESOURCE linMap{}, rawMap{};
+    if (FAILED(context->Map(linStaging.Get(), 0, D3D11_MAP_READ, 0, &linMap))) {
+        s_cached_validated_tex = linearTex;
+        s_cached_verdict = false;
+        return false;
+    }
+    if (FAILED(context->Map(rawStaging.Get(), 0, D3D11_MAP_READ, 0, &rawMap))) {
+        context->Unmap(linStaging.Get(), 0);
+        s_cached_validated_tex = linearTex;
+        s_cached_verdict = false;
+        return false;
+    }
+
+    bool valid = true;
+    unsigned checked_count = 0;
+    const float effDepthB = (depthB > 0.0f && depthB < 1.0f) ? depthB : 0.025f;
+
+    for (UINT row = 0; row < 4 && valid; ++row) {
+        const float* linRow = reinterpret_cast<const float*>(
+            static_cast<const uint8_t*>(linMap.pData) + row * linMap.RowPitch);
+        const uint8_t* rawRowBytes = static_cast<const uint8_t*>(rawMap.pData) + row * rawMap.RowPitch;
+
+        for (UINT col = 0; col < 4 && valid; ++col) {
+            const float zLin = linRow[col];
+            if (!std::isfinite(zLin) || zLin <= 0.0f) {
+                if (zLin < 0.0f || std::isnan(zLin)) {
+                    valid = false;
+                    break;
+                }
+                continue;
+            }
+
+            float zRaw = 0.0f;
+            if (rdesc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+                rdesc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                zRaw = *reinterpret_cast<const float*>(rawRowBytes + col * sizeof(uint64_t));
+            } else {
+                zRaw = *reinterpret_cast<const float*>(rawRowBytes + col * sizeof(float));
+            }
+
+            if (std::isfinite(zRaw) && zRaw > 1e-5f && zRaw <= 1.0f) {
+                const float expectedZ = effDepthB / zRaw;
+                const float relError = std::fabs(zLin - expectedZ) / expectedZ;
+                if (relError > 0.02f && expectedZ < 50000.0f) {
+                    valid = false;
+                    break;
+                }
+                ++checked_count;
+            }
+        }
+    }
+
+    context->Unmap(rawStaging.Get(), 0);
+    context->Unmap(linStaging.Get(), 0);
+
+    s_cached_validated_tex = linearTex;
+    s_cached_verdict = valid && (checked_count > 0);
+    return s_cached_verdict;
+}
+
+bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
+    if (!context || !scene_hdr_color_source) return false;
     auto& upscaler = edpe::UpscalerManager::instance();
-    const bool upscale_active = upscaler.isReconstructionActive();
-    if (!upscale_active || !context) return;
-    if (!scene_hdr_color_source) return;
+    if (!upscaler.isReconstructionActive()) return false;
+
+    // A1: RAII State Guard wrapping entire injection block
+    D3D11ContextStateGuard stateGuard(context);
+
+    // A2: Reentrancy guard preventing injected work from triggering hooks
+    ReentrancyGuard reentrant(s_reentrant_draw);
 
     D3D11_TEXTURE2D_DESC hdrDesc{};
     scene_hdr_color_source->GetDesc(&hdrDesc);
     const UINT width = hdrDesc.Width;
     const UINT height = hdrDesc.Height;
-    if (!width || !height) return;
+    if (!width || !height) return false;
 
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
-    if (!device) return;
+    if (!device) return false;
 
     const auto rendered = last_present_frame.load(std::memory_order_relaxed);
-    if (s_camera_frame != rendered) {
-        if (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered) {
-            updateMainCamera(s_latest_unmapped_camera, rendered);
-        } else if (s_fallback_unmapped_camera_frame == rendered && ++s_auxiliary_rejection_streak >= 3) {
-            updateMainCamera(s_fallback_unmapped_camera, rendered);
-            s_auxiliary_rejection_streak = 0;
-        } else if (s_camera_now.scaleX > 0.0f) {
-            s_camera_previous = s_camera_now;
-            s_camera_previous_frame = s_camera_frame;
-            s_camera_frame = rendered;
+
+    // C1: Update camera
+    updateFrameCamera(rendered);
+    if (s_camera_now.scaleX <= 0.0f) return false;
+
+    // B2: Prefer raw depth as primary source (includes cockpit and HUD panels).
+    // Use R32 linear depth only if raw depth is unavailable or if configured.
+    const bool preferLinear = (edpe::Config::instance().depthSource == 1);
+    const bool linearValidFrame = (s_scene_linear_depth && s_scene_linear_depth_frame == rendered);
+    bool useLinearDepth = false;
+
+    if (preferLinear && linearValidFrame) {
+        if (validateLinearDepthTexture(device.Get(), context, s_scene_linear_depth.Get(),
+                scene_depth_source.Get(), s_camera_now.depthB)) {
+            useLinearDepth = true;
         }
+    } else if (!scene_depth_source && linearValidFrame) {
+        useLinearDepth = true;
     }
 
-    if (s_camera_now.scaleX <= 0.0f) return;
-
-    // 1. Motion Vectors from Linear Depth (or fallback to raw depth)
-    if (!motion_pass) {
-        auto candidate = std::make_unique<edpe::MotionPass>();
-        if (!candidate->initialize(device.Get(), context)) return;
-        motion_pass = std::move(candidate);
+    static int s_last_logged_depth_source = -1;
+    if (s_last_logged_depth_source != (useLinearDepth ? 1 : 0)) {
+        s_last_logged_depth_source = (useLinearDepth ? 1 : 0);
+        wchar_t dmsg[128];
+        swprintf_s(dmsg, L"EDPE: motion pass using %ls depth source",
+            useLinearDepth ? L"validated R32 linear" : L"raw reversed-Z (scene_depth_source)");
+        EdpeLog(dmsg);
     }
 
-    const bool useLinearDepth = (s_scene_linear_depth_srv != nullptr);
     ID3D11ShaderResourceView* depthSrv = nullptr;
-
     if (useLinearDepth) {
         depthSrv = s_scene_linear_depth_srv.Get();
     } else if (scene_depth_source) {
-        if (!motion_depth) {
-            D3D11_TEXTURE2D_DESC dd{};
-            scene_depth_source->GetDesc(&dd);
-            dd.Usage = D3D11_USAGE_DEFAULT;
-            dd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            dd.CPUAccessFlags = dd.MiscFlags = 0;
-            if (SUCCEEDED(device->CreateTexture2D(&dd, nullptr, &motion_depth))) {
-                D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
-                srvD.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-                srvD.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                srvD.Texture2D.MipLevels = 1;
-                device->CreateShaderResourceView(motion_depth.Get(), &srvD, &motion_depth_view);
+        // B5: Recreate motion_depth if desc changed
+        D3D11_TEXTURE2D_DESC dd{};
+        scene_depth_source->GetDesc(&dd);
+        bool needRecreateMotionDepth = !motion_depth ||
+            dd.Width != s_motion_depth_desc.Width ||
+            dd.Height != s_motion_depth_desc.Height ||
+            dd.Format != s_motion_depth_desc.Format ||
+            dd.SampleDesc.Count != s_motion_depth_desc.SampleDesc.Count;
+        if (needRecreateMotionDepth) {
+            motion_depth.Reset();
+            motion_depth_view.Reset();
+            D3D11_TEXTURE2D_DESC mdDesc = dd;
+            mdDesc.Usage = D3D11_USAGE_DEFAULT;
+            mdDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            mdDesc.CPUAccessFlags = mdDesc.MiscFlags = 0;
+            HRESULT hr = device->CreateTexture2D(&mdDesc, nullptr, &motion_depth);
+            if (FAILED(hr)) {
+                wchar_t msg[160];
+                swprintf_s(msg, L"EDPE: failed to create motion_depth format=%u hr=0x%08X", mdDesc.Format, hr);
+                EdpeLog(msg);
+                return false;
             }
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
+            srvD.Format = (mdDesc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
+                ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+                : (mdDesc.Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : mdDesc.Format);
+            srvD.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvD.Texture2D.MipLevels = 1;
+            hr = device->CreateShaderResourceView(motion_depth.Get(), &srvD, &motion_depth_view);
+            if (FAILED(hr)) {
+                wchar_t msg[160];
+                swprintf_s(msg, L"EDPE: failed to create motion_depth_view hr=0x%08X", hr);
+                EdpeLog(msg);
+                return false;
+            }
+            s_motion_depth_desc = mdDesc;
         }
         if (motion_depth) {
             context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
@@ -2511,19 +2985,29 @@ void executeUpscaleAtBloomStart(ID3D11DeviceContext* context) {
         }
     }
 
-    if (!depthSrv) return;
+    if (!depthSrv) return false;
 
-    if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
-        motion_pass->clear(context);
-    } else {
-        // Build motion vectors from linear depth + previous and current view-projection
-        // Dynamic objects are treated as static with camera reprojection (noting the ghosting risk).
-        motion_pass->render(depthSrv, s_camera_now, s_camera_previous, width, height, useLinearDepth);
+    if (!motion_pass) {
+        auto candidate = std::make_unique<edpe::MotionPass>();
+        if (!candidate->initialize(device.Get(), context)) return false;
+        motion_pass = std::move(candidate);
     }
 
-    if (!motion_pass->output()) return;
+    bool motionOk = false;
+    if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
+        motion_pass->clear(context);
+        motionOk = true;
+    } else {
+        motionOk = motion_pass->render(depthSrv, s_camera_now, s_camera_previous, width, height, useLinearDepth);
+        if (!motionOk) {
+            // B4: On false, clear motion output and set reset = true
+            motion_pass->clear(context);
+        }
+    }
 
-    // 2. Prepare Jitter and Scale
+    if (!motion_pass->output()) return false;
+
+    // Prepare Jitter and Scale
     float jx = s_injected_jitter.pixelX;
     float jy = s_injected_jitter.pixelY;
     if (s_jitter_swap_xy.load(std::memory_order_relaxed)) std::swap(jx, jy);
@@ -2534,63 +3018,61 @@ void executeUpscaleAtBloomStart(ID3D11DeviceContext* context) {
     const float mScaleX = (s_motion_invert_x.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
     const float mScaleY = (s_motion_invert_y.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
 
-    // Delta time
-    static LARGE_INTEGER s_last_upscale_qpc{};
-    static LARGE_INTEGER s_upscale_freq{};
-    if (s_upscale_freq.QuadPart == 0) QueryPerformanceFrequency(&s_upscale_freq);
-    LARGE_INTEGER now_qpc;
-    QueryPerformanceCounter(&now_qpc);
-    float dt_ms = 16.667f;
-    if (s_last_upscale_qpc.QuadPart > 0 && s_upscale_freq.QuadPart > 0) {
-        const double measured_ms = static_cast<double>(now_qpc.QuadPart - s_last_upscale_qpc.QuadPart) * 1000.0 /
-                                   static_cast<double>(s_upscale_freq.QuadPart);
-        if (measured_ms >= 0.5 && measured_ms <= 250.0) dt_ms = static_cast<float>(measured_ms);
-    }
-    s_last_upscale_qpc = now_qpc;
+    // C1: helpers for dt_ms and scene_cut
+    const float dt_ms = computeFrameDeltaTimeMs();
+    const bool scene_cut = detectSceneCut(s_camera_now, s_camera_previous, s_camera_previous_frame);
 
-    // Scene cut detection
-    const float* c = s_camera_now.worldFromView;
-    const float* p = s_camera_previous.worldFromView;
-    const float dx = c[3] - p[3];
-    const float dy = c[7] - p[7];
-    const float dz = c[11] - p[11];
-    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const float rotTrace = (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
-                           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
-                           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
-    const bool orientation_cut = (rotTrace < 2.0f);
-    const bool teleport_cut = (moveDist > 5000.0f);
-    const bool translation_cut = (moveDist > 50.0f && rotTrace < 2.85f);
-    const bool scene_cut = (s_camera_previous_frame == ~0ull) || orientation_cut || teleport_cut || translation_cut;
-
-    // Color input for upscaler
-    if (!s_dlaa_input) {
+    // B5: Recreate s_dlaa_input if needed
+    bool needRecreateDlaa = !s_dlaa_input ||
+        hdrDesc.Width != s_dlaa_input_desc.Width ||
+        hdrDesc.Height != s_dlaa_input_desc.Height ||
+        hdrDesc.Format != s_dlaa_input_desc.Format ||
+        hdrDesc.SampleDesc.Count != s_dlaa_input_desc.SampleDesc.Count;
+    if (needRecreateDlaa) {
+        s_dlaa_input.Reset();
+        s_dlaa_input_srv.Reset();
         D3D11_TEXTURE2D_DESC inDesc = hdrDesc;
         inDesc.Usage = D3D11_USAGE_DEFAULT;
         inDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         inDesc.CPUAccessFlags = inDesc.MiscFlags = 0;
-        if (FAILED(device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input)) ||
-            FAILED(device->CreateShaderResourceView(s_dlaa_input.Get(), nullptr, &s_dlaa_input_srv))) return;
+        HRESULT hr = device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input);
+        if (FAILED(hr)) {
+            wchar_t msg[160];
+            swprintf_s(msg, L"EDPE: failed to create s_dlaa_input format=%u hr=0x%08X", inDesc.Format, hr);
+            EdpeLog(msg);
+            return false;
+        }
+        hr = device->CreateShaderResourceView(s_dlaa_input.Get(), nullptr, &s_dlaa_input_srv);
+        if (FAILED(hr)) {
+            wchar_t msg[160];
+            swprintf_s(msg, L"EDPE: failed to create s_dlaa_input_srv hr=0x%08X", hr);
+            EdpeLog(msg);
+            return false;
+        }
+        s_dlaa_input_desc = inDesc;
     }
     context->CopyResource(s_dlaa_input.Get(), scene_hdr_color_source.Get());
 
-    // Prepare raw depth copy for backend if needed
-    if (!motion_depth && scene_depth_source) {
-        D3D11_TEXTURE2D_DESC dd{};
-        scene_depth_source->GetDesc(&dd);
-        dd.Usage = D3D11_USAGE_DEFAULT;
-        dd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        dd.CPUAccessFlags = dd.MiscFlags = 0;
-        if (SUCCEEDED(device->CreateTexture2D(&dd, nullptr, &motion_depth))) {
-            D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
-            srvD.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-            srvD.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            srvD.Texture2D.MipLevels = 1;
-            device->CreateShaderResourceView(motion_depth.Get(), &srvD, &motion_depth_view);
+    // B5: Recreate s_bloom_upscale_output if needed
+    bool needRecreateOut = !s_bloom_upscale_output ||
+        hdrDesc.Width != s_bloom_output_desc.Width ||
+        hdrDesc.Height != s_bloom_output_desc.Height ||
+        hdrDesc.Format != s_bloom_output_desc.Format ||
+        hdrDesc.SampleDesc.Count != s_bloom_output_desc.SampleDesc.Count;
+    if (needRecreateOut) {
+        s_bloom_upscale_output.Reset();
+        D3D11_TEXTURE2D_DESC outDesc = hdrDesc;
+        outDesc.Usage = D3D11_USAGE_DEFAULT;
+        outDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
+        outDesc.CPUAccessFlags = outDesc.MiscFlags = 0;
+        HRESULT hr = device->CreateTexture2D(&outDesc, nullptr, &s_bloom_upscale_output);
+        if (FAILED(hr)) {
+            wchar_t msg[160];
+            swprintf_s(msg, L"EDPE: failed to create s_bloom_upscale_output format=%u hr=0x%08X", outDesc.Format, hr);
+            EdpeLog(msg);
+            return false;
         }
-    }
-    if (motion_depth && scene_depth_source) {
-        context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
+        s_bloom_output_desc = outDesc;
     }
 
     edpe::TemporalFrameInputs inputs{};
@@ -2609,7 +3091,7 @@ void executeUpscaleAtBloomStart(ID3D11DeviceContext* context) {
     inputs.motionScaleX = mScaleX;
     inputs.motionScaleY = mScaleY;
     inputs.frameTimeMs = dt_ms;
-    inputs.reset = s_camera_reset || scene_cut;
+    inputs.reset = s_camera_reset || scene_cut || (!motionOk);
     inputs.cameraNow = s_camera_now;
     inputs.cameraPrevious = s_camera_previous;
     inputs.sharpness = edpe::Config::instance().sharpness;
@@ -2617,30 +3099,20 @@ void executeUpscaleAtBloomStart(ID3D11DeviceContext* context) {
     inputs.motionIsLowRes = false;
     inputs.colorIsHdr = true;
 
-    // Destination texture for upscaler output
-    if (!s_bloom_upscale_output) {
-        D3D11_TEXTURE2D_DESC outDesc = hdrDesc;
-        outDesc.Usage = D3D11_USAGE_DEFAULT;
-        outDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
-        outDesc.CPUAccessFlags = outDesc.MiscFlags = 0;
-        if (FAILED(device->CreateTexture2D(&outDesc, nullptr, &s_bloom_upscale_output))) return;
+    // Temporarily unbind PS slot hdr_slot before CopyResource to prevent D3D11 copy hazard
+    if (hdr_slot >= 0) {
+        ID3D11ShaderResourceView* nullSrv = nullptr;
+        context->PSSetShaderResources(static_cast<UINT>(hdr_slot), 1, &nullSrv);
     }
-
-    // Save and temporarily unbind PS SRV 0 to prevent D3D11 resource hazard
-    ID3D11ShaderResourceView* savedPsSrv0 = nullptr;
-    context->PSGetShaderResources(0, 1, &savedPsSrv0);
-    ID3D11ShaderResourceView* nullSrv = nullptr;
-    context->PSSetShaderResources(0, 1, &nullSrv);
 
     if (upscaler.evaluate(context, inputs, nullptr, s_bloom_upscale_output.Get())) {
         s_camera_reset = false;
         // Overwrite the HDR scene color target with the reconstructed image
         context->CopyResource(scene_hdr_color_source.Get(), s_bloom_upscale_output.Get());
+        return true;
     }
 
-    // Restore PS SRV 0 so bloom start draw receives the reconstructed HDR scene
-    context->PSSetShaderResources(0, 1, &savedPsSrv0);
-    if (savedPsSrv0) savedPsSrv0->Release();
+    return false;
 }
 
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered,
@@ -2656,19 +3128,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (!motion_color_source || !scene_depth_source) skip = L"scene color/depth not observed";
     else if (motion_color_frame != rendered) skip = L"no scene MRT pass this frame";
     else if (s_camera_frame != rendered) {
-        if (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered) {
-            updateMainCamera(s_latest_unmapped_camera, rendered);
-        } else if (s_fallback_unmapped_camera_frame == rendered && ++s_auxiliary_rejection_streak >= 3) {
-            // Genuine camera cut persisted across >= 3 frames (e.g. external camera switch):
-            updateMainCamera(s_fallback_unmapped_camera, rendered);
-            s_auxiliary_rejection_streak = 0;
-        } else if (s_camera_now.scaleX > 0.0f) {
-            // Camera was not unmapped or only a 1-frame auxiliary probe ran this frame.
-            // Retain previous camera smoothly without resetting temporal history!
-            s_camera_previous = s_camera_now;
-            s_camera_previous_frame = s_camera_frame;
-            s_camera_frame = rendered;
-        } else {
+        updateFrameCamera(rendered);
+        if (s_camera_now.scaleX <= 0.0f) {
             skip = L"no main camera latched this frame";
         }
     }
@@ -2916,34 +3377,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     // 3. Astronomical position teleport (moveDist > 5000.0f, e.g. supercruise drop / hyperspace).
     // 4. Large position jump (> 50.0f) ONLY IF accompanied by an orientation deviation (rotTrace < 2.85f).
     // Steady linear flight (rotTrace >= 2.85f) must NEVER trigger a scene cut regardless of velocity!
-    const float* c = s_camera_now.worldFromView;
-    const float* p = s_camera_previous.worldFromView;
-    const float dx = c[3] - p[3];
-    const float dy = c[7] - p[7];
-    const float dz = c[11] - p[11];
-    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const float rotTrace = (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
-                           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
-                           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
-    const bool orientation_cut = (rotTrace < 2.0f);
-    const bool teleport_cut = (moveDist > 5000.0f);
-    const bool translation_cut = (moveDist > 50.0f && rotTrace < 2.85f);
-    const bool scene_cut = (s_camera_previous_frame == ~0ull) || orientation_cut || teleport_cut || translation_cut;
-
-    static LARGE_INTEGER s_last_upscale_qpc{};
-    static LARGE_INTEGER s_upscale_freq{};
-    if (s_upscale_freq.QuadPart == 0) QueryPerformanceFrequency(&s_upscale_freq);
-    LARGE_INTEGER now_qpc;
-    QueryPerformanceCounter(&now_qpc);
-    float dt_ms = 16.667f;
-    if (s_last_upscale_qpc.QuadPart > 0 && s_upscale_freq.QuadPart > 0) {
-        const double measured_ms = static_cast<double>(now_qpc.QuadPart - s_last_upscale_qpc.QuadPart) * 1000.0 /
-                                   static_cast<double>(s_upscale_freq.QuadPart);
-        if (measured_ms >= 0.5 && measured_ms <= 250.0) {
-            dt_ms = static_cast<float>(measured_ms);
-        }
-    }
-    s_last_upscale_qpc = now_qpc;
+    float moveDist = 0.0f;
+    float rotTrace = 3.0f;
+    const bool scene_cut = detectSceneCut(s_camera_now, s_camera_previous, s_camera_previous_frame, &moveDist, &rotTrace);
+    const float dt_ms = computeFrameDeltaTimeMs();
 
     edpe::TemporalFrameInputs inputs{};
     inputs.color = s_dlaa_input.Get();
@@ -3400,21 +3837,39 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         }
     }
 
-    // 2. Check Linear Depth target: 1 RTV of DXGI_FORMAT_R32_FLOAT, full scene size, null DSV
-    if (count >= 1 && targets && targets[0] && !dsv) {
-        D3D11_RENDER_TARGET_VIEW_DESC rdesc{};
-        targets[0]->GetDesc(&rdesc);
-        if (rdesc.Format == DXGI_FORMAT_R32_FLOAT) {
-            ID3D11Resource* res0 = nullptr;
-            targets[0]->GetResource(&res0);
-            if (res0) {
+    // A7: Collapsed single-pass classification querying targets[0] once
+    if (count >= 1 && targets && targets[0]) {
+        D3D11_RENDER_TARGET_VIEW_DESC rdesc0{};
+        targets[0]->GetDesc(&rdesc0);
+        ID3D11Resource* res0 = nullptr;
+        targets[0]->GetResource(&res0);
+        if (res0) {
+            auto* bb = s_swapchain_backbuffer.load(std::memory_order_relaxed);
+            if (res0 == bb) {
+                s_current_is_backbuffer_target.store(true, std::memory_order_relaxed);
+            }
+
+            if (dsv && scene_hdr_color_source && scene_depth_source && res0 == scene_hdr_color_source.Get()) {
+                ID3D11Resource* d_res = nullptr;
+                dsv->GetResource(&d_res);
+                if (d_res) {
+                    if (d_res == scene_depth_source.Get()) {
+                        s_current_is_scene_geometry.store(true, std::memory_order_relaxed);
+                    }
+                    d_res->Release();
+                }
+            }
+
+            if (!dsv) {
                 Microsoft::WRL::ComPtr<ID3D11Texture2D> tex0;
                 if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex0.GetAddressOf())))) {
                     D3D11_TEXTURE2D_DESC td{};
                     tex0->GetDesc(&td);
                     const UINT sW = s_observed_scene_width.load(std::memory_order_relaxed);
                     const UINT sH = s_observed_scene_height.load(std::memory_order_relaxed);
-                    if (td.SampleDesc.Count == 1 && (sW == 0 || (td.Width == sW && td.Height == sH))) {
+
+                    if (rdesc0.Format == DXGI_FORMAT_R32_FLOAT && td.SampleDesc.Count == 1 &&
+                        (sW == 0 || (td.Width == sW && td.Height == sH))) {
                         s_current_is_linear_depth.store(true, std::memory_order_relaxed);
                         s_scene_linear_depth = tex0;
                         s_scene_linear_depth_frame = current_frame_census;
@@ -3431,84 +3886,15 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                                 dev->CreateShaderResourceView(tex0.Get(), &srvD, &s_scene_linear_depth_srv);
                             }
                         }
-                    }
-                }
-                res0->Release();
-            }
-        }
-    }
-
-    // 3. Check Scene Geometry: Target 0 is scene_hdr_color_source and DSV is scene_depth_source
-    if (count >= 1 && targets && targets[0] && dsv && scene_hdr_color_source && scene_depth_source) {
-        ID3D11Resource* r0 = nullptr;
-        targets[0]->GetResource(&r0);
-        ID3D11Resource* d_res = nullptr;
-        dsv->GetResource(&d_res);
-        if (r0 == scene_hdr_color_source.Get() && d_res == scene_depth_source.Get()) {
-            s_current_is_scene_geometry.store(true, std::memory_order_relaxed);
-        }
-        if (r0) r0->Release();
-        if (d_res) d_res->Release();
-    }
-
-    // 4. Check Bloom start target: 1 RTV of DXGI_FORMAT_R11G11B10_FLOAT, half size (approx sceneW / 2, sceneH / 2), null DSV
-    if (count >= 1 && targets && targets[0] && !dsv) {
-        D3D11_RENDER_TARGET_VIEW_DESC rdesc{};
-        targets[0]->GetDesc(&rdesc);
-        if (rdesc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
-            ID3D11Resource* res0 = nullptr;
-            targets[0]->GetResource(&res0);
-            if (res0) {
-                Microsoft::WRL::ComPtr<ID3D11Texture2D> tex0;
-                if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex0.GetAddressOf())))) {
-                    D3D11_TEXTURE2D_DESC td{};
-                    tex0->GetDesc(&td);
-                    const UINT sW = s_observed_scene_width.load(std::memory_order_relaxed);
-                    const UINT sH = s_observed_scene_height.load(std::memory_order_relaxed);
-                    if (sW > 0 && sH > 0 &&
+                    } else if (rdesc0.Format == DXGI_FORMAT_R11G11B10_FLOAT && sW > 0 && sH > 0 &&
                         std::abs(static_cast<int>(td.Width) - static_cast<int>(sW / 2)) <= 2 &&
                         std::abs(static_cast<int>(td.Height) - static_cast<int>(sH / 2)) <= 2) {
                         s_current_is_bloom_target.store(true, std::memory_order_relaxed);
+                    } else if ((rdesc0.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rdesc0.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) &&
+                        res0 != bb && sW > 0 && sH > 0 && td.Width == sW && td.Height == sH) {
+                        s_current_is_tonemap_target.store(true, std::memory_order_relaxed);
                     }
                 }
-                res0->Release();
-            }
-        }
-    }
-
-    // 5. Check Tonemap target: 1 RTV of DXGI_FORMAT_R8G8B8A8_UNORM / TYPELESS, full size, null DSV, not backbuffer
-    if (count >= 1 && targets && targets[0] && !dsv) {
-        D3D11_RENDER_TARGET_VIEW_DESC rdesc{};
-        targets[0]->GetDesc(&rdesc);
-        if (rdesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rdesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) {
-            ID3D11Resource* res0 = nullptr;
-            targets[0]->GetResource(&res0);
-            if (res0) {
-                auto* bb = s_swapchain_backbuffer.load(std::memory_order_relaxed);
-                if (res0 != bb) {
-                    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex0;
-                    if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex0.GetAddressOf())))) {
-                        D3D11_TEXTURE2D_DESC td{};
-                        tex0->GetDesc(&td);
-                        const UINT sW = s_observed_scene_width.load(std::memory_order_relaxed);
-                        const UINT sH = s_observed_scene_height.load(std::memory_order_relaxed);
-                        if (sW > 0 && sH > 0 && td.Width == sW && td.Height == sH) {
-                            s_current_is_tonemap_target.store(true, std::memory_order_relaxed);
-                        }
-                    }
-                }
-                res0->Release();
-            }
-        }
-    }
-
-    // 6 & 7. Check Backbuffer target: targets[0] matches s_swapchain_backbuffer
-    if (count >= 1 && targets && targets[0]) {
-        ID3D11Resource* res0 = nullptr;
-        targets[0]->GetResource(&res0);
-        if (res0) {
-            if (res0 == s_swapchain_backbuffer.load(std::memory_order_relaxed)) {
-                s_current_is_backbuffer_target.store(true, std::memory_order_relaxed);
             }
             res0->Release();
         }
@@ -4065,29 +4451,63 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             }
         }
 
-        if (s_detected_gbuffer_start_draw > 0 || s_detected_bloom_start_draw > 0) {
+        struct PipelineMilestones {
+            unsigned gbuffer = 0;
+            unsigned linearDepth = 0;
+            unsigned sceneFinish = 0;
+            unsigned bloomUpscale = 0;
+            unsigned tonemap = 0;
+            unsigned blit = 0;
+            unsigned overlay = 0;
+            unsigned total = 0;
+            bool operator==(const PipelineMilestones& o) const {
+                return gbuffer == o.gbuffer && linearDepth == o.linearDepth &&
+                       sceneFinish == o.sceneFinish && bloomUpscale == o.bloomUpscale &&
+                       tonemap == o.tonemap && blit == o.blit &&
+                       overlay == o.overlay && total == o.total;
+            }
+        };
+        static PipelineMilestones s_last_logged_milestones{};
+        static auto s_last_milestone_log_time = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+
+        PipelineMilestones cur_m{
+            s_detected_gbuffer_start_draw,
+            s_detected_linear_depth_draw,
+            s_detected_scene_finish_draw,
+            s_detected_bloom_start_draw,
+            s_detected_tonemap_draw,
+            s_detected_backbuffer_blit_draw,
+            s_detected_overlay_draw,
+            s_frame_draw_index.load(std::memory_order_relaxed)
+        };
+
+        const auto now_time = std::chrono::steady_clock::now();
+        if ((cur_m.gbuffer > 0 || cur_m.bloomUpscale > 0) &&
+            !(cur_m == s_last_logged_milestones) &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now_time - s_last_milestone_log_time).count() >= 1000) {
+            s_last_logged_milestones = cur_m;
+            s_last_milestone_log_time = now_time;
             wchar_t eidMsg[512];
             swprintf_s(eidMsg,
-                L"EDPE: [Frame %llu] Pipeline detection summary: "
-                L"G-buffer start draw #%u (capture EID 1507), "
-                L"Linear depth draw #%u (capture EID 2826), "
-                L"Scene finish draw #%u (capture EID 4311), "
-                L"Bloom start/upscale draw #%u (capture EID 4334), "
-                L"Tonemap draw #%u (capture EID 4581), "
-                L"Backbuffer blit draw #%u (capture EID 4598), "
-                L"2D overlay draw #%u (capture EID 4626), "
-                L"Total frame draws=%u",
+                L"EDPE: [Frame %llu] Pipeline milestones: G-Buffer #%u, LinearDepth #%u, "
+                L"SceneFinish #%u, BloomUpscale #%u, Tonemap #%u, Blit #%u, Overlay #%u, TotalDraws=%u",
                 frame,
-                s_detected_gbuffer_start_draw,
-                s_detected_linear_depth_draw,
-                s_detected_scene_finish_draw,
-                s_detected_bloom_start_draw,
-                s_detected_tonemap_draw,
-                s_detected_backbuffer_blit_draw,
-                s_detected_overlay_draw,
-                s_frame_draw_index.load(std::memory_order_relaxed));
+                cur_m.gbuffer, cur_m.linearDepth, cur_m.sceneFinish,
+                cur_m.bloomUpscale, cur_m.tonemap, cur_m.blit,
+                cur_m.overlay, cur_m.total);
             EdpeLog(eidMsg);
         }
+
+        // A5: Frame reset in ContextCensusOnPresent
+        s_inside_scene_passes.store(false, std::memory_order_release);
+        s_jitter_disabled_for_frame.store(false, std::memory_order_relaxed);
+        s_current_is_gbuffer_mrt.store(false, std::memory_order_relaxed);
+        s_current_is_linear_depth.store(false, std::memory_order_relaxed);
+        s_current_is_scene_geometry.store(false, std::memory_order_relaxed);
+        s_current_is_bloom_target.store(false, std::memory_order_relaxed);
+        s_current_is_tonemap_target.store(false, std::memory_order_relaxed);
+        s_current_is_backbuffer_target.store(false, std::memory_order_relaxed);
+        s_scene_linear_depth_frame = ~0ull;
 
         s_detected_gbuffer_start_draw = 0;
         s_detected_linear_depth_draw = 0;
@@ -4447,6 +4867,14 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     s_detected_backbuffer_blit_draw = 0;
     s_detected_overlay_draw = 0;
     s_frame_draw_index.store(0, std::memory_order_relaxed);
+    s_dlaa_input.Reset();
+    s_dlaa_input_srv.Reset();
+    s_dlaa_input_desc = {};
+    s_bloom_upscale_output.Reset();
+    s_bloom_output_desc = {};
+    motion_depth.Reset();
+    motion_depth_view.Reset();
+    s_motion_depth_desc = {};
     {
         std::lock_guard lock(seen_mutex);
         snapshot_queued = -1;
@@ -4568,6 +4996,7 @@ bool ContextCensusGetJitterTestOverride() {
 }
 
 bool ContextCensusIsJitterActive() {
+    if (s_jitter_disabled_for_frame.load(std::memory_order_relaxed)) return false;
     if (!jitter_enabled.load(std::memory_order_relaxed)) return false;
     if (jitter_test_override.load(std::memory_order_relaxed)) return true;
     if (s_jitter_debug_view.load(std::memory_order_relaxed)) return true;

@@ -1,4 +1,5 @@
 #include "motion_pass.h"
+#include "temporal_math.h"
 
 #include <DirectXPackedVector.h>
 #include <d3dcompiler.h>
@@ -13,8 +14,14 @@ using Microsoft::WRL::ComPtr;
 int main() {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
-            D3D11_SDK_VERSION, &device, nullptr, &context))) return 1;
+    // Prefer Hardware adapter; fallback to WARP for software rasterization.
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, &device, nullptr, &context);
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+                D3D11_SDK_VERSION, &device, nullptr, &context);
+    }
+    if (FAILED(hr) || !device || !context) return 77; // Skip code for runners without D3D11 support
 
     std::array<std::uint64_t, 16> depths{};
     depths.fill(std::bit_cast<std::uint32_t>(0.0025f));
@@ -238,7 +245,9 @@ int main() {
     if (std::fabs(turned_x - expected_x) >= .01f ||
         std::fabs(turned_y - expected_y) >= .01f) return 33;
 
-    // Test linear depth R32_FLOAT motion generation
+    // -------------------------------------------------------------------------
+    // D2 & Linear depth R32_FLOAT motion generation tests
+    // -------------------------------------------------------------------------
     previous = {{-.965338f,-.0708149f,-.251214f,19.5594f,
                  -.00114341f,.963628f,-.267244f,-39.2084f,
                  .261002f,-.257694f,-.930307f,-99.7282f},
@@ -258,7 +267,9 @@ int main() {
     lin_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     std::array<float, 16> lin_depths{};
     lin_depths.fill(10.0f); // 10.0m corresponding to raw depth 0.0025f with depthB 0.025f
-    lin_depths[0] = 0.0f; // invalid/skybox
+    lin_depths[0] = 0.0f;     // Texel (0,0): skybox / invalid -> pure rotation expected
+    lin_depths[2] = 55000.0f; // Texel (2,0): >= 50000m celestial -> pure rotation expected
+    lin_depths[3] = 2.0f;     // Texel (3,0): z < 3.5m cockpit clamp -> zero motion expected
     D3D11_SUBRESOURCE_DATA lin_initial{lin_depths.data(), 4 * sizeof(float), 0};
     ComPtr<ID3D11Texture2D> lin_depth_tex;
     ComPtr<ID3D11ShaderResourceView> lin_depth_srv;
@@ -268,13 +279,71 @@ int main() {
     if (!pass.render(lin_depth_srv.Get(), now, previous, 4, 4, true /* isLinearDepth */)) return 36;
     context->CopyResource(readback.Get(), output.Get());
     if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 37;
+
+    // Normal world geometry texel (1, 1)
     valid = reinterpret_cast<const std::uint16_t*>(
         static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch + 4);
     const float lin_actual_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
     const float lin_actual_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
-    context->Unmap(readback.Get(), 0);
     if (std::fabs(lin_actual_x - expected_x) >= .01f ||
-        std::fabs(lin_actual_y - expected_y) >= .01f) return 38;
+        std::fabs(lin_actual_y - expected_y) >= .01f) {
+        context->Unmap(readback.Get(), 0);
+        return 38;
+    }
 
-    return 0;
+    // D2 Case 1: Skybox texel (value 0.0) at (0, 0) expects pure rotational motion
+    float exp_sky_x = 0, exp_sky_y = 0;
+    if (!edpe::cameraSkyboxMotion(now, previous, 4, 4, 0.0f, 0.0f, &exp_sky_x, &exp_sky_y)) {
+        context->Unmap(readback.Get(), 0);
+        return 39;
+    }
+    const auto* skybox_val = static_cast<const std::uint16_t*>(mapped.pData);
+    const float act_sky_x = DirectX::PackedVector::XMConvertHalfToFloat(skybox_val[0]);
+    const float act_sky_y = DirectX::PackedVector::XMConvertHalfToFloat(skybox_val[1]);
+    if (std::fabs(act_sky_x - exp_sky_x) >= .01f ||
+        std::fabs(act_sky_y - exp_sky_y) >= .01f) {
+        context->Unmap(readback.Get(), 0);
+        return 40;
+    }
+
+    // D2 Case 2: Celestial texel (depth >= 50000m) at (2, 0) expects pure rotational motion
+    float exp_cel_x = 0, exp_cel_y = 0;
+    if (!edpe::cameraSkyboxMotion(now, previous, 4, 4, 2.0f, 0.0f, &exp_cel_x, &exp_cel_y)) {
+        context->Unmap(readback.Get(), 0);
+        return 41;
+    }
+    const auto* cel_val = static_cast<const std::uint16_t*>(mapped.pData) + 2 * 2;
+    const float act_cel_x = DirectX::PackedVector::XMConvertHalfToFloat(cel_val[0]);
+    const float act_cel_y = DirectX::PackedVector::XMConvertHalfToFloat(cel_val[1]);
+    if (std::fabs(act_cel_x - exp_cel_x) >= .01f ||
+        std::fabs(act_cel_y - exp_cel_y) >= .01f) {
+        context->Unmap(readback.Get(), 0);
+        return 42;
+    }
+
+    // D2 Case 3: Cockpit texel (z = 2.0m < 3.5m) at (3, 0) with clamp enabled expects exactly zero motion
+    const auto* cockpit_val = static_cast<const std::uint16_t*>(mapped.pData) + 3 * 2;
+    const float act_cockpit_x = DirectX::PackedVector::XMConvertHalfToFloat(cockpit_val[0]);
+    const float act_cockpit_y = DirectX::PackedVector::XMConvertHalfToFloat(cockpit_val[1]);
+    if (act_cockpit_x != 0.0f || act_cockpit_y != 0.0f) {
+        context->Unmap(readback.Get(), 0);
+        return 43;
+    }
+    context->Unmap(readback.Get(), 0);
+
+    // D2 Case 4: Read the info.w = 0 raw path after a linear render to prove there is no state leak
+    if (!pass.render(depth_view.Get(), now, previous, 4, 4, false /* isLinearDepth = false */)) return 44;
+    context->CopyResource(readback.Get(), output.Get());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 45;
+    valid = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch + 4);
+    const float raw_after_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
+    const float raw_after_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
+    context->Unmap(readback.Get(), 0);
+    float exp_raw_after_x = 0, exp_raw_after_y = 0;
+    if (!edpe::cameraDepthMotion(now, previous, 4, 4, 1, 1, .0025f, &exp_raw_after_x, &exp_raw_after_y)) return 46;
+    if (std::fabs(raw_after_x - exp_raw_after_x) >= .01f ||
+        std::fabs(raw_after_y - exp_raw_after_y) >= .01f) return 47;
+
+    return 0; // All GPU motion tests passed
 }

@@ -38,7 +38,7 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
     float celestialDepthThresh = (depthB > 0.0) ? (depthB / 50000.0) : 1e-6;
     bool isCelestial = isLinear ?
         (depthVal <= 0.0 || depthVal >= 50000.0 || isnan(depthVal) || isinf(depthVal)) :
-        (depthVal <= 0.0 || depthVal > 1.0 || depthVal < celestialDepthThresh);
+        (depthVal <= 0.0 || depthVal > 1.0 || depthVal < celestialDepthThresh || isnan(depthVal) || isinf(depthVal));
 
     if (isCelestial) {
         float2 ndc = float2(2.0 * pixel.x / info.y - 1.0, 1.0 - 2.0 * pixel.y / info.z);
