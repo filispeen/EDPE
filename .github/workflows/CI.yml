@@ -1,28 +1,17 @@
-name: CI
+name: Release
 
 on:
   push:
-    branches: 
-      - master
-      - experimental
-  pull_request:
-    branches:
-      - master
-      - experimental
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+      branches: 
+        - master
+        - experimental
 
 permissions:
-  contents: read
-
-env:
-  NV_DLSS_TAG: "v3.7.20"
+  contents: write
 
 jobs:
-  build-and-test:
-    name: Build and Test
+  build-and-release:
+    name: Build and Publish Release
     runs-on: windows-latest
 
     steps:
@@ -37,15 +26,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: external/DLSS
-          key: dlss-sdk-${{ runner.os }}-${{ env.NV_DLSS_TAG }}
+          key: dlss-sdk-${{ runner.os }}-v1
+          restore-keys: |
+            dlss-sdk-${{ runner.os }}-
 
       - name: Clone NVIDIA DLSS SDK
         if: steps.cache-dlss.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           if (-not (Test-Path "external/DLSS/include/nvsdk_ngx.h")) {
-            Write-Host "Cloning official NVIDIA DLSS SDK (${{ env.NV_DLSS_TAG }})..."
-            git clone --depth 1 --branch ${{ env.NV_DLSS_TAG }} --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+            Write-Host "Cloning official NVIDIA DLSS SDK (sparse)..."
+            git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
             Push-Location external/DLSS
             git sparse-checkout set include lib/Windows_x86_64
             Pop-Location
@@ -69,23 +60,3 @@ jobs:
         shell: pwsh
         run: |
           ctest --test-dir build -C Release --output-on-failure
-
-      - name: Upload Binaries
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: edpe-binaries
-          path: |
-            build/Release/*.dll
-            build/Release/*.exe
-            build/stage/*
-
-      - name: Upload Test Logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: edpe-test-logs
-          path: |
-            build/Testing/Temporary/*
-            build/Release/edpe.log
-            build/stage/edpe.log

@@ -192,11 +192,6 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
   - `temporal_math_test`: Added absolute hand-computed tests for pure Y translation ($dx=0, dy=+10$) and pure Y rotation ($dx=-50\tan(0.1), dy=0$), rejection of infinite linear depth and zero camera scale; all return codes made unique.
   - `motion_gpu_test`: Added skybox texel ($0.0$) pure rotation case, celestial depth ($\ge 50000$) pure rotation case, cockpit clamp ($z < 3.5$) zero-motion verification, and post-linear raw pass state-leak test. Added WARP fallback and CMake `SKIP_RETURN_CODE 77` with `gpu` label.
   - `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`: All pass cleanly in Release build.
-- **CI Workflow (.github/workflows/CI.yml):**
-  - Workflow renamed to `CI`, job to `build-and-test`, permissions set to `contents: read`.
-  - Added triggers for push and pull-request on `master` and `experimental`, with concurrency cancellation.
-  - Pinned official NVIDIA DLSS SDK tag (`v3.7.20`) in cache key without restore-keys.
-  - Binaries and test logs uploaded as workflow artifacts on every run.
 
 ---
 
