@@ -208,4 +208,71 @@ inline bool estimateEliteBlockNdcOffset(const float* block, NdcOffset* out) {
     return true;
 }
 
+// Scene cut detection based on orientation and translation discontinuities between camera states.
+inline bool detectSceneCut(const CameraProjection& now, const CameraProjection& prev,
+                           std::uint64_t prevFrame, float* outMoveDist = nullptr,
+                           float* outRotTrace = nullptr) {
+    if (prevFrame == ~0ull) {
+        if (outMoveDist) *outMoveDist = 0.0f;
+        if (outRotTrace) *outRotTrace = 3.0f;
+        return true;
+    }
+    const float* c = now.worldFromView;
+    const float* p = prev.worldFromView;
+    const float dx = c[3] - p[3];
+    const float dy = c[7] - p[7];
+    const float dz = c[11] - p[11];
+    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float rotTrace = (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
+                           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
+                           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
+    if (outMoveDist) *outMoveDist = moveDist;
+    if (outRotTrace) *outRotTrace = rotTrace;
+    const bool orientation_cut = (rotTrace < 2.0f);
+    const bool teleport_cut = (moveDist > 5000.0f);
+    const bool translation_cut = (moveDist > 50.0f && rotTrace < 2.85f);
+    return orientation_cut || teleport_cut || translation_cut;
+}
+
+struct CameraHistory {
+    CameraProjection current{};
+    CameraProjection previous{};
+    std::uint64_t currentFrame = ~0ull;
+    std::uint64_t previousFrame = ~0ull;
+    unsigned fallbackStreak = 0;
+};
+
+inline bool updateCameraHistory(CameraHistory& history, std::uint64_t frame,
+                                const CameraProjection* primaryCandidate,
+                                const CameraProjection* fallbackCandidate) {
+    if (history.currentFrame == frame) return false;
+    if (primaryCandidate && primaryCandidate->scaleX > 0.0f) {
+        if (history.current.scaleX > 0.0f) {
+            history.previous = history.current;
+            history.previousFrame = history.currentFrame;
+        }
+        history.current = *primaryCandidate;
+        history.currentFrame = frame;
+        history.fallbackStreak = 0;
+        return true;
+    }
+    if (fallbackCandidate && fallbackCandidate->scaleX > 0.0f && ++history.fallbackStreak >= 3) {
+        if (history.current.scaleX > 0.0f) {
+            history.previous = history.current;
+            history.previousFrame = history.currentFrame;
+        }
+        history.current = *fallbackCandidate;
+        history.currentFrame = frame;
+        history.fallbackStreak = 0;
+        return true;
+    }
+    if (history.current.scaleX > 0.0f) {
+        history.previous = history.current;
+        history.previousFrame = history.currentFrame;
+        history.currentFrame = frame;
+        return true;
+    }
+    return false;
+}
+
 } // namespace edpe

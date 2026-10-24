@@ -959,6 +959,12 @@ void dumpSceneShaders() {
 void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context,
     UINT start, UINT count, ID3D11Buffer* const* buffers) {
     const auto forward = original_vs_set_buffers.load(std::memory_order_acquire);
+    if (s_reentrant_draw) {
+        if (forward && forward != &observedVSSetConstantBuffers) {
+            forward(context, start, count, buffers);
+        }
+        return;
+    }
     forward(context, start, count, buffers);
     if (context != observed_context.load(std::memory_order_acquire) ||
         !vs_buffer_probe_active.load(std::memory_order_acquire)) return;
@@ -1053,6 +1059,13 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
                         EdpeLog(L"EDPE: executeUpscaleAtBloomStart failed; falling back to Present upscale");
                     }
                 }
+            } else if (scene_hdr_color_source) {
+                static auto s_last_missing_hdr_log = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+                auto now_time = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now_time - s_last_missing_hdr_log).count() >= 1000) {
+                    s_last_missing_hdr_log = now_time;
+                    EdpeLog(L"EDPE: bloom target active but HDR scene SRV not found in PS slots 0..7");
+                }
             }
         }
         s_current_is_bloom_target.store(false, std::memory_order_relaxed);
@@ -1101,10 +1114,16 @@ void armPipelineDrawHooks() {
     if (vs_buffer_probe_active.load(std::memory_order_acquire) ||
         draw_probe_active.load(std::memory_order_acquire)) return;
 
-    if (!s_install_draw) {
+    if (!s_install_draw && patched_table[kDraw] != reinterpret_cast<void*>(&observedDraw)) {
         s_install_draw = reinterpret_cast<DrawFn>(patched_table[kDraw]);
+    }
+    if (!s_install_draw_indexed && patched_table[kDrawIndexed] != reinterpret_cast<void*>(&observedDrawIndexed)) {
         s_install_draw_indexed = reinterpret_cast<DrawIndexedFn>(patched_table[kDrawIndexed]);
+    }
+    if (!s_install_draw_indexed_instanced && patched_table[kDrawIndexedInstanced] != reinterpret_cast<void*>(&observedDrawIndexedInstanced)) {
         s_install_draw_indexed_instanced = reinterpret_cast<DrawIndexedInstancedFn>(patched_table[kDrawIndexedInstanced]);
+    }
+    if (!s_install_draw_instanced && patched_table[kDrawInstanced] != reinterpret_cast<void*>(&observedDrawInstanced)) {
         s_install_draw_instanced = reinterpret_cast<DrawInstancedFn>(patched_table[kDrawInstanced]);
     }
 
@@ -1158,7 +1177,7 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
         auto orig = original_draw_indexed.load(std::memory_order_acquire);
         if (orig && orig != reinterpret_cast<DrawIndexedFn>(&observedDrawIndexed)) {
             orig(context, count, start, base);
-        } else if (s_install_draw_indexed) {
+        } else if (s_install_draw_indexed && s_install_draw_indexed != reinterpret_cast<DrawIndexedFn>(&observedDrawIndexed)) {
             s_install_draw_indexed(context, count, start, base);
         }
         return;
@@ -1192,7 +1211,7 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
         auto orig = original_draw.load(std::memory_order_acquire);
         if (orig && orig != reinterpret_cast<DrawFn>(&observedDraw)) {
             orig(context, count, start);
-        } else if (s_install_draw) {
+        } else if (s_install_draw && s_install_draw != reinterpret_cast<DrawFn>(&observedDraw)) {
             s_install_draw(context, count, start);
         }
         return;
@@ -1228,7 +1247,7 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
         auto orig = original_draw_indexed_instanced.load(std::memory_order_acquire);
         if (orig && orig != reinterpret_cast<DrawIndexedInstancedFn>(&observedDrawIndexedInstanced)) {
             orig(context, index_count, instance_count, start_index, base_vertex, start_instance);
-        } else if (s_install_draw_indexed_instanced) {
+        } else if (s_install_draw_indexed_instanced && s_install_draw_indexed_instanced != reinterpret_cast<DrawIndexedInstancedFn>(&observedDrawIndexedInstanced)) {
             s_install_draw_indexed_instanced(context, index_count, instance_count, start_index, base_vertex, start_instance);
         }
         return;
@@ -1265,7 +1284,7 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         auto orig = original_draw_instanced.load(std::memory_order_acquire);
         if (orig && orig != reinterpret_cast<DrawInstancedFn>(&observedDrawInstanced)) {
             orig(context, vertex_count, instance_count, start_vertex, start_instance);
-        } else if (s_install_draw_instanced) {
+        } else if (s_install_draw_instanced && s_install_draw_instanced != reinterpret_cast<DrawInstancedFn>(&observedDrawInstanced)) {
             s_install_draw_instanced(context, vertex_count, instance_count, start_vertex, start_instance);
         }
         return;
@@ -1383,8 +1402,14 @@ void endHudDrawProbe() {
 
 HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
-    const HRESULT result = original_map.load(std::memory_order_acquire)(
-        context, resource, subresource, type, flags, mapped);
+    const auto forward = original_map.load(std::memory_order_acquire);
+    if (s_reentrant_draw) {
+        if (forward && forward != &observedMap) {
+            return forward(context, resource, subresource, type, flags, mapped);
+        }
+        return E_FAIL;
+    }
+    const HRESULT result = forward(context, resource, subresource, type, flags, mapped);
     if (s_in_edpe_present.load(std::memory_order_acquire)) return result;
     if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
         resource && map_hook_active.load(std::memory_order_acquire)) {
@@ -1429,6 +1454,13 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
 
 void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource) {
+    const auto forward = original_unmap.load(std::memory_order_acquire);
+    if (s_reentrant_draw) {
+        if (forward && forward != &observedUnmap) {
+            forward(context, resource, subresource);
+        }
+        return;
+    }
     if (!s_in_edpe_present.load(std::memory_order_acquire) &&
         context == observed_context.load(std::memory_order_acquire) &&
         resource &&
@@ -2575,17 +2607,22 @@ static unsigned long long s_last_temporal_inputs_frame = ~0ull;
 //   scene target (scene_ldr_source, renderWidth x renderHeight) and reconstructs
 //   into the native-resolution backbuffer (outputWidth x outputHeight).
 // `rendered` is the last_present_frame value seen while this frame rendered.
-// RAII State Guard for complete D3D11 pipeline state isolation (A1)
+// RAII State Guard for complete D3D11 pipeline state isolation
 class D3D11ContextStateGuard {
 public:
     explicit D3D11ContextStateGuard(ID3D11DeviceContext* ctx) : context_(ctx) {
         if (!context_) return;
-        // OM
-        context_->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs_, &saved_dsv_);
+        // OM Render Targets, DSV, and OM UAVs
+        context_->OMGetRenderTargetsAndUnorderedAccessViews(
+            D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs_, &saved_dsv_,
+            0, 8, saved_om_uavs_);
+        for (UINT i = 0; i < 8; ++i) {
+            if (saved_om_uavs_[i]) has_om_uavs_ = true;
+        }
         context_->OMGetBlendState(&saved_blend_, saved_blend_factor_, &saved_sample_mask_);
         context_->OMGetDepthStencilState(&saved_ds_, &saved_stencil_ref_);
 
-        // RS
+        // RS Viewports, Scissor Rects, State
         saved_vp_count_ = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
         context_->RSGetViewports(&saved_vp_count_, saved_viewports_);
         saved_sr_count_ = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
@@ -2595,27 +2632,43 @@ public:
         // IA
         context_->IAGetInputLayout(&saved_layout_);
         context_->IAGetPrimitiveTopology(&saved_topology_);
-        context_->IAGetVertexBuffers(0, 16, saved_vbs_, saved_strides_, saved_offsets_);
+        context_->IAGetVertexBuffers(0, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, saved_vbs_, saved_strides_, saved_offsets_);
         context_->IAGetIndexBuffer(&saved_ib_, &saved_ib_format_, &saved_ib_offset_);
 
-        // VS
+        // Shaders: VS, PS, CS, GS, HS, DS
         context_->VSGetShader(&saved_vs_, nullptr, &saved_vs_instances_);
-        context_->VSGetConstantBuffers(0, 16, saved_vs_cbs_);
-        context_->VSGetShaderResources(0, 16, saved_vs_srvs_);
-        context_->VSGetSamplers(0, 16, saved_vs_samplers_);
+        context_->VSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_vs_cbs_);
+        context_->VSGetShaderResources(0, 32, saved_vs_srvs_);
+        context_->VSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_vs_samplers_);
 
-        // PS
         context_->PSGetShader(&saved_ps_, nullptr, &saved_ps_instances_);
-        context_->PSGetConstantBuffers(0, 16, saved_ps_cbs_);
-        context_->PSGetShaderResources(0, 16, saved_ps_srvs_);
-        context_->PSGetSamplers(0, 16, saved_ps_samplers_);
+        context_->PSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_ps_cbs_);
+        context_->PSGetShaderResources(0, 32, saved_ps_srvs_);
+        context_->PSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_ps_samplers_);
 
-        // CS
         context_->CSGetShader(&saved_cs_, nullptr, &saved_cs_instances_);
-        context_->CSGetConstantBuffers(0, 16, saved_cs_cbs_);
-        context_->CSGetShaderResources(0, 16, saved_cs_srvs_);
-        context_->CSGetSamplers(0, 16, saved_cs_samplers_);
+        context_->CSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_cs_cbs_);
+        context_->CSGetShaderResources(0, 32, saved_cs_srvs_);
+        context_->CSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_cs_samplers_);
         context_->CSGetUnorderedAccessViews(0, 8, saved_cs_uavs_);
+
+        context_->GSGetShader(&saved_gs_, nullptr, &saved_gs_instances_);
+        context_->GSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_gs_cbs_);
+        context_->GSGetShaderResources(0, 32, saved_gs_srvs_);
+        context_->GSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_gs_samplers_);
+
+        context_->HSGetShader(&saved_hs_, nullptr, &saved_hs_instances_);
+        context_->HSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_hs_cbs_);
+        context_->HSGetShaderResources(0, 32, saved_hs_srvs_);
+        context_->HSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_hs_samplers_);
+
+        context_->DSGetShader(&saved_ds_shader_, nullptr, &saved_ds_instances_);
+        context_->DSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_ds_cbs_);
+        context_->DSGetShaderResources(0, 32, saved_ds_srvs_);
+        context_->DSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_ds_samplers_);
+
+        // SO Targets
+        context_->SOGetTargets(4, saved_so_buffers_);
     }
 
     ~D3D11ContextStateGuard() {
@@ -2623,28 +2676,48 @@ public:
         // Restore IA
         context_->IASetInputLayout(saved_layout_);
         context_->IASetPrimitiveTopology(saved_topology_);
-        context_->IASetVertexBuffers(0, 16, saved_vbs_, saved_strides_, saved_offsets_);
+        context_->IASetVertexBuffers(0, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, saved_vbs_, saved_strides_, saved_offsets_);
         context_->IASetIndexBuffer(saved_ib_, saved_ib_format_, saved_ib_offset_);
 
         // Restore VS
         context_->VSSetShader(saved_vs_, nullptr, 0);
-        context_->VSSetConstantBuffers(0, 16, saved_vs_cbs_);
-        context_->VSSetShaderResources(0, 16, saved_vs_srvs_);
-        context_->VSSetSamplers(0, 16, saved_vs_samplers_);
+        context_->VSSetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_vs_cbs_);
+        context_->VSSetShaderResources(0, 32, saved_vs_srvs_);
+        context_->VSSetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_vs_samplers_);
 
         // Restore PS
         context_->PSSetShader(saved_ps_, nullptr, 0);
-        context_->PSSetConstantBuffers(0, 16, saved_ps_cbs_);
-        context_->PSSetShaderResources(0, 16, saved_ps_srvs_);
-        context_->PSSetSamplers(0, 16, saved_ps_samplers_);
+        context_->PSSetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_ps_cbs_);
+        context_->PSSetShaderResources(0, 32, saved_ps_srvs_);
+        context_->PSSetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_ps_samplers_);
 
         // Restore CS
         context_->CSSetShader(saved_cs_, nullptr, 0);
-        context_->CSSetConstantBuffers(0, 16, saved_cs_cbs_);
-        context_->CSSetShaderResources(0, 16, saved_cs_srvs_);
-        context_->CSSetSamplers(0, 16, saved_cs_samplers_);
+        context_->CSSetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_cs_cbs_);
+        context_->CSSetShaderResources(0, 32, saved_cs_srvs_);
+        context_->CSSetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_cs_samplers_);
         UINT init_counts[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
         context_->CSSetUnorderedAccessViews(0, 8, saved_cs_uavs_, init_counts);
+
+        // Restore GS, HS, DS
+        context_->GSSetShader(saved_gs_, nullptr, 0);
+        context_->GSSetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_gs_cbs_);
+        context_->GSSetShaderResources(0, 32, saved_gs_srvs_);
+        context_->GSSetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_gs_samplers_);
+
+        context_->HSSetShader(saved_hs_, nullptr, 0);
+        context_->HSSetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_hs_cbs_);
+        context_->HSSetShaderResources(0, 32, saved_hs_srvs_);
+        context_->HSSetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_hs_samplers_);
+
+        context_->DSSetShader(saved_ds_shader_, nullptr, 0);
+        context_->DSSetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, saved_ds_cbs_);
+        context_->DSSetShaderResources(0, 32, saved_ds_srvs_);
+        context_->DSSetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, saved_ds_samplers_);
+
+        // Restore SO
+        UINT so_offsets[4] = {~0u, ~0u, ~0u, ~0u};
+        context_->SOSetTargets(4, saved_so_buffers_, so_offsets);
 
         // Restore RS
         context_->RSSetState(saved_rs_);
@@ -2654,36 +2727,65 @@ public:
         // Restore OM
         context_->OMSetBlendState(saved_blend_, saved_blend_factor_, saved_sample_mask_);
         context_->OMSetDepthStencilState(saved_ds_, saved_stencil_ref_);
-        context_->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs_, saved_dsv_);
+        if (has_om_uavs_) {
+            UINT uav_counts[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+            context_->OMSetRenderTargetsAndUnorderedAccessViews(
+                D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs_, saved_dsv_,
+                0, 8, saved_om_uavs_, uav_counts);
+        } else {
+            context_->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, saved_rtvs_, saved_dsv_);
+        }
 
         // Release COM references
         for (auto* rtv : saved_rtvs_) if (rtv) rtv->Release();
         if (saved_dsv_) saved_dsv_->Release();
+        for (auto* uav : saved_om_uavs_) if (uav) uav->Release();
         if (saved_blend_) saved_blend_->Release();
         if (saved_ds_) saved_ds_->Release();
         if (saved_rs_) saved_rs_->Release();
         if (saved_layout_) saved_layout_->Release();
         for (auto* vb : saved_vbs_) if (vb) vb->Release();
         if (saved_ib_) saved_ib_->Release();
+        for (auto* buf : saved_so_buffers_) if (buf) buf->Release();
+
         if (saved_vs_) saved_vs_->Release();
         for (auto* cb : saved_vs_cbs_) if (cb) cb->Release();
         for (auto* srv : saved_vs_srvs_) if (srv) srv->Release();
         for (auto* samp : saved_vs_samplers_) if (samp) samp->Release();
+
         if (saved_ps_) saved_ps_->Release();
         for (auto* cb : saved_ps_cbs_) if (cb) cb->Release();
         for (auto* srv : saved_ps_srvs_) if (srv) srv->Release();
         for (auto* samp : saved_ps_samplers_) if (samp) samp->Release();
+
         if (saved_cs_) saved_cs_->Release();
         for (auto* cb : saved_cs_cbs_) if (cb) cb->Release();
         for (auto* srv : saved_cs_srvs_) if (srv) srv->Release();
         for (auto* samp : saved_cs_samplers_) if (samp) samp->Release();
         for (auto* uav : saved_cs_uavs_) if (uav) uav->Release();
+
+        if (saved_gs_) saved_gs_->Release();
+        for (auto* cb : saved_gs_cbs_) if (cb) cb->Release();
+        for (auto* srv : saved_gs_srvs_) if (srv) srv->Release();
+        for (auto* samp : saved_gs_samplers_) if (samp) samp->Release();
+
+        if (saved_hs_) saved_hs_->Release();
+        for (auto* cb : saved_hs_cbs_) if (cb) cb->Release();
+        for (auto* srv : saved_hs_srvs_) if (srv) srv->Release();
+        for (auto* samp : saved_hs_samplers_) if (samp) samp->Release();
+
+        if (saved_ds_shader_) saved_ds_shader_->Release();
+        for (auto* cb : saved_ds_cbs_) if (cb) cb->Release();
+        for (auto* srv : saved_ds_srvs_) if (srv) srv->Release();
+        for (auto* samp : saved_ds_samplers_) if (samp) samp->Release();
     }
 
 private:
     ID3D11DeviceContext* context_ = nullptr;
+    bool has_om_uavs_ = false;
     ID3D11RenderTargetView* saved_rtvs_[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     ID3D11DepthStencilView* saved_dsv_ = nullptr;
+    ID3D11UnorderedAccessView* saved_om_uavs_[8]{};
     ID3D11BlendState* saved_blend_ = nullptr;
     float saved_blend_factor_[4]{};
     UINT saved_sample_mask_ = 0;
@@ -2696,31 +2798,52 @@ private:
     ID3D11RasterizerState* saved_rs_ = nullptr;
     ID3D11InputLayout* saved_layout_ = nullptr;
     D3D11_PRIMITIVE_TOPOLOGY saved_topology_ = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-    ID3D11Buffer* saved_vbs_[16]{};
-    UINT saved_strides_[16]{};
-    UINT saved_offsets_[16]{};
+    ID3D11Buffer* saved_vbs_[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT]{};
+    UINT saved_strides_[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT]{};
+    UINT saved_offsets_[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT]{};
     ID3D11Buffer* saved_ib_ = nullptr;
     DXGI_FORMAT saved_ib_format_ = DXGI_FORMAT_UNKNOWN;
     UINT saved_ib_offset_ = 0;
+    ID3D11Buffer* saved_so_buffers_[4]{};
+
     ID3D11VertexShader* saved_vs_ = nullptr;
     UINT saved_vs_instances_ = 0;
-    ID3D11Buffer* saved_vs_cbs_[16]{};
-    ID3D11ShaderResourceView* saved_vs_srvs_[16]{};
-    ID3D11SamplerState* saved_vs_samplers_[16]{};
+    ID3D11Buffer* saved_vs_cbs_[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]{};
+    ID3D11ShaderResourceView* saved_vs_srvs_[32]{};
+    ID3D11SamplerState* saved_vs_samplers_[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
+
     ID3D11PixelShader* saved_ps_ = nullptr;
     UINT saved_ps_instances_ = 0;
-    ID3D11Buffer* saved_ps_cbs_[16]{};
-    ID3D11ShaderResourceView* saved_ps_srvs_[16]{};
-    ID3D11SamplerState* saved_ps_samplers_[16]{};
+    ID3D11Buffer* saved_ps_cbs_[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]{};
+    ID3D11ShaderResourceView* saved_ps_srvs_[32]{};
+    ID3D11SamplerState* saved_ps_samplers_[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
+
     ID3D11ComputeShader* saved_cs_ = nullptr;
     UINT saved_cs_instances_ = 0;
-    ID3D11Buffer* saved_cs_cbs_[16]{};
-    ID3D11ShaderResourceView* saved_cs_srvs_[16]{};
-    ID3D11SamplerState* saved_cs_samplers_[16]{};
+    ID3D11Buffer* saved_cs_cbs_[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]{};
+    ID3D11ShaderResourceView* saved_cs_srvs_[32]{};
+    ID3D11SamplerState* saved_cs_samplers_[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
     ID3D11UnorderedAccessView* saved_cs_uavs_[8]{};
+
+    ID3D11GeometryShader* saved_gs_ = nullptr;
+    UINT saved_gs_instances_ = 0;
+    ID3D11Buffer* saved_gs_cbs_[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]{};
+    ID3D11ShaderResourceView* saved_gs_srvs_[32]{};
+    ID3D11SamplerState* saved_gs_samplers_[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
+
+    ID3D11HullShader* saved_hs_ = nullptr;
+    UINT saved_hs_instances_ = 0;
+    ID3D11Buffer* saved_hs_cbs_[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]{};
+    ID3D11ShaderResourceView* saved_hs_srvs_[32]{};
+    ID3D11SamplerState* saved_hs_samplers_[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
+
+    ID3D11DomainShader* saved_ds_shader_ = nullptr;
+    UINT saved_ds_instances_ = 0;
+    ID3D11Buffer* saved_ds_cbs_[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT]{};
+    ID3D11ShaderResourceView* saved_ds_srvs_[32]{};
+    ID3D11SamplerState* saved_ds_samplers_[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
 };
 
-// C1: Shared helpers for camera update, scene cut detection, and frame delta time
 static void updateFrameCamera(unsigned long long rendered) {
     if (s_camera_frame == rendered) return;
     if (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered) {
@@ -2733,30 +2856,6 @@ static void updateFrameCamera(unsigned long long rendered) {
         s_camera_previous_frame = s_camera_frame;
         s_camera_frame = rendered;
     }
-}
-
-static bool detectSceneCut(const edpe::CameraProjection& now, const edpe::CameraProjection& prev, unsigned long long prevFrame,
-                           float* outMoveDist = nullptr, float* outRotTrace = nullptr) {
-    if (prevFrame == ~0ull) {
-        if (outMoveDist) *outMoveDist = 0.0f;
-        if (outRotTrace) *outRotTrace = 3.0f;
-        return true;
-    }
-    const float* c = now.worldFromView;
-    const float* p = prev.worldFromView;
-    const float dx = c[3] - p[3];
-    const float dy = c[7] - p[7];
-    const float dz = c[11] - p[11];
-    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const float rotTrace = (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
-                           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
-                           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
-    if (outMoveDist) *outMoveDist = moveDist;
-    if (outRotTrace) *outRotTrace = rotTrace;
-    const bool orientation_cut = (rotTrace < 2.0f);
-    const bool teleport_cut = (moveDist > 5000.0f);
-    const bool translation_cut = (moveDist > 50.0f && rotTrace < 2.85f);
-    return orientation_cut || teleport_cut || translation_cut;
 }
 
 static float computeFrameDeltaTimeMs() {
@@ -2775,24 +2874,66 @@ static float computeFrameDeltaTimeMs() {
     return dt_ms;
 }
 
-// B1: Linear depth validation against raw depth copy
+inline DXGI_FORMAT getDepthCopyTextureFormat(DXGI_FORMAT srcFormat) {
+    switch (srcFormat) {
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            return DXGI_FORMAT_R32G8X24_TYPELESS;
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            return DXGI_FORMAT_R24G8_TYPELESS;
+        case DXGI_FORMAT_R32_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_R32_FLOAT:
+            return DXGI_FORMAT_R32_TYPELESS;
+        case DXGI_FORMAT_R16_TYPELESS:
+        case DXGI_FORMAT_D16_UNORM:
+            return DXGI_FORMAT_R16_TYPELESS;
+        default:
+            return srcFormat;
+    }
+}
+
+inline DXGI_FORMAT getDepthSrvFormat(DXGI_FORMAT texFormat) {
+    switch (texFormat) {
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R32_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_R32_FLOAT:
+            return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R16_TYPELESS:
+        case DXGI_FORMAT_D16_UNORM:
+            return DXGI_FORMAT_R16_UNORM;
+        default:
+            return texFormat;
+    }
+}
+
 static bool validateLinearDepthTexture(ID3D11Device* device, ID3D11DeviceContext* context,
-    ID3D11Texture2D* linearTex, ID3D11Texture2D* rawDepthTex, float depthB) {
-    if (!device || !context || !linearTex || !rawDepthTex) return false;
-    static ID3D11Texture2D* s_cached_validated_tex = nullptr;
+    ID3D11Texture2D* linearTex, ID3D11Texture2D* rawDepthCopyTex, float depthB) {
+    if (!device || !context || !linearTex || !rawDepthCopyTex) return false;
+    static ID3D11Texture2D* s_cached_validated_linear = nullptr;
+    static ID3D11Texture2D* s_cached_validated_raw = nullptr;
     static bool s_cached_verdict = false;
-    if (s_cached_validated_tex == linearTex) return s_cached_verdict;
+    if (s_cached_validated_linear == linearTex && s_cached_validated_raw == rawDepthCopyTex) {
+        return s_cached_verdict;
+    }
 
     D3D11_TEXTURE2D_DESC ldesc{}, rdesc{};
     linearTex->GetDesc(&ldesc);
-    rawDepthTex->GetDesc(&rdesc);
+    rawDepthCopyTex->GetDesc(&rdesc);
     if (ldesc.Width != rdesc.Width || ldesc.Height != rdesc.Height || ldesc.Width < 4 || ldesc.Height < 4) {
-        s_cached_validated_tex = linearTex;
+        s_cached_validated_linear = linearTex;
+        s_cached_validated_raw = rawDepthCopyTex;
         s_cached_verdict = false;
         return false;
     }
 
-    // Read back a 4x4 coarse grid
     D3D11_TEXTURE2D_DESC stDesc{};
     stDesc.Width = 4;
     stDesc.Height = 4;
@@ -2805,14 +2946,16 @@ static bool validateLinearDepthTexture(ID3D11Device* device, ID3D11DeviceContext
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> linStaging, rawStaging;
     if (FAILED(device->CreateTexture2D(&stDesc, nullptr, &linStaging))) {
-        s_cached_validated_tex = linearTex;
+        s_cached_validated_linear = linearTex;
+        s_cached_validated_raw = rawDepthCopyTex;
         s_cached_verdict = false;
         return false;
     }
 
     stDesc.Format = rdesc.Format;
     if (FAILED(device->CreateTexture2D(&stDesc, nullptr, &rawStaging))) {
-        s_cached_validated_tex = linearTex;
+        s_cached_validated_linear = linearTex;
+        s_cached_validated_raw = rawDepthCopyTex;
         s_cached_verdict = false;
         return false;
     }
@@ -2823,46 +2966,50 @@ static bool validateLinearDepthTexture(ID3D11Device* device, ID3D11DeviceContext
             const UINT y = (row * (ldesc.Height - 1)) / 3;
             D3D11_BOX box{x, y, 0, x + 1, y + 1, 1};
             context->CopySubresourceRegion(linStaging.Get(), 0, col, row, 0, linearTex, 0, &box);
-            context->CopySubresourceRegion(rawStaging.Get(), 0, col, row, 0, rawDepthTex, 0, &box);
+            context->CopySubresourceRegion(rawStaging.Get(), 0, col, row, 0, rawDepthCopyTex, 0, &box);
         }
     }
 
     D3D11_MAPPED_SUBRESOURCE linMap{}, rawMap{};
     if (FAILED(context->Map(linStaging.Get(), 0, D3D11_MAP_READ, 0, &linMap))) {
-        s_cached_validated_tex = linearTex;
+        s_cached_validated_linear = linearTex;
+        s_cached_validated_raw = rawDepthCopyTex;
         s_cached_verdict = false;
         return false;
     }
     if (FAILED(context->Map(rawStaging.Get(), 0, D3D11_MAP_READ, 0, &rawMap))) {
         context->Unmap(linStaging.Get(), 0);
-        s_cached_validated_tex = linearTex;
+        s_cached_validated_linear = linearTex;
+        s_cached_validated_raw = rawDepthCopyTex;
         s_cached_verdict = false;
         return false;
     }
 
-    bool valid = true;
-    unsigned checked_count = 0;
+    unsigned total_valid = 0;
+    unsigned matching_count = 0;
     const float effDepthB = (depthB > 0.0f && depthB < 1.0f) ? depthB : 0.025f;
 
-    for (UINT row = 0; row < 4 && valid; ++row) {
+    for (UINT row = 0; row < 4; ++row) {
         const float* linRow = reinterpret_cast<const float*>(
             static_cast<const uint8_t*>(linMap.pData) + row * linMap.RowPitch);
         const uint8_t* rawRowBytes = static_cast<const uint8_t*>(rawMap.pData) + row * rawMap.RowPitch;
 
-        for (UINT col = 0; col < 4 && valid; ++col) {
+        for (UINT col = 0; col < 4; ++col) {
             const float zLin = linRow[col];
-            if (!std::isfinite(zLin) || zLin <= 0.0f) {
-                if (zLin < 0.0f || std::isnan(zLin)) {
-                    valid = false;
-                    break;
-                }
-                continue;
-            }
+            if (!std::isfinite(zLin) || zLin <= 0.0f) continue;
 
             float zRaw = 0.0f;
             if (rdesc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
                 rdesc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
                 zRaw = *reinterpret_cast<const float*>(rawRowBytes + col * sizeof(uint64_t));
+            } else if (rdesc.Format == DXGI_FORMAT_R24G8_TYPELESS ||
+                       rdesc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                const uint32_t val = *reinterpret_cast<const uint32_t*>(rawRowBytes + col * sizeof(uint32_t));
+                zRaw = static_cast<float>(val & 0x00FFFFFF) / 16777215.0f;
+            } else if (rdesc.Format == DXGI_FORMAT_R16_TYPELESS ||
+                       rdesc.Format == DXGI_FORMAT_D16_UNORM) {
+                const uint16_t val = *reinterpret_cast<const uint16_t*>(rawRowBytes + col * sizeof(uint16_t));
+                zRaw = static_cast<float>(val) / 65535.0f;
             } else {
                 zRaw = *reinterpret_cast<const float*>(rawRowBytes + col * sizeof(float));
             }
@@ -2870,11 +3017,10 @@ static bool validateLinearDepthTexture(ID3D11Device* device, ID3D11DeviceContext
             if (std::isfinite(zRaw) && zRaw > 1e-5f && zRaw <= 1.0f) {
                 const float expectedZ = effDepthB / zRaw;
                 const float relError = std::fabs(zLin - expectedZ) / expectedZ;
-                if (relError > 0.02f && expectedZ < 50000.0f) {
-                    valid = false;
-                    break;
+                ++total_valid;
+                if (relError <= 0.02f) {
+                    ++matching_count;
                 }
-                ++checked_count;
             }
         }
     }
@@ -2882,8 +3028,11 @@ static bool validateLinearDepthTexture(ID3D11Device* device, ID3D11DeviceContext
     context->Unmap(rawStaging.Get(), 0);
     context->Unmap(linStaging.Get(), 0);
 
-    s_cached_validated_tex = linearTex;
-    s_cached_verdict = valid && (checked_count > 0);
+    const bool verdict = (total_valid >= 4) &&
+        (static_cast<float>(matching_count) / static_cast<float>(total_valid) >= 0.75f);
+    s_cached_validated_linear = linearTex;
+    s_cached_validated_raw = rawDepthCopyTex;
+    s_cached_verdict = verdict;
     return s_cached_verdict;
 }
 
@@ -2892,10 +3041,10 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     auto& upscaler = edpe::UpscalerManager::instance();
     if (!upscaler.isReconstructionActive()) return false;
 
-    // A1: RAII State Guard wrapping entire injection block
+    // RAII State Guard wrapping entire injection block
     D3D11ContextStateGuard stateGuard(context);
 
-    // A2: Reentrancy guard preventing injected work from triggering hooks
+    // Reentrancy guard preventing injected work from triggering hooks
     ReentrancyGuard reentrant(s_reentrant_draw);
 
     D3D11_TEXTURE2D_DESC hdrDesc{};
@@ -2910,19 +3059,58 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
 
     const auto rendered = last_present_frame.load(std::memory_order_relaxed);
 
-    // C1: Update camera
     updateFrameCamera(rendered);
     if (s_camera_now.scaleX <= 0.0f) return false;
 
-    // B2: Prefer raw depth as primary source (includes cockpit and HUD panels).
+    // Always update raw depth copy (motion_depth) if scene_depth_source is present
+    if (scene_depth_source) {
+        D3D11_TEXTURE2D_DESC dd{};
+        scene_depth_source->GetDesc(&dd);
+        const DXGI_FORMAT copyFormat = getDepthCopyTextureFormat(dd.Format);
+        const DXGI_FORMAT srvFormat = getDepthSrvFormat(copyFormat);
+
+        bool needRecreateMotionDepth = !motion_depth ||
+            dd.Width != s_motion_depth_desc.Width ||
+            dd.Height != s_motion_depth_desc.Height ||
+            copyFormat != s_motion_depth_desc.Format ||
+            dd.SampleDesc.Count != s_motion_depth_desc.SampleDesc.Count;
+
+        if (needRecreateMotionDepth) {
+            motion_depth.Reset();
+            motion_depth_view.Reset();
+            D3D11_TEXTURE2D_DESC mdDesc = dd;
+            mdDesc.Format = copyFormat;
+            mdDesc.Usage = D3D11_USAGE_DEFAULT;
+            mdDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            mdDesc.CPUAccessFlags = mdDesc.MiscFlags = 0;
+            HRESULT hr = device->CreateTexture2D(&mdDesc, nullptr, &motion_depth);
+            if (SUCCEEDED(hr)) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
+                srvD.Format = srvFormat;
+                srvD.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvD.Texture2D.MipLevels = 1;
+                hr = device->CreateShaderResourceView(motion_depth.Get(), &srvD, &motion_depth_view);
+                if (SUCCEEDED(hr)) {
+                    s_motion_depth_desc = mdDesc;
+                } else {
+                    motion_depth.Reset();
+                }
+            }
+        }
+        if (motion_depth) {
+            context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
+        }
+    }
+
+    // Prefer raw depth as primary source (includes cockpit and HUD panels).
     // Use R32 linear depth only if raw depth is unavailable or if configured.
     const bool preferLinear = (edpe::Config::instance().depthSource == 1);
     const bool linearValidFrame = (s_scene_linear_depth && s_scene_linear_depth_frame == rendered);
     bool useLinearDepth = false;
 
-    if (preferLinear && linearValidFrame) {
+    if (preferLinear && linearValidFrame && motion_depth) {
         if (validateLinearDepthTexture(device.Get(), context, s_scene_linear_depth.Get(),
-                scene_depth_source.Get(), s_camera_now.depthB)) {
+                motion_depth.Get(), s_camera_now.depthB)) {
             useLinearDepth = true;
         }
     } else if (!scene_depth_source && linearValidFrame) {
@@ -2939,53 +3127,16 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     }
 
     ID3D11ShaderResourceView* depthSrv = nullptr;
-    if (useLinearDepth) {
+    ID3D11Texture2D* depthResource = nullptr;
+    if (useLinearDepth && s_scene_linear_depth_srv) {
         depthSrv = s_scene_linear_depth_srv.Get();
-    } else if (scene_depth_source) {
-        // B5: Recreate motion_depth if desc changed
-        D3D11_TEXTURE2D_DESC dd{};
-        scene_depth_source->GetDesc(&dd);
-        bool needRecreateMotionDepth = !motion_depth ||
-            dd.Width != s_motion_depth_desc.Width ||
-            dd.Height != s_motion_depth_desc.Height ||
-            dd.Format != s_motion_depth_desc.Format ||
-            dd.SampleDesc.Count != s_motion_depth_desc.SampleDesc.Count;
-        if (needRecreateMotionDepth) {
-            motion_depth.Reset();
-            motion_depth_view.Reset();
-            D3D11_TEXTURE2D_DESC mdDesc = dd;
-            mdDesc.Usage = D3D11_USAGE_DEFAULT;
-            mdDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            mdDesc.CPUAccessFlags = mdDesc.MiscFlags = 0;
-            HRESULT hr = device->CreateTexture2D(&mdDesc, nullptr, &motion_depth);
-            if (FAILED(hr)) {
-                wchar_t msg[160];
-                swprintf_s(msg, L"EDPE: failed to create motion_depth format=%u hr=0x%08X", mdDesc.Format, hr);
-                EdpeLog(msg);
-                return false;
-            }
-            D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
-            srvD.Format = (mdDesc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
-                ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
-                : (mdDesc.Format == DXGI_FORMAT_R24G8_TYPELESS ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : mdDesc.Format);
-            srvD.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            srvD.Texture2D.MipLevels = 1;
-            hr = device->CreateShaderResourceView(motion_depth.Get(), &srvD, &motion_depth_view);
-            if (FAILED(hr)) {
-                wchar_t msg[160];
-                swprintf_s(msg, L"EDPE: failed to create motion_depth_view hr=0x%08X", hr);
-                EdpeLog(msg);
-                return false;
-            }
-            s_motion_depth_desc = mdDesc;
-        }
-        if (motion_depth) {
-            context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
-            depthSrv = motion_depth_view.Get();
-        }
+        depthResource = s_scene_linear_depth.Get();
+    } else if (motion_depth_view) {
+        depthSrv = motion_depth_view.Get();
+        depthResource = motion_depth.Get();
     }
 
-    if (!depthSrv) return false;
+    if (!depthSrv || !depthResource) return false;
 
     if (!motion_pass) {
         auto candidate = std::make_unique<edpe::MotionPass>();
@@ -3000,7 +3151,6 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     } else {
         motionOk = motion_pass->render(depthSrv, s_camera_now, s_camera_previous, width, height, useLinearDepth);
         if (!motionOk) {
-            // B4: On false, clear motion output and set reset = true
             motion_pass->clear(context);
         }
     }
@@ -3018,11 +3168,10 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     const float mScaleX = (s_motion_invert_x.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
     const float mScaleY = (s_motion_invert_y.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
 
-    // C1: helpers for dt_ms and scene_cut
     const float dt_ms = computeFrameDeltaTimeMs();
-    const bool scene_cut = detectSceneCut(s_camera_now, s_camera_previous, s_camera_previous_frame);
+    const bool scene_cut = edpe::detectSceneCut(s_camera_now, s_camera_previous, s_camera_previous_frame);
 
-    // B5: Recreate s_dlaa_input if needed
+    // Recreate s_dlaa_input if needed
     bool needRecreateDlaa = !s_dlaa_input ||
         hdrDesc.Width != s_dlaa_input_desc.Width ||
         hdrDesc.Height != s_dlaa_input_desc.Height ||
@@ -3053,7 +3202,7 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     }
     context->CopyResource(s_dlaa_input.Get(), scene_hdr_color_source.Get());
 
-    // B5: Recreate s_bloom_upscale_output if needed
+    // Recreate s_bloom_upscale_output if needed
     bool needRecreateOut = !s_bloom_upscale_output ||
         hdrDesc.Width != s_bloom_output_desc.Width ||
         hdrDesc.Height != s_bloom_output_desc.Height ||
@@ -3078,8 +3227,8 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     edpe::TemporalFrameInputs inputs{};
     inputs.color = s_dlaa_input.Get();
     inputs.colorSrv = s_dlaa_input_srv.Get();
-    inputs.depth = motion_depth ? motion_depth.Get() : s_scene_linear_depth.Get();
-    inputs.depthSrv = motion_depth_view ? motion_depth_view.Get() : s_scene_linear_depth_srv.Get();
+    inputs.depth = depthResource;
+    inputs.depthSrv = depthSrv;
     inputs.motionVectors = motion_pass->outputTexture();
     inputs.motionSrv = motion_pass->output();
     inputs.renderWidth = width;
@@ -3095,7 +3244,7 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     inputs.cameraNow = s_camera_now;
     inputs.cameraPrevious = s_camera_previous;
     inputs.sharpness = edpe::Config::instance().sharpness;
-    inputs.depthInverted = true;
+    inputs.depthInverted = !useLinearDepth;
     inputs.motionIsLowRes = false;
     inputs.colorIsHdr = true;
 
@@ -3379,7 +3528,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     // Steady linear flight (rotTrace >= 2.85f) must NEVER trigger a scene cut regardless of velocity!
     float moveDist = 0.0f;
     float rotTrace = 3.0f;
-    const bool scene_cut = detectSceneCut(s_camera_now, s_camera_previous, s_camera_previous_frame, &moveDist, &rotTrace);
+    const bool scene_cut = edpe::detectSceneCut(s_camera_now, s_camera_previous, s_camera_previous_frame, &moveDist, &rotTrace);
     const float dt_ms = computeFrameDeltaTimeMs();
 
     edpe::TemporalFrameInputs inputs{};
@@ -3774,6 +3923,12 @@ bool isMainSceneMrtDepth(const D3D11_TEXTURE2D_DESC& dd, UINT outW, UINT outH, b
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
     const auto forward = original.load(std::memory_order_acquire);
+    if (s_reentrant_draw) {
+        if (forward && forward != &observedOMSetRenderTargets) {
+            forward(context, count, targets, dsv);
+        }
+        return;
+    }
     if (s_in_edpe_present.load(std::memory_order_acquire)) {
         forward(context, count, targets, dsv);
         return;
@@ -3837,7 +3992,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         }
     }
 
-    // A7: Collapsed single-pass classification querying targets[0] once
+    // Collapsed single-pass classification querying targets[0] once
     if (count >= 1 && targets && targets[0]) {
         D3D11_RENDER_TARGET_VIEW_DESC rdesc0{};
         targets[0]->GetDesc(&rdesc0);
@@ -4406,6 +4561,12 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 reinterpret_cast<void*>(&observedOMSetRenderTargets))) {
             patched_table = table;
             observed_swap_chain = swap_chain;
+            if (!s_install_draw && table[kDraw] != reinterpret_cast<void*>(&observedDraw)) {
+                s_install_draw = reinterpret_cast<DrawFn>(table[kDraw]);
+                s_install_draw_indexed = reinterpret_cast<DrawIndexedFn>(table[kDrawIndexed]);
+                s_install_draw_indexed_instanced = reinterpret_cast<DrawIndexedInstancedFn>(table[kDrawIndexedInstanced]);
+                s_install_draw_instanced = reinterpret_cast<DrawInstancedFn>(table[kDrawInstanced]);
+            }
             DXGI_SWAP_CHAIN_DESC sc_init{};
             if (SUCCEEDED(swap_chain->GetDesc(&sc_init))) {
                 s_swapchain_width.store(sc_init.BufferDesc.Width, std::memory_order_relaxed);
@@ -4498,7 +4659,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             EdpeLog(eidMsg);
         }
 
-        // A5: Frame reset in ContextCensusOnPresent
+        // Frame reset in ContextCensusOnPresent
         s_inside_scene_passes.store(false, std::memory_order_release);
         s_jitter_disabled_for_frame.store(false, std::memory_order_relaxed);
         s_current_is_gbuffer_mrt.store(false, std::memory_order_relaxed);

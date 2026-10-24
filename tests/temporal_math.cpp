@@ -274,5 +274,54 @@ int main() {
     zero_scale.scaleY = 0.0f;
     if (edpe::cameraLinearDepthMotion(hand_now, zero_scale, 100, 100, 49.5f, 49.5f, 10.0f, &hand_dx, &hand_dy)) return 48;
 
+    // Unit tests for detectSceneCut:
+    float testMoveDist = 0.0f, testRotTrace = 0.0f;
+    if (!edpe::detectSceneCut(hand_now, hand_prev, ~0ull, &testMoveDist, &testRotTrace)) return 49;
+    if (testRotTrace != 3.0f || testMoveDist != 0.0f) return 50;
+
+    // Identical camera states: no scene cut
+    if (edpe::detectSceneCut(hand_now, hand_now, 0, &testMoveDist, &testRotTrace)) return 51;
+    if (testMoveDist != 0.0f || std::fabs(testRotTrace - 3.0f) > 1e-4f) return 52;
+
+    // Large rotation (rotTrace < 2.0f): scene cut
+    auto rotated_cam = hand_now;
+    rotated_cam.worldFromView[0] = rotated_cam.worldFromView[10] = 0.0f;
+    rotated_cam.worldFromView[2] = 1.0f;
+    rotated_cam.worldFromView[8] = -1.0f;
+    if (!edpe::detectSceneCut(rotated_cam, hand_now, 0, &testMoveDist, &testRotTrace)) return 53;
+
+    // High velocity straight flight (moveDist = 100, rotTrace = 3.0f): must NOT trigger cut
+    auto flight_cam = hand_now;
+    flight_cam.worldFromView[11] = 100.0f;
+    if (edpe::detectSceneCut(flight_cam, hand_now, 0, &testMoveDist, &testRotTrace)) return 54;
+
+    // Teleport (moveDist = 6000.0f): scene cut
+    flight_cam.worldFromView[11] = 6000.0f;
+    if (!edpe::detectSceneCut(flight_cam, hand_now, 0, &testMoveDist, &testRotTrace)) return 55;
+
+    // Unit tests for updateCameraHistory:
+    edpe::CameraHistory camHist{};
+    if (edpe::updateCameraHistory(camHist, 1, nullptr, nullptr)) return 56;
+    if (!edpe::updateCameraHistory(camHist, 1, &hand_now, nullptr)) return 57;
+    if (camHist.currentFrame != 1 || camHist.previousFrame != ~0ull) return 58;
+    if (edpe::updateCameraHistory(camHist, 1, &hand_now, nullptr)) return 59; // same frame returns false
+
+    // Next frame: current becomes previous
+    auto next_cam = hand_now;
+    next_cam.worldFromView[3] = 5.0f;
+    if (!edpe::updateCameraHistory(camHist, 2, &next_cam, nullptr)) return 60;
+    if (camHist.currentFrame != 2 || camHist.previousFrame != 1) return 61;
+    if (camHist.previous.worldFromView[3] != 0.0f || camHist.current.worldFromView[3] != 5.0f) return 62;
+
+    // Fallback streak test:
+    auto fallback_cam = hand_now;
+    fallback_cam.worldFromView[3] = 99.0f;
+    if (!edpe::updateCameraHistory(camHist, 3, nullptr, &fallback_cam)) return 63;
+    if (camHist.fallbackStreak != 1 || camHist.current.worldFromView[3] != 5.0f) return 64;
+    if (!edpe::updateCameraHistory(camHist, 4, nullptr, &fallback_cam)) return 65;
+    if (camHist.fallbackStreak != 2 || camHist.current.worldFromView[3] != 5.0f) return 66;
+    if (!edpe::updateCameraHistory(camHist, 5, nullptr, &fallback_cam)) return 67;
+    if (camHist.current.worldFromView[3] != 99.0f || camHist.fallbackStreak != 0) return 68;
+
     return 0; // All temporal math tests passed
 }

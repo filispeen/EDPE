@@ -167,10 +167,11 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 ---
 
-## Frame Injection Milestones & State Isolation — VERIFIED (2026-10-24)
+## Frame Injection Milestones & State Isolation — IMPLEMENTATION & CAPTURE ANALYSIS (2026-10-24)
 
+- **DLAA vs Super Resolution Scope:** The injection path at bloom start evaluates temporal reconstruction at native render resolution (`renderWidth == outputWidth == hdrWidth`). Because Cobra's post-processing passes (bloom downsample, tonemap composite, and presentation blit) operate on render targets created by the game engine, this injection point functions as native temporal anti-aliasing (DLAA / Native AA). True Super Resolution (`render < output`) requires running the entire post-processing chain at output resolution or reconstructing the image before presentation via `UiCompositePass`.
 - **Draw Ordinals vs RenderDoc EIDs:** Draw ordinals logged per frame in `EDPE: [Frame N] Pipeline milestones:` represent sequential D3D11 draw call indices observed by the proxy hooks. They **do not equal** RenderDoc event IDs (which include state changes, dispatches, clears, and resource barriers). Any comparison between EDPE logs and RenderDoc captures must use the action index from RenderDoc `list_actions` or identify draw actions by their target formats, dimensions, and shader resource bindings.
-- **RenderDoc Capture Verification (`F:\Downloads\gameplay.rdc`):**
+- **RenderDoc Capture Analysis (`F:\Downloads\gameplay.rdc`):**
   - G-buffer MRT: 4 targets (`R10G10B10A2`, two `R8G8B8A8`, and full-size `R11G11B10_FLOAT` HDR scene target `ResourceId::6321`) with `D32S8` depth (`ResourceId::6316`).
   - Linear depth pass: fullscreen draw writing linear depth into full-size `R32_FLOAT` RT (`ResourceId::6317`).
   - Scene finish: last scene draw into HDR scene target at EID 4311 with depth `ResourceId::6316`.
@@ -178,18 +179,18 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
   - Tonemap & bloom composite: EID 4581 writing full-size `R8G8B8A8` RT (`ResourceId::6312`), sampling HDR scene RT (`ResourceId::6321`) in PS SRV slot 1.
   - Presentation blit & 2D overlay: EID 4598 blits to swapchain backbuffer (`ResourceId::44`), followed by 2D HUD overlay draw at EID 4626.
 - **State Isolation & Reentrancy:**
-  - `D3D11ContextStateGuard` RAII guard wraps the injection point, saving and restoring all OM (RTVs, DSV, UAVs), Viewports, Scissors, IA (layout, topology, VBs, IB), VS/PS/CS shaders, constant buffers (0..15), SRVs (0..15), samplers (0..15), blend state, depth-stencil state, and rasterizer state.
-  - Thread-local `s_reentrant_draw` flag prevents injected upscale draws and `replayGlassDraw` from triggering recursive hooks or corrupting draw ordinals.
+  - `D3D11ContextStateGuard` RAII guard wraps the injection point, saving and restoring OM (RTVs, DSV, UAVs), Viewports, Scissors, IA (layout, topology, VBs, IB), VS/PS/CS/GS/HS/DS shaders, constant buffers (slots 0..13, `D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT`), SRVs (0..31), samplers (0..15), blend state, depth-stencil state, and rasterizer state.
+  - Thread-local `s_reentrant_draw` flag prevents injected upscale draws and state guard operations from triggering recursive hooks (`observedDraw*`, `observedOMSetRenderTargets`, `observedVSSetConstantBuffers`, `observedMap`, `observedUnmap`).
 - **Fail-Open Upscale Execution:**
   - `executeUpscaleAtBloomStart` returns `bool`. If upscaling fails or resources are invalid, jitter is disabled for the rest of that frame, failure is throttled to once per second, and `tryTemporalUpscale` remains available as fallback.
 - **Depth & Motion Vector Integrity:**
-  - Raw depth from `scene_depth_source` copy preferred by default (configurable via `[Depth] depthSource = 0`).
-  - R32 linear depth target validated against raw depth ($z = \text{depthB} / \text{rawDepth}$ within 2% error, finite, monotonic) before first use in a frame, caching the verdict per texture.
+  - Raw depth from `scene_depth_source` copy preferred by default (configurable via `[Depth] depthSource = 0`). Raw depth copy is always maintained whenever `scene_depth_source` is present.
+  - R32 linear depth target validated against raw depth copy ($z = \text{depthB} / \text{rawDepth}$ within 2% error, finite, monotonic on $\ge 75\%$ of valid samples) before first use in a frame, caching the verdict per texture pair.
   - Motion pass render return status strictly checked; outputs cleared and `inputs.reset = true` on failure.
   - Camera constant buffer write validated: `renderGpuCameras` explicitly writes `values[31] = 0.0f` (`info.w = 0.0f`).
   - Celestial skybox motion and cockpit clamp ($z < 3.5$) applied consistently across both raw and linear depth paths in `motion_shader.h`.
 - **Automated Test Suite (11/11 passing):**
-  - `temporal_math_test`: Added absolute hand-computed tests for pure Y translation ($dx=0, dy=+10$) and pure Y rotation ($dx=-50\tan(0.1), dy=0$), rejection of infinite linear depth and zero camera scale; all return codes made unique.
+  - `temporal_math_test`: Added absolute hand-computed tests for pure Y translation ($dx=0, dy=+10$) and pure Y rotation ($dx=-50\tan(0.1), dy=0$), rejection of infinite linear depth and zero camera scale, unit tests for `detectSceneCut` and `updateCameraHistory`; all return codes unique.
   - `motion_gpu_test`: Added skybox texel ($0.0$) pure rotation case, celestial depth ($\ge 50000$) pure rotation case, cockpit clamp ($z < 3.5$) zero-motion verification, and post-linear raw pass state-leak test. Added WARP fallback and CMake `SKIP_RETURN_CODE 77` with `gpu` label.
   - `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`: All pass cleanly in Release build.
 
