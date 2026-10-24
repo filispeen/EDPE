@@ -18,13 +18,12 @@
 
 namespace edpe {
 
-// NGX feature state.
 struct NgxFeatureState {
     bool initialized = false;
     bool dlss_available = false;
     bool dlaa_available = false;
-    uint32_t quality_mode = 0; // 0=Unknown, 1=Quality, 2=Balanced, 3=Performance, 4=UltraPerformance
-    uint32_t preset = 0;       // 0=Auto(K), 10=J, 11=K, 12=L, 13=M
+    uint32_t quality_mode = 0;
+    uint32_t preset = 0;
     uint32_t active_perf_quality = 0;
     uint32_t active_preset = 0;
     uint32_t render_width = 0;
@@ -35,13 +34,10 @@ struct NgxFeatureState {
     bool reset_requested = false;
 };
 
-// EDPE's own NGX project ID, for NVSDK_NGX_D3D11_Init_with_ProjectID.
-// Generated for EDPE with PowerShell New-Guid on 2026-10-05; it is not EDVR's ID
-// and not the example GUID from the SDK header.
 constexpr char kNgxProjectId[] = "48d353f3-d07b-4048-876b-09f8622f5a27";
 constexpr char kNgxEngineVersion[] = "EDPE-unreleased";
+constexpr uint32_t kNgxFeatureStabilityFrames = 5;
 
-// NGX feature state.
 static NgxFeatureState g_ngx_state{};
 static wchar_t g_status_msg[256] = L"NGX uninitialized";
 
@@ -49,6 +45,32 @@ static wchar_t g_status_msg[256] = L"NGX uninitialized";
 static NVSDK_NGX_Parameter* g_ngx_params = nullptr;
 static NVSDK_NGX_Handle* g_dlaa_feature = nullptr;
 static ID3D11Device* g_ngx_device = nullptr;
+
+struct NgxStateKey {
+    uint32_t renderWidth = 0;
+    uint32_t renderHeight = 0;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
+    uint32_t perfQuality = 0;
+    bool isHdr = false;
+
+    bool operator==(const NgxStateKey& o) const {
+        return renderWidth == o.renderWidth &&
+               renderHeight == o.renderHeight &&
+               outputWidth == o.outputWidth &&
+               outputHeight == o.outputHeight &&
+               perfQuality == o.perfQuality &&
+               isHdr == o.isHdr;
+    }
+    bool operator!=(const NgxStateKey& o) const {
+        return !(*this == o);
+    }
+};
+
+static NgxStateKey s_active_feature_key{};
+static NgxStateKey s_pending_feature_key{};
+static uint32_t s_pending_feature_frames = 0;
+static bool s_has_switched_once = false;
 
 static std::wstring getModuleDir() {
     wchar_t path[MAX_PATH]{};
@@ -144,7 +166,6 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
 
     g_ngx_state.dlss_available = true;
 
-    // Check DLAA mode at 2560x1440
     unsigned ow = 0, oh = 0, maxw = 0, maxh = 0, minw = 0, minh = 0;
     float sharp = 0.0f;
     r = NGX_DLSS_GET_OPTIMAL_SETTINGS(g_ngx_params, 2560, 1440,
@@ -293,21 +314,37 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
 
     const uint32_t effectivePreset = (preset >= 10u && preset <= 13u) ? preset : 11u;
     const uint32_t perfQualityInt = static_cast<uint32_t>(perfQuality);
+    const NgxStateKey requestedKey{renderWidth, renderHeight, outputWidth, outputHeight, perfQualityInt, isHdr};
 
-    if (g_dlaa_feature &&
-        g_ngx_state.render_width == renderWidth &&
-        g_ngx_state.render_height == renderHeight &&
-        g_ngx_state.output_width == outputWidth &&
-        g_ngx_state.output_height == outputHeight &&
-        g_ngx_state.active_perf_quality == perfQualityInt &&
-        g_ngx_state.active_preset == effectivePreset &&
-        g_ngx_state.is_hdr == isHdr) {
+    if (g_dlaa_feature && s_active_feature_key == requestedKey && g_ngx_state.active_preset == effectivePreset) {
+        s_pending_feature_key = {};
+        s_pending_feature_frames = 0;
+        s_has_switched_once = false;
         return true;
+    }
+
+    if (g_dlaa_feature) {
+        if (!s_has_switched_once) {
+            s_has_switched_once = true;
+            s_pending_feature_key = {};
+            s_pending_feature_frames = 0;
+        } else {
+            if (requestedKey == s_pending_feature_key) {
+                ++s_pending_feature_frames;
+            } else {
+                s_pending_feature_key = requestedKey;
+                s_pending_feature_frames = 1;
+            }
+            if (s_pending_feature_frames < kNgxFeatureStabilityFrames) {
+                return false;
+            }
+            s_has_switched_once = false;
+            s_pending_feature_frames = 0;
+        }
     }
 
     releaseFeature();
 
-    // Apply selected DLSS Transformer/CNN preset (defaulting to Preset K = 11).
     NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, effectivePreset);
     NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, effectivePreset);
     NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, effectivePreset);
@@ -335,6 +372,7 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
         return false;
     }
 
+    s_active_feature_key = requestedKey;
     g_ngx_state.render_width = renderWidth;
     g_ngx_state.render_height = renderHeight;
     g_ngx_state.output_width = outputWidth;
@@ -372,6 +410,10 @@ void NgxContext::releaseFeature() {
         NVSDK_NGX_D3D11_ReleaseFeature(g_dlaa_feature);
         g_dlaa_feature = nullptr;
     }
+    s_active_feature_key = {};
+    s_pending_feature_key = {};
+    s_pending_feature_frames = 0;
+    s_has_switched_once = false;
 #endif
     g_ngx_state.render_width = 0;
     g_ngx_state.render_height = 0;
@@ -400,6 +442,9 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     if (!ensureDlssFeature(context, renderWidth, renderHeight, outputWidth, outputHeight, mode, params.isHdr, usePreset)) {
         return false;
     }
+    if (g_ngx_state.is_hdr != params.isHdr) {
+        return false;
+    }
 
     NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
     ep.Feature.pInColor = colorIn;
@@ -419,8 +464,41 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
 
     NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(context, g_dlaa_feature, g_ngx_params, &ep);
     if (r != NVSDK_NGX_Result_Success) {
+        struct FailureKey {
+            NVSDK_NGX_Result code;
+            uint32_t rw, rh, ow, oh, pq, pr;
+            bool hdr;
+        };
+        static FailureKey s_last_failure{};
+        static bool s_has_failed = false;
+
+        const FailureKey currentFailure{r, g_ngx_state.render_width, g_ngx_state.render_height,
+                                        g_ngx_state.output_width, g_ngx_state.output_height,
+                                        g_ngx_state.active_perf_quality, g_ngx_state.active_preset,
+                                        g_ngx_state.is_hdr};
+
+        const bool isDistinct = !s_has_failed ||
+                                (s_last_failure.code != currentFailure.code ||
+                                 s_last_failure.rw != currentFailure.rw ||
+                                 s_last_failure.rh != currentFailure.rh ||
+                                 s_last_failure.ow != currentFailure.ow ||
+                                 s_last_failure.oh != currentFailure.oh ||
+                                 s_last_failure.pq != currentFailure.pq ||
+                                 s_last_failure.pr != currentFailure.pr ||
+                                 s_last_failure.hdr != currentFailure.hdr);
+
+        if (isDistinct) {
+            s_has_failed = true;
+            s_last_failure = currentFailure;
+            wchar_t failMsg[256];
+            swprintf_s(failMsg,
+                L"EDPE: NGX_D3D11_EVALUATE_DLSS_EXT failed: 0x%08X (render=%ux%u output=%ux%u perfQuality=%u preset=%u hdr=%d)",
+                static_cast<unsigned>(r),
+                currentFailure.rw, currentFailure.rh, currentFailure.ow, currentFailure.oh,
+                currentFailure.pq, currentFailure.pr, currentFailure.hdr ? 1 : 0);
+            EdpeLog(failMsg);
+        }
         swprintf_s(g_status_msg, L"NGX_D3D11_EVALUATE_DLSS_EXT failed: 0x%08X", static_cast<unsigned>(r));
-        EdpeLog(g_status_msg);
         return false;
     }
 
@@ -463,4 +541,4 @@ const wchar_t* NgxContext::get_status_message() {
     return g_status_msg;
 }
 
-} // namespace edpe
+}
