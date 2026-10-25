@@ -77,6 +77,7 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
     ID3D11ShaderResourceView* bloomSrv,
     ID3D11Resource* bloomSlotRes,
     int hdr_slot);
+void restoreUnjitteredSceneProjection(ID3D11DeviceContext* context);
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
@@ -359,6 +360,38 @@ static std::atomic<bool> s_inside_scene_passes{false};
 static std::atomic<bool> s_jitter_disabled_for_frame{false};
 
 static bool s_upscale_evaluated_this_frame = false;
+
+enum class SplitPoint {
+    None = 0,
+    CockpitHud = 1,
+    BloomStartFallback = 2
+};
+static SplitPoint s_split_point_used = SplitPoint::None;
+static unsigned s_count_split_cockpit_hud = 0;
+static unsigned s_count_split_bloom_fallback = 0;
+static unsigned s_count_post_split_hdr_draws = 0;
+
+struct HdrDrawRecord {
+    unsigned drawIndex;
+    uint64_t vsHash;
+    uint64_t psHash;
+    void* rtvPtr;
+    DXGI_FORMAT rtvFormat;
+    struct SrvInfo {
+        void* resPtr;
+        DXGI_FORMAT format;
+        UINT width;
+        UINT height;
+    } srvs[8];
+};
+static HdrDrawRecord s_recorded_hdr_draws[128]{};
+static unsigned s_recorded_hdr_draw_count = 0;
+static bool s_diag_hdr_draws_logged = false;
+
+static float s_unjittered_projection_block[16]{};
+static bool s_has_unjittered_projection = false;
+static uint8_t s_scene_cb_shadow[5376]{};
+static Microsoft::WRL::ComPtr<ID3D11Buffer> s_last_jittered_scene_cb;
 
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_scene_linear_depth;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_scene_linear_depth_srv;
@@ -1062,8 +1095,158 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
         s_detected_scene_finish_draw = drawIndex;
     }
 
-    
+    ID3D11RenderTargetView* cur_rtv = nullptr;
+    context->OMGetRenderTargets(1, &cur_rtv, nullptr);
+    ID3D11Resource* cur_rtv_res = nullptr;
+    DXGI_FORMAT cur_rtv_fmt = DXGI_FORMAT_UNKNOWN;
+    if (cur_rtv) {
+        cur_rtv->GetResource(&cur_rtv_res);
+        D3D11_RENDER_TARGET_VIEW_DESC rdesc{};
+        cur_rtv->GetDesc(&rdesc);
+        cur_rtv_fmt = rdesc.Format;
+    }
+
+    const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+    const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+    bool is_hdr_draw = false;
+    if (cur_rtv_res && scene_hdr_color_source && cur_rtv_res == scene_hdr_color_source.Get()) {
+        is_hdr_draw = true;
+    } else if (cur_rtv_res && cur_rtv_fmt == DXGI_FORMAT_R11G11B10_FLOAT && outW > 0 && outH > 0) {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+        if (SUCCEEDED(cur_rtv_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex.GetAddressOf())))) {
+            D3D11_TEXTURE2D_DESC td{};
+            tex->GetDesc(&td);
+            if (td.Width == outW && td.Height == outH) {
+                is_hdr_draw = true;
+            }
+        }
+    }
+
+    if (is_hdr_draw) {
+        uint64_t vs_hash = 0, ps_hash = 0;
+        Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
+        Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
+        context->VSGetShader(vs.GetAddressOf(), nullptr, nullptr);
+        context->PSGetShader(ps.GetAddressOf(), nullptr, nullptr);
+        if (vs) {
+            UINT sz = sizeof(vs_hash);
+            vs->GetPrivateData(kEdpeShaderHashGuid, &sz, &vs_hash);
+        }
+        if (ps) {
+            UINT sz = sizeof(ps_hash);
+            ps->GetPrivateData(kEdpeShaderHashGuid, &sz, &ps_hash);
+        }
+
+        ID3D11ShaderResourceView* ps_srvs_local[8]{};
+        context->PSGetShaderResources(0, 8, ps_srvs_local);
+        HdrDrawRecord::SrvInfo srv_infos[8]{};
+        for (UINT s = 0; s < 8; ++s) {
+            if (ps_srvs_local[s]) {
+                ID3D11Resource* s_res = nullptr;
+                ps_srvs_local[s]->GetResource(&s_res);
+                if (s_res) {
+                    srv_infos[s].resPtr = s_res;
+                    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+                    ps_srvs_local[s]->GetDesc(&sd);
+                    srv_infos[s].format = sd.Format;
+                    Microsoft::WRL::ComPtr<ID3D11Texture2D> stex;
+                    if (SUCCEEDED(s_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(stex.GetAddressOf())))) {
+                        D3D11_TEXTURE2D_DESC td{};
+                        stex->GetDesc(&td);
+                        srv_infos[s].width = td.Width;
+                        srv_infos[s].height = td.Height;
+                        if (srv_infos[s].format == DXGI_FORMAT_UNKNOWN) {
+                            srv_infos[s].format = td.Format;
+                        }
+                    }
+                    s_res->Release();
+                }
+                ps_srvs_local[s]->Release();
+            }
+        }
+
+        if (!s_diag_hdr_draws_logged && s_inside_scene_passes.load(std::memory_order_relaxed)) {
+            if (s_recorded_hdr_draw_count < 128) {
+                auto& rec = s_recorded_hdr_draws[s_recorded_hdr_draw_count++];
+                rec.drawIndex = drawIndex;
+                rec.vsHash = vs_hash;
+                rec.psHash = ps_hash;
+                rec.rtvPtr = cur_rtv_res;
+                rec.rtvFormat = cur_rtv_fmt;
+                for (UINT s = 0; s < 8; ++s) rec.srvs[s] = srv_infos[s];
+            }
+        }
+
+        if (s_upscale_evaluated_this_frame) {
+            ++s_count_post_split_hdr_draws;
+        } else {
+            const bool is_hud =
+                (vs_hash == 0xB7790CBFC6554097ull && ps_hash == 0x8DEF46452FA459F5ull) ||
+                (vs_hash == 0x81216C77F90DEDD6ull && ps_hash == 0xA2965EC2931A39C8ull) ||
+                (vs_hash == 0xE508648660A352B2ull && ps_hash == 0x63ABD86359B57D01ull);
+            const bool is_glass =
+                (vs_hash == 0xF512712C40D93C12ull && ps_hash == 0x4A71EB0D34E9F2EFull);
+
+            bool samples_offscreen_ui = false;
+            for (UINT s = 0; s < 8; ++s) {
+                if (srv_infos[s].resPtr && srv_infos[s].format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                    srv_infos[s].width > 0 && srv_infos[s].height > 0 &&
+                    (srv_infos[s].width != outW || srv_infos[s].height != outH)) {
+                    samples_offscreen_ui = true;
+                    break;
+                }
+            }
+
+            if (is_hud || is_glass || samples_offscreen_ui) {
+                ID3D11Texture2D* hdr_tex = scene_hdr_color_source.Get();
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> local_hdr_tex;
+                if (!hdr_tex && cur_rtv_res) {
+                    cur_rtv_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(local_hdr_tex.GetAddressOf()));
+                    hdr_tex = local_hdr_tex.Get();
+                }
+                if (hdr_tex) {
+                    const bool ok = executeUpscaleAtBloomStart(context, hdr_tex, nullptr, hdr_tex, -1);
+                    if (ok) {
+                        s_upscale_evaluated_this_frame = true;
+                        s_split_point_used = SplitPoint::CockpitHud;
+                        ++s_count_split_cockpit_hud;
+                        restoreUnjitteredSceneProjection(context);
+                        s_inside_scene_passes.store(false, std::memory_order_release);
+                        s_jitter_disabled_for_frame.store(true, std::memory_order_release);
+                        ++s_count_post_split_hdr_draws;
+                    }
+                }
+            }
+        }
+    }
+    if (cur_rtv_res) cur_rtv_res->Release();
+    if (cur_rtv) cur_rtv->Release();
+
     if (s_current_is_bloom_target.load(std::memory_order_relaxed)) {
+        if (!s_diag_hdr_draws_logged && s_recorded_hdr_draw_count > 0) {
+            s_diag_hdr_draws_logged = true;
+            const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+            wchar_t headMsg[160];
+            swprintf_s(headMsg, L"EDPE: === [Diag HDR Draws] frame=%llu count=%u ===", cur_frame, s_recorded_hdr_draw_count);
+            EdpeLog(headMsg);
+            for (unsigned d = 0; d < s_recorded_hdr_draw_count; ++d) {
+                const auto& rec = s_recorded_hdr_draws[d];
+                wchar_t dmsg[256];
+                swprintf_s(dmsg, L"EDPE: [Diag HDR Draw] idx=%u VS=%016llX PS=%016llX RTV=%p fmt=%u",
+                    rec.drawIndex, rec.vsHash, rec.psHash, rec.rtvPtr, static_cast<unsigned>(rec.rtvFormat));
+                EdpeLog(dmsg);
+                for (UINT s = 0; s < 8; ++s) {
+                    if (rec.srvs[s].resPtr) {
+                        wchar_t smsg[256];
+                        swprintf_s(smsg, L"EDPE:   SRV[%u]: res=%p fmt=%u %ux%u",
+                            s, rec.srvs[s].resPtr, static_cast<unsigned>(rec.srvs[s].format),
+                            rec.srvs[s].width, rec.srvs[s].height);
+                        EdpeLog(smsg);
+                    }
+                }
+            }
+        }
+
         if (!s_upscale_evaluated_this_frame) {
             int hdr_slot = -1;
             struct BoundSrvInfo {
@@ -1157,6 +1340,8 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
                 const bool ok = executeUpscaleAtBloomStart(context, bloom_slot_tex.Get(), bloom_slot_srv.Get(), bloom_slot_res.Get(), hdr_slot);
                 if (ok) {
                     s_upscale_evaluated_this_frame = true;
+                    s_split_point_used = SplitPoint::BloomStartFallback;
+                    ++s_count_split_bloom_fallback;
                     s_inside_scene_passes.store(false, std::memory_order_release);
                     s_jitter_disabled_for_frame.store(true, std::memory_order_release);
                 } else {
@@ -1675,6 +1860,14 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     {
                         std::lock_guard lock(jitter_mutex);
                         jitter = active_projection_jitter;
+                    }
+                    std::memcpy(s_unjittered_projection_block, &words[1080], sizeof(s_unjittered_projection_block));
+                    s_has_unjittered_projection = true;
+                    std::memcpy(s_scene_cb_shadow, mapped_ptr, sizeof(s_scene_cb_shadow));
+                    ID3D11Buffer* cb_buf = nullptr;
+                    if (resource && SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Buffer), reinterpret_cast<void**>(&cb_buf)))) {
+                        s_last_jittered_scene_cb = cb_buf;
+                        cb_buf->Release();
                     }
                     float jittered_block[16]{};
                     if (edpe::jitterEliteProjectionBlock(&words[1080], jittered_block, jitter)) {
@@ -3191,6 +3384,26 @@ static bool validateLinearDepthTexture(ID3D11Device* device, ID3D11DeviceContext
     return verdict;
 }
 
+void restoreUnjitteredSceneProjection(ID3D11DeviceContext* context) {
+    if (!context || !s_last_jittered_scene_cb || !s_has_unjittered_projection) return;
+    std::memcpy(&s_scene_cb_shadow[1080 * sizeof(float)], s_unjittered_projection_block, sizeof(s_unjittered_projection_block));
+    auto orig_map = original_map.load(std::memory_order_acquire);
+    auto orig_unmap = original_unmap.load(std::memory_order_acquire);
+    if (!orig_map || !orig_unmap) return;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = orig_map(context, s_last_jittered_scene_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr) && mapped.pData) {
+        std::memcpy(mapped.pData, s_scene_cb_shadow, sizeof(s_scene_cb_shadow));
+        orig_unmap(context, s_last_jittered_scene_cb.Get(), 0);
+        static unsigned long long s_last_unjitter_log_frame = ~0ull;
+        const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+        if (s_last_unjitter_log_frame == ~0ull || cur_frame >= s_last_unjitter_log_frame + 120) {
+            s_last_unjitter_log_frame = cur_frame;
+            EdpeLog(L"EDPE: restored unjittered projection to scene constant buffer for post-split draws");
+        }
+    }
+}
+
 bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
     ID3D11Texture2D* bloomTex,
     ID3D11ShaderResourceView* bloomSrv,
@@ -3384,12 +3597,17 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
         context->PSSetShaderResources(static_cast<UINT>(hdr_slot), 1, &nullSrv);
     }
 
+    ID3D11RenderTargetView* nullRtv = nullptr;
+    context->OMSetRenderTargets(1, &nullRtv, nullptr);
+
     if (upscaler.evaluate(context, inputs, nullptr, s_bloom_upscale_output.Get())) {
         s_camera_reset = false;
         ++s_count_bloom_upscale;
         context->CopyResource(bloomTex, s_bloom_upscale_output.Get());
         scene_hdr_color_source = bloomTex;
         scene_hdr_color_frame = rendered;
+        s_last_temporal_inputs = inputs;
+        s_last_temporal_inputs_frame = rendered;
 
         static unsigned long long s_last_bloom_diag_frame = ~0ull;
         if (s_last_bloom_diag_frame == ~0ull || rendered >= s_last_bloom_diag_frame + 120) {
@@ -4913,6 +5131,20 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
 
         
+        static unsigned long long s_last_split_diag_frame = ~0ull;
+        if (s_last_split_diag_frame == ~0ull || frame >= s_last_split_diag_frame + 120) {
+            s_last_split_diag_frame = frame;
+            const wchar_t* ptName = (s_split_point_used == SplitPoint::CockpitHud) ? L"CockpitHud" :
+                (s_split_point_used == SplitPoint::BloomStartFallback) ? L"BloomStartFallback" : L"None";
+            wchar_t spMsg[256];
+            swprintf_s(spMsg,
+                L"EDPE: split point diag frame=%llu used=%ls (cockpit_hud=%u bloom_fallback=%u post_split_draws=%u)",
+                frame, ptName, s_count_split_cockpit_hud, s_count_split_bloom_fallback, s_count_post_split_hdr_draws);
+            EdpeLog(spMsg);
+        }
+        s_split_point_used = SplitPoint::None;
+        s_count_post_split_hdr_draws = 0;
+
         s_inside_scene_passes.store(false, std::memory_order_release);
         s_jitter_disabled_for_frame.store(false, std::memory_order_relaxed);
         s_current_is_gbuffer_mrt.store(false, std::memory_order_relaxed);
@@ -5280,6 +5512,8 @@ extern "C" BOOL WINAPI EdpeRequestBindSequence() {
 void ContextCensusOnSwapChainRelease(IUnknown* object) {
     if (object != observed_swap_chain) return;
     disarmPipelineDrawHooks();
+    s_last_jittered_scene_cb.Reset();
+    s_has_unjittered_projection = false;
     s_scene_linear_depth.Reset();
     s_scene_linear_depth_srv.Reset();
     s_cached_linear_depth_tex = nullptr;
