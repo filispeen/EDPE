@@ -439,10 +439,24 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     if (!context || !colorIn || !outputUav || !depthIn || !motionIn) return false;
     const uint32_t usePreset = preset ? preset : g_ngx_state.preset;
-    if (!ensureDlssFeature(context, renderWidth, renderHeight, outputWidth, outputHeight, mode, params.isHdr, usePreset)) {
+
+    DXGI_FORMAT colorFmt = DXGI_FORMAT_UNKNOWN;
+    UINT cW = 0, cH = 0;
+    ID3D11Texture2D* cTex = nullptr;
+    if (colorIn && SUCCEEDED(colorIn->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&cTex)))) {
+        D3D11_TEXTURE2D_DESC ctd{};
+        cTex->GetDesc(&ctd);
+        colorFmt = ctd.Format;
+        cW = ctd.Width;
+        cH = ctd.Height;
+        cTex->Release();
+    }
+    const bool actualIsHdr = isHdrFormat(colorFmt);
+
+    if (!ensureDlssFeature(context, renderWidth, renderHeight, outputWidth, outputHeight, mode, actualIsHdr, usePreset)) {
         return false;
     }
-    if (g_ngx_state.is_hdr != params.isHdr) {
+    if (g_ngx_state.is_hdr != actualIsHdr) {
         return false;
     }
 
@@ -451,22 +465,11 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ++s_eval_dlss_calls;
     if (s_eval_dlss_calls == 1 || s_eval_dlss_calls >= s_last_hdr_diag_call + 120) {
         s_last_hdr_diag_call = s_eval_dlss_calls;
-        DXGI_FORMAT colorFmt = DXGI_FORMAT_UNKNOWN;
-        UINT cW = 0, cH = 0;
-        ID3D11Texture2D* cTex = nullptr;
-        if (colorIn && SUCCEEDED(colorIn->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&cTex)))) {
-            D3D11_TEXTURE2D_DESC ctd{};
-            cTex->GetDesc(&ctd);
-            colorFmt = ctd.Format;
-            cW = ctd.Width;
-            cH = ctd.Height;
-            cTex->Release();
-        }
         wchar_t hdrDiag[256];
         swprintf_s(hdrDiag,
             L"EDPE: NGX HDR diag: ensureDlssFeature isHdr=%d evaluateDlss params.isHdr=%d srcFmt=%u (%ux%u) mode=%ls",
             g_ngx_state.is_hdr ? 1 : 0,
-            params.isHdr ? 1 : 0,
+            actualIsHdr ? 1 : 0,
             static_cast<unsigned>(colorFmt),
             cW, cH,
             getUpscaleModeName(mode));

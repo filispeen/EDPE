@@ -27,7 +27,8 @@ public:
         float jitterY,
         bool reset,
         uint32_t renderWidth = 0,
-        uint32_t renderHeight = 0);
+        uint32_t renderHeight = 0,
+        bool isHdr = false);
 
     void resetHistory() { resetRequested_ = true; }
     bool isInitialized() const { return device_ != nullptr; }

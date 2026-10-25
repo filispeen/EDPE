@@ -72,7 +72,11 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
 void armPipelineDrawHooks();
 void disarmPipelineDrawHooks();
 void onBeforeDraw(ID3D11DeviceContext* context);
-bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot);
+bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
+    ID3D11Texture2D* bloomTex,
+    ID3D11ShaderResourceView* bloomSrv,
+    ID3D11Resource* bloomSlotRes,
+    int hdr_slot);
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
@@ -262,6 +266,10 @@ inline bool isRevisitedCamera(const edpe::CameraProjection& camera) {
 
 static edpe::CameraHistory s_camera_history{};
 
+static uint32_t s_camera_120_invalid_samples = 0;
+static uint32_t s_camera_120_history_resets = 0;
+static uint32_t s_camera_120_reused = 0;
+
 static void updateFrameCamera(unsigned long long rendered) {
     const edpe::CameraProjection* primary =
         (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered && !isRevisitedCamera(s_latest_unmapped_camera))
@@ -269,15 +277,22 @@ static void updateFrameCamera(unsigned long long rendered) {
     const edpe::CameraProjection* fallback =
         (s_fallback_unmapped_camera_frame == rendered && !isRevisitedCamera(s_fallback_unmapped_camera))
         ? &s_fallback_unmapped_camera : nullptr;
-    if (edpe::updateCameraHistory(s_camera_history, rendered, primary, fallback)) {
+    bool cameraReused = false;
+    if (edpe::updateCameraHistory(s_camera_history, rendered, primary, fallback, &cameraReused)) {
         s_camera_now = s_camera_history.current;
         s_camera_frame = s_camera_history.currentFrame;
         s_camera_previous = s_camera_history.previous;
         s_camera_previous_frame = s_camera_history.previousFrame;
+        if (cameraReused) {
+            ++s_camera_120_reused;
+        }
     }
 }
 
 inline void updateMainCamera(const edpe::CameraProjection& camera, unsigned long long cur_frame) {
+    s_latest_unmapped_camera = camera;
+    s_latest_unmapped_camera_frame = cur_frame;
+    s_latest_unmapped_camera_valid = true;
     updateFrameCamera(cur_frame);
 }
 
@@ -1062,71 +1077,84 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
 
             ID3D11ShaderResourceView* ps_srvs[8]{};
             context->PSGetShaderResources(0, 8, ps_srvs);
-                for (UINT i = 0; i < 8; ++i) {
-                    if (ps_srvs[i]) {
-                        ID3D11Resource* srv_res = nullptr;
-                        ps_srvs[i]->GetResource(&srv_res);
-                        if (srv_res) {
-                            bound_srvs[i].bound = true;
-                            bound_srvs[i].res = srv_res;
-                            D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
-                            ps_srvs[i]->GetDesc(&srvD);
-                            bound_srvs[i].format = srvD.Format;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> bloom_slot_tex;
+            Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> bloom_slot_srv;
+            Microsoft::WRL::ComPtr<ID3D11Resource> bloom_slot_res;
 
-                            Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
-                            if (SUCCEEDED(srv_res->QueryInterface(__uuidof(ID3D11Texture2D),
-                                    reinterpret_cast<void**>(tex.GetAddressOf())))) {
-                                D3D11_TEXTURE2D_DESC td{};
-                                tex->GetDesc(&td);
-                                bound_srvs[i].width = td.Width;
-                                bound_srvs[i].height = td.Height;
-                                if (bound_srvs[i].format == DXGI_FORMAT_UNKNOWN) {
-                                    bound_srvs[i].format = td.Format;
-                                }
+            for (UINT i = 0; i < 8; ++i) {
+                if (ps_srvs[i]) {
+                    ID3D11Resource* srv_res = nullptr;
+                    ps_srvs[i]->GetResource(&srv_res);
+                    if (srv_res) {
+                        bound_srvs[i].bound = true;
+                        bound_srvs[i].res = srv_res;
+                        D3D11_SHADER_RESOURCE_VIEW_DESC srvD{};
+                        ps_srvs[i]->GetDesc(&srvD);
+                        bound_srvs[i].format = srvD.Format;
 
-                                const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
-                                const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
-
-                                if (outW > 0 && outH > 0 &&
-                                    td.Width == outW && td.Height == outH &&
-                                    (td.Format == DXGI_FORMAT_R11G11B10_FLOAT || bound_srvs[i].format == DXGI_FORMAT_R11G11B10_FLOAT)) {
-                                    if (hdr_slot < 0) {
-                                        hdr_slot = static_cast<int>(i);
-                                        if (srv_res != scene_hdr_color_source.Get()) {
-                                            wchar_t updMsg[256];
-                                            swprintf_s(updMsg,
-                                                L"EDPE: HDR scene target updated from bloom PS SRV: old=%p new=%p (slot=%u %ux%u fmt=%u)",
-                                                scene_hdr_color_source.Get(), srv_res, i, td.Width, td.Height,
-                                                static_cast<unsigned>(td.Format));
-                                            EdpeLog(updMsg);
-                                            scene_hdr_color_source = tex;
-                                            scene_hdr_color_frame = last_present_frame.load(std::memory_order_relaxed);
-                                        }
-                                    }
-                                }
+                        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+                        if (SUCCEEDED(srv_res->QueryInterface(__uuidof(ID3D11Texture2D),
+                                reinterpret_cast<void**>(tex.GetAddressOf())))) {
+                            D3D11_TEXTURE2D_DESC td{};
+                            tex->GetDesc(&td);
+                            bound_srvs[i].width = td.Width;
+                            bound_srvs[i].height = td.Height;
+                            if (bound_srvs[i].format == DXGI_FORMAT_UNKNOWN) {
+                                bound_srvs[i].format = td.Format;
                             }
 
-                            if (hdr_slot < 0 && scene_hdr_color_source) {
-                                if (srv_res == scene_hdr_color_source.Get()) {
+                            const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+                            const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+
+                            if (outW > 0 && outH > 0 &&
+                                td.Width == outW && td.Height == outH &&
+                                (td.Format == DXGI_FORMAT_R11G11B10_FLOAT || bound_srvs[i].format == DXGI_FORMAT_R11G11B10_FLOAT)) {
+                                if (hdr_slot < 0) {
                                     hdr_slot = static_cast<int>(i);
-                                } else {
-                                    Microsoft::WRL::ComPtr<IUnknown> unkSrv, unkHdr;
-                                    if (SUCCEEDED(srv_res->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(unkSrv.GetAddressOf()))) &&
-                                        SUCCEEDED(scene_hdr_color_source.Get()->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(unkHdr.GetAddressOf()))) &&
-                                        unkSrv.Get() == unkHdr.Get()) {
-                                        hdr_slot = static_cast<int>(i);
+                                    bloom_slot_tex = tex;
+                                    bloom_slot_srv = ps_srvs[i];
+                                    bloom_slot_res = srv_res;
+                                    if (srv_res != scene_hdr_color_source.Get()) {
+                                        wchar_t updMsg[256];
+                                        swprintf_s(updMsg,
+                                            L"EDPE: HDR scene target updated from bloom PS SRV: old=%p new=%p (slot=%u %ux%u fmt=%u)",
+                                            scene_hdr_color_source.Get(), srv_res, i, td.Width, td.Height,
+                                            static_cast<unsigned>(td.Format));
+                                        EdpeLog(updMsg);
+                                        scene_hdr_color_source = tex;
+                                        scene_hdr_color_frame = last_present_frame.load(std::memory_order_relaxed);
                                     }
                                 }
                             }
-                            srv_res->Release();
                         }
-                        ps_srvs[i]->Release();
-                    }
-                }
 
-            if (hdr_slot >= 0) {
+                        if (hdr_slot < 0 && scene_hdr_color_source) {
+                            if (srv_res == scene_hdr_color_source.Get()) {
+                                hdr_slot = static_cast<int>(i);
+                                bloom_slot_tex = tex;
+                                bloom_slot_srv = ps_srvs[i];
+                                bloom_slot_res = srv_res;
+                            } else {
+                                Microsoft::WRL::ComPtr<IUnknown> unkSrv, unkHdr;
+                                if (SUCCEEDED(srv_res->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(unkSrv.GetAddressOf()))) &&
+                                    SUCCEEDED(scene_hdr_color_source.Get()->QueryInterface(IID_IUnknown, reinterpret_cast<void**>(unkHdr.GetAddressOf()))) &&
+                                    unkSrv.Get() == unkHdr.Get()) {
+                                    hdr_slot = static_cast<int>(i);
+                                    bloom_slot_tex = tex;
+                                    bloom_slot_srv = ps_srvs[i];
+                                    bloom_slot_res = srv_res;
+                                }
+                            }
+                        }
+                        srv_res->Release();
+                    }
+                    ps_srvs[i]->Release();
+                }
+            }
+
+            if (hdr_slot >= 0 && bloom_slot_tex) {
                 s_detected_bloom_start_draw = drawIndex;
-                const bool ok = executeUpscaleAtBloomStart(context, hdr_slot);
+                const bool ok = executeUpscaleAtBloomStart(context, bloom_slot_tex.Get(), bloom_slot_srv.Get(), bloom_slot_res.Get(), hdr_slot);
                 if (ok) {
                     s_upscale_evaluated_this_frame = true;
                     s_inside_scene_passes.store(false, std::memory_order_release);
@@ -2131,7 +2159,13 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
     }
 }
 
-void logCameraDelta(unsigned long long frame, bool parsed, const edpe::CameraProjection& camera) {
+void logCameraDelta(unsigned long long frame, bool parsed, const edpe::CameraProjection& camera, const char* reason = nullptr) {
+    if (!parsed) {
+        ++s_camera_120_invalid_samples;
+        wchar_t invMsg[256];
+        swprintf_s(invMsg, L"EDPE: camera sample invalid frame=%llu reason=%hs", frame, reason ? reason : "unknown");
+        EdpeLog(invMsg);
+    }
     const auto r = camera_delta_tracker.feed(frame, parsed, camera);
     wchar_t message[512]; 
     if (!camera_delta_announced) {
@@ -2226,10 +2260,11 @@ void pollCameraDeltaRing(ID3D11DeviceContext* context) {
         if (result == DXGI_ERROR_WAS_STILL_DRAWING) return;
         if (SUCCEEDED(result) && mapped.pData) {
             edpe::CameraProjection camera{};
+            const char* reason = nullptr;
             const bool parsed = edpe::parseEliteCamera(static_cast<const float*>(mapped.pData),
-                5376 / sizeof(float), &camera);
+                5376 / sizeof(float), &camera, &reason);
             context->Unmap(slot.staging.Get(), 0);
-            logCameraDelta(slot.frame, parsed, camera);
+            logCameraDelta(slot.frame, parsed, camera, reason);
         } else {
             ++camera_delta_dropped;
         }
@@ -3156,8 +3191,12 @@ static bool validateLinearDepthTexture(ID3D11Device* device, ID3D11DeviceContext
     return verdict;
 }
 
-bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
-    if (!context || !scene_hdr_color_source) return false;
+bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
+    ID3D11Texture2D* bloomTex,
+    ID3D11ShaderResourceView* bloomSrv,
+    ID3D11Resource* bloomSlotRes,
+    int hdr_slot) {
+    if (!context || !bloomTex) return false;
     auto& upscaler = edpe::UpscalerManager::instance();
     if (!upscaler.isReconstructionActive()) return false;
 
@@ -3165,7 +3204,7 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     D3D11ContextStateGuard stateGuard(context);
 
     D3D11_TEXTURE2D_DESC hdrDesc{};
-    scene_hdr_color_source->GetDesc(&hdrDesc);
+    bloomTex->GetDesc(&hdrDesc);
     const UINT width = hdrDesc.Width;
     const UINT height = hdrDesc.Height;
     if (!width || !height) return false;
@@ -3179,7 +3218,6 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     updateFrameCamera(rendered);
     if (s_camera_now.scaleX <= 0.0f) return false;
 
-    
     if (scene_depth_source) {
         D3D11_TEXTURE2D_DESC dd{};
         scene_depth_source->GetDesc(&dd);
@@ -3227,8 +3265,6 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
         }
     }
 
-    
-    
     const bool preferLinear = (edpe::Config::instance().depthSource == 1);
     const bool linearValidFrame = (s_scene_linear_depth && s_scene_linear_depth_frame == rendered);
     bool useLinearDepth = false;
@@ -3282,7 +3318,6 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
 
     if (!motion_pass->output()) return false;
 
-    
     float jx = s_injected_jitter.pixelX;
     float jy = s_injected_jitter.pixelY;
     if (s_jitter_swap_xy.load(std::memory_order_relaxed)) std::swap(jx, jy);
@@ -3296,38 +3331,6 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     const float dt_ms = computeFrameDeltaTimeMs();
     const bool scene_cut = edpe::detectSceneCut(s_camera_now, s_camera_previous, s_camera_previous_frame);
 
-    
-    bool needRecreateDlaa = !s_dlaa_input ||
-        hdrDesc.Width != s_dlaa_input_desc.Width ||
-        hdrDesc.Height != s_dlaa_input_desc.Height ||
-        hdrDesc.Format != s_dlaa_input_desc.Format ||
-        hdrDesc.SampleDesc.Count != s_dlaa_input_desc.SampleDesc.Count;
-    if (needRecreateDlaa) {
-        s_dlaa_input.Reset();
-        s_dlaa_input_srv.Reset();
-        D3D11_TEXTURE2D_DESC inDesc = hdrDesc;
-        inDesc.Usage = D3D11_USAGE_DEFAULT;
-        inDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        inDesc.CPUAccessFlags = inDesc.MiscFlags = 0;
-        HRESULT hr = device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input);
-        if (FAILED(hr)) {
-            wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: failed to create s_dlaa_input format=%u hr=0x%08X", inDesc.Format, hr);
-            EdpeLog(msg);
-            return false;
-        }
-        hr = device->CreateShaderResourceView(s_dlaa_input.Get(), nullptr, &s_dlaa_input_srv);
-        if (FAILED(hr)) {
-            wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: failed to create s_dlaa_input_srv hr=0x%08X", hr);
-            EdpeLog(msg);
-            return false;
-        }
-        s_dlaa_input_desc = inDesc;
-    }
-    context->CopyResource(s_dlaa_input.Get(), scene_hdr_color_source.Get());
-
-    
     bool needRecreateOut = !s_bloom_upscale_output ||
         hdrDesc.Width != s_bloom_output_desc.Width ||
         hdrDesc.Height != s_bloom_output_desc.Height ||
@@ -3350,8 +3353,8 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     }
 
     edpe::TemporalFrameInputs inputs{};
-    inputs.color = s_dlaa_input.Get();
-    inputs.colorSrv = s_dlaa_input_srv.Get();
+    inputs.color = bloomTex;
+    inputs.colorSrv = bloomSrv;
     inputs.depth = depthResource;
     inputs.depthSrv = depthSrv;
     inputs.motionVectors = motion_pass->outputTexture();
@@ -3366,14 +3369,16 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     inputs.motionScaleY = mScaleY;
     inputs.frameTimeMs = dt_ms;
     inputs.reset = s_camera_reset || scene_cut || (!motionOk);
+    if (inputs.reset) {
+        ++s_camera_120_history_resets;
+    }
     inputs.cameraNow = s_camera_now;
     inputs.cameraPrevious = s_camera_previous;
     inputs.sharpness = edpe::Config::instance().sharpness;
     inputs.depthInverted = !useLinearDepth;
     inputs.motionIsLowRes = false;
-    inputs.colorIsHdr = true;
+    inputs.colorIsHdr = edpe::isHdrFormat(hdrDesc.Format);
 
-    
     if (hdr_slot >= 0) {
         ID3D11ShaderResourceView* nullSrv = nullptr;
         context->PSSetShaderResources(static_cast<UINT>(hdr_slot), 1, &nullSrv);
@@ -3382,7 +3387,25 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context, int hdr_slot) {
     if (upscaler.evaluate(context, inputs, nullptr, s_bloom_upscale_output.Get())) {
         s_camera_reset = false;
         ++s_count_bloom_upscale;
-        context->CopyResource(scene_hdr_color_source.Get(), s_bloom_upscale_output.Get());
+        context->CopyResource(bloomTex, s_bloom_upscale_output.Get());
+        scene_hdr_color_source = bloomTex;
+        scene_hdr_color_frame = rendered;
+
+        static unsigned long long s_last_bloom_diag_frame = ~0ull;
+        if (s_last_bloom_diag_frame == ~0ull || rendered >= s_last_bloom_diag_frame + 120) {
+            s_last_bloom_diag_frame = rendered;
+            wchar_t bmsg[256];
+            swprintf_s(bmsg,
+                L"EDPE: bloom upscale diag frame=%llu input=%p fmt=%u output=%p fmt=%u slotRes=%p inputEqSlot=%d",
+                rendered,
+                static_cast<void*>(bloomTex),
+                static_cast<unsigned>(hdrDesc.Format),
+                static_cast<void*>(bloomTex),
+                static_cast<unsigned>(hdrDesc.Format),
+                static_cast<void*>(bloomSlotRes),
+                (static_cast<void*>(bloomTex) == static_cast<void*>(bloomSlotRes)) ? 1 : 0);
+            EdpeLog(bmsg);
+        }
         return true;
     }
 
@@ -3714,15 +3737,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.motionScaleY = mScaleY;
     inputs.frameTimeMs = dt_ms;
     inputs.reset = s_camera_reset || scene_cut;
+    if (inputs.reset) {
+        ++s_camera_120_history_resets;
+    }
     inputs.cameraNow = s_camera_now;
     inputs.cameraPrevious = s_camera_previous;
     inputs.sharpness = edpe::Config::instance().sharpness;
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
-    const bool isHdrColor = hdrInput &&
-                            (srcColorDesc.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
-                             srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-                             srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
+    const bool isHdrColor = edpe::isHdrFormat(srcColorDesc.Format);
     inputs.colorIsHdr = isHdrColor;
 
     s_last_temporal_inputs = inputs;
@@ -4914,6 +4937,18 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_latest_unmapped_camera_valid = false;
         s_jitter_injected_frame = ~0ull;
         clearTrackedMappedBuffers();
+    }
+    static unsigned long long s_last_camera_stats_frame = 0;
+    if (frame == 1 || frame >= s_last_camera_stats_frame + 120) {
+        s_last_camera_stats_frame = frame;
+        wchar_t cStatMsg[256];
+        swprintf_s(cStatMsg,
+            L"EDPE: camera stats 120f: frame=%llu invalidSamples=%u historyResets=%u cameraReused=%u",
+            frame, s_camera_120_invalid_samples, s_camera_120_history_resets, s_camera_120_reused);
+        EdpeLog(cStatMsg);
+        s_camera_120_invalid_samples = 0;
+        s_camera_120_history_resets = 0;
+        s_camera_120_reused = 0;
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         UINT outW = 0, outH = 0;

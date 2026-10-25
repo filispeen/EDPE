@@ -8,9 +8,10 @@ namespace edpe {
 // history reconstruction, cockpit interior stabilization, and velocity/UI confidence protection.
 inline constexpr char kTaaShader[] = R"(
 cbuffer TaaConstants : register(b0) {
-    float4 resolution;       // x: outputWidth, y: outputHeight, z: 1/outputWidth, w: 1/outputHeight
-    float4 renderResolution; // x: renderWidth, y: renderHeight, z: 1/renderWidth, w: 1/renderHeight
-    float4 params;           // x: jitterX, y: jitterY, z: blendWeight, w: resetFlag
+    float4 resolution;
+    float4 renderResolution;
+    float4 params;
+    float4 options;
 };
 
 Texture2D<float4> currentFrame  : register(t0);
@@ -43,11 +44,12 @@ float3 RGBToYCoCg(float3 c) {
 }
 
 float3 YCoCgToRGB(float3 c) {
-    return saturate(float3(
+    float3 rgb = float3(
         c.x + c.y - c.z,
         c.x + c.z,
         c.x - c.y - c.z
-    ));
+    );
+    return (options.x > 0.5) ? max(rgb, 0.0) : saturate(rgb);
 }
 
 // Brian Karis (Epic Games / UE4) AABB Ray Intersection Color Clipping

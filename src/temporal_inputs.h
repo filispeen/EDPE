@@ -210,7 +210,23 @@ struct NvidiaDlssInputParams {
     float frameTimeMs = 0.0f;
 };
 
-// Translates EDPE temporal conventions to NVIDIA NGX conventions.
+inline bool isHdrFormat(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R16_FLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 inline bool translateToNvidia(const TemporalFrameInputs& inputs,
     NvidiaDlssInputParams* outParams, const wchar_t** outReason = nullptr) {
     if (!outParams) {
@@ -219,20 +235,14 @@ inline bool translateToNvidia(const TemporalFrameInputs& inputs,
     }
     if (!inputs.isValid(outReason)) return false;
 
-    // Jitter: NGX expects jitter in input/render pixels (same unit as EDPE Halton).
     outParams->jitterX = inputs.jitterX;
     outParams->jitterY = inputs.jitterY;
-
-    // Motion vector scale: EDPE generates displacement in render pixels.
     outParams->motionScaleX = inputs.motionScaleX;
     outParams->motionScaleY = inputs.motionScaleY;
-
-    // Depth convention: Elite's reversed Z maps to DepthInverted.
     outParams->depthInverted = inputs.depthInverted;
-
-    // Feature flags:
     outParams->motionLowRes = inputs.motionIsLowRes;
     outParams->motionJittered = inputs.motionJittered;
+
     outParams->isHdr = inputs.colorIsHdr;
     outParams->inReset = inputs.reset;
     outParams->frameTimeMs = inputs.frameTimeMs;

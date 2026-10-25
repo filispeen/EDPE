@@ -10,9 +10,10 @@ namespace edpe {
 namespace {
 
 struct TaaConstantBufferData {
-    float resolution[4];       // outputWidth, outputHeight, 1/outputWidth, 1/outputHeight
-    float renderResolution[4]; // renderWidth, renderHeight, 1/renderWidth, 1/renderHeight
-    float params[4];           // jitterX, jitterY, blendWeight, resetFlag
+    float resolution[4];
+    float renderResolution[4];
+    float params[4];
+    float options[4];
 };
 
 } // namespace
@@ -157,7 +158,8 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     float jitterY,
     bool reset,
     uint32_t renderWidth,
-    uint32_t renderHeight) {
+    uint32_t renderHeight,
+    bool isHdr) {
     if (!device_ || !context || !currentFrameSrv || !destinationTexture || width == 0 || height == 0) {
         return false;
     }
@@ -195,8 +197,12 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     cb.renderResolution[3] = 1.0f / static_cast<float>(rH);
     cb.params[0] = jitterX;
     cb.params[1] = jitterY;
-    cb.params[2] = 0.90f; // 90% history weight
+    cb.params[2] = 0.90f;
     cb.params[3] = performReset ? 1.0f : 0.0f;
+    cb.options[0] = isHdr ? 1.0f : 0.0f;
+    cb.options[1] = 0.0f;
+    cb.options[2] = 0.0f;
+    cb.options[3] = 0.0f;
 
     context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cb, 0, 0);
 

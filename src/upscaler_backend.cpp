@@ -393,8 +393,12 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         return false;
     }
 
+    D3D11_TEXTURE2D_DESC inColorDesc{};
+    inputs.color->GetDesc(&inColorDesc);
+    const bool isHdr = isHdrFormat(inColorDesc.Format);
+
     if (!impl_->ensureFsrContext(device.Get(), inputs.renderWidth, inputs.renderHeight,
-                                 inputs.outputWidth, inputs.outputHeight, inputs.colorIsHdr)) {
+                                 inputs.outputWidth, inputs.outputHeight, isHdr)) {
         return false;
     }
 
@@ -529,6 +533,10 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         depthSrv = localDepthSrv.Get();
     }
 
+    D3D11_TEXTURE2D_DESC inColorDesc{};
+    inputs.color->GetDesc(&inColorDesc);
+    const bool isHdr = isHdrFormat(inColorDesc.Format);
+
     return pass_.render(context,
         colorSrv,
         motionSrv,
@@ -541,7 +549,8 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.jitterY,
         inputs.reset,
         inputs.renderWidth,
-        inputs.renderHeight);
+        inputs.renderHeight,
+        isHdr);
 }
 
 void TaaUpscalerBackend::resetHistory() {

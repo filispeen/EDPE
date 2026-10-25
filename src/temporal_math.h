@@ -244,7 +244,9 @@ struct CameraHistory {
 
 inline bool updateCameraHistory(CameraHistory& history, std::uint64_t frame,
                                 const CameraProjection* primaryCandidate,
-                                const CameraProjection* fallbackCandidate) {
+                                const CameraProjection* fallbackCandidate,
+                                bool* outReused = nullptr) {
+    if (outReused) *outReused = false;
     if (history.currentFrame == frame) return false;
     if (primaryCandidate && primaryCandidate->scaleX > 0.0f) {
         if (history.current.scaleX > 0.0f) {
@@ -270,9 +272,10 @@ inline bool updateCameraHistory(CameraHistory& history, std::uint64_t frame,
         history.previous = history.current;
         history.previousFrame = history.currentFrame;
         history.currentFrame = frame;
+        if (outReused) *outReused = true;
         return true;
     }
     return false;
 }
 
-} // namespace edpe
+}
