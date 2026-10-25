@@ -1060,9 +1060,8 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
             };
             BoundSrvInfo bound_srvs[8]{};
 
-            if (scene_hdr_color_source) {
-                ID3D11ShaderResourceView* ps_srvs[8]{};
-                context->PSGetShaderResources(0, 8, ps_srvs);
+            ID3D11ShaderResourceView* ps_srvs[8]{};
+            context->PSGetShaderResources(0, 8, ps_srvs);
                 for (UINT i = 0; i < 8; ++i) {
                     if (ps_srvs[i]) {
                         ID3D11Resource* srv_res = nullptr;
@@ -1124,7 +1123,6 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
                         ps_srvs[i]->Release();
                     }
                 }
-            }
 
             if (hdr_slot >= 0) {
                 s_detected_bloom_start_draw = drawIndex;
@@ -1143,7 +1141,7 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
                         EdpeLog(L"EDPE: executeUpscaleAtBloomStart failed; falling back to Present upscale");
                     }
                 }
-            } else if (scene_hdr_color_source) {
+            } else {
                 const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
                 static unsigned long long s_last_missing_hdr_frame = ~0ull;
                 if (s_last_missing_hdr_frame == ~0ull || cur_frame >= s_last_missing_hdr_frame + 120) {
@@ -3434,87 +3432,84 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
 
 
-    const bool cond_hdr = (hdrInput && scene_hdr_color_source && scene_hdr_color_frame == rendered);
     const bool cond_ldr = (scene_ldr_source != nullptr && scene_ldr_frame == rendered);
     const bool cond_bb = (!isSubNative && backbuffer != nullptr &&
                           backbufferDesc.Width == depthDesc.Width &&
                           backbufferDesc.Height == depthDesc.Height);
 
-    if (cond_hdr) {
+    if (s_active_color_path == TemporalColorPath::Unset) {
+        if (cond_ldr) {
+            s_active_color_path = TemporalColorPath::OffscreenLdr;
+            wchar_t pmsg[256];
+            swprintf_s(pmsg, L"EDPE: temporal color path initialized to OffscreenLdr (cond_ldr=1, cond_bb=%d, frame=%llu)",
+                cond_bb ? 1 : 0, frame);
+            EdpeLog(pmsg);
+        } else if (cond_bb) {
+            s_active_color_path = TemporalColorPath::NativeBackbuffer;
+            wchar_t pmsg[256];
+            swprintf_s(pmsg, L"EDPE: temporal color path initialized to NativeBackbuffer (cond_ldr=0, cond_bb=1, frame=%llu)",
+                frame);
+            EdpeLog(pmsg);
+        }
+    } else if (s_active_color_path == TemporalColorPath::OffscreenLdr) {
+        if (cond_bb && !cond_ldr) {
+            if (s_pending_color_path == TemporalColorPath::NativeBackbuffer) {
+                ++s_pending_path_frames;
+            } else {
+                s_pending_color_path = TemporalColorPath::NativeBackbuffer;
+                s_pending_path_frames = 1;
+            }
+            if (s_pending_path_frames >= kPathSwitchStabilityFrames) {
+                s_active_color_path = TemporalColorPath::NativeBackbuffer;
+                s_pending_color_path = TemporalColorPath::Unset;
+                s_pending_path_frames = 0;
+                wchar_t pmsg[256];
+                swprintf_s(pmsg, L"EDPE: temporal color path changed: OffscreenLdr -> NativeBackbuffer (cond_ldr=0, cond_bb=1 for %u frames, frame=%llu)",
+                    kPathSwitchStabilityFrames, frame);
+                EdpeLog(pmsg);
+            }
+        } else {
+            s_pending_color_path = TemporalColorPath::Unset;
+            s_pending_path_frames = 0;
+        }
+    } else if (s_active_color_path == TemporalColorPath::NativeBackbuffer) {
+        if (cond_ldr) {
+            if (s_pending_color_path == TemporalColorPath::OffscreenLdr) {
+                ++s_pending_path_frames;
+            } else {
+                s_pending_color_path = TemporalColorPath::OffscreenLdr;
+                s_pending_path_frames = 1;
+            }
+            if (s_pending_path_frames >= kPathSwitchStabilityFrames) {
+                s_active_color_path = TemporalColorPath::OffscreenLdr;
+                s_pending_color_path = TemporalColorPath::Unset;
+                s_pending_path_frames = 0;
+                wchar_t pmsg[256];
+                swprintf_s(pmsg, L"EDPE: temporal color path changed: NativeBackbuffer -> OffscreenLdr (cond_ldr=1 for %u frames, frame=%llu)",
+                    kPathSwitchStabilityFrames, frame);
+                EdpeLog(pmsg);
+            }
+        } else {
+            s_pending_color_path = TemporalColorPath::Unset;
+            s_pending_path_frames = 0;
+        }
+    }
+
+    if (s_active_color_path == TemporalColorPath::OffscreenLdr && scene_ldr_source) {
+        colorSource = scene_ldr_source.Get();
+    } else if (s_active_color_path == TemporalColorPath::NativeBackbuffer) {
+        colorSource = backbuffer;
+    } else if (cond_ldr) {
+        colorSource = scene_ldr_source.Get();
+    } else if (cond_bb) {
+        colorSource = backbuffer;
+    } else if (hdrInput && scene_hdr_color_source && scene_hdr_color_frame == rendered) {
         colorSource = scene_hdr_color_source.Get();
     } else {
-        if (s_active_color_path == TemporalColorPath::Unset) {
-            if (cond_ldr) {
-                s_active_color_path = TemporalColorPath::OffscreenLdr;
-                wchar_t pmsg[256];
-                swprintf_s(pmsg, L"EDPE: temporal color path initialized to OffscreenLdr (cond_ldr=1, cond_bb=%d, frame=%llu)",
-                    cond_bb ? 1 : 0, frame);
-                EdpeLog(pmsg);
-            } else if (cond_bb) {
-                s_active_color_path = TemporalColorPath::NativeBackbuffer;
-                wchar_t pmsg[256];
-                swprintf_s(pmsg, L"EDPE: temporal color path initialized to NativeBackbuffer (cond_ldr=0, cond_bb=1, frame=%llu)",
-                    frame);
-                EdpeLog(pmsg);
-            }
-        } else if (s_active_color_path == TemporalColorPath::OffscreenLdr) {
-            if (cond_bb && !cond_ldr) {
-                if (s_pending_color_path == TemporalColorPath::NativeBackbuffer) {
-                    ++s_pending_path_frames;
-                } else {
-                    s_pending_color_path = TemporalColorPath::NativeBackbuffer;
-                    s_pending_path_frames = 1;
-                }
-                if (s_pending_path_frames >= kPathSwitchStabilityFrames) {
-                    s_active_color_path = TemporalColorPath::NativeBackbuffer;
-                    s_pending_color_path = TemporalColorPath::Unset;
-                    s_pending_path_frames = 0;
-                    wchar_t pmsg[256];
-                    swprintf_s(pmsg, L"EDPE: temporal color path changed: OffscreenLdr -> NativeBackbuffer (cond_ldr=0, cond_bb=1 for %u frames, frame=%llu)",
-                        kPathSwitchStabilityFrames, frame);
-                    EdpeLog(pmsg);
-                }
-            } else {
-                s_pending_color_path = TemporalColorPath::Unset;
-                s_pending_path_frames = 0;
-            }
-        } else if (s_active_color_path == TemporalColorPath::NativeBackbuffer) {
-            if (cond_ldr) {
-                if (s_pending_color_path == TemporalColorPath::OffscreenLdr) {
-                    ++s_pending_path_frames;
-                } else {
-                    s_pending_color_path = TemporalColorPath::OffscreenLdr;
-                    s_pending_path_frames = 1;
-                }
-                if (s_pending_path_frames >= kPathSwitchStabilityFrames) {
-                    s_active_color_path = TemporalColorPath::OffscreenLdr;
-                    s_pending_color_path = TemporalColorPath::Unset;
-                    s_pending_path_frames = 0;
-                    wchar_t pmsg[256];
-                    swprintf_s(pmsg, L"EDPE: temporal color path changed: NativeBackbuffer -> OffscreenLdr (cond_ldr=1 for %u frames, frame=%llu)",
-                        kPathSwitchStabilityFrames, frame);
-                    EdpeLog(pmsg);
-                }
-            } else {
-                s_pending_color_path = TemporalColorPath::Unset;
-                s_pending_path_frames = 0;
-            }
+        if (++s_consecutive_skipped_frames > 2) {
+            s_camera_reset = true;
         }
-
-        if (s_active_color_path == TemporalColorPath::OffscreenLdr && scene_ldr_source) {
-            colorSource = scene_ldr_source.Get();
-        } else if (s_active_color_path == TemporalColorPath::NativeBackbuffer) {
-            colorSource = backbuffer;
-        } else if (cond_ldr) {
-            colorSource = scene_ldr_source.Get();
-        } else if (cond_bb) {
-            colorSource = backbuffer;
-        } else {
-            if (++s_consecutive_skipped_frames > 2) {
-                s_camera_reset = true;
-            }
-            return;
-        }
+        return;
     }
     s_consecutive_skipped_frames = 0;
 
