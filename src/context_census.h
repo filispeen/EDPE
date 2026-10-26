@@ -6,6 +6,8 @@
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags);
 void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags);
 void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags);
+void ContextCensusHookDeferredContext(ID3D11DeviceContext* context);
+unsigned long long ContextCensusGetDsvBinds();
 void ContextCensusOnSwapChainRelease(IUnknown* object);
 bool ContextCensusRequestBindSequence();
 bool ContextCensusBindSequenceAvailable();

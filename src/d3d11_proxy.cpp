@@ -1,4 +1,5 @@
 #include "d3d11_proxy.h"
+#include "context_census.h"
 #include "config.h"
 #include "input_hook.h"
 #include "log.h"
@@ -24,7 +25,9 @@ using CreateSamplerStateFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*,
     const D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
 std::atomic<CreateVertexShaderFn> original_create_vertex_shader{nullptr};
 std::atomic<CreatePixelShaderFn> original_create_pixel_shader{nullptr};
+using CreateDeferredContextFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, UINT, ID3D11DeviceContext**);
 std::atomic<CreateSamplerStateFn> original_create_sampler_state{nullptr};
+std::atomic<CreateDeferredContextFn> original_create_deferred_context{nullptr};
 std::atomic<void**> hooked_device_table{nullptr};
 std::atomic<bool> retain_vertex_bytecode{false};
 
@@ -96,6 +99,16 @@ HRESULT STDMETHODCALLTYPE observedCreateSamplerState(ID3D11Device* device,
     return original_create_sampler_state.load(std::memory_order_acquire)(device, &mod_desc, sampler);
 }
 
+HRESULT STDMETHODCALLTYPE observedCreateDeferredContext(ID3D11Device* device,
+    UINT ContextFlags, ID3D11DeviceContext** ppDeferredContext) {
+    auto forward = original_create_deferred_context.load(std::memory_order_acquire);
+    const HRESULT result = forward ? forward(device, ContextFlags, ppDeferredContext) : E_FAIL;
+    if (SUCCEEDED(result) && ppDeferredContext && *ppDeferredContext) {
+        ContextCensusHookDeferredContext(*ppDeferredContext);
+    }
+    return result;
+}
+
 bool armShaderProbe() {
     wchar_t path[MAX_PATH];
     const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -163,6 +176,24 @@ void hookShaderCreation(ID3D11Device* device) {
                 sampler_hooked = replaced == reinterpret_cast<void*>(sampler_forward);
             }
         }
+        constexpr size_t deferred_slot = 27;
+        bool deferred_hooked = false;
+        auto deferred_forward = reinterpret_cast<CreateDeferredContextFn>(table[deferred_slot]);
+        if (deferred_forward && deferred_forward != &observedCreateDeferredContext) {
+            original_create_deferred_context.store(deferred_forward, std::memory_order_release);
+            if (VirtualProtect(table + deferred_slot, sizeof(void*), PAGE_READWRITE, &old_protection)) {
+                replaced = InterlockedCompareExchangePointer(
+                    reinterpret_cast<PVOID volatile*>(table + deferred_slot),
+                    reinterpret_cast<void*>(&observedCreateDeferredContext),
+                    reinterpret_cast<void*>(deferred_forward));
+                VirtualProtect(table + deferred_slot, sizeof(void*), old_protection, &ignored);
+                deferred_hooked = (replaced == reinterpret_cast<void*>(deferred_forward));
+            }
+        }
+        EdpeLog(deferred_hooked
+            ? L"EDPE: deferred context hook available"
+            : L"EDPE: deferred context hook unavailable");
+
         EdpeLog(pixel_hooked
             ? L"EDPE: vertex/pixel shader signatures available"
             : L"EDPE: vertex shader signatures available; pixel shader hook unavailable");

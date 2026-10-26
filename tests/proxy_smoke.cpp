@@ -508,6 +508,20 @@ int wmain(int argc, wchar_t** argv) {
     const HRESULT resized_present = SUCCEEDED(resize_result) ? swap_chain->Present(0, 0) : resize_result;
     for (int i = 0; i < 40; ++i) swap_chain->Present(0, 0);
     const bool scene_candidate_expired = scene_depth_candidate() == -1;
+    ID3D11DeviceContext* deferred_context = nullptr;
+    const HRESULT def_hr = device->CreateDeferredContext(0, &deferred_context);
+    bool def_executed = false;
+    if (SUCCEEDED(def_hr) && deferred_context) {
+        deferred_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, depth_view, 0, 0, nullptr, nullptr);
+        deferred_context->OMSetRenderTargets(0, nullptr, nullptr);
+        ID3D11CommandList* cmd_list = nullptr;
+        if (SUCCEEDED(deferred_context->FinishCommandList(FALSE, &cmd_list)) && cmd_list) {
+            context->ExecuteCommandList(cmd_list, FALSE);
+            cmd_list->Release();
+            def_executed = true;
+        }
+        deferred_context->Release();
+    }
     while (present_count() < 1024) swap_chain->Present(0, DXGI_PRESENT_TEST);
     const bool interval_observed = present_count() == 1024;
     SendMessageW(window, WM_KEYUP, VK_F5, 0);
@@ -594,7 +608,7 @@ int wmain(int argc, wchar_t** argv) {
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
         SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
         SUCCEEDED(snapshot_arm_present) && SUCCEEDED(snapshot_present) && snapshot_requested &&
-        scene_candidate_found && scene_candidate_held && scene_candidate_expired &&
+        scene_candidate_found && scene_candidate_held && scene_candidate_expired && def_executed &&
         pair_requested && SUCCEEDED(pair_arm_present) &&
         SUCCEEDED(pair_present) && motion_requested &&
         SUCCEEDED(motion_arm_present) && SUCCEEDED(motion_present) &&
@@ -629,7 +643,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:28") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:29") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
@@ -708,7 +722,17 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: motion candidate currentAfterPresent=17 center=(6.39844,0)") &&
         std::strstr(contents, "EDPE: motion grid 5x5 finite=25") &&
         std::strstr(contents, "pixels finite=1") &&
-        std::strstr(contents, "EDPE: DSV census frame=1024 binds=28 unique=1 slotActive=1") &&
+        std::strstr(contents, "EDPE: DSV census frame=1024 binds=29 unique=1 slotActive=1") &&
+        std::strstr(contents, "EDPE: hook OMSetRenderTargets this=") &&
+        std::strstr(contents, "type=immediate") &&
+        std::strstr(contents, "type=deferred") &&
+        std::strstr(contents, "EDPE: deferred context vtable hooked") &&
+        std::strstr(contents, "EDPE: context calls frame=1024") &&
+        std::strstr(contents, "OMSetRenderTargetsAndUnorderedAccessViews=") &&
+        std::strstr(contents, "FinishCommandList=") &&
+        std::strstr(contents, "ExecuteCommandList=") &&
+        std::strstr(contents, "vtable slot 33 (OMSetRenderTargets) match") &&
+        std::strstr(contents, "vtable slot 34 (OMSetRenderTargetsAndUAVs)") &&
         std::strstr(contents, "EDPE: Dear ImGui ready") &&
         std::strstr(contents, "EDPE: D3D11 context state available=1") &&
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&

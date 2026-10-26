@@ -42,11 +42,21 @@ constexpr size_t kUnmap = 15;
 constexpr size_t kDrawIndexedInstanced = 20;
 constexpr size_t kDrawInstanced = 21;
 constexpr size_t kOMSetRenderTargets = 33;
+constexpr size_t kOMSetRenderTargetsAndUnorderedAccessViews = 34;
+constexpr size_t kExecuteCommandList = 58;
+constexpr size_t kFinishCommandList = 114;
 constexpr unsigned kPairFirstSample = 100;
 constexpr unsigned kPairSecondSample = 101;
 constexpr unsigned kAlternateProjectionSample = 102;
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
+using OMSetRenderTargetsAndUnorderedAccessViewsFn = void(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*,
+    UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*);
+using ExecuteCommandListFn = void(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*, ID3D11CommandList*, BOOL);
+using FinishCommandListFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*, BOOL, ID3D11CommandList**);
 using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     UINT, ID3D11Buffer* const*);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
@@ -62,8 +72,49 @@ using DrawInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
 bool patchSlot(void** table, size_t slot, void* expected, void* replacement);
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv);
+void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
+    ID3D11DeviceContext* context, UINT numRTVs, ID3D11RenderTargetView* const* targets,
+    ID3D11DepthStencilView* dsv, UINT uavStartSlot, UINT numUAVs,
+    ID3D11UnorderedAccessView* const* uavs, const UINT* initialCounts);
+void STDMETHODCALLTYPE observedExecuteCommandList(
+    ID3D11DeviceContext* context, ID3D11CommandList* pCommandList, BOOL restoreContextState);
+HRESULT STDMETHODCALLTYPE observedFinishCommandList(
+    ID3D11DeviceContext* context, BOOL restoreDeferredContextState, ID3D11CommandList** ppCommandList);
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
+std::atomic<OMSetRenderTargetsFn> original_deferred_om{nullptr};
+std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_om_uav{nullptr};
+std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_deferred_om_uav{nullptr};
+std::atomic<ExecuteCommandListFn> original_execute_command_list{nullptr};
+std::atomic<ExecuteCommandListFn> original_deferred_execute_command_list{nullptr};
+std::atomic<FinishCommandListFn> original_finish_command_list{nullptr};
+std::atomic<FinishCommandListFn> original_deferred_finish_command_list{nullptr};
+
+std::atomic<unsigned long long> s_count_om_set_render_targets{0};
+std::atomic<unsigned long long> s_count_om_set_rt_uav{0};
+std::atomic<unsigned long long> s_count_finish_command_list{0};
+std::atomic<unsigned long long> s_count_execute_command_list{0};
+
+static std::atomic<bool> s_log_om_imm{false}, s_log_om_def{false};
+static std::atomic<bool> s_log_om_uav_imm{false}, s_log_om_uav_def{false};
+static std::atomic<bool> s_log_finish_imm{false}, s_log_finish_def{false};
+static std::atomic<bool> s_log_exec_imm{false}, s_log_exec_def{false};
+
+static void logContextHookOnce(ID3D11DeviceContext* context, size_t slot, const wchar_t* hookName,
+    std::atomic<bool>& immFlag, std::atomic<bool>& defFlag) {
+    if (!context) return;
+    const auto type = context->GetType();
+    std::atomic<bool>& flag = (type == D3D11_DEVICE_CONTEXT_IMMEDIATE) ? immFlag : defFlag;
+    if (!flag.exchange(true, std::memory_order_acq_rel)) {
+        const char* typeStr = (type == D3D11_DEVICE_CONTEXT_IMMEDIATE) ? "immediate" : "deferred";
+        void** table = *reinterpret_cast<void***>(context);
+        void* slotAddr = table ? &table[slot] : nullptr;
+        wchar_t msg[256];
+        swprintf_s(msg, L"EDPE: hook %ls this=%p type=%hs slotAddr=%p",
+            hookName, context, typeStr, slotAddr);
+        EdpeLog(msg);
+    }
+}
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
 std::atomic<DrawIndexedFn> original_draw_indexed{nullptr};
 std::atomic<DrawFn> original_draw{nullptr};
@@ -2993,21 +3044,13 @@ bool isMainSceneMrtDepth(const D3D11_TEXTURE2D_DESC& dd, UINT outW, UINT outH, b
     return true;
 }
 
-void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
+void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
-    const auto forward = original.load(std::memory_order_acquire);
-    if (s_in_edpe_present.load(std::memory_order_acquire)) {
-        forward(context, count, targets, dsv);
-        return;
-    }
     if (context == observed_context.load(std::memory_order_acquire)) {
-        endVSBufferProbe();
-        endPipelineSample(context);
+        copyCameraDeltaSource(context);
+        rearmHudDrawProbe();
     }
-    forward(context, count, targets, dsv);
-    if (context != observed_context.load(std::memory_order_acquire)) return;
-    copyCameraDeltaSource(context);
-    rearmHudDrawProbe();
+
     edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::OMSetRenderTargets);
     const bool reconstruction_active =
         edpe::UpscalerManager::instance().isReconstructionActive() ||
@@ -3348,7 +3391,91 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         color_texture.Width, color_texture.Height,
         static_cast<unsigned>(color_view.Format), color_texture.BindFlags);
     EdpeLog(message);
+
 }
+
+void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
+    ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
+    s_count_om_set_render_targets.fetch_add(1, std::memory_order_relaxed);
+    logContextHookOnce(context, kOMSetRenderTargets, L"OMSetRenderTargets", s_log_om_imm, s_log_om_def);
+
+    const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+    auto forward = is_deferred ? original_deferred_om.load(std::memory_order_acquire)
+                               : original.load(std::memory_order_acquire);
+    if (!forward) forward = original.load(std::memory_order_acquire);
+
+    if (s_in_edpe_present.load(std::memory_order_acquire)) {
+        if (forward) forward(context, count, targets, dsv);
+        return;
+    }
+    if (context == observed_context.load(std::memory_order_acquire)) {
+        endVSBufferProbe();
+        endPipelineSample(context);
+    }
+    if (forward) forward(context, count, targets, dsv);
+
+    observeDepthStencilView(context, count, targets, dsv);
+}
+
+void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
+    ID3D11DeviceContext* context,
+    UINT numRTVs,
+    ID3D11RenderTargetView* const* targets,
+    ID3D11DepthStencilView* dsv,
+    UINT uavStartSlot,
+    UINT numUAVs,
+    ID3D11UnorderedAccessView* const* uavs,
+    const UINT* initialCounts) {
+    s_count_om_set_rt_uav.fetch_add(1, std::memory_order_relaxed);
+    logContextHookOnce(context, kOMSetRenderTargetsAndUnorderedAccessViews,
+        L"OMSetRenderTargetsAndUnorderedAccessViews", s_log_om_uav_imm, s_log_om_uav_def);
+
+    const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+    auto forward = is_deferred ? original_deferred_om_uav.load(std::memory_order_acquire)
+                               : original_om_uav.load(std::memory_order_acquire);
+    if (!forward) forward = original_om_uav.load(std::memory_order_acquire);
+
+    if (s_in_edpe_present.load(std::memory_order_acquire)) {
+        if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
+        return;
+    }
+    if (context == observed_context.load(std::memory_order_acquire)) {
+        endVSBufferProbe();
+        endPipelineSample(context);
+    }
+    if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
+
+    observeDepthStencilView(context, numRTVs, targets, dsv);
+}
+
+void STDMETHODCALLTYPE observedExecuteCommandList(
+    ID3D11DeviceContext* context,
+    ID3D11CommandList* pCommandList,
+    BOOL restoreContextState) {
+    s_count_execute_command_list.fetch_add(1, std::memory_order_relaxed);
+    logContextHookOnce(context, kExecuteCommandList, L"ExecuteCommandList", s_log_exec_imm, s_log_exec_def);
+
+    const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+    auto forward = is_deferred ? original_deferred_execute_command_list.load(std::memory_order_acquire)
+                               : original_execute_command_list.load(std::memory_order_acquire);
+    if (!forward) forward = original_execute_command_list.load(std::memory_order_acquire);
+    if (forward) forward(context, pCommandList, restoreContextState);
+}
+
+HRESULT STDMETHODCALLTYPE observedFinishCommandList(
+    ID3D11DeviceContext* context,
+    BOOL restoreDeferredContextState,
+    ID3D11CommandList** ppCommandList) {
+    s_count_finish_command_list.fetch_add(1, std::memory_order_relaxed);
+    logContextHookOnce(context, kFinishCommandList, L"FinishCommandList", s_log_finish_imm, s_log_finish_def);
+
+    const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+    auto forward = is_deferred ? original_deferred_finish_command_list.load(std::memory_order_acquire)
+                               : original_finish_command_list.load(std::memory_order_acquire);
+    if (!forward) forward = original_finish_command_list.load(std::memory_order_acquire);
+    return forward ? forward(context, restoreDeferredContextState, ppCommandList) : E_FAIL;
+}
+
 
 bool patchSlot(void** table, size_t slot, void* expected, void* replacement) {
     DWORD old_protection = 0;
@@ -3372,7 +3499,47 @@ void rearmContextHooks() {
         if (restored && !s_swap_logged) {
             s_swap_logged = true;
             EdpeLog(L"EDPE: DSV observer restored after context-state swap");
+
+            void* cur_om = patched_table[kOMSetRenderTargets];
+            void* exp_om = reinterpret_cast<void*>(&observedOMSetRenderTargets);
+            if (cur_om == exp_om) {
+                EdpeLog(L"EDPE: vtable slot 33 (OMSetRenderTargets) match");
+            } else {
+                wchar_t msg[160];
+                swprintf_s(msg, L"EDPE: vtable slot 33 (OMSetRenderTargets) mismatch current=%p expected=%p; re-patching", cur_om, exp_om);
+                EdpeLog(msg);
+                patchSlot(patched_table, kOMSetRenderTargets, cur_om, exp_om);
+            }
+
+            void* cur_uav = patched_table[kOMSetRenderTargetsAndUnorderedAccessViews];
+            void* exp_uav = reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews);
+            if (cur_uav == exp_uav) {
+                EdpeLog(L"EDPE: vtable slot 34 (OMSetRenderTargetsAndUAVs) match");
+            } else {
+                wchar_t msg[160];
+                swprintf_s(msg, L"EDPE: vtable slot 34 (OMSetRenderTargetsAndUAVs) mismatch current=%p expected=%p; re-patching", cur_uav, exp_uav);
+                EdpeLog(msg);
+                patchSlot(patched_table, kOMSetRenderTargetsAndUnorderedAccessViews, cur_uav, exp_uav);
+            }
         }
+    }
+    const auto forward_uav = original_om_uav.load(std::memory_order_acquire);
+    if (forward_uav && patched_table[kOMSetRenderTargetsAndUnorderedAccessViews] != reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews)) {
+        patchSlot(patched_table, kOMSetRenderTargetsAndUnorderedAccessViews,
+            patched_table[kOMSetRenderTargetsAndUnorderedAccessViews],
+            reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
+    }
+    const auto forward_exec = original_execute_command_list.load(std::memory_order_acquire);
+    if (forward_exec && patched_table[kExecuteCommandList] != reinterpret_cast<void*>(&observedExecuteCommandList)) {
+        patchSlot(patched_table, kExecuteCommandList,
+            patched_table[kExecuteCommandList],
+            reinterpret_cast<void*>(&observedExecuteCommandList));
+    }
+    const auto forward_finish = original_finish_command_list.load(std::memory_order_acquire);
+    if (forward_finish && patched_table[kFinishCommandList] != reinterpret_cast<void*>(&observedFinishCommandList)) {
+        patchSlot(patched_table, kFinishCommandList,
+            patched_table[kFinishCommandList],
+            reinterpret_cast<void*>(&observedFinishCommandList));
     }
     const auto forward_map = original_map.load(std::memory_order_acquire);
     if (forward_map && map_hook_active.load(std::memory_order_acquire) &&
@@ -3534,6 +3701,31 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             }
             EdpeLog(L"EDPE: OMSetRenderTargets DSV census armed");
 
+            auto forward_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(
+                table[kOMSetRenderTargetsAndUnorderedAccessViews]);
+            if (forward_uav && forward_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews) {
+                original_om_uav.store(forward_uav, std::memory_order_release);
+                patchSlot(table, kOMSetRenderTargetsAndUnorderedAccessViews,
+                    reinterpret_cast<void*>(forward_uav),
+                    reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
+            }
+
+            auto forward_exec = reinterpret_cast<ExecuteCommandListFn>(table[kExecuteCommandList]);
+            if (forward_exec && forward_exec != &observedExecuteCommandList) {
+                original_execute_command_list.store(forward_exec, std::memory_order_release);
+                patchSlot(table, kExecuteCommandList,
+                    reinterpret_cast<void*>(forward_exec),
+                    reinterpret_cast<void*>(&observedExecuteCommandList));
+            }
+
+            auto forward_finish = reinterpret_cast<FinishCommandListFn>(table[kFinishCommandList]);
+            if (forward_finish && forward_finish != &observedFinishCommandList) {
+                original_finish_command_list.store(forward_finish, std::memory_order_release);
+                patchSlot(table, kFinishCommandList,
+                    reinterpret_cast<void*>(forward_finish),
+                    reinterpret_cast<void*>(&observedFinishCommandList));
+            }
+
             auto map_forward = reinterpret_cast<MapFn>(table[kMap]);
             auto unmap_forward = reinterpret_cast<UnmapFn>(table[kUnmap]);
             if (map_forward) original_map.store(map_forward, std::memory_order_release);
@@ -3667,6 +3859,17 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             jlog.sceneCut = false;
             edpe::JitterLogger::instance().pushFrame(jlog);
         }
+    }
+    if (frame % 1024 == 0 && observed_swap_chain == swap_chain) {
+        wchar_t callMsg[256];
+        swprintf_s(callMsg,
+            L"EDPE: context calls frame=%llu OMSetRenderTargets=%llu OMSetRenderTargetsAndUnorderedAccessViews=%llu FinishCommandList=%llu ExecuteCommandList=%llu",
+            frame,
+            s_count_om_set_render_targets.load(std::memory_order_relaxed),
+            s_count_om_set_rt_uav.load(std::memory_order_relaxed),
+            s_count_finish_command_list.load(std::memory_order_relaxed),
+            s_count_execute_command_list.load(std::memory_order_relaxed));
+        EdpeLog(callMsg);
     }
     if (frame % 1024 == 0 && observed_swap_chain == swap_chain &&
         !edpe::UpscalerManager::instance().isReconstructionActive()) {
@@ -4020,6 +4223,21 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         patchSlot(patched_table, kOMSetRenderTargets,
             reinterpret_cast<void*>(&observedOMSetRenderTargets),
             reinterpret_cast<void*>(original.load(std::memory_order_acquire)));
+        if (auto orig_uav = original_om_uav.load(std::memory_order_acquire)) {
+            patchSlot(patched_table, kOMSetRenderTargetsAndUnorderedAccessViews,
+                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews),
+                reinterpret_cast<void*>(orig_uav));
+        }
+        if (auto orig_exec = original_execute_command_list.load(std::memory_order_acquire)) {
+            patchSlot(patched_table, kExecuteCommandList,
+                reinterpret_cast<void*>(&observedExecuteCommandList),
+                reinterpret_cast<void*>(orig_exec));
+        }
+        if (auto orig_finish = original_finish_command_list.load(std::memory_order_acquire)) {
+            patchSlot(patched_table, kFinishCommandList,
+                reinterpret_cast<void*>(&observedFinishCommandList),
+                reinterpret_cast<void*>(orig_finish));
+        }
     }
     scene_map_target.store(nullptr, std::memory_order_release);
     scene_mapped_data.store(nullptr, std::memory_order_release);
@@ -4236,3 +4454,53 @@ int ContextCensusGetJitterDebugMode() {
     return s_jitter_debug_mode.load(std::memory_order_relaxed);
 }
 
+
+
+void ContextCensusHookDeferredContext(ID3D11DeviceContext* context) {
+    if (!context) return;
+    void** table = *reinterpret_cast<void***>(context);
+    if (!table) return;
+
+    if (table[kOMSetRenderTargets] == reinterpret_cast<void*>(&observedOMSetRenderTargets)) {
+        return;
+    }
+
+    auto forward_om = reinterpret_cast<OMSetRenderTargetsFn>(table[kOMSetRenderTargets]);
+    if (forward_om && forward_om != &observedOMSetRenderTargets) {
+        original_deferred_om.store(forward_om, std::memory_order_release);
+        patchSlot(table, kOMSetRenderTargets, reinterpret_cast<void*>(forward_om),
+            reinterpret_cast<void*>(&observedOMSetRenderTargets));
+    }
+
+    auto forward_om_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(
+        table[kOMSetRenderTargetsAndUnorderedAccessViews]);
+    if (forward_om_uav && forward_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews) {
+        original_deferred_om_uav.store(forward_om_uav, std::memory_order_release);
+        patchSlot(table, kOMSetRenderTargetsAndUnorderedAccessViews,
+            reinterpret_cast<void*>(forward_om_uav),
+            reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
+    }
+
+    auto forward_finish = reinterpret_cast<FinishCommandListFn>(table[kFinishCommandList]);
+    if (forward_finish && forward_finish != &observedFinishCommandList) {
+        original_deferred_finish_command_list.store(forward_finish, std::memory_order_release);
+        patchSlot(table, kFinishCommandList, reinterpret_cast<void*>(forward_finish),
+            reinterpret_cast<void*>(&observedFinishCommandList));
+    }
+
+    auto forward_exec = reinterpret_cast<ExecuteCommandListFn>(table[kExecuteCommandList]);
+    if (forward_exec && forward_exec != &observedExecuteCommandList) {
+        original_deferred_execute_command_list.store(forward_exec, std::memory_order_release);
+        patchSlot(table, kExecuteCommandList, reinterpret_cast<void*>(forward_exec),
+            reinterpret_cast<void*>(&observedExecuteCommandList));
+    }
+
+    wchar_t msg[192];
+    swprintf_s(msg, L"EDPE: deferred context vtable hooked context=%p table=%p slot33=%p slot34=%p slot114=%p",
+        context, table, table[kOMSetRenderTargets], table[kOMSetRenderTargetsAndUnorderedAccessViews], table[kFinishCommandList]);
+    EdpeLog(msg);
+}
+
+unsigned long long ContextCensusGetDsvBinds() {
+    return dsv_binds.load(std::memory_order_relaxed);
+}

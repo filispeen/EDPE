@@ -598,6 +598,7 @@ void UpscalerManager::shutdown() {
     }
     timingWriteIndex_ = 0;
     lastGpuTimeMs_ = 0.0f;
+    evalCount_ = 0;
 
     device_ = nullptr;
     context_ = nullptr;
@@ -666,6 +667,7 @@ bool UpscalerManager::setBackend(UpscalerBackend backend) {
 
     currentBackendType_ = backend;
     pendingReset_ = true;
+    evalCount_ = 0;
 
     wchar_t message[128];
     swprintf_s(message, L"EDPE: upscaler backend changed to %ls", getUpscalerBackendName(backend));
@@ -759,6 +761,9 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     auto t0 = std::chrono::high_resolution_clock::now();
     const bool evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
     auto t1 = std::chrono::high_resolution_clock::now();
+    if (evalSuccess) {
+        ++evalCount_;
+    }
 
     if (canQueryGpu) {
         context->End(slot.end.Get());

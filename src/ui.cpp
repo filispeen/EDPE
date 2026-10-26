@@ -1317,15 +1317,28 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     const bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
     const auto& diag = upscaler.getDiagnostics();
+    const uint32_t dsvBinds = ContextCensusGetDsvBinds();
+    const bool isReconActive = nvidia_active ? edpe::NgxContext::has_evaluated()
+                                            : (upscaler.isReconstructionActive() && upscaler.hasEvaluated());
     if (backend_active) {
         const char* backendName = taa_active ? "Native D3D11" : (amd_active ? "AMD" : "NVIDIA");
         const char* techName = taa_active
             ? (isSr ? "TAA Super Resolution" : "TAA Native AA")
             : (amd_active ? (isSr ? "FSR Super Resolution" : "FSR Native AA")
                           : (isSr ? "DLSS Super Resolution" : "DLAA"));
-        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-            "Reconstruction: %s %s Active",
-            backendName, techName);
+        if (isReconActive) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
+                "Reconstruction: %s %s Active",
+                backendName, techName);
+        } else if (dsvBinds == 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                "Reconstruction: %s %s (Initialized, no depth found)",
+                backendName, techName);
+        } else {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                "Reconstruction: %s %s (Standby)",
+                backendName, techName);
+        }
         ImGui::Text("Resolution: Scene %ux%u -> Output %ux%u (%.1f%%)",
             sceneW, sceneH, outW, outH, activeScalePct);
         ImGui::Text("Active Mode: %ls",
@@ -1334,16 +1347,36 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
                 "Scaling is automatically driven by game Supersampling (< 1.0x).");
         } else {
-            ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
-                "Native 1:1 render detected -> %s antialiasing active.",
-                taa_active ? "TAA" : (amd_active ? "FSR Native AA" : "DLAA"));
+            if (isReconActive) {
+                ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
+                    "Native 1:1 render detected -> %s antialiasing active.",
+                    taa_active ? "TAA" : (amd_active ? "FSR Native AA" : "DLAA"));
+            } else if (dsvBinds == 0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                    "Native 1:1 render detected -> %s initialized, no depth found.",
+                    taa_active ? "TAA" : (amd_active ? "FSR Native AA" : "DLAA"));
+            } else {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                    "Native 1:1 render detected -> %s standby.",
+                    taa_active ? "TAA" : (amd_active ? "FSR Native AA" : "DLAA"));
+            }
         }
     } else {
         ImGui::Text("Reconstruction: Inactive (Scene %ux%u -> Output %ux%u)",
             sceneW, sceneH, outW, outH);
     }
 
-    ImGui::Text("Status: %ls", diag.statusMessage);
+    if (backend_active) {
+        if (dsvBinds == 0) {
+            ImGui::Text("Status: Initialized, no depth found");
+        } else if (isReconActive) {
+            ImGui::Text("Status: Active");
+        } else {
+            ImGui::Text("Status: %ls", diag.statusMessage);
+        }
+    } else {
+        ImGui::Text("Status: %ls", diag.statusMessage);
+    }
     if (diag.didRun) {
         ImGui::Text("GPU Reconstruction Time: %.3f ms", diag.gpuTimeMs);
     }
