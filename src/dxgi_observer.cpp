@@ -199,6 +199,16 @@ void logContextDispatch(IDXGISwapChain* swap_chain, unsigned long long frame) {
 }
 
 HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
+    static LARGE_INTEGER s_last_present_qpc = {0};
+    LARGE_INTEGER tStartPresent{}, tEndPresent{}, freqPresent{};
+    QueryPerformanceFrequency(&freqPresent);
+    QueryPerformanceCounter(&tStartPresent);
+    double frameTimeMs = 0.0;
+    if (s_last_present_qpc.QuadPart > 0 && freqPresent.QuadPart > 0) {
+        frameTimeMs = static_cast<double>(tStartPresent.QuadPart - s_last_present_qpc.QuadPart) * 1000.0 / static_cast<double>(freqPresent.QuadPart);
+    }
+    s_last_present_qpc = tStartPresent;
+
     const auto frame = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (frame == 1) logFirstPresent(swap_chain);
     if (frame <= 8 || (frame <= 32768 && frame % 1024 == 0)) logContextDispatch(swap_chain, frame);
@@ -208,7 +218,11 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
     ContextCensusAfterOverlay(swap_chain, flags);
     const auto original = reinterpret_cast<PresentFn>(tableOf(swap_chain)->original[kPresent]);
     const HRESULT result = original(swap_chain, sync_interval, flags);
-    ContextCensusAfterPresent(swap_chain, flags);
+    QueryPerformanceCounter(&tEndPresent);
+    const double presentCpuMs = (freqPresent.QuadPart > 0)
+        ? static_cast<double>(tEndPresent.QuadPart - tStartPresent.QuadPart) * 1000.0 / static_cast<double>(freqPresent.QuadPart)
+        : 0.0;
+    ContextCensusAfterPresent(swap_chain, flags, frame, presentCpuMs, frameTimeMs);
     edpe::PerfTracker::instance().onPresentEnd();
     return result;
 }

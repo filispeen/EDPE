@@ -78,6 +78,7 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
     ID3D11Resource* bloomSlotRes,
     int hdr_slot);
 void restoreUnjitteredSceneProjection(ID3D11DeviceContext* context);
+void setPostSplitProjection(ID3D11DeviceContext* context, bool want_jittered);
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
@@ -177,6 +178,36 @@ static unsigned s_consecutive_skipped_frames = 0;
 static unsigned s_auxiliary_rejection_streak = 0;
 static edpe::CameraProjection s_fallback_unmapped_camera{};
 static unsigned long long s_fallback_unmapped_camera_frame = ~0ull;
+static const GUID kEdpeFrameIdGuid = { 0x58249a02, 0xd029, 0x4a43, { 0x93, 0x3f, 0xbf, 0x3e, 0x40, 0x05, 0xbb, 0xd2 } };
+static ID3D11Resource* s_last_upscale_in_tex = nullptr;
+static ID3D11Resource* s_last_upscale_out_tex = nullptr;
+static uint64_t s_last_upscale_in_frame_id = 0;
+
+static float s_jittered_projection_block[16]{};
+static bool s_has_jittered_projection = false;
+static bool s_cb0_currently_jittered = true;
+
+static uint32_t s_post_split_total_120 = 0;
+static uint32_t s_post_split_jittered_120 = 0;
+static uint32_t s_post_split_unjittered_120 = 0;
+static std::vector<std::pair<uint64_t, uint64_t>> s_post_split_jittered_shaders;
+static std::vector<std::pair<uint64_t, uint64_t>> s_post_split_unjittered_shaders;
+
+static void recordPostSplitShader(bool jittered, uint64_t vs, uint64_t ps) {
+    auto& list = jittered ? s_post_split_jittered_shaders : s_post_split_unjittered_shaders;
+    for (const auto& item : list) {
+        if (item.first == vs && item.second == ps) return;
+    }
+    if (list.size() < 16) {
+        list.emplace_back(vs, ps);
+    }
+}
+
+static bool s_camera_reused_this_frame = false;
+static bool s_last_frame_camera_reused = false;
+static bool s_history_reset_this_frame = false;
+static bool s_last_frame_history_reset = false;
+
 static edpe::CameraProjection s_latest_unmapped_camera{};
 static unsigned long long s_latest_unmapped_camera_frame = ~0ull;
 static bool s_latest_unmapped_camera_valid = false;
@@ -209,34 +240,13 @@ inline float cameraRotationTrace(const edpe::CameraProjection& a, const edpe::Ca
 }
 
 inline bool isReflectionOrAuxiliaryCamera(const edpe::CameraProjection& candidate, const edpe::CameraProjection& baseline) {
-    
     const float det = cameraRotationDeterminant(candidate);
     if (det < 0.5f) return true;
 
     if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) return false;
 
-    
     if (std::fabs(candidate.scaleX - baseline.scaleX) > 0.01f * baseline.scaleX ||
         std::fabs(candidate.scaleY - baseline.scaleY) > 0.01f * baseline.scaleY) {
-        return true;
-    }
-
-    
-    const float* c = candidate.worldFromView;
-    const float* b = baseline.worldFromView;
-    const float dx = c[3] - b[3];
-    const float dy = c[7] - b[7];
-    const float dz = c[11] - b[11];
-    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const float rotTrace = cameraRotationTrace(candidate, baseline);
-
-    
-    if (rotTrace < 2.40f) {
-        return true;
-    }
-
-    
-    if (dist > 0.05f && rotTrace < 2.90f) {
         return true;
     }
 
@@ -250,21 +260,6 @@ inline bool sameCamera(const edpe::CameraProjection& a, const edpe::CameraProjec
     return std::fabs(a.scaleX - b.scaleX) < 1e-5f && std::fabs(a.scaleY - b.scaleY) < 1e-5f;
 }
 
-inline bool isRevisitedCamera(const edpe::CameraProjection& camera) {
-    static std::array<edpe::CameraProjection, 8> recent{};
-    static unsigned count = 0;
-    static unsigned head = 0;
-    if (s_camera_now.scaleX > 0.0f && sameCamera(camera, s_camera_now)) return false;
-    const unsigned stored = count < 8 ? count : 8;
-    for (unsigned i = 0; i < stored; ++i) {
-        if (sameCamera(camera, recent[i])) return true;
-    }
-    recent[head] = camera;
-    head = (head + 1) % 8;
-    if (count < 8) ++count;
-    return false;
-}
-
 static edpe::CameraHistory s_camera_history{};
 
 static uint32_t s_camera_120_invalid_samples = 0;
@@ -273,10 +268,10 @@ static uint32_t s_camera_120_reused = 0;
 
 static void updateFrameCamera(unsigned long long rendered) {
     const edpe::CameraProjection* primary =
-        (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered && !isRevisitedCamera(s_latest_unmapped_camera))
+        (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered)
         ? &s_latest_unmapped_camera : nullptr;
     const edpe::CameraProjection* fallback =
-        (s_fallback_unmapped_camera_frame == rendered && !isRevisitedCamera(s_fallback_unmapped_camera))
+        (s_fallback_unmapped_camera_frame == rendered)
         ? &s_fallback_unmapped_camera : nullptr;
     bool cameraReused = false;
     if (edpe::updateCameraHistory(s_camera_history, rendered, primary, fallback, &cameraReused)) {
@@ -284,6 +279,7 @@ static void updateFrameCamera(unsigned long long rendered) {
         s_camera_frame = s_camera_history.currentFrame;
         s_camera_previous = s_camera_history.previous;
         s_camera_previous_frame = s_camera_history.previousFrame;
+        s_camera_reused_this_frame = cameraReused;
         if (cameraReused) {
             ++s_camera_120_reused;
         }
@@ -393,9 +389,28 @@ static uint32_t s_reset_cause_mode_change = 0;
 enum class SplitPoint {
     None = 0,
     CockpitHud = 1,
-    BloomStartFallback = 2
+    BloomStartFallback = 2,
+    PresentFallback = 3
 };
 static SplitPoint s_split_point_used = SplitPoint::None;
+static SplitPoint s_last_frame_split_point = SplitPoint::None;
+
+struct CamJumpDiagRecord {
+    unsigned long long frame = 0;
+    double frameTimeMs = 0.0;
+    double presentCpuMs = 0.0;
+    double evalCpuMs = 0.0;
+    float rotDeg = 0.0f;
+    uint64_t inFrameId = 0;
+    ID3D11Resource* inTex = nullptr;
+    ID3D11Resource* outTex = nullptr;
+    SplitPoint split = SplitPoint::None;
+    bool reset = false;
+    bool reused = false;
+};
+static bool s_cam_jump_diag_active = false;
+static std::chrono::steady_clock::time_point s_cam_jump_diag_start_time{};
+static std::vector<CamJumpDiagRecord> s_cam_jump_diag_records;
 static unsigned s_count_split_cockpit_hud = 0;
 static unsigned s_count_split_bloom_fallback = 0;
 static unsigned s_count_post_split_hdr_draws = 0;
@@ -1133,6 +1148,10 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
         D3D11_RENDER_TARGET_VIEW_DESC rdesc{};
         cur_rtv->GetDesc(&rdesc);
         cur_rtv_fmt = rdesc.Format;
+        if (cur_rtv_res) {
+            uint64_t fid = last_present_frame.load(std::memory_order_relaxed);
+            cur_rtv_res->SetPrivateData(kEdpeFrameIdGuid, sizeof(fid), &fid);
+        }
     }
 
     const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
@@ -1213,6 +1232,29 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
 
         if (s_upscale_evaluated_this_frame) {
             ++s_count_post_split_hdr_draws;
+            ++s_post_split_total_120;
+            bool reads_depth = false;
+            for (UINT s = 0; s < 8; ++s) {
+                if (srv_infos[s].resPtr && srv_infos[s].width == expW && srv_infos[s].height == expH) {
+                    if (srv_infos[s].format == DXGI_FORMAT_R32_FLOAT ||
+                        srv_infos[s].format == DXGI_FORMAT_R32_TYPELESS ||
+                        srv_infos[s].format == DXGI_FORMAT_D32_FLOAT ||
+                        srv_infos[s].resPtr == s_scene_linear_depth.Get() ||
+                        srv_infos[s].resPtr == scene_depth_source.Get()) {
+                        reads_depth = true;
+                        break;
+                    }
+                }
+            }
+            if (reads_depth) {
+                setPostSplitProjection(context, true);
+                ++s_post_split_jittered_120;
+                recordPostSplitShader(true, vs_hash, ps_hash);
+            } else {
+                setPostSplitProjection(context, false);
+                ++s_post_split_unjittered_120;
+                recordPostSplitShader(false, vs_hash, ps_hash);
+            }
         } else {
             const bool is_hud =
                 (vs_hash == 0xB7790CBFC6554097ull && ps_hash == 0x8DEF46452FA459F5ull) ||
@@ -1246,10 +1288,13 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
                         if (ok) {
                             s_split_point_used = SplitPoint::CockpitHud;
                             ++s_count_split_cockpit_hud;
-                            restoreUnjitteredSceneProjection(context);
+                            setPostSplitProjection(context, false);
                             s_inside_scene_passes.store(false, std::memory_order_release);
                             s_jitter_disabled_for_frame.store(true, std::memory_order_release);
                             ++s_count_post_split_hdr_draws;
+                            ++s_post_split_total_120;
+                            ++s_post_split_unjittered_120;
+                            recordPostSplitShader(false, vs_hash, ps_hash);
                         }
                     } else {
                         recordSizeRejection(tdHdr.Width, tdHdr.Height);
@@ -1913,6 +1958,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     float jittered_block[16]{};
                     if (edpe::jitterEliteProjectionBlock(&words[1080], jittered_block, jitter)) {
                         std::memcpy(&words[1080], jittered_block, sizeof(jittered_block));
+                        std::memcpy(s_jittered_projection_block, jittered_block, sizeof(s_jittered_projection_block));
+                        s_has_jittered_projection = true;
+                        s_cb0_currently_jittered = true;
                         s_injected_jitter = jitter;
                         s_last_rendered_jitter = jitter;
                         s_jitter_injected_frame = cur_frame;
@@ -3425,24 +3473,30 @@ static bool validateLinearDepthTexture(ID3D11Device* device, ID3D11DeviceContext
     return verdict;
 }
 
-void restoreUnjitteredSceneProjection(ID3D11DeviceContext* context) {
-    if (!context || !s_last_jittered_scene_cb || !s_has_unjittered_projection) return;
-    std::memcpy(&s_scene_cb_shadow[1080 * sizeof(float)], s_unjittered_projection_block, sizeof(s_unjittered_projection_block));
+void setPostSplitProjection(ID3D11DeviceContext* context, bool want_jittered) {
+    if (!context || !s_last_jittered_scene_cb) return;
+    if (want_jittered && !s_has_jittered_projection) return;
+    if (!want_jittered && !s_has_unjittered_projection) return;
+    if (s_cb0_currently_jittered == want_jittered) return;
+
+    const float* block = want_jittered ? s_jittered_projection_block : s_unjittered_projection_block;
+    std::memcpy(&s_scene_cb_shadow[1080 * sizeof(float)], block, sizeof(float) * 16);
+
     auto orig_map = original_map.load(std::memory_order_acquire);
     auto orig_unmap = original_unmap.load(std::memory_order_acquire);
     if (!orig_map || !orig_unmap) return;
+
     D3D11_MAPPED_SUBRESOURCE mapped{};
     HRESULT hr = orig_map(context, s_last_jittered_scene_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr) && mapped.pData) {
         std::memcpy(mapped.pData, s_scene_cb_shadow, sizeof(s_scene_cb_shadow));
         orig_unmap(context, s_last_jittered_scene_cb.Get(), 0);
-        static unsigned long long s_last_unjitter_log_frame = ~0ull;
-        const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
-        if (s_last_unjitter_log_frame == ~0ull || cur_frame >= s_last_unjitter_log_frame + 120) {
-            s_last_unjitter_log_frame = cur_frame;
-            EdpeLog(L"EDPE: restored unjittered projection to scene constant buffer for post-split draws");
-        }
+        s_cb0_currently_jittered = want_jittered;
     }
+}
+
+void restoreUnjitteredSceneProjection(ID3D11DeviceContext* context) {
+    setPostSplitProjection(context, false);
 }
 
 bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
@@ -3455,7 +3509,6 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
     if (!upscaler.isReconstructionActive()) return false;
 
     if (s_upscale_evaluated_this_frame) {
-        ++s_upscale_rejects_120;
         return false;
     }
 
@@ -3623,6 +3676,13 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
         s_bloom_output_desc = outDesc;
     }
 
+    uint64_t inFrameId = 0;
+    UINT fidSize = sizeof(inFrameId);
+    bloomTex->GetPrivateData(kEdpeFrameIdGuid, &fidSize, &inFrameId);
+    s_last_upscale_in_frame_id = inFrameId;
+    s_last_upscale_in_tex = bloomTex;
+    s_last_upscale_out_tex = bloomSlotRes ? bloomSlotRes : bloomTex;
+
     edpe::TemporalFrameInputs inputs{};
     inputs.color = bloomTex;
     inputs.colorSrv = bloomSrv;
@@ -3652,6 +3712,7 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
 
     inputs.reset = feature_reset || scene_cut || mode_reset || skipped_reset;
     if (inputs.reset) {
+        s_history_reset_this_frame = true;
         ++s_camera_120_history_resets;
     }
     inputs.cameraNow = s_camera_now;
@@ -3705,7 +3766,6 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered,
     ID3D11Texture2D* backbuffer) {
     if (s_upscale_evaluated_this_frame) {
-        ++s_upscale_rejects_120;
         return;
     }
     const auto frame = rendered;
@@ -4023,6 +4083,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const bool scene_cut = edpe::detectSceneCut(s_camera_now, s_camera_previous, s_camera_previous_frame, &moveDist, &rotTrace);
     const float dt_ms = computeFrameDeltaTimeMs();
 
+    uint64_t inFrameId = 0;
+    UINT fidSize = sizeof(inFrameId);
+    if (s_dlaa_input) {
+        s_dlaa_input->GetPrivateData(kEdpeFrameIdGuid, &fidSize, &inFrameId);
+    }
+    s_last_upscale_in_frame_id = inFrameId;
+    s_last_upscale_in_tex = s_dlaa_input.Get();
+    s_last_upscale_out_tex = backbuffer;
+
     edpe::TemporalFrameInputs inputs{};
     inputs.color = s_dlaa_input.Get();
     inputs.colorSrv = s_dlaa_input_srv.Get();
@@ -4052,6 +4121,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
     inputs.reset = feature_reset || scene_cut || mode_reset || skipped_reset;
     if (inputs.reset) {
+        s_history_reset_this_frame = true;
         ++s_camera_120_history_resets;
     }
     inputs.cameraNow = s_camera_now;
@@ -4139,6 +4209,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         bool compOk = false;
         if (upscaler.evaluate(context, inputs, nullptr, evalDestination)) {
             s_upscale_evaluated_this_frame = true;
+            s_split_point_used = SplitPoint::PresentFallback;
             ++s_upscale_evaluates_120;
             s_camera_reset = false;
             s_consecutive_skipped_frames = 0;
@@ -4775,6 +4846,16 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             }
 
 
+            if (targets[3]) {
+                uint64_t fid = current_frame;
+                targets[3]->SetPrivateData(kEdpeFrameIdGuid, sizeof(fid), &fid);
+                ID3D11Resource* t3Res = nullptr;
+                targets[3]->GetResource(&t3Res);
+                if (t3Res) {
+                    t3Res->SetPrivateData(kEdpeFrameIdGuid, sizeof(fid), &fid);
+                    t3Res->Release();
+                }
+            }
             if (reconstruction_active) {
                 motion_color_source = targets[3];
                 motion_color_frame = current_frame;
@@ -5199,7 +5280,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     reinterpret_cast<void**>(backbuffer.GetAddressOf())))) {
                 s_swapchain_backbuffer.store(backbuffer.Get(), std::memory_order_relaxed);
                 const bool debug_view_active = s_jitter_debug_view.load(std::memory_order_relaxed);
-                if (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active) {
+                if (!s_upscale_evaluated_this_frame && (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active)) {
                     tryTemporalUpscale(context, rendered_frame, backbuffer.Get());
                 }
                 if (debug_view_active) {
@@ -5267,7 +5348,44 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 L"EDPE: split point diag frame=%llu used=%ls (cockpit_hud=%u bloom_fallback=%u post_split_draws=%u)",
                 frame, ptName, s_count_split_cockpit_hud, s_count_split_bloom_fallback, s_count_post_split_hdr_draws);
             EdpeLog(spMsg);
+            wchar_t psMsg[256];
+            swprintf_s(psMsg, L"EDPE: post-split draws 120f: total=%u jittered=%u unjittered=%u",
+                s_post_split_total_120, s_post_split_jittered_120, s_post_split_unjittered_120);
+            EdpeLog(psMsg);
+            if (s_post_split_jittered_120 > 0 && !s_post_split_jittered_shaders.empty()) {
+                std::wstring jMsg = L"EDPE:   jittered shaders: ";
+                for (size_t i = 0; i < s_post_split_jittered_shaders.size(); ++i) {
+                    wchar_t buf[64];
+                    swprintf_s(buf, L"VS=%016llX PS=%016llX%s",
+                        s_post_split_jittered_shaders[i].first, s_post_split_jittered_shaders[i].second,
+                        (i + 1 < s_post_split_jittered_shaders.size()) ? L", " : L"");
+                    jMsg += buf;
+                }
+                EdpeLog(jMsg.c_str());
+            }
+            if (s_post_split_unjittered_120 > 0 && !s_post_split_unjittered_shaders.empty()) {
+                std::wstring uMsg = L"EDPE:   unjittered shaders: ";
+                for (size_t i = 0; i < s_post_split_unjittered_shaders.size(); ++i) {
+                    wchar_t buf[64];
+                    swprintf_s(buf, L"VS=%016llX PS=%016llX%s",
+                        s_post_split_unjittered_shaders[i].first, s_post_split_unjittered_shaders[i].second,
+                        (i + 1 < s_post_split_unjittered_shaders.size()) ? L", " : L"");
+                    uMsg += buf;
+                }
+                EdpeLog(uMsg.c_str());
+            }
+            s_post_split_total_120 = 0;
+            s_post_split_jittered_120 = 0;
+            s_post_split_unjittered_120 = 0;
+            s_post_split_jittered_shaders.clear();
+            s_post_split_unjittered_shaders.clear();
         }
+        s_last_frame_split_point = s_split_point_used;
+        s_last_frame_camera_reused = s_camera_reused_this_frame;
+        s_last_frame_history_reset = s_history_reset_this_frame;
+        s_camera_reused_this_frame = false;
+        s_history_reset_this_frame = false;
+        s_cb0_currently_jittered = true;
         s_split_point_used = SplitPoint::None;
         s_count_post_split_hdr_draws = 0;
 
@@ -5517,10 +5635,100 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
     }
 }
 
-void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags) {
+void ContextCensusStartCameraJumpDiagnostics() {
+    const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+    wchar_t marker[160];
+    swprintf_s(marker, L"EDPE: === [Camera Jump Diagnostic Capture Started] frame=%llu ===", cur_frame);
+    EdpeLog(marker);
+    s_cam_jump_diag_active = true;
+    s_cam_jump_diag_start_time = std::chrono::steady_clock::now();
+    s_cam_jump_diag_records.clear();
+    s_cam_jump_diag_records.reserve(600);
+}
+
+void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags, unsigned long long frame, double presentCpuMs, double frameTimeMs) {
     s_in_edpe_present.store(false, std::memory_order_release);
     if ((flags & DXGI_PRESENT_TEST) || observed_swap_chain != swap_chain || !patched_table) return;
     rearmContextHooks();
+
+    if (s_cam_jump_diag_active) {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_cam_jump_diag_start_time).count();
+        if (elapsedMs < 5000) {
+            const double evalDlssCpuMs = edpe::NgxContext::getLastEvaluateCpuTimeMs();
+            const wchar_t* splitName = (s_last_frame_split_point == SplitPoint::CockpitHud) ? L"CockpitHud" :
+                (s_last_frame_split_point == SplitPoint::BloomStartFallback) ? L"BloomStartFallback" :
+                (s_last_frame_split_point == SplitPoint::PresentFallback) ? L"PresentFallback" : L"None";
+            const unsigned jitterIndex = jitter_frame_index.load(std::memory_order_relaxed);
+            const bool resetFlag = s_last_frame_history_reset;
+            const bool reusedFlag = s_last_frame_camera_reused;
+
+            float rotDeg = 0.0f;
+            if (s_camera_now.scaleX > 0.0f && s_camera_previous.scaleX > 0.0f) {
+                const float trace = cameraRotationTrace(s_camera_now, s_camera_previous);
+                const float cosVal = std::clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f);
+                rotDeg = std::acos(cosVal) * 57.29577951308232f;
+            }
+
+            wchar_t diagMsg[512];
+            swprintf_s(diagMsg,
+                L"EDPE: [CamJumpDiag] frame=%llu presentMs=%.3f evalMs=%.3f split=%ls jitterIdx=%u reset=%d reused=%d rotDeg=%.3f inTex=%p outTex=%p inFrameId=%llu",
+                frame, presentCpuMs, evalDlssCpuMs, splitName, jitterIndex, resetFlag ? 1 : 0, reusedFlag ? 1 : 0, rotDeg,
+                s_last_upscale_in_tex, s_last_upscale_out_tex, s_last_upscale_in_frame_id);
+            EdpeLog(diagMsg);
+
+            CamJumpDiagRecord rec{};
+            rec.frame = frame;
+            rec.frameTimeMs = frameTimeMs;
+            rec.presentCpuMs = presentCpuMs;
+            rec.evalCpuMs = evalDlssCpuMs;
+            rec.rotDeg = rotDeg;
+            rec.inFrameId = s_last_upscale_in_frame_id;
+            rec.inTex = s_last_upscale_in_tex;
+            rec.outTex = s_last_upscale_out_tex;
+            rec.split = s_last_frame_split_point;
+            rec.reset = resetFlag;
+            rec.reused = reusedFlag;
+            s_cam_jump_diag_records.push_back(rec);
+        } else {
+            s_cam_jump_diag_active = false;
+            if (!s_cam_jump_diag_records.empty()) {
+                std::vector<double> ftList;
+                ftList.reserve(s_cam_jump_diag_records.size());
+                for (const auto& r : s_cam_jump_diag_records) {
+                    if (r.frameTimeMs > 0.0) ftList.push_back(r.frameTimeMs);
+                }
+                double medianFt = 0.0;
+                if (!ftList.empty()) {
+                    std::sort(ftList.begin(), ftList.end());
+                    medianFt = ftList[ftList.size() / 2];
+                }
+                const double spikeThreshold = 2.0 * medianFt;
+                wchar_t finishMsg[256];
+                swprintf_s(finishMsg,
+                    L"EDPE: === [Camera Jump Diagnostic Capture Finished] frames=%zu medianFrametime=%.3fms ===",
+                    s_cam_jump_diag_records.size(), medianFt);
+                EdpeLog(finishMsg);
+
+                for (const auto& r : s_cam_jump_diag_records) {
+                    if (spikeThreshold > 0.0 && r.frameTimeMs > spikeThreshold) {
+                        wchar_t spikeMsg[256];
+                        swprintf_s(spikeMsg,
+                            L"EDPE: [CamJumpDiag Spike] frame=%llu frametime=%.3fms (>2x median %.3fms) presentMs=%.3f evalMs=%.3f rotDeg=%.3f reset=%d reused=%d",
+                            r.frame, r.frameTimeMs, medianFt, r.presentCpuMs, r.evalCpuMs, r.rotDeg, r.reset ? 1 : 0, r.reused ? 1 : 0);
+                        EdpeLog(spikeMsg);
+                    }
+                    if (r.inFrameId > 0 && r.inFrameId < r.frame) {
+                        wchar_t staleMsg[256];
+                        swprintf_s(staleMsg,
+                            L"EDPE: [CamJumpDiag StaleResource] frame=%llu presenting inFrameId=%llu (older by %llu frames) inTex=%p",
+                            r.frame, r.inFrameId, r.frame - r.inFrameId, r.inTex);
+                        EdpeLog(staleMsg);
+                    }
+                }
+            }
+        }
+    }
 }
 
 bool ContextCensusRequestBindSequence() {

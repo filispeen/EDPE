@@ -168,6 +168,12 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         return true;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F9) return true;
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        (wparam == VK_F10 || wparam == VK_F6) && !(lparam & (1LL << 30))) {
+        ContextCensusStartCameraJumpDiagnostics();
+        return true;
+    }
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && (wparam == VK_F10 || wparam == VK_F6)) return true;
     if (menu_visible.load()) {
         if (message == WM_INPUT) return true;
         if (message == WM_SETCURSOR) {

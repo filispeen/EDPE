@@ -4,7 +4,8 @@
 #include <d3d11.h>
 
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags);
-void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags);
+void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags, unsigned long long frame = 0, double presentCpuMs = 0.0, double frameTimeMs = 0.0);
+void ContextCensusStartCameraJumpDiagnostics();
 void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags);
 void ContextCensusOnSwapChainRelease(IUnknown* object);
 bool ContextCensusRequestBindSequence();

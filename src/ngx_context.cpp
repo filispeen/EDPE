@@ -429,6 +429,12 @@ void NgxContext::releaseFeature() {
     g_ngx_state.active_preset = 0;
 }
 
+static double s_last_evaluate_dlss_cpu_ms = 0.0;
+
+double NgxContext::getLastEvaluateCpuTimeMs() {
+    return s_last_evaluate_dlss_cpu_ms;
+}
+
 bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     const NvidiaDlssInputParams& params,
     ID3D11Resource* colorIn,
@@ -442,6 +448,20 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     uint32_t outputHeight,
     UpscaleMode mode,
     uint32_t preset) {
+    LARGE_INTEGER evalT0{}, evalFreq{};
+    QueryPerformanceFrequency(&evalFreq);
+    QueryPerformanceCounter(&evalT0);
+    struct EvalTimer {
+        LARGE_INTEGER t0;
+        LARGE_INTEGER freq;
+        ~EvalTimer() {
+            LARGE_INTEGER t1{};
+            QueryPerformanceCounter(&t1);
+            if (freq.QuadPart > 0) {
+                s_last_evaluate_dlss_cpu_ms = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+            }
+        }
+    } evalTimerScope{evalT0, evalFreq};
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     if (!context || !colorIn || !outputUav || !depthIn || !motionIn) return false;
     const uint32_t usePreset = preset ? preset : g_ngx_state.preset;

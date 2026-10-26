@@ -105,8 +105,8 @@ public:
     static bool ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height, bool isHdr = false);
     static void releaseFeature();
     static uint32_t getFeatureCreationCount();
+    static double getLastEvaluateCpuTimeMs();
 
-    // Evaluation
     static bool evaluateDlss(ID3D11DeviceContext* context,
         const NvidiaDlssInputParams& params,
         ID3D11Resource* colorIn,
