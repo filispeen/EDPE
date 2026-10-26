@@ -40,6 +40,7 @@ constexpr uint32_t kNgxFeatureStabilityFrames = 5;
 
 static NgxFeatureState g_ngx_state{};
 static wchar_t g_status_msg[256] = L"NGX uninitialized";
+static std::atomic<uint32_t> s_feature_creation_count{0};
 
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
 static NVSDK_NGX_Parameter* g_ngx_params = nullptr;
@@ -381,6 +382,7 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     g_ngx_state.active_preset = effectivePreset;
     g_ngx_state.is_hdr = isHdr;
     g_ngx_state.reset_requested = true;
+    ++s_feature_creation_count;
 
     const wchar_t* presetName =
         effectivePreset == 10u ? L"J" :
@@ -402,6 +404,10 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
 
 bool NgxContext::ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height, bool isHdr) {
     return ensureDlssFeature(context, width, height, width, height, UpscaleMode::NativeAA, isHdr, g_ngx_state.preset);
+}
+
+uint32_t NgxContext::getFeatureCreationCount() {
+    return s_feature_creation_count.load(std::memory_order_relaxed);
 }
 
 void NgxContext::releaseFeature() {

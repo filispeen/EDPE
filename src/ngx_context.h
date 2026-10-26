@@ -98,13 +98,13 @@ public:
     static bool queryOptimalSettings(uint32_t outputWidth, uint32_t outputHeight,
         UpscaleMode mode, DlssOptimalSettings* outSettings);
 
-    // Feature lifecycle
     static bool ensureDlssFeature(ID3D11DeviceContext* context,
         uint32_t renderWidth, uint32_t renderHeight,
         uint32_t outputWidth, uint32_t outputHeight,
         UpscaleMode mode, bool isHdr = false, uint32_t preset = 0);
     static bool ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width, uint32_t height, bool isHdr = false);
     static void releaseFeature();
+    static uint32_t getFeatureCreationCount();
 
     // Evaluation
     static bool evaluateDlss(ID3D11DeviceContext* context,

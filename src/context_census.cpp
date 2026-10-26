@@ -361,6 +361,35 @@ static std::atomic<bool> s_jitter_disabled_for_frame{false};
 
 static bool s_upscale_evaluated_this_frame = false;
 
+struct SizeEntry {
+    UINT width = 0;
+    UINT height = 0;
+};
+static std::atomic<UINT> s_size_rejection_count{0};
+static std::mutex s_rejected_sizes_mutex;
+static std::vector<SizeEntry> s_rejected_sizes;
+
+static void recordSizeRejection(UINT width, UINT height) {
+    s_size_rejection_count.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(s_rejected_sizes_mutex);
+    for (const auto& entry : s_rejected_sizes) {
+        if (entry.width == width && entry.height == height) return;
+    }
+    if (s_rejected_sizes.size() < 16) {
+        s_rejected_sizes.push_back({width, height});
+    }
+}
+
+static uint32_t s_upscale_evaluates_120 = 0;
+static uint32_t s_upscale_rejects_120 = 0;
+static uint32_t s_last_feature_creations_count = 0;
+
+static uint32_t s_reset_cause_feature_recreation = 0;
+static uint32_t s_reset_cause_camera_invalid = 0;
+static uint32_t s_reset_cause_scene_cut = 0;
+static uint32_t s_reset_cause_skipped_frames = 0;
+static uint32_t s_reset_cause_mode_change = 0;
+
 enum class SplitPoint {
     None = 0,
     CockpitHud = 1,
@@ -1108,16 +1137,21 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
 
     const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
     const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+    UINT expW = outW, expH = outH;
+    getExpectedRenderSize(outW, outH, &expW, &expH);
     bool is_hdr_draw = false;
-    if (cur_rtv_res && scene_hdr_color_source && cur_rtv_res == scene_hdr_color_source.Get()) {
-        is_hdr_draw = true;
-    } else if (cur_rtv_res && cur_rtv_fmt == DXGI_FORMAT_R11G11B10_FLOAT && outW > 0 && outH > 0) {
+    if (cur_rtv_res && outW > 0 && outH > 0) {
         Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
         if (SUCCEEDED(cur_rtv_res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex.GetAddressOf())))) {
             D3D11_TEXTURE2D_DESC td{};
             tex->GetDesc(&td);
-            if (td.Width == outW && td.Height == outH) {
-                is_hdr_draw = true;
+            if (td.Width == expW && td.Height == expH &&
+                (td.Format == DXGI_FORMAT_R11G11B10_FLOAT || cur_rtv_fmt == DXGI_FORMAT_R11G11B10_FLOAT)) {
+                if (scene_hdr_color_source && cur_rtv_res == scene_hdr_color_source.Get()) {
+                    is_hdr_draw = true;
+                } else if (!scene_hdr_color_source) {
+                    is_hdr_draw = true;
+                }
             }
         }
     }
@@ -1205,15 +1239,20 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
                     hdr_tex = local_hdr_tex.Get();
                 }
                 if (hdr_tex) {
-                    const bool ok = executeUpscaleAtBloomStart(context, hdr_tex, nullptr, hdr_tex, -1);
-                    if (ok) {
-                        s_upscale_evaluated_this_frame = true;
-                        s_split_point_used = SplitPoint::CockpitHud;
-                        ++s_count_split_cockpit_hud;
-                        restoreUnjitteredSceneProjection(context);
-                        s_inside_scene_passes.store(false, std::memory_order_release);
-                        s_jitter_disabled_for_frame.store(true, std::memory_order_release);
-                        ++s_count_post_split_hdr_draws;
+                    D3D11_TEXTURE2D_DESC tdHdr{};
+                    hdr_tex->GetDesc(&tdHdr);
+                    if (tdHdr.Width == expW && tdHdr.Height == expH) {
+                        const bool ok = executeUpscaleAtBloomStart(context, hdr_tex, nullptr, hdr_tex, -1);
+                        if (ok) {
+                            s_split_point_used = SplitPoint::CockpitHud;
+                            ++s_count_split_cockpit_hud;
+                            restoreUnjitteredSceneProjection(context);
+                            s_inside_scene_passes.store(false, std::memory_order_release);
+                            s_jitter_disabled_for_frame.store(true, std::memory_order_release);
+                            ++s_count_post_split_hdr_draws;
+                        }
+                    } else {
+                        recordSizeRejection(tdHdr.Width, tdHdr.Height);
                     }
                 }
             }
@@ -1288,9 +1327,11 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
 
                             const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
                             const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+                            UINT expW = outW, expH = outH;
+                            getExpectedRenderSize(outW, outH, &expW, &expH);
 
                             if (outW > 0 && outH > 0 &&
-                                td.Width == outW && td.Height == outH &&
+                                td.Width == expW && td.Height == expH &&
                                 (td.Format == DXGI_FORMAT_R11G11B10_FLOAT || bound_srvs[i].format == DXGI_FORMAT_R11G11B10_FLOAT)) {
                                 if (hdr_slot < 0) {
                                     hdr_slot = static_cast<int>(i);
@@ -1311,7 +1352,7 @@ void onBeforeDraw(ID3D11DeviceContext* context) {
                             }
                         }
 
-                        if (hdr_slot < 0 && scene_hdr_color_source) {
+                        if (hdr_slot < 0 && scene_hdr_color_source && bound_srvs[i].width == expW && bound_srvs[i].height == expH) {
                             if (srv_res == scene_hdr_color_source.Get()) {
                                 hdr_slot = static_cast<int>(i);
                                 bloom_slot_tex = tex;
@@ -3413,11 +3454,28 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
     auto& upscaler = edpe::UpscalerManager::instance();
     if (!upscaler.isReconstructionActive()) return false;
 
-    ReentrancyGuard reentrant(s_reentrant_draw);
-    D3D11ContextStateGuard stateGuard(context);
+    if (s_upscale_evaluated_this_frame) {
+        ++s_upscale_rejects_120;
+        return false;
+    }
+
+    const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+    const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+    if (!outW || !outH) return false;
+
+    UINT expW = outW, expH = outH;
+    getExpectedRenderSize(outW, outH, &expW, &expH);
 
     D3D11_TEXTURE2D_DESC hdrDesc{};
     bloomTex->GetDesc(&hdrDesc);
+    if (hdrDesc.Width != expW || hdrDesc.Height != expH) {
+        recordSizeRejection(hdrDesc.Width, hdrDesc.Height);
+        return false;
+    }
+
+    ReentrancyGuard reentrant(s_reentrant_draw);
+    D3D11ContextStateGuard stateGuard(context);
+
     const UINT width = hdrDesc.Width;
     const UINT height = hdrDesc.Height;
     if (!width || !height) return false;
@@ -3581,7 +3639,18 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
     inputs.motionScaleX = mScaleX;
     inputs.motionScaleY = mScaleY;
     inputs.frameTimeMs = dt_ms;
-    inputs.reset = s_camera_reset || scene_cut || (!motionOk);
+    const bool feature_reset = edpe::NgxContext::reset_requested();
+    const bool mode_reset = upscaler.consumeModeChangeReset();
+    const bool skipped_reset = (s_consecutive_skipped_frames > 2);
+    const bool camera_invalid_cut = (s_camera_history.fallbackStreak > 0) && scene_cut;
+
+    if (feature_reset) ++s_reset_cause_feature_recreation;
+    if (scene_cut && !camera_invalid_cut) ++s_reset_cause_scene_cut;
+    if (camera_invalid_cut) ++s_reset_cause_camera_invalid;
+    if (skipped_reset) ++s_reset_cause_skipped_frames;
+    if (mode_reset) ++s_reset_cause_mode_change;
+
+    inputs.reset = feature_reset || scene_cut || mode_reset || skipped_reset;
     if (inputs.reset) {
         ++s_camera_120_history_resets;
     }
@@ -3601,7 +3670,10 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
     context->OMSetRenderTargets(1, &nullRtv, nullptr);
 
     if (upscaler.evaluate(context, inputs, nullptr, s_bloom_upscale_output.Get())) {
+        s_upscale_evaluated_this_frame = true;
+        ++s_upscale_evaluates_120;
         s_camera_reset = false;
+        s_consecutive_skipped_frames = 0;
         ++s_count_bloom_upscale;
         context->CopyResource(bloomTex, s_bloom_upscale_output.Get());
         scene_hdr_color_source = bloomTex;
@@ -3632,7 +3704,10 @@ bool executeUpscaleAtBloomStart(ID3D11DeviceContext* context,
 
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered,
     ID3D11Texture2D* backbuffer) {
-    if (s_upscale_evaluated_this_frame) return;
+    if (s_upscale_evaluated_this_frame) {
+        ++s_upscale_rejects_120;
+        return;
+    }
     const auto frame = rendered;
     auto& upscaler = edpe::UpscalerManager::instance();
     const bool upscale_active = upscaler.isReconstructionActive();
@@ -3754,8 +3829,17 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     }
     s_consecutive_skipped_frames = 0;
 
+    const UINT expOutW = backbufferDesc.Width;
+    const UINT expOutH = backbufferDesc.Height;
+    UINT expRenW = expOutW, expRenH = expOutH;
+    getExpectedRenderSize(expOutW, expOutH, &expRenW, &expRenH);
+
     D3D11_TEXTURE2D_DESC srcColorDesc{};
     colorSource->GetDesc(&srcColorDesc);
+    if (srcColorDesc.Width != expRenW || srcColorDesc.Height != expRenH) {
+        recordSizeRejection(srcColorDesc.Width, srcColorDesc.Height);
+        return;
+    }
     if (srcColorDesc.Width != depthDesc.Width || srcColorDesc.Height != depthDesc.Height) {
         if (!isSubNative && colorSource != backbuffer) {
             colorSource = backbuffer;
@@ -3815,6 +3899,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (FAILED(device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input))) return;
         device->CreateShaderResourceView(s_dlaa_input.Get(), nullptr, &s_dlaa_input_srv);
         s_camera_reset = true;
+        ++s_reset_cause_feature_recreation;
         wchar_t msg[160];
         swprintf_s(msg, L"EDPE: temporal color input created %ux%u format=%u (%ls)",
             depthDesc.Width, depthDesc.Height, static_cast<unsigned>(inputFormat),
@@ -3954,7 +4039,18 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.motionScaleX = mScaleX;
     inputs.motionScaleY = mScaleY;
     inputs.frameTimeMs = dt_ms;
-    inputs.reset = s_camera_reset || scene_cut;
+    const bool feature_reset = edpe::NgxContext::reset_requested();
+    const bool mode_reset = upscaler.consumeModeChangeReset();
+    const bool skipped_reset = (s_consecutive_skipped_frames > 2);
+    const bool camera_invalid_cut = (s_camera_history.fallbackStreak > 0) && scene_cut;
+
+    if (feature_reset) ++s_reset_cause_feature_recreation;
+    if (scene_cut && !camera_invalid_cut) ++s_reset_cause_scene_cut;
+    if (camera_invalid_cut) ++s_reset_cause_camera_invalid;
+    if (skipped_reset) ++s_reset_cause_skipped_frames;
+    if (mode_reset) ++s_reset_cause_mode_change;
+
+    inputs.reset = feature_reset || scene_cut || mode_reset || skipped_reset;
     if (inputs.reset) {
         ++s_camera_120_history_resets;
     }
@@ -4042,7 +4138,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
         bool compOk = false;
         if (upscaler.evaluate(context, inputs, nullptr, evalDestination)) {
+            s_upscale_evaluated_this_frame = true;
+            ++s_upscale_evaluates_120;
             s_camera_reset = false;
+            s_consecutive_skipped_frames = 0;
             if (colorSource == backbuffer) {
                 ++s_count_present_bb;
             } else {
@@ -4378,19 +4477,9 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             views[1].Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
             views[2].Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
             views[3].Format == DXGI_FORMAT_R11G11B10_FLOAT) {
-            s_current_is_gbuffer_mrt.store(true, std::memory_order_relaxed);
-            ID3D11Resource* res3 = nullptr;
-            targets[3]->GetResource(&res3);
-            if (res3) {
-                Microsoft::WRL::ComPtr<ID3D11Texture2D> tex3;
-                if (SUCCEEDED(res3->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex3.GetAddressOf())))) {
-                    scene_hdr_color_source = tex3;
-                    scene_hdr_color_frame = current_frame_census;
-                }
-                res3->Release();
-            }
             ID3D11Resource* dres = nullptr;
             dsv->GetResource(&dres);
+            bool is_main_depth = false;
             if (dres) {
                 Microsoft::WRL::ComPtr<ID3D11Texture2D> dtex;
                 if (SUCCEEDED(dres->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(dtex.GetAddressOf())))) {
@@ -4400,6 +4489,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                     const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
                     const bool same_frame = (s_observed_scene_frame == current_frame_census);
                     if (isMainSceneMrtDepth(dd, outW, outH, same_frame)) {
+                        is_main_depth = true;
                         scene_depth_source = dtex;
                         s_observed_scene_width.store(dd.Width, std::memory_order_relaxed);
                         s_observed_scene_height.store(dd.Height, std::memory_order_relaxed);
@@ -4407,6 +4497,27 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                     }
                 }
                 dres->Release();
+            }
+            if (is_main_depth) {
+                s_current_is_gbuffer_mrt.store(true, std::memory_order_relaxed);
+                ID3D11Resource* res3 = nullptr;
+                targets[3]->GetResource(&res3);
+                if (res3) {
+                    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex3;
+                    if (SUCCEEDED(res3->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex3.GetAddressOf())))) {
+                        D3D11_TEXTURE2D_DESC td3{};
+                        tex3->GetDesc(&td3);
+                        const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+                        const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+                        UINT expW = outW, expH = outH;
+                        getExpectedRenderSize(outW, outH, &expW, &expH);
+                        if (td3.Width == expW && td3.Height == expH) {
+                            scene_hdr_color_source = tex3;
+                            scene_hdr_color_frame = current_frame_census;
+                        }
+                    }
+                    res3->Release();
+                }
             }
         }
     }
@@ -4460,10 +4571,17 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                                 dev->CreateShaderResourceView(tex0.Get(), &srvD, &s_scene_linear_depth_srv);
                             }
                         }
-                    } else if (rdesc0.Format == DXGI_FORMAT_R11G11B10_FLOAT && sW > 0 && sH > 0 &&
-                        std::abs(static_cast<int>(td.Width) - static_cast<int>(sW / 2)) <= 2 &&
-                        std::abs(static_cast<int>(td.Height) - static_cast<int>(sH / 2)) <= 2) {
-                        s_current_is_bloom_target.store(true, std::memory_order_relaxed);
+                    } else if (rdesc0.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+                        s_swapchain_width.load(std::memory_order_relaxed) > 0 && s_swapchain_height.load(std::memory_order_relaxed) > 0) {
+                        const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+                        const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+                        UINT expW = outW, expH = outH;
+                        getExpectedRenderSize(outW, outH, &expW, &expH);
+                        if (expW >= 640 && expH >= 360 &&
+                            std::abs(static_cast<int>(td.Width) - static_cast<int>(expW / 2)) <= 2 &&
+                            std::abs(static_cast<int>(td.Height) - static_cast<int>(expH / 2)) <= 2) {
+                            s_current_is_bloom_target.store(true, std::memory_order_relaxed);
+                        }
                     } else if ((rdesc0.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rdesc0.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) &&
                         res0 != bb && sW > 0 && sH > 0 && td.Width == sW && td.Height == sH) {
                         s_current_is_tonemap_target.store(true, std::memory_order_relaxed);
@@ -4719,8 +4837,16 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                     Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
                     if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
                             reinterpret_cast<void**>(tex.GetAddressOf())))) {
-                        scene_hdr_color_source = tex;
-                        scene_hdr_color_frame = frame;
+                        D3D11_TEXTURE2D_DESC td{};
+                        tex->GetDesc(&td);
+                        const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+                        const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+                        UINT expW = outW, expH = outH;
+                        getExpectedRenderSize(outW, outH, &expW, &expH);
+                        if (td.Width == expW && td.Height == expH) {
+                            scene_hdr_color_source = tex;
+                            scene_hdr_color_frame = frame;
+                        }
                     }
                     res->Release();
                 }
@@ -5181,6 +5307,49 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_camera_120_invalid_samples = 0;
         s_camera_120_history_resets = 0;
         s_camera_120_reused = 0;
+
+        wchar_t rstMsg[256];
+        swprintf_s(rstMsg,
+            L"EDPE: history reset causes 120f: featureRecreation=%u cameraInvalid=%u sceneCut=%u skippedFrames=%u modeChange=%u",
+            s_reset_cause_feature_recreation, s_reset_cause_camera_invalid,
+            s_reset_cause_scene_cut, s_reset_cause_skipped_frames, s_reset_cause_mode_change);
+        EdpeLog(rstMsg);
+        s_reset_cause_feature_recreation = 0;
+        s_reset_cause_camera_invalid = 0;
+        s_reset_cause_scene_cut = 0;
+        s_reset_cause_skipped_frames = 0;
+        s_reset_cause_mode_change = 0;
+
+        const uint32_t curFeatureCreations = edpe::NgxContext::getFeatureCreationCount();
+        const uint32_t featureCreations120 = (curFeatureCreations >= s_last_feature_creations_count)
+            ? (curFeatureCreations - s_last_feature_creations_count) : 0;
+        s_last_feature_creations_count = curFeatureCreations;
+
+        wchar_t upMsg[256];
+        swprintf_s(upMsg, L"EDPE: upscale summary 120f: evaluates=%u rejects=%u featureCreations=%u",
+            s_upscale_evaluates_120, s_upscale_rejects_120, featureCreations120);
+        EdpeLog(upMsg);
+        s_upscale_evaluates_120 = 0;
+        s_upscale_rejects_120 = 0;
+
+        const UINT sizeRejections = s_size_rejection_count.exchange(0, std::memory_order_relaxed);
+        std::vector<SizeEntry> rejectedSizes;
+        {
+            std::lock_guard lock(s_rejected_sizes_mutex);
+            rejectedSizes = std::move(s_rejected_sizes);
+            s_rejected_sizes.clear();
+        }
+        wchar_t rejMsg[512];
+        int used = swprintf_s(rejMsg, L"EDPE: upscale size gate rejected %u calls", sizeRejections);
+        if (sizeRejections > 0 && !rejectedSizes.empty()) {
+            used += swprintf_s(rejMsg + used, sizeof(rejMsg) / sizeof(wchar_t) - used, L" (sizes: ");
+            for (size_t i = 0; i < rejectedSizes.size(); ++i) {
+                used += swprintf_s(rejMsg + used, sizeof(rejMsg) / sizeof(wchar_t) - used,
+                    (i + 1 < rejectedSizes.size()) ? L"%ux%u, " : L"%ux%u)",
+                    rejectedSizes[i].width, rejectedSizes[i].height);
+            }
+        }
+        EdpeLog(rejMsg);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         UINT outW = 0, outH = 0;

@@ -675,6 +675,7 @@ bool UpscalerManager::setBackend(UpscalerBackend backend) {
 
     currentBackendType_ = backend;
     pendingReset_ = true;
+    modeChangedReset_.store(true, std::memory_order_relaxed);
 
     wchar_t message[128];
     swprintf_s(message, L"EDPE: upscaler backend changed to %ls", getUpscalerBackendName(backend));
@@ -696,6 +697,7 @@ bool UpscalerManager::setMode(UpscaleMode mode) {
 
     currentMode_ = mode;
     pendingReset_ = true;
+    modeChangedReset_.store(true, std::memory_order_relaxed);
 
     wchar_t message[128];
     swprintf_s(message, L"EDPE: upscaler mode changed to %ls", getUpscaleModeName(mode));

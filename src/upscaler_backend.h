@@ -202,6 +202,7 @@ public:
         ID3D11Texture2D* destinationTexture);
 
     void requestReset() { pendingReset_ = true; }
+    bool consumeModeChangeReset() { return modeChangedReset_.exchange(false, std::memory_order_relaxed); }
 
     const UpscalerDiagnostics& getDiagnostics() const { return diagnostics_; }
 
@@ -217,6 +218,7 @@ private:
     UpscalerBackend currentBackendType_ = UpscalerBackend::None;
     UpscaleMode currentMode_ = UpscaleMode::Native;
     bool pendingReset_ = false;
+    std::atomic<bool> modeChangedReset_{false};
 
     NullUpscalerBackend nullBackend_;
     NvidiaUpscalerBackend nvidiaBackend_;

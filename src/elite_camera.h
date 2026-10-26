@@ -71,11 +71,11 @@ inline bool parseEliteCamera(const float* words, size_t count, CameraProjection*
 
     for (size_t row = 0; row < 3; ++row) {
         const size_t c = 932 + row * 4, p = 1080 + row * 4;
-        if (std::fabs(words[p] / scaleX - words[c]) > 0.02) {
+        if (std::fabs(words[p] / scaleX - words[c]) > 0.06) {
             if (outReason) *outReason = "proj vs row X mismatch";
             return false;
         }
-        if (std::fabs(words[p + 1] / scaleY - words[c + 1]) > 0.02) {
+        if (std::fabs(words[p + 1] / scaleY - words[c + 1]) > 0.06) {
             if (outReason) *outReason = "proj vs row Y mismatch";
             return false;
         }
@@ -83,7 +83,7 @@ inline bool parseEliteCamera(const float* words, size_t count, CameraProjection*
             if (outReason) *outReason = "proj Z non-zero";
             return false;
         }
-        if (std::fabs(words[p + 3] - words[c + 2]) > 0.02) {
+        if (std::fabs(words[p + 3] - words[c + 2]) > 0.06) {
             if (outReason) *outReason = "proj vs row Z mismatch";
             return false;
         }
