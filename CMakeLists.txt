@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.25)
 project(EDPE LANGUAGES CXX)
 
+if(DEFINED CACHE{EDPE_VERSION} AND NOT "$CACHE{EDPE_VERSION}" STREQUAL "")
+    set(EDPE_BUILD_VERSION "$CACHE{EDPE_VERSION}")
+else()
+    set(EDPE_BUILD_VERSION "dev")
+endif()
+
+if(NOT EDPE_BUILD_VERSION STREQUAL "dev")
+    add_compile_definitions(EDPE_VERSION="${EDPE_BUILD_VERSION}")
+endif()
+
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "EDPE requires 64-bit Windows")
 endif()
