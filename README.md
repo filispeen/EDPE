@@ -1,6 +1,7 @@
-# EDPE — Elite Dangerous Performance Enhanced
-
 <div align="center">
+
+# EDPE
+### (Elite Dangerous Performance Enhanced)
 
 [![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version)](https://github.com/filispeen/EDPE/releases/latest)
 [![CI](https://github.com/filispeen/EDPE/actions/workflows/CI.yml/badge.svg)](https://github.com/filispeen/EDPE/actions/workflows/CI.yml)
