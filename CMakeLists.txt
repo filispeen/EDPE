@@ -13,6 +13,17 @@ else()
 endif()
 
 set(FFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/ffx-dx11")
+if(NOT EXISTS "${FFX_SDK_DIR}/include/FidelityFX/host/ffx_fsr3upscaler.h")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        message(STATUS "Fetching FidelityFX DX11 SDK...")
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/fetch_ffx_dx11.py"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            RESULT_VARIABLE FFX_FETCH_RES
+        )
+    endif()
+endif()
 if(EXISTS "${FFX_SDK_DIR}/include/FidelityFX/host/ffx_fsr3upscaler.h")
     set(EDPE_HAVE_FSR TRUE)
 else()
