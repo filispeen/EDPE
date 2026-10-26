@@ -149,7 +149,7 @@ def cmake_candidates():
         candidates.append(("PATH", on_path))
     vs = find_vs_install()
     if vs:
-        candidates.append(("VS2022 bundled", os.path.join(
+        candidates.append(("VS bundled", os.path.join(
             vs, "Common7", "IDE", "CommonExtensions", "Microsoft", "CMake", "CMake", "bin", "cmake.exe")))
     return candidates
 
@@ -168,6 +168,37 @@ def find_cmake():
     return path
 
 
+def find_vs_generator(cmake_exe=None):
+    progfiles86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = os.path.join(progfiles86, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    gen = None
+    if os.path.isfile(vswhere):
+        try:
+            ver = subprocess.check_output([
+                vswhere, "-latest", "-products", "*",
+                "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property", "installationVersion",
+            ]).decode().strip()
+            major = ver.split(".")[0] if ver else ""
+            known = {
+                "18": "Visual Studio 18 2026",
+                "17": "Visual Studio 17 2022",
+                "16": "Visual Studio 16 2019",
+                "15": "Visual Studio 15 2017",
+            }
+            gen = known.get(major)
+        except (subprocess.CalledProcessError, OSError):
+            pass
+    if gen and cmake_exe:
+        try:
+            help_out = subprocess.check_output([cmake_exe, "--help"]).decode("utf-8", "replace")
+            if gen not in help_out:
+                gen = None
+        except (subprocess.CalledProcessError, OSError):
+            pass
+    return gen
+
+
 def find_dumpbin():
     vs = find_vs_install()
     if vs:
@@ -177,7 +208,7 @@ def find_dumpbin():
     return shutil.which("dumpbin")
 
 
-def toolset_string(cmake_exe):
+def toolset_string(cmake_exe, generator=None):
     parts = []
     try:
         parts.append(run_capture(cmake_exe, "--version").splitlines()[0].strip())
@@ -189,15 +220,24 @@ def toolset_string(cmake_exe):
         if msvc_dirs:
             parts.append("MSVC " + os.path.basename(msvc_dirs[-1]))
         parts.append(os.path.basename(vs.rstrip("\\/")))
-    parts.append('generator "Visual Studio 17 2022" -A x64')
+    gen = generator or find_vs_generator(cmake_exe) or "default"
+    parts.append('generator "%s" -A x64' % gen)
     return "; ".join(parts) if parts else "unknown"
 
 
-def build(src, cmake_exe, jobs=None):
+def build(src, cmake_exe, jobs=None, generator=None):
     sdk = os.path.join(src, "sdk")
     build_dir = os.path.join(sdk, "build_edpe")
-    run(cmake_exe, "-S", sdk, "-B", build_dir, "-G", "Visual Studio 17 2022", "-A", "x64",
-        *CMAKE_CONFIGURE_ARGS)
+    gen = generator or find_vs_generator(cmake_exe)
+    vs_install = find_vs_install()
+    cmd = [cmake_exe, "-S", sdk, "-B", build_dir]
+    if gen:
+        cmd += ["-G", gen]
+    cmd += ["-A", "x64"]
+    if vs_install:
+        cmd += ["-DCMAKE_GENERATOR_INSTANCE=" + vs_install]
+    cmd += CMAKE_CONFIGURE_ARGS
+    run(*cmd)
     args = [cmake_exe, "--build", build_dir, "--config", "Release", "--parallel", str(jobs or os.cpu_count() or 4)]
     run(*args)
     return os.path.join(sdk, "bin", "ffx_sdk")
@@ -251,7 +291,7 @@ def check_library(name, lib_path, run_directives, run_symbols, problems, summary
     summary.append("%s: CRT=%s imports=%s" % (name, crt, ",".join(imports) if imports else "none"))
 
 
-def stage(src, lib_dir, dest, commit, cmake_exe):
+def stage(src, lib_dir, dest, commit, cmake_exe, generator=None):
     include_dest = os.path.join(dest, HEADER_DEST)
     os.makedirs(os.path.join(include_dest, "backends", "dx11"), exist_ok=True)
     for rel in HEADERS:
@@ -321,7 +361,7 @@ def stage(src, lib_dir, dest, commit, cmake_exe):
         "toolset: %s\n"
         "shader compiler (sdk\\tools\\binary_store\\FidelityFX_SC.exe) SHA-256: %s"
         " -- build-time only, never staged or shipped\n"
-        % (commit, FSR_VERSION, crt, toolset_string(cmake_exe), sc_hash)
+        % (commit, FSR_VERSION, crt, toolset_string(cmake_exe, generator), sc_hash)
     )
     with open(os.path.join(dest, VERSION_FILE), "w", encoding="utf-8") as f:
         f.write(version_text)
@@ -380,6 +420,7 @@ def main(argv=None):
     ap.add_argument("--dest", default=None, help="where to fetch/build/stage (default: external\\ffx-dx11)")
     ap.add_argument("--work-dir", default=None, help="work directory for checkout and build (must be pure ASCII for FidelityFX_SC)")
     ap.add_argument("--commit", default=COMMIT, help="override the pinned commit")
+    ap.add_argument("--generator", default=None, help="override CMake generator")
     ap.add_argument("--verify", default=None, metavar="DIR", help="verify an existing staged copy and exit")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -400,8 +441,9 @@ def main(argv=None):
             work_dir = os.path.join(dest, "src")
 
     if args.dry_run:
+        gen = args.generator or find_vs_generator(shutil.which("cmake")) or "default generator"
         print("Would fetch %s at %s into %s" % (URL, args.commit[:12], work_dir))
-        print("Would configure+build sdk\\ with CMake + VS2022 (Release, dynamic /MD)")
+        print("Would configure+build sdk\\ with CMake + %s (Release, dynamic /MD)" % gen)
         print("Would stage include\\, lib\\, %s and %s under %s" % (LICENCE, VERSION_FILE, dest))
         return 0
 
@@ -414,9 +456,9 @@ def main(argv=None):
     fetch(src, args.commit)
     cmake_exe = find_cmake()
     if not cmake_exe:
-        sys.exit("fetch_ffx_dx11: no cmake.exe on PATH or under VS2022")
-    lib_dir = build(src, cmake_exe)
-    stage(src, lib_dir, dest, args.commit, cmake_exe)
+        sys.exit("fetch_ffx_dx11: no cmake.exe on PATH or under Visual Studio")
+    lib_dir = build(src, cmake_exe, generator=args.generator)
+    stage(src, lib_dir, dest, args.commit, cmake_exe, generator=args.generator)
     problems = verify(dest)
     return 2 if problems else 0
 
