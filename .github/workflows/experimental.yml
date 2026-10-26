@@ -43,6 +43,21 @@ jobs:
             Write-Host "NVIDIA DLSS SDK found in cache."
           }
 
+      - name: Cache FidelityFX DX11 SDK
+        id: cache-ffx
+        uses: actions/cache@v4
+        with:
+          path: external/ffx-dx11
+          key: ffx-sdk-${{ runner.os }}-${{ hashFiles('tools/fetch_ffx_dx11.py') }}
+          restore-keys: |
+            ffx-sdk-${{ runner.os }}-
+
+      - name: Fetch FidelityFX DX11 SDK
+        if: steps.cache-ffx.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          python tools/fetch_ffx_dx11.py
+
       - name: Configure CMake
         shell: pwsh
         run: |
