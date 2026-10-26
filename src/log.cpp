@@ -7,7 +7,13 @@
 #include <string>
 #include <windows.h>
 
+#include <atomic>
+
 namespace {
+constexpr size_t kLogRingLines = 50;
+constexpr size_t kLogRingLineLength = 512;
+static char s_logRing[kLogRingLines][kLogRingLineLength];
+static std::atomic<uint32_t> s_logRingWriteIdx{0};
 std::mutex s_logMutex;
 
 struct DedupeState {
@@ -117,6 +123,14 @@ void EdpeLog(const wchar_t* message) {
     OutputDebugStringW(formatted);
     OutputDebugStringW(L"\n");
 
+    char ringBuf[kLogRingLineLength];
+    const int ringBytes = WideCharToMultiByte(CP_UTF8, 0, formatted, -1, ringBuf,
+        static_cast<int>(sizeof(ringBuf)), nullptr, nullptr);
+    if (ringBytes > 0) {
+        const uint32_t ringIdx = s_logRingWriteIdx.fetch_add(1, std::memory_order_relaxed);
+        memcpy(s_logRing[ringIdx % kLogRingLines], ringBuf, static_cast<size_t>(ringBytes));
+    }
+
     if (!info.valid) return;
 
     static const HANDLE session = beginLogSession(info.logPath);
@@ -202,4 +216,26 @@ void EdpeLog(const wchar_t* message) {
     }
 
     CloseHandle(file);
+}
+
+void EdpeLogDumpRecent(HANDLE file) {
+    if (!file || file == INVALID_HANDLE_VALUE) return;
+    const uint32_t total = s_logRingWriteIdx.load(std::memory_order_relaxed);
+    const uint32_t count = (total < kLogRingLines) ? total : kLogRingLines;
+    const uint32_t start = (total < kLogRingLines) ? 0 : (total - kLogRingLines);
+
+    static const char header[] = "--- EDPE Internal Log (Recent Entries) ---\r\n";
+    DWORD written = 0;
+    WriteFile(file, header, static_cast<DWORD>(strlen(header)), &written, nullptr);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t ringIdx = (start + i) % kLogRingLines;
+        const char* msg = s_logRing[ringIdx];
+        if (msg[0] != '\0') {
+            DWORD len = static_cast<DWORD>(strlen(msg));
+            WriteFile(file, msg, len, &written, nullptr);
+            WriteFile(file, "\r\n", 2, &written, nullptr);
+        }
+    }
+    WriteFile(file, "\r\n", 2, &written, nullptr);
 }

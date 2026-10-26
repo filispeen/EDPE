@@ -21,6 +21,7 @@ endif()
 
 add_library(EDPE_DXGI SHARED
     src/dllmain.cpp
+    src/crash_logger.cpp
     src/log.cpp
     src/d3d11_proxy.cpp
     src/dxgi_proxy.cpp
@@ -45,6 +46,11 @@ target_compile_definitions(EDPE_DXGI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(EDPE_DXGI PROPERTIES OUTPUT_NAME dxgi)
 add_library(EDPE ALIAS EDPE_DXGI)
 
+option(EDPE_CRASH_TEST "Trigger intentional crash after startup to test logger" OFF)
+if(EDPE_CRASH_TEST)
+    target_compile_definitions(EDPE_DXGI PRIVATE EDPE_CRASH_TEST=1)
+endif()
+
 add_library(EDPE_IMGUI STATIC
     external/imgui/imgui.cpp
     external/imgui/imgui_draw.cpp
@@ -54,7 +60,7 @@ add_library(EDPE_IMGUI STATIC
     external/imgui/backends/imgui_impl_dx11.cpp)
 target_include_directories(EDPE_IMGUI PUBLIC external/imgui external/imgui/backends)
 target_compile_definitions(EDPE_IMGUI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(EDPE_DXGI PRIVATE EDPE_IMGUI d3dcompiler dxguid)
+target_link_libraries(EDPE_DXGI PRIVATE EDPE_IMGUI d3dcompiler dxguid dbghelp)
 
 if(EDPE_HAVE_NGX)
     target_include_directories(EDPE_DXGI PRIVATE "${NGX_SDK_DIR}/include")
@@ -130,6 +136,12 @@ add_executable(jitter_view_report_test tests/jitter_view_report_test.cpp)
 target_compile_features(jitter_view_report_test PRIVATE cxx_std_20)
 target_include_directories(jitter_view_report_test PRIVATE src)
 add_test(NAME jitter_view_report COMMAND jitter_view_report_test)
+add_executable(crash_logger_test tests/crash_logger_test.cpp src/crash_logger.cpp src/log.cpp)
+target_compile_features(crash_logger_test PRIVATE cxx_std_20)
+target_compile_definitions(crash_logger_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(crash_logger_test PRIVATE src)
+target_link_libraries(crash_logger_test PRIVATE dbghelp dxgi)
+add_test(NAME crash_logger COMMAND crash_logger_test)
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)
 target_link_libraries(proxy_smoke PRIVATE d3dcompiler)

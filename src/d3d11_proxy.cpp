@@ -1,4 +1,5 @@
 #include "d3d11_proxy.h"
+#include "crash_logger.h"
 #include "config.h"
 #include "input_hook.h"
 #include "log.h"
@@ -212,6 +213,8 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
     const HRESULT result = create_device(adapter, driver_type, software, flags,
         feature_levels, feature_level_count, sdk_version, device, feature_level, context);
     if (SUCCEEDED(result) && device && *device) {
+        edpe::setLastD3D11HResult(result);
+        edpe::updateCrashGpuInfoFromDevice(*device);
         void** methods = *reinterpret_cast<void***>(*device);
         wchar_t message[160];
         swprintf_s(message, L"EDPE: D3D11 device created device=%p vtable=%p dsvMethod=%p",
@@ -219,6 +222,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
         EdpeLog(message);
         hookShaderCreation(*device);
     } else {
+        edpe::setLastD3D11HResult(result);
         EdpeLog(SUCCEEDED(result) ? L"EDPE: D3D11 device created without output"
                                   : L"EDPE: D3D11 device creation failed");
     }

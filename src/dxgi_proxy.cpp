@@ -1,4 +1,5 @@
 #include "d3d11_proxy.h"
+#include "crash_logger.h"
 #include "config.h"
 #include "log.h"
 #include "system_dll.h"
@@ -38,6 +39,7 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory(REFIID iid, void** factory) {
     if (!create_factory) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
 
     const HRESULT result = create_factory(iid, factory);
+    edpe::setLastD3D11HResult(result);
     if (SUCCEEDED(result) && factory && *factory) ObserveDxgiFactory(iid, *factory);
     EdpeLog(SUCCEEDED(result) ? L"EDPE: DXGI factory created"
                               : L"EDPE: DXGI factory creation failed");
@@ -54,6 +56,7 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory1(REFIID iid, void** factory) {
     if (!create_factory) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
 
     const HRESULT result = create_factory(iid, factory);
+    edpe::setLastD3D11HResult(result);
     if (SUCCEEDED(result) && factory && *factory) ObserveDxgiFactory(iid, *factory);
     EdpeLog(SUCCEEDED(result) ? L"EDPE: DXGI factory created"
                               : L"EDPE: DXGI factory creation failed");
@@ -70,6 +73,7 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory2(UINT flags, REFIID iid, void** 
     if (!create_factory) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
 
     const HRESULT result = create_factory(flags, iid, factory);
+    edpe::setLastD3D11HResult(result);
     if (SUCCEEDED(result) && factory && *factory) ObserveDxgiFactory(iid, *factory);
     EdpeLog(SUCCEEDED(result) ? L"EDPE: DXGI factory created"
                               : L"EDPE: DXGI factory creation failed");

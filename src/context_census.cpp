@@ -1,4 +1,5 @@
 #include "context_census.h"
+#include "crash_logger.h"
 #include "camera_delta.h"
 #include "dxbc_fanout.h"
 #include "elite_camera.h"
@@ -2703,7 +2704,17 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
 
         bool compOk = false;
-        if (upscaler.evaluate(context, inputs, nullptr, evalDestination)) {
+        const bool upscalerEvalOk = upscaler.evaluate(context, inputs, nullptr, evalDestination);
+        edpe::updateCrashUpscalerState(
+            static_cast<int>(upscaler.getBackend()),
+            static_cast<int>(upscaler.getMode()),
+            !upscalerEvalOk,
+            inputs.renderWidth,
+            inputs.renderHeight,
+            inputs.outputWidth,
+            inputs.outputHeight,
+            last_present_frame.load(std::memory_order_relaxed));
+        if (upscalerEvalOk) {
             s_camera_reset = false;
 
             const bool canCompositeUi = (s_preserve_native_ui.load(std::memory_order_relaxed) &&
@@ -3453,6 +3464,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     const auto rendered_frame = last_present_frame.load(std::memory_order_relaxed);
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
         last_present_frame.store(frame, std::memory_order_relaxed);
+        edpe::setCrashFrameNumber(frame);
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         int finished_pair = -1;
         {

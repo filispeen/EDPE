@@ -1,4 +1,5 @@
 #include "d3d11_proxy.h"
+#include "crash_logger.h"
 #include "log.h"
 #include "ui.h"
 #include "context_census.h"
@@ -131,6 +132,7 @@ HRESULT STDMETHODCALLTYPE observedCreateSwapChainForHwnd(IDXGIFactory2* factory,
 }
 
 void logFirstPresent(IDXGISwapChain* swap_chain) {
+    edpe::updateCrashGpuInfo(swap_chain);
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(swap_chain->GetDesc(&desc))) return;
     ID3D11Device* device = nullptr;
@@ -208,6 +210,7 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
     ContextCensusAfterOverlay(swap_chain, flags);
     const auto original = reinterpret_cast<PresentFn>(tableOf(swap_chain)->original[kPresent]);
     const HRESULT result = original(swap_chain, sync_interval, flags);
+    edpe::setLastD3D11HResult(result);
     ContextCensusAfterPresent(swap_chain, flags);
     edpe::PerfTracker::instance().onPresentEnd();
     return result;
