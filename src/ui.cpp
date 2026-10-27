@@ -277,6 +277,11 @@ void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int
         EdpeLog(L"EDPE: texture capture skipped (too many pending captures)");
         return;
     }
+    ID3D11Device* srcDevice = nullptr;
+    source->GetDevice(&srcDevice);
+    if (!srcDevice) srcDevice = ui.device;
+    ID3D11DeviceContext* srcContext = nullptr;
+    srcDevice->GetImmediateContext(&srcContext);
     D3D11_TEXTURE2D_DESC staging_desc = desc;
     staging_desc.Usage = D3D11_USAGE_STAGING;
     staging_desc.BindFlags = 0;
@@ -285,8 +290,8 @@ void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int
     staging_desc.MipLevels = 1;
     staging_desc.ArraySize = 1;
     ID3D11Texture2D* staging = nullptr;
-    if (SUCCEEDED(ui.device->CreateTexture2D(&staging_desc, nullptr, &staging))) {
-        ui.context->CopyResource(staging, source);
+    if (srcContext && SUCCEEDED(srcDevice->CreateTexture2D(&staging_desc, nullptr, &staging))) {
+        srcContext->CopyResource(staging, source);
         SYSTEMTIME t{};
         if (customTime) {
             t = *customTime;
@@ -308,6 +313,108 @@ void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int
     } else {
         EdpeLog(L"EDPE: texture capture staging creation failed");
     }
+    if (srcContext) srcContext->Release();
+    if (srcDevice) srcDevice->Release();
+}
+
+ID3D11ShaderResourceView* cloneSrvToUiDevice(ID3D11ShaderResourceView* srv, ID3D11Texture2D** ioCopy = nullptr) {
+    if (!srv || !ui.device || !ui.context) return srv;
+    ID3D11Device* srvDevice = nullptr;
+    srv->GetDevice(&srvDevice);
+    if (srvDevice) srvDevice->Release();
+    if (!srvDevice || srvDevice == ui.device) return srv;
+
+    ID3D11DeviceContext* srvContext = nullptr;
+    srvDevice->GetImmediateContext(&srvContext);
+    if (!srvContext) return srv;
+
+    ID3D11Resource* res = nullptr;
+    srv->GetResource(&res);
+    ID3D11Texture2D* srcTex = nullptr;
+    if (res) {
+        res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&srcTex));
+        res->Release();
+    }
+    if (!srcTex) {
+        srvContext->Release();
+        return srv;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    srcTex->GetDesc(&desc);
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srv->GetDesc(&srvDesc);
+
+    ID3D11Texture2D* uiTex = nullptr;
+    ID3D11ShaderResourceView* uiSrv = nullptr;
+
+    D3D11_TEXTURE2D_DESC sharedDesc = desc;
+    sharedDesc.Usage = D3D11_USAGE_DEFAULT;
+    sharedDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    sharedDesc.CPUAccessFlags = 0;
+    sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    if (SUCCEEDED(ui.device->CreateTexture2D(&sharedDesc, nullptr, &uiTex)) && uiTex) {
+        IDXGIResource* dxgiRes = nullptr;
+        HANDLE sharedHandle = nullptr;
+        if (SUCCEEDED(uiTex->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void**>(&dxgiRes))) && dxgiRes) {
+            dxgiRes->GetSharedHandle(&sharedHandle);
+            dxgiRes->Release();
+        }
+        ID3D11Texture2D* sharedOnSrc = nullptr;
+        if (sharedHandle && SUCCEEDED(srvDevice->OpenSharedResource(sharedHandle,
+                __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&sharedOnSrc))) && sharedOnSrc) {
+            srvContext->CopyResource(sharedOnSrc, srcTex);
+            srvContext->Flush();
+            sharedOnSrc->Release();
+            ui.device->CreateShaderResourceView(uiTex, &srvDesc, &uiSrv);
+        }
+        if (!uiSrv) {
+            uiTex->Release();
+            uiTex = nullptr;
+        }
+    }
+
+    if (!uiSrv) {
+        D3D11_TEXTURE2D_DESC stagDesc = desc;
+        stagDesc.Usage = D3D11_USAGE_STAGING;
+        stagDesc.BindFlags = 0;
+        stagDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        stagDesc.MiscFlags = 0;
+        ID3D11Texture2D* staging = nullptr;
+        if (SUCCEEDED(srvDevice->CreateTexture2D(&stagDesc, nullptr, &staging)) && staging) {
+            srvContext->CopyResource(staging, srcTex);
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(srvContext->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)) && mapped.pData) {
+                D3D11_TEXTURE2D_DESC dstDesc = desc;
+                dstDesc.Usage = D3D11_USAGE_DEFAULT;
+                dstDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                dstDesc.CPUAccessFlags = 0;
+                dstDesc.MiscFlags = 0;
+                D3D11_SUBRESOURCE_DATA initData{mapped.pData, mapped.RowPitch, 0};
+                if (SUCCEEDED(ui.device->CreateTexture2D(&dstDesc, &initData, &uiTex)) && uiTex) {
+                    ui.device->CreateShaderResourceView(uiTex, &srvDesc, &uiSrv);
+                }
+                srvContext->Unmap(staging, 0);
+            }
+            staging->Release();
+        }
+    }
+
+    srcTex->Release();
+    srvContext->Release();
+
+    if (uiSrv) {
+        srv->Release();
+        if (ioCopy) {
+            if (*ioCopy) (*ioCopy)->Release();
+            *ioCopy = uiTex;
+        } else if (uiTex) {
+            uiTex->Release();
+        }
+        return uiSrv;
+    }
+    if (uiTex) uiTex->Release();
+    return srv;
 }
 
 void queueTextureCaptureFromSrv(ID3D11ShaderResourceView* srv, UiState::CaptureKind kind, int index = -1) {
@@ -357,11 +464,18 @@ void pollFrameCapture() {
 
     for (auto it = ui.pending_captures.begin(); it != ui.pending_captures.end();) {
         auto& req = *it;
+        ID3D11Device* stagDevice = nullptr;
+        ID3D11DeviceContext* stagContext = nullptr;
+        if (req.staging) req.staging->GetDevice(&stagDevice);
+        if (stagDevice) stagDevice->GetImmediateContext(&stagContext);
+        if (!stagContext) stagContext = ui.context;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        const HRESULT result = ui.context->Map(req.staging, 0, D3D11_MAP_READ,
+        const HRESULT result = stagContext->Map(req.staging, 0, D3D11_MAP_READ,
             D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
 
         if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++req.attempts < 120) {
+            if (stagContext && stagContext != ui.context) stagContext->Release();
+            if (stagDevice) stagDevice->Release();
             ++it;
             continue;
         }
@@ -563,10 +677,12 @@ void pollFrameCapture() {
                     EdpeLog(L"EDPE: capture file write failed");
                 }
             }
-            ui.context->Unmap(req.staging, 0);
+            stagContext->Unmap(req.staging, 0);
         } else {
             EdpeLog(L"EDPE: capture readback failed or timed out");
         }
+        if (stagContext && stagContext != ui.context) stagContext->Release();
+        if (stagDevice) stagDevice->Release();
         req.staging->Release();
         it = ui.pending_captures.erase(it);
     }
@@ -662,6 +778,12 @@ void ensureDepthContrastShader() {
 }
 
 void queueDepthSamples(const D3D11_TEXTURE2D_DESC& source_desc) {
+    if (!ui.depth_copy) return;
+    ID3D11Device* srcDevice = nullptr;
+    ui.depth_copy->GetDevice(&srcDevice);
+    if (!srcDevice) srcDevice = ui.device;
+    ID3D11DeviceContext* srcContext = nullptr;
+    srcDevice->GetImmediateContext(&srcContext);
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = desc.Height = 8;
     desc.MipLevels = desc.ArraySize = 1;
@@ -669,7 +791,10 @@ void queueDepthSamples(const D3D11_TEXTURE2D_DESC& source_desc) {
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (FAILED(ui.device->CreateTexture2D(&desc, nullptr, &ui.depth_samples))) {
+    if (!srcContext || FAILED(srcDevice->CreateTexture2D(&desc, nullptr, &ui.depth_samples))) {
+        if (srcContext) srcContext->Release();
+        if (srcDevice && srcDevice != ui.device) srcDevice->Release();
+        else if (srcDevice == ui.device) srcDevice->Release();
         EdpeLog(L"EDPE: depth sample grid unavailable (staging creation failed)");
         return;
     }
@@ -682,18 +807,29 @@ void queueDepthSamples(const D3D11_TEXTURE2D_DESC& source_desc) {
             const UINT sy = x == 4 && y == 4 ? source_desc.Height / 2
                 : (2 * y + 1) * source_desc.Height / 16;
             const D3D11_BOX box{sx, sy, 0, sx + 1, sy + 1, 1};
-            ui.context->CopySubresourceRegion(ui.depth_samples, 0, x, y, 0,
+            srcContext->CopySubresourceRegion(ui.depth_samples, 0, x, y, 0,
                 ui.depth_copy, 0, &box);
         }
     }
+    srcContext->Release();
+    srcDevice->Release();
 }
 
 void pollDepthSamples() {
     if (!ui.depth_samples) return;
+    ID3D11Device* stagDevice = nullptr;
+    ID3D11DeviceContext* stagContext = nullptr;
+    ui.depth_samples->GetDevice(&stagDevice);
+    if (stagDevice) stagDevice->GetImmediateContext(&stagContext);
+    if (!stagContext) stagContext = ui.context;
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    const HRESULT result = ui.context->Map(ui.depth_samples, 0, D3D11_MAP_READ,
+    const HRESULT result = stagContext->Map(ui.depth_samples, 0, D3D11_MAP_READ,
         D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-    if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++ui.depth_sample_attempts < 120) return;
+    if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++ui.depth_sample_attempts < 120) {
+        if (stagContext && stagContext != ui.context) stagContext->Release();
+        if (stagDevice) stagDevice->Release();
+        return;
+    }
     if (FAILED(result)) {
         EdpeLog(L"EDPE: depth sample grid unavailable (nonblocking map failed or timed out)");
     } else {
@@ -723,7 +859,7 @@ void pollDepthSamples() {
                 ++valid;
             }
         }
-        ui.context->Unmap(ui.depth_samples, 0);
+        stagContext->Unmap(ui.depth_samples, 0);
         ui.depth_range_valid = valid != 0;
         ui.depth_min = minimum;
         ui.depth_max = maximum;
@@ -733,15 +869,28 @@ void pollDepthSamples() {
             static_cast<unsigned>(ui.depth_center_valid), ui.depth_center);
         EdpeLog(message);
     }
+    if (stagContext && stagContext != ui.context) stagContext->Release();
+    if (stagDevice) stagDevice->Release();
     ui.depth_samples->Release();
     ui.depth_samples = nullptr;
 }
 
 void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
+    ID3D11Device* srcDevice = nullptr;
+    view->GetDevice(&srcDevice);
+    if (!srcDevice) srcDevice = ui.device;
+    ID3D11DeviceContext* srcContext = nullptr;
+    srcDevice->GetImmediateContext(&srcContext);
+    if (!srcContext) {
+        if (srcDevice) srcDevice->Release();
+        return;
+    }
     ID3D11DepthStencilView* bound = nullptr;
-    ui.context->OMGetRenderTargets(0, nullptr, &bound);
+    srcContext->OMGetRenderTargets(0, nullptr, &bound);
     if (bound) {
         bound->Release();
+        srcContext->Release();
+        srcDevice->Release();
         EdpeLog(L"EDPE: depth snapshot skipped (depth still bound at Present)");
         return;
     }
@@ -753,6 +902,8 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
         resource->Release();
     }
     if (!source) {
+        srcContext->Release();
+        srcDevice->Release();
         EdpeLog(L"EDPE: depth snapshot skipped (not a Texture2D)");
         return;
     }
@@ -764,6 +915,8 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
     if (!desc.Width || !desc.Height || desc.MipLevels != 1 || desc.ArraySize != 1 ||
         desc.SampleDesc.Count != 1 || read_format == DXGI_FORMAT_UNKNOWN) {
         source->Release();
+        srcContext->Release();
+        srcDevice->Release();
         EdpeLog(L"EDPE: depth snapshot skipped (unsupported texture layout or format)");
         return;
     }
@@ -773,17 +926,17 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
     copy_desc.CPUAccessFlags = 0;
     copy_desc.MiscFlags = 0;
     ID3D11Texture2D* copy = nullptr;
-    HRESULT result = ui.device->CreateTexture2D(&copy_desc, nullptr, &copy);
+    HRESULT result = srcDevice->CreateTexture2D(&copy_desc, nullptr, &copy);
     ID3D11ShaderResourceView* srv = nullptr;
     if (SUCCEEDED(result)) {
         D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
         srv_desc.Format = read_format;
         srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srv_desc.Texture2D.MipLevels = 1;
-        result = ui.device->CreateShaderResourceView(copy, &srv_desc, &srv);
+        result = srcDevice->CreateShaderResourceView(copy, &srv_desc, &srv);
     }
     if (SUCCEEDED(result)) {
-        ui.context->CopyResource(copy, source);
+        srcContext->CopyResource(copy, source);
         releaseDepthSnapshot();
         ui.depth_copy = copy;
         ui.depth_srv = srv;
@@ -795,6 +948,7 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
         ensureDepthContrastShader();
         queueDepthSamples(desc);
         queueTextureCapture(copy, UiState::CaptureKind::Depth, static_cast<int>(index));
+        ui.depth_srv = cloneSrvToUiDevice(ui.depth_srv, &ui.depth_copy);
         wchar_t message[160];
         swprintf_s(message, L"EDPE: depth snapshot #%u copied %ux%u format=%u",
             index, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
@@ -808,11 +962,22 @@ void captureDepthSnapshot(ID3D11DepthStencilView* view, unsigned index) {
         EdpeLog(message);
     }
     source->Release();
+    srcContext->Release();
+    srcDevice->Release();
 }
 
 void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
+    ID3D11Device* srcDevice = nullptr;
+    view->GetDevice(&srcDevice);
+    if (!srcDevice) srcDevice = ui.device;
+    ID3D11DeviceContext* srcContext = nullptr;
+    srcDevice->GetImmediateContext(&srcContext);
+    if (!srcContext) {
+        if (srcDevice) srcDevice->Release();
+        return;
+    }
     ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-    ui.context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
+    srcContext->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
     bool still_bound = false;
     for (auto*& target : bound) {
         if (target == view) still_bound = true;
@@ -823,6 +988,8 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
     D3D11_RENDER_TARGET_VIEW_DESC target{};
     view->GetDesc(&target);
     if (target.Format != DXGI_FORMAT_R11G11B10_FLOAT) {
+        srcContext->Release();
+        srcDevice->Release();
         EdpeLog(L"EDPE: scene color snapshot skipped (last RTV0 is not R11G11B10_FLOAT)");
         return;
     }
@@ -834,6 +1001,8 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
         resource->Release();
     }
     if (!source) {
+        srcContext->Release();
+        srcDevice->Release();
         EdpeLog(L"EDPE: scene color snapshot skipped (not a Texture2D)");
         return;
     }
@@ -842,6 +1011,8 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
     if (!desc.Width || !desc.Height || desc.MipLevels != 1 || desc.ArraySize != 1 ||
         desc.SampleDesc.Count != 1 || desc.Format != target.Format) {
         source->Release();
+        srcContext->Release();
+        srcDevice->Release();
         EdpeLog(L"EDPE: scene color snapshot skipped (unsupported texture layout)");
         return;
     }
@@ -851,11 +1022,11 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
     copy_desc.CPUAccessFlags = 0;
     copy_desc.MiscFlags = 0;
     ID3D11Texture2D* copy = nullptr;
-    HRESULT result = ui.device->CreateTexture2D(&copy_desc, nullptr, &copy);
+    HRESULT result = srcDevice->CreateTexture2D(&copy_desc, nullptr, &copy);
     ID3D11ShaderResourceView* srv = nullptr;
-    if (SUCCEEDED(result)) result = ui.device->CreateShaderResourceView(copy, nullptr, &srv);
+    if (SUCCEEDED(result)) result = srcDevice->CreateShaderResourceView(copy, nullptr, &srv);
     if (SUCCEEDED(result)) {
-        ui.context->CopyResource(copy, source);
+        srcContext->CopyResource(copy, source);
         releaseColorSnapshot();
         ui.color_copy = copy;
         ui.color_srv = srv;
@@ -864,6 +1035,7 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
         ui.color_snapshot_index = static_cast<int>(index);
         ui.color_window_open = true;
         queueTextureCapture(copy, UiState::CaptureKind::SceneColor, static_cast<int>(index));
+        ui.color_srv = cloneSrvToUiDevice(ui.color_srv, &ui.color_copy);
         wchar_t message[160];
         swprintf_s(message, L"EDPE: scene color snapshot #%u copied %ux%u format=%u",
             index, desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
@@ -877,6 +1049,8 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
         EdpeLog(message);
     }
     source->Release();
+    srcContext->Release();
+    srcDevice->Release();
 }
 
 void shutdownUi() {
@@ -1050,6 +1224,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.snapshot_ready = true;
         ensureMotionPreviewShader();
         queueTextureCaptureFromSrv(ui.motion_srv, UiState::CaptureKind::Motion);
+        ui.motion_srv = cloneSrvToUiDevice(ui.motion_srv);
         EdpeLog(L"EDPE: motion snapshot handed to ImGui");
         motion_batch_ready = true;
     }
@@ -1062,6 +1237,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.color_height = motion_color_height;
         ui.color_window_open = true;
         queueTextureCaptureFromSrv(ui.color_srv, UiState::CaptureKind::SceneColor);
+        ui.color_srv = cloneSrvToUiDevice(ui.color_srv);
         EdpeLog(L"EDPE: same-frame HDR color handed to ImGui");
     }
     if (auto* early = ContextCensusTakeMotionEarlyColorSnapshot(
@@ -1070,6 +1246,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.early_color_srv = early;
         ui.early_color_window_open = true;
         queueTextureCaptureFromSrv(ui.early_color_srv, UiState::CaptureKind::EarlyHdr);
+        ui.early_color_srv = cloneSrvToUiDevice(ui.early_color_srv);
         EdpeLog(L"EDPE: early HDR color handed to ImGui");
     }
     UINT motion_depth_width = 0, motion_depth_height = 0;
@@ -1085,6 +1262,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.snapshot_ready = true;
         ensureDepthContrastShader();
         queueTextureCaptureFromSrv(ui.depth_srv, UiState::CaptureKind::Depth, static_cast<int>(motion_depth_idx));
+        ui.depth_srv = cloneSrvToUiDevice(ui.depth_srv);
         EdpeLog(L"EDPE: same-frame depth handed to ImGui");
     }
     if (motion_batch_ready && ui.pending_backbuffer_capture_on_motion) {

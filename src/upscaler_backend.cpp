@@ -700,6 +700,24 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     const TemporalFrameInputs& inputs,
     ID3D11RenderTargetView* destinationRtv,
     ID3D11Texture2D* destinationTexture) {
+    if (context) {
+        Microsoft::WRL::ComPtr<ID3D11Device> evalDevice;
+        context->GetDevice(&evalDevice);
+        if (evalDevice && evalDevice.Get() != device_) {
+            const UpscalerBackend savedBackend = currentBackendType_;
+            const UpscaleMode savedMode = currentMode_;
+            const uint32_t savedPreset = NgxContext::get_preset();
+            wchar_t msg[192];
+            swprintf_s(msg, L"EDPE: rebinding UpscalerManager from device=%p to scene device=%p",
+                device_, evalDevice.Get());
+            EdpeLog(msg);
+            shutdown();
+            NgxContext::set_preset(savedPreset);
+            initialize(evalDevice.Get(), context);
+            setBackend(savedBackend);
+            setMode(savedMode);
+        }
+    }
     diagnostics_.didRun = true;
     diagnostics_.backend = currentBackendType_;
     diagnostics_.mode = currentMode_;

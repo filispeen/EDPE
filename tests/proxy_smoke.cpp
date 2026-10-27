@@ -105,6 +105,9 @@ int wmain(int argc, wchar_t** argv) {
     const auto scene_depth_candidate = reinterpret_cast<int (WINAPI*)()>(
         GetProcAddress(dxgi_proxy, "EDPE_SceneDepthCandidate"));
     if (!scene_depth_candidate) return 7;
+    const auto set_jitter_test_override = reinterpret_cast<void (WINAPI*)(BOOL)>(
+        GetProcAddress(dxgi_proxy, "EDPE_SetJitterTestOverride"));
+    if (!set_jitter_test_override) return 7;
     IDXGIFactory1* factory = nullptr;
     const HRESULT factory_result = create_factory(__uuidof(IDXGIFactory1),
         reinterpret_cast<void**>(&factory));
@@ -591,9 +594,21 @@ int wmain(int argc, wchar_t** argv) {
                 make_dev2_rtv(DXGI_FORMAT_R8G8B8A8_UNORM, &dev2_t2, &dev2_r2);
                 make_dev2_rtv(DXGI_FORMAT_R11G11B10_FLOAT, &dev2_t3, &dev2_r3);
                 ID3D11RenderTargetView* dev2_mrts[4]{dev2_r0, dev2_r1, dev2_r2, dev2_r3};
+                ID3D11Buffer* dev2_cb = nullptr;
+                device2->CreateBuffer(&probe_desc, &probe_initial, &dev2_cb);
+                set_jitter_test_override(TRUE);
                 for (int i = 0; i < 32; ++i) {
                     context2->OMSetRenderTargets(4, dev2_mrts, depth2_view);
+                    if (i == 0 && dev2_cb) {
+                        D3D11_MAPPED_SUBRESOURCE dev2_mapped{};
+                        if (SUCCEEDED(context2->Map(dev2_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &dev2_mapped))) {
+                            std::memcpy(dev2_mapped.pData, probe_values, sizeof(probe_values));
+                            context2->Unmap(dev2_cb, 0);
+                        }
+                    }
                 }
+                set_jitter_test_override(FALSE);
+                if (dev2_cb) dev2_cb->Release();
                 context2->OMSetRenderTargets(1, &dev2_r3, depth2_view);
                 context2->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, depth2_view, 0, 0, nullptr, nullptr);
                 context2->OMSetRenderTargets(0, nullptr, nullptr);
@@ -833,6 +848,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV census frame=1024 binds=29 unique=1 slotActive=1") &&
         std::strstr(contents, "EDPE: DSV census frame=1024 binds=34 unique=1 slotActive=1") &&
         std::strstr(contents, "EDPE: WARNING: scene context differs from present context") &&
+        std::strstr(contents, "EDPE: projection jitter applied #1 frame=") &&
         std::strstr(contents, dev2_census_prefix) &&
         std::strstr(contents, "EDPE: context census ctx=") &&
         std::strstr(contents, "maxDsv=256x256") &&

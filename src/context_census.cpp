@@ -141,6 +141,8 @@ struct HookedTableEntry {
     OMSetRenderTargetsAndUnorderedAccessViewsFn orig_om_uav = nullptr;
     ExecuteCommandListFn orig_exec = nullptr;
     FinishCommandListFn orig_finish = nullptr;
+    MapFn orig_map = nullptr;
+    UnmapFn orig_unmap = nullptr;
 };
 static constexpr size_t kMaxHookedTables = 16;
 static std::atomic<size_t> s_hooked_table_count{0};
@@ -166,6 +168,8 @@ struct ClonedContextVtable {
     void** original_table = nullptr;
     OMSetRenderTargetsFn orig_om = nullptr;
     OMSetRenderTargetsAndUnorderedAccessViewsFn orig_om_uav = nullptr;
+    MapFn orig_map = nullptr;
+    UnmapFn orig_unmap = nullptr;
     void* methods[134]{};
 };
 static constexpr size_t kMaxClonedContexts = 16;
@@ -268,6 +272,27 @@ PerContextData* findSceneContextData(bool logWarning = true) {
     return best;
 }
 
+ID3D11DeviceContext* activeSceneContext() {
+    if (PerContextData* scene = findSceneContextData(false)) {
+        if (scene->context && scene->nonNullDsvCalls.load(std::memory_order_relaxed) > 0) {
+            return scene->context;
+        }
+    }
+    return observed_context.load(std::memory_order_acquire);
+}
+
+bool isObservedImmediateContext(ID3D11DeviceContext* context) {
+    if (!context) return false;
+    if (context == observed_context.load(std::memory_order_acquire)) return true;
+    const size_t count = s_tracked_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
+        if (s_tracked_contexts[i] && s_tracked_contexts[i]->context == context) {
+            return context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+        }
+    }
+    return context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+}
+
 void updateContextMaxDsv(PerContextData* data, ID3D11DepthStencilView* dsv) {
     if (!data || !dsv) return;
     ID3D11Resource* res = nullptr;
@@ -310,6 +335,7 @@ int camera_pair_target = -1;
 unsigned long long camera_pair_armed_after = 0;
 unsigned long long camera_pair_bind_frame = ~0ull;
 unsigned camera_pair_bind_count = 0;
+std::array<unsigned long long, 2> camera_pair_sample_frames{~0ull, ~0ull};
 bool motion_pair_queued = false;
 bool motion_pair_active = false;
 std::array<edpe::CameraProjection, 2> motion_cameras{};
@@ -321,6 +347,7 @@ std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 2> gpu_camera_pair{};
 // read at a later Present with DO_NOT_WAIT. Nothing is written to the game.
 struct CameraDeltaSlot {
     Microsoft::WRL::ComPtr<ID3D11Buffer> staging;
+    ID3D11DeviceContext* context = nullptr;
     unsigned long long frame = 0;
 };
 constexpr size_t kCameraDeltaRing = 4;
@@ -328,6 +355,7 @@ std::array<CameraDeltaSlot, kCameraDeltaRing> camera_delta_ring{};
 size_t camera_delta_head = 0;  // next slot to read
 size_t camera_delta_count = 0; // slots holding queued copies
 Microsoft::WRL::ComPtr<ID3D11Buffer> camera_delta_source; // copied at the next OMSetRenderTargets
+ID3D11DeviceContext* camera_delta_source_context = nullptr;
 unsigned long long camera_delta_source_frame = 0;
 unsigned long long camera_delta_taken_frame = ~0ull;
 unsigned camera_delta_dropped = 0;  // ring full or map failure, reset each summary
@@ -510,6 +538,7 @@ unsigned hud_draw_hook_mask = 0;
 unsigned hud_draw_rearmed_mask = 0;
 unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
+ID3D11DeviceContext* motion_grid_context = nullptr;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 std::unique_ptr<edpe::UiCompositePass> ui_composite_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
@@ -520,6 +549,7 @@ unsigned motion_hook_watch = 0;
 struct PairDepthSample {
     ID3D11DepthStencilView* view = nullptr;
     ID3D11Texture2D* staging = nullptr;
+    ID3D11DeviceContext* context = nullptr;
     unsigned long long after_present = 0;
     UINT width = 0;
     UINT height = 0;
@@ -528,6 +558,7 @@ struct PairDepthSample {
 std::array<PairDepthSample, 2> camera_pair_depth{}; // One-shot diagnostic only.
 struct ConstantBufferSample {
     ID3D11Buffer* buffer = nullptr;
+    ID3D11DeviceContext* context = nullptr;
     unsigned bind = 0;
     unsigned long long after_present = 0;
     unsigned wait = 0;
@@ -537,6 +568,7 @@ struct ConstantBufferSample {
 std::array<ConstantBufferSample, 9> constant_buffer_samples{}; // Snapshot, adjacent-frame, and alternate-projection probes.
 struct PipelineSample {
     ID3D11Query* query = nullptr;
+    ID3D11DeviceContext* context = nullptr;
     unsigned bind = 0;
     unsigned long long after_present = 0;
     unsigned wait = 0;
@@ -1133,7 +1165,7 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
     UINT start, UINT count, ID3D11Buffer* const* buffers) {
     const auto forward = original_vs_set_buffers.load(std::memory_order_acquire);
     forward(context, start, count, buffers);
-    if (context != observed_context.load(std::memory_order_acquire) ||
+    if (!isObservedImmediateContext(context) ||
         !vs_buffer_probe_active.load(std::memory_order_acquire)) return;
     vs_buffer_calls.fetch_add(1, std::memory_order_relaxed);
     if (start > 1 || count <= 1 - start) return;
@@ -1160,9 +1192,10 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
 
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
     UINT start, INT base) {
-    if (context == observed_context.load(std::memory_order_acquire))
+    const bool immediate = isObservedImmediateContext(context);
+    if (immediate)
         observeHudDraw(context, 'I', 1);
-    if (context == observed_context.load(std::memory_order_acquire) &&
+    if (immediate &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_indexed_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
@@ -1173,9 +1206,10 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
 }
 
 void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start) {
-    if (context == observed_context.load(std::memory_order_acquire))
+    const bool immediate = isObservedImmediateContext(context);
+    if (immediate)
         observeHudDraw(context, 'D', 1);
-    if (context == observed_context.load(std::memory_order_acquire) &&
+    if (immediate &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
@@ -1188,9 +1222,10 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
     UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
     UINT start_instance) {
-    const bool replay = context == observed_context.load(std::memory_order_acquire) &&
+    const bool immediate = isObservedImmediateContext(context);
+    const bool replay = immediate &&
         observeHudDraw(context, 'X', instance_count);
-    if (context == observed_context.load(std::memory_order_acquire) &&
+    if (immediate &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_indexed_instanced_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
@@ -1205,9 +1240,10 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
 
 void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
-    if (context == observed_context.load(std::memory_order_acquire))
+    const bool immediate = isObservedImmediateContext(context);
+    if (immediate)
         observeHudDraw(context, 'N', instance_count);
-    if (context == observed_context.load(std::memory_order_acquire) &&
+    if (immediate &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_instanced_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
@@ -1301,16 +1337,72 @@ void endHudDrawProbe() {
     hud_draw_hook_mask = 0;
 }
 
+MapFn resolveOriginalMap(ID3D11DeviceContext* context);
+UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context);
+
+HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
+    UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped);
+void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
+    UINT subresource);
+
+MapFn resolveOriginalMap(ID3D11DeviceContext* context) {
+    if (!context) return original_map.load(std::memory_order_acquire);
+    void** table = *reinterpret_cast<void***>(context);
+    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < cloneCount; ++i) {
+        if (s_cloned_contexts[i] &&
+            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
+            if (s_cloned_contexts[i]->orig_map && s_cloned_contexts[i]->orig_map != &observedMap)
+                return s_cloned_contexts[i]->orig_map;
+            table = s_cloned_contexts[i]->original_table;
+            break;
+        }
+    }
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_map &&
+            s_hooked_tables[i].orig_map != &observedMap) {
+            return s_hooked_tables[i].orig_map;
+        }
+    }
+    return original_map.load(std::memory_order_acquire);
+}
+
+UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context) {
+    if (!context) return original_unmap.load(std::memory_order_acquire);
+    void** table = *reinterpret_cast<void***>(context);
+    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < cloneCount; ++i) {
+        if (s_cloned_contexts[i] &&
+            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
+            if (s_cloned_contexts[i]->orig_unmap && s_cloned_contexts[i]->orig_unmap != &observedUnmap)
+                return s_cloned_contexts[i]->orig_unmap;
+            table = s_cloned_contexts[i]->original_table;
+            break;
+        }
+    }
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_unmap &&
+            s_hooked_tables[i].orig_unmap != &observedUnmap) {
+            return s_hooked_tables[i].orig_unmap;
+        }
+    }
+    return original_unmap.load(std::memory_order_acquire);
+}
+
 HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
-    const HRESULT result = original_map.load(std::memory_order_acquire)(
-        context, resource, subresource, type, flags, mapped);
+    const MapFn forward = resolveOriginalMap(context);
+    const HRESULT result = forward ? forward(
+        context, resource, subresource, type, flags, mapped) : E_FAIL;
     if (s_in_edpe_present.load(std::memory_order_acquire)) return result;
-    if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
+    if (SUCCEEDED(result) && isObservedImmediateContext(context) &&
         resource && map_hook_active.load(std::memory_order_acquire)) {
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
         bool is_scene_cb = (resource == target);
-        if (is_scene_cb || !target) {
+        const bool probe_active = vs_buffer_probe_active.load(std::memory_order_relaxed);
+        if (is_scene_cb || !target || !probe_active) {
             edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
             if (!is_scene_cb) {
                 D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
@@ -1323,11 +1415,12 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
                         buffer->GetDesc(&desc);
                         if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
                             (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+                            const bool had_target = (target != nullptr);
                             scene_map_target.store(buffer, std::memory_order_release);
-                            clearTrackedMappedBuffersExcept(buffer);
+                            if (probe_active) clearTrackedMappedBuffersExcept(buffer);
                             target = buffer;
                             is_scene_cb = true;
-                            if (!scene_maps_before_bind.load(std::memory_order_relaxed)) {
+                            if (!had_target && !scene_maps_before_bind.load(std::memory_order_relaxed)) {
                                 scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
                                 EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
                             }
@@ -1353,21 +1446,21 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
 
 void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource) {
+    const UnmapFn forward = resolveOriginalUnmap(context);
     if (!s_in_edpe_present.load(std::memory_order_acquire) &&
-        context == observed_context.load(std::memory_order_acquire) &&
+        isObservedImmediateContext(context) &&
         resource &&
         unmap_hook_active.load(std::memory_order_acquire)) {
+        void* mapped_ptr = popMappedBuffer(resource);
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
-        if (target && resource != target) {
-            popMappedBuffer(resource);
-            original_unmap.load(std::memory_order_acquire)(context, resource, subresource);
+        if (!mapped_ptr && resource == target) {
+            mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
+        }
+        if (!mapped_ptr) {
+            if (forward) forward(context, resource, subresource);
             return;
         }
         edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
-        void* mapped_ptr = popMappedBuffer(resource);
-        if (!mapped_ptr && resource == scene_map_target.load(std::memory_order_acquire)) {
-            mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
-        }
         if (mapped_ptr) {
             scene_unmaps.fetch_add(1, std::memory_order_relaxed);
             unsigned long long camera = 14695981039346656037ull;
@@ -1478,7 +1571,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             }
         }
     }
-    original_unmap.load(std::memory_order_acquire)(context, resource, subresource);
+    if (forward) forward(context, resource, subresource);
 }
 
 void endDrawProbe() {
@@ -1705,8 +1798,10 @@ void endPipelineSample(ID3D11DeviceContext* context) {
     std::lock_guard lock(seen_mutex);
     for (auto& sample : pipeline_samples) {
         if (!sample.active) continue;
-        logDepthState(context, sample, L"end");
-        context->End(sample.query);
+        ID3D11DeviceContext* ctx = sample.context ? sample.context : context;
+        if (context && sample.context && sample.context != context) continue;
+        logDepthState(ctx, sample, L"end");
+        ctx->End(sample.query);
         sample.active = false;
     }
 }
@@ -1727,6 +1822,7 @@ void beginPipelineSample(ID3D11DeviceContext* context, unsigned bind) {
         EdpeLog(L"EDPE: scene pipeline statistics unavailable (query creation failed)");
         return;
     }
+    sample.context = context;
     sample.bind = bind;
     sample.after_present = last_present_frame.load(std::memory_order_relaxed);
     sample.wait = 0;
@@ -1739,9 +1835,10 @@ void pollPipelineSamples(ID3D11DeviceContext* context) {
     std::lock_guard lock(seen_mutex);
     for (auto& sample : pipeline_samples) {
         if (!sample.query || sample.active) continue;
+        ID3D11DeviceContext* ctx = sample.context ? sample.context : context;
         D3D11_QUERY_DATA_PIPELINE_STATISTICS stats{};
-        const HRESULT result = context->GetData(sample.query, &stats, sizeof(stats),
-            D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        const HRESULT result = ctx ? ctx->GetData(sample.query, &stats, sizeof(stats),
+            D3D11_ASYNC_GETDATA_DONOTFLUSH) : E_FAIL;
         if (result == S_FALSE && ++sample.wait < 120) continue;
         if (result == S_OK) {
             wchar_t message[208];
@@ -1812,6 +1909,7 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
     context->CopyResource(staging, gpu_copy ? gpu_copy.Get() : source);
     if (device) device->Release();
     sample.buffer = staging;
+    sample.context = context;
     sample.bind = bind_ordinal;
     sample.after_present = last_present_frame.load(std::memory_order_relaxed);
     sample.wait = 0;
@@ -1821,9 +1919,10 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
 void pollConstantBufferSamples(ID3D11DeviceContext* context) {
     for (auto& sample : constant_buffer_samples) {
         if (!sample.ready.load(std::memory_order_acquire)) continue;
+        ID3D11DeviceContext* ctx = sample.context ? sample.context : context;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        const HRESULT result = context->Map(sample.buffer, 0, D3D11_MAP_READ,
-            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        const HRESULT result = ctx ? ctx->Map(sample.buffer, 0, D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) : E_FAIL;
         if (SUCCEEDED(result) && mapped.pData) {
             const auto* values = static_cast<const float*>(mapped.pData);
             if (sample.bind == 0 || sample.bind == 51 || sample.bind == 3) {
@@ -1906,7 +2005,7 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
                     EdpeLog(words);
                 }
             }
-            context->Unmap(sample.buffer, 0);
+            ctx->Unmap(sample.buffer, 0);
         } else if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++sample.wait < 120) {
             continue;
         } else {
@@ -1914,6 +2013,7 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
         }
         sample.buffer->Release();
         sample.buffer = nullptr;
+        sample.context = nullptr;
         sample.ready.store(false, std::memory_order_release);
         sample.claimed.store(false, std::memory_order_release);
     }
@@ -1971,19 +2071,27 @@ void takeCameraDeltaSource(ID3D11DeviceContext* context, unsigned long long fram
         scene_map_target.store(buffer, std::memory_order_release);
     }
     camera_delta_source.Attach(buffer);
+    camera_delta_source_context = context;
     camera_delta_source_frame = frame;
 }
 
 // Called when the scene-MRT interval ends: queue a 5376-byte GPU copy.
 void copyCameraDeltaSource(ID3D11DeviceContext* context) {
     if (!camera_delta_source) return;
+    ID3D11DeviceContext* srcCtx = camera_delta_source_context ? camera_delta_source_context : context;
+    if (!srcCtx) return;
     edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::CameraDeltaCopy);
     const auto source = std::move(camera_delta_source);
+    camera_delta_source_context = nullptr;
     if (camera_delta_count == kCameraDeltaRing) {
         ++camera_delta_dropped;
         return;
     }
     auto& slot = camera_delta_ring[(camera_delta_head + camera_delta_count) % kCameraDeltaRing];
+    if (slot.staging && slot.context != srcCtx) {
+        slot.staging.Reset();
+        slot.context = nullptr;
+    }
     if (!slot.staging) { // Created once per slot, never per frame.
         D3D11_BUFFER_DESC desc{};
         source->GetDesc(&desc);
@@ -1993,14 +2101,15 @@ void copyCameraDeltaSource(ID3D11DeviceContext* context) {
         desc.MiscFlags = 0;
         desc.StructureByteStride = 0;
         Microsoft::WRL::ComPtr<ID3D11Device> device;
-        context->GetDevice(&device);
+        srcCtx->GetDevice(&device);
         if (!device || FAILED(device->CreateBuffer(&desc, nullptr, &slot.staging))) {
             camera_delta_disabled = true;
             EdpeLog(L"EDPE: camera delta log disabled (staging creation failed)");
             return;
         }
+        slot.context = srcCtx;
     }
-    context->CopyResource(slot.staging.Get(), source.Get());
+    srcCtx->CopyResource(slot.staging.Get(), source.Get());
     slot.frame = camera_delta_source_frame;
     ++camera_delta_count;
 }
@@ -2009,15 +2118,16 @@ void copyCameraDeltaSource(ID3D11DeviceContext* context) {
 void pollCameraDeltaRing(ID3D11DeviceContext* context) {
     while (camera_delta_count) {
         auto& slot = camera_delta_ring[camera_delta_head];
+        ID3D11DeviceContext* ctx = slot.context ? slot.context : context;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        const HRESULT result = context->Map(slot.staging.Get(), 0, D3D11_MAP_READ,
-            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        const HRESULT result = ctx ? ctx->Map(slot.staging.Get(), 0, D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) : E_FAIL;
         if (result == DXGI_ERROR_WAS_STILL_DRAWING) return;
         if (SUCCEEDED(result) && mapped.pData) {
             edpe::CameraProjection camera{};
             const bool parsed = edpe::parseEliteCamera(static_cast<const float*>(mapped.pData),
                 5376 / sizeof(float), &camera);
-            context->Unmap(slot.staging.Get(), 0);
+            ctx->Unmap(slot.staging.Get(), 0);
             logCameraDelta(slot.frame, parsed, camera);
         } else {
             ++camera_delta_dropped;
@@ -2029,6 +2139,7 @@ void pollCameraDeltaRing(ID3D11DeviceContext* context) {
 
 void resetCameraDelta() {
     camera_delta_source.Reset();
+    camera_delta_source_context = nullptr;
     for (auto& slot : camera_delta_ring) slot = {};
     camera_delta_head = camera_delta_count = 0;
     camera_delta_taken_frame = ~0ull;
@@ -2085,7 +2196,7 @@ void queueCameraPairSample(ID3D11DeviceContext* context, unsigned sample_label) 
 
 void queueMotionDepth(ID3D11DeviceContext* context, ID3D11Texture2D* source,
     const D3D11_TEXTURE2D_DESC& source_desc, unsigned long long after_present) {
-    if (!motion_pair_active || after_present != camera_pair_armed_after + 1) return;
+    if (!motion_pair_active || after_present != camera_pair_sample_frames[1]) return;
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
     D3D11_TEXTURE2D_DESC desc = source_desc;
@@ -2113,7 +2224,7 @@ void queueMotionDepth(ID3D11DeviceContext* context, ID3D11Texture2D* source,
 
 void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
     if (!motion_pair_active || !motion_color_source ||
-        motion_color_frame + 1 != frame || motion_depth_frame != motion_color_frame)
+        frame <= motion_color_frame || motion_depth_frame != motion_color_frame)
         return;
     wchar_t transition[160];
     swprintf_s(transition,
@@ -2216,18 +2327,25 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
 }
 
 void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
+    ID3D11DeviceContext* pairCtx = camera_pair_context ? camera_pair_context : activeSceneContext();
+    if (!pairCtx) pairCtx = context;
     for (auto& sample : camera_pair_depth) {
         ID3D11DepthStencilView* view = nullptr;
+        ID3D11DeviceContext* sampleCtx = nullptr;
         {
             std::lock_guard lock(seen_mutex);
-            if (sample.view && sample.after_present + 1 == frame) {
+            if (sample.view && frame > sample.after_present) {
                 view = sample.view;
                 sample.view = nullptr;
+                sampleCtx = sample.context ? sample.context : pairCtx;
             }
         }
-        if (!view) continue;
+        if (!view || !sampleCtx) {
+            if (view) view->Release();
+            continue;
+        }
         ID3D11DepthStencilView* bound = nullptr;
-        context->OMGetRenderTargets(0, nullptr, &bound);
+        sampleCtx->OMGetRenderTargets(0, nullptr, &bound);
         if (bound) {
             bound->Release();
             view->Release();
@@ -2256,8 +2374,8 @@ void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame
             continue;
         }
         ID3D11Device* device = nullptr;
-        context->GetDevice(&device);
-        queueMotionDepth(context, source, desc, sample.after_present);
+        sampleCtx->GetDevice(&device);
+        queueMotionDepth(sampleCtx, source, desc, sample.after_present);
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -2266,9 +2384,10 @@ void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame
         const HRESULT result = device ? device->CreateTexture2D(&desc, nullptr, &staging) : E_FAIL;
         if (device) device->Release();
         if (SUCCEEDED(result) && staging) {
-            context->CopyResource(staging, source); // One-shot full depth copy; no normal-frame readback.
+            sampleCtx->CopyResource(staging, source); // One-shot full depth copy; no normal-frame readback.
             std::lock_guard lock(seen_mutex);
             sample.staging = staging;
+            sample.context = sampleCtx;
             sample.width = desc.Width;
             sample.height = desc.Height;
             sample.wait = 0;
@@ -2277,16 +2396,17 @@ void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame
         }
         source->Release();
     }
-    queueMotionColor(context, frame);
+    queueMotionColor(pairCtx, frame);
 }
 
 void pollCameraPairDepth(ID3D11DeviceContext* context) {
     std::lock_guard lock(seen_mutex);
     for (auto& sample : camera_pair_depth) {
         if (!sample.staging) continue;
+        ID3D11DeviceContext* ctx = sample.context ? sample.context : context;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        const HRESULT result = context->Map(sample.staging, 0, D3D11_MAP_READ,
-            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        const HRESULT result = ctx ? ctx->Map(sample.staging, 0, D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) : E_FAIL;
         if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++sample.wait < 120) continue;
         if (SUCCEEDED(result) && mapped.pData) {
             float depth = 0;
@@ -2294,7 +2414,7 @@ void pollCameraPairDepth(ID3D11DeviceContext* context) {
                 static_cast<size_t>(sample.height / 2) * mapped.RowPitch +
                 static_cast<size_t>(sample.width / 2) * 8;
             std::memcpy(&depth, pixel, sizeof(depth));
-            context->Unmap(sample.staging, 0);
+            ctx->Unmap(sample.staging, 0);
             wchar_t message[160];
             swprintf_s(message,
                 L"EDPE: adjacent depth afterPresent=%llu centerValid=%u center=%.9g size=%ux%u",
@@ -2306,14 +2426,16 @@ void pollCameraPairDepth(ID3D11DeviceContext* context) {
         }
         sample.staging->Release();
         sample.staging = nullptr;
+        sample.context = nullptr;
     }
 }
 
 void pollMotionGrid(ID3D11DeviceContext* context) {
     if (!motion_grid_readback) return;
+    ID3D11DeviceContext* ctx = motion_grid_context ? motion_grid_context : context;
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    const HRESULT result = context->Map(motion_grid_readback.Get(), 0,
-        D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    const HRESULT result = ctx ? ctx->Map(motion_grid_readback.Get(), 0,
+        D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) : E_FAIL;
     if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++motion_grid_wait < 120) return;
     if (SUCCEEDED(result) && mapped.pData) {
         float min_x = std::numeric_limits<float>::infinity();
@@ -2336,7 +2458,7 @@ void pollMotionGrid(ID3D11DeviceContext* context) {
                 over_ten += magnitude > 10.0f;
             }
         }
-        context->Unmap(motion_grid_readback.Get(), 0);
+        ctx->Unmap(motion_grid_readback.Get(), 0);
         wchar_t message[192];
         swprintf_s(message,
             L"EDPE: motion candidate currentAfterPresent=%llu center=(%.6g,%.6g) pixels finite=%u",
@@ -2351,10 +2473,13 @@ void pollMotionGrid(ID3D11DeviceContext* context) {
         EdpeLog(L"EDPE: motion candidate grid unavailable (nonblocking readback failed)");
     }
     motion_grid_readback.Reset();
+    motion_grid_context = nullptr;
 }
 
-void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
+void tryMotionPair(ID3D11DeviceContext* fallback_context, unsigned long long frame) {
     if (!motion_pair_active) return;
+    ID3D11DeviceContext* context = camera_pair_context ? camera_pair_context : activeSceneContext();
+    if (!context) context = fallback_context;
     if (frame > camera_pair_armed_after + 120) {
         EdpeLog(L"EDPE: motion candidate unavailable (camera/depth pair timed out)");
         motion_pair_active = false;
@@ -2366,15 +2491,21 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         motion_clean_color_target.Reset();
         return;
     }
-    if (motion_camera_frames[0] != camera_pair_armed_after ||
-        motion_camera_frames[1] != camera_pair_armed_after + 1 ||
-        motion_depth_frame != camera_pair_armed_after + 1 ||
+    if (camera_pair_sample_frames[0] == ~0ull ||
+        camera_pair_sample_frames[1] == ~0ull ||
+        motion_camera_frames[0] != camera_pair_sample_frames[0] ||
+        motion_camera_frames[1] != camera_pair_sample_frames[1] ||
+        motion_depth_frame != camera_pair_sample_frames[1] ||
         !motion_depth_view) return;
 
     D3D11_TEXTURE2D_DESC desc{};
     motion_depth->GetDesc(&desc);
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
+    static ID3D11Device* s_motion_pass_device = nullptr;
+    if (motion_pass && s_motion_pass_device != device.Get()) {
+        motion_pass.reset();
+    }
     if (!motion_pass) {
         auto candidate = std::make_unique<edpe::MotionPass>();
         if (!candidate->initialize(device.Get(), context)) {
@@ -2387,6 +2518,7 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
             return;
         }
         motion_pass = std::move(candidate);
+        s_motion_pass_device = device.Get();
     }
     const bool gpu_cameras = gpu_camera_pair[0] && gpu_camera_pair[1];
     const bool gpu_rendered = gpu_cameras && motion_pass->renderGpuCameras(
@@ -2434,6 +2566,7 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
     if (FAILED(device->CreateTexture2D(&read_desc, nullptr, &motion_grid_readback))) {
         EdpeLog(L"EDPE: motion candidate unavailable (grid readback creation failed)");
     } else {
+        motion_grid_context = context;
         for (UINT row = 0; row < 5; ++row) for (UINT column = 0; column < 5; ++column) {
             const UINT x = (column * (desc.Width - 1) + 2) / 4;
             const UINT y = (row * (desc.Height - 1) + 2) / 4;
@@ -2484,8 +2617,74 @@ static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_backbuffer_copy_srv;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_copy_rtv;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlaa_input;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlaa_input_srv;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
+static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
+static ID3D11Texture2D* s_cached_backbuffer_ptr = nullptr;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_present;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_scene;
+static ID3D11Device* s_shared_present_dev = nullptr;
+static ID3D11Device* s_shared_scene_dev = nullptr;
+static ID3D11Device* s_temporal_resources_device = nullptr;
+static unsigned long long s_last_reconstructed_frame = ~0ull;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_final_output_present;
 static edpe::TemporalFrameInputs s_last_temporal_inputs{};
 static unsigned long long s_last_temporal_inputs_frame = ~0ull;
+
+bool ensureSharedBackbufferBridge(ID3D11Device* presentDevice, ID3D11Device* sceneDevice,
+    const D3D11_TEXTURE2D_DESC& bbDesc) {
+    if (!presentDevice || !sceneDevice) return false;
+    const DXGI_FORMAT fmt = concreteLdrColorFormat(bbDesc.Format);
+    if (s_shared_bb_present && s_shared_bb_scene &&
+        s_shared_present_dev == presentDevice && s_shared_scene_dev == sceneDevice) {
+        D3D11_TEXTURE2D_DESC cur{};
+        s_shared_bb_present->GetDesc(&cur);
+        if (cur.Width == bbDesc.Width && cur.Height == bbDesc.Height && cur.Format == fmt) {
+            return true;
+        }
+    }
+    s_shared_bb_present.Reset();
+    s_shared_bb_scene.Reset();
+    s_shared_present_dev = nullptr;
+    s_shared_scene_dev = nullptr;
+
+    D3D11_TEXTURE2D_DESC sharedDesc{};
+    sharedDesc.Width = bbDesc.Width;
+    sharedDesc.Height = bbDesc.Height;
+    sharedDesc.MipLevels = 1;
+    sharedDesc.ArraySize = 1;
+    sharedDesc.Format = fmt;
+    sharedDesc.SampleDesc.Count = 1;
+    sharedDesc.Usage = D3D11_USAGE_DEFAULT;
+    sharedDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+    if (FAILED(presentDevice->CreateTexture2D(&sharedDesc, nullptr, &s_shared_bb_present))) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IDXGIResource> dxgiRes;
+    HANDLE sharedHandle = nullptr;
+    if (FAILED(s_shared_bb_present.As(&dxgiRes)) ||
+        FAILED(dxgiRes->GetSharedHandle(&sharedHandle)) || !sharedHandle) {
+        s_shared_bb_present.Reset();
+        return false;
+    }
+    if (FAILED(sceneDevice->OpenSharedResource(sharedHandle, __uuidof(ID3D11Texture2D),
+            reinterpret_cast<void**>(s_shared_bb_scene.GetAddressOf())))) {
+        s_shared_bb_present.Reset();
+        return false;
+    }
+    s_shared_present_dev = presentDevice;
+    s_shared_scene_dev = sceneDevice;
+    wchar_t msg[220];
+    swprintf_s(msg,
+        L"EDPE: initialized cross-device shared backbuffer bridge %ux%u format=%u (presentDev=%p -> sceneDev=%p)",
+        bbDesc.Width, bbDesc.Height, static_cast<unsigned>(fmt), presentDevice, sceneDevice);
+    EdpeLog(msg);
+    return true;
+}
+
+OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context);
 
 // - When render resolution == output resolution (DLAA), evaluates on the finished
 //   LDR backbuffer (tone mapped, HUD included).
@@ -2502,6 +2701,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const bool upscale_active = upscaler.isReconstructionActive();
     const bool debug_view_active = s_jitter_debug_view.load(std::memory_order_relaxed);
     if ((!upscale_active && !debug_view_active) || !context || !backbuffer) return;
+
+    ID3D11DeviceContext* presentCtx = context;
+    ID3D11Texture2D* presentBackbuffer = backbuffer;
 
     const wchar_t* skip = nullptr;
     if (!motion_color_source || !scene_depth_source) skip = L"scene color/depth not observed";
@@ -2524,14 +2726,33 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
     }
     if (skip) {
-        if (++s_consecutive_skipped_frames > 2) {
+        if (motion_color_frame != rendered && upscale_active &&
+            s_last_reconstructed_frame != ~0ull && rendered > s_last_reconstructed_frame &&
+            rendered - s_last_reconstructed_frame <= 2) {
+            if (s_last_final_output_present) {
+                D3D11_TEXTURE2D_DESC bbDesc{}, lastDesc{};
+                presentBackbuffer->GetDesc(&bbDesc);
+                s_last_final_output_present->GetDesc(&lastDesc);
+                if (bbDesc.Width == lastDesc.Width && bbDesc.Height == lastDesc.Height) {
+                    presentCtx->CopyResource(presentBackbuffer, s_last_final_output_present.Get());
+                }
+            }
+            return;
+        }
+        if (++s_consecutive_skipped_frames > 4) {
             s_camera_reset = true;
+        }
+        if (upscale_active && (s_consecutive_skipped_frames == 10 || s_consecutive_skipped_frames % 600 == 0)) {
+            wchar_t msg[192];
+            swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu streak=%u (%ls)",
+                frame, s_consecutive_skipped_frames, skip);
+            EdpeLog(msg);
         }
         return;
     }
 
     D3D11_TEXTURE2D_DESC backbufferDesc{};
-    backbuffer->GetDesc(&backbufferDesc);
+    presentBackbuffer->GetDesc(&backbufferDesc);
     if (!backbufferDesc.Width || !backbufferDesc.Height || backbufferDesc.SampleDesc.Count != 1) return;
 
     D3D11_TEXTURE2D_DESC depthDesc{};
@@ -2539,6 +2760,46 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (!depthDesc.Width || !depthDesc.Height ||
         depthDesc.Width > backbufferDesc.Width || depthDesc.Height > backbufferDesc.Height) {
         return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device> presentDevice;
+    presentCtx->GetDevice(&presentDevice);
+    if (!presentDevice) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> sceneDevice;
+    scene_depth_source->GetDevice(&sceneDevice);
+    if (!sceneDevice) sceneDevice = presentDevice;
+
+    const bool crossDevice = (sceneDevice.Get() != presentDevice.Get());
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> sceneCtxHolder;
+    if (crossDevice) {
+        sceneDevice->GetImmediateContext(&sceneCtxHolder);
+        if (!sceneCtxHolder) return;
+        if (!ensureSharedBackbufferBridge(presentDevice.Get(), sceneDevice.Get(), backbufferDesc)) {
+            return;
+        }
+        presentCtx->CopyResource(s_shared_bb_present.Get(), presentBackbuffer);
+        presentCtx->Flush();
+        context = sceneCtxHolder.Get();
+        backbuffer = s_shared_bb_scene.Get();
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device = sceneDevice;
+    if (s_temporal_resources_device != device.Get()) {
+        s_dlaa_input.Reset();
+        s_dlaa_input_srv.Reset();
+        motion_depth.Reset();
+        motion_depth_view.Reset();
+        motion_pass.reset();
+        s_dlss_output_texture.Reset();
+        s_dlss_output_srv.Reset();
+        s_backbuffer_copy.Reset();
+        s_backbuffer_copy_srv.Reset();
+        s_backbuffer_copy_rtv.Reset();
+        s_backbuffer_rtv.Reset();
+        s_cached_backbuffer_ptr = nullptr;
+        ui_composite_pass.reset();
+        s_temporal_resources_device = device.Get();
     }
 
     const bool isSubNative = (depthDesc.Width < backbufferDesc.Width ||
@@ -2559,7 +2820,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         } else if (!isSubNative) {
             colorSource = scene_hdr_color_source ? scene_hdr_color_source.Get() : backbuffer;
         } else {
-            if (++s_consecutive_skipped_frames > 2) {
+            if (++s_consecutive_skipped_frames > 4) {
                 s_camera_reset = true;
             }
             return;
@@ -2572,7 +2833,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         } else if (!isSubNative) {
             colorSource = backbuffer;
         } else {
-            if (++s_consecutive_skipped_frames > 2) {
+            if (++s_consecutive_skipped_frames > 4) {
                 s_camera_reset = true;
             }
             static unsigned long long s_last_ldr_log = ~0ull;
@@ -2618,10 +2879,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             frame, depthDesc.Width, depthDesc.Height, backbufferDesc.Width, backbufferDesc.Height);
         EdpeLog(msg);
     }
-
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
-    if (!device) return;
 
     const DXGI_FORMAT inputFormat = concreteLdrColorFormat(srcColorDesc.Format);
 
@@ -2685,10 +2942,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     ID3D11RenderTargetView* savedRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     ID3D11DepthStencilView* savedDsv = nullptr;
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, &savedDsv);
-    if (savedDsv) {
-        if (const auto rawSet = original.load(std::memory_order_acquire)) {
-            rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, nullptr);
-        }
+    const OMSetRenderTargetsFn rawSet = resolveOriginalOM(context);
+    if (savedDsv && rawSet) {
+        rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, nullptr);
     }
     struct RestoreTargetsGuard {
         ID3D11DeviceContext* ctx;
@@ -2704,7 +2960,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             }
             if (dsv) dsv->Release();
         }
-    } restoreTargets{context, original.load(std::memory_order_acquire), savedRtvs, savedDsv};
+    } restoreTargets{context, rawSet, savedRtvs, savedDsv};
 
     context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
 
@@ -2833,11 +3089,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (!upscale_active) {
         s_camera_reset = false;
     } else {
-        static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
-        static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
-        static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
-        static ID3D11Texture2D* s_cached_backbuffer_ptr = nullptr;
-
         const DXGI_FORMAT bbFormat = concreteLdrColorFormat(backbufferDesc.Format);
         const DXGI_FORMAT outFormat = isHdrColor ? srcColorDesc.Format : bbFormat;
 
@@ -2963,6 +3214,16 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     }
                 }
             }
+
+            if (crossDevice) {
+                context->Flush();
+                presentCtx->CopyResource(presentBackbuffer, s_shared_bb_present.Get());
+                s_last_final_output_present = s_shared_bb_present;
+                s_last_reconstructed_frame = rendered;
+            } else {
+                s_last_final_output_present.Reset();
+                s_last_reconstructed_frame = rendered;
+            }
         }
 
         {
@@ -3040,18 +3301,49 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
     ID3D11Texture2D* backbuffer) {
     if (!context || !backbuffer) return;
 
+    ID3D11DeviceContext* presentCtx = context;
+    ID3D11Texture2D* presentBackbuffer = backbuffer;
+
     D3D11_TEXTURE2D_DESC bbDesc{};
-    backbuffer->GetDesc(&bbDesc);
+    presentBackbuffer->GetDesc(&bbDesc);
     if (!bbDesc.Width || !bbDesc.Height || bbDesc.SampleDesc.Count != 1) return;
 
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
-    if (!device) return;
+    Microsoft::WRL::ComPtr<ID3D11Device> presentDevice;
+    presentCtx->GetDevice(&presentDevice);
+    if (!presentDevice) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device = presentDevice;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> sceneCtxHolder;
+    const bool crossDevice = (s_temporal_resources_device &&
+                              s_temporal_resources_device != presentDevice.Get() &&
+                              s_last_temporal_inputs_frame == rendered);
+    if (crossDevice) {
+        s_temporal_resources_device->GetImmediateContext(&sceneCtxHolder);
+        if (!sceneCtxHolder || !ensureSharedBackbufferBridge(presentDevice.Get(), s_temporal_resources_device, bbDesc)) {
+            return;
+        }
+        presentCtx->CopyResource(s_shared_bb_present.Get(), presentBackbuffer);
+        presentCtx->Flush();
+        context = sceneCtxHolder.Get();
+        backbuffer = s_shared_bb_scene.Get();
+        device = s_temporal_resources_device;
+    }
 
     static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_debug_input_copy;
     static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_debug_input_srv;
     static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_debug_backbuffer_rtv;
     static ID3D11Texture2D* s_debug_cached_backbuffer = nullptr;
+    static ID3D11Device* s_debug_pass_device = nullptr;
+    static std::unique_ptr<edpe::JitterDebugPass> s_jitter_debug_pass;
+
+    if (s_debug_pass_device != device.Get()) {
+        s_debug_input_copy.Reset();
+        s_debug_input_srv.Reset();
+        s_debug_backbuffer_rtv.Reset();
+        s_debug_cached_backbuffer = nullptr;
+        s_jitter_debug_pass.reset();
+        s_debug_pass_device = device.Get();
+    }
 
     if (s_debug_cached_backbuffer != backbuffer || !s_debug_backbuffer_rtv) {
         s_debug_cached_backbuffer = backbuffer;
@@ -3061,7 +3353,6 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         }
     }
 
-    static std::unique_ptr<edpe::JitterDebugPass> s_jitter_debug_pass;
     if (!s_jitter_debug_pass) {
         auto pass = std::make_unique<edpe::JitterDebugPass>();
         if (!pass->initialize(device.Get(), context)) {
@@ -3132,6 +3423,11 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         reset,
         isHdr);
 
+    if (crossDevice) {
+        context->Flush();
+        presentCtx->CopyResource(presentBackbuffer, s_shared_bb_present.Get());
+    }
+
     auto& recorder = edpe::JitterViewRecorder::instance();
     if (recorder.isActive()) {
         const auto& passInfo = s_jitter_debug_pass->getLastFrameInfo();
@@ -3194,7 +3490,7 @@ bool isMainSceneMrtDepth(const D3D11_TEXTURE2D_DESC& dd, UINT outW, UINT outH, b
 
 void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
-    if (context == observed_context.load(std::memory_order_acquire)) {
+    if (isObservedImmediateContext(context)) {
         copyCameraDeltaSource(context);
         rearmHudDrawProbe();
     }
@@ -3490,20 +3786,27 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         const bool is_pair_ctx = (!camera_pair_context || camera_pair_context == context);
         if (is_pair_ctx && camera_pair_target == static_cast<int>(index)) {
             const auto frame = last_present_frame.load(std::memory_order_relaxed);
-            if (frame == camera_pair_armed_after || frame == camera_pair_armed_after + 1) {
+            if (frame >= camera_pair_armed_after && camera_pair_sample_frames[1] == ~0ull) {
                 if (camera_pair_bind_frame != frame) {
                     camera_pair_bind_frame = frame;
                     camera_pair_bind_count = 0;
                 }
                 if (++camera_pair_bind_count == 3 && is_main_scene &&
-                    ctx_seen[index].mrt_frame == frame && ctx_seen[index].mrt_hdr_view)
-                    camera_pair_sample = frame == camera_pair_armed_after
-                        ? kPairFirstSample : kPairSecondSample;
+                    ctx_seen[index].mrt_frame == frame && ctx_seen[index].mrt_hdr_view) {
+                    if (camera_pair_sample_frames[0] == ~0ull) {
+                        camera_pair_sample_frames[0] = frame;
+                        camera_pair_sample = kPairFirstSample;
+                    } else if (frame > camera_pair_sample_frames[0]) {
+                        camera_pair_sample_frames[1] = frame;
+                        camera_pair_sample = kPairSecondSample;
+                    }
+                }
                 if (camera_pair_sample) {
                     auto& depth = camera_pair_depth[camera_pair_sample - kPairFirstSample];
                     if (!depth.view && !depth.staging) {
                         dsv->AddRef();
                         depth.view = dsv;
+                        depth.context = context;
                         depth.after_present = frame;
                     }
                     if (motion_pair_active && camera_pair_sample == kPairSecondSample &&
@@ -3689,7 +3992,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         if (forward) forward(context, count, targets, dsv);
         return;
     }
-    if (context == observed_context.load(std::memory_order_acquire)) {
+    if (isObservedImmediateContext(context)) {
         endVSBufferProbe();
         endPipelineSample(context);
     }
@@ -3745,7 +4048,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
         if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
         return;
     }
-    if (context == observed_context.load(std::memory_order_acquire)) {
+    if (isObservedImmediateContext(context)) {
         endVSBufferProbe();
         endPipelineSample(context);
     }
@@ -3883,6 +4186,36 @@ void rearmContextHooks() {
             patched_table[kUnmap],
             reinterpret_cast<void*>(&observedUnmap));
     }
+
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    const bool map_active = map_hook_active.load(std::memory_order_acquire);
+    const bool unmap_active = unmap_hook_active.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        auto& entry = s_hooked_tables[i];
+        if (!entry.table) continue;
+        if (entry.orig_om &&
+            entry.table[kOMSetRenderTargets] != reinterpret_cast<void*>(&observedOMSetRenderTargets)) {
+            patchSlot(entry.table, kOMSetRenderTargets, entry.table[kOMSetRenderTargets],
+                reinterpret_cast<void*>(&observedOMSetRenderTargets));
+        }
+        if (entry.orig_om_uav &&
+            entry.table[kOMSetRenderTargetsAndUnorderedAccessViews] !=
+                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews)) {
+            patchSlot(entry.table, kOMSetRenderTargetsAndUnorderedAccessViews,
+                entry.table[kOMSetRenderTargetsAndUnorderedAccessViews],
+                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
+        }
+        if (map_active && entry.orig_map &&
+            entry.table[kMap] != reinterpret_cast<void*>(&observedMap)) {
+            patchSlot(entry.table, kMap, entry.table[kMap],
+                reinterpret_cast<void*>(&observedMap));
+        }
+        if (unmap_active && entry.orig_unmap &&
+            entry.table[kUnmap] != reinterpret_cast<void*>(&observedUnmap)) {
+            patchSlot(entry.table, kUnmap, entry.table[kUnmap],
+                reinterpret_cast<void*>(&observedUnmap));
+        }
+    }
 }
 } // namespace
 
@@ -3925,21 +4258,21 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         ~PresentScopeGuard() { s_in_edpe_present.store(false, std::memory_order_release); }
     } present_scope_guard;
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
-        auto* context = observed_context.load(std::memory_order_acquire);
+        auto* context = activeSceneContext();
         endHudDrawProbe();
         endVSBufferProbe();
         endPipelineSample(context);
         pollPipelineSamples(context);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
-        pollConstantBufferSamples(observed_context.load(std::memory_order_acquire));
+        pollConstantBufferSamples(activeSceneContext());
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
-        auto* context = observed_context.load(std::memory_order_acquire);
+        auto* context = activeSceneContext();
         copyCameraDeltaSource(context);
         pollCameraDeltaRing(context);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
-        auto* context = observed_context.load(std::memory_order_acquire);
+        auto* context = activeSceneContext();
         queueCameraPairDepth(context, frame);
         pollCameraPairDepth(context);
         pollMotionGrid(context);
@@ -3952,7 +4285,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         int finished_pair = -1;
         {
             std::lock_guard lock(seen_mutex);
-            if (camera_pair_target >= 0 && frame >= camera_pair_armed_after + 2) {
+            if (camera_pair_target >= 0 &&
+                ((camera_pair_sample_frames[1] != ~0ull && frame > camera_pair_sample_frames[1]) ||
+                 frame >= camera_pair_armed_after + 120)) {
                 finished_pair = camera_pair_target;
                 camera_pair_target = -1;
                 for (auto& sample : camera_pair_depth) {
@@ -4280,6 +4615,7 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             camera_pair_target = camera_pair_queued;
             camera_pair_queued = -1;
             camera_pair_armed_after = last_present_frame.load(std::memory_order_relaxed);
+            camera_pair_sample_frames = {~0ull, ~0ull};
             camera_pair_bind_frame = ~0ull;
             camera_pair_bind_count = 0;
             motion_pair_active = motion_pair_queued;
@@ -4511,6 +4847,20 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         scene_hdr_color_frame = ~0ull;
         s_dlaa_input.Reset();
         s_dlaa_input_srv.Reset();
+        s_dlss_output_texture.Reset();
+        s_dlss_output_srv.Reset();
+        s_backbuffer_copy.Reset();
+        s_backbuffer_copy_srv.Reset();
+        s_backbuffer_copy_rtv.Reset();
+        s_backbuffer_rtv.Reset();
+        s_cached_backbuffer_ptr = nullptr;
+        s_shared_bb_present.Reset();
+        s_shared_bb_scene.Reset();
+        s_last_final_output_present.Reset();
+        s_shared_present_dev = nullptr;
+        s_shared_scene_dev = nullptr;
+        s_temporal_resources_device = nullptr;
+        s_last_reconstructed_frame = ~0ull;
         s_last_temporal_inputs = {};
         s_last_temporal_inputs_frame = ~0ull;
         s_in_scene_camera_latched_frame = ~0ull;
@@ -4534,9 +4884,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_color_bound = motion_color_rebound =
             motion_color_first_exit_logged = false;
         motion_grid_readback.Reset();
+        motion_grid_context = nullptr;
         motion_snapshot.Reset();
         motion_pass.reset();
         motion_camera_frames = {~0ull, ~0ull};
+        camera_pair_sample_frames = {~0ull, ~0ull};
         gpu_camera_pair = {};
         motion_depth_frame = ~0ull;
         camera_pair_bind_frame = ~0ull;
@@ -4552,13 +4904,15 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     for (auto& sample : constant_buffer_samples) {
         if (sample.buffer) sample.buffer->Release();
         sample.buffer = nullptr;
+        sample.context = nullptr;
         sample.ready.store(false, std::memory_order_release);
         sample.claimed.store(false, std::memory_order_release);
     }
     {
         std::lock_guard lock(seen_mutex);
         for (auto& sample : pipeline_samples) {
-            if (sample.active) observed_context.load(std::memory_order_acquire)->End(sample.query);
+            auto* end_ctx = sample.context ? sample.context : observed_context.load(std::memory_order_acquire);
+            if (sample.active && end_ctx) end_ctx->End(sample.query);
             if (sample.query) sample.query->Release();
             sample = {};
         }
@@ -4592,6 +4946,16 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
                 patchSlot(entry.table, kFinishCommandList,
                     reinterpret_cast<void*>(&observedFinishCommandList),
                     reinterpret_cast<void*>(entry.orig_finish));
+            }
+            if (entry.orig_map) {
+                patchSlot(entry.table, kMap,
+                    reinterpret_cast<void*>(&observedMap),
+                    reinterpret_cast<void*>(entry.orig_map));
+            }
+            if (entry.orig_unmap) {
+                patchSlot(entry.table, kUnmap,
+                    reinterpret_cast<void*>(&observedUnmap),
+                    reinterpret_cast<void*>(entry.orig_unmap));
             }
         }
     }
@@ -4856,6 +5220,8 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
         }
     }
 
+    const bool is_immediate = (context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE);
+
     bool sharedPatchOk = alreadyHooked;
     if (!alreadyHooked) {
         HookedTableEntry entry{};
@@ -4865,6 +5231,10 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             table[kOMSetRenderTargetsAndUnorderedAccessViews]);
         entry.orig_exec = reinterpret_cast<ExecuteCommandListFn>(table[kExecuteCommandList]);
         entry.orig_finish = reinterpret_cast<FinishCommandListFn>(table[kFinishCommandList]);
+        if (is_immediate) {
+            entry.orig_map = reinterpret_cast<MapFn>(table[kMap]);
+            entry.orig_unmap = reinterpret_cast<UnmapFn>(table[kUnmap]);
+        }
 
         bool om_ok = (entry.orig_om == &observedOMSetRenderTargets);
         if (entry.orig_om && entry.orig_om != &observedOMSetRenderTargets) {
@@ -4889,6 +5259,26 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             patchSlot(table, kFinishCommandList, reinterpret_cast<void*>(entry.orig_finish),
                 reinterpret_cast<void*>(&observedFinishCommandList));
         }
+        if (is_immediate) {
+            if (entry.orig_map && entry.orig_map != &observedMap) {
+                if (!original_map.load(std::memory_order_relaxed)) {
+                    original_map.store(entry.orig_map, std::memory_order_release);
+                }
+                if (map_hook_active.load(std::memory_order_acquire)) {
+                    patchSlot(table, kMap, reinterpret_cast<void*>(entry.orig_map),
+                        reinterpret_cast<void*>(&observedMap));
+                }
+            }
+            if (entry.orig_unmap && entry.orig_unmap != &observedUnmap) {
+                if (!original_unmap.load(std::memory_order_relaxed)) {
+                    original_unmap.store(entry.orig_unmap, std::memory_order_release);
+                }
+                if (unmap_hook_active.load(std::memory_order_acquire)) {
+                    patchSlot(table, kUnmap, reinterpret_cast<void*>(entry.orig_unmap),
+                        reinterpret_cast<void*>(&observedUnmap));
+                }
+            }
+        }
         sharedPatchOk = om_ok && uav_ok;
 
         std::lock_guard lock(s_hooked_tables_mutex);
@@ -4901,6 +5291,12 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
                     s_hooked_tables[i].orig_om_uav = entry.orig_om_uav;
                 if (entry.orig_exec != &observedExecuteCommandList) s_hooked_tables[i].orig_exec = entry.orig_exec;
                 if (entry.orig_finish != &observedFinishCommandList) s_hooked_tables[i].orig_finish = entry.orig_finish;
+                if (is_immediate) {
+                    if (entry.orig_map && entry.orig_map != &observedMap)
+                        s_hooked_tables[i].orig_map = entry.orig_map;
+                    if (entry.orig_unmap && entry.orig_unmap != &observedUnmap)
+                        s_hooked_tables[i].orig_unmap = entry.orig_unmap;
+                }
                 found = true;
                 break;
             }
@@ -4924,10 +5320,20 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             clone->orig_om = reinterpret_cast<OMSetRenderTargetsFn>(table[kOMSetRenderTargets]);
             clone->orig_om_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(
                 table[kOMSetRenderTargetsAndUnorderedAccessViews]);
+            if (is_immediate) {
+                clone->orig_map = reinterpret_cast<MapFn>(table[kMap]);
+                clone->orig_unmap = reinterpret_cast<UnmapFn>(table[kUnmap]);
+            }
             std::memcpy(clone->methods, table, sizeof(clone->methods));
             clone->methods[kOMSetRenderTargets] = reinterpret_cast<void*>(&observedOMSetRenderTargets);
             clone->methods[kOMSetRenderTargetsAndUnorderedAccessViews] =
                 reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews);
+            if (is_immediate && map_hook_active.load(std::memory_order_acquire)) {
+                clone->methods[kMap] = reinterpret_cast<void*>(&observedMap);
+            }
+            if (is_immediate && unmap_hook_active.load(std::memory_order_acquire)) {
+                clone->methods[kUnmap] = reinterpret_cast<void*>(&observedUnmap);
+            }
             *reinterpret_cast<void***>(context) = clone->methods;
             s_cloned_contexts[cloneCount] = std::move(clone);
             s_cloned_context_count.store(cloneCount + 1, std::memory_order_release);

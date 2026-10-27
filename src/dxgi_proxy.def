@@ -11,3 +11,4 @@ EXPORTS
     EDPE_RequestCameraPair=EdpeRequestCameraPair
     EDPE_RequestMotionPair=EdpeRequestMotionPair
     EDPE_SceneDepthCandidate=EdpeSceneDepthCandidate
+    EDPE_SetJitterTestOverride=EdpeSetJitterTestOverride

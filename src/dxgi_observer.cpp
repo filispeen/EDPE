@@ -212,15 +212,28 @@ void logContextDispatch(IDXGISwapChain* swap_chain, unsigned long long frame) {
 
 HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
     const auto frame = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    static std::atomic<bool> s_present_device_logged{false};
-    if (!s_present_device_logged.exchange(true)) {
-        ID3D11Device* presentDevice = nullptr;
-        if (SUCCEEDED(swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&presentDevice))) && presentDevice) {
-            ContextCensusLogPresentDevice(swap_chain, presentDevice);
-            presentDevice->Release();
+    static IDXGISwapChain* s_logged_swapchains[8]{};
+    static std::atomic<size_t> s_logged_swapchain_count{0};
+    bool already_logged_sc = false;
+    const size_t sc_count = s_logged_swapchain_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < sc_count; ++i) {
+        if (s_logged_swapchains[i] == swap_chain) {
+            already_logged_sc = true;
+            break;
         }
     }
-    if (frame == 1) logFirstPresent(swap_chain);
+    if (!already_logged_sc && sc_count < 8) {
+        const size_t idx = s_logged_swapchain_count.fetch_add(1, std::memory_order_acq_rel);
+        if (idx < 8) {
+            s_logged_swapchains[idx] = swap_chain;
+            ID3D11Device* presentDevice = nullptr;
+            if (SUCCEEDED(swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&presentDevice))) && presentDevice) {
+                ContextCensusLogPresentDevice(swap_chain, presentDevice);
+                presentDevice->Release();
+            }
+            logFirstPresent(swap_chain);
+        }
+    }
     if (frame <= 8 || (frame <= 32768 && frame % 1024 == 0)) logContextDispatch(swap_chain, frame);
     edpe::PerfTracker::instance().onPresentStart(swap_chain);
     ContextCensusOnPresent(swap_chain, frame, flags);
