@@ -93,14 +93,16 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
 
     if (lastPresentStart_.QuadPart > 0 && perfFreq_.QuadPart > 0) {
         const double deltaMs = static_cast<double>(now.QuadPart - lastPresentStart_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
-        if (deltaMs > 0.1 && deltaMs < 1000.0) {
+        if (deltaMs >= 1.5 && deltaMs < 1000.0) {
             telemetry_.totalFrametimeMs = static_cast<float>(deltaMs);
             smoothedFrametimeMs_ = smoothedFrametimeMs_ * 0.90f + telemetry_.totalFrametimeMs * 0.10f;
             telemetry_.fps = (smoothedFrametimeMs_ > 0.0f) ? (1000.0f / smoothedFrametimeMs_) : 0.0f;
+            lastPresentStart_ = now;
         }
+    } else {
+        lastPresentStart_ = now;
     }
     currentPresentStart_ = now;
-    lastPresentStart_ = now;
 
     // Retrieve active upscaler timing
     auto& upscaler = UpscalerManager::instance();

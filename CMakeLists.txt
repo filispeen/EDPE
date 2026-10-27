@@ -160,6 +160,7 @@ if(EDPE_HAVE_NGX)
 endif()
 add_test(NAME proxy_alias_smoke COMMAND "${EDPE_STAGE}/proxy_smoke.exe"
     "${EDPE_STAGE}/dxgi.dll" "${EDPE_STAGE}/edpe.log")
+set_tests_properties(proxy_alias_smoke PROPERTIES RUN_SERIAL TRUE)
 
 # === NGX PROBE (standalone, never part of EDPE.dll or the proxy) ===
 # ngx_probe       child: real NGX SDK calls on a hardware adapter, one log line per stage

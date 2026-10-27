@@ -1391,6 +1391,25 @@ UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context) {
     return original_unmap.load(std::memory_order_acquire);
 }
 
+static constexpr size_t kRejectedCacheSize = 256;
+static std::atomic<ID3D11Resource*> s_rejected_map_resources[kRejectedCacheSize]{};
+
+inline bool isResourceCachedRejected(ID3D11Resource* res) {
+    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
+    return s_rejected_map_resources[slot].load(std::memory_order_relaxed) == res;
+}
+
+inline void cacheRejectedResource(ID3D11Resource* res) {
+    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
+    s_rejected_map_resources[slot].store(res, std::memory_order_relaxed);
+}
+
+inline void clearRejectedResourceCache() {
+    for (size_t i = 0; i < kRejectedCacheSize; ++i) {
+        s_rejected_map_resources[i].store(nullptr, std::memory_order_relaxed);
+    }
+}
+
 HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
     const MapFn forward = resolveOriginalMap(context);
@@ -1402,9 +1421,9 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
         bool is_scene_cb = (resource == target);
         const bool probe_active = vs_buffer_probe_active.load(std::memory_order_relaxed);
-        if (is_scene_cb || !target || !probe_active) {
-            edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
-            if (!is_scene_cb) {
+        if (!is_scene_cb) {
+            if (!isResourceCachedRejected(resource)) {
+                edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
                 D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
                 resource->GetType(&dimension);
                 if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
@@ -1424,9 +1443,13 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
                                 scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
                                 EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
                             }
+                        } else {
+                            cacheRejectedResource(resource);
                         }
                         buffer->Release();
                     }
+                } else {
+                    cacheRejectedResource(resource);
                 }
             }
         }
@@ -2726,19 +2749,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
     }
     if (skip) {
-        if (motion_color_frame != rendered && upscale_active &&
-            s_last_reconstructed_frame != ~0ull && rendered > s_last_reconstructed_frame &&
-            rendered - s_last_reconstructed_frame <= 2) {
-            if (s_last_final_output_present) {
-                D3D11_TEXTURE2D_DESC bbDesc{}, lastDesc{};
-                presentBackbuffer->GetDesc(&bbDesc);
-                s_last_final_output_present->GetDesc(&lastDesc);
-                if (bbDesc.Width == lastDesc.Width && bbDesc.Height == lastDesc.Height) {
-                    presentCtx->CopyResource(presentBackbuffer, s_last_final_output_present.Get());
-                }
-            }
-            return;
-        }
         if (++s_consecutive_skipped_frames > 4) {
             s_camera_reset = true;
         }
@@ -2811,9 +2821,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const bool hdrInput = edpe::Config::instance().hdrInput;
     ID3D11Texture2D* colorSource = nullptr;
     if (hdrInput) {
-        if (scene_hdr_color_source && scene_hdr_color_frame == rendered) {
+        if (isSubNative && scene_hdr_color_source && scene_hdr_color_frame == rendered) {
             colorSource = scene_hdr_color_source.Get();
-        } else if (scene_ldr_source && scene_ldr_frame == rendered) {
+        } else if (isSubNative && scene_ldr_source && scene_ldr_frame == rendered) {
             colorSource = scene_ldr_source.Get();
         } else if (isSubNative && scene_ldr_source) {
             colorSource = scene_ldr_source.Get();
@@ -2826,7 +2836,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             return;
         }
     } else {
-        if (scene_ldr_source && scene_ldr_frame == rendered) {
+        if (isSubNative && scene_ldr_source && scene_ldr_frame == rendered) {
             colorSource = scene_ldr_source.Get();
         } else if (isSubNative && scene_ldr_source) {
             colorSource = scene_ldr_source.Get();
@@ -3156,7 +3166,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (upscaler.evaluate(context, inputs, nullptr, evalDestination)) {
             s_camera_reset = false;
 
-            const bool canCompositeUi = (s_preserve_native_ui.load(std::memory_order_relaxed) &&
+            const bool canCompositeUi = (isSubNative &&
+                                         s_preserve_native_ui.load(std::memory_order_relaxed) &&
                                          evalDestination == s_dlss_output_texture.Get() &&
                                          s_dlss_output_srv && s_backbuffer_copy_srv &&
                                          s_dlaa_input_srv && s_backbuffer_rtv &&
@@ -3863,6 +3874,12 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         ctxData->seen[index].samples = texture_desc.SampleDesc.Count;
         ctxData->seen[index].width = texture_desc.Width;
         ctxData->seen[index].height = texture_desc.Height;
+        UINT curMaxW = ctxData->maxDsvWidth.load(std::memory_order_relaxed);
+        UINT curMaxH = ctxData->maxDsvHeight.load(std::memory_order_relaxed);
+        if (texture_desc.Width > curMaxW || (texture_desc.Width == curMaxW && texture_desc.Height > curMaxH)) {
+            ctxData->maxDsvWidth.store(texture_desc.Width, std::memory_order_relaxed);
+            ctxData->maxDsvHeight.store(texture_desc.Height, std::memory_order_relaxed);
+        }
     }
     D3D11_RENDER_TARGET_VIEW_DESC color_view{};
     D3D11_TEXTURE2D_DESC color_texture{};
@@ -3984,7 +4001,6 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             } else {
                 ctxData->gameNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
             }
-            updateContextMaxDsv(ctxData, dsv);
         }
     }
 
@@ -4040,7 +4056,6 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
             } else {
                 ctxData->gameNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
             }
-            updateContextMaxDsv(ctxData, dsv);
         }
     }
 
@@ -4415,6 +4430,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 if (scene_map_target.load(std::memory_order_relaxed) != nullptr) {
                     if (++s_watchdog_no_jitter_frames >= 120) {
                         scene_map_target.store(nullptr, std::memory_order_release);
+                        clearRejectedResourceCache();
                         s_watchdog_no_jitter_frames = 0;
                     }
                 }
@@ -4440,6 +4456,16 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
         active_render_width = (sceneW > 0 && (!outW || sceneW <= outW)) ? sceneW : outW;
         active_render_height = (sceneH > 0 && (!outH || sceneH <= outH)) ? sceneH : outH;
+
+        static unsigned long long s_scene_jitter_counter = 0;
+        const bool scene_rendered_this_interval =
+            (motion_color_source && motion_color_frame == rendered_frame);
+        if (scene_rendered_this_interval) {
+            ++s_scene_jitter_counter;
+        }
+        const unsigned long long jitter_seq_index =
+            (s_scene_jitter_counter > 0) ? s_scene_jitter_counter : frame;
+
         if (active_render_width && active_render_height) {
             std::lock_guard lock(jitter_mutex);
             const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
@@ -4450,14 +4476,14 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     std::lround(static_cast<float>(base_phases) * upscaleRatio * upscaleRatio), 8l, 256l));
             }
             s_active_jitter_phases.store(phases ? phases : 32, std::memory_order_relaxed);
-            auto jitter = edpe::projectionJitter(frame, active_render_width, active_render_height, phases);
+            auto jitter = edpe::projectionJitter(jitter_seq_index, active_render_width, active_render_height, phases);
             const float scale = s_jitter_scale.load(std::memory_order_relaxed);
             jitter.pixelX *= scale;
             jitter.pixelY *= scale;
             jitter.ndcX *= scale;
             jitter.ndcY *= scale;
             active_projection_jitter = jitter;
-            jitter_frame_index.store(frame, std::memory_order_relaxed);
+            jitter_frame_index.store(jitter_seq_index, std::memory_order_relaxed);
         }
 
         if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
