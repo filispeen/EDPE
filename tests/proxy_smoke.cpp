@@ -56,7 +56,23 @@ int wmain(int argc, wchar_t** argv) {
     const HRESULT result = create_device(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context);
     if (FAILED(result) || !device || !context) return 4;
-    void* original_om_set = (*reinterpret_cast<void***>(context))[33];
+    void* hooked_om_set = (*reinterpret_cast<void***>(context))[33];
+    void* real_system_om_set = nullptr;
+    HMODULE sys_d3d11 = LoadLibraryExW(L"d3d11.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (sys_d3d11) {
+        auto sys_create = reinterpret_cast<decltype(&D3D11CreateDevice)>(
+            GetProcAddress(sys_d3d11, "D3D11CreateDevice"));
+        if (sys_create) {
+            ID3D11Device* d = nullptr;
+            ID3D11DeviceContext* c = nullptr;
+            if (SUCCEEDED(sys_create(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &d, nullptr, &c)) && c) {
+                real_system_om_set = (*reinterpret_cast<void***>(c))[33];
+                c->Release();
+                d->Release();
+            }
+        }
+        FreeLibrary(sys_d3d11);
+    }
     void* original_draws[]{(*reinterpret_cast<void***>(context))[12],
         (*reinterpret_cast<void***>(context))[13],
         (*reinterpret_cast<void***>(context))[20],
@@ -520,7 +536,41 @@ int wmain(int argc, wchar_t** argv) {
             cmd_list->Release();
             def_executed = true;
         }
-        deferred_context->Release();
+    }
+    bool dev2_executed = false;
+    ID3D11Device* device2 = nullptr;
+    ID3D11DeviceContext* context2 = nullptr;
+    ID3D11Texture2D* depth2_tex = nullptr;
+    ID3D11DepthStencilView* depth2_view = nullptr;
+    const HRESULT dev2_hr = create_device(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+        nullptr, 0, D3D11_SDK_VERSION, &device2, nullptr, &context2);
+    if (SUCCEEDED(dev2_hr) && device2 && context2) {
+        D3D11_TEXTURE2D_DESC depth2_desc{};
+        depth2_desc.Width = 256;
+        depth2_desc.Height = 256;
+        depth2_desc.MipLevels = 1;
+        depth2_desc.ArraySize = 1;
+        depth2_desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+        depth2_desc.SampleDesc.Count = 1;
+        depth2_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+        HRESULT tex_hr = device2->CreateTexture2D(&depth2_desc, nullptr, &depth2_tex);
+        if (SUCCEEDED(tex_hr)) {
+            D3D11_DEPTH_STENCIL_VIEW_DESC dsv2_desc{};
+            dsv2_desc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+            dsv2_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+            HRESULT dsv_hr = device2->CreateDepthStencilView(depth2_tex, &dsv2_desc, &depth2_view);
+            if (SUCCEEDED(dsv_hr)) {
+                context2->OMSetRenderTargets(0, nullptr, depth2_view);
+                context2->OMSetRenderTargets(0, nullptr, nullptr);
+                dev2_executed = true;
+            } else {
+                std::fprintf(stderr, "DSV2_FAIL: %08lx\n", dsv_hr);
+            }
+        } else {
+            std::fprintf(stderr, "TEX2_FAIL: %08lx\n", tex_hr);
+        }
+    } else {
+        std::fprintf(stderr, "DEV2_FAIL: %08lx dev=%p ctx=%p\n", dev2_hr, device2, context2);
     }
     while (present_count() < 1024) swap_chain->Present(0, DXGI_PRESENT_TEST);
     const bool interval_observed = present_count() == 1024;
@@ -552,12 +602,19 @@ int wmain(int argc, wchar_t** argv) {
     depth_texture->Release();
     swap_chain->Release();
     const bool context_hook_restored =
-        (*reinterpret_cast<void***>(context))[33] == original_om_set;
+        real_system_om_set ? ((*reinterpret_cast<void***>(context))[33] == real_system_om_set &&
+                              (*reinterpret_cast<void***>(context))[33] != hooked_om_set)
+                           : ((*reinterpret_cast<void***>(context))[33] != hooked_om_set);
     const bool draw_hooks_restored =
         (*reinterpret_cast<void***>(context))[12] == original_draws[0] &&
         (*reinterpret_cast<void***>(context))[13] == original_draws[1] &&
         (*reinterpret_cast<void***>(context))[20] == original_draws[2] &&
         (*reinterpret_cast<void***>(context))[21] == original_draws[3];
+    if (depth2_view) depth2_view->Release();
+    if (depth2_tex) depth2_tex->Release();
+    if (context2) context2->Release();
+    if (device2) device2->Release();
+    if (deferred_context) deferred_context->Release();
     if (factory) factory->Release();
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
@@ -608,7 +665,7 @@ int wmain(int argc, wchar_t** argv) {
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
         SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
         SUCCEEDED(snapshot_arm_present) && SUCCEEDED(snapshot_present) && snapshot_requested &&
-        scene_candidate_found && scene_candidate_held && scene_candidate_expired && def_executed &&
+        scene_candidate_found && scene_candidate_held && scene_candidate_expired && def_executed && dev2_executed &&
         pair_requested && SUCCEEDED(pair_arm_present) &&
         SUCCEEDED(pair_present) && motion_requested &&
         SUCCEEDED(motion_arm_present) && SUCCEEDED(motion_present) &&
@@ -623,7 +680,9 @@ int wmain(int argc, wchar_t** argv) {
          std::strstr(contents, "EDPE: frame capture saved ")) &&
         std::strstr(contents, "EDPE: D3D11 device created") &&
         std::strstr(contents, "EDPE: DXGI factory created") &&
+        std::strstr(contents, "EDPE: swapchain created") &&
         std::strstr(contents, "EDPE: Present swapchain=") &&
+        std::strstr(contents, "matched known device") &&
         std::strstr(contents, "EDPE: Present bindings") &&
         std::strstr(contents, "EDPE: context dispatch frame=1") &&
         std::strstr(contents, "EDPE: context dispatch frame=8") &&
@@ -643,7 +702,7 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:29") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:30") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
@@ -722,7 +781,9 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: motion candidate currentAfterPresent=17 center=(6.39844,0)") &&
         std::strstr(contents, "EDPE: motion grid 5x5 finite=25") &&
         std::strstr(contents, "pixels finite=1") &&
-        std::strstr(contents, "EDPE: DSV census frame=1024 binds=29 unique=1 slotActive=1") &&
+        std::strstr(contents, "EDPE: DSV census frame=1024 binds=31 unique=2 slotActive=1") &&
+        std::strstr(contents, "EDPE: context census ctx=") &&
+        std::strstr(contents, "maxDsv=256x256") &&
         std::strstr(contents, "EDPE: hook OMSetRenderTargets this=") &&
         std::strstr(contents, "type=immediate") &&
         std::strstr(contents, "type=deferred") &&
@@ -738,12 +799,12 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");
     if (!passed) std::fprintf(stderr,
-        "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d insert=%d repeat=%d input=%d/%d/%d read=%d glassRestored=%d candidate=%d/%d/%d interval=%d hooks=%d/%d requests=%d/%d/%d\n",
+        "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d insert=%d repeat=%d input=%d/%d/%d read=%d glassRestored=%d dev2=%d candidate=%d/%d/%d interval=%d hooks=%d/%d requests=%d/%d/%d\n",
         present_result, second_present_result, first_real_present, overlay_present,
         resize_result, resized_present, observed, opened, closed,
         insert_passed, f5_repeat_ignored,
         hidden_input_passed, visible_input_blocked, hidden_input_restored, read,
-        glass_target_restored, scene_candidate_found, scene_candidate_held,
+        glass_target_restored, dev2_executed, scene_candidate_found, scene_candidate_held,
         scene_candidate_expired, interval_observed, context_hook_restored,
         draw_hooks_restored, sequence_requested, snapshot_requested, pair_requested);
     return passed ? 0 : 12;

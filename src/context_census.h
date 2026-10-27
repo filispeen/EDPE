@@ -7,6 +7,10 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
 void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags);
 void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags);
 void ContextCensusHookDeferredContext(ID3D11DeviceContext* context);
+void ContextCensusHookContext(ID3D11DeviceContext* context);
+void ContextCensusRegisterDevice(ID3D11Device* device, ID3D11DeviceContext* immContext);
+bool ContextCensusIsDeviceRegistered(ID3D11Device* device);
+void ContextCensusLogPresentDevice(IDXGISwapChain* swapChain, ID3D11Device* presentDevice);
 unsigned long long ContextCensusGetDsvBinds();
 void ContextCensusOnSwapChainRelease(IUnknown* object);
 bool ContextCensusRequestBindSequence();

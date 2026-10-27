@@ -3,6 +3,7 @@ EXPORTS
     CreateDXGIFactory1=EdpeCreateDXGIFactory1
     CreateDXGIFactory2=EdpeCreateDXGIFactory2
     D3D11CreateDevice=EdpeD3D11CreateDevice
+    D3D11CreateDeviceAndSwapChain=EdpeD3D11CreateDeviceAndSwapChain
     EDPE_ObservedPresentCount=EdpeObservedPresentCount
     EDPE_MenuVisible=EdpeMenuVisible
     EDPE_RequestBindSequence=EdpeRequestBindSequence
