@@ -4422,6 +4422,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_latest_unmapped_camera_valid = false;
         s_jitter_injected_frame = ~0ull;
         clearTrackedMappedBuffers();
+        clearRejectedResourceCache();
         static unsigned s_watchdog_last_jitter_writes = 0;
         static unsigned s_watchdog_no_jitter_frames = 0;
         const unsigned cur_writes = jittered_writes_count.load(std::memory_order_relaxed);
@@ -5016,6 +5017,9 @@ bool ContextCensusGetJitterEnabled() {
 }
 
 void ContextCensusSetJitterTestOverride(bool override) {
+    if (override) {
+        clearRejectedResourceCache();
+    }
     jitter_test_override.store(override, std::memory_order_relaxed);
 }
 
