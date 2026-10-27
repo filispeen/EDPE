@@ -183,11 +183,34 @@ struct AmdUpscalerBackend::Impl {
     uint32_t maxOutputWidth = 0;
     uint32_t maxOutputHeight = 0;
     bool currentIsHdr = false;
+    wchar_t lastErrorReason[256]{};
 
 #if defined(EDPE_ENABLE_FSR)
     std::vector<uint8_t> scratchBuffer;
     FfxInterface ffxInterface{};
     FfxFsr3UpscalerContext fsrContext{};
+
+    static const wchar_t* getFfxErrorString(FfxErrorCode err) {
+        switch (err) {
+        case FFX_OK: return L"OK";
+        case FFX_ERROR_INVALID_POINTER: return L"Invalid pointer";
+        case FFX_ERROR_INVALID_ALIGNMENT: return L"Invalid alignment";
+        case FFX_ERROR_INVALID_SIZE: return L"Invalid size";
+        case FFX_EOF: return L"End of file";
+        case FFX_ERROR_INVALID_PATH: return L"Invalid path";
+        case FFX_ERROR_EOF: return L"EOF reached";
+        case FFX_ERROR_MALFORMED_DATA: return L"Malformed data";
+        case FFX_ERROR_OUT_OF_MEMORY: return L"Out of memory";
+        case FFX_ERROR_INCOMPLETE_INTERFACE: return L"Incomplete interface";
+        case FFX_ERROR_INVALID_ENUM: return L"Invalid enum";
+        case FFX_ERROR_INVALID_ARGUMENT: return L"Invalid argument";
+        case FFX_ERROR_OUT_OF_RANGE: return L"Out of range";
+        case FFX_ERROR_NULL_DEVICE: return L"Null device";
+        case FFX_ERROR_BACKEND_API_ERROR: return L"Backend API error";
+        case FFX_ERROR_INSUFFICIENT_MEMORY: return L"Insufficient memory";
+        default: return L"Unknown error";
+        }
+    }
 #endif
 
     bool ensureOutputTexture(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format) {
@@ -213,6 +236,7 @@ struct AmdUpscalerBackend::Impl {
 
         HRESULT hr = device->CreateTexture2D(&desc, nullptr, &outputTexture);
         if (FAILED(hr)) {
+            swprintf_s(lastErrorReason, L"CreateTexture2D failed (HRESULT 0x%08X)", static_cast<unsigned>(hr));
             EdpeLog(L"EDPE: Failed to create AMD output texture");
             return false;
         }
@@ -223,6 +247,7 @@ struct AmdUpscalerBackend::Impl {
         uavDesc.Texture2D.MipSlice = 0;
         hr = device->CreateUnorderedAccessView(outputTexture.Get(), &uavDesc, &outputUav);
         if (FAILED(hr)) {
+            swprintf_s(lastErrorReason, L"CreateUnorderedAccessView failed (HRESULT 0x%08X)", static_cast<unsigned>(hr));
             EdpeLog(L"EDPE: Failed to create AMD output UAV");
             outputTexture.Reset();
             return false;
@@ -283,7 +308,8 @@ struct AmdUpscalerBackend::Impl {
         FfxErrorCode err = ffxFsr3UpscalerContextCreate(&fsrContext, &desc);
         if (err != FFX_OK) {
             wchar_t buf[256];
-            swprintf_s(buf, L"EDPE: ffxFsr3UpscalerContextCreate failed (%d)", err);
+            swprintf_s(lastErrorReason, L"ffxFsr3UpscalerContextCreate failed (0x%08X: %ls)", static_cast<unsigned>(err), getFfxErrorString(err));
+            swprintf_s(buf, L"EDPE: ffxFsr3UpscalerContextCreate failed (0x%08X)", static_cast<unsigned>(err));
             EdpeLog(buf);
             return false;
         }
@@ -313,6 +339,9 @@ bool AmdUpscalerBackend::isAvailable() const {
 const wchar_t* AmdUpscalerBackend::unavailableReason() const {
 #if defined(EDPE_ENABLE_FSR)
     if (isAvailable()) return L"";
+    if (impl_ && impl_->lastErrorReason[0] != L'\0') {
+        return impl_->lastErrorReason;
+    }
     return L"AMD FidelityFX SDK D3D11 backend not initialized";
 #else
     return L"AMD FidelityFX SDK not compiled into EDPE";
@@ -331,7 +360,10 @@ bool AmdUpscalerBackend::isModeSupported(UpscaleMode mode) const {
 bool AmdUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* /*context*/) {
 #if defined(EDPE_ENABLE_FSR)
     if (!impl_) impl_ = std::make_unique<Impl>();
-    if (!device) return false;
+    if (!device) {
+        swprintf_s(impl_->lastErrorReason, L"D3D11 device is null (HRESULT 0x%08X)", static_cast<unsigned>(E_POINTER));
+        return false;
+    }
 
     size_t scratchSize = ffxGetScratchMemorySizeDX11(FFX_FSR3UPSCALER_CONTEXT_COUNT);
     impl_->scratchBuffer.resize(scratchSize);
@@ -339,12 +371,14 @@ bool AmdUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* /
     FfxErrorCode err = ffxGetInterfaceDX11(&impl_->ffxInterface, ffxDevice,
         impl_->scratchBuffer.data(), scratchSize, FFX_FSR3UPSCALER_CONTEXT_COUNT);
     if (err != FFX_OK) {
+        swprintf_s(impl_->lastErrorReason, L"ffxGetInterfaceDX11 failed (0x%08X: %ls)", static_cast<unsigned>(err), Impl::getFfxErrorString(err));
         wchar_t buf[256];
-        swprintf_s(buf, L"EDPE: ffxGetInterfaceDX11 failed (%d)", err);
+        swprintf_s(buf, L"EDPE: ffxGetInterfaceDX11 failed (0x%08X)", static_cast<unsigned>(err));
         EdpeLog(buf);
         return false;
     }
     impl_->initialized = true;
+    impl_->lastErrorReason[0] = L'\0';
     EdpeLog(L"EDPE: AMD FSR 3.1 D3D11 backend initialized successfully");
     return true;
 #else
@@ -361,6 +395,7 @@ void AmdUpscalerBackend::shutdown() {
     impl_->scratchBuffer.clear();
 #endif
     impl_->initialized = false;
+    impl_->lastErrorReason[0] = L'\0';
 }
 
 bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
@@ -381,6 +416,7 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
 
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
+    if (!device) return false;
 
     D3D11_TEXTURE2D_DESC outDesc{};
     if (destinationTexture) {
@@ -404,8 +440,12 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     // Resources
     dispatchDesc.color = ffxGetResourceDX11_Fsr31(inputs.color,
         GetFfxResourceDescriptionDX11(inputs.color), L"FSR3_Color", FFX_RESOURCE_STATE_COMPUTE_READ);
+    FfxResourceDescription depthDesc = GetFfxResourceDescriptionDX11(inputs.depth);
+    if (depthDesc.format == FFX_SURFACE_FORMAT_UNKNOWN) {
+        depthDesc.format = FFX_SURFACE_FORMAT_R32_FLOAT;
+    }
     dispatchDesc.depth = ffxGetResourceDX11_Fsr31(inputs.depth,
-        GetFfxResourceDescriptionDX11(inputs.depth), L"FSR3_Depth", FFX_RESOURCE_STATE_COMPUTE_READ);
+        depthDesc, L"FSR3_Depth", FFX_RESOURCE_STATE_COMPUTE_READ);
     dispatchDesc.motionVectors = ffxGetResourceDX11_Fsr31(inputs.motionVectors,
         GetFfxResourceDescriptionDX11(inputs.motionVectors), L"FSR3_MotionVectors", FFX_RESOURCE_STATE_COMPUTE_READ);
 
@@ -445,8 +485,9 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
 
     FfxErrorCode err = ffxFsr3UpscalerContextDispatch(&impl_->fsrContext, &dispatchDesc);
     if (err != FFX_OK) {
+        swprintf_s(impl_->lastErrorReason, L"ffxFsr3UpscalerContextDispatch failed (0x%08X: %ls)", static_cast<unsigned>(err), Impl::getFfxErrorString(err));
         wchar_t buf[256];
-        swprintf_s(buf, L"EDPE: ffxFsr3UpscalerContextDispatch failed (%d)", err);
+        swprintf_s(buf, L"EDPE: ffxFsr3UpscalerContextDispatch failed (0x%08X)", static_cast<unsigned>(err));
         EdpeLog(buf);
         return false;
     }
@@ -772,9 +813,14 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     diagnostics_.success = evalSuccess;
 
     if (!evalSuccess) {
-        // Fail open requirement: log warning, clear reset, restore normal path.
-        swprintf_s(diagnostics_.statusMessage, L"Evaluation failed on %ls; falling back to original output",
-            backend->name());
+        const wchar_t* reason = backend->unavailableReason();
+        if (reason && reason[0] != L'\0') {
+            swprintf_s(diagnostics_.statusMessage, L"Evaluation failed on %ls (%ls)",
+                backend->name(), reason);
+        } else {
+            swprintf_s(diagnostics_.statusMessage, L"Evaluation failed on %ls; falling back to original output",
+                backend->name());
+        }
         wchar_t message[256];
         swprintf_s(message, L"EDPE: %ls evaluate failed; failing open", backend->name());
         EdpeLog(message);
