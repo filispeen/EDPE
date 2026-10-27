@@ -538,6 +538,7 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
     bool dev2_executed = false;
+    bool dev2_candidate_found = false;
     ID3D11Device* device2 = nullptr;
     ID3D11DeviceContext* context2 = nullptr;
     ID3D11Texture2D* depth2_tex = nullptr;
@@ -545,6 +546,10 @@ int wmain(int argc, wchar_t** argv) {
     const HRESULT dev2_hr = create_device(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION, &device2, nullptr, &context2);
     if (SUCCEEDED(dev2_hr) && device2 && context2) {
+        const bool shared_runtime_vtable =
+            (*reinterpret_cast<void***>(device) == *reinterpret_cast<void***>(device2)) &&
+            ((*reinterpret_cast<void***>(context))[33] == (*reinterpret_cast<void***>(context2))[33]) &&
+            ((*reinterpret_cast<void***>(context))[34] == (*reinterpret_cast<void***>(context2))[34]);
         D3D11_TEXTURE2D_DESC depth2_desc{};
         depth2_desc.Width = 256;
         depth2_desc.Height = 256;
@@ -560,9 +565,48 @@ int wmain(int argc, wchar_t** argv) {
             dsv2_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
             HRESULT dsv_hr = device2->CreateDepthStencilView(depth2_tex, &dsv2_desc, &depth2_view);
             if (SUCCEEDED(dsv_hr)) {
-                context2->OMSetRenderTargets(0, nullptr, depth2_view);
+                auto make_dev2_rtv = [&](DXGI_FORMAT fmt, ID3D11Texture2D** out_tex, ID3D11RenderTargetView** out_rtv) {
+                    D3D11_TEXTURE2D_DESC td{};
+                    td.Width = 256;
+                    td.Height = 256;
+                    td.MipLevels = 1;
+                    td.ArraySize = 1;
+                    td.Format = fmt;
+                    td.SampleDesc.Count = 1;
+                    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                    if (SUCCEEDED(device2->CreateTexture2D(&td, nullptr, out_tex)) && *out_tex) {
+                        device2->CreateRenderTargetView(*out_tex, nullptr, out_rtv);
+                    }
+                };
+                ID3D11Texture2D* dev2_t0 = nullptr;
+                ID3D11Texture2D* dev2_t1 = nullptr;
+                ID3D11Texture2D* dev2_t2 = nullptr;
+                ID3D11Texture2D* dev2_t3 = nullptr;
+                ID3D11RenderTargetView* dev2_r0 = nullptr;
+                ID3D11RenderTargetView* dev2_r1 = nullptr;
+                ID3D11RenderTargetView* dev2_r2 = nullptr;
+                ID3D11RenderTargetView* dev2_r3 = nullptr;
+                make_dev2_rtv(DXGI_FORMAT_R10G10B10A2_UNORM, &dev2_t0, &dev2_r0);
+                make_dev2_rtv(DXGI_FORMAT_R8G8B8A8_UNORM, &dev2_t1, &dev2_r1);
+                make_dev2_rtv(DXGI_FORMAT_R8G8B8A8_UNORM, &dev2_t2, &dev2_r2);
+                make_dev2_rtv(DXGI_FORMAT_R11G11B10_FLOAT, &dev2_t3, &dev2_r3);
+                ID3D11RenderTargetView* dev2_mrts[4]{dev2_r0, dev2_r1, dev2_r2, dev2_r3};
+                for (int i = 0; i < 32; ++i) {
+                    context2->OMSetRenderTargets(4, dev2_mrts, depth2_view);
+                }
+                context2->OMSetRenderTargets(1, &dev2_r3, depth2_view);
+                context2->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, depth2_view, 0, 0, nullptr, nullptr);
                 context2->OMSetRenderTargets(0, nullptr, nullptr);
-                dev2_executed = true;
+                dev2_candidate_found = (scene_depth_candidate() == 0);
+                dev2_executed = shared_runtime_vtable && dev2_candidate_found;
+                if (dev2_r0) dev2_r0->Release();
+                if (dev2_r1) dev2_r1->Release();
+                if (dev2_r2) dev2_r2->Release();
+                if (dev2_r3) dev2_r3->Release();
+                if (dev2_t0) dev2_t0->Release();
+                if (dev2_t1) dev2_t1->Release();
+                if (dev2_t2) dev2_t2->Release();
+                if (dev2_t3) dev2_t3->Release();
             } else {
                 std::fprintf(stderr, "DSV2_FAIL: %08lx\n", dsv_hr);
             }
@@ -661,6 +705,10 @@ int wmain(int argc, wchar_t** argv) {
             }
         }
     }
+    char dev2_census_prefix[256]{};
+    std::snprintf(dev2_census_prefix, sizeof(dev2_census_prefix),
+        "EDPE: context census ctx=%p device=%p OMSetRenderTargets=34 (game=34 own=0) OMSetRenderTargetsAndUnorderedAccessViews=1 (game=1 own=0) omCalls=35 dsvCalls=34 (game=34 own=0) maxDsv=256x256",
+        context2, device2);
     const bool passed = SUCCEEDED(present_result) && SUCCEEDED(second_present_result) && observed &&
         SUCCEEDED(first_real_present) && SUCCEEDED(overlay_present) &&
         SUCCEEDED(arm_present) && SUCCEEDED(sequence_present) && sequence_requested &&
@@ -702,7 +750,8 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: DSV bind #0 phase=first view=") &&
         std::strstr(contents, "EDPE: DSV bind #0 phase=first-color view=") &&
         std::strstr(contents, "color=64x64 colorFormat=28 colorBind=0x20") &&
-        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:30") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:29") &&
+        std::strstr(contents, "EDPE: DSV interval frame=1024 top=0:34") &&
         std::strstr(contents, "EDPE: DSV bind sequence frame=6 transitions=2 stored=2") &&
         std::strstr(contents, "EDPE: DSV bind sequence 0 target=-1") &&
         std::strstr(contents, "EDPE: DSV bind sequence 1 target=0") &&
@@ -781,7 +830,10 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: motion candidate currentAfterPresent=17 center=(6.39844,0)") &&
         std::strstr(contents, "EDPE: motion grid 5x5 finite=25") &&
         std::strstr(contents, "pixels finite=1") &&
-        std::strstr(contents, "EDPE: DSV census frame=1024 binds=31 unique=2 slotActive=1") &&
+        std::strstr(contents, "EDPE: DSV census frame=1024 binds=29 unique=1 slotActive=1") &&
+        std::strstr(contents, "EDPE: DSV census frame=1024 binds=34 unique=1 slotActive=1") &&
+        std::strstr(contents, "EDPE: WARNING: scene context differs from present context") &&
+        std::strstr(contents, dev2_census_prefix) &&
         std::strstr(contents, "EDPE: context census ctx=") &&
         std::strstr(contents, "maxDsv=256x256") &&
         std::strstr(contents, "EDPE: hook OMSetRenderTargets this=") &&
@@ -799,12 +851,12 @@ int wmain(int argc, wchar_t** argv) {
         std::strstr(contents, "EDPE: queued input routed to Dear ImGui") &&
         std::strstr(contents, "vtable=") && std::strstr(contents, "dsvMethod=");
     if (!passed) std::fprintf(stderr,
-        "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d insert=%d repeat=%d input=%d/%d/%d read=%d glassRestored=%d dev2=%d candidate=%d/%d/%d interval=%d hooks=%d/%d requests=%d/%d/%d\n",
+        "present=%08lx/%08lx real=%08lx overlay=%08lx resize=%08lx/%08lx observed=%d menu=%d/%d insert=%d repeat=%d input=%d/%d/%d read=%d glassRestored=%d dev2=%d/%d candidate=%d/%d/%d interval=%d hooks=%d/%d requests=%d/%d/%d\n",
         present_result, second_present_result, first_real_present, overlay_present,
         resize_result, resized_present, observed, opened, closed,
         insert_passed, f5_repeat_ignored,
         hidden_input_passed, visible_input_blocked, hidden_input_restored, read,
-        glass_target_restored, dev2_executed, scene_candidate_found, scene_candidate_held,
+        glass_target_restored, dev2_executed, dev2_candidate_found, scene_candidate_found, scene_candidate_held,
         scene_candidate_expired, interval_observed, context_hook_restored,
         draw_hooks_restored, sequence_requested, snapshot_requested, pair_requested);
     return passed ? 0 : 12;

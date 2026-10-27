@@ -147,19 +147,59 @@ static std::atomic<size_t> s_hooked_table_count{0};
 static HookedTableEntry s_hooked_tables[kMaxHookedTables]{};
 static std::mutex s_hooked_tables_mutex;
 
+struct SeenDepthView {
+    ID3D11DepthStencilView* view = nullptr; // Identity only; never dereferenced later.
+    DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN;
+    UINT samples = 0;
+    bool color_logged = false;
+    unsigned long long interval_binds = 0;
+    ID3D11RenderTargetView* mrt_hdr_view = nullptr; // Weak; compared within one frame only.
+    unsigned long long mrt_frame = 0;
+    unsigned long long scene_match_frame = ~0ull;
+    UINT width = 0;
+    UINT height = 0;
+    ID3D11Device* owning_device = nullptr;
+};
+
+struct ClonedContextVtable {
+    ID3D11DeviceContext* context = nullptr;
+    void** original_table = nullptr;
+    OMSetRenderTargetsFn orig_om = nullptr;
+    OMSetRenderTargetsAndUnorderedAccessViewsFn orig_om_uav = nullptr;
+    void* methods[134]{};
+};
+static constexpr size_t kMaxClonedContexts = 16;
+static std::array<std::unique_ptr<ClonedContextVtable>, kMaxClonedContexts> s_cloned_contexts{};
+static std::atomic<size_t> s_cloned_context_count{0};
+static std::mutex s_cloned_contexts_mutex;
+
 struct PerContextData {
     ID3D11DeviceContext* context = nullptr;
     ID3D11Device* owningDevice = nullptr;
+    std::atomic<unsigned long long> omCalls{0};
     std::atomic<unsigned long long> gameOmCalls{0};
     std::atomic<unsigned long long> edpeOmCalls{0};
+    std::atomic<unsigned long long> omUavCalls{0};
+    std::atomic<unsigned long long> gameOmUavCalls{0};
+    std::atomic<unsigned long long> edpeOmUavCalls{0};
     std::atomic<unsigned long long> nonNullDsvCalls{0};
+    std::atomic<unsigned long long> gameNonNullDsvCalls{0};
+    std::atomic<unsigned long long> edpeNonNullDsvCalls{0};
     std::atomic<UINT> maxDsvWidth{0};
     std::atomic<UINT> maxDsvHeight{0};
+    std::array<SeenDepthView, 32> seen{};
+    size_t seen_count = 0;
+    std::atomic<unsigned long long> dsv_binds{0};
+    std::array<int, 64> bind_sequence{};
+    size_t sequence_stored = 0;
+    unsigned sequence_transitions = 0;
+    int sequence_last = -2;
 };
 static constexpr size_t kMaxTrackedContexts = 32;
 static std::array<std::unique_ptr<PerContextData>, kMaxTrackedContexts> s_tracked_contexts{};
 static std::atomic<size_t> s_tracked_context_count{0};
 static std::mutex s_tracked_contexts_mutex;
+static std::atomic<ID3D11DeviceContext*> s_last_warned_scene_ctx{nullptr};
 
 PerContextData* getOrCreateContextData(ID3D11DeviceContext* context) {
     if (!context) return nullptr;
@@ -196,6 +236,38 @@ PerContextData* getOrCreateContextData(ID3D11DeviceContext* context) {
     return ptr;
 }
 
+PerContextData* findSceneContextData(bool logWarning = true) {
+    auto* presentCtx = observed_context.load(std::memory_order_acquire);
+    PerContextData* presentData = presentCtx ? getOrCreateContextData(presentCtx) : nullptr;
+    PerContextData* best = presentData;
+    unsigned long long bestDsvCalls = presentData ? presentData->nonNullDsvCalls.load(std::memory_order_relaxed) : 0;
+
+    const size_t count = s_tracked_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
+        auto* data = s_tracked_contexts[i].get();
+        if (!data) continue;
+        const unsigned long long dsvCalls = data->nonNullDsvCalls.load(std::memory_order_relaxed);
+        if (dsvCalls > bestDsvCalls) {
+            bestDsvCalls = dsvCalls;
+            best = data;
+        }
+    }
+
+    if (logWarning && best && presentCtx && best->context != presentCtx && bestDsvCalls > 0) {
+        ID3D11Device* presentDev = presentData ? presentData->owningDevice : s_present_device.load(std::memory_order_acquire);
+        if (s_last_warned_scene_ctx.exchange(best->context, std::memory_order_acq_rel) != best->context) {
+            wchar_t warnMsg[320];
+            swprintf_s(warnMsg,
+                L"EDPE: WARNING: scene context differs from present context (scene ctx=%p device=%p, present ctx=%p device=%p, dsvCalls=%llu vs %llu)",
+                best->context, best->owningDevice, presentCtx, presentDev,
+                bestDsvCalls,
+                presentData ? presentData->nonNullDsvCalls.load(std::memory_order_relaxed) : 0ull);
+            EdpeLog(warnMsg);
+        }
+    }
+    return best;
+}
+
 void updateContextMaxDsv(PerContextData* data, ID3D11DepthStencilView* dsv) {
     if (!data || !dsv) return;
     ID3D11Resource* res = nullptr;
@@ -216,28 +288,11 @@ void updateContextMaxDsv(PerContextData* data, ID3D11DepthStencilView* dsv) {
 }
 
 std::mutex seen_mutex;
-struct SeenDepthView {
-    ID3D11DepthStencilView* view = nullptr; // Identity only; never dereferenced later.
-    DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN;
-    UINT samples = 0;
-    bool color_logged = false;
-    unsigned long long interval_binds = 0;
-    ID3D11RenderTargetView* mrt_hdr_view = nullptr; // Weak; compared within one frame only.
-    unsigned long long mrt_frame = 0;
-    unsigned long long scene_match_frame = ~0ull;
-    UINT width = 0;
-    UINT height = 0;
-    ID3D11Device* owning_device = nullptr;
-};
-std::array<SeenDepthView, 32> seen{};
-size_t seen_count = 0;
 std::atomic<unsigned long long> dsv_binds{0};
 std::atomic<bool> sequence_requested{false};
 std::atomic<bool> sequence_active{false};
-std::array<int, 64> bind_sequence{};
-size_t sequence_stored = 0;
-unsigned sequence_transitions = 0;
-int sequence_last = -2;
+ID3D11DeviceContext* snapshot_target_context = nullptr;
+ID3D11DeviceContext* camera_pair_context = nullptr;
 int snapshot_queued = -1;
 int snapshot_active = -1;
 int snapshot_index = -1;
@@ -1703,11 +1758,12 @@ void pollPipelineSamples(ID3D11DeviceContext* context) {
     }
 }
 
-void recordBind(int index) {
-    if (index == sequence_last) return;
-    sequence_last = index;
-    ++sequence_transitions;
-    if (sequence_stored < bind_sequence.size()) bind_sequence[sequence_stored++] = index;
+void recordBind(PerContextData* ctxData, int index) {
+    if (!ctxData || index == ctxData->sequence_last) return;
+    ctxData->sequence_last = index;
+    ++ctxData->sequence_transitions;
+    if (ctxData->sequence_stored < ctxData->bind_sequence.size())
+        ctxData->bind_sequence[ctxData->sequence_stored++] = index;
 }
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
@@ -3220,14 +3276,18 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             }
         }
     }
+    PerContextData* ctxData = getOrCreateContextData(context);
+    if (!ctxData) return;
+
     if (!dsv) {
         if (sequence_active.load(std::memory_order_acquire)) {
             std::lock_guard lock(seen_mutex);
-            recordBind(-1);
+            recordBind(ctxData, -1);
         }
         return;
     }
     dsv_binds.fetch_add(1, std::memory_order_relaxed);
+    ctxData->dsv_binds.fetch_add(1, std::memory_order_relaxed);
 
     bool scene_mrt = false;
     if (count >= 4 && targets && targets[0] && targets[1] && targets[2] && targets[3]) {
@@ -3334,36 +3394,54 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     bool camera_delta_take = false;
     {
         std::lock_guard lock(seen_mutex);
-        while (index < seen_count && seen[index].view != dsv) ++index;
-        if (index == seen.size()) {
-            if (sequence_active.load(std::memory_order_acquire)) recordBind(-3);
+        auto& ctx_seen = ctxData->seen;
+        size_t& ctx_seen_count = ctxData->seen_count;
+        while (index < ctx_seen_count && ctx_seen[index].view != dsv) ++index;
+        if (index == ctx_seen.size()) {
+            if (sequence_active.load(std::memory_order_acquire)) recordBind(ctxData, -3);
             return;
         }
-        if (index == seen_count) {
-            seen[seen_count].view = dsv;
+        if (index == ctx_seen_count) {
+            ctx_seen[ctx_seen_count].view = dsv;
             ID3D11Device* dev = nullptr;
             dsv->GetDevice(&dev);
             if (!dev) context->GetDevice(&dev);
-            seen[seen_count].owning_device = dev;
+            ctx_seen[ctx_seen_count].owning_device = dev;
             if (dev) dev->Release();
-            seen_count++;
+            ID3D11Resource* init_res = nullptr;
+            dsv->GetResource(&init_res);
+            if (init_res) {
+                ID3D11Texture2D* init_tex = nullptr;
+                if (SUCCEEDED(init_res->QueryInterface(__uuidof(ID3D11Texture2D),
+                        reinterpret_cast<void**>(&init_tex)))) {
+                    D3D11_TEXTURE2D_DESC init_desc{};
+                    init_tex->GetDesc(&init_desc);
+                    ctx_seen[ctx_seen_count].texture_format = init_desc.Format;
+                    ctx_seen[ctx_seen_count].samples = init_desc.SampleDesc.Count;
+                    ctx_seen[ctx_seen_count].width = init_desc.Width;
+                    ctx_seen[ctx_seen_count].height = init_desc.Height;
+                    init_tex->Release();
+                }
+                init_res->Release();
+            }
+            ctx_seen_count++;
             first_bind = true;
         }
-        ++seen[index].interval_binds;
-        if (seen[index].texture_format == DXGI_FORMAT_R32G8X24_TYPELESS &&
-            seen[index].samples == 1) {
+        ++ctx_seen[index].interval_binds;
+        if (ctx_seen[index].texture_format == DXGI_FORMAT_R32G8X24_TYPELESS &&
+            ctx_seen[index].samples == 1) {
             const auto frame = current_frame;
-            if (seen[index].mrt_frame != frame) {
-                seen[index].mrt_hdr_view = nullptr;
-                seen[index].mrt_frame = frame;
+            if (ctx_seen[index].mrt_frame != frame) {
+                ctx_seen[index].mrt_hdr_view = nullptr;
+                ctx_seen[index].mrt_frame = frame;
             }
             ID3D11RenderTargetView* hdrRtv = nullptr;
-            if (is_main_scene) {
-                seen[index].mrt_hdr_view = targets[3];
-                hdrRtv = targets[3];
-            } else if (seen[index].mrt_hdr_view && count && targets &&
-                targets[0] == seen[index].mrt_hdr_view) {
-                seen[index].scene_match_frame = frame;
+            if (is_main_scene || scene_mrt) {
+                ctx_seen[index].mrt_hdr_view = targets[3];
+                if (is_main_scene) hdrRtv = targets[3];
+            } else if (ctx_seen[index].mrt_hdr_view && count && targets &&
+                targets[0] == ctx_seen[index].mrt_hdr_view) {
+                ctx_seen[index].scene_match_frame = frame;
                 hdrRtv = targets[0];
             } else if (count && targets && targets[0]) {
                 D3D11_RENDER_TARGET_VIEW_DESC rtvd{};
@@ -3387,15 +3465,16 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             }
             camera_delta_take = is_main_scene;
         }
-        if (sequence_active.load(std::memory_order_acquire)) recordBind(static_cast<int>(index));
-        if (snapshot_active == static_cast<int>(index) && !snapshot_view) {
+        if (sequence_active.load(std::memory_order_acquire)) recordBind(ctxData, static_cast<int>(index));
+        const bool is_snapshot_ctx = (!snapshot_target_context || snapshot_target_context == context);
+        if (is_snapshot_ctx && snapshot_active == static_cast<int>(index) && !snapshot_view) {
             dsv->AddRef();
             snapshot_view = dsv;
             snapshot_index = snapshot_active;
             snapshot_active = -1;
             snapshot_waiting.store(false, std::memory_order_release);
         }
-        if (snapshot_view == dsv && snapshot_index == static_cast<int>(index)) {
+        if (is_snapshot_ctx && snapshot_view == dsv && snapshot_index == static_cast<int>(index)) {
             auto* color = count && targets ? targets[0] : nullptr;
             if (color != snapshot_color_view) {
                 if (color) color->AddRef();
@@ -3408,7 +3487,8 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             ++snapshot_bind_count;
             snapshot_probe_bind = snapshot_bind_count;
         }
-        if (camera_pair_target == static_cast<int>(index)) {
+        const bool is_pair_ctx = (!camera_pair_context || camera_pair_context == context);
+        if (is_pair_ctx && camera_pair_target == static_cast<int>(index)) {
             const auto frame = last_present_frame.load(std::memory_order_relaxed);
             if (frame == camera_pair_armed_after || frame == camera_pair_armed_after + 1) {
                 if (camera_pair_bind_frame != frame) {
@@ -3416,7 +3496,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                     camera_pair_bind_count = 0;
                 }
                 if (++camera_pair_bind_count == 3 && is_main_scene &&
-                    seen[index].mrt_frame == frame && seen[index].mrt_hdr_view)
+                    ctx_seen[index].mrt_frame == frame && ctx_seen[index].mrt_hdr_view)
                     camera_pair_sample = frame == camera_pair_armed_after
                         ? kPairFirstSample : kPairSecondSample;
                 if (camera_pair_sample) {
@@ -3436,10 +3516,14 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                 }
             }
         }
-        if (count && targets && targets[0] && !seen[index].color_logged) {
-            seen[index].color_logged = true;
+        if (count && targets && targets[0] && !ctx_seen[index].color_logged) {
+            ctx_seen[index].color_logged = true;
             first_color = true;
         }
+    }
+
+    if (context != observed_context.load(std::memory_order_acquire)) {
+        findSceneContextData(true);
     }
 
     if (hud_probe_begin) beginHudDrawProbe();
@@ -3472,10 +3556,10 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     }
     if (first_bind) {
         std::lock_guard lock(seen_mutex);
-        seen[index].texture_format = texture_desc.Format;
-        seen[index].samples = texture_desc.SampleDesc.Count;
-        seen[index].width = texture_desc.Width;
-        seen[index].height = texture_desc.Height;
+        ctxData->seen[index].texture_format = texture_desc.Format;
+        ctxData->seen[index].samples = texture_desc.SampleDesc.Count;
+        ctxData->seen[index].width = texture_desc.Width;
+        ctxData->seen[index].height = texture_desc.Height;
     }
     D3D11_RENDER_TARGET_VIEW_DESC color_view{};
     D3D11_TEXTURE2D_DESC color_texture{};
@@ -3507,39 +3591,98 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
 
 }
 
+thread_local bool s_in_om_detour = false;
+
+OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context) {
+    if (!context) return original.load(std::memory_order_acquire);
+    void** table = *reinterpret_cast<void***>(context);
+    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < cloneCount; ++i) {
+        if (s_cloned_contexts[i] &&
+            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
+            if (s_cloned_contexts[i]->orig_om && s_cloned_contexts[i]->orig_om != &observedOMSetRenderTargets)
+                return s_cloned_contexts[i]->orig_om;
+            table = s_cloned_contexts[i]->original_table;
+            break;
+        }
+    }
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_om &&
+            s_hooked_tables[i].orig_om != &observedOMSetRenderTargets) {
+            return s_hooked_tables[i].orig_om;
+        }
+    }
+    const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+    OMSetRenderTargetsFn forward = is_deferred
+        ? original_deferred_om.load(std::memory_order_acquire)
+        : original.load(std::memory_order_acquire);
+    if (!forward) forward = original.load(std::memory_order_acquire);
+    return forward;
+}
+
+OMSetRenderTargetsAndUnorderedAccessViewsFn resolveOriginalOMUav(ID3D11DeviceContext* context) {
+    if (!context) return original_om_uav.load(std::memory_order_acquire);
+    void** table = *reinterpret_cast<void***>(context);
+    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < cloneCount; ++i) {
+        if (s_cloned_contexts[i] &&
+            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
+            if (s_cloned_contexts[i]->orig_om_uav &&
+                s_cloned_contexts[i]->orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews)
+                return s_cloned_contexts[i]->orig_om_uav;
+            table = s_cloned_contexts[i]->original_table;
+            break;
+        }
+    }
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_om_uav &&
+            s_hooked_tables[i].orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews) {
+            return s_hooked_tables[i].orig_om_uav;
+        }
+    }
+    const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+    OMSetRenderTargetsAndUnorderedAccessViewsFn forward = is_deferred
+        ? original_deferred_om_uav.load(std::memory_order_acquire)
+        : original_om_uav.load(std::memory_order_acquire);
+    if (!forward) forward = original_om_uav.load(std::memory_order_acquire);
+    return forward;
+}
+
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
+    OMSetRenderTargetsFn forward = resolveOriginalOM(context);
+    if (s_in_om_detour) {
+        if (forward) forward(context, count, targets, dsv);
+        return;
+    }
+    struct DetourGuard {
+        DetourGuard() { s_in_om_detour = true; }
+        ~DetourGuard() { s_in_om_detour = false; }
+    } detour_guard;
+
     s_count_om_set_render_targets.fetch_add(1, std::memory_order_relaxed);
     logContextHookOnce(context, kOMSetRenderTargets, L"OMSetRenderTargets", s_log_om_imm, s_log_om_def);
 
     PerContextData* ctxData = getOrCreateContextData(context);
     const bool in_edpe = s_in_edpe_present.load(std::memory_order_acquire);
-    if (in_edpe) {
-        if (ctxData) ctxData->edpeOmCalls.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        if (ctxData) {
+    if (ctxData) {
+        ctxData->omCalls.fetch_add(1, std::memory_order_relaxed);
+        if (in_edpe) {
+            ctxData->edpeOmCalls.fetch_add(1, std::memory_order_relaxed);
+        } else {
             ctxData->gameOmCalls.fetch_add(1, std::memory_order_relaxed);
-            if (dsv) {
-                ctxData->nonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
-                updateContextMaxDsv(ctxData, dsv);
+        }
+        if (dsv) {
+            ctxData->nonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            if (in_edpe) {
+                ctxData->edpeNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ctxData->gameNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
             }
+            updateContextMaxDsv(ctxData, dsv);
         }
-    }
-
-    void** table = *reinterpret_cast<void***>(context);
-    OMSetRenderTargetsFn forward = nullptr;
-    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
-    for (size_t i = 0; i < tblCount; ++i) {
-        if (s_hooked_tables[i].table == table) {
-            forward = s_hooked_tables[i].orig_om;
-            break;
-        }
-    }
-    if (!forward) {
-        const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
-        forward = is_deferred ? original_deferred_om.load(std::memory_order_acquire)
-                              : original.load(std::memory_order_acquire);
-        if (!forward) forward = original.load(std::memory_order_acquire);
     }
 
     if (in_edpe) {
@@ -3564,38 +3707,38 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
     UINT numUAVs,
     ID3D11UnorderedAccessView* const* uavs,
     const UINT* initialCounts) {
+    OMSetRenderTargetsAndUnorderedAccessViewsFn forward = resolveOriginalOMUav(context);
+    if (s_in_om_detour) {
+        if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
+        return;
+    }
+    struct DetourGuard {
+        DetourGuard() { s_in_om_detour = true; }
+        ~DetourGuard() { s_in_om_detour = false; }
+    } detour_guard;
+
     s_count_om_set_rt_uav.fetch_add(1, std::memory_order_relaxed);
     logContextHookOnce(context, kOMSetRenderTargetsAndUnorderedAccessViews,
         L"OMSetRenderTargetsAndUnorderedAccessViews", s_log_om_uav_imm, s_log_om_uav_def);
 
     PerContextData* ctxData = getOrCreateContextData(context);
     const bool in_edpe = s_in_edpe_present.load(std::memory_order_acquire);
-    if (in_edpe) {
-        if (ctxData) ctxData->edpeOmCalls.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        if (ctxData) {
-            ctxData->gameOmCalls.fetch_add(1, std::memory_order_relaxed);
-            if (dsv) {
-                ctxData->nonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
-                updateContextMaxDsv(ctxData, dsv);
+    if (ctxData) {
+        ctxData->omUavCalls.fetch_add(1, std::memory_order_relaxed);
+        if (in_edpe) {
+            ctxData->edpeOmUavCalls.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ctxData->gameOmUavCalls.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (dsv) {
+            ctxData->nonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            if (in_edpe) {
+                ctxData->edpeNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ctxData->gameNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
             }
+            updateContextMaxDsv(ctxData, dsv);
         }
-    }
-
-    void** table = *reinterpret_cast<void***>(context);
-    OMSetRenderTargetsAndUnorderedAccessViewsFn forward = nullptr;
-    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
-    for (size_t i = 0; i < tblCount; ++i) {
-        if (s_hooked_tables[i].table == table) {
-            forward = s_hooked_tables[i].orig_om_uav;
-            break;
-        }
-    }
-    if (!forward) {
-        const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
-        forward = is_deferred ? original_deferred_om_uav.load(std::memory_order_acquire)
-                              : original_om_uav.load(std::memory_order_acquire);
-        if (!forward) forward = original_om_uav.load(std::memory_order_acquire);
     }
 
     if (in_edpe) {
@@ -3840,22 +3983,30 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
         sequence_active.exchange(false, std::memory_order_acq_rel)) {
-        std::array<int, 64> sequence{};
-        size_t stored = 0;
-        unsigned transitions = 0;
-        {
-            std::lock_guard lock(seen_mutex);
-            sequence = bind_sequence;
-            stored = sequence_stored;
-            transitions = sequence_transitions;
-        }
-        wchar_t message[128];
-        swprintf_s(message, L"EDPE: DSV bind sequence frame=%llu transitions=%u stored=%zu",
-            frame, transitions, stored);
-        EdpeLog(message);
-        for (size_t i = 0; i < stored; ++i) {
-            swprintf_s(message, L"EDPE: DSV bind sequence %zu target=%d", i, sequence[i]);
+        const size_t ctxCount = s_tracked_context_count.load(std::memory_order_acquire);
+        bool any_logged = false;
+        for (size_t c = 0; c < ctxCount; ++c) {
+            auto* data = s_tracked_contexts[c].get();
+            if (!data) continue;
+            std::array<int, 64> sequence{};
+            size_t stored = 0;
+            unsigned transitions = 0;
+            {
+                std::lock_guard lock(seen_mutex);
+                sequence = data->bind_sequence;
+                stored = data->sequence_stored;
+                transitions = data->sequence_transitions;
+            }
+            if (transitions == 0 && (c + 1 < ctxCount || any_logged)) continue;
+            any_logged = true;
+            wchar_t message[160];
+            swprintf_s(message, L"EDPE: DSV bind sequence frame=%llu transitions=%u stored=%zu ctx=%p",
+                frame, transitions, stored, data->context);
             EdpeLog(message);
+            for (size_t i = 0; i < stored; ++i) {
+                swprintf_s(message, L"EDPE: DSV bind sequence %zu target=%d", i, sequence[i]);
+                EdpeLog(message);
+            }
         }
     }
     if (!attempted) {
@@ -4028,54 +4179,73 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         for (size_t i = 0; i < ctxCount; ++i) {
             auto* data = s_tracked_contexts[i].get();
             if (!data) continue;
-            const unsigned long long gameCalls = data->gameOmCalls.load(std::memory_order_relaxed);
-            const unsigned long long ownCalls = data->edpeOmCalls.load(std::memory_order_relaxed);
+            const unsigned long long omCalls = data->omCalls.load(std::memory_order_relaxed);
+            const unsigned long long gameOm = data->gameOmCalls.load(std::memory_order_relaxed);
+            const unsigned long long ownOm = data->edpeOmCalls.load(std::memory_order_relaxed);
+            const unsigned long long uavCalls = data->omUavCalls.load(std::memory_order_relaxed);
+            const unsigned long long gameUav = data->gameOmUavCalls.load(std::memory_order_relaxed);
+            const unsigned long long ownUav = data->edpeOmUavCalls.load(std::memory_order_relaxed);
             const unsigned long long dsvCalls = data->nonNullDsvCalls.load(std::memory_order_relaxed);
+            const unsigned long long gameDsv = data->gameNonNullDsvCalls.load(std::memory_order_relaxed);
+            const unsigned long long ownDsv = data->edpeNonNullDsvCalls.load(std::memory_order_relaxed);
             const UINT maxW = data->maxDsvWidth.load(std::memory_order_relaxed);
             const UINT maxH = data->maxDsvHeight.load(std::memory_order_relaxed);
 
-            wchar_t ctxMsg[384];
+            wchar_t ctxMsg[512];
             swprintf_s(ctxMsg,
-                L"EDPE: context census ctx=%p device=%p omCalls=%llu dsvCalls=%llu maxDsv=%ux%u (game=%llu own=%llu)",
+                L"EDPE: context census ctx=%p device=%p OMSetRenderTargets=%llu (game=%llu own=%llu) OMSetRenderTargetsAndUnorderedAccessViews=%llu (game=%llu own=%llu) omCalls=%llu dsvCalls=%llu (game=%llu own=%llu) maxDsv=%ux%u",
                 data->context, data->owningDevice,
-                gameCalls + ownCalls, dsvCalls, maxW, maxH,
-                gameCalls, ownCalls);
+                omCalls, gameOm, ownOm,
+                uavCalls, gameUav, ownUav,
+                omCalls + uavCalls,
+                dsvCalls, gameDsv, ownDsv,
+                maxW, maxH);
             EdpeLog(ctxMsg);
         }
+        findSceneContextData(true);
     }
     if (frame % 1024 == 0 && observed_swap_chain == swap_chain &&
         !edpe::UpscalerManager::instance().isReconstructionActive()) {
-        size_t distinct = 0;
-        std::array<unsigned long long, 32> counts{};
-        {
-            std::lock_guard lock(seen_mutex);
-            distinct = seen_count;
-            for (size_t i = 0; i < distinct; ++i) {
-                counts[i] = seen[i].interval_binds;
-                seen[i].interval_binds = 0;
-            }
-        }
-        wchar_t message[144];
-        swprintf_s(message, L"EDPE: DSV census frame=%llu binds=%llu unique=%zu slotActive=%u",
-            frame, dsv_binds.load(std::memory_order_relaxed), distinct,
-            patched_table && patched_table[kOMSetRenderTargets] ==
-                reinterpret_cast<void*>(&observedOMSetRenderTargets));
-        EdpeLog(message);
-        int busiest[4]{-1, -1, -1, -1};
-        unsigned long long binds[4]{};
-        for (size_t rank = 0; rank < 4; ++rank) {
-            for (size_t i = 0; i < distinct; ++i) {
-                if (counts[i] > binds[rank]) {
-                    binds[rank] = counts[i];
-                    busiest[rank] = static_cast<int>(i);
+        const size_t ctxCount = s_tracked_context_count.load(std::memory_order_acquire);
+        const unsigned slotActive = patched_table && patched_table[kOMSetRenderTargets] ==
+            reinterpret_cast<void*>(&observedOMSetRenderTargets);
+        for (size_t c = 0; c < ctxCount; ++c) {
+            auto* data = s_tracked_contexts[c].get();
+            if (!data) continue;
+            size_t distinct = 0;
+            std::array<unsigned long long, 32> counts{};
+            {
+                std::lock_guard lock(seen_mutex);
+                distinct = data->seen_count;
+                for (size_t i = 0; i < distinct; ++i) {
+                    counts[i] = data->seen[i].interval_binds;
+                    data->seen[i].interval_binds = 0;
                 }
             }
-            if (busiest[rank] >= 0) counts[busiest[rank]] = 0;
+            const unsigned long long ctxBinds = data->dsv_binds.load(std::memory_order_relaxed);
+            if (distinct == 0 && ctxBinds == 0 &&
+                data->context != observed_context.load(std::memory_order_acquire))
+                continue;
+            wchar_t message[192];
+            swprintf_s(message, L"EDPE: DSV census frame=%llu binds=%llu unique=%zu slotActive=%u ctx=%p",
+                frame, ctxBinds, distinct, slotActive, data->context);
+            EdpeLog(message);
+            int busiest[4]{-1, -1, -1, -1};
+            unsigned long long binds[4]{};
+            for (size_t rank = 0; rank < 4; ++rank) {
+                for (size_t i = 0; i < distinct; ++i) {
+                    if (counts[i] > binds[rank]) {
+                        binds[rank] = counts[i];
+                        busiest[rank] = static_cast<int>(i);
+                    }
+                }
+                if (busiest[rank] >= 0) counts[busiest[rank]] = 0;
+            }
+            swprintf_s(message, L"EDPE: DSV interval frame=%llu top=%d:%llu,%d:%llu,%d:%llu,%d:%llu ctx=%p",
+                frame, busiest[0], binds[0], busiest[1], binds[1],
+                busiest[2], binds[2], busiest[3], binds[3], data->context);
+            EdpeLog(message);
         }
-        swprintf_s(message, L"EDPE: DSV interval frame=%llu top=%d:%llu,%d:%llu,%d:%llu,%d:%llu",
-            frame, busiest[0], binds[0], busiest[1], binds[1],
-            busiest[2], binds[2], busiest[3], binds[3]);
-        EdpeLog(message);
     }
     edpe::Profiler::instance().onFrameEnd();
 }
@@ -4087,9 +4257,14 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
     {
         std::lock_guard lock(seen_mutex);
         if (arm_sequence) {
-            sequence_stored = 0;
-            sequence_transitions = 0;
-            sequence_last = -2;
+            const size_t ctxCount = s_tracked_context_count.load(std::memory_order_acquire);
+            for (size_t i = 0; i < ctxCount; ++i) {
+                if (auto* data = s_tracked_contexts[i].get()) {
+                    data->sequence_stored = 0;
+                    data->sequence_transitions = 0;
+                    data->sequence_last = -2;
+                }
+            }
             sequence_active.store(true, std::memory_order_release);
         }
         if (snapshot_queued >= 0) {
@@ -4156,13 +4331,13 @@ bool ContextCensusBindSequenceAvailable() {
 }
 
 namespace {
-bool depthSnapshotAvailableLocked(unsigned index) {
-    if (!patched_table || index >= seen_count || snapshot_queued >= 0 ||
+bool depthSnapshotAvailableForContextLocked(const PerContextData* ctxData, unsigned index) {
+    if (!patched_table || !ctxData || index >= ctxData->seen_count || snapshot_queued >= 0 ||
         snapshot_active >= 0 || snapshot_view || camera_pair_queued >= 0 ||
         camera_pair_target >= 0 || camera_pair_depth[0].staging ||
         camera_pair_depth[1].staging || motion_pair_active ||
         motion_grid_readback) return false;
-    const auto& candidate = seen[index];
+    const auto& candidate = ctxData->seen[index];
     return candidate.samples == 1 &&
         (candidate.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS ||
          candidate.texture_format == DXGI_FORMAT_R24G8_TYPELESS);
@@ -4170,28 +4345,35 @@ bool depthSnapshotAvailableLocked(unsigned index) {
 }
 
 bool ContextCensusRequestDepthSnapshot(unsigned index) {
+    PerContextData* sceneCtx = findSceneContextData(false);
     std::lock_guard lock(seen_mutex);
-    if (!depthSnapshotAvailableLocked(index)) return false;
+    if (!depthSnapshotAvailableForContextLocked(sceneCtx, index)) return false;
+    snapshot_target_context = sceneCtx->context;
     snapshot_queued = static_cast<int>(index);
     return true;
 }
 
 bool ContextCensusDepthSnapshotAvailable(unsigned index) {
+    PerContextData* sceneCtx = findSceneContextData(false);
     std::lock_guard lock(seen_mutex);
-    return depthSnapshotAvailableLocked(index);
+    return depthSnapshotAvailableForContextLocked(sceneCtx, index);
 }
 
 bool ContextCensusRequestCameraPair(unsigned index) {
+    PerContextData* sceneCtx = findSceneContextData(false);
     std::lock_guard lock(seen_mutex);
-    if (!depthSnapshotAvailableLocked(index)) return false;
+    if (!depthSnapshotAvailableForContextLocked(sceneCtx, index)) return false;
+    camera_pair_context = sceneCtx->context;
     camera_pair_queued = static_cast<int>(index);
     return true;
 }
 
 bool ContextCensusRequestMotionPair(unsigned index) {
+    PerContextData* sceneCtx = findSceneContextData(false);
     std::lock_guard lock(seen_mutex);
-    if (!depthSnapshotAvailableLocked(index) ||
-        seen[index].texture_format != DXGI_FORMAT_R32G8X24_TYPELESS) return false;
+    if (!depthSnapshotAvailableForContextLocked(sceneCtx, index) ||
+        sceneCtx->seen[index].texture_format != DXGI_FORMAT_R32G8X24_TYPELESS) return false;
+    camera_pair_context = sceneCtx->context;
     camera_pair_queued = static_cast<int>(index);
     motion_pair_queued = true;
     return true;
@@ -4227,29 +4409,18 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionDepthSnapshot(UINT* width, UINT
 }
 
 int ContextCensusSceneDepthCandidate() {
+    PerContextData* sceneCtx = findSceneContextData(true);
     std::lock_guard lock(seen_mutex);
+    if (!sceneCtx) return -1;
     const auto frame = last_present_frame.load(std::memory_order_relaxed);
     int candidate = -1;
-    for (size_t index = 0; index < seen_count; ++index) {
-        const auto match = seen[index].scene_match_frame;
+    for (size_t index = 0; index < sceneCtx->seen_count; ++index) {
+        const auto match = sceneCtx->seen[index].scene_match_frame;
         // Present can run between scene signature binds; keep a recent match stable.
         if (match == ~0ull || match > frame || frame - match > 32 ||
-            !depthSnapshotAvailableLocked(static_cast<unsigned>(index))) continue;
+            !depthSnapshotAvailableForContextLocked(sceneCtx, static_cast<unsigned>(index))) continue;
         if (candidate >= 0) return -1; // Ambiguous: require manual selection.
         candidate = static_cast<int>(index);
-    }
-    if (candidate >= 0) {
-        ID3D11Device* sceneDevice = seen[candidate].owning_device;
-        ID3D11Device* presentDev = s_present_device.load(std::memory_order_acquire);
-        if (sceneDevice && presentDev && sceneDevice != presentDev) {
-            static std::atomic<bool> s_warned_candidate_diff{false};
-            if (!s_warned_candidate_diff.exchange(true)) {
-                wchar_t warnMsg[256];
-                swprintf_s(warnMsg, L"EDPE: WARNING: scene device differs from present device (scene device=%p, present device=%p)",
-                    sceneDevice, presentDev);
-                EdpeLog(warnMsg);
-            }
-        }
     }
     return candidate;
 }
@@ -4394,6 +4565,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     }
     endVSBufferProbe();
     resetCameraDelta();
+    for (size_t i = 0; i < s_cloned_context_count.load(std::memory_order_acquire); ++i) {
+        if (s_cloned_contexts[i] && s_cloned_contexts[i]->context && s_cloned_contexts[i]->original_table) {
+            *reinterpret_cast<void***>(s_cloned_contexts[i]->context) = s_cloned_contexts[i]->original_table;
+        }
+    }
     for (size_t i = 0; i < s_hooked_table_count.load(std::memory_order_acquire); ++i) {
         auto& entry = s_hooked_tables[i];
         if (entry.table) {
@@ -4653,6 +4829,16 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
     void** table = *reinterpret_cast<void***>(context);
     if (!table) return;
 
+    {
+        const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+        for (size_t i = 0; i < cloneCount; ++i) {
+            if (s_cloned_contexts[i] && s_cloned_contexts[i]->methods == table) {
+                table = s_cloned_contexts[i]->original_table;
+                break;
+            }
+        }
+    }
+
     getOrCreateContextData(context);
 
     bool alreadyHooked = false;
@@ -4661,13 +4847,16 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
         const size_t count = s_hooked_table_count.load(std::memory_order_relaxed);
         for (size_t i = 0; i < count; ++i) {
             if (s_hooked_tables[i].table == table &&
-                table[kOMSetRenderTargets] == reinterpret_cast<void*>(&observedOMSetRenderTargets)) {
+                table[kOMSetRenderTargets] == reinterpret_cast<void*>(&observedOMSetRenderTargets) &&
+                table[kOMSetRenderTargetsAndUnorderedAccessViews] ==
+                    reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews)) {
                 alreadyHooked = true;
                 break;
             }
         }
     }
 
+    bool sharedPatchOk = alreadyHooked;
     if (!alreadyHooked) {
         HookedTableEntry entry{};
         entry.table = table;
@@ -4677,14 +4866,16 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
         entry.orig_exec = reinterpret_cast<ExecuteCommandListFn>(table[kExecuteCommandList]);
         entry.orig_finish = reinterpret_cast<FinishCommandListFn>(table[kFinishCommandList]);
 
+        bool om_ok = (entry.orig_om == &observedOMSetRenderTargets);
         if (entry.orig_om && entry.orig_om != &observedOMSetRenderTargets) {
             original.store(entry.orig_om, std::memory_order_release);
-            patchSlot(table, kOMSetRenderTargets, reinterpret_cast<void*>(entry.orig_om),
+            om_ok = patchSlot(table, kOMSetRenderTargets, reinterpret_cast<void*>(entry.orig_om),
                 reinterpret_cast<void*>(&observedOMSetRenderTargets));
         }
+        bool uav_ok = (entry.orig_om_uav == &observedOMSetRenderTargetsAndUnorderedAccessViews);
         if (entry.orig_om_uav && entry.orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews) {
             original_om_uav.store(entry.orig_om_uav, std::memory_order_release);
-            patchSlot(table, kOMSetRenderTargetsAndUnorderedAccessViews,
+            uav_ok = patchSlot(table, kOMSetRenderTargetsAndUnorderedAccessViews,
                 reinterpret_cast<void*>(entry.orig_om_uav),
                 reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
         }
@@ -4698,13 +4889,18 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             patchSlot(table, kFinishCommandList, reinterpret_cast<void*>(entry.orig_finish),
                 reinterpret_cast<void*>(&observedFinishCommandList));
         }
+        sharedPatchOk = om_ok && uav_ok;
 
         std::lock_guard lock(s_hooked_tables_mutex);
         const size_t count = s_hooked_table_count.load(std::memory_order_relaxed);
         bool found = false;
         for (size_t i = 0; i < count; ++i) {
             if (s_hooked_tables[i].table == table) {
-                s_hooked_tables[i] = entry;
+                if (entry.orig_om != &observedOMSetRenderTargets) s_hooked_tables[i].orig_om = entry.orig_om;
+                if (entry.orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews)
+                    s_hooked_tables[i].orig_om_uav = entry.orig_om_uav;
+                if (entry.orig_exec != &observedExecuteCommandList) s_hooked_tables[i].orig_exec = entry.orig_exec;
+                if (entry.orig_finish != &observedFinishCommandList) s_hooked_tables[i].orig_finish = entry.orig_finish;
                 found = true;
                 break;
             }
@@ -4712,6 +4908,30 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
         if (!found && count < kMaxHookedTables) {
             s_hooked_tables[count] = entry;
             s_hooked_table_count.store(count + 1, std::memory_order_release);
+        }
+    }
+
+    if (!sharedPatchOk) {
+        std::lock_guard lock(s_cloned_contexts_mutex);
+        const size_t cloneCount = s_cloned_context_count.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < cloneCount; ++i) {
+            if (s_cloned_contexts[i] && s_cloned_contexts[i]->context == context) return;
+        }
+        if (cloneCount < kMaxClonedContexts) {
+            auto clone = std::make_unique<ClonedContextVtable>();
+            clone->context = context;
+            clone->original_table = table;
+            clone->orig_om = reinterpret_cast<OMSetRenderTargetsFn>(table[kOMSetRenderTargets]);
+            clone->orig_om_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(
+                table[kOMSetRenderTargetsAndUnorderedAccessViews]);
+            std::memcpy(clone->methods, table, sizeof(clone->methods));
+            clone->methods[kOMSetRenderTargets] = reinterpret_cast<void*>(&observedOMSetRenderTargets);
+            clone->methods[kOMSetRenderTargetsAndUnorderedAccessViews] =
+                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews);
+            *reinterpret_cast<void***>(context) = clone->methods;
+            s_cloned_contexts[cloneCount] = std::move(clone);
+            s_cloned_context_count.store(cloneCount + 1, std::memory_order_release);
+            EdpeLog(L"EDPE: shared context vtable patch failed; installed per-context clone hook fallback");
         }
     }
 }
