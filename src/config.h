@@ -51,8 +51,8 @@ public:
         sharpness = static_cast<float>(_wtof(sharpnessBuf));
         if (sharpness < 0.0f || sharpness > 1.0f) sharpness = 0.0f;
 
-        jitterInvertX = GetPrivateProfileIntW(L"Jitter", L"InvertX", 0, path.c_str()) != 0;
-        jitterInvertY = GetPrivateProfileIntW(L"Jitter", L"InvertY", 0, path.c_str()) != 0;
+        jitterInvertX = GetPrivateProfileIntW(L"Jitter", L"InvertX", 1, path.c_str()) != 0;
+        jitterInvertY = GetPrivateProfileIntW(L"Jitter", L"InvertY", 1, path.c_str()) != 0;
         jitterSwapXY = GetPrivateProfileIntW(L"Jitter", L"SwapXY", 0, path.c_str()) != 0;
 
         wchar_t buf[64]{};
@@ -232,8 +232,8 @@ public:
     bool preserveNativeUi = true;
     bool hdrInput = false;
 
-    bool jitterInvertX = false;
-    bool jitterInvertY = false;
+    bool jitterInvertX = true;
+    bool jitterInvertY = true;
     bool jitterSwapXY = false;
     float jitterScale = 1.0f;
     unsigned jitterPhaseCount = 32;

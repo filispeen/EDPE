@@ -380,6 +380,8 @@ static std::atomic<bool> s_inside_main_scene{false};
 static std::atomic<bool> s_in_edpe_present{false};
 static edpe::ProjectionJitter s_injected_jitter{};
 static unsigned long long s_jitter_injected_frame = ~0ull;
+static std::atomic<unsigned long long> s_jitter_standdown_until{0};
+static unsigned long long s_jitter_standdown_len = 60;
 static edpe::ProjectionJitter s_last_rendered_jitter{};
 
 inline bool isSceneCameraAspect(float scaleX, float scaleY, UINT width, UINT height) {
@@ -688,8 +690,8 @@ edpe::ProjectionJitter active_projection_jitter{};
 UINT active_render_width = 0;
 UINT active_render_height = 0;
 
-std::atomic<bool> s_jitter_invert_x{false};
-std::atomic<bool> s_jitter_invert_y{false};
+std::atomic<bool> s_jitter_invert_x{true};
+std::atomic<bool> s_jitter_invert_y{true};
 std::atomic<bool> s_jitter_swap_xy{false};
 std::atomic<float> s_jitter_scale{1.0f};
 std::atomic<unsigned> s_jitter_phase_count{32};
@@ -4485,6 +4487,24 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 }
             }
         }
+        // Fail open (AGENTS.md "Projection jitter"): Elite must never keep rendering a
+        // jittered image that reconstruction did not resolve this frame; the raw
+        // sub-pixel offset shows up as the whole image constantly shaking.
+        // Stand the jitter down with back-off until reconstruction works again.
+        if (s_jitter_injected_frame == rendered_frame &&
+            !s_jitter_debug_view.load(std::memory_order_relaxed) &&
+            !jitter_test_override.load(std::memory_order_relaxed)) {
+            if (s_last_reconstructed_frame == rendered_frame) {
+                s_jitter_standdown_len = 60;
+            } else {
+                s_jitter_standdown_until.store(rendered_frame + s_jitter_standdown_len, std::memory_order_relaxed);
+                wchar_t standdown_msg[200];
+                swprintf_s(standdown_msg, L"EDPE: jitter stood down for %llu frames (frame=%llu was jittered but not reconstructed)",
+                    s_jitter_standdown_len, rendered_frame);
+                EdpeLog(standdown_msg);
+                s_jitter_standdown_len = (std::min)(s_jitter_standdown_len * 2ull, 960ull);
+            }
+        }
         s_upscale_evaluated_this_frame = false;
         motion_color_first_exit_logged = false;
         s_latest_unmapped_camera_valid = false;
@@ -5096,6 +5116,7 @@ bool ContextCensusIsJitterActive() {
     if (!jitter_enabled.load(std::memory_order_relaxed)) return false;
     if (jitter_test_override.load(std::memory_order_relaxed)) return true;
     if (s_jitter_debug_view.load(std::memory_order_relaxed)) return true;
+    if (jitter_frame_index.load(std::memory_order_relaxed) < s_jitter_standdown_until.load(std::memory_order_relaxed)) return false;
     return edpe::UpscalerManager::instance().isReconstructionActive();
 }
 
