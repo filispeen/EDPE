@@ -2646,6 +2646,15 @@ static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
 static ID3D11Texture2D* s_cached_backbuffer_ptr = nullptr;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_present;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_scene;
+// Keyed mutex protocol for the cross-device bridge (GPU-side synchronisation;
+// a bare Flush() does not order work between two D3D11 devices and caused
+// stale/torn frames = flicker):
+//   key 0: present device owns the texture   key 1: scene device owns it
+//   present: Acquire(0) -> copy backbuffer in -> Release(1)
+//   scene:   Acquire(1) -> reconstruct        -> Release(0)
+//   present: Acquire(0) -> copy result out    -> Release(0)
+static Microsoft::WRL::ComPtr<IDXGIKeyedMutex> s_shared_mutex_present;
+static Microsoft::WRL::ComPtr<IDXGIKeyedMutex> s_shared_mutex_scene;
 static ID3D11Device* s_shared_present_dev = nullptr;
 static ID3D11Device* s_shared_scene_dev = nullptr;
 static ID3D11Device* s_temporal_resources_device = nullptr;
@@ -2653,6 +2662,63 @@ static unsigned long long s_last_reconstructed_frame = ~0ull;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_final_output_present;
 static edpe::TemporalFrameInputs s_last_temporal_inputs{};
 static unsigned long long s_last_temporal_inputs_frame = ~0ull;
+
+constexpr DWORD kBridgeTimeoutMs = 100;
+
+void resetSharedBackbufferBridge() {
+    s_shared_mutex_present.Reset();
+    s_shared_mutex_scene.Reset();
+    s_shared_bb_present.Reset();
+    s_shared_bb_scene.Reset();
+    s_shared_present_dev = nullptr;
+    s_shared_scene_dev = nullptr;
+}
+
+// Present device -> shared texture, then hands ownership to the scene device.
+bool bridgeCopyBackbufferIn(ID3D11DeviceContext* presentCtx, ID3D11Resource* presentBackbuffer) {
+    if (!s_shared_mutex_present || !s_shared_bb_present) return false;
+    if (s_shared_mutex_present->AcquireSync(0, kBridgeTimeoutMs) != S_OK) {
+        EdpeLog(L"EDPE: WARNING: shared bridge acquire (present->scene) timed out; resetting bridge");
+        resetSharedBackbufferBridge();
+        return false;
+    }
+    presentCtx->CopyResource(s_shared_bb_present.Get(), presentBackbuffer);
+    s_shared_mutex_present->ReleaseSync(1);
+    return true;
+}
+
+// Scene-device ownership of the shared texture for the duration of one pass.
+// Always hands the texture back (key 0) on release/destruction so the present
+// device can never deadlock, even on early returns.
+struct SceneBridgeLock {
+    bool held = false;
+    bool acquire() {
+        held = s_shared_mutex_scene && s_shared_mutex_scene->AcquireSync(1, kBridgeTimeoutMs) == S_OK;
+        if (!held) {
+            EdpeLog(L"EDPE: WARNING: shared bridge acquire (scene) timed out; resetting bridge");
+            resetSharedBackbufferBridge();
+        }
+        return held;
+    }
+    void release() {
+        if (held && s_shared_mutex_scene) s_shared_mutex_scene->ReleaseSync(0);
+        held = false;
+    }
+    ~SceneBridgeLock() { release(); }
+};
+
+// Shared texture -> present backbuffer. Caller must have released SceneBridgeLock.
+bool bridgeCopyResultOut(ID3D11DeviceContext* presentCtx, ID3D11Resource* presentBackbuffer) {
+    if (!s_shared_mutex_present || !s_shared_bb_present) return false;
+    if (s_shared_mutex_present->AcquireSync(0, kBridgeTimeoutMs) != S_OK) {
+        EdpeLog(L"EDPE: WARNING: shared bridge acquire (scene->present) timed out; resetting bridge");
+        resetSharedBackbufferBridge();
+        return false;
+    }
+    presentCtx->CopyResource(presentBackbuffer, s_shared_bb_present.Get());
+    s_shared_mutex_present->ReleaseSync(0);
+    return true;
+}
 
 bool ensureSharedBackbufferBridge(ID3D11Device* presentDevice, ID3D11Device* sceneDevice,
     const D3D11_TEXTURE2D_DESC& bbDesc) {
@@ -2666,10 +2732,7 @@ bool ensureSharedBackbufferBridge(ID3D11Device* presentDevice, ID3D11Device* sce
             return true;
         }
     }
-    s_shared_bb_present.Reset();
-    s_shared_bb_scene.Reset();
-    s_shared_present_dev = nullptr;
-    s_shared_scene_dev = nullptr;
+    resetSharedBackbufferBridge();
 
     D3D11_TEXTURE2D_DESC sharedDesc{};
     sharedDesc.Width = bbDesc.Width;
@@ -2680,7 +2743,7 @@ bool ensureSharedBackbufferBridge(ID3D11Device* presentDevice, ID3D11Device* sce
     sharedDesc.SampleDesc.Count = 1;
     sharedDesc.Usage = D3D11_USAGE_DEFAULT;
     sharedDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
     if (FAILED(presentDevice->CreateTexture2D(&sharedDesc, nullptr, &s_shared_bb_present))) {
         return false;
@@ -2689,12 +2752,14 @@ bool ensureSharedBackbufferBridge(ID3D11Device* presentDevice, ID3D11Device* sce
     HANDLE sharedHandle = nullptr;
     if (FAILED(s_shared_bb_present.As(&dxgiRes)) ||
         FAILED(dxgiRes->GetSharedHandle(&sharedHandle)) || !sharedHandle) {
-        s_shared_bb_present.Reset();
+        resetSharedBackbufferBridge();
         return false;
     }
     if (FAILED(sceneDevice->OpenSharedResource(sharedHandle, __uuidof(ID3D11Texture2D),
-            reinterpret_cast<void**>(s_shared_bb_scene.GetAddressOf())))) {
-        s_shared_bb_present.Reset();
+            reinterpret_cast<void**>(s_shared_bb_scene.GetAddressOf()))) ||
+        FAILED(s_shared_bb_present.As(&s_shared_mutex_present)) ||
+        FAILED(s_shared_bb_scene.As(&s_shared_mutex_scene))) {
+        resetSharedBackbufferBridge();
         return false;
     }
     s_shared_present_dev = presentDevice;
@@ -2781,6 +2846,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (!sceneDevice) sceneDevice = presentDevice;
 
     const bool crossDevice = (sceneDevice.Get() != presentDevice.Get());
+    SceneBridgeLock sceneBridgeLock;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> sceneCtxHolder;
     if (crossDevice) {
         sceneDevice->GetImmediateContext(&sceneCtxHolder);
@@ -2788,8 +2854,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (!ensureSharedBackbufferBridge(presentDevice.Get(), sceneDevice.Get(), backbufferDesc)) {
             return;
         }
-        presentCtx->CopyResource(s_shared_bb_present.Get(), presentBackbuffer);
-        presentCtx->Flush();
+        if (!bridgeCopyBackbufferIn(presentCtx, presentBackbuffer)) return;
+        if (!sceneBridgeLock.acquire()) return;
         context = sceneCtxHolder.Get();
         backbuffer = s_shared_bb_scene.Get();
     }
@@ -3227,10 +3293,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             }
 
             if (crossDevice) {
-                context->Flush();
-                presentCtx->CopyResource(presentBackbuffer, s_shared_bb_present.Get());
-                s_last_final_output_present = s_shared_bb_present;
-                s_last_reconstructed_frame = rendered;
+                sceneBridgeLock.release();
+                if (bridgeCopyResultOut(presentCtx, presentBackbuffer)) {
+                    s_last_final_output_present = s_shared_bb_present;
+                    s_last_reconstructed_frame = rendered;
+                }
             } else {
                 s_last_final_output_present.Reset();
                 s_last_reconstructed_frame = rendered;
@@ -3328,13 +3395,14 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
     const bool crossDevice = (s_temporal_resources_device &&
                               s_temporal_resources_device != presentDevice.Get() &&
                               s_last_temporal_inputs_frame == rendered);
+    SceneBridgeLock sceneBridgeLock;
     if (crossDevice) {
         s_temporal_resources_device->GetImmediateContext(&sceneCtxHolder);
         if (!sceneCtxHolder || !ensureSharedBackbufferBridge(presentDevice.Get(), s_temporal_resources_device, bbDesc)) {
             return;
         }
-        presentCtx->CopyResource(s_shared_bb_present.Get(), presentBackbuffer);
-        presentCtx->Flush();
+        if (!bridgeCopyBackbufferIn(presentCtx, presentBackbuffer)) return;
+        if (!sceneBridgeLock.acquire()) return;
         context = sceneCtxHolder.Get();
         backbuffer = s_shared_bb_scene.Get();
         device = s_temporal_resources_device;
@@ -3435,8 +3503,8 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         isHdr);
 
     if (crossDevice) {
-        context->Flush();
-        presentCtx->CopyResource(presentBackbuffer, s_shared_bb_present.Get());
+        sceneBridgeLock.release();
+        bridgeCopyResultOut(presentCtx, presentBackbuffer);
     }
 
     auto& recorder = edpe::JitterViewRecorder::instance();
@@ -4881,11 +4949,8 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_backbuffer_copy_rtv.Reset();
         s_backbuffer_rtv.Reset();
         s_cached_backbuffer_ptr = nullptr;
-        s_shared_bb_present.Reset();
-        s_shared_bb_scene.Reset();
+        resetSharedBackbufferBridge();
         s_last_final_output_present.Reset();
-        s_shared_present_dev = nullptr;
-        s_shared_scene_dev = nullptr;
         s_temporal_resources_device = nullptr;
         s_last_reconstructed_frame = ~0ull;
         s_last_temporal_inputs = {};
