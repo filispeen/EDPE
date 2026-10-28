@@ -690,8 +690,8 @@ edpe::ProjectionJitter active_projection_jitter{};
 UINT active_render_width = 0;
 UINT active_render_height = 0;
 
-std::atomic<bool> s_jitter_invert_x{true};
-std::atomic<bool> s_jitter_invert_y{true};
+std::atomic<bool> s_jitter_invert_x{false};
+std::atomic<bool> s_jitter_invert_y{false};
 std::atomic<bool> s_jitter_swap_xy{false};
 std::atomic<float> s_jitter_scale{1.0f};
 std::atomic<unsigned> s_jitter_phase_count{32};
