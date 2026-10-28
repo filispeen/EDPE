@@ -1,4 +1,5 @@
 #include "ngx_context.h"
+#include "context_census.h"
 #include "temporal_inputs.h"
 #include "log.h"
 
@@ -420,7 +421,11 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ep.InExposureScale = 1.0f;
     ep.InFrameTimeDeltaInMsec = params.frameTimeMs;
 
-    NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(context, g_dlaa_feature, g_ngx_params, &ep);
+    NVSDK_NGX_Result r;
+    {
+        EvaluatingUpscalerGuard evalGuard;
+        r = NGX_D3D11_EVALUATE_DLSS_EXT(context, g_dlaa_feature, g_ngx_params, &ep);
+    }
     if (r != NVSDK_NGX_Result_Success) {
         swprintf_s(g_status_msg, L"NGX_D3D11_EVALUATE_DLSS_EXT failed: 0x%08X", static_cast<unsigned>(r));
         EdpeLog(g_status_msg);

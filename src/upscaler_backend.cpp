@@ -1,6 +1,11 @@
 #include "upscaler_backend.h"
+#include "context_census.h"
 #include "log.h"
 #include "ngx_context.h"
+
+std::atomic<bool> g_is_evaluating_upscaler{false};
+std::atomic<int> g_evaluating_upscaler_depth{0};
+std::recursive_mutex g_scene_ctx_mutex;
 
 #include <algorithm>
 #include <cfloat>
@@ -443,7 +448,11 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.cameraFar = FLT_MAX;
     dispatchDesc.viewSpaceToMetersFactor = 1.0f;
 
-    FfxErrorCode err = ffxFsr3UpscalerContextDispatch(&impl_->fsrContext, &dispatchDesc);
+    FfxErrorCode err;
+    {
+        EvaluatingUpscalerGuard evalGuard;
+        err = ffxFsr3UpscalerContextDispatch(&impl_->fsrContext, &dispatchDesc);
+    }
     if (err != FFX_OK) {
         wchar_t buf[256];
         swprintf_s(buf, L"EDPE: ffxFsr3UpscalerContextDispatch failed (%d)", err);
@@ -777,7 +786,11 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     }
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    const bool evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
+    bool evalSuccess = false;
+    {
+        EvaluatingUpscalerGuard evalGuard;
+        evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
+    }
     auto t1 = std::chrono::high_resolution_clock::now();
     if (evalSuccess) {
         ++evalCount_;

@@ -2,6 +2,27 @@
 
 #include <dxgi.h>
 #include <d3d11.h>
+#include <atomic>
+#include <mutex>
+
+extern std::atomic<bool> g_is_evaluating_upscaler;
+extern std::atomic<int> g_evaluating_upscaler_depth;
+extern std::recursive_mutex g_scene_ctx_mutex;
+
+struct EvaluatingUpscalerGuard {
+    EvaluatingUpscalerGuard() {
+        if (g_evaluating_upscaler_depth.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            g_is_evaluating_upscaler.store(true, std::memory_order_release);
+        }
+    }
+    ~EvaluatingUpscalerGuard() {
+        if (g_evaluating_upscaler_depth.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            g_is_evaluating_upscaler.store(false, std::memory_order_release);
+        }
+    }
+    EvaluatingUpscalerGuard(const EvaluatingUpscalerGuard&) = delete;
+    EvaluatingUpscalerGuard& operator=(const EvaluatingUpscalerGuard&) = delete;
+};
 
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags);
 void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags);
