@@ -69,15 +69,32 @@ jobs:
         run: |
           python tools/fetch_ffx_dx11.py
 
+      - name: Cache EDPE Build
+        id: cache-build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: edpe-build-${{ runner.os }}-v1-${{ hashFiles('CMakeLists.txt', '.gitmodules', 'src/**', 'external/imgui/**', 'tests/**', 'tools/**') }}
+          restore-keys: |
+            edpe-build-${{ runner.os }}-v1-
+
       - name: Configure CMake
+        if: steps.cache-build.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           cmake -S . -B build -A x64
 
       - name: Build EDPE (Release)
+        if: steps.cache-build.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           cmake --build build --config Release --parallel
+
+      - name: Using Cached Build
+        if: steps.cache-build.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Exact cache hit for build directory. Reusing cached build (compilation skipped)."
 
       - name: Run Tests
         shell: pwsh
