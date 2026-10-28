@@ -107,14 +107,6 @@ if (-not $SkipSubmoduleUpdate) {
     finally {
         Pop-Location
     }
-
-    if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'external/ffx-dx11/include/FidelityFX/host/ffx_fsr3upscaler.h'))) {
-        $python = Get-Command python -ErrorAction SilentlyContinue
-        if ($python) {
-            Write-Host 'Fetching FidelityFX DX11 SDK...'
-            & $python.Source (Join-Path $repoRoot 'tools/fetch_ffx_dx11.py')
-        }
-    }
 }
 
 Write-Host ''

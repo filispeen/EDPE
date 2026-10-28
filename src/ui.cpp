@@ -879,25 +879,6 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
     source->Release();
 }
 
-static ImGuiStyle s_base_imgui_style;
-static bool s_base_style_initialized = false;
-
-static void applyUiScale(float scale) {
-    if (!ui.imgui) return;
-    ImGuiContext* previous = ImGui::GetCurrentContext();
-    ImGui::SetCurrentContext(ui.imgui);
-    if (!s_base_style_initialized) {
-        s_base_imgui_style = ImGui::GetStyle();
-        s_base_style_initialized = true;
-    }
-    scale = std::clamp(scale, 0.5f, 2.5f);
-    ImGuiIO& io = ImGui::GetIO();
-    io.FontGlobalScale = scale;
-    ImGui::GetStyle() = s_base_imgui_style;
-    ImGui::GetStyle().ScaleAllSizes(scale);
-    ImGui::SetCurrentContext(previous);
-}
-
 void shutdownUi() {
     menu_visible.store(false);
     if (ui.window && ui.original_wndproc &&
@@ -927,7 +908,6 @@ void shutdownUi() {
     if (ui.device) ui.device->Release();
     edpe::UpscalerManager::instance().shutdown();
     edpe::PerfTracker::instance().shutdown();
-    s_base_style_initialized = false;
     ui = {};
     std::lock_guard lock(input_mutex);
     pending_input.clear();
@@ -994,7 +974,6 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     {
         auto& cfg = edpe::Config::instance();
         cfg.load();
-        applyUiScale(cfg.uiScale);
         edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
         if (cfg.upscalerBackend == 1 &&
             edpe::UpscalerManager::instance().isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss)) {
@@ -1218,10 +1197,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
     }
     if (ImGui::SliderFloat("HUD Scale", &cfg.perfOverlayScale, 0.5f, 2.5f, "%.2fx")) {
-        cfg.save();
-    }
-    if (ImGui::SliderFloat("UI Scale", &cfg.uiScale, 0.5f, 2.5f, "%.2fx")) {
-        applyUiScale(cfg.uiScale);
         cfg.save();
     }
 
