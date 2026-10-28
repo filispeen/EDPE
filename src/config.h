@@ -86,6 +86,10 @@ public:
         perfOverlayScale = static_cast<float>(_wtof(buf));
         if (perfOverlayScale < 0.5f || perfOverlayScale > 3.0f) perfOverlayScale = 1.0f;
 
+        GetPrivateProfileStringW(L"Overlay", L"UiScale", L"1.0", buf, 64, path.c_str());
+        uiScale = static_cast<float>(_wtof(buf));
+        if (uiScale < 0.5f || uiScale > 2.5f) uiScale = 1.0f;
+
         GetPrivateProfileStringW(L"Overlay", L"PosX", L"-1.0", buf, 64, path.c_str());
         perfOverlayPosX = static_cast<float>(_wtof(buf));
         GetPrivateProfileStringW(L"Overlay", L"PosY", L"-1.0", buf, 64, path.c_str());
@@ -135,6 +139,8 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"Corner", std::to_wstring(perfOverlayCorner).c_str(), path.c_str());
         swprintf_s(buf, L"%.2f", perfOverlayScale);
         WritePrivateProfileStringW(L"Overlay", L"Scale", buf, path.c_str());
+        swprintf_s(buf, L"%.2f", uiScale);
+        WritePrivateProfileStringW(L"Overlay", L"UiScale", buf, path.c_str());
         swprintf_s(buf, L"%.1f", perfOverlayPosX);
         WritePrivateProfileStringW(L"Overlay", L"PosX", buf, path.c_str());
         swprintf_s(buf, L"%.1f", perfOverlayPosY);
@@ -248,6 +254,7 @@ public:
     bool enableProfiler = false;
     int perfOverlayCorner = 0; // 0=Top-Left, 1=Top-Right, 2=Bottom-Left, 3=Bottom-Right
     float perfOverlayScale = 1.0f;
+    float uiScale = 1.0f;
     float perfOverlayPosX = -1.0f;
     float perfOverlayPosY = -1.0f;
 };
