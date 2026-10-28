@@ -45,7 +45,6 @@ constexpr size_t kDrawIndexedInstanced = 20;
 constexpr size_t kDrawInstanced = 21;
 constexpr size_t kOMSetRenderTargets = 33;
 constexpr size_t kOMSetRenderTargetsAndUnorderedAccessViews = 34;
-constexpr size_t kClearDepthStencilView = 53;
 constexpr size_t kExecuteCommandList = 58;
 constexpr size_t kFinishCommandList = 114;
 constexpr unsigned kPairFirstSample = 100;
@@ -56,8 +55,6 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT
 using OMSetRenderTargetsAndUnorderedAccessViewsFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*,
     UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*);
-using ClearDepthStencilViewFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,
-    ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
 using ExecuteCommandListFn = void(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, ID3D11CommandList*, BOOL);
 using FinishCommandListFn = HRESULT(STDMETHODCALLTYPE*)(
@@ -81,9 +78,6 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
     ID3D11DeviceContext* context, UINT numRTVs, ID3D11RenderTargetView* const* targets,
     ID3D11DepthStencilView* dsv, UINT uavStartSlot, UINT numUAVs,
     ID3D11UnorderedAccessView* const* uavs, const UINT* initialCounts);
-void STDMETHODCALLTYPE observedClearDepthStencilView(ID3D11DeviceContext* context,
-    ID3D11DepthStencilView* pDepthStencilView, UINT ClearFlags, FLOAT Depth, UINT8 Stencil);
-ClearDepthStencilViewFn resolveOriginalClearDsv(ID3D11DeviceContext* context);
 void STDMETHODCALLTYPE observedExecuteCommandList(
     ID3D11DeviceContext* context, ID3D11CommandList* pCommandList, BOOL restoreContextState);
 HRESULT STDMETHODCALLTYPE observedFinishCommandList(
@@ -91,7 +85,6 @@ HRESULT STDMETHODCALLTYPE observedFinishCommandList(
 
 static std::atomic<unsigned long long> s_rendered_scene_frame_id{0};
 
-std::atomic<ClearDepthStencilViewFn> original_clear_dsv{nullptr};
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<OMSetRenderTargetsFn> original_deferred_om{nullptr};
 std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_om_uav{nullptr};
@@ -154,7 +147,6 @@ struct HookedTableEntry {
     FinishCommandListFn orig_finish = nullptr;
     MapFn orig_map = nullptr;
     UnmapFn orig_unmap = nullptr;
-    ClearDepthStencilViewFn orig_clear_dsv = nullptr;
 };
 static constexpr size_t kMaxHookedTables = 16;
 static std::atomic<size_t> s_hooked_table_count{0};
@@ -182,7 +174,6 @@ struct ClonedContextVtable {
     OMSetRenderTargetsAndUnorderedAccessViewsFn orig_om_uav = nullptr;
     MapFn orig_map = nullptr;
     UnmapFn orig_unmap = nullptr;
-    ClearDepthStencilViewFn orig_clear_dsv = nullptr;
     void* methods[134]{};
 };
 static constexpr size_t kMaxClonedContexts = 16;
@@ -733,6 +724,41 @@ std::atomic<int> s_jitter_debug_mode{0};
 
 
 std::atomic<bool> s_zero_motion_vectors{false};
+
+edpe::ProjectionJitter getOrUpdateSceneProjectionJitter(unsigned long long cur_frame) {
+    std::lock_guard lock(jitter_mutex);
+    static unsigned long long s_last_jitter_frame = ~0ull;
+    if (s_last_jitter_frame != cur_frame) {
+        s_last_jitter_frame = cur_frame;
+        const unsigned long long scene_seq = s_rendered_scene_frame_id.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        const UINT scW = s_swapchain_width.load(std::memory_order_relaxed);
+        const UINT scH = s_swapchain_height.load(std::memory_order_relaxed);
+        const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
+        const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
+        const UINT rW = (sceneW > 0 && (!scW || sceneW <= scW)) ? sceneW : scW;
+        const UINT rH = (sceneH > 0 && (!scH || sceneH <= scH)) ? sceneH : scH;
+
+        const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
+        unsigned phases = base_phases ? base_phases : 32;
+        if (scW > rW && rW > 0) {
+            const float upscaleRatio = static_cast<float>(scW) / static_cast<float>(rW);
+            phases = static_cast<unsigned>(std::clamp(
+                std::lround(static_cast<float>(phases) * upscaleRatio * upscaleRatio), 8l, 256l));
+        }
+        s_active_jitter_phases.store(phases ? phases : 32, std::memory_order_relaxed);
+
+        auto jitter = edpe::projectionJitter(scene_seq, rW ? rW : 2560, rH ? rH : 1440, phases ? phases : 32);
+        const float scale = s_jitter_scale.load(std::memory_order_relaxed);
+        jitter.pixelX *= scale;
+        jitter.pixelY *= scale;
+        jitter.ndcX *= scale;
+        jitter.ndcY *= scale;
+        active_projection_jitter = jitter;
+        jitter_frame_index.store(scene_seq, std::memory_order_relaxed);
+    }
+    return active_projection_jitter;
+}
 std::atomic<bool> s_motion_invert_x{false};
 std::atomic<bool> s_motion_invert_y{false};
 std::atomic<float> s_motion_scale{1.0f};
@@ -1594,11 +1620,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 }
                 if (valid_projection) {
-                    edpe::ProjectionJitter jitter{};
-                    {
-                        std::lock_guard lock(jitter_mutex);
-                        jitter = active_projection_jitter;
-                    }
+                    edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter(cur_frame);
                     float jittered_block[16]{};
                     if (edpe::jitterEliteProjectionBlock(&words[1080], jittered_block, jitter)) {
                         std::memcpy(&words[1080], jittered_block, sizeof(jittered_block));
@@ -2849,12 +2871,18 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (skip) {
         if (upscale_active && s_last_reconstructed_output && s_last_reconstructed_frame != ~0ull &&
             (rendered >= s_last_reconstructed_frame && rendered - s_last_reconstructed_frame <= 2)) {
-            D3D11_TEXTURE2D_DESC curDesc{}, pbDesc{};
-            s_last_reconstructed_output->GetDesc(&curDesc);
-            presentBackbuffer->GetDesc(&pbDesc);
-            if (curDesc.Width == pbDesc.Width && curDesc.Height == pbDesc.Height && curDesc.Format == pbDesc.Format) {
-                presentCtx->CopyResource(presentBackbuffer, s_last_reconstructed_output.Get());
-                return;
+            Microsoft::WRL::ComPtr<ID3D11Device> lastDev;
+            s_last_reconstructed_output->GetDevice(&lastDev);
+            Microsoft::WRL::ComPtr<ID3D11Device> pbDev;
+            presentBackbuffer->GetDevice(&pbDev);
+            if (lastDev && pbDev && lastDev.Get() == pbDev.Get()) {
+                D3D11_TEXTURE2D_DESC curDesc{}, pbDesc{};
+                s_last_reconstructed_output->GetDesc(&curDesc);
+                presentBackbuffer->GetDesc(&pbDesc);
+                if (curDesc.Width == pbDesc.Width && curDesc.Height == pbDesc.Height && curDesc.Format == pbDesc.Format) {
+                    presentCtx->CopyResource(presentBackbuffer, s_last_reconstructed_output.Get());
+                    return;
+                }
             }
         }
         if (++s_consecutive_skipped_frames > 4) {
@@ -3341,14 +3369,33 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 if (bridgeCopyResultOut(presentCtx, presentBackbuffer)) {
                     s_last_final_output_present = s_shared_bb_present;
                     s_last_reconstructed_frame = rendered;
+                    compOk = true;
+                } else {
+                    compOk = false;
                 }
             } else {
                 s_last_final_output_present.Reset();
                 s_last_reconstructed_frame = rendered;
             }
 
-            if (presentCtx && presentBackbuffer) {
-                if (!s_last_reconstructed_output) {
+            if (presentCtx && presentBackbuffer && presentDevice) {
+                bool needCreate = (!s_last_reconstructed_output);
+                if (s_last_reconstructed_output) {
+                    Microsoft::WRL::ComPtr<ID3D11Device> recDev;
+                    s_last_reconstructed_output->GetDevice(&recDev);
+                    if (!recDev || recDev.Get() != presentDevice.Get()) {
+                        needCreate = true;
+                    } else {
+                        D3D11_TEXTURE2D_DESC curDesc{}, pbDesc{};
+                        s_last_reconstructed_output->GetDesc(&curDesc);
+                        presentBackbuffer->GetDesc(&pbDesc);
+                        if (curDesc.Width != pbDesc.Width || curDesc.Height != pbDesc.Height || curDesc.Format != pbDesc.Format) {
+                            needCreate = true;
+                        }
+                    }
+                }
+                if (needCreate) {
+                    s_last_reconstructed_output.Reset();
                     D3D11_TEXTURE2D_DESC roDesc{};
                     presentBackbuffer->GetDesc(&roDesc);
                     roDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -3356,17 +3403,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     roDesc.CPUAccessFlags = 0;
                     roDesc.MiscFlags = 0;
                     presentDevice->CreateTexture2D(&roDesc, nullptr, &s_last_reconstructed_output);
-                } else {
-                    D3D11_TEXTURE2D_DESC curDesc{}, pbDesc{};
-                    s_last_reconstructed_output->GetDesc(&curDesc);
-                    presentBackbuffer->GetDesc(&pbDesc);
-                    if (curDesc.Width != pbDesc.Width || curDesc.Height != pbDesc.Height || curDesc.Format != pbDesc.Format) {
-                        s_last_reconstructed_output.Reset();
-                        pbDesc.Usage = D3D11_USAGE_DEFAULT;
-                        pbDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                        pbDesc.CPUAccessFlags = pbDesc.MiscFlags = 0;
-                        presentDevice->CreateTexture2D(&pbDesc, nullptr, &s_last_reconstructed_output);
-                    }
                 }
                 if (s_last_reconstructed_output) {
                     presentCtx->CopyResource(s_last_reconstructed_output.Get(), presentBackbuffer);
@@ -3419,13 +3455,12 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_last_writes = cur_writes;
 
         const unsigned phases = s_active_jitter_phases.load(std::memory_order_relaxed);
-        const unsigned long long scene_frame_id = s_rendered_scene_frame_id.load(std::memory_order_relaxed);
-        const unsigned long long jitter_seq_index = (scene_frame_id > 0) ? scene_frame_id : rendered;
+        const unsigned long long scene_seq = jitter_frame_index.load(std::memory_order_relaxed);
 
         edpe::JitterFrameLog jlog{};
         jlog.frame = rendered;
         jlog.deltaMs = dt_ms;
-        jlog.phase = static_cast<unsigned>(jitter_seq_index % (phases ? phases : 32));
+        jlog.phase = static_cast<unsigned>(scene_seq % (phases ? phases : 32));
         jlog.totalPhases = phases ? phases : 32;
         jlog.pixelX = s_injected_jitter.pixelX;
         jlog.pixelY = s_injected_jitter.pixelY;
@@ -3773,11 +3808,6 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                         s_observed_scene_width.store(dd.Width, std::memory_order_relaxed);
                         s_observed_scene_height.store(dd.Height, std::memory_order_relaxed);
                         s_observed_scene_frame = current_frame;
-                        static unsigned long long s_last_scene_frame_counted = ~0ull;
-                        if (s_last_scene_frame_counted != current_frame) {
-                            s_last_scene_frame_counted = current_frame;
-                            s_rendered_scene_frame_id.fetch_add(1, std::memory_order_relaxed);
-                        }
                     }
                 }
                 dsv_res->Release();
@@ -4128,40 +4158,7 @@ OMSetRenderTargetsAndUnorderedAccessViewsFn resolveOriginalOMUav(ID3D11DeviceCon
     return forward;
 }
 
-ClearDepthStencilViewFn resolveOriginalClearDsv(ID3D11DeviceContext* context) {
-    if (!context) return original_clear_dsv.load(std::memory_order_acquire);
-    void** table = *reinterpret_cast<void***>(context);
-    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
-    for (size_t i = 0; i < cloneCount; ++i) {
-        if (s_cloned_contexts[i] &&
-            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
-            if (s_cloned_contexts[i]->orig_clear_dsv &&
-                s_cloned_contexts[i]->orig_clear_dsv != &observedClearDepthStencilView)
-                return s_cloned_contexts[i]->orig_clear_dsv;
-            table = s_cloned_contexts[i]->original_table;
-            break;
-        }
-    }
-    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
-    for (size_t i = 0; i < tblCount; ++i) {
-        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_clear_dsv &&
-            s_hooked_tables[i].orig_clear_dsv != &observedClearDepthStencilView) {
-            return s_hooked_tables[i].orig_clear_dsv;
-        }
-    }
-    return original_clear_dsv.load(std::memory_order_acquire);
-}
 
-void STDMETHODCALLTYPE observedClearDepthStencilView(ID3D11DeviceContext* context,
-    ID3D11DepthStencilView* pDepthStencilView, UINT ClearFlags, FLOAT Depth, UINT8 Stencil) {
-    ClearDepthStencilViewFn forward = resolveOriginalClearDsv(context);
-    if (g_is_evaluating_upscaler.load(std::memory_order_acquire)) {
-        if (forward) forward(context, pDepthStencilView, ClearFlags, Depth, Stencil);
-        return;
-    }
-    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
-    if (forward) forward(context, pDepthStencilView, ClearFlags, Depth, Stencil);
-}
 
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
@@ -4680,11 +4677,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         active_render_width = (sceneW > 0 && (!outW || sceneW <= outW)) ? sceneW : outW;
         active_render_height = (sceneH > 0 && (!outH || sceneH <= outH)) ? sceneH : outH;
 
-        const unsigned long long scene_frame_id = s_rendered_scene_frame_id.load(std::memory_order_relaxed);
-        const unsigned long long jitter_seq_index =
-            (scene_frame_id > 0) ? scene_frame_id : frame;
-
-        if (active_render_width && active_render_height) {
+        if (active_render_width && active_render_height && jitter_frame_index.load(std::memory_order_relaxed) == 0) {
             std::lock_guard lock(jitter_mutex);
             const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
             unsigned phases = base_phases;
@@ -4694,14 +4687,13 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     std::lround(static_cast<float>(base_phases) * upscaleRatio * upscaleRatio), 8l, 256l));
             }
             s_active_jitter_phases.store(phases ? phases : 32, std::memory_order_relaxed);
-            auto jitter = edpe::projectionJitter(jitter_seq_index, active_render_width, active_render_height, phases);
+            auto jitter = edpe::projectionJitter(0, active_render_width, active_render_height, phases);
             const float scale = s_jitter_scale.load(std::memory_order_relaxed);
             jitter.pixelX *= scale;
             jitter.pixelY *= scale;
             jitter.ndcX *= scale;
             jitter.ndcY *= scale;
             active_projection_jitter = jitter;
-            jitter_frame_index.store(jitter_seq_index, std::memory_order_relaxed);
         }
 
         if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
@@ -4723,10 +4715,11 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             s_last_writes = cur_writes;
 
             const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
+            const unsigned long long scene_seq = jitter_frame_index.load(std::memory_order_relaxed);
             edpe::JitterFrameLog jlog{};
             jlog.frame = frame;
             jlog.deltaMs = dt_ms;
-            jlog.phase = static_cast<unsigned>(jitter_seq_index % (base_phases ? base_phases : 32));
+            jlog.phase = static_cast<unsigned>(scene_seq % (base_phases ? base_phases : 32));
             jlog.totalPhases = base_phases ? base_phases : 32;
             jlog.pixelX = s_injected_jitter.pixelX;
             jlog.pixelY = s_injected_jitter.pixelY;
@@ -5000,7 +4993,6 @@ int ContextCensusSceneDepthCandidate() {
     const auto frame = last_present_frame.load(std::memory_order_relaxed);
 
     int bestCandidate = -1;
-    bool foundD32 = false;
 
     for (size_t index = 0; index < sceneCtx->seen_count; ++index) {
         const auto match = sceneCtx->seen[index].scene_match_frame;
@@ -5008,14 +5000,26 @@ int ContextCensusSceneDepthCandidate() {
         if (match == ~0ull || match > frame || frame - match > 32 ||
             !depthSnapshotAvailableForContextLocked(sceneCtx, static_cast<unsigned>(index))) continue;
 
-        const bool isD32 = (sceneCtx->seen[index].texture_format == DXGI_FORMAT_R32G8X24_TYPELESS);
-        if (isD32) {
-            if (foundD32) return -1; // Ambiguous: require manual selection if multiple D32
+        if (bestCandidate < 0) {
             bestCandidate = static_cast<int>(index);
-            foundD32 = true;
-        } else if (!foundD32) {
-            if (bestCandidate >= 0) return -1; // Ambiguous if multiple D24 and no D32
+            continue;
+        }
+
+        const auto& cand = sceneCtx->seen[index];
+        const auto& best = sceneCtx->seen[bestCandidate];
+        const int candPrio = (cand.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS) ? 1 : 0;
+        const int bestPrio = (best.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS) ? 1 : 0;
+
+        if (candPrio > bestPrio) {
             bestCandidate = static_cast<int>(index);
+        } else if (candPrio == bestPrio) {
+            if (cand.scene_match_frame > best.scene_match_frame) {
+                bestCandidate = static_cast<int>(index);
+            } else if (cand.scene_match_frame == best.scene_match_frame) {
+                if (index > static_cast<size_t>(bestCandidate)) {
+                    bestCandidate = static_cast<int>(index);
+                }
+            }
         }
     }
     return bestCandidate;
@@ -5195,11 +5199,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
                     reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews),
                     reinterpret_cast<void*>(entry.orig_om_uav));
             }
-            if (entry.orig_clear_dsv) {
-                patchSlot(entry.table, kClearDepthStencilView,
-                    reinterpret_cast<void*>(&observedClearDepthStencilView),
-                    reinterpret_cast<void*>(entry.orig_clear_dsv));
-            }
+
             if (entry.orig_exec) {
                 patchSlot(entry.table, kExecuteCommandList,
                     reinterpret_cast<void*>(&observedExecuteCommandList),
@@ -5498,7 +5498,7 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             table[kOMSetRenderTargetsAndUnorderedAccessViews]);
         entry.orig_exec = reinterpret_cast<ExecuteCommandListFn>(table[kExecuteCommandList]);
         entry.orig_finish = reinterpret_cast<FinishCommandListFn>(table[kFinishCommandList]);
-        entry.orig_clear_dsv = reinterpret_cast<ClearDepthStencilViewFn>(table[kClearDepthStencilView]);
+
         if (is_immediate) {
             entry.orig_map = reinterpret_cast<MapFn>(table[kMap]);
             entry.orig_unmap = reinterpret_cast<UnmapFn>(table[kUnmap]);
@@ -5522,11 +5522,7 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             patchSlot(table, kExecuteCommandList, reinterpret_cast<void*>(entry.orig_exec),
                 reinterpret_cast<void*>(&observedExecuteCommandList));
         }
-        if (entry.orig_clear_dsv && entry.orig_clear_dsv != &observedClearDepthStencilView) {
-            original_clear_dsv.store(entry.orig_clear_dsv, std::memory_order_release);
-            patchSlot(table, kClearDepthStencilView, reinterpret_cast<void*>(entry.orig_clear_dsv),
-                reinterpret_cast<void*>(&observedClearDepthStencilView));
-        }
+
         if (entry.orig_finish && entry.orig_finish != &observedFinishCommandList) {
             original_finish_command_list.store(entry.orig_finish, std::memory_order_release);
             patchSlot(table, kFinishCommandList, reinterpret_cast<void*>(entry.orig_finish),
@@ -5564,7 +5560,7 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
                     s_hooked_tables[i].orig_om_uav = entry.orig_om_uav;
                 if (entry.orig_exec != &observedExecuteCommandList) s_hooked_tables[i].orig_exec = entry.orig_exec;
                 if (entry.orig_finish != &observedFinishCommandList) s_hooked_tables[i].orig_finish = entry.orig_finish;
-                if (entry.orig_clear_dsv != &observedClearDepthStencilView) s_hooked_tables[i].orig_clear_dsv = entry.orig_clear_dsv;
+
                 if (is_immediate) {
                     if (entry.orig_map && entry.orig_map != &observedMap)
                         s_hooked_tables[i].orig_map = entry.orig_map;
@@ -5594,7 +5590,7 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             clone->orig_om = reinterpret_cast<OMSetRenderTargetsFn>(table[kOMSetRenderTargets]);
             clone->orig_om_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(
                 table[kOMSetRenderTargetsAndUnorderedAccessViews]);
-            clone->orig_clear_dsv = reinterpret_cast<ClearDepthStencilViewFn>(table[kClearDepthStencilView]);
+
             if (is_immediate) {
                 clone->orig_map = reinterpret_cast<MapFn>(table[kMap]);
                 clone->orig_unmap = reinterpret_cast<UnmapFn>(table[kUnmap]);
@@ -5603,7 +5599,7 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             clone->methods[kOMSetRenderTargets] = reinterpret_cast<void*>(&observedOMSetRenderTargets);
             clone->methods[kOMSetRenderTargetsAndUnorderedAccessViews] =
                 reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews);
-            clone->methods[kClearDepthStencilView] = reinterpret_cast<void*>(&observedClearDepthStencilView);
+
             if (is_immediate && map_hook_active.load(std::memory_order_acquire)) {
                 clone->methods[kMap] = reinterpret_cast<void*>(&observedMap);
             }
