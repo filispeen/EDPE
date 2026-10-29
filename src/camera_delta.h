@@ -34,6 +34,74 @@ inline CameraDelta cameraDelta(const CameraProjection& previous, const CameraPro
         std::fabs(static_cast<double>(now.depthB) - previous.depthB)};
 }
 
+inline float cameraRotationDeterminant(const CameraProjection& cam) {
+    const float* m = cam.worldFromView;
+    return m[0] * (m[5] * m[10] - m[6] * m[9])
+         - m[1] * (m[4] * m[10] - m[6] * m[8])
+         + m[2] * (m[4] * m[9]  - m[5] * m[8]);
+}
+
+inline float cameraRotationTrace(const CameraProjection& a, const CameraProjection& b) {
+    const float* c = a.worldFromView;
+    const float* p = b.worldFromView;
+    return (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
+           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
+           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
+}
+
+inline bool isReflectionOrAuxiliaryCamera(const CameraProjection& candidate, const CameraProjection& baseline) {
+    // 1. Planar reflection matrices invert coordinate chirality: det(R) = -1.0.
+    const float det = cameraRotationDeterminant(candidate);
+    if (det < 0.5f) return true;
+
+    if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) return false;
+
+    // 2. Projection FOV / scale mismatch against active main camera:
+    if (std::fabs(candidate.scaleX - baseline.scaleX) > 0.02f * baseline.scaleX ||
+        std::fabs(candidate.scaleY - baseline.scaleY) > 0.02f * baseline.scaleY) {
+        return true;
+    }
+
+    // 3. Discontinuous single-frame orientation or probe offset relative to active baseline:
+    const float* c = candidate.worldFromView;
+    const float* b = baseline.worldFromView;
+    const float dx = c[3] - b[3];
+    const float dy = c[7] - b[7];
+    const float dz = c[11] - b[11];
+    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float rotTrace = cameraRotationTrace(candidate, baseline);
+
+    // Abrupt single-frame orientation jump (> 45 deg, rotTrace < 2.40) at any distance is an auxiliary/probe camera:
+    if (rotTrace < 2.40f) {
+        return true;
+    }
+
+    // Auxiliary mirror / panel / probe camera with combined orientation (> 18 deg) and position jump:
+    if (dist > 0.05f && rotTrace < 2.90f) {
+        return true;
+    }
+
+    // 4. Auxiliary stereo eye / IPD / lateral reflection probe check:
+    // Cobra engine periodically evaluates a secondary stereo eye or cockpit probe (~1 Hz).
+    // In Odyssey 2D mode, this probe has identical orientation (rotTrace > 2.99) and identical
+    // FOV/aspect, but exhibits a discrete lateral eye displacement (e.g. 68.2 mm IPD or 136.4 mm stereo baseline).
+    const float dRight   = dx * c[0] + dy * c[4] + dz * c[8];
+    const float dUp      = dx * c[1] + dy * c[5] + dz * c[9];
+    const float dForward = dx * c[2] + dy * c[6] + dz * c[10];
+    const float absRight = std::fabs(dRight);
+    const float absUp    = std::fabs(dUp);
+    const float absFwd   = std::fabs(dForward);
+
+    // If the displacement matches the stereo eye / IPD baseline range (0.04m .. 0.35m)
+    // with overwhelmingly lateral motion (|dRight| >= 80% of total distance),
+    // near-zero forward and vertical motion, and identical orientation:
+    if (dist >= 0.04f && dist <= 0.35f && absRight >= 0.80f * dist && absUp < 0.04f && absFwd < 0.04f && rotTrace > 2.99f) {
+        return true;
+    }
+
+    return false;
+}
+
 enum CameraDeltaFlag : unsigned {
     kCameraDeltaRotation = 1,     // rotation above the logging threshold
     kCameraDeltaTranslation = 2,  // translation above the logging threshold

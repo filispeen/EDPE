@@ -85,5 +85,41 @@ int main() {
     // History survives the window boundary.
     r = tracker.feed(frame, true, yawed(0));
     if (!r.haveDelta || r.gap != 1) return 14;
+
+    // Unit tests for isReflectionOrAuxiliaryCamera:
+    // 1. Stationary identical camera is not auxiliary:
+    if (edpe::isReflectionOrAuxiliaryCamera(identity(), identity())) return 15;
+
+    // 2. High-speed straight forward flight (e.g. 5 meters along forward axis) is not auxiliary:
+    auto forwardFlight = identity();
+    forwardFlight.worldFromView[11] = 5.0f;
+    if (edpe::isReflectionOrAuxiliaryCamera(forwardFlight, identity())) return 16;
+
+    // 3. Stereo auxiliary eye / IPD probe (0.1364m lateral jump with identical rotation) MUST be identified as auxiliary:
+    auto stereoProbe = identity();
+    stereoProbe.worldFromView[3] = 0.1364f;
+    if (!edpe::isReflectionOrAuxiliaryCamera(stereoProbe, identity())) return 17;
+
+    // 4. Single eye probe (0.0682m lateral jump with identical rotation) MUST be identified as auxiliary:
+    auto singleEyeProbe = identity();
+    singleEyeProbe.worldFromView[3] = 0.0682f;
+    if (!edpe::isReflectionOrAuxiliaryCamera(singleEyeProbe, identity())) return 18;
+
+    // 5. Large sideways flight (> 0.40m, e.g. 1.0m) is not an IPD probe:
+    auto largeSideways = identity();
+    largeSideways.worldFromView[3] = 1.0f;
+    if (edpe::isReflectionOrAuxiliaryCamera(largeSideways, identity())) return 19;
+
+    // 6. Planar reflection camera (det < 0.5) MUST be identified as auxiliary:
+    auto planarReflection = identity();
+    planarReflection.worldFromView[0] = -1.0f;
+    if (!edpe::isReflectionOrAuxiliaryCamera(planarReflection, identity())) return 20;
+
+    // 7. FOV mismatch MUST be identified as auxiliary:
+    if (!edpe::isReflectionOrAuxiliaryCamera(zoomed, identity())) return 21;
+
+    // 8. Sudden orientation jump (> 45 deg) MUST be identified as auxiliary:
+    if (!edpe::isReflectionOrAuxiliaryCamera(yawed(50), identity())) return 22;
+
     return 0;
 }

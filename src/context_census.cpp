@@ -426,8 +426,9 @@ inline float getJitterLogTimeMs() {
         : 0.0f;
 }
 
-inline float cameraRotationDeterminant(const edpe::CameraProjection& cam);
-inline bool isReflectionOrAuxiliaryCamera(const edpe::CameraProjection& candidate, const edpe::CameraProjection& baseline);
+using edpe::cameraRotationDeterminant;
+using edpe::cameraRotationTrace;
+using edpe::isReflectionOrAuxiliaryCamera;
 
 inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
                                            const edpe::CameraProjection& parsed_camera,
@@ -496,55 +497,6 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
     return true;
 }
 
-inline float cameraRotationDeterminant(const edpe::CameraProjection& cam) {
-    const float* m = cam.worldFromView;
-    return m[0] * (m[5] * m[10] - m[6] * m[9])
-         - m[1] * (m[4] * m[10] - m[6] * m[8])
-         + m[2] * (m[4] * m[9]  - m[5] * m[8]);
-}
-
-inline float cameraRotationTrace(const edpe::CameraProjection& a, const edpe::CameraProjection& b) {
-    const float* c = a.worldFromView;
-    const float* p = b.worldFromView;
-    return (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
-           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
-           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
-}
-
-inline bool isReflectionOrAuxiliaryCamera(const edpe::CameraProjection& candidate, const edpe::CameraProjection& baseline) {
-    // 1. Planar reflection matrices invert coordinate chirality: det(R) = -1.0.
-    const float det = cameraRotationDeterminant(candidate);
-    if (det < 0.5f) return true;
-
-    if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) return false;
-
-    // 2. Projection FOV / scale mismatch against active main camera:
-    if (std::fabs(candidate.scaleX - baseline.scaleX) > 0.01f * baseline.scaleX ||
-        std::fabs(candidate.scaleY - baseline.scaleY) > 0.01f * baseline.scaleY) {
-        return true;
-    }
-
-    // 3. Discontinuous single-frame orientation or probe offset relative to active baseline:
-    const float* c = candidate.worldFromView;
-    const float* b = baseline.worldFromView;
-    const float dx = c[3] - b[3];
-    const float dy = c[7] - b[7];
-    const float dz = c[11] - b[11];
-    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const float rotTrace = cameraRotationTrace(candidate, baseline);
-
-    // Abrupt single-frame orientation jump (> 45 deg, rotTrace < 2.40) at any distance is an auxiliary/probe camera:
-    if (rotTrace < 2.40f) {
-        return true;
-    }
-
-    // Auxiliary mirror / panel / probe camera with combined orientation (> 18 deg) and position jump:
-    if (dist > 0.05f && rotTrace < 2.90f) {
-        return true;
-    }
-
-    return false;
-}
 
 inline bool sameCamera(const edpe::CameraProjection& a, const edpe::CameraProjection& b) {
     for (int i = 0; i < 12; ++i) {
@@ -1662,7 +1614,10 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             if (edpe::parseEliteCamera(words, 5376 / sizeof(float), &parsed_camera)) {
                 const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
                 const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
-                if (isAuthoritativeMainSceneCamera(words, 5376 / sizeof(float), parsed_camera, outW, outH)) {
+                const bool main_gbuffer_already_finished =
+                    (s_hdr_slot0_seen_frame == cur_frame && motion_color_frame == cur_frame);
+                if (isAuthoritativeMainSceneCamera(words, 5376 / sizeof(float), parsed_camera, outW, outH) &&
+                    !main_gbuffer_already_finished) {
                     is_main_camera = true;
                     s_auxiliary_rejection_streak = 0;
                     if (in_main_scene) {
@@ -1675,7 +1630,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         s_latest_unmapped_camera_frame = cur_frame;
                         s_latest_unmapped_camera_valid = true;
                     }
-                } else if (cameraRotationDeterminant(parsed_camera) >= 0.5f && in_main_scene) {
+                } else if (cameraRotationDeterminant(parsed_camera) >= 0.5f) {
                     s_fallback_unmapped_camera = parsed_camera;
                     s_fallback_unmapped_camera_frame = cur_frame;
                 }
@@ -3654,6 +3609,10 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         jx = s_last_temporal_inputs.jitterX;
         jy = s_last_temporal_inputs.jitterY;
         reset = s_last_temporal_inputs.reset;
+        if (s_camera_now.scaleX > 0.0f && s_camera_previous.scaleX > 0.0f &&
+            isReflectionOrAuxiliaryCamera(s_camera_now, s_camera_previous)) {
+            reset = true;
+        }
         isHdr = s_last_temporal_inputs.colorIsHdr;
     } else if (s_last_temporal_inputs.colorSrv != nullptr &&
                rendered > s_last_temporal_inputs_frame &&
