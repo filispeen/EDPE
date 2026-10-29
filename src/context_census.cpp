@@ -437,10 +437,10 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
 
     // 1. Strict Near Plane (depthB) range filter:
     // In Cobra Odyssey, reversed-Z perspective depth is rawDepth = depthB / viewZ.
-    // The player's main eye camera consistently uses near plane depthB around 0.025m (2.5 cm, range 0.005m..0.50m).
+    // The player's main eye camera consistently uses near plane depthB around 0.025m (2.5 cm, range 0.01m..0.25m).
     // Secondary passes (cubemaps, shadow cascades, planet orbital maps) use much larger
-    // or different depthB ranges (e.g. depthB >= 1.0m, or <= 0.0f).
-    if (parsed_camera.depthB < 0.005f || parsed_camera.depthB > 0.50f) {
+    // or different depthB ranges (e.g. depthB >= 0.5m, 1.0m, or >5.0m).
+    if (parsed_camera.depthB < 0.01f || parsed_camera.depthB > 0.25f) {
         return false;
     }
 
@@ -454,7 +454,22 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
         return false;
     }
 
-    // 3. Camera aspect ratio validation:
+    // 3. Viewport / resolution filtering from words 1328..1331:
+    // Elite embeds the viewport dimensions at words 1328..1331: (vpW, vpH, 1/vpW, 1/vpH).
+    // Cubemap faces (1024x1024 or 512x512) and radar displays (512x512) are square.
+    // Primary scene rendering is always widescreen / landscape (vpW > vpH) on standard displays.
+    const float vpW = words[1328];
+    const float vpH = words[1329];
+    if (std::isfinite(vpW) && std::isfinite(vpH) && vpW > 0.0f && vpH > 0.0f) {
+        if (outW > outH && std::fabs(vpW - vpH) < 1.0f) {
+            return false;
+        }
+        if (vpW < 64.0f || vpH < 64.0f) {
+            return false;
+        }
+    }
+
+    // 4. Camera aspect ratio validation:
     const float camAspect = parsed_camera.scaleY / parsed_camera.scaleX;
     // Cubemaps use 90-degree square FOV (camAspect == 1.0). On widescreen displays, reject square cameras.
     if (outW > outH && std::fabs(camAspect - 1.0f) < 0.03f) {
@@ -467,9 +482,14 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
         }
     }
 
-    // 4. Coordinate chirality / reflection check:
-    // Planar reflections (canopy mirrors) invert coordinate chirality: det(R) = -1.0.
+    // 5. Coordinate chirality / reflection check:
     if (cameraRotationDeterminant(parsed_camera) < 0.5f) {
+        return false;
+    }
+
+    // 6. Auxiliary probe check against active baseline:
+    extern edpe::CameraProjection s_camera_now;
+    if (isReflectionOrAuxiliaryCamera(parsed_camera, s_camera_now)) {
         return false;
     }
 
