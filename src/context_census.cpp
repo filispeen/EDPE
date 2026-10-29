@@ -3655,6 +3655,21 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         jy = s_last_temporal_inputs.jitterY;
         reset = s_last_temporal_inputs.reset;
         isHdr = s_last_temporal_inputs.colorIsHdr;
+    } else if (s_last_temporal_inputs.colorSrv != nullptr &&
+               rendered > s_last_temporal_inputs_frame &&
+               rendered - s_last_temporal_inputs_frame <= 2) {
+        // Cobra periodically runs a 1-frame secondary probe (~once per second) or drops a frame:
+        // retain previous valid HDR scene and motion inputs smoothly with zero jitter instead of
+        // violently switching to the SDR backbuffer copy and resetting history, which caused a 1-frame flash.
+        inputColorSrv = s_last_temporal_inputs.colorSrv;
+        motionSrv = s_last_temporal_inputs.motionSrv;
+        depthSrv = s_last_temporal_inputs.depthSrv;
+        renderW = s_last_temporal_inputs.renderWidth ? s_last_temporal_inputs.renderWidth : bbDesc.Width;
+        renderH = s_last_temporal_inputs.renderHeight ? s_last_temporal_inputs.renderHeight : bbDesc.Height;
+        jx = 0.0f;
+        jy = 0.0f;
+        reset = false;
+        isHdr = s_last_temporal_inputs.colorIsHdr;
     } else {
         const DXGI_FORMAT typedFormat = concreteLdrColorFormat(bbDesc.Format);
         if (s_debug_input_copy) {
