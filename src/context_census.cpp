@@ -725,11 +725,12 @@ std::atomic<int> s_jitter_debug_mode{0};
 
 std::atomic<bool> s_zero_motion_vectors{false};
 
-edpe::ProjectionJitter getOrUpdateSceneProjectionJitter(unsigned long long cur_frame) {
+static std::atomic<bool> s_scene_jitter_consumed{true};
+static std::atomic<unsigned> s_scene_writes_since_eval{0};
+
+edpe::ProjectionJitter getOrUpdateSceneProjectionJitter() {
     std::lock_guard lock(jitter_mutex);
-    static unsigned long long s_last_jitter_frame = ~0ull;
-    if (s_last_jitter_frame != cur_frame) {
-        s_last_jitter_frame = cur_frame;
+    if (s_scene_jitter_consumed.exchange(false, std::memory_order_acq_rel)) {
         const unsigned long long scene_seq = s_rendered_scene_frame_id.fetch_add(1, std::memory_order_relaxed) + 1;
 
         const UINT scW = s_swapchain_width.load(std::memory_order_relaxed);
@@ -756,6 +757,7 @@ edpe::ProjectionJitter getOrUpdateSceneProjectionJitter(unsigned long long cur_f
         jitter.ndcY *= scale;
         active_projection_jitter = jitter;
         jitter_frame_index.store(scene_seq, std::memory_order_relaxed);
+        s_scene_writes_since_eval.store(0, std::memory_order_relaxed);
     }
     return active_projection_jitter;
 }
@@ -1620,12 +1622,13 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 }
                 if (valid_projection) {
-                    edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter(cur_frame);
+                    edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
                     float jittered_block[16]{};
                     if (edpe::jitterEliteProjectionBlock(&words[1080], jittered_block, jitter)) {
                         std::memcpy(&words[1080], jittered_block, sizeof(jittered_block));
                         s_injected_jitter = jitter;
                         s_last_rendered_jitter = jitter;
+                        s_scene_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
                         s_jitter_injected_frame = cur_frame;
                         const unsigned count = jittered_writes_count.fetch_add(1, std::memory_order_relaxed) + 1;
                         if (count == 1) {
@@ -3133,8 +3136,13 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
     if (!motionRes || FAILED(motionRes.As(&motionTexture))) return;
 
+    const unsigned scene_writes_this_eval = s_scene_writes_since_eval.exchange(0, std::memory_order_acq_rel);
+    const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0) ||
+        (s_jitter_injected_frame != 0 && rendered >= s_jitter_injected_frame && (rendered - s_jitter_injected_frame) <= 1);
+    s_scene_jitter_consumed.store(true, std::memory_order_release);
+
     float jx = 0.0f, jy = 0.0f;
-    if (s_jitter_injected_frame == rendered) {
+    if (has_fresh_scene_jitter && ContextCensusIsJitterActive()) {
         jx = s_injected_jitter.pixelX;
         jy = s_injected_jitter.pixelY;
         s_last_rendered_jitter = s_injected_jitter;
@@ -3466,11 +3474,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         jlog.pixelY = s_injected_jitter.pixelY;
         jlog.ndcX = s_injected_jitter.ndcX;
         jlog.ndcY = s_injected_jitter.ndcY;
-        jlog.injectedWrites = writes_this_frame;
+        jlog.injectedWrites = scene_writes_this_eval;
         jlog.rejections = jitter_rejection_count.load(std::memory_order_relaxed);
         jlog.evalJx = inputs.jitterX;
         jlog.evalJy = inputs.jitterY;
-        jlog.syncOk = (s_jitter_injected_frame == rendered);
+        jlog.syncOk = has_fresh_scene_jitter;
         jlog.cameraValid = (s_camera_now.scaleX > 0.0f);
         jlog.heldJitter = false;
         jlog.sceneCut = scene_cut || s_camera_reset;

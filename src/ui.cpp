@@ -175,9 +175,15 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F8) return true;
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
         wparam == VK_F9 && !(lparam & (1LL << 30))) {
-        if (edpe::JitterViewRecorder::instance().isIdle()) {
+        auto& recorder = edpe::JitterViewRecorder::instance();
+        if (recorder.isSaving()) {
+            EdpeLog(L"EDPE: jitter recorder is still flushing previous capture to disk");
+        } else if (recorder.isIdle()) {
             EdpeLog(L"EDPE: F9 pressed - Jitter View recording started");
-            edpe::JitterViewRecorder::instance().startRecording();
+            recorder.startRecording();
+        } else if (recorder.isRecording()) {
+            EdpeLog(L"EDPE: F9 pressed - stopping Jitter View recording");
+            recorder.stopRecording();
         }
         return true;
     }
@@ -224,6 +230,9 @@ LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     return ui.original_wndproc ? CallWindowProcW(ui.original_wndproc, window, message, wparam, lparam)
                                : DefWindowProcW(window, message, wparam, lparam);
 }
+
+void ensureMotionPreviewShader();
+void ensureDepthContrastShader();
 
 void releaseBackbuffer() {
     if (ui.backbuffer_rtv) ui.backbuffer_rtv->Release();
@@ -414,7 +423,8 @@ ID3D11ShaderResourceView* cloneSrvToUiDevice(ID3D11ShaderResourceView* srv, ID3D
         return uiSrv;
     }
     if (uiTex) uiTex->Release();
-    return srv;
+    srv->Release();
+    return nullptr;
 }
 
 void queueTextureCaptureFromSrv(ID3D11ShaderResourceView* srv, UiState::CaptureKind kind, int index = -1) {
@@ -481,6 +491,190 @@ void pollFrameCapture() {
         }
 
         if (SUCCEEDED(result)) {
+            // Populate preview textures on Present Device for Dear ImGui from CPU staging readback data
+            if (ui.device) {
+                if (req.kind == UiState::CaptureKind::Depth) {
+                    std::vector<float> depthBuffer(static_cast<size_t>(req.width) * req.height);
+                    for (UINT y = 0; y < req.height; ++y) {
+                        const auto* source = static_cast<const unsigned char*>(mapped.pData) +
+                            static_cast<size_t>(y) * mapped.RowPitch;
+                        for (UINT x = 0; x < req.width; ++x) {
+                            float depth = 0.0f;
+                            if (req.format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+                                req.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) {
+                                std::memcpy(&depth, source + 8 * x, sizeof(depth));
+                            } else if (req.format == DXGI_FORMAT_R24G8_TYPELESS ||
+                                       req.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                       req.format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                                uint32_t packed = 0;
+                                std::memcpy(&packed, source + 4 * x, sizeof(packed));
+                                depth = static_cast<float>(packed & 0x00FFFFFFu) / 16777215.0f;
+                            } else if (req.format == DXGI_FORMAT_R32_TYPELESS ||
+                                       req.format == DXGI_FORMAT_R32_FLOAT ||
+                                       req.format == DXGI_FORMAT_D32_FLOAT) {
+                                std::memcpy(&depth, source + 4 * x, sizeof(depth));
+                            } else if (req.format == DXGI_FORMAT_R16_TYPELESS ||
+                                       req.format == DXGI_FORMAT_R16_UNORM ||
+                                       req.format == DXGI_FORMAT_D16_UNORM) {
+                                uint16_t packed = 0;
+                                std::memcpy(&packed, source + 2 * x, sizeof(packed));
+                                depth = static_cast<float>(packed) / 65535.0f;
+                            }
+                            depthBuffer[static_cast<size_t>(y) * req.width + x] = depth;
+                        }
+                    }
+                    D3D11_TEXTURE2D_DESC texDesc{};
+                    texDesc.Width = req.width;
+                    texDesc.Height = req.height;
+                    texDesc.MipLevels = 1;
+                    texDesc.ArraySize = 1;
+                    texDesc.Format = DXGI_FORMAT_R32_FLOAT;
+                    texDesc.SampleDesc.Count = 1;
+                    texDesc.Usage = D3D11_USAGE_DEFAULT;
+                    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    D3D11_SUBRESOURCE_DATA subData{};
+                    subData.pSysMem = depthBuffer.data();
+                    subData.SysMemPitch = req.width * sizeof(float);
+                    ID3D11Texture2D* previewTex = nullptr;
+                    if (SUCCEEDED(ui.device->CreateTexture2D(&texDesc, &subData, &previewTex)) && previewTex) {
+                        ID3D11ShaderResourceView* previewSrv = nullptr;
+                        if (SUCCEEDED(ui.device->CreateShaderResourceView(previewTex, nullptr, &previewSrv)) && previewSrv) {
+                            if (ui.depth_srv) ui.depth_srv->Release();
+                            ui.depth_srv = previewSrv;
+                            if (ui.depth_copy) ui.depth_copy->Release();
+                            ui.depth_copy = previewTex;
+                            previewTex->AddRef();
+                            ui.depth_width = req.width;
+                            ui.depth_height = req.height;
+                            if (req.index >= 0) ui.depth_snapshot_index = req.index;
+                            ui.depth_window_open = true;
+                            ui.snapshot_ready = true;
+                            ensureDepthContrastShader();
+                        }
+                        previewTex->Release();
+                    }
+                } else if (req.kind == UiState::CaptureKind::Motion) {
+                    const size_t bytesPerPixel = (req.format == DXGI_FORMAT_R32G32_FLOAT) ? 8 : 4;
+                    std::vector<unsigned char> motionBuffer(static_cast<size_t>(req.width) * req.height * bytesPerPixel);
+                    for (UINT y = 0; y < req.height; ++y) {
+                        const auto* source = static_cast<const unsigned char*>(mapped.pData) +
+                            static_cast<size_t>(y) * mapped.RowPitch;
+                        std::memcpy(&motionBuffer[static_cast<size_t>(y) * req.width * bytesPerPixel], source, static_cast<size_t>(req.width) * bytesPerPixel);
+                    }
+                    D3D11_TEXTURE2D_DESC texDesc{};
+                    texDesc.Width = req.width;
+                    texDesc.Height = req.height;
+                    texDesc.MipLevels = 1;
+                    texDesc.ArraySize = 1;
+                    texDesc.Format = (req.format == DXGI_FORMAT_R32G32_FLOAT) ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R16G16_FLOAT;
+                    texDesc.SampleDesc.Count = 1;
+                    texDesc.Usage = D3D11_USAGE_DEFAULT;
+                    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    D3D11_SUBRESOURCE_DATA subData{};
+                    subData.pSysMem = motionBuffer.data();
+                    subData.SysMemPitch = static_cast<UINT>(req.width * bytesPerPixel);
+                    ID3D11Texture2D* previewTex = nullptr;
+                    if (SUCCEEDED(ui.device->CreateTexture2D(&texDesc, &subData, &previewTex)) && previewTex) {
+                        ID3D11ShaderResourceView* previewSrv = nullptr;
+                        if (SUCCEEDED(ui.device->CreateShaderResourceView(previewTex, nullptr, &previewSrv)) && previewSrv) {
+                            if (ui.motion_srv) ui.motion_srv->Release();
+                            ui.motion_srv = previewSrv;
+                            ui.motion_width = req.width;
+                            ui.motion_height = req.height;
+                            ui.motion_window_open = true;
+                            ui.snapshot_ready = true;
+                            ensureMotionPreviewShader();
+                        }
+                        previewTex->Release();
+                    }
+                } else if (req.kind == UiState::CaptureKind::SceneColor || req.kind == UiState::CaptureKind::EarlyHdr) {
+                    std::vector<unsigned char> colorBuffer(static_cast<size_t>(req.width) * req.height * 4);
+                    for (UINT y = 0; y < req.height; ++y) {
+                        const auto* source = static_cast<const unsigned char*>(mapped.pData) +
+                            static_cast<size_t>(y) * mapped.RowPitch;
+                        for (UINT x = 0; x < req.width; ++x) {
+                            unsigned char r = 0, g = 0, b = 0, a = 255;
+                            if (req.format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                                uint32_t val = 0;
+                                std::memcpy(&val, source + 4 * x, sizeof(val));
+                                const float cr = edpe::decodeFloat11(val & 0x7FF);
+                                const float cg = edpe::decodeFloat11((val >> 11) & 0x7FF);
+                                const float cb = edpe::decodeFloat10((val >> 22) & 0x3FF);
+                                r = edpe::toneMapSrgb(cr);
+                                g = edpe::toneMapSrgb(cg);
+                                b = edpe::toneMapSrgb(cb);
+                            } else if (req.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                                uint32_t val = 0;
+                                std::memcpy(&val, source + 4 * x, sizeof(val));
+                                r = static_cast<unsigned char>((val & 0x3FF) >> 2);
+                                g = static_cast<unsigned char>(((val >> 10) & 0x3FF) >> 2);
+                                b = static_cast<unsigned char>(((val >> 20) & 0x3FF) >> 2);
+                            } else if (req.format == DXGI_FORMAT_B8G8R8A8_UNORM || req.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+                                const auto* px = source + 4 * x;
+                                b = px[0];
+                                g = px[1];
+                                r = px[2];
+                                a = px[3];
+                            } else if (req.format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                                const auto* px = reinterpret_cast<const uint16_t*>(source + 8 * x);
+                                r = edpe::toneMapSrgb(edpe::halfToFloat(px[0]));
+                                g = edpe::toneMapSrgb(edpe::halfToFloat(px[1]));
+                                b = edpe::toneMapSrgb(edpe::halfToFloat(px[2]));
+                            } else {
+                                const auto* px = source + 4 * x;
+                                r = px[0];
+                                g = px[1];
+                                b = px[2];
+                                a = px[3];
+                            }
+                            const size_t idx = (static_cast<size_t>(y) * req.width + x) * 4;
+                            colorBuffer[idx + 0] = r;
+                            colorBuffer[idx + 1] = g;
+                            colorBuffer[idx + 2] = b;
+                            colorBuffer[idx + 3] = a;
+                        }
+                    }
+                    D3D11_TEXTURE2D_DESC desc{};
+                    desc.Width = req.width;
+                    desc.Height = req.height;
+                    desc.MipLevels = 1;
+                    desc.ArraySize = 1;
+                    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    desc.SampleDesc.Count = 1;
+                    desc.Usage = D3D11_USAGE_DEFAULT;
+                    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    D3D11_SUBRESOURCE_DATA subData{};
+                    subData.pSysMem = colorBuffer.data();
+                    subData.SysMemPitch = req.width * 4;
+                    ID3D11Texture2D* previewTex = nullptr;
+                    if (SUCCEEDED(ui.device->CreateTexture2D(&desc, &subData, &previewTex)) && previewTex) {
+                        ID3D11ShaderResourceView* previewSrv = nullptr;
+                        if (SUCCEEDED(ui.device->CreateShaderResourceView(previewTex, nullptr, &previewSrv)) && previewSrv) {
+                            if (req.kind == UiState::CaptureKind::SceneColor) {
+                                if (ui.color_srv) ui.color_srv->Release();
+                                ui.color_srv = previewSrv;
+                                if (ui.color_copy) ui.color_copy->Release();
+                                ui.color_copy = previewTex;
+                                previewTex->AddRef();
+                                ui.color_width = req.width;
+                                ui.color_height = req.height;
+                                if (req.index >= 0) ui.color_snapshot_index = req.index;
+                                ui.color_window_open = true;
+                                ui.snapshot_ready = true;
+                            } else {
+                                if (ui.early_color_srv) ui.early_color_srv->Release();
+                                ui.early_color_srv = previewSrv;
+                                ui.early_color_width = req.width;
+                                ui.early_color_height = req.height;
+                                ui.early_color_window_open = true;
+                                ui.snapshot_ready = true;
+                            }
+                        }
+                        previewTex->Release();
+                    }
+                }
+            }
+
             if (!folder.empty()) {
                 wchar_t name[128];
                 switch (req.kind) {
