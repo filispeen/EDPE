@@ -141,10 +141,6 @@ inline bool isReflectionOrAuxiliaryCamera(
     if (rotTrace < 2.40f) {
         return true;
     }
-    const float dist = length(cameraPosition(candidate) - cameraPosition(baseline));
-    if (dist > 0.05f && rotTrace < 2.90f) {
-        return true;
-    }
 
     return false;
 }
