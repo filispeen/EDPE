@@ -384,6 +384,7 @@ edpe::CameraDeltaTracker camera_delta_tracker;
 static edpe::CameraProjection s_camera_previous{};
 static edpe::CameraProjection s_camera_now{};
 static edpe::Vec3 s_last_valid_velocity{0.0f, 0.0f, 0.0f};
+static edpe::Vec3 s_prev_valid_velocity{0.0f, 0.0f, 0.0f};
 static bool s_camera_reset = false;
 static unsigned long long s_camera_frame = ~0ull;
 static unsigned long long s_camera_previous_frame = ~0ull;
@@ -394,6 +395,9 @@ static unsigned s_consecutive_skipped_frames = 0;
 static edpe::CameraProjection s_staged_camera{};
 static unsigned long long s_staged_camera_frame = ~0ull;
 static bool s_has_staged_camera = false;
+static bool s_staged_from_in_scene = false;
+static bool s_last_committed_scene_cut = false;
+static unsigned s_teleport_rejection_streak = 0;
 static std::atomic<uint64_t> s_valid_camera_seen_counter{0};
 
 // Frame timing for kinematic 2nd-order prediction
@@ -489,8 +493,8 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
         return false;
     }
 
-    // 6. Stereo eye / IPD probe filter via 2nd-order kinematic residual filter:
-    if (isStereoEyeOrIpdProbe(parsed_camera, committed_camera, last_velocity, dtRatio)) {
+    // 6. Повний фільтр допоміжних камер та стерео-зондів відносно зафіксованої камери:
+    if (isReflectionOrAuxiliaryCamera(parsed_camera, committed_camera, last_velocity, dtRatio)) {
         return false;
     }
 
@@ -499,19 +503,26 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
 
 // Single-point camera commitment for the frame (Two-Phase Staging & Commit)
 inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_cut) {
+    if (s_camera_frame == rendered_frame) {
+        out_scene_cut = s_last_committed_scene_cut;
+        return;
+    }
+
     out_scene_cut = false;
     if (s_has_staged_camera && s_staged_camera_frame == rendered_frame) {
         if (s_camera_now.scaleX > 0.0f) {
             const float rotTrace = edpe::cameraRotationTrace(s_staged_camera, s_camera_now);
-            const bool fovChanged = std::fabs(s_camera_now.scaleX - s_staged_camera.scaleX) > 0.01f * s_camera_now.scaleX;
+            const bool fovChanged =
+                std::fabs(s_camera_now.scaleX - s_staged_camera.scaleX) > 0.01f * s_camera_now.scaleX;
 
+            s_prev_valid_velocity = s_last_valid_velocity;
             if (rotTrace < 2.414f || fovChanged) {
-                // Real scene transition (> 45 deg angle jump or FOV change)
                 out_scene_cut = true;
                 s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
             } else {
                 out_scene_cut = false;
-                s_last_valid_velocity = edpe::cameraPosition(s_staged_camera) - edpe::cameraPosition(s_camera_now);
+                s_last_valid_velocity =
+                    edpe::cameraPosition(s_staged_camera) - edpe::cameraPosition(s_camera_now);
             }
             s_camera_previous = s_camera_now;
             s_camera_previous_frame = s_camera_frame;
@@ -519,14 +530,16 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
             s_camera_previous = s_staged_camera;
             s_camera_previous_frame = rendered_frame;
             out_scene_cut = true;
+            s_prev_valid_velocity = {0.0f, 0.0f, 0.0f};
             s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
         }
         s_camera_now = s_staged_camera;
         s_camera_frame = rendered_frame;
         s_has_staged_camera = false;
+        s_staged_from_in_scene = false;
     } else if (s_camera_now.scaleX > 0.0f) {
-        // Fallback: camera was not unmapped or probe pass was rejected.
-        // Extrapolate position using last valid velocity and NEVER reset history!
+        // Fallback: жоден пас не оновив камеру — плавна екстраполяція без скидання TAA/DLAA
+        s_prev_valid_velocity = s_last_valid_velocity;
         s_camera_previous = s_camera_now;
         s_camera_previous_frame = s_camera_frame;
         const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
@@ -534,6 +547,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         s_camera_frame = rendered_frame;
         out_scene_cut = false;
     }
+    s_last_committed_scene_cut = out_scene_cut;
 }
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_depth_source;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_ldr_source;
@@ -1601,13 +1615,17 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             // Phase 3: Candidate staging and jitter injection (Two-Phase Staging & Commit)
             edpe::CameraProjection parsed_camera{};
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+            const bool in_main_scene = s_inside_main_scene.load(std::memory_order_acquire);
             bool is_main_camera = false;
             const float* words = static_cast<const float*>(mapped_ptr);
             if (edpe::parseEliteCamera(words, 5376 / sizeof(float), &parsed_camera)) {
                 const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
                 const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+
+                // Як тільки 4-MRT G-Buffer завершився (!in_main_scene при motion_color_frame == cur_frame)
+                // або з'явився HDR slot0 — прийом основної камери в цьому кадрі закрито назавжди:
                 const bool main_gbuffer_already_finished =
-                    (s_hdr_slot0_seen_frame == cur_frame && motion_color_frame == cur_frame);
+                    (motion_color_frame == cur_frame && (!in_main_scene || s_hdr_slot0_seen_frame == cur_frame));
 
                 float dtRatio = 1.0f;
                 if (s_last_frame_dt > 1e-5f && s_current_frame_dt > 1e-5f) {
@@ -1618,16 +1636,35 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     isAuthoritativeMainSceneCamera(words, 5376 / sizeof(float), parsed_camera,
                         outW, outH, s_camera_now, s_last_valid_velocity, dtRatio)) {
 
-                    // Intra-frame first candidate locking (Section 5, rule 2):
-                    // If we already staged a primary candidate in this frame, check distance.
-                    // If intraDist > 0.04m, reject secondary sub-pass!
                     bool allow_stage = true;
-                    if (s_has_staged_camera && s_staged_camera_frame == cur_frame) {
-                        const edpe::Vec3 intraDelta = edpe::cameraPosition(parsed_camera) -
-                                                      edpe::cameraPosition(s_staged_camera);
-                        const float intraDist = edpe::length(intraDelta);
-                        if (intraDist > 0.04f) {
+
+                    // Захист від 1-кадрових стрибків голограм (+221.4 м, +83.9 м, +94.8 м) до прив'язки G-Buffer,
+                    // який НЕ блокує Supercruise (якщо стрибок реальний, він проходить на 2-му кадрі поспіль):
+                    if (s_camera_now.scaleX > 0.0f) {
+                        const edpe::Vec3 predicted =
+                            edpe::cameraPosition(s_camera_now) + (s_last_valid_velocity * std::clamp(dtRatio, 0.25f, 4.0f));
+                        const float jumpResidual = edpe::length(edpe::cameraPosition(parsed_camera) - predicted);
+                        if (jumpResidual > 15.0f && jumpResidual < 500.0f) {
+                            if (++s_teleport_rejection_streak < 2) {
+                                allow_stage = false;
+                            }
+                        } else {
+                            s_teleport_rejection_streak = 0;
+                        }
+                    }
+
+                    if (allow_stage && s_has_staged_camera && s_staged_camera_frame == cur_frame) {
+                        // Перевіряємо, чи не є новий пас стерео-зондом відносно ВЖЕ збереженого кандидата цього кадру:
+                        if (isReflectionOrAuxiliaryCamera(parsed_camera, s_staged_camera, {0.0f, 0.0f, 0.0f}, 1.0f)) {
                             allow_stage = false;
+                        } else if (s_staged_from_in_scene) {
+                            // Якщо ми вже зафіксували камеру всередині активного 4-MRT G-Buffer,
+                            // блокуємо будь-який наступний пас зі зміщенням > 3 см:
+                            const float intraDist = edpe::length(
+                                edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
+                            if (intraDist > 0.03f) {
+                                allow_stage = false;
+                            }
                         }
                     }
 
@@ -1635,6 +1672,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         s_staged_camera = parsed_camera;
                         s_has_staged_camera = true;
                         s_staged_camera_frame = cur_frame;
+                        if (in_main_scene) {
+                            s_staged_from_in_scene = true;
+                        }
                         s_valid_camera_seen_counter.fetch_add(1, std::memory_order_relaxed);
                         is_main_camera = true;
                     }
@@ -3596,7 +3636,7 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         reset = s_last_temporal_inputs.reset;
         float debugDtRatio = (s_last_frame_dt > 1e-5f) ? (s_current_frame_dt / s_last_frame_dt) : 1.0f;
         if (s_camera_now.scaleX > 0.0f && s_camera_previous.scaleX > 0.0f &&
-            isStereoEyeOrIpdProbe(s_camera_now, s_camera_previous, s_last_valid_velocity, debugDtRatio)) {
+            isReflectionOrAuxiliaryCamera(s_camera_now, s_camera_previous, s_prev_valid_velocity, debugDtRatio)) {
             reset = true;
         }
         isHdr = s_last_temporal_inputs.colorIsHdr;
@@ -3767,7 +3807,9 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         } else if (is_hdr_slot0) {
             // Transitioned from 4-MRT G-buffer (Binds 1-3) to RTV0 deferred lighting/HUD (Binds 4-7)
             s_inside_main_scene.store(false, std::memory_order_release);
-            s_hdr_slot0_seen_frame = current_frame;
+            if (motion_color_frame == current_frame && s_has_staged_camera && s_staged_camera_frame == current_frame) {
+                s_hdr_slot0_seen_frame = current_frame;
+            }
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
         motion_color_bound = bound;
@@ -4692,6 +4734,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_upscale_evaluated_this_frame = false;
         motion_color_first_exit_logged = false;
         s_has_staged_camera = false;
+        s_hdr_slot0_seen_frame = ~0ull;
         s_jitter_injected_frame = ~0ull;
         clearTrackedMappedBuffers();
         clearRejectedResourceCache();
@@ -5182,8 +5225,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_hdr_slot0_seen_frame = ~0ull;
         s_consecutive_skipped_frames = 0;
         s_has_staged_camera = false;
+        s_staged_from_in_scene = false;
         s_staged_camera_frame = ~0ull;
         s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+        s_prev_valid_velocity = {0.0f, 0.0f, 0.0f};
+        s_teleport_rejection_streak = 0;
         s_gbuffer_resources = {};
         s_observed_scene_width.store(0, std::memory_order_relaxed);
         s_observed_scene_height.store(0, std::memory_order_relaxed);

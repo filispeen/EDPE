@@ -154,5 +154,11 @@ int main() {
     dtCand.worldFromView[3] = 0.0833f * 2.0f;
     if (edpe::isReflectionOrAuxiliaryCamera(dtCand, identity(), halfVelocity, 2.0f)) return 31;
 
+    // 14. 4x IPD probe (0.2728m lateral jump) MUST be identified as auxiliary probe:
+    auto quadEyeProbe = identity();
+    quadEyeProbe.worldFromView[3] = 0.2728f;
+    if (!edpe::isStereoEyeOrIpdProbe(quadEyeProbe, identity())) return 32;
+    if (!edpe::isReflectionOrAuxiliaryCamera(quadEyeProbe, identity())) return 33;
+
     return 0;
 }
