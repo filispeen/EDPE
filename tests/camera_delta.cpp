@@ -121,5 +121,38 @@ int main() {
     // 8. Sudden orientation jump (> 45 deg) MUST be identified as auxiliary:
     if (!edpe::isReflectionOrAuxiliaryCamera(yawed(50), identity())) return 22;
 
+    // 9. Lateral thruster strafe (Q/E) at 10 m/s with velocity history MUST NOT be identified as auxiliary:
+    const edpe::Vec3 strafeVelocity{0.1667f, 0.0f, 0.0f}; // ~10 m/s at 60 FPS
+    auto strafing = identity();
+    strafing.worldFromView[3] = 0.1667f;
+    if (edpe::isReflectionOrAuxiliaryCamera(strafing, identity(), strafeVelocity)) return 23;
+    if (edpe::isStereoEyeOrIpdProbe(strafing, identity(), strafeVelocity)) return 24;
+
+    // 10. Stereo auxiliary probe arriving during 10 m/s strafe MUST be identified as auxiliary probe:
+    auto strafeWithProbe = identity();
+    strafeWithProbe.worldFromView[3] = 0.1667f + 0.0682f;
+    if (!edpe::isStereoEyeOrIpdProbe(strafeWithProbe, identity(), strafeVelocity)) return 25;
+    if (!edpe::isReflectionOrAuxiliaryCamera(strafeWithProbe, identity(), strafeVelocity)) return 26;
+
+    // 11. Supercruise high-speed forward flight at 50,000 m/s MUST NOT be identified as auxiliary:
+    const edpe::Vec3 scVelocity{0.0f, 0.0f, 833.33f};
+    auto scFlight = identity();
+    scFlight.worldFromView[11] = 833.33f;
+    if (edpe::isReflectionOrAuxiliaryCamera(scFlight, identity(), scVelocity)) return 27;
+    if (edpe::isStereoEyeOrIpdProbe(scFlight, identity(), scVelocity)) return 28;
+
+    // 12. Supercruise flight with 68.2 mm stereo probe jump MUST be identified as auxiliary probe:
+    auto scWithProbe = identity();
+    scWithProbe.worldFromView[3] = 0.0682f;
+    scWithProbe.worldFromView[11] = 833.33f;
+    if (!edpe::isStereoEyeOrIpdProbe(scWithProbe, identity(), scVelocity)) return 29;
+    if (!edpe::isReflectionOrAuxiliaryCamera(scWithProbe, identity(), scVelocity)) return 30;
+
+    // 13. Variable framerate (dtRatio = 2.0, e.g. 120 FPS -> 60 FPS) strafe test:
+    const edpe::Vec3 halfVelocity{0.0833f, 0.0f, 0.0f};
+    auto dtCand = identity();
+    dtCand.worldFromView[3] = 0.0833f * 2.0f;
+    if (edpe::isReflectionOrAuxiliaryCamera(dtCand, identity(), halfVelocity, 2.0f)) return 31;
+
     return 0;
 }

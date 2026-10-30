@@ -51,6 +51,7 @@ public:
         sharpness = static_cast<float>(_wtof(sharpnessBuf));
         if (sharpness < 0.0f || sharpness > 1.0f) sharpness = 0.0f;
 
+        jitterEnabled = GetPrivateProfileIntW(L"Jitter", L"Enabled", 1, path.c_str()) != 0;
         jitterInvertX = GetPrivateProfileIntW(L"Jitter", L"InvertX", 0, path.c_str()) != 0;
         jitterInvertY = GetPrivateProfileIntW(L"Jitter", L"InvertY", 0, path.c_str()) != 0;
         jitterSwapXY = GetPrivateProfileIntW(L"Jitter", L"SwapXY", 0, path.c_str()) != 0;
@@ -111,6 +112,7 @@ public:
         swprintf_s(sharpnessBuf, L"%.2f", sharpness);
         WritePrivateProfileStringW(L"Upscaler", L"Sharpness", sharpnessBuf, path.c_str());
 
+        WritePrivateProfileStringW(L"Jitter", L"Enabled", jitterEnabled ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"InvertX", jitterInvertX ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"InvertY", jitterInvertY ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"SwapXY", jitterSwapXY ? L"1" : L"0", path.c_str());
@@ -232,6 +234,7 @@ public:
     bool preserveNativeUi = true;
     bool hdrInput = false;
 
+    bool jitterEnabled = true;
     bool jitterInvertX = false;
     bool jitterInvertY = false;
     bool jitterSwapXY = false;

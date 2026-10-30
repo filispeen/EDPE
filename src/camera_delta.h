@@ -49,10 +49,68 @@ inline float cameraRotationTrace(const CameraProjection& a, const CameraProjecti
            (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
 }
 
-inline bool isReflectionOrAuxiliaryCamera(const CameraProjection& candidate, const CameraProjection& baseline) {
-    // 1. Planar reflection matrices invert coordinate chirality: det(R) = -1.0.
+// 2nd-order kinematic residual filter (Jerk/Impulse Filter) for Cobra stereo eye / IPD probes.
+// Extrapolates expected position based on ship velocity history, making it completely immune
+// to lateral thruster strafe (Q/E, 2.4-21 m/s), boost acceleration, and Supercruise.
+inline bool isStereoEyeOrIpdProbe(
+    const CameraProjection& candidate,
+    const CameraProjection& baseline,
+    const Vec3& last_velocity = {0.0f, 0.0f, 0.0f},
+    float dtRatio = 1.0f)
+{
+    if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) {
+        return false;
+    }
+
+    // 1. Auxiliary stereo eye probe exhibits identical orientation (rotTrace > 2.999f)
+    const float rotTrace = cameraRotationTrace(candidate, baseline);
+    if (rotTrace < 2.999f) {
+        return false;
+    }
+
+    // 2. Probe exhibits identical FOV / projection scales
+    if (std::fabs(candidate.scaleX - baseline.scaleX) > 1e-4f ||
+        std::fabs(candidate.scaleY - baseline.scaleY) > 1e-4f) {
+        return false;
+    }
+
+    // 3. 2nd-order kinematic extrapolation:
+    const float clampedDtRatio = std::clamp(dtRatio, 0.25f, 4.0f);
+    const Vec3 prevPos = cameraPosition(baseline);
+    const Vec3 candPos = cameraPosition(candidate);
+    const Vec3 predictedPos = prevPos + (last_velocity * clampedDtRatio);
+    const Vec3 residual = candPos - predictedPos; // 2nd-order acceleration/jerk residual
+    const float resDist = length(residual);
+
+    // 4. Stereo eye baseline window: 1x IPD (~68.2 mm) or 2x IPD (~136.4 mm)
+    if (resDist < 0.045f || resDist > 0.165f) {
+        return false;
+    }
+
+    // 5. Project residual onto candidate camera axes:
+    const Vec3 right = cameraRight(candidate);
+    const Vec3 up = cameraUp(candidate);
+    const Vec3 fwd = cameraForward(candidate);
+    const float rRight   = std::fabs(dot(residual, right));
+    const float rUp      = std::fabs(dot(residual, up));
+    const float rForward = std::fabs(dot(residual, fwd));
+
+    // Must be strictly lateral along Right axis with negligible Up and Forward motion
+    const bool strictlyLateral = (rRight >= 0.92f * resDist) &&
+                                 (rUp < 0.01f) &&
+                                 (rForward < 0.01f);
+    return strictlyLateral;
+}
+
+inline bool isReflectionOrAuxiliaryCamera(
+    const CameraProjection& candidate,
+    const CameraProjection& baseline,
+    const Vec3& last_velocity = {0.0f, 0.0f, 0.0f},
+    float dtRatio = 1.0f)
+{
+    // 1. Planar reflection matrices invert coordinate chirality or non-orthonormal det(R):
     const float det = cameraRotationDeterminant(candidate);
-    if (det < 0.5f) return true;
+    if (det < 0.85f || det > 1.15f) return true;
 
     if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) return false;
 
@@ -62,40 +120,14 @@ inline bool isReflectionOrAuxiliaryCamera(const CameraProjection& candidate, con
         return true;
     }
 
-    // 3. Discontinuous single-frame orientation or probe offset relative to active baseline:
-    const float* c = candidate.worldFromView;
-    const float* b = baseline.worldFromView;
-    const float dx = c[3] - b[3];
-    const float dy = c[7] - b[7];
-    const float dz = c[11] - b[11];
-    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    // 3. Stereo eye / IPD probe check via 2nd-order kinematic filter:
+    if (isStereoEyeOrIpdProbe(candidate, baseline, last_velocity, dtRatio)) {
+        return true;
+    }
+
+    // 4. Auxiliary mirror / panel / probe camera with abrupt orientation jump (> 45 deg, rotTrace < 2.40):
     const float rotTrace = cameraRotationTrace(candidate, baseline);
-
-    // Abrupt single-frame orientation jump (> 45 deg, rotTrace < 2.40) at any distance is an auxiliary/probe camera:
     if (rotTrace < 2.40f) {
-        return true;
-    }
-
-    // Auxiliary mirror / panel / probe camera with combined orientation (> 18 deg) and position jump:
-    if (dist > 0.05f && rotTrace < 2.90f) {
-        return true;
-    }
-
-    // 4. Auxiliary stereo eye / IPD / lateral reflection probe check:
-    // Cobra engine periodically evaluates a secondary stereo eye or cockpit probe (~1 Hz).
-    // In Odyssey 2D mode, this probe has identical orientation (rotTrace > 2.99) and identical
-    // FOV/aspect, but exhibits a discrete lateral eye displacement (e.g. 68.2 mm IPD or 136.4 mm stereo baseline).
-    const float dRight   = dx * c[0] + dy * c[4] + dz * c[8];
-    const float dUp      = dx * c[1] + dy * c[5] + dz * c[9];
-    const float dForward = dx * c[2] + dy * c[6] + dz * c[10];
-    const float absRight = std::fabs(dRight);
-    const float absUp    = std::fabs(dUp);
-    const float absFwd   = std::fabs(dForward);
-
-    // If the displacement matches the stereo eye / IPD baseline range (0.04m .. 0.35m)
-    // with overwhelmingly lateral motion (|dRight| >= 80% of total distance),
-    // near-zero forward and vertical motion, and identical orientation:
-    if (dist >= 0.04f && dist <= 0.35f && absRight >= 0.80f * dist && absUp < 0.04f && absFwd < 0.04f && rotTrace > 2.99f) {
         return true;
     }
 

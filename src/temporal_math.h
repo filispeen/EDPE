@@ -14,6 +14,44 @@ struct CameraProjection {
     float depthB;
 };
 
+struct Vec3 {
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+
+    Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    Vec3 operator*(float s) const { return {x * s, y * s, z * s}; }
+};
+
+inline float dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+inline float length(const Vec3& v) {
+    return std::sqrt(dot(v, v));
+}
+
+inline Vec3 cameraRight(const CameraProjection& c) {
+    return {c.worldFromView[0], c.worldFromView[4], c.worldFromView[8]};
+}
+
+inline Vec3 cameraUp(const CameraProjection& c) {
+    return {c.worldFromView[1], c.worldFromView[5], c.worldFromView[9]};
+}
+
+inline Vec3 cameraForward(const CameraProjection& c) {
+    return {c.worldFromView[2], c.worldFromView[6], c.worldFromView[10]};
+}
+
+inline Vec3 cameraPosition(const CameraProjection& c) {
+    return {c.worldFromView[3], c.worldFromView[7], c.worldFromView[11]};
+}
+
+inline void cameraSetPosition(CameraProjection& c, const Vec3& p) {
+    c.worldFromView[3] = p.x;
+    c.worldFromView[7] = p.y;
+    c.worldFromView[11] = p.z;
+}
+
 // Current-to-previous motion in render-resolution pixels, with +Y downward.
 // Pixel coordinates name pixel centres by integer index; jitter is excluded.
 inline bool cameraDepthMotion(const CameraProjection& now, const CameraProjection& previous,

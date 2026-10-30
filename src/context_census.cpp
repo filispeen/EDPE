@@ -383,18 +383,23 @@ bool camera_delta_announced = false;
 edpe::CameraDeltaTracker camera_delta_tracker;
 static edpe::CameraProjection s_camera_previous{};
 static edpe::CameraProjection s_camera_now{};
+static edpe::Vec3 s_last_valid_velocity{0.0f, 0.0f, 0.0f};
 static bool s_camera_reset = false;
 static unsigned long long s_camera_frame = ~0ull;
 static unsigned long long s_camera_previous_frame = ~0ull;
-static unsigned long long s_in_scene_camera_latched_frame = ~0ull;
 static unsigned long long s_hdr_slot0_seen_frame = ~0ull;
 static unsigned s_consecutive_skipped_frames = 0;
-static unsigned s_auxiliary_rejection_streak = 0;
-static edpe::CameraProjection s_fallback_unmapped_camera{};
-static unsigned long long s_fallback_unmapped_camera_frame = ~0ull;
-static edpe::CameraProjection s_latest_unmapped_camera{};
-static unsigned long long s_latest_unmapped_camera_frame = ~0ull;
-static bool s_latest_unmapped_camera_valid = false;
+
+// Staging buffer for current frame camera candidate (Two-Phase Staging & Commit)
+static edpe::CameraProjection s_staged_camera{};
+static unsigned long long s_staged_camera_frame = ~0ull;
+static bool s_has_staged_camera = false;
+static std::atomic<uint64_t> s_valid_camera_seen_counter{0};
+
+// Frame timing for kinematic 2nd-order prediction
+static float s_last_frame_dt = 0.01667f;
+static float s_current_frame_dt = 0.01667f;
+
 static std::atomic<bool> s_inside_main_scene{false};
 static std::atomic<bool> s_in_edpe_present{false};
 static edpe::ProjectionJitter s_injected_jitter{};
@@ -429,26 +434,25 @@ inline float getJitterLogTimeMs() {
 using edpe::cameraRotationDeterminant;
 using edpe::cameraRotationTrace;
 using edpe::isReflectionOrAuxiliaryCamera;
+using edpe::isStereoEyeOrIpdProbe;
 
 inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
                                            const edpe::CameraProjection& parsed_camera,
-                                           UINT outW, UINT outH) {
+                                           UINT outW, UINT outH,
+                                           const edpe::CameraProjection& committed_camera,
+                                           const edpe::Vec3& last_velocity,
+                                           float dtRatio) {
     if (!words || wordCount != 5376 / sizeof(float)) return false;
     if (parsed_camera.scaleX <= 0.0f || parsed_camera.scaleY <= 0.0f) return false;
 
-    // 1. Strict Near Plane (depthB) range filter:
+    // 1. Strict Near Plane (depthB) range filter (0.01m .. 0.25m):
     // In Cobra Odyssey, reversed-Z perspective depth is rawDepth = depthB / viewZ.
     // The player's main eye camera consistently uses near plane depthB around 0.025m (2.5 cm, range 0.01m..0.25m).
-    // Secondary passes (cubemaps, shadow cascades, planet orbital maps) use much larger
-    // or different depthB ranges (e.g. depthB >= 0.5m, 1.0m, or >5.0m).
     if (parsed_camera.depthB < 0.01f || parsed_camera.depthB > 0.25f) {
         return false;
     }
 
     // 2. Strict perspective vs orthographic check:
-    // Perspective projection uses division by Z: column 3 of the 3x4 block (words 1083, 1087, 1091)
-    // represents the forward view direction with unit length (|W| ≈ 1.0).
-    // Orthographic shadow passes do not divide by Z, so their W column is zero or near zero.
     const double w0 = words[1083], w1 = words[1087], w2 = words[1091];
     const double wLenSq = w0 * w0 + w1 * w1 + w2 * w2;
     if (wLenSq < 0.5 || wLenSq > 1.5) {
@@ -456,9 +460,6 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
     }
 
     // 3. Viewport / resolution filtering from words 1328..1331:
-    // Elite embeds the viewport dimensions at words 1328..1331: (vpW, vpH, 1/vpW, 1/vpH).
-    // Cubemap faces (1024x1024 or 512x512) and radar displays (512x512) are square.
-    // Primary scene rendering is always widescreen / landscape (vpW > vpH) on standard displays.
     const float vpW = words[1328];
     const float vpH = words[1329];
     if (std::isfinite(vpW) && std::isfinite(vpH) && vpW > 0.0f && vpH > 0.0f) {
@@ -472,7 +473,6 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
 
     // 4. Camera aspect ratio validation:
     const float camAspect = parsed_camera.scaleY / parsed_camera.scaleX;
-    // Cubemaps use 90-degree square FOV (camAspect == 1.0). On widescreen displays, reject square cameras.
     if (outW > outH && std::fabs(camAspect - 1.0f) < 0.03f) {
         return false;
     }
@@ -483,63 +483,57 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
         }
     }
 
-    // 5. Coordinate chirality / reflection check:
-    if (cameraRotationDeterminant(parsed_camera) < 0.5f) {
+    // 5. Coordinate chirality / orthonormality check (rejects planar reflections det < 0.85 or det > 1.15):
+    const float det = cameraRotationDeterminant(parsed_camera);
+    if (det < 0.85f || det > 1.15f) {
         return false;
     }
 
-    // 6. Auxiliary probe check against active baseline:
-    extern edpe::CameraProjection s_camera_now;
-    if (isReflectionOrAuxiliaryCamera(parsed_camera, s_camera_now)) {
+    // 6. Stereo eye / IPD probe filter via 2nd-order kinematic residual filter:
+    if (isStereoEyeOrIpdProbe(parsed_camera, committed_camera, last_velocity, dtRatio)) {
         return false;
     }
 
     return true;
 }
 
+// Single-point camera commitment for the frame (Two-Phase Staging & Commit)
+inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_cut) {
+    out_scene_cut = false;
+    if (s_has_staged_camera && s_staged_camera_frame == rendered_frame) {
+        if (s_camera_now.scaleX > 0.0f) {
+            const float rotTrace = edpe::cameraRotationTrace(s_staged_camera, s_camera_now);
+            const bool fovChanged = std::fabs(s_camera_now.scaleX - s_staged_camera.scaleX) > 0.01f * s_camera_now.scaleX;
 
-inline bool sameCamera(const edpe::CameraProjection& a, const edpe::CameraProjection& b) {
-    for (int i = 0; i < 12; ++i) {
-        if (std::fabs(a.worldFromView[i] - b.worldFromView[i]) > 1e-5f) return false;
-    }
-    return std::fabs(a.scaleX - b.scaleX) < 1e-5f && std::fabs(a.scaleY - b.scaleY) < 1e-5f;
-}
-
-inline bool isRevisitedCamera(const edpe::CameraProjection& camera) {
-    static std::array<edpe::CameraProjection, 8> recent{};
-    static unsigned count = 0;
-    static unsigned head = 0;
-    if (s_camera_now.scaleX > 0.0f && sameCamera(camera, s_camera_now)) return false;
-    const unsigned stored = count < 8 ? count : 8;
-    for (unsigned i = 0; i < stored; ++i) {
-        if (sameCamera(camera, recent[i])) return true;
-    }
-    recent[head] = camera;
-    head = (head + 1) % 8;
-    if (count < 8) ++count;
-    return false;
-}
-
-inline void updateMainCamera(const edpe::CameraProjection& camera, unsigned long long cur_frame) {
-    static unsigned s_revisit_rejected = 0;
-    if (false) {
-        if (++s_revisit_rejected <= 8 || (s_revisit_rejected % 512) == 0) {
-            wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: ignored revisited camera sample #%u frame=%llu",
-                s_revisit_rejected, cur_frame);
-            EdpeLog(msg);
+            if (rotTrace < 2.414f || fovChanged) {
+                // Real scene transition (> 45 deg angle jump or FOV change)
+                out_scene_cut = true;
+                s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+            } else {
+                out_scene_cut = false;
+                s_last_valid_velocity = edpe::cameraPosition(s_staged_camera) - edpe::cameraPosition(s_camera_now);
+            }
+            s_camera_previous = s_camera_now;
+            s_camera_previous_frame = s_camera_frame;
+        } else {
+            s_camera_previous = s_staged_camera;
+            s_camera_previous_frame = rendered_frame;
+            out_scene_cut = true;
+            s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
         }
-        return;
-    }
-    if (s_camera_frame == ~0ull) {
-        s_camera_previous = camera;
-        s_camera_previous_frame = cur_frame;
-    } else if (s_camera_frame != cur_frame) {
+        s_camera_now = s_staged_camera;
+        s_camera_frame = rendered_frame;
+        s_has_staged_camera = false;
+    } else if (s_camera_now.scaleX > 0.0f) {
+        // Fallback: camera was not unmapped or probe pass was rejected.
+        // Extrapolate position using last valid velocity and NEVER reset history!
         s_camera_previous = s_camera_now;
         s_camera_previous_frame = s_camera_frame;
+        const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
+        edpe::cameraSetPosition(s_camera_now, extPos);
+        s_camera_frame = rendered_frame;
+        out_scene_cut = false;
     }
-    s_camera_now = camera;
-    s_camera_frame = cur_frame;
 }
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_depth_source;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_ldr_source;
@@ -1604,11 +1598,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             scene_last_projection_hash.store(projection, std::memory_order_relaxed);
 
             // Track the unjittered main-view camera for the motion pass.
-            // Filter out canopy planar reflections and auxiliary sub-cameras,
-            // latching only authoritative primary scene cameras once per frame.
+            // Phase 3: Candidate staging and jitter injection (Two-Phase Staging & Commit)
             edpe::CameraProjection parsed_camera{};
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
-            const bool in_main_scene = s_inside_main_scene.load(std::memory_order_acquire);
             bool is_main_camera = false;
             const float* words = static_cast<const float*>(mapped_ptr);
             if (edpe::parseEliteCamera(words, 5376 / sizeof(float), &parsed_camera)) {
@@ -1616,23 +1608,36 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
                 const bool main_gbuffer_already_finished =
                     (s_hdr_slot0_seen_frame == cur_frame && motion_color_frame == cur_frame);
-                if (isAuthoritativeMainSceneCamera(words, 5376 / sizeof(float), parsed_camera, outW, outH) &&
-                    !main_gbuffer_already_finished) {
-                    is_main_camera = true;
-                    s_auxiliary_rejection_streak = 0;
-                    if (in_main_scene) {
-                        if (s_in_scene_camera_latched_frame != cur_frame) {
-                            updateMainCamera(parsed_camera, cur_frame);
-                            s_in_scene_camera_latched_frame = cur_frame;
+
+                float dtRatio = 1.0f;
+                if (s_last_frame_dt > 1e-5f && s_current_frame_dt > 1e-5f) {
+                    dtRatio = s_current_frame_dt / s_last_frame_dt;
+                }
+
+                if (!main_gbuffer_already_finished &&
+                    isAuthoritativeMainSceneCamera(words, 5376 / sizeof(float), parsed_camera,
+                        outW, outH, s_camera_now, s_last_valid_velocity, dtRatio)) {
+
+                    // Intra-frame first candidate locking (Section 5, rule 2):
+                    // If we already staged a primary candidate in this frame, check distance.
+                    // If intraDist > 0.04m, reject secondary sub-pass!
+                    bool allow_stage = true;
+                    if (s_has_staged_camera && s_staged_camera_frame == cur_frame) {
+                        const edpe::Vec3 intraDelta = edpe::cameraPosition(parsed_camera) -
+                                                      edpe::cameraPosition(s_staged_camera);
+                        const float intraDist = edpe::length(intraDelta);
+                        if (intraDist > 0.04f) {
+                            allow_stage = false;
                         }
-                    } else if (s_camera_frame != cur_frame) {
-                        s_latest_unmapped_camera = parsed_camera;
-                        s_latest_unmapped_camera_frame = cur_frame;
-                        s_latest_unmapped_camera_valid = true;
                     }
-                } else if (cameraRotationDeterminant(parsed_camera) >= 0.5f) {
-                    s_fallback_unmapped_camera = parsed_camera;
-                    s_fallback_unmapped_camera_frame = cur_frame;
+
+                    if (allow_stage) {
+                        s_staged_camera = parsed_camera;
+                        s_has_staged_camera = true;
+                        s_staged_camera_frame = cur_frame;
+                        s_valid_camera_seen_counter.fetch_add(1, std::memory_order_relaxed);
+                        is_main_camera = true;
+                    }
                 }
             }
 
@@ -2890,22 +2895,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const wchar_t* skip = nullptr;
     if (!motion_color_source || !scene_depth_source) skip = L"scene color/depth not observed";
     else if (motion_color_frame != rendered) skip = L"no scene MRT pass this frame";
-    else if (s_camera_frame != rendered) {
-        if (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered) {
-            updateMainCamera(s_latest_unmapped_camera, rendered);
-        } else if (s_fallback_unmapped_camera_frame == rendered && ++s_auxiliary_rejection_streak >= 3) {
-            // Genuine camera cut persisted across >= 3 frames (e.g. external camera switch):
-            updateMainCamera(s_fallback_unmapped_camera, rendered);
-            s_auxiliary_rejection_streak = 0;
-        } else if (s_camera_now.scaleX > 0.0f) {
-            // Camera was not unmapped or only a 1-frame auxiliary probe ran this frame.
-            // Retain previous camera smoothly without resetting temporal history!
-            s_camera_previous = s_camera_now;
-            s_camera_previous_frame = s_camera_frame;
-            s_camera_frame = rendered;
-        } else {
-            skip = L"no main camera latched this frame";
-        }
+    else if (!s_has_staged_camera && s_camera_now.scaleX <= 0.0f) skip = L"no main camera latched this frame";
+
+    bool scene_cut = false;
+    if (!skip) {
+        commitMainCamera(rendered, scene_cut);
     }
     if (skip) {
         if (upscale_active && s_last_reconstructed_output && s_last_reconstructed_frame != ~0ull &&
@@ -3202,27 +3196,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const float mScaleX = (s_motion_invert_x.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
     const float mScaleY = (s_motion_invert_y.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
 
-    // Physical camera scene-cut detection based on position and rotation discontinuities.
-    // A true scene cut requires an abrupt discontinuous camera change:
-    // 1. First frame after initialization (no previous frame).
-    // 2. Abrupt orientation discontinuity (rotTrace < 2.0f, corresponding to > 45 degree turn).
-    // 3. Astronomical position teleport (moveDist > 5000.0f, e.g. supercruise drop / hyperspace).
-    // 4. Large position jump (> 50.0f) ONLY IF accompanied by an orientation deviation (rotTrace < 2.85f).
-    // Steady linear flight (rotTrace >= 2.85f) must NEVER trigger a scene cut regardless of velocity!
-    const float* c = s_camera_now.worldFromView;
-    const float* p = s_camera_previous.worldFromView;
-    const float dx = c[3] - p[3];
-    const float dy = c[7] - p[7];
-    const float dz = c[11] - p[11];
-    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const float rotTrace = (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
-                           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
-                           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
-    const bool orientation_cut = (rotTrace < 2.0f);
-    const bool teleport_cut = (moveDist > 5000.0f);
-    const bool translation_cut = (moveDist > 50.0f && rotTrace < 2.85f);
-    const bool scene_cut = (s_camera_previous_frame == ~0ull) || orientation_cut || teleport_cut || translation_cut;
-
     static LARGE_INTEGER s_last_upscale_qpc{};
     static LARGE_INTEGER s_upscale_freq{};
     if (s_upscale_freq.QuadPart == 0) QueryPerformanceFrequency(&s_upscale_freq);
@@ -3234,9 +3207,21 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                                    static_cast<double>(s_upscale_freq.QuadPart);
         if (measured_ms >= 0.5 && measured_ms <= 250.0) {
             dt_ms = static_cast<float>(measured_ms);
+            s_last_frame_dt = s_current_frame_dt;
+            s_current_frame_dt = dt_ms * 0.001f;
         }
     }
     s_last_upscale_qpc = now_qpc;
+
+    const float* c = s_camera_now.worldFromView;
+    const float* p = s_camera_previous.worldFromView;
+    const float dx = c[3] - p[3];
+    const float dy = c[7] - p[7];
+    const float dz = c[11] - p[11];
+    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float rotTrace = edpe::cameraRotationTrace(s_camera_now, s_camera_previous);
+    const bool teleport_cut = (moveDist > 5000.0f);
+    scene_cut = scene_cut || (s_camera_previous_frame == ~0ull) || teleport_cut;
 
     edpe::TemporalFrameInputs inputs{};
     inputs.color = s_dlaa_input.Get();
@@ -3609,8 +3594,9 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         jx = s_last_temporal_inputs.jitterX;
         jy = s_last_temporal_inputs.jitterY;
         reset = s_last_temporal_inputs.reset;
+        float debugDtRatio = (s_last_frame_dt > 1e-5f) ? (s_current_frame_dt / s_last_frame_dt) : 1.0f;
         if (s_camera_now.scaleX > 0.0f && s_camera_previous.scaleX > 0.0f &&
-            isReflectionOrAuxiliaryCamera(s_camera_now, s_camera_previous)) {
+            isStereoEyeOrIpdProbe(s_camera_now, s_camera_previous, s_last_valid_velocity, debugDtRatio)) {
             reset = true;
         }
         isHdr = s_last_temporal_inputs.colorIsHdr;
@@ -3922,10 +3908,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                 }
             }
 
-            if (s_camera_frame != current_frame && s_latest_unmapped_camera_valid &&
-                s_latest_unmapped_camera_frame == current_frame) {
-                updateMainCamera(s_latest_unmapped_camera, current_frame);
-            }
+
         } else {
             s_inside_main_scene.store(false, std::memory_order_release);
         }
@@ -4503,6 +4486,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_config_loaded = true;
         auto& cfg = edpe::Config::instance();
         cfg.load();
+        jitter_enabled.store(cfg.jitterEnabled, std::memory_order_relaxed);
         s_jitter_invert_x.store(cfg.jitterInvertX, std::memory_order_relaxed);
         s_jitter_invert_y.store(cfg.jitterInvertY, std::memory_order_relaxed);
         s_jitter_swap_xy.store(cfg.jitterSwapXY, std::memory_order_relaxed);
@@ -4699,31 +4683,37 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 s_jitter_standdown_len = (std::min)(s_jitter_standdown_len * 2ull, 960ull);
             }
         }
+        if (!s_upscale_evaluated_this_frame) {
+            bool dummy_cut = false;
+            if (s_has_staged_camera && s_staged_camera_frame == rendered_frame) {
+                commitMainCamera(rendered_frame, dummy_cut);
+            }
+        }
         s_upscale_evaluated_this_frame = false;
         motion_color_first_exit_logged = false;
-        s_latest_unmapped_camera_valid = false;
+        s_has_staged_camera = false;
         s_jitter_injected_frame = ~0ull;
         clearTrackedMappedBuffers();
         clearRejectedResourceCache();
-        static unsigned s_watchdog_last_jitter_writes = 0;
-        static unsigned s_watchdog_no_jitter_frames = 0;
-        const unsigned cur_writes = jittered_writes_count.load(std::memory_order_relaxed);
+        static uint64_t s_watchdog_last_camera_seen = 0;
+        static unsigned s_watchdog_no_camera_frames = 0;
+        const uint64_t cur_camera_seen = s_valid_camera_seen_counter.load(std::memory_order_relaxed);
         if (edpe::UpscalerManager::instance().isReconstructionActive()) {
-            if (cur_writes == s_watchdog_last_jitter_writes) {
+            if (cur_camera_seen == s_watchdog_last_camera_seen) {
                 if (scene_map_target.load(std::memory_order_relaxed) != nullptr) {
-                    if (++s_watchdog_no_jitter_frames >= 120) {
+                    if (++s_watchdog_no_camera_frames >= 120) {
                         scene_map_target.store(nullptr, std::memory_order_release);
                         clearRejectedResourceCache();
-                        s_watchdog_no_jitter_frames = 0;
+                        s_watchdog_no_camera_frames = 0;
                     }
                 }
             } else {
-                s_watchdog_last_jitter_writes = cur_writes;
-                s_watchdog_no_jitter_frames = 0;
+                s_watchdog_last_camera_seen = cur_camera_seen;
+                s_watchdog_no_camera_frames = 0;
             }
         } else {
-            s_watchdog_last_jitter_writes = cur_writes;
-            s_watchdog_no_jitter_frames = 0;
+            s_watchdog_last_camera_seen = cur_camera_seen;
+            s_watchdog_no_camera_frames = 0;
         }
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
@@ -5189,11 +5179,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_last_reconstructed_frame = ~0ull;
         s_last_temporal_inputs = {};
         s_last_temporal_inputs_frame = ~0ull;
-        s_in_scene_camera_latched_frame = ~0ull;
         s_hdr_slot0_seen_frame = ~0ull;
         s_consecutive_skipped_frames = 0;
-        s_auxiliary_rejection_streak = 0;
-        s_fallback_unmapped_camera_frame = ~0ull;
+        s_has_staged_camera = false;
+        s_staged_camera_frame = ~0ull;
+        s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
         s_gbuffer_resources = {};
         s_observed_scene_width.store(0, std::memory_order_relaxed);
         s_observed_scene_height.store(0, std::memory_order_relaxed);
@@ -5310,6 +5300,13 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
 
 void ContextCensusSetJitterEnabled(bool enabled) {
     jitter_enabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) {
+        s_jitter_standdown_until.store(0, std::memory_order_relaxed);
+        s_jitter_standdown_len = 60;
+    }
+    auto& cfg = edpe::Config::instance();
+    cfg.jitterEnabled = enabled;
+    cfg.save();
 }
 
 bool ContextCensusGetJitterEnabled() {
