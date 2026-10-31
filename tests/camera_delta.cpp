@@ -160,5 +160,28 @@ int main() {
     if (!edpe::isStereoEyeOrIpdProbe(quadEyeProbe, identity())) return 32;
     if (!edpe::isReflectionOrAuxiliaryCamera(quadEyeProbe, identity())) return 33;
 
+    // 15. Stereo probe (0.1364m) with micro-FOV jitter (0.07% scaleX diff, inside old 1e-4..2% blind spot)
+    // MUST still be caught as an auxiliary stereo probe:
+    auto microFovProbe = identity();
+    microFovProbe.worldFromView[3] = 0.1364f;
+    microFovProbe.scaleX *= 1.0007f;
+    if (!edpe::isStereoEyeOrIpdProbe(microFovProbe, identity())) return 34;
+    if (!edpe::isReflectionOrAuxiliaryCamera(microFovProbe, identity())) return 35;
+
+    // 16. Measured Cobra Odyssey cockpit head / canopy probe (0.1364m: dUp=0.1098m, dFwd=0.0809m, dRight=0.0000)
+    // MUST be identified as auxiliary probe:
+    auto cockpitHeadProbe = identity();
+    cockpitHeadProbe.worldFromView[7] = 0.1098f;  // Up
+    cockpitHeadProbe.worldFromView[11] = 0.0809f; // Forward
+    if (!edpe::isStereoEyeOrIpdProbe(cockpitHeadProbe, identity())) return 36;
+    if (!edpe::isReflectionOrAuxiliaryCamera(cockpitHeadProbe, identity())) return 37;
+
+    // 17. matchesAnchorPrediction unit tests:
+    const edpe::Vec3 anchorVel{0.05f, 0.0f, 0.0f};
+    auto matchingCand = identity();
+    matchingCand.worldFromView[3] = 0.05f;
+    if (!edpe::matchesAnchorPrediction(matchingCand, identity(), anchorVel, 1.0f)) return 38;
+    if (edpe::matchesAnchorPrediction(cockpitHeadProbe, identity(), anchorVel, 1.0f)) return 39;
+
     return 0;
 }

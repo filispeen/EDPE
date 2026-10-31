@@ -50,8 +50,27 @@ inline float cameraRotationTrace(const CameraProjection& a, const CameraProjecti
 }
 
 // 2nd-order kinematic residual filter (Jerk/Impulse Filter) for Cobra stereo eye / IPD probes.
-// Extrapolates expected position based on ship velocity history, making it completely immune
-// to lateral thruster strafe (Q/E, 2.4-21 m/s), boost acceleration, and Supercruise.
+// Eliminates the FOV blind spot (1e-4f..2%) and prevents velocity poisoning rebounds.
+inline bool matchesAnchorPrediction(
+    const CameraProjection& cand,
+    const CameraProjection& anchor,
+    const Vec3& velocity,
+    float dtRatio)
+{
+    if (anchor.scaleX <= 0.0f || anchor.scaleY <= 0.0f) {
+        return false;
+    }
+    if (cameraRotationTrace(cand, anchor) < 2.985f) {
+        return false;
+    }
+    if (std::fabs(cand.scaleX - anchor.scaleX) > 0.02f * anchor.scaleX) {
+        return false;
+    }
+    const float r = std::clamp(dtRatio, 0.25f, 4.0f);
+    const Vec3 predicted = cameraPosition(anchor) + velocity * r;
+    return length(cameraPosition(cand) - predicted) < 0.03f;
+}
+
 inline bool isStereoEyeOrIpdProbe(
     const CameraProjection& candidate,
     const CameraProjection& baseline,
@@ -62,53 +81,66 @@ inline bool isStereoEyeOrIpdProbe(
         return false;
     }
 
-    // Дозволяємо плавне обертання корабля між кадрами (rotTrace > 2.985f ≈ до 10 град/кадр)
+    // 1. Дозволяємо плавне обертання корабля між кадрами (rotTrace > 2.985f ≈ до 10 град/кадр)
     const float rotTrace = cameraRotationTrace(candidate, baseline);
     if (rotTrace < 2.985f) {
         return false;
     }
 
-    // Стерео-зонд має ідентичний FOV
-    if (std::fabs(candidate.scaleX - baseline.scaleX) > 1e-4f ||
-        std::fabs(candidate.scaleY - baseline.scaleY) > 1e-4f) {
+    // 2. УСУНЕННЯ СЛІПОЇ ЗОНИ FOV: узгоджуємо поріг із isReflectionOrAuxiliaryCamera (2%).
+    // Будь-яке мікро-тремтіння scaleX/scaleY стерео-зонда (< 2%) тепер гарантовано перевіряється тут.
+    if (std::fabs(candidate.scaleX - baseline.scaleX) > 0.02f * baseline.scaleX ||
+        std::fabs(candidate.scaleY - baseline.scaleY) > 0.02f * baseline.scaleY) {
         return false;
     }
 
     const Vec3 prevPos = cameraPosition(baseline);
     const Vec3 candPos = cameraPosition(candidate);
-    const Vec3 right = cameraRight(candidate);
-    const Vec3 up = cameraUp(candidate);
-    const Vec3 fwd = cameraForward(candidate);
+    const Vec3 right   = cameraRight(candidate);
+    const Vec3 up      = cameraUp(candidate);
+    const Vec3 fwd     = cameraForward(candidate);
 
-    // Перевірка 1: Прямий внутрішньокадровий або стаціонарний латеральний зсув (68.2 мм .. 350 мм)
+    // 3. Перевірка 1: Прямий латеральний зсув відносно baseline (від 1x IPD 68.2 мм до 4x IPD 272.8 мм).
+    // Спрацьовує при стаціонарному кораблі або при внутрішньокадровому порівнянні пасів (last_velocity == 0).
     const Vec3 rawDelta = candPos - prevPos;
     const float rawDist = length(rawDelta);
-    if (rotTrace > 2.995f && rawDist >= 0.035f && rawDist <= 0.35f) {
+    if (rotTrace > 2.992f && rawDist >= 0.032f && rawDist <= 0.36f) {
         const float dRight = std::fabs(dot(rawDelta, right));
         const float dUp    = std::fabs(dot(rawDelta, up));
         const float dFwd   = std::fabs(dot(rawDelta, fwd));
-        // Якщо корабель майже не рухався вбік на минулому кадрі, це гарантовано стерео-зонд
-        if (std::fabs(dot(last_velocity, right)) < 0.025f &&
-            dRight >= 0.82f * rawDist && dUp < 0.04f && dFwd < 0.04f) {
+        const float prevLateralSpeed = std::fabs(dot(last_velocity, right));
+
+        // 3a. Латеральний стерео-очний зонд (IPD 68.2 мм, 136.4 мм, 272.8 мм)
+        const bool isLateralIpd = (prevLateralSpeed < 0.025f &&
+            dRight >= 0.80f * rawDist && dUp < 0.045f && dFwd < 0.045f);
+
+        // 3b. Кабінний / наголовний зонд Cobra Odyssey (136.4 мм: +10.98 см Up, +8.09 см Fwd, 0.00 см Right)
+        const bool isCockpitHeadProbe = (dRight < 0.025f &&
+            dUp >= 0.65f * rawDist && dFwd >= 0.45f * rawDist);
+
+        if (isLateralIpd || isCockpitHeadProbe) {
             return true;
         }
     }
 
-    // Перевірка 2: Кінематична нев'язка 2-го порядку (працює під час стрейфу Q/E та Supercruise)
+    // 4. Перевірка 2: Кінематична нев'язка 2-го порядку (під час стрейфу Q/E та Supercruise).
     const float clampedDtRatio = std::clamp(dtRatio, 0.25f, 4.0f);
     const Vec3 predictedPos = prevPos + (last_velocity * clampedDtRatio);
     const Vec3 residual = candPos - predictedPos;
     const float resDist = length(residual);
 
-    if (resDist >= 0.035f && resDist <= 0.35f) {
+    if (resDist >= 0.032f && resDist <= 0.36f) {
         const float rRight   = std::fabs(dot(residual, right));
         const float rUp      = std::fabs(dot(residual, up));
         const float rForward = std::fabs(dot(residual, fwd));
-        if (rRight >= 0.82f * resDist && rUp < 0.04f && rForward < 0.04f) {
+
+        const bool isResLateralIpd = (rRight >= 0.80f * resDist && rUp < 0.045f && rForward < 0.045f);
+        const bool isResCockpitHeadProbe = (rRight < 0.025f && rUp >= 0.65f * resDist && rForward >= 0.45f * resDist);
+
+        if (isResLateralIpd || isResCockpitHeadProbe) {
             return true;
         }
     }
-
     return false;
 }
 
@@ -124,19 +156,19 @@ inline bool isReflectionOrAuxiliaryCamera(
 
     if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) return false;
 
-    // 2. Стрибок масштабу проєкції (FOV) відносно базової камери
+    // 2. Стрибок масштабу проєкції (FOV > 2%) відносно базової камери
     const float scaleDiffX = std::fabs(candidate.scaleX - baseline.scaleX);
     const float scaleDiffY = std::fabs(candidate.scaleY - baseline.scaleY);
     if (scaleDiffX > 0.02f * baseline.scaleX || scaleDiffY > 0.02f * baseline.scaleY) {
         return true;
     }
 
-    // 3. Стерео-зонд (68.2 мм / 136.4 мм)
+    // 3. Стерео-зонд (68.2 мм / 136.4 мм / 272.8 мм)
     if (isStereoEyeOrIpdProbe(candidate, baseline, last_velocity, dtRatio)) {
         return true;
     }
 
-    // 4. Однокадровий стрибок орієнтації (> 45 град) або комбінований стрибок дзеркала/панелі
+    // 4. Однокадровий стрибок орієнтації (> 45 град, rotTrace < 2.40)
     const float rotTrace = cameraRotationTrace(candidate, baseline);
     if (rotTrace < 2.40f) {
         return true;
