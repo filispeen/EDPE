@@ -195,6 +195,8 @@ public:
         return currentBackendType_ != UpscalerBackend::None && currentMode_ != UpscaleMode::Native;
     }
 
+    bool hasEvaluated() const { return evalCount_ > 0; }
+
     // Dispatches temporal reconstruction. Fails open on any error.
     bool evaluate(ID3D11DeviceContext* context,
         const TemporalFrameInputs& inputs,
@@ -233,6 +235,7 @@ private:
     GpuTimingSlot timingRing_[kTimingRingSize]{};
     size_t timingWriteIndex_ = 0;
     float lastGpuTimeMs_ = 0.0f;
+    unsigned evalCount_{0};
 
     UpscalerDiagnostics diagnostics_{};
 };

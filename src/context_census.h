@@ -2,10 +2,37 @@
 
 #include <dxgi.h>
 #include <d3d11.h>
+#include <atomic>
+#include <mutex>
+
+extern std::atomic<bool> g_is_evaluating_upscaler;
+extern std::atomic<int> g_evaluating_upscaler_depth;
+extern std::recursive_mutex g_scene_ctx_mutex;
+
+struct EvaluatingUpscalerGuard {
+    EvaluatingUpscalerGuard() {
+        if (g_evaluating_upscaler_depth.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            g_is_evaluating_upscaler.store(true, std::memory_order_release);
+        }
+    }
+    ~EvaluatingUpscalerGuard() {
+        if (g_evaluating_upscaler_depth.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            g_is_evaluating_upscaler.store(false, std::memory_order_release);
+        }
+    }
+    EvaluatingUpscalerGuard(const EvaluatingUpscalerGuard&) = delete;
+    EvaluatingUpscalerGuard& operator=(const EvaluatingUpscalerGuard&) = delete;
+};
 
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags);
 void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags);
 void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags);
+void ContextCensusHookDeferredContext(ID3D11DeviceContext* context);
+void ContextCensusHookContext(ID3D11DeviceContext* context);
+void ContextCensusRegisterDevice(ID3D11Device* device, ID3D11DeviceContext* immContext);
+bool ContextCensusIsDeviceRegistered(ID3D11Device* device);
+void ContextCensusLogPresentDevice(IDXGISwapChain* swapChain, ID3D11Device* presentDevice);
+unsigned long long ContextCensusGetDsvBinds();
 void ContextCensusOnSwapChainRelease(IUnknown* object);
 bool ContextCensusRequestBindSequence();
 bool ContextCensusBindSequenceAvailable();
@@ -54,6 +81,8 @@ void ContextCensusSetMotionScale(float scale);
 float ContextCensusGetMotionScale();
 void ContextCensusSetPreserveNativeUi(bool preserve);
 bool ContextCensusGetPreserveNativeUi();
+void ContextCensusSetSharpness(float sharpness);
+float ContextCensusGetSharpness();
 void ContextCensusGetSceneRenderSize(UINT* outWidth, UINT* outHeight);
 void ContextCensusRequestComparisonCapture();
 bool ContextCensusIsComparisonCapturePending();

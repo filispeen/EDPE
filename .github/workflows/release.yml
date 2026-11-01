@@ -84,7 +84,8 @@ jobs:
         if: steps.cache-build.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          cmake -S . -B build -A x64
+          $ver = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
+          cmake -S . -B build -A x64 -DEDPE_VERSION="$ver"
 
       - name: Build EDPE (Release)
         if: steps.cache-build.outputs.cache-hit != 'true'

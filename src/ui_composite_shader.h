@@ -36,6 +36,20 @@ VSOutput vs_main(uint id : SV_VertexID) {
 float4 ps_main(VSOutput pin) : SV_Target {
     int3 pixelPos = int3(pin.pos.xy, 0);
 
+    [branch]
+    if (flags.y > 0.5 && flags.x < 0.5) {
+        float3 gameN = tGame.Load(pixelPos).rgb;
+        float3 lowN = tLowWorld.Load(pixelPos).rgb;
+        float3 dlssN = tDlss.Load(pixelPos).rgb;
+        float3 nd = abs(gameN - lowN);
+        float d = max(nd.r, max(nd.g, nd.b));
+        float a = smoothstep(0.04, 0.35, d);
+        float3 darken = saturate(gameN / max(lowN, 0.002));
+        float3 isDark = step(gameN + 0.0005, lowN);
+        float3 t = lerp(float3(1.0 - a, 1.0 - a, 1.0 - a), darken, isDark);
+        return float4(saturate(gameN + t * (dlssN - lowN)), 1.0);
+    }
+
     float3 cDlss = tDlss.Load(pixelPos).rgb;
     float3 cGame = tGame.Load(pixelPos).rgb;
     float3 cLow  = tLowWorld.SampleLevel(sLinear, pin.uv, 0).rgb;

@@ -132,6 +132,7 @@ public:
         uint32_t height);
 
     static const wchar_t* get_status_message();
+    static bool has_evaluated();
 };
 
 } // namespace edpe

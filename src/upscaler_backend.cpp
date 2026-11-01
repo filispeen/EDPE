@@ -1,6 +1,11 @@
 #include "upscaler_backend.h"
+#include "context_census.h"
 #include "log.h"
 #include "ngx_context.h"
+
+std::atomic<bool> g_is_evaluating_upscaler{false};
+std::atomic<int> g_evaluating_upscaler_depth{0};
+std::recursive_mutex g_scene_ctx_mutex;
 
 #include <algorithm>
 #include <cfloat>
@@ -483,7 +488,11 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.cameraFar = FLT_MAX;
     dispatchDesc.viewSpaceToMetersFactor = 1.0f;
 
-    FfxErrorCode err = ffxFsr3UpscalerContextDispatch(&impl_->fsrContext, &dispatchDesc);
+    FfxErrorCode err;
+    {
+        EvaluatingUpscalerGuard evalGuard;
+        err = ffxFsr3UpscalerContextDispatch(&impl_->fsrContext, &dispatchDesc);
+    }
     if (err != FFX_OK) {
         swprintf_s(impl_->lastErrorReason, L"ffxFsr3UpscalerContextDispatch failed (0x%08X: %ls)", static_cast<unsigned>(err), Impl::getFfxErrorString(err));
         wchar_t buf[256];
@@ -639,6 +648,7 @@ void UpscalerManager::shutdown() {
     }
     timingWriteIndex_ = 0;
     lastGpuTimeMs_ = 0.0f;
+    evalCount_ = 0;
 
     device_ = nullptr;
     context_ = nullptr;
@@ -707,6 +717,7 @@ bool UpscalerManager::setBackend(UpscalerBackend backend) {
 
     currentBackendType_ = backend;
     pendingReset_ = true;
+    evalCount_ = 0;
 
     wchar_t message[128];
     swprintf_s(message, L"EDPE: upscaler backend changed to %ls", getUpscalerBackendName(backend));
@@ -739,6 +750,24 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     const TemporalFrameInputs& inputs,
     ID3D11RenderTargetView* destinationRtv,
     ID3D11Texture2D* destinationTexture) {
+    if (context) {
+        Microsoft::WRL::ComPtr<ID3D11Device> evalDevice;
+        context->GetDevice(&evalDevice);
+        if (evalDevice && evalDevice.Get() != device_) {
+            const UpscalerBackend savedBackend = currentBackendType_;
+            const UpscaleMode savedMode = currentMode_;
+            const uint32_t savedPreset = NgxContext::get_preset();
+            wchar_t msg[192];
+            swprintf_s(msg, L"EDPE: rebinding UpscalerManager from device=%p to scene device=%p",
+                device_, evalDevice.Get());
+            EdpeLog(msg);
+            shutdown();
+            NgxContext::set_preset(savedPreset);
+            initialize(evalDevice.Get(), context);
+            setBackend(savedBackend);
+            setMode(savedMode);
+        }
+    }
     diagnostics_.didRun = true;
     diagnostics_.backend = currentBackendType_;
     diagnostics_.mode = currentMode_;
@@ -798,8 +827,15 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     }
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    const bool evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
+    bool evalSuccess = false;
+    {
+        EvaluatingUpscalerGuard evalGuard;
+        evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
+    }
     auto t1 = std::chrono::high_resolution_clock::now();
+    if (evalSuccess) {
+        ++evalCount_;
+    }
 
     if (canQueryGpu) {
         context->End(slot.end.Get());

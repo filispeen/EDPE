@@ -107,7 +107,7 @@ void hookDeviceIfD3D11(IUnknown* device) {
     if (!device) return;
     ID3D11Device* d3d_device = nullptr;
     if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Device), reinterpret_cast<void**>(&d3d_device)))) {
-        hookShaderCreation(d3d_device);
+        processDeviceCreated(d3d_device, nullptr, 0, static_cast<D3D_FEATURE_LEVEL>(0));
         d3d_device->Release();
     }
 }
@@ -117,7 +117,13 @@ HRESULT STDMETHODCALLTYPE observedCreateSwapChain(IDXGIFactory* factory, IUnknow
     hookDeviceIfD3D11(device);
     const auto original = reinterpret_cast<CreateSwapChainFn>(tableOf(factory)->original[kCreateSwapChain]);
     const HRESULT result = original(factory, device, desc, swap_chain);
-    if (SUCCEEDED(result) && swap_chain && *swap_chain) observeSwapChain(*swap_chain);
+    if (SUCCEEDED(result) && swap_chain && *swap_chain) {
+        wchar_t scMsg[192];
+        swprintf_s(scMsg, L"EDPE: swapchain created swapchain=%p device=%p",
+            static_cast<void*>(*swap_chain), static_cast<void*>(device));
+        EdpeLog(scMsg);
+        observeSwapChain(*swap_chain);
+    }
     return result;
 }
 
@@ -127,7 +133,13 @@ HRESULT STDMETHODCALLTYPE observedCreateSwapChainForHwnd(IDXGIFactory2* factory,
     hookDeviceIfD3D11(device);
     const auto original = reinterpret_cast<CreateSwapChainForHwndFn>(tableOf(factory)->original[kCreateSwapChainForHwnd]);
     const HRESULT result = original(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swap_chain);
-    if (SUCCEEDED(result) && swap_chain && *swap_chain) observeSwapChain(*swap_chain);
+    if (SUCCEEDED(result) && swap_chain && *swap_chain) {
+        wchar_t scMsg[192];
+        swprintf_s(scMsg, L"EDPE: swapchain created swapchain=%p device=%p",
+            static_cast<void*>(*swap_chain), static_cast<void*>(device));
+        EdpeLog(scMsg);
+        observeSwapChain(*swap_chain);
+    }
     return result;
 }
 
@@ -202,7 +214,28 @@ void logContextDispatch(IDXGISwapChain* swap_chain, unsigned long long frame) {
 
 HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
     const auto frame = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (frame == 1) logFirstPresent(swap_chain);
+    static IDXGISwapChain* s_logged_swapchains[8]{};
+    static std::atomic<size_t> s_logged_swapchain_count{0};
+    bool already_logged_sc = false;
+    const size_t sc_count = s_logged_swapchain_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < sc_count; ++i) {
+        if (s_logged_swapchains[i] == swap_chain) {
+            already_logged_sc = true;
+            break;
+        }
+    }
+    if (!already_logged_sc && sc_count < 8) {
+        const size_t idx = s_logged_swapchain_count.fetch_add(1, std::memory_order_acq_rel);
+        if (idx < 8) {
+            s_logged_swapchains[idx] = swap_chain;
+            ID3D11Device* presentDevice = nullptr;
+            if (SUCCEEDED(swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&presentDevice))) && presentDevice) {
+                ContextCensusLogPresentDevice(swap_chain, presentDevice);
+                presentDevice->Release();
+            }
+            logFirstPresent(swap_chain);
+        }
+    }
     if (frame <= 8 || (frame <= 32768 && frame % 1024 == 0)) logContextDispatch(swap_chain, frame);
     edpe::PerfTracker::instance().onPresentStart(swap_chain);
     ContextCensusOnPresent(swap_chain, frame, flags);

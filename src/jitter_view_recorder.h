@@ -69,7 +69,9 @@ public:
     bool isRecording() const;
     bool isDraining() const;
     bool isWriting() const;
+    bool isSaving() const;
     bool isActive() const;
+    void stopRecording();
 
     float getRecordingElapsedSeconds() const;
     size_t getLastSavedFrameCount() const;
@@ -133,7 +135,7 @@ private:
     UINT inputCopyHeight_ = 0;
     DXGI_FORMAT inputCopyFormat_ = DXGI_FORMAT_UNKNOWN;
 
-    std::thread writerThread_;
+    std::atomic<bool> isSaving_{false};
 };
 
 }

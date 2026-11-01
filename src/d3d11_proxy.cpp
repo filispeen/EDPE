@@ -1,5 +1,6 @@
 #include "d3d11_proxy.h"
 #include "crash_logger.h"
+#include "context_census.h"
 #include "config.h"
 #include "input_hook.h"
 #include "log.h"
@@ -11,6 +12,8 @@
 #include <cmath>
 #include <cwchar>
 #include <d3d11.h>
+#include <wrl/client.h>
+#include <string>
 #include <mutex>
 #include <set>
 #include <tuple>
@@ -25,7 +28,9 @@ using CreateSamplerStateFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*,
     const D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
 std::atomic<CreateVertexShaderFn> original_create_vertex_shader{nullptr};
 std::atomic<CreatePixelShaderFn> original_create_pixel_shader{nullptr};
+using CreateDeferredContextFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, UINT, ID3D11DeviceContext**);
 std::atomic<CreateSamplerStateFn> original_create_sampler_state{nullptr};
+std::atomic<CreateDeferredContextFn> original_create_deferred_context{nullptr};
 std::atomic<void**> hooked_device_table{nullptr};
 std::atomic<bool> retain_vertex_bytecode{false};
 
@@ -97,6 +102,16 @@ HRESULT STDMETHODCALLTYPE observedCreateSamplerState(ID3D11Device* device,
     return original_create_sampler_state.load(std::memory_order_acquire)(device, &mod_desc, sampler);
 }
 
+HRESULT STDMETHODCALLTYPE observedCreateDeferredContext(ID3D11Device* device,
+    UINT ContextFlags, ID3D11DeviceContext** ppDeferredContext) {
+    auto forward = original_create_deferred_context.load(std::memory_order_acquire);
+    const HRESULT result = forward ? forward(device, ContextFlags, ppDeferredContext) : E_FAIL;
+    if (SUCCEEDED(result) && ppDeferredContext && *ppDeferredContext) {
+        ContextCensusHookDeferredContext(*ppDeferredContext);
+    }
+    return result;
+}
+
 bool armShaderProbe() {
     wchar_t path[MAX_PATH];
     const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -113,8 +128,9 @@ bool armShaderProbe() {
 void hookShaderCreation(ID3D11Device* device) {
     if (!device) return;
     void** table = *reinterpret_cast<void***>(device);
-    if (hooked_device_table.load(std::memory_order_acquire)) return;
-    retain_vertex_bytecode.store(armShaderProbe(), std::memory_order_relaxed);
+    if (!retain_vertex_bytecode.load(std::memory_order_relaxed) && armShaderProbe()) {
+        retain_vertex_bytecode.store(true, std::memory_order_relaxed);
+    }
     HMODULE self = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
             GET_MODULE_HANDLE_EX_FLAG_PIN,
@@ -125,7 +141,23 @@ void hookShaderCreation(ID3D11Device* device) {
     constexpr size_t slot = 12;
     constexpr size_t pixel_slot = 15;
     auto forward = reinterpret_cast<CreateVertexShaderFn>(table[slot]);
-    if (!forward || forward == &observedCreateVertexShader) return;
+    if (!forward || forward == &observedCreateVertexShader) {
+        constexpr size_t deferred_slot = 27;
+        auto deferred_forward = reinterpret_cast<CreateDeferredContextFn>(table[deferred_slot]);
+        if (deferred_forward && deferred_forward != &observedCreateDeferredContext) {
+            original_create_deferred_context.store(deferred_forward, std::memory_order_release);
+            DWORD old_prot = 0;
+            if (VirtualProtect(table + deferred_slot, sizeof(void*), PAGE_READWRITE, &old_prot)) {
+                InterlockedCompareExchangePointer(
+                    reinterpret_cast<PVOID volatile*>(table + deferred_slot),
+                    reinterpret_cast<void*>(&observedCreateDeferredContext),
+                    reinterpret_cast<void*>(deferred_forward));
+                DWORD ignored = 0;
+                VirtualProtect(table + deferred_slot, sizeof(void*), old_prot, &ignored);
+            }
+        }
+        return;
+    }
     original_create_vertex_shader.store(forward, std::memory_order_release);
     DWORD old_protection = 0;
     if (!VirtualProtect(table + slot, sizeof(void*), PAGE_READWRITE, &old_protection)) return;
@@ -164,6 +196,24 @@ void hookShaderCreation(ID3D11Device* device) {
                 sampler_hooked = replaced == reinterpret_cast<void*>(sampler_forward);
             }
         }
+        constexpr size_t deferred_slot = 27;
+        bool deferred_hooked = false;
+        auto deferred_forward = reinterpret_cast<CreateDeferredContextFn>(table[deferred_slot]);
+        if (deferred_forward && deferred_forward != &observedCreateDeferredContext) {
+            original_create_deferred_context.store(deferred_forward, std::memory_order_release);
+            if (VirtualProtect(table + deferred_slot, sizeof(void*), PAGE_READWRITE, &old_protection)) {
+                replaced = InterlockedCompareExchangePointer(
+                    reinterpret_cast<PVOID volatile*>(table + deferred_slot),
+                    reinterpret_cast<void*>(&observedCreateDeferredContext),
+                    reinterpret_cast<void*>(deferred_forward));
+                VirtualProtect(table + deferred_slot, sizeof(void*), old_protection, &ignored);
+                deferred_hooked = (replaced == reinterpret_cast<void*>(deferred_forward));
+            }
+        }
+        EdpeLog(deferred_hooked
+            ? L"EDPE: deferred context hook available"
+            : L"EDPE: deferred context hook unavailable");
+
         EdpeLog(pixel_hooked
             ? L"EDPE: vertex/pixel shader signatures available"
             : L"EDPE: vertex shader signatures available; pixel shader hook unavailable");
@@ -173,6 +223,52 @@ void hookShaderCreation(ID3D11Device* device) {
         if (retain_vertex_bytecode.load(std::memory_order_relaxed))
             EdpeLog(L"EDPE: one-run vertex shader bytecode probe armed");
     } else EdpeLog(L"EDPE: vertex shader bytecode probe unavailable (slot changed)");
+}
+
+void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UINT flags, D3D_FEATURE_LEVEL featureLevel) {
+    if (!device) return;
+    if (ContextCensusIsDeviceRegistered(device)) {
+        hookShaderCreation(device);
+        if (context) ContextCensusHookContext(context);
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> immContext;
+    if (context) {
+        immContext = context;
+    } else {
+        device->GetImmediateContext(&immContext);
+    }
+
+    std::wstring adapterName = L"Unknown";
+    LUID adapterLuid{};
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(dxgiDevice.GetAddressOf()))) && dxgiDevice) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter> dxgiAdapter;
+        if (SUCCEEDED(dxgiDevice->GetAdapter(&dxgiAdapter)) && dxgiAdapter) {
+            DXGI_ADAPTER_DESC aDesc{};
+            if (SUCCEEDED(dxgiAdapter->GetDesc(&aDesc))) {
+                adapterName = aDesc.Description;
+                adapterLuid = aDesc.AdapterLuid;
+            }
+        }
+    }
+
+    D3D_FEATURE_LEVEL fl = (featureLevel != 0) ? featureLevel : device->GetFeatureLevel();
+
+    wchar_t message[384];
+    swprintf_s(message,
+        L"EDPE: D3D11 device created device=%p context=%p adapter=\"%ls\" luid=%08x:%08x featureLevel=0x%04X flags=0x%X thread=%u",
+        device, immContext.Get(), adapterName.c_str(),
+        adapterLuid.HighPart, adapterLuid.LowPart,
+        static_cast<unsigned>(fl), flags, GetCurrentThreadId());
+    EdpeLog(message);
+
+    hookShaderCreation(device);
+    ContextCensusRegisterDevice(device, immContext.Get());
+    if (immContext) {
+        ContextCensusHookContext(immContext.Get());
+    }
 }
 
 namespace edpe {
@@ -187,6 +283,11 @@ void installD3D11Hooks() {
     if (patchIatEntry(gameExe, "d3d11.dll", "D3D11CreateDevice",
             reinterpret_cast<void*>(&EdpeD3D11CreateDevice), &s_orig_d3d11)) {
         EdpeLog(L"EDPE: D3D11CreateDevice IAT hook installed in main executable");
+    }
+    static void* s_orig_d3d11_sc = nullptr;
+    if (patchIatEntry(gameExe, "d3d11.dll", "D3D11CreateDeviceAndSwapChain",
+            reinterpret_cast<void*>(&EdpeD3D11CreateDeviceAndSwapChain), &s_orig_d3d11_sc)) {
+        EdpeLog(L"EDPE: D3D11CreateDeviceAndSwapChain IAT hook installed in main executable");
     }
 }
 }
@@ -221,10 +322,52 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
             *device, methods, methods[10]);
         EdpeLog(message);
         hookShaderCreation(*device);
+        processDeviceCreated(*device, (context && *context) ? *context : nullptr, flags,
+            (feature_level && *feature_level) ? *feature_level : static_cast<D3D_FEATURE_LEVEL>(0));
     } else {
         edpe::setLastD3D11HResult(result);
         EdpeLog(SUCCEEDED(result) ? L"EDPE: D3D11 device created without output"
                                   : L"EDPE: D3D11 device creation failed");
+    }
+    return result;
+}
+
+extern "C" HRESULT WINAPI EdpeD3D11CreateDeviceAndSwapChain(
+    IDXGIAdapter* pAdapter,
+    D3D_DRIVER_TYPE DriverType,
+    HMODULE Software,
+    UINT Flags,
+    const D3D_FEATURE_LEVEL* pFeatureLevels,
+    UINT FeatureLevels,
+    UINT SDKVersion,
+    const DXGI_SWAP_CHAIN_DESC* pSwapChainDesc,
+    IDXGISwapChain** ppSwapChain,
+    ID3D11Device** ppDevice,
+    D3D_FEATURE_LEVEL* pFeatureLevel,
+    ID3D11DeviceContext** ppImmediateContext) {
+    syncConfigOnce();
+    static const HMODULE system_d3d11 = LoadSystemDll(L"d3d11.dll");
+    if (!system_d3d11) return HRESULT_FROM_WIN32(GetLastError());
+
+    static const auto create_device_and_swap_chain = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(
+        GetProcAddress(system_d3d11, "D3D11CreateDeviceAndSwapChain"));
+    if (!create_device_and_swap_chain) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+
+    const HRESULT result = create_device_and_swap_chain(pAdapter, DriverType, Software, Flags,
+        pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+    if (SUCCEEDED(result)) {
+        if (ppDevice && *ppDevice) {
+            processDeviceCreated(*ppDevice, (ppImmediateContext && *ppImmediateContext) ? *ppImmediateContext : nullptr,
+                Flags, (pFeatureLevel && *pFeatureLevel) ? *pFeatureLevel : static_cast<D3D_FEATURE_LEVEL>(0));
+        }
+        if (ppSwapChain && *ppSwapChain) {
+            wchar_t scMsg[192];
+            swprintf_s(scMsg, L"EDPE: swapchain created swapchain=%p device=%p",
+                static_cast<void*>(*ppSwapChain), static_cast<void*>(ppDevice ? *ppDevice : nullptr));
+            EdpeLog(scMsg);
+        }
+    } else {
+        EdpeLog(L"EDPE: D3D11CreateDeviceAndSwapChain failed");
     }
     return result;
 }

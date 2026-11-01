@@ -99,14 +99,18 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 tempDiff = abs(rawColor - histColor);
     float tempDelta = isReset ? 0.0 : max(tempDiff.r, max(tempDiff.g, tempDiff.b));
 
+    float jMag = length(jitterParams.xy);
+    float spatialBoost = clamp(0.38 / max(jMag, 0.12), 0.65, 2.2);
+    float normalizedSpatial = spatialDelta * spatialBoost;
+
     int mode = int(debugMode.x + 0.5);
     float delta = 0.0;
     if (mode == 1) {
-        delta = spatialDelta * 2.5;
+        delta = normalizedSpatial * 2.5;
     } else if (mode == 2) {
         delta = tempDelta * 1.5;
     } else {
-        delta = max(spatialDelta * 2.0, tempDelta * 1.25);
+        delta = max(normalizedSpatial * 2.0, tempDelta * 1.25);
     }
 
     float sensitivity = max(jitterParams.z, 0.01);

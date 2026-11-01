@@ -1,4 +1,5 @@
 #include "ngx_context.h"
+#include "context_census.h"
 #include "temporal_inputs.h"
 #include "log.h"
 
@@ -44,6 +45,7 @@ constexpr char kNgxEngineVersion[] = "EDPE-unreleased";
 // NGX feature state.
 static NgxFeatureState g_ngx_state{};
 static wchar_t g_status_msg[256] = L"NGX uninitialized";
+static std::atomic<bool> s_ngx_has_evaluated{false};
 
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
 static NVSDK_NGX_Parameter* g_ngx_params = nullptr;
@@ -167,6 +169,7 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
 }
 
 void NgxContext::shutdown() {
+    s_ngx_has_evaluated.store(false, std::memory_order_release);
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     releaseFeature();
     if (g_ngx_params) {
@@ -404,6 +407,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
     ep.Feature.pInColor = colorIn;
     ep.Feature.pInOutput = outputUav;
+    ep.Feature.InSharpness = std::clamp(params.sharpness, 0.0f, 1.0f);
     ep.pInDepth = depthIn;
     ep.pInMotionVectors = motionIn;
     ep.InJitterOffsetX = params.jitterX;
@@ -418,13 +422,18 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ep.InExposureScale = 1.0f;
     ep.InFrameTimeDeltaInMsec = params.frameTimeMs;
 
-    NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(context, g_dlaa_feature, g_ngx_params, &ep);
+    NVSDK_NGX_Result r;
+    {
+        EvaluatingUpscalerGuard evalGuard;
+        r = NGX_D3D11_EVALUATE_DLSS_EXT(context, g_dlaa_feature, g_ngx_params, &ep);
+    }
     if (r != NVSDK_NGX_Result_Success) {
         swprintf_s(g_status_msg, L"NGX_D3D11_EVALUATE_DLSS_EXT failed: 0x%08X", static_cast<unsigned>(r));
         EdpeLog(g_status_msg);
         return false;
     }
 
+    s_ngx_has_evaluated.store(true, std::memory_order_release);
     static unsigned s_ngx_eval_count = 0;
     if (++s_ngx_eval_count == 1) {
         wchar_t msg[192];
@@ -462,6 +471,10 @@ bool NgxContext::evaluateDlaa(ID3D11DeviceContext* context,
 
 const wchar_t* NgxContext::get_status_message() {
     return g_status_msg;
+}
+
+bool NgxContext::has_evaluated() {
+    return s_ngx_has_evaluated.load(std::memory_order_acquire);
 }
 
 } // namespace edpe

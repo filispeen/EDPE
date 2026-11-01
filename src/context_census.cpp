@@ -34,6 +34,8 @@
 #include <wrl/client.h>
 #include <windows.h>
 
+
+
 namespace {
 constexpr size_t kVSSetConstantBuffers = 7;
 constexpr size_t kDrawIndexed = 12;
@@ -43,11 +45,21 @@ constexpr size_t kUnmap = 15;
 constexpr size_t kDrawIndexedInstanced = 20;
 constexpr size_t kDrawInstanced = 21;
 constexpr size_t kOMSetRenderTargets = 33;
+constexpr size_t kOMSetRenderTargetsAndUnorderedAccessViews = 34;
+constexpr size_t kExecuteCommandList = 58;
+constexpr size_t kFinishCommandList = 114;
 constexpr unsigned kPairFirstSample = 100;
 constexpr unsigned kPairSecondSample = 101;
 constexpr unsigned kAlternateProjectionSample = 102;
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
+using OMSetRenderTargetsAndUnorderedAccessViewsFn = void(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*,
+    UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*);
+using ExecuteCommandListFn = void(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*, ID3D11CommandList*, BOOL);
+using FinishCommandListFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*, BOOL, ID3D11CommandList**);
 using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     UINT, ID3D11Buffer* const*);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
@@ -63,8 +75,51 @@ using DrawInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
 bool patchSlot(void** table, size_t slot, void* expected, void* replacement);
 void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv);
+void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
+    ID3D11DeviceContext* context, UINT numRTVs, ID3D11RenderTargetView* const* targets,
+    ID3D11DepthStencilView* dsv, UINT uavStartSlot, UINT numUAVs,
+    ID3D11UnorderedAccessView* const* uavs, const UINT* initialCounts);
+void STDMETHODCALLTYPE observedExecuteCommandList(
+    ID3D11DeviceContext* context, ID3D11CommandList* pCommandList, BOOL restoreContextState);
+HRESULT STDMETHODCALLTYPE observedFinishCommandList(
+    ID3D11DeviceContext* context, BOOL restoreDeferredContextState, ID3D11CommandList** ppCommandList);
+
+static std::atomic<unsigned long long> s_rendered_scene_frame_id{0};
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
+std::atomic<OMSetRenderTargetsFn> original_deferred_om{nullptr};
+std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_om_uav{nullptr};
+std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_deferred_om_uav{nullptr};
+std::atomic<ExecuteCommandListFn> original_execute_command_list{nullptr};
+std::atomic<ExecuteCommandListFn> original_deferred_execute_command_list{nullptr};
+std::atomic<FinishCommandListFn> original_finish_command_list{nullptr};
+std::atomic<FinishCommandListFn> original_deferred_finish_command_list{nullptr};
+
+std::atomic<unsigned long long> s_count_om_set_render_targets{0};
+std::atomic<unsigned long long> s_count_om_set_rt_uav{0};
+std::atomic<unsigned long long> s_count_finish_command_list{0};
+std::atomic<unsigned long long> s_count_execute_command_list{0};
+
+static std::atomic<bool> s_log_om_imm{false}, s_log_om_def{false};
+static std::atomic<bool> s_log_om_uav_imm{false}, s_log_om_uav_def{false};
+static std::atomic<bool> s_log_finish_imm{false}, s_log_finish_def{false};
+static std::atomic<bool> s_log_exec_imm{false}, s_log_exec_def{false};
+
+static void logContextHookOnce(ID3D11DeviceContext* context, size_t slot, const wchar_t* hookName,
+    std::atomic<bool>& immFlag, std::atomic<bool>& defFlag) {
+    if (!context) return;
+    const auto type = context->GetType();
+    std::atomic<bool>& flag = (type == D3D11_DEVICE_CONTEXT_IMMEDIATE) ? immFlag : defFlag;
+    if (!flag.exchange(true, std::memory_order_acq_rel)) {
+        const char* typeStr = (type == D3D11_DEVICE_CONTEXT_IMMEDIATE) ? "immediate" : "deferred";
+        void** table = *reinterpret_cast<void***>(context);
+        void* slotAddr = table ? &table[slot] : nullptr;
+        wchar_t msg[256];
+        swprintf_s(msg, L"EDPE: hook %ls this=%p type=%hs slotAddr=%p",
+            hookName, context, typeStr, slotAddr);
+        EdpeLog(msg);
+    }
+}
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
 std::atomic<DrawIndexedFn> original_draw_indexed{nullptr};
 std::atomic<DrawFn> original_draw{nullptr};
@@ -76,7 +131,29 @@ std::atomic<ID3D11DeviceContext*> observed_context{nullptr};
 IDXGISwapChain* observed_swap_chain = nullptr; // Weak; released by the game.
 void** patched_table = nullptr;
 bool attempted = false;
-std::mutex seen_mutex;
+struct KnownDeviceInfo {
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* immContext = nullptr;
+};
+static std::vector<KnownDeviceInfo> s_known_devices;
+static std::mutex s_device_registry_mutex;
+static std::atomic<ID3D11Device*> s_present_device{nullptr};
+static std::atomic<bool> s_present_device_logged{false};
+
+struct HookedTableEntry {
+    void** table = nullptr;
+    OMSetRenderTargetsFn orig_om = nullptr;
+    OMSetRenderTargetsAndUnorderedAccessViewsFn orig_om_uav = nullptr;
+    ExecuteCommandListFn orig_exec = nullptr;
+    FinishCommandListFn orig_finish = nullptr;
+    MapFn orig_map = nullptr;
+    UnmapFn orig_unmap = nullptr;
+};
+static constexpr size_t kMaxHookedTables = 16;
+static std::atomic<size_t> s_hooked_table_count{0};
+static HookedTableEntry s_hooked_tables[kMaxHookedTables]{};
+static std::mutex s_hooked_tables_mutex;
+
 struct SeenDepthView {
     ID3D11DepthStencilView* view = nullptr; // Identity only; never dereferenced later.
     DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN;
@@ -86,16 +163,181 @@ struct SeenDepthView {
     ID3D11RenderTargetView* mrt_hdr_view = nullptr; // Weak; compared within one frame only.
     unsigned long long mrt_frame = 0;
     unsigned long long scene_match_frame = ~0ull;
+    UINT width = 0;
+    UINT height = 0;
+    ID3D11Device* owning_device = nullptr;
 };
-std::array<SeenDepthView, 32> seen{};
-size_t seen_count = 0;
+
+struct ClonedContextVtable {
+    ID3D11DeviceContext* context = nullptr;
+    void** original_table = nullptr;
+    OMSetRenderTargetsFn orig_om = nullptr;
+    OMSetRenderTargetsAndUnorderedAccessViewsFn orig_om_uav = nullptr;
+    MapFn orig_map = nullptr;
+    UnmapFn orig_unmap = nullptr;
+    void* methods[134]{};
+};
+static constexpr size_t kMaxClonedContexts = 16;
+static std::array<std::unique_ptr<ClonedContextVtable>, kMaxClonedContexts> s_cloned_contexts{};
+static std::atomic<size_t> s_cloned_context_count{0};
+static std::mutex s_cloned_contexts_mutex;
+
+struct PerContextData {
+    ID3D11DeviceContext* context = nullptr;
+    ID3D11Device* owningDevice = nullptr;
+    std::atomic<unsigned long long> omCalls{0};
+    std::atomic<unsigned long long> gameOmCalls{0};
+    std::atomic<unsigned long long> edpeOmCalls{0};
+    std::atomic<unsigned long long> omUavCalls{0};
+    std::atomic<unsigned long long> gameOmUavCalls{0};
+    std::atomic<unsigned long long> edpeOmUavCalls{0};
+    std::atomic<unsigned long long> nonNullDsvCalls{0};
+    std::atomic<unsigned long long> gameNonNullDsvCalls{0};
+    std::atomic<unsigned long long> edpeNonNullDsvCalls{0};
+    std::atomic<UINT> maxDsvWidth{0};
+    std::atomic<UINT> maxDsvHeight{0};
+    std::array<SeenDepthView, 32> seen{};
+    size_t seen_count = 0;
+    std::atomic<unsigned long long> dsv_binds{0};
+    std::array<int, 64> bind_sequence{};
+    size_t sequence_stored = 0;
+    unsigned sequence_transitions = 0;
+    int sequence_last = -2;
+};
+static constexpr size_t kMaxTrackedContexts = 32;
+static std::array<std::unique_ptr<PerContextData>, kMaxTrackedContexts> s_tracked_contexts{};
+static std::atomic<size_t> s_tracked_context_count{0};
+static std::mutex s_tracked_contexts_mutex;
+static std::atomic<ID3D11DeviceContext*> s_last_warned_scene_ctx{nullptr};
+
+PerContextData* getOrCreateContextData(ID3D11DeviceContext* context) {
+    if (!context) return nullptr;
+    ID3D11Device* curDevice = nullptr;
+    context->GetDevice(&curDevice);
+    if (curDevice) curDevice->Release();
+
+    const size_t count = s_tracked_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
+        if (s_tracked_contexts[i] &&
+            s_tracked_contexts[i]->context == context &&
+            s_tracked_contexts[i]->owningDevice == curDevice) {
+            return s_tracked_contexts[i].get();
+        }
+    }
+    std::lock_guard lock(s_tracked_contexts_mutex);
+    const size_t cur_count = s_tracked_context_count.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < cur_count; ++i) {
+        if (s_tracked_contexts[i] &&
+            s_tracked_contexts[i]->context == context &&
+            s_tracked_contexts[i]->owningDevice == curDevice) {
+            return s_tracked_contexts[i].get();
+        }
+    }
+    if (cur_count >= kMaxTrackedContexts) return nullptr;
+
+    auto data = std::make_unique<PerContextData>();
+    data->context = context;
+    data->owningDevice = curDevice;
+
+    PerContextData* ptr = data.get();
+    s_tracked_contexts[cur_count] = std::move(data);
+    s_tracked_context_count.store(cur_count + 1, std::memory_order_release);
+    return ptr;
+}
+
+PerContextData* findSceneContextData(bool logWarning = true) {
+    auto* presentCtx = observed_context.load(std::memory_order_acquire);
+    PerContextData* presentData = presentCtx ? getOrCreateContextData(presentCtx) : nullptr;
+    PerContextData* best = presentData;
+    unsigned long long bestDsvCalls = presentData ? presentData->nonNullDsvCalls.load(std::memory_order_relaxed) : 0;
+
+    const size_t count = s_tracked_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
+        auto* data = s_tracked_contexts[i].get();
+        if (!data) continue;
+        const unsigned long long dsvCalls = data->nonNullDsvCalls.load(std::memory_order_relaxed);
+        if (dsvCalls > bestDsvCalls) {
+            bestDsvCalls = dsvCalls;
+            best = data;
+        }
+    }
+
+    if (logWarning && best && presentCtx && best->context != presentCtx && bestDsvCalls > 0) {
+        ID3D11Device* presentDev = presentData ? presentData->owningDevice : s_present_device.load(std::memory_order_acquire);
+        if (s_last_warned_scene_ctx.exchange(best->context, std::memory_order_acq_rel) != best->context) {
+            wchar_t warnMsg[320];
+            swprintf_s(warnMsg,
+                L"EDPE: WARNING: scene context differs from present context (scene ctx=%p device=%p, present ctx=%p device=%p, dsvCalls=%llu vs %llu)",
+                best->context, best->owningDevice, presentCtx, presentDev,
+                bestDsvCalls,
+                presentData ? presentData->nonNullDsvCalls.load(std::memory_order_relaxed) : 0ull);
+            EdpeLog(warnMsg);
+        }
+    }
+    return best;
+}
+
+ID3D11DeviceContext* activeSceneContext() {
+    if (PerContextData* scene = findSceneContextData(false)) {
+        if (scene->context && scene->nonNullDsvCalls.load(std::memory_order_relaxed) > 0) {
+            return scene->context;
+        }
+    }
+    return observed_context.load(std::memory_order_acquire);
+}
+
+bool isObservedImmediateContext(ID3D11DeviceContext* context) {
+    if (!context) return false;
+    if (context == observed_context.load(std::memory_order_acquire)) return true;
+    const size_t count = s_tracked_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
+        if (s_tracked_contexts[i] && s_tracked_contexts[i]->context == context) {
+            return context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+        }
+    }
+    return context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+}
+
+extern std::atomic<UINT> s_observed_scene_width;
+extern std::atomic<UINT> s_observed_scene_height;
+extern std::atomic<UINT> s_swapchain_width;
+extern std::atomic<UINT> s_swapchain_height;
+
+void updateContextMaxDsv(PerContextData* data, ID3D11DepthStencilView* dsv, ID3D11RenderTargetView* rtv0 = nullptr) {
+    if (!data || !dsv || !rtv0) return;
+    ID3D11Resource* res = nullptr;
+    dsv->GetResource(&res);
+    if (!res) return;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex.GetAddressOf())))) {
+        D3D11_TEXTURE2D_DESC desc{};
+        tex->GetDesc(&desc);
+        if (desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS && desc.Format != DXGI_FORMAT_R24G8_TYPELESS) {
+            res->Release();
+            return;
+        }
+        const UINT scW = s_swapchain_width.load(std::memory_order_relaxed);
+        const UINT scH = s_swapchain_height.load(std::memory_order_relaxed);
+        if (scW > scH && desc.Width == desc.Height) {
+            res->Release();
+            return;
+        }
+        UINT curMaxW = data->maxDsvWidth.load(std::memory_order_relaxed);
+        UINT curMaxH = data->maxDsvHeight.load(std::memory_order_relaxed);
+        if (desc.Width > curMaxW || (desc.Width == curMaxW && desc.Height > curMaxH)) {
+            data->maxDsvWidth.store(desc.Width, std::memory_order_relaxed);
+            data->maxDsvHeight.store(desc.Height, std::memory_order_relaxed);
+        }
+    }
+    res->Release();
+}
+
+std::mutex seen_mutex;
 std::atomic<unsigned long long> dsv_binds{0};
 std::atomic<bool> sequence_requested{false};
 std::atomic<bool> sequence_active{false};
-std::array<int, 64> bind_sequence{};
-size_t sequence_stored = 0;
-unsigned sequence_transitions = 0;
-int sequence_last = -2;
+ID3D11DeviceContext* snapshot_target_context = nullptr;
+ID3D11DeviceContext* camera_pair_context = nullptr;
 int snapshot_queued = -1;
 int snapshot_active = -1;
 int snapshot_index = -1;
@@ -113,6 +355,7 @@ int camera_pair_target = -1;
 unsigned long long camera_pair_armed_after = 0;
 unsigned long long camera_pair_bind_frame = ~0ull;
 unsigned camera_pair_bind_count = 0;
+std::array<unsigned long long, 2> camera_pair_sample_frames{~0ull, ~0ull};
 bool motion_pair_queued = false;
 bool motion_pair_active = false;
 std::array<edpe::CameraProjection, 2> motion_cameras{};
@@ -124,6 +367,7 @@ std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 2> gpu_camera_pair{};
 // read at a later Present with DO_NOT_WAIT. Nothing is written to the game.
 struct CameraDeltaSlot {
     Microsoft::WRL::ComPtr<ID3D11Buffer> staging;
+    ID3D11DeviceContext* context = nullptr;
     unsigned long long frame = 0;
 };
 constexpr size_t kCameraDeltaRing = 4;
@@ -131,6 +375,7 @@ std::array<CameraDeltaSlot, kCameraDeltaRing> camera_delta_ring{};
 size_t camera_delta_head = 0;  // next slot to read
 size_t camera_delta_count = 0; // slots holding queued copies
 Microsoft::WRL::ComPtr<ID3D11Buffer> camera_delta_source; // copied at the next OMSetRenderTargets
+ID3D11DeviceContext* camera_delta_source_context = nullptr;
 unsigned long long camera_delta_source_frame = 0;
 unsigned long long camera_delta_taken_frame = ~0ull;
 unsigned camera_delta_dropped = 0;  // ring full or map failure, reset each summary
@@ -139,123 +384,248 @@ bool camera_delta_announced = false;
 edpe::CameraDeltaTracker camera_delta_tracker;
 static edpe::CameraProjection s_camera_previous{};
 static edpe::CameraProjection s_camera_now{};
+static edpe::Vec3 s_last_valid_velocity{0.0f, 0.0f, 0.0f};
+static edpe::Vec3 s_prev_valid_velocity{0.0f, 0.0f, 0.0f};
 static bool s_camera_reset = false;
 static unsigned long long s_camera_frame = ~0ull;
 static unsigned long long s_camera_previous_frame = ~0ull;
-static unsigned long long s_in_scene_camera_latched_frame = ~0ull;
 static unsigned long long s_hdr_slot0_seen_frame = ~0ull;
 static unsigned s_consecutive_skipped_frames = 0;
-static unsigned s_auxiliary_rejection_streak = 0;
-static edpe::CameraProjection s_fallback_unmapped_camera{};
-static unsigned long long s_fallback_unmapped_camera_frame = ~0ull;
-static edpe::CameraProjection s_latest_unmapped_camera{};
-static unsigned long long s_latest_unmapped_camera_frame = ~0ull;
-static bool s_latest_unmapped_camera_valid = false;
+
+// Authoritative Camera Anchor state (Steps 2-4)
+static edpe::CameraProjection s_anchor_camera{};
+static bool s_anchor_valid = false;
+static unsigned long long s_anchor_frame = ~0ull;
+static bool s_probe_seen_this_frame = false;
+static unsigned s_spike_reject_streak = 0;
+static unsigned s_consecutive_fallback_frames = 0;
+static unsigned s_unreconstructed_jitter_streak = 0;
+
+// Staging buffer for current frame camera candidate (Two-Phase Staging & Commit)
+static edpe::CameraProjection s_staged_camera{};
+static unsigned long long s_staged_camera_frame = ~0ull;
+static bool s_has_staged_camera = false;
+static bool s_staged_from_in_scene = false;
+static bool s_last_committed_scene_cut = false;
+static unsigned s_teleport_rejection_streak = 0;
+static unsigned long long s_last_teleport_rejection_frame = ~0ull;
+static unsigned s_cut_rejection_streak = 0;
+static unsigned long long s_last_cut_rejection_frame = ~0ull;
+struct UnmapFrameStats {
+    unsigned total = 0, noMapped = 0, parseFail = 0, gbufDone = 0, probe = 0;
+    unsigned filterFail = 0, stageDenied = 0, accepted = 0, jitterOff = 0;
+    unsigned acceptedIdx = 0, nearLate = 0, firstNearLateIdx = 0, gbufStartIdx = 0;
+    unsigned failReason[12]{};
+    unsigned blockOnly = 0;
+    unsigned firstFailIdx = 0;
+    int firstFailReason = 0;
+    bool haveFirstOk = false, haveFirstFail = false;
+    float firstOkWords[28]{};
+    float firstFailWords[28]{};
+    unsigned long long mapsAtReset = 0;
+    float lastRDist = 0.0f, lastRTrace = 0.0f;
+};
+static UnmapFrameStats s_ustat{};
+static std::atomic<uint64_t> s_valid_camera_seen_counter{0};
+
+// Frame timing for kinematic 2nd-order prediction
+static float s_last_frame_dt = 0.01667f;
+static float s_current_frame_dt = 0.01667f;
+
 static std::atomic<bool> s_inside_main_scene{false};
 static std::atomic<bool> s_in_edpe_present{false};
 static edpe::ProjectionJitter s_injected_jitter{};
 static unsigned long long s_jitter_injected_frame = ~0ull;
+static std::atomic<unsigned long long> s_jitter_standdown_until{0};
+static unsigned long long s_jitter_standdown_len = 60;
 static edpe::ProjectionJitter s_last_rendered_jitter{};
 
 inline bool isSceneCameraAspect(float scaleX, float scaleY, UINT width, UINT height) {
-    if (scaleX <= 0.0f || scaleY <= 0.0f || !width || !height) return true;
+    if (scaleX <= 0.0f || scaleY <= 0.0f) return false;
     const float camAspect = scaleY / scaleX;
+    if (width > height && std::fabs(camAspect - 1.0f) < 0.03f) return false; // Square cameras are cubemaps/RTTs on widescreen displays
+    if (!width || !height) return true;
     const float screenAspect = static_cast<float>(width) / static_cast<float>(height);
     return std::fabs(camAspect - screenAspect) < 0.05f;
 }
 
-inline float cameraRotationDeterminant(const edpe::CameraProjection& cam) {
-    const float* m = cam.worldFromView;
-    return m[0] * (m[5] * m[10] - m[6] * m[9])
-         - m[1] * (m[4] * m[10] - m[6] * m[8])
-         + m[2] * (m[4] * m[9]  - m[5] * m[8]);
+inline float getJitterLogTimeMs() {
+    static LARGE_INTEGER s_base{};
+    static LARGE_INTEGER s_freq{};
+    if (s_freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&s_freq);
+        QueryPerformanceCounter(&s_base);
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (s_freq.QuadPart > 0)
+        ? static_cast<float>(static_cast<double>(now.QuadPart - s_base.QuadPart) * 1000.0 / static_cast<double>(s_freq.QuadPart))
+        : 0.0f;
 }
 
-inline float cameraRotationTrace(const edpe::CameraProjection& a, const edpe::CameraProjection& b) {
-    const float* c = a.worldFromView;
-    const float* p = b.worldFromView;
-    return (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
-           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
-           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
-}
+using edpe::cameraRotationDeterminant;
+using edpe::cameraRotationTrace;
+using edpe::isReflectionOrAuxiliaryCamera;
+using edpe::isStereoEyeOrIpdProbe;
+using edpe::isRearOrAuxiliaryProbe;
 
-inline bool isReflectionOrAuxiliaryCamera(const edpe::CameraProjection& candidate, const edpe::CameraProjection& baseline) {
-    // 1. Planar reflection matrices invert coordinate chirality: det(R) = -1.0.
-    const float det = cameraRotationDeterminant(candidate);
-    if (det < 0.5f) return true;
+inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
+                                           const edpe::CameraProjection& parsed_camera,
+                                           UINT outW, UINT outH,
+                                           const edpe::CameraProjection& committed_camera,
+                                           const edpe::Vec3& last_velocity,
+                                           float dtRatio) {
+    if (!words || wordCount != 5376 / sizeof(float)) return false;
+    if (parsed_camera.scaleX <= 0.0f || parsed_camera.scaleY <= 0.0f) return false;
 
-    if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) return false;
-
-    // 2. Projection FOV / scale mismatch against active main camera:
-    if (std::fabs(candidate.scaleX - baseline.scaleX) > 0.01f * baseline.scaleX ||
-        std::fabs(candidate.scaleY - baseline.scaleY) > 0.01f * baseline.scaleY) {
-        return true;
+    // 1. Strict Near Plane (depthB) range filter (0.01m .. 0.25m):
+    // In Cobra Odyssey, reversed-Z perspective depth is rawDepth = depthB / viewZ.
+    // The player's main eye camera consistently uses near plane depthB around 0.025m (2.5 cm, range 0.01m..0.25m).
+    if (parsed_camera.depthB < 0.01f || parsed_camera.depthB > 0.25f) {
+        return false;
     }
 
-    // 3. Discontinuous single-frame orientation or probe offset relative to active baseline:
-    const float* c = candidate.worldFromView;
-    const float* b = baseline.worldFromView;
-    const float dx = c[3] - b[3];
-    const float dy = c[7] - b[7];
-    const float dz = c[11] - b[11];
-    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const float rotTrace = cameraRotationTrace(candidate, baseline);
-
-    // Abrupt single-frame orientation jump (> 45 deg, rotTrace < 2.40) at any distance is an auxiliary/probe camera:
-    if (rotTrace < 2.40f) {
-        return true;
+    // 2. Strict perspective vs orthographic check:
+    const double w0 = words[1083], w1 = words[1087], w2 = words[1091];
+    const double wLenSq = w0 * w0 + w1 * w1 + w2 * w2;
+    if (wLenSq < 0.5 || wLenSq > 1.5) {
+        return false;
     }
 
-    // Auxiliary mirror / panel / probe camera with combined orientation (> 18 deg) and position jump:
-    if (dist > 0.05f && rotTrace < 2.90f) {
-        return true;
-    }
-
-    return false;
-}
-
-inline bool sameCamera(const edpe::CameraProjection& a, const edpe::CameraProjection& b) {
-    for (int i = 0; i < 12; ++i) {
-        if (std::fabs(a.worldFromView[i] - b.worldFromView[i]) > 1e-5f) return false;
-    }
-    return std::fabs(a.scaleX - b.scaleX) < 1e-5f && std::fabs(a.scaleY - b.scaleY) < 1e-5f;
-}
-
-inline bool isRevisitedCamera(const edpe::CameraProjection& camera) {
-    static std::array<edpe::CameraProjection, 8> recent{};
-    static unsigned count = 0;
-    static unsigned head = 0;
-    if (s_camera_now.scaleX > 0.0f && sameCamera(camera, s_camera_now)) return false;
-    const unsigned stored = count < 8 ? count : 8;
-    for (unsigned i = 0; i < stored; ++i) {
-        if (sameCamera(camera, recent[i])) return true;
-    }
-    recent[head] = camera;
-    head = (head + 1) % 8;
-    if (count < 8) ++count;
-    return false;
-}
-
-inline void updateMainCamera(const edpe::CameraProjection& camera, unsigned long long cur_frame) {
-    static unsigned s_revisit_rejected = 0;
-    if (isRevisitedCamera(camera)) {
-        if (++s_revisit_rejected <= 8 || (s_revisit_rejected % 512) == 0) {
-            wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: ignored revisited camera sample #%u frame=%llu",
-                s_revisit_rejected, cur_frame);
-            EdpeLog(msg);
+    // 3. Viewport / resolution filtering from words 1328..1331:
+    const float vpW = words[1328];
+    const float vpH = words[1329];
+    if (std::isfinite(vpW) && std::isfinite(vpH) && vpW > 0.0f && vpH > 0.0f) {
+        if (outW > outH && std::fabs(vpW - vpH) < 1.0f) {
+            return false;
         }
+        if (vpW < 64.0f || vpH < 64.0f) {
+            return false;
+        }
+    }
+
+    // 4. Camera aspect ratio validation:
+    const float camAspect = parsed_camera.scaleY / parsed_camera.scaleX;
+    if (outW > outH && std::fabs(camAspect - 1.0f) < 0.03f) {
+        return false;
+    }
+    if (outW > 0 && outH > 0) {
+        const float screenAspect = static_cast<float>(outW) / static_cast<float>(outH);
+        if (std::fabs(camAspect - screenAspect) > 0.05f) {
+            return false;
+        }
+    }
+
+    // 5. Coordinate chirality / orthonormality check (rejects planar reflections det < 0.85 or det > 1.15):
+    const float det = cameraRotationDeterminant(parsed_camera);
+    if (det < 0.85f || det > 1.15f) {
+        return false;
+    }
+
+    // 6. Повний фільтр допоміжних камер та стерео-зондів відносно зафіксованої камери:
+    if (isReflectionOrAuxiliaryCamera(parsed_camera, committed_camera, last_velocity, dtRatio)) {
+        return false;
+    }
+
+    return true;
+}
+
+// Single-point camera commitment for the frame (Two-Phase Staging & Commit)
+inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_cut) {
+    if (s_camera_frame == rendered_frame) {
+        out_scene_cut = s_last_committed_scene_cut;
         return;
     }
-    if (s_camera_frame == ~0ull) {
-        s_camera_previous = camera;
-        s_camera_previous_frame = cur_frame;
-    } else if (s_camera_frame != cur_frame) {
+
+    out_scene_cut = false;
+    if (s_has_staged_camera && s_staged_camera_frame == rendered_frame) {
+        float dtRatio = 1.0f;
+        if (s_last_frame_dt > 1e-5f && s_current_frame_dt > 1e-5f) {
+            dtRatio = s_current_frame_dt / s_last_frame_dt;
+        }
+
+        if (s_camera_now.scaleX > 0.0f) {
+            const float rotTrace = edpe::cameraRotationTrace(s_staged_camera, s_camera_now);
+            const bool fovChanged =
+                std::fabs(s_camera_now.scaleX - s_staged_camera.scaleX) > 0.01f * s_camera_now.scaleX;
+
+            s_prev_valid_velocity = s_last_valid_velocity;
+            if (rotTrace < 2.414f || fovChanged) {
+                out_scene_cut = true;
+                s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+            } else {
+                out_scene_cut = false;
+                const edpe::Vec3 newDelta =
+                    edpe::cameraPosition(s_staged_camera) - edpe::cameraPosition(s_camera_now);
+                const edpe::Vec3 right = edpe::cameraRight(s_staged_camera);
+                const edpe::Vec3 up    = edpe::cameraUp(s_staged_camera);
+                const edpe::Vec3 fwd   = edpe::cameraForward(s_staged_camera);
+
+                const float dLen   = edpe::length(newDelta);
+                const float dRight = std::fabs(edpe::dot(newDelta, right));
+                const float dUp    = std::fabs(edpe::dot(newDelta, up));
+                const float dFwd   = std::fabs(edpe::dot(newDelta, fwd));
+
+                const bool isLateralSpike = (dRight >= 0.80f * dLen && dUp < 0.045f && dFwd < 0.045f);
+                const bool isCockpitHeadSpike = (dRight < 0.025f && dUp >= 0.65f * dLen && dFwd >= 0.45f * dLen);
+
+                const bool looksLikeSuddenSpike =
+                    (rotTrace > 2.992f && dLen >= 0.032f && dLen <= 0.36f &&
+                     (isLateralSpike || isCockpitHeadSpike));
+
+                if (looksLikeSuddenSpike && s_anchor_valid && (rendered_frame <= s_anchor_frame + 2) &&
+                    !edpe::matchesAnchorPrediction(s_staged_camera, s_anchor_camera, s_last_valid_velocity, dtRatio)) {
+                    if (++s_spike_reject_streak < 6) {
+                        // Відхиляємо staged камеру - утримуємо попередню валідну камеру з екстраполяцією:
+                        s_has_staged_camera = false;
+                        s_camera_previous = s_camera_now;
+                        s_camera_previous_frame = s_camera_frame;
+                        const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
+                        edpe::cameraSetPosition(s_camera_now, extPos);
+                        s_camera_frame = rendered_frame;
+                        out_scene_cut = false;
+                        s_last_committed_scene_cut = out_scene_cut;
+                        return;
+                    }
+                }
+
+                s_last_valid_velocity = newDelta;
+            }
+            s_camera_previous = s_camera_now;
+            s_camera_previous_frame = s_camera_frame;
+        } else {
+            s_camera_previous = s_staged_camera;
+            s_camera_previous_frame = rendered_frame;
+            out_scene_cut = true;
+            s_prev_valid_velocity = {0.0f, 0.0f, 0.0f};
+            s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+        }
+
+        s_consecutive_fallback_frames = 0;
+        s_spike_reject_streak = 0;
+        s_anchor_camera = s_staged_camera;
+        s_anchor_valid = true;
+        s_anchor_frame = rendered_frame;
+
+        s_camera_now = s_staged_camera;
+        s_camera_frame = rendered_frame;
+        s_has_staged_camera = false;
+        s_staged_from_in_scene = false;
+    } else if (s_camera_now.scaleX > 0.0f) {
+        // Fallback: жоден пас не оновив камеру — плавна екстраполяція без скидання TAA/DLAA
+        if (++s_consecutive_fallback_frames > 2) {
+            s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+            s_anchor_valid = false;
+        }
+        s_prev_valid_velocity = s_last_valid_velocity;
         s_camera_previous = s_camera_now;
         s_camera_previous_frame = s_camera_frame;
+        const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
+        edpe::cameraSetPosition(s_camera_now, extPos);
+        s_camera_frame = rendered_frame;
+        out_scene_cut = false;
     }
-    s_camera_now = camera;
-    s_camera_frame = cur_frame;
+    s_last_committed_scene_cut = out_scene_cut;
 }
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_depth_source;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_ldr_source;
@@ -313,6 +683,7 @@ unsigned hud_draw_hook_mask = 0;
 unsigned hud_draw_rearmed_mask = 0;
 unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
+ID3D11DeviceContext* motion_grid_context = nullptr;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 std::unique_ptr<edpe::UiCompositePass> ui_composite_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
@@ -323,6 +694,7 @@ unsigned motion_hook_watch = 0;
 struct PairDepthSample {
     ID3D11DepthStencilView* view = nullptr;
     ID3D11Texture2D* staging = nullptr;
+    ID3D11DeviceContext* context = nullptr;
     unsigned long long after_present = 0;
     UINT width = 0;
     UINT height = 0;
@@ -331,6 +703,7 @@ struct PairDepthSample {
 std::array<PairDepthSample, 2> camera_pair_depth{}; // One-shot diagnostic only.
 struct ConstantBufferSample {
     ID3D11Buffer* buffer = nullptr;
+    ID3D11DeviceContext* context = nullptr;
     unsigned bind = 0;
     unsigned long long after_present = 0;
     unsigned wait = 0;
@@ -340,6 +713,7 @@ struct ConstantBufferSample {
 std::array<ConstantBufferSample, 9> constant_buffer_samples{}; // Snapshot, adjacent-frame, and alternate-projection probes.
 struct PipelineSample {
     ID3D11Query* query = nullptr;
+    ID3D11DeviceContext* context = nullptr;
     unsigned bind = 0;
     unsigned long long after_present = 0;
     unsigned wait = 0;
@@ -466,6 +840,7 @@ std::atomic<float> s_jitter_scale{1.0f};
 std::atomic<unsigned> s_jitter_phase_count{32};
 std::atomic<unsigned> s_active_jitter_phases{32};
 std::atomic<bool> s_preserve_native_ui{true};
+std::atomic<float> s_sharpness{0.0f};
 
 std::atomic<bool> s_jitter_debug_view{false};
 std::atomic<float> s_jitter_debug_sensitivity{1.5f};
@@ -474,6 +849,43 @@ std::atomic<int> s_jitter_debug_mode{0};
 
 
 std::atomic<bool> s_zero_motion_vectors{false};
+
+static std::atomic<bool> s_scene_jitter_consumed{true};
+static std::atomic<unsigned> s_scene_writes_since_eval{0};
+
+edpe::ProjectionJitter getOrUpdateSceneProjectionJitter() {
+    std::lock_guard lock(jitter_mutex);
+    if (s_scene_jitter_consumed.exchange(false, std::memory_order_acq_rel)) {
+        const unsigned long long scene_seq = s_rendered_scene_frame_id.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        const UINT scW = s_swapchain_width.load(std::memory_order_relaxed);
+        const UINT scH = s_swapchain_height.load(std::memory_order_relaxed);
+        const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
+        const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
+        const UINT rW = (sceneW > 0 && (!scW || sceneW <= scW)) ? sceneW : scW;
+        const UINT rH = (sceneH > 0 && (!scH || sceneH <= scH)) ? sceneH : scH;
+
+        const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
+        unsigned phases = base_phases ? base_phases : 32;
+        if (scW > rW && rW > 0) {
+            const float upscaleRatio = static_cast<float>(scW) / static_cast<float>(rW);
+            phases = static_cast<unsigned>(std::clamp(
+                std::lround(static_cast<float>(phases) * upscaleRatio * upscaleRatio), 8l, 256l));
+        }
+        s_active_jitter_phases.store(phases ? phases : 32, std::memory_order_relaxed);
+
+        auto jitter = edpe::projectionJitter(scene_seq, rW ? rW : 2560, rH ? rH : 1440, phases ? phases : 32);
+        const float scale = s_jitter_scale.load(std::memory_order_relaxed);
+        jitter.pixelX *= scale;
+        jitter.pixelY *= scale;
+        jitter.ndcX *= scale;
+        jitter.ndcY *= scale;
+        active_projection_jitter = jitter;
+        jitter_frame_index.store(scene_seq, std::memory_order_relaxed);
+        s_scene_writes_since_eval.store(0, std::memory_order_relaxed);
+    }
+    return active_projection_jitter;
+}
 std::atomic<bool> s_motion_invert_x{false};
 std::atomic<bool> s_motion_invert_y{false};
 std::atomic<float> s_motion_scale{1.0f};
@@ -936,7 +1348,7 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
     UINT start, UINT count, ID3D11Buffer* const* buffers) {
     const auto forward = original_vs_set_buffers.load(std::memory_order_acquire);
     forward(context, start, count, buffers);
-    if (context != observed_context.load(std::memory_order_acquire) ||
+    if (!isObservedImmediateContext(context) ||
         !vs_buffer_probe_active.load(std::memory_order_acquire)) return;
     vs_buffer_calls.fetch_add(1, std::memory_order_relaxed);
     if (start > 1 || count <= 1 - start) return;
@@ -963,9 +1375,10 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
 
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
     UINT start, INT base) {
-    if (context == observed_context.load(std::memory_order_acquire))
+    const bool immediate = isObservedImmediateContext(context);
+    if (immediate)
         observeHudDraw(context, 'I', 1);
-    if (context == observed_context.load(std::memory_order_acquire) &&
+    if (immediate &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_indexed_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
@@ -976,9 +1389,10 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
 }
 
 void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start) {
-    if (context == observed_context.load(std::memory_order_acquire))
+    const bool immediate = isObservedImmediateContext(context);
+    if (immediate)
         observeHudDraw(context, 'D', 1);
-    if (context == observed_context.load(std::memory_order_acquire) &&
+    if (immediate &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
@@ -991,9 +1405,10 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
     UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
     UINT start_instance) {
-    const bool replay = context == observed_context.load(std::memory_order_acquire) &&
+    const bool immediate = isObservedImmediateContext(context);
+    const bool replay = immediate &&
         observeHudDraw(context, 'X', instance_count);
-    if (context == observed_context.load(std::memory_order_acquire) &&
+    if (immediate &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_indexed_instanced_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
@@ -1008,9 +1423,10 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
 
 void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
-    if (context == observed_context.load(std::memory_order_acquire))
+    const bool immediate = isObservedImmediateContext(context);
+    if (immediate)
         observeHudDraw(context, 'N', instance_count);
-    if (context == observed_context.load(std::memory_order_acquire) &&
+    if (immediate &&
         draw_probe_active.load(std::memory_order_acquire)) {
         draw_instanced_calls.fetch_add(1, std::memory_order_relaxed);
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
@@ -1104,18 +1520,94 @@ void endHudDrawProbe() {
     hud_draw_hook_mask = 0;
 }
 
+MapFn resolveOriginalMap(ID3D11DeviceContext* context);
+UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context);
+
+HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
+    UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped);
+void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
+    UINT subresource);
+
+MapFn resolveOriginalMap(ID3D11DeviceContext* context) {
+    if (!context) return original_map.load(std::memory_order_acquire);
+    void** table = *reinterpret_cast<void***>(context);
+    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < cloneCount; ++i) {
+        if (s_cloned_contexts[i] &&
+            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
+            if (s_cloned_contexts[i]->orig_map && s_cloned_contexts[i]->orig_map != &observedMap)
+                return s_cloned_contexts[i]->orig_map;
+            table = s_cloned_contexts[i]->original_table;
+            break;
+        }
+    }
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_map &&
+            s_hooked_tables[i].orig_map != &observedMap) {
+            return s_hooked_tables[i].orig_map;
+        }
+    }
+    return original_map.load(std::memory_order_acquire);
+}
+
+UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context) {
+    if (!context) return original_unmap.load(std::memory_order_acquire);
+    void** table = *reinterpret_cast<void***>(context);
+    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < cloneCount; ++i) {
+        if (s_cloned_contexts[i] &&
+            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
+            if (s_cloned_contexts[i]->orig_unmap && s_cloned_contexts[i]->orig_unmap != &observedUnmap)
+                return s_cloned_contexts[i]->orig_unmap;
+            table = s_cloned_contexts[i]->original_table;
+            break;
+        }
+    }
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_unmap &&
+            s_hooked_tables[i].orig_unmap != &observedUnmap) {
+            return s_hooked_tables[i].orig_unmap;
+        }
+    }
+    return original_unmap.load(std::memory_order_acquire);
+}
+
+static constexpr size_t kRejectedCacheSize = 256;
+static std::atomic<ID3D11Resource*> s_rejected_map_resources[kRejectedCacheSize]{};
+
+inline bool isResourceCachedRejected(ID3D11Resource* res) {
+    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
+    return s_rejected_map_resources[slot].load(std::memory_order_relaxed) == res;
+}
+
+inline void cacheRejectedResource(ID3D11Resource* res) {
+    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
+    s_rejected_map_resources[slot].store(res, std::memory_order_relaxed);
+}
+
+inline void clearRejectedResourceCache() {
+    for (size_t i = 0; i < kRejectedCacheSize; ++i) {
+        s_rejected_map_resources[i].store(nullptr, std::memory_order_relaxed);
+    }
+}
+
 HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
-    const HRESULT result = original_map.load(std::memory_order_acquire)(
-        context, resource, subresource, type, flags, mapped);
+    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+    const MapFn forward = resolveOriginalMap(context);
+    const HRESULT result = forward ? forward(
+        context, resource, subresource, type, flags, mapped) : E_FAIL;
     if (s_in_edpe_present.load(std::memory_order_acquire)) return result;
-    if (SUCCEEDED(result) && context == observed_context.load(std::memory_order_acquire) &&
+    if (SUCCEEDED(result) && isObservedImmediateContext(context) &&
         resource && map_hook_active.load(std::memory_order_acquire)) {
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
         bool is_scene_cb = (resource == target);
-        if (is_scene_cb || !target) {
-            edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
-            if (!is_scene_cb) {
+        const bool probe_active = vs_buffer_probe_active.load(std::memory_order_relaxed);
+        if (!is_scene_cb) {
+            if (!isResourceCachedRejected(resource)) {
+                edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
                 D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
                 resource->GetType(&dimension);
                 if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
@@ -1126,17 +1618,22 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
                         buffer->GetDesc(&desc);
                         if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
                             (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+                            const bool had_target = (target != nullptr);
                             scene_map_target.store(buffer, std::memory_order_release);
-                            clearTrackedMappedBuffersExcept(buffer);
+                            if (probe_active) clearTrackedMappedBuffersExcept(buffer);
                             target = buffer;
                             is_scene_cb = true;
-                            if (!scene_maps_before_bind.load(std::memory_order_relaxed)) {
+                            if (!had_target && !scene_maps_before_bind.load(std::memory_order_relaxed)) {
                                 scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
                                 EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
                             }
+                        } else {
+                            cacheRejectedResource(resource);
                         }
                         buffer->Release();
                     }
+                } else {
+                    cacheRejectedResource(resource);
                 }
             }
         }
@@ -1156,23 +1653,26 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
 
 void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource) {
+    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+    const UnmapFn forward = resolveOriginalUnmap(context);
     if (!s_in_edpe_present.load(std::memory_order_acquire) &&
-        context == observed_context.load(std::memory_order_acquire) &&
+        isObservedImmediateContext(context) &&
         resource &&
         unmap_hook_active.load(std::memory_order_acquire)) {
+        void* mapped_ptr = popMappedBuffer(resource);
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
-        if (target && resource != target) {
-            popMappedBuffer(resource);
-            original_unmap.load(std::memory_order_acquire)(context, resource, subresource);
+        if (!mapped_ptr && resource == target) {
+            mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
+        }
+        if (!mapped_ptr) {
+            if (resource == target) ++s_ustat.noMapped;
+            if (forward) forward(context, resource, subresource);
             return;
         }
         edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
-        void* mapped_ptr = popMappedBuffer(resource);
-        if (!mapped_ptr && resource == scene_map_target.load(std::memory_order_acquire)) {
-            mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
-        }
         if (mapped_ptr) {
             scene_unmaps.fetch_add(1, std::memory_order_relaxed);
+            ++s_ustat.total;
             unsigned long long camera = 14695981039346656037ull;
             unsigned long long projection = camera;
             const auto* data = static_cast<const unsigned char*>(mapped_ptr);
@@ -1193,77 +1693,292 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             scene_last_projection_hash.store(projection, std::memory_order_relaxed);
 
             // Track the unjittered main-view camera for the motion pass.
-            // Filter out canopy planar reflections and auxiliary sub-cameras,
-            // latching only authoritative primary scene cameras once per frame.
+            // Phase 3: Candidate staging and jitter injection (Two-Phase Staging & Commit)
             edpe::CameraProjection parsed_camera{};
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
             const bool in_main_scene = s_inside_main_scene.load(std::memory_order_acquire);
-            bool is_reflection = false;
+            if (motion_color_frame == cur_frame && s_ustat.gbufStartIdx == 0) s_ustat.gbufStartIdx = s_ustat.total;
             bool is_main_camera = false;
-            bool aspect_ok = false;
-            if (edpe::parseEliteCamera(static_cast<const float*>(mapped_ptr), 5376 / sizeof(float), &parsed_camera)) {
-                const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
-                const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
-                aspect_ok = isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH);
-                is_reflection = isReflectionOrAuxiliaryCamera(parsed_camera, s_camera_now);
-                if (aspect_ok) {
-                    if (!is_reflection) {
-                        is_main_camera = true;
-                        s_auxiliary_rejection_streak = 0;
-                        if (in_main_scene) {
-                            if (s_in_scene_camera_latched_frame != cur_frame) {
-                                updateMainCamera(parsed_camera, cur_frame);
-                                s_in_scene_camera_latched_frame = cur_frame;
-                            }
-                        } else if (s_camera_frame != cur_frame) {
-                            s_latest_unmapped_camera = parsed_camera;
-                            s_latest_unmapped_camera_frame = cur_frame;
-                            s_latest_unmapped_camera_valid = true;
+            const float* words = static_cast<const float*>(mapped_ptr);
+            int parse_fail_reason = 0;
+            const bool parse_ok = edpe::parseEliteCamera(words, 5376 / sizeof(float), &parsed_camera, &parse_fail_reason);
+            if (parse_ok && !s_ustat.haveFirstOk) {
+                s_ustat.haveFirstOk = true;
+                std::memcpy(&s_ustat.firstOkWords[0], &words[932], 12 * sizeof(float));
+                std::memcpy(&s_ustat.firstOkWords[12], &words[1080], 16 * sizeof(float));
+            }
+            if (!parse_ok) {
+                if (parse_fail_reason >= 0 && parse_fail_reason < 12) ++s_ustat.failReason[parse_fail_reason];
+                if (!s_ustat.haveFirstFail) {
+                    s_ustat.haveFirstFail = true;
+                    s_ustat.firstFailReason = parse_fail_reason;
+                    s_ustat.firstFailIdx = s_ustat.total;
+                    std::memcpy(&s_ustat.firstFailWords[0], &words[932], 12 * sizeof(float));
+                    std::memcpy(&s_ustat.firstFailWords[12], &words[1080], 16 * sizeof(float));
+                }
+            }
+            // Cobra sometimes rewrites rows 932..943 with another orientation (cubemap faces)
+            // while the projection block 1080..1095 still carries the pilot's current projection
+            // and rotation. The strict parser rejects those writes (codes 7, 8, 10). Build the
+            // camera from the block orientation so the pilot pose keeps updating every frame.
+            bool block_cam_ok = false;
+            if (!parse_ok && (parse_fail_reason == 7 || parse_fail_reason == 8 || parse_fail_reason == 10) &&
+                s_camera_now.scaleX > 0.0f &&
+                !(s_hdr_slot0_seen_frame == cur_frame && motion_color_frame == cur_frame)) {
+                bool finite_block = true;
+                for (size_t i = 1080; i < 1096; ++i)
+                    if (!std::isfinite(words[i])) { finite_block = false; break; }
+                if (finite_block) {
+                    double xl = 0, yl = 0;
+                    for (size_t row = 0; row < 3; ++row) {
+                        xl += static_cast<double>(words[1080 + row * 4]) * words[1080 + row * 4];
+                        yl += static_cast<double>(words[1081 + row * 4]) * words[1081 + row * 4];
+                    }
+                    const double bsx = std::sqrt(xl), bsy = std::sqrt(yl);
+                    bool ok =
+                        std::fabs(bsx - s_camera_now.scaleX) < 2e-3 &&
+                        std::fabs(bsy - s_camera_now.scaleY) < 2e-3 &&
+                        std::fabs(words[1094] - s_camera_now.depthB) < 1e-4f &&
+                        std::fabs(words[1082]) <= 0.002f && std::fabs(words[1086]) <= 0.002f &&
+                        std::fabs(words[1090]) <= 0.002f && std::fabs(words[1092]) <= 0.002f &&
+                        std::fabs(words[1093]) <= 0.002f && std::fabs(words[1095]) <= 0.002f;
+                    if (ok) {
+                        double col[3][3];
+                        for (size_t row = 0; row < 3; ++row) {
+                            col[0][row] = words[1080 + row * 4] / bsx;
+                            col[1][row] = words[1081 + row * 4] / bsy;
+                            col[2][row] = words[1083 + row * 4];
                         }
-                    } else if (cameraRotationDeterminant(parsed_camera) >= 0.5f && in_main_scene) {
-                        s_fallback_unmapped_camera = parsed_camera;
-                        s_fallback_unmapped_camera_frame = cur_frame;
+                        for (int a = 0; a < 3 && ok; ++a) {
+                            const double len = col[a][0] * col[a][0] + col[a][1] * col[a][1] + col[a][2] * col[a][2];
+                            if (len < 0.98 || len > 1.02) ok = false;
+                            for (int b = 0; b < a && ok; ++b) {
+                                const double dp = col[a][0] * col[b][0] + col[a][1] * col[b][1] + col[a][2] * col[b][2];
+                                if (std::fabs(dp) > 0.02) ok = false;
+                            }
+                        }
+                    }
+                    if (ok) {
+                        edpe::CameraProjection bc = s_camera_now;
+                        for (size_t row = 0; row < 3; ++row) {
+                            bc.worldFromView[row * 4] = static_cast<float>(words[1080 + row * 4] / bsx);
+                            bc.worldFromView[row * 4 + 1] = static_cast<float>(words[1081 + row * 4] / bsy);
+                            bc.worldFromView[row * 4 + 2] = words[1083 + row * 4];
+                        }
+                        bc.scaleX = static_cast<float>(bsx);
+                        bc.scaleY = static_cast<float>(bsy);
+                        bc.depthB = words[1094];
+                        edpe::cameraSetPosition(bc, edpe::cameraPosition(s_camera_now) + s_last_valid_velocity);
+                        parsed_camera = bc;
+                        block_cam_ok = true;
+                        ++s_ustat.blockOnly;
                     }
                 }
             }
+            if (parse_ok || block_cam_ok) {
+                const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+                const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+
+                // Як тільки 4-MRT G-Buffer завершився (перехід до HDR slot0 освітлення)
+                // прийом основної камери в цьому кадрі закрито назавжди:
+                const bool main_gbuffer_already_finished =
+                    (s_hdr_slot0_seen_frame == cur_frame && motion_color_frame == cur_frame);
+
+                float dtRatio = 1.0f;
+                if (s_last_frame_dt > 1e-5f && s_current_frame_dt > 1e-5f) {
+                    dtRatio = s_current_frame_dt / s_last_frame_dt;
+                }
+
+                if (!main_gbuffer_already_finished) {
+                    const bool anchor_fresh = s_anchor_valid && (cur_frame <= s_anchor_frame + 2);
+                    const bool matches_anchor = anchor_fresh &&
+                        edpe::matchesAnchorPrediction(parsed_camera, s_anchor_camera, s_last_valid_velocity, dtRatio);
+
+                    const bool probe_vs_anchor = anchor_fresh && !matches_anchor &&
+                        isStereoEyeOrIpdProbe(parsed_camera, s_anchor_camera, s_last_valid_velocity, dtRatio);
+
+                    const bool probe_vs_committed = (s_camera_now.scaleX > 0.0f) && !matches_anchor &&
+                        isStereoEyeOrIpdProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio);
+
+                    const bool is_probe = probe_vs_anchor || probe_vs_committed;
+
+                    if (is_probe) {
+                        s_probe_seen_this_frame = true;
+                        ++s_ustat.probe;
+                    }
+
+                    bool passes_filter = !is_probe &&
+                        isAuthoritativeMainSceneCamera(
+                            words, 5376 / sizeof(float), parsed_camera,
+                            outW, outH, s_camera_now, s_last_valid_velocity, dtRatio);
+
+                    // Real camera/FOV change persisting >= 2 frames is accepted as a new baseline:
+                    // Must be in active 4-MRT scene and not an IPD/rear probe or auxiliary mirror
+                    if (!passes_filter && !is_probe && in_main_scene &&
+                        cameraRotationDeterminant(parsed_camera) >= 0.85f &&
+                        parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
+                        !isRearOrAuxiliaryProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio)) {
+                        if (s_last_cut_rejection_frame != cur_frame) {
+                            s_last_cut_rejection_frame = cur_frame;
+                            ++s_cut_rejection_streak;
+                        }
+                        if (s_cut_rejection_streak >= 2) {
+                            passes_filter = true;
+                            s_cut_rejection_streak = 0;
+                            s_anchor_valid = false;
+                        }
+                    } else if (passes_filter) {
+                        s_cut_rejection_streak = 0;
+                    }
+
+                    bool allow_stage = false;
+                    if (passes_filter) {
+                        allow_stage = true;
+
+                        // Per-FRAME hologram jump guard (passes 25-26 share one frame).
+                        if (s_camera_now.scaleX > 0.0f) {
+                            const edpe::Vec3 predicted =
+                                edpe::cameraPosition(s_camera_now) +
+                                (s_last_valid_velocity * std::clamp(dtRatio, 0.25f, 4.0f));
+                            const float jumpResidual =
+                                edpe::length(edpe::cameraPosition(parsed_camera) - predicted);
+                            if (jumpResidual > 15.0f && jumpResidual < 500.0f) {
+                                if (s_last_teleport_rejection_frame != cur_frame) {
+                                    s_last_teleport_rejection_frame = cur_frame;
+                                    ++s_teleport_rejection_streak;
+                                }
+                                if (s_teleport_rejection_streak < 2) {
+                                    allow_stage = false;
+                                }
+                            } else if (jumpResidual <= 15.0f) {
+                                s_teleport_rejection_streak = 0;
+                            }
+                        }
+
+                        if (allow_stage && s_has_staged_camera && s_staged_camera_frame == cur_frame) {
+                            if (in_main_scene && !s_staged_from_in_scene) {
+                                allow_stage = true;
+                            } else if (!in_main_scene && s_staged_from_in_scene) {
+                                allow_stage = false;
+                            } else if (isReflectionOrAuxiliaryCamera(parsed_camera, s_staged_camera, {0.0f, 0.0f, 0.0f}, 1.0f) ||
+                                       isRearOrAuxiliaryProbe(parsed_camera, s_staged_camera)) {
+                                allow_stage = false;
+                            } else if (s_staged_from_in_scene) {
+                                const float intraDist = edpe::length(
+                                    edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
+                                if (intraDist > 0.03f) {
+                                    allow_stage = false;
+                                }
+                            }
+                        }
+
+                        if (allow_stage) {
+                            s_staged_camera = parsed_camera;
+                            s_has_staged_camera = true;
+                            s_staged_camera_frame = cur_frame;
+                            if (in_main_scene) {
+                                s_staged_from_in_scene = true;
+                            }
+                            s_valid_camera_seen_counter.fetch_add(1, std::memory_order_relaxed);
+                            is_main_camera = true;
+                        } else if (s_has_staged_camera && s_staged_camera_frame == cur_frame) {
+                            const float intraDist = edpe::length(
+                                edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
+                            if (intraDist <= 0.04f && cameraRotationDeterminant(parsed_camera) >= 0.85f &&
+                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
+                                !isRearOrAuxiliaryProbe(parsed_camera, s_staged_camera)) {
+                                is_main_camera = true;
+                            }
+                        }
+                    }
+
+                    if (is_main_camera) {
+                        ++s_ustat.accepted;
+                        if (s_ustat.acceptedIdx == 0) s_ustat.acceptedIdx = s_ustat.total;
+                    } else {
+                        if (!passes_filter && !is_probe) ++s_ustat.filterFail;
+                        else if (passes_filter) ++s_ustat.stageDenied;
+                        s_ustat.lastRDist = edpe::length(
+                            edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_camera_now));
+                        s_ustat.lastRTrace = edpe::cameraRotationTrace(parsed_camera, s_camera_now);
+                    }
+
+                    if (!is_main_camera) {
+                        static unsigned long long s_last_diag_unmap_frame = 0;
+                        static unsigned s_diag_unmap_count = 0;
+                        if (cur_frame != s_last_diag_unmap_frame) {
+                            s_last_diag_unmap_frame = cur_frame;
+                            s_diag_unmap_count = 0;
+                        }
+                        static unsigned s_diag_total_logged = 0;
+                        if (++s_diag_unmap_count <= 2 && s_diag_total_logged < 40) {
+                            ++s_diag_total_logged;
+                            const edpe::Vec3 candPos = edpe::cameraPosition(parsed_camera);
+                            const edpe::Vec3 nowPos = edpe::cameraPosition(s_camera_now);
+                            const float rDist = edpe::length(candPos - nowPos);
+                            const float rTrace = edpe::cameraRotationTrace(parsed_camera, s_camera_now);
+                            const float det = edpe::cameraRotationDeterminant(parsed_camera);
+                            wchar_t diagMsg[256];
+                            swprintf_s(diagMsg,
+                                L"EDPE DIAG: unmap candidate ignored frame=%llu in_scene=%d is_probe=%d passes=%d allow=%d staged=%d rDist=%.4f rTrace=%.4f det=%.3f depthB=%.4f",
+                                cur_frame, (int)in_main_scene, (int)is_probe, (int)passes_filter, (int)allow_stage, (int)s_has_staged_camera,
+                                rDist, rTrace, det, parsed_camera.depthB);
+                            EdpeLog(diagMsg);
+                        }
+                    }
+                } else {
+                    ++s_ustat.gbufDone;
+                    if (s_camera_now.scaleX > 0.0f) {
+                        const float lateDist = edpe::length(
+                            edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_camera_now));
+                        const float lateTrace = edpe::cameraRotationTrace(parsed_camera, s_camera_now);
+                        if (lateDist < 0.1f && lateTrace > 2.95f) {
+                            ++s_ustat.nearLate;
+                            if (s_ustat.firstNearLateIdx == 0) s_ustat.firstNearLateIdx = s_ustat.total;
+                        }
+                    }
+                }
+            } else {
+                ++s_ustat.parseFail;
+            }
+
+            const bool block_only_pilot = block_cam_ok;
+            const bool jitter_candidate = is_main_camera || block_only_pilot;
 
             // Phase 5: Projection jitter injection into words 1080..1095
-            // Inject jitter into all non-reflection scene/cockpit camera projections matching the display aspect ratio
-            const bool is_planar_reflection = aspect_ok && (cameraRotationDeterminant(parsed_camera) < 0.5f);
-            if ((is_main_camera || (aspect_ok && !is_planar_reflection)) && ContextCensusIsJitterActive()) {
-                float* words = static_cast<float*>(mapped_ptr);
+            // Inject jitter ONLY into authoritative primary scene camera projections
+            if (jitter_candidate && !ContextCensusIsJitterActive()) ++s_ustat.jitterOff;
+            if (jitter_candidate && ContextCensusIsJitterActive()) {
+                float* mutable_words = static_cast<float*>(mapped_ptr);
                 bool valid_projection = true;
                 for (size_t i = 1080; i < 1096; ++i) {
-                    if (!std::isfinite(words[i])) {
+                    if (!std::isfinite(mutable_words[i])) {
                         valid_projection = false;
                         break;
                     }
                 }
                 if (valid_projection) {
-                    const float depthB = words[1094];
-                    if (depthB <= 0.0f || depthB > 1.0f ||
-                        std::fabs(words[1092]) > 0.002f ||
-                        std::fabs(words[1093]) > 0.002f ||
-                        std::fabs(words[1095]) > 0.002f) {
+                    const float depthB = mutable_words[1094];
+                    if (depthB < 0.01f || depthB > 0.25f ||
+                        std::fabs(mutable_words[1092]) > 0.002f ||
+                        std::fabs(mutable_words[1093]) > 0.002f ||
+                        std::fabs(mutable_words[1095]) > 0.002f) {
                         valid_projection = false;
                     }
                 }
                 if (valid_projection) {
-                    edpe::ProjectionJitter jitter{};
-                    {
-                        std::lock_guard lock(jitter_mutex);
-                        jitter = active_projection_jitter;
-                    }
+                    edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
                     float jittered_block[16]{};
-                    if (edpe::jitterEliteProjectionBlock(&words[1080], jittered_block, jitter)) {
-                        std::memcpy(&words[1080], jittered_block, sizeof(jittered_block));
+                    if (edpe::jitterEliteProjectionBlock(&mutable_words[1080], jittered_block, jitter)) {
+                        std::memcpy(&mutable_words[1080], jittered_block, sizeof(jittered_block));
                         s_injected_jitter = jitter;
                         s_last_rendered_jitter = jitter;
+                        s_scene_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
                         s_jitter_injected_frame = cur_frame;
                         const unsigned count = jittered_writes_count.fetch_add(1, std::memory_order_relaxed) + 1;
                         if (count == 1) {
                             edpe::NdcOffset verified_offset{};
-                            edpe::estimateEliteBlockNdcOffset(&words[1080], &verified_offset);
+                            edpe::estimateEliteBlockNdcOffset(&mutable_words[1080], &verified_offset);
                             wchar_t msg[256];
                             swprintf_s(msg,
                                 L"EDPE: projection jitter applied #%u frame=%llu pixel=(%.4f, %.4f) ndc=(%.6g, %.6g) verified_ndc=(%.6g, %.6g)",
@@ -1281,7 +1996,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             }
         }
     }
-    original_unmap.load(std::memory_order_acquire)(context, resource, subresource);
+    if (forward) forward(context, resource, subresource);
 }
 
 void endDrawProbe() {
@@ -1508,8 +2223,10 @@ void endPipelineSample(ID3D11DeviceContext* context) {
     std::lock_guard lock(seen_mutex);
     for (auto& sample : pipeline_samples) {
         if (!sample.active) continue;
-        logDepthState(context, sample, L"end");
-        context->End(sample.query);
+        ID3D11DeviceContext* ctx = sample.context ? sample.context : context;
+        if (context && sample.context && sample.context != context) continue;
+        logDepthState(ctx, sample, L"end");
+        ctx->End(sample.query);
         sample.active = false;
     }
 }
@@ -1530,6 +2247,7 @@ void beginPipelineSample(ID3D11DeviceContext* context, unsigned bind) {
         EdpeLog(L"EDPE: scene pipeline statistics unavailable (query creation failed)");
         return;
     }
+    sample.context = context;
     sample.bind = bind;
     sample.after_present = last_present_frame.load(std::memory_order_relaxed);
     sample.wait = 0;
@@ -1542,9 +2260,10 @@ void pollPipelineSamples(ID3D11DeviceContext* context) {
     std::lock_guard lock(seen_mutex);
     for (auto& sample : pipeline_samples) {
         if (!sample.query || sample.active) continue;
+        ID3D11DeviceContext* ctx = sample.context ? sample.context : context;
         D3D11_QUERY_DATA_PIPELINE_STATISTICS stats{};
-        const HRESULT result = context->GetData(sample.query, &stats, sizeof(stats),
-            D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        const HRESULT result = ctx ? ctx->GetData(sample.query, &stats, sizeof(stats),
+            D3D11_ASYNC_GETDATA_DONOTFLUSH) : E_FAIL;
         if (result == S_FALSE && ++sample.wait < 120) continue;
         if (result == S_OK) {
             wchar_t message[208];
@@ -1561,11 +2280,12 @@ void pollPipelineSamples(ID3D11DeviceContext* context) {
     }
 }
 
-void recordBind(int index) {
-    if (index == sequence_last) return;
-    sequence_last = index;
-    ++sequence_transitions;
-    if (sequence_stored < bind_sequence.size()) bind_sequence[sequence_stored++] = index;
+void recordBind(PerContextData* ctxData, int index) {
+    if (!ctxData || index == ctxData->sequence_last) return;
+    ctxData->sequence_last = index;
+    ++ctxData->sequence_transitions;
+    if (ctxData->sequence_stored < ctxData->bind_sequence.size())
+        ctxData->bind_sequence[ctxData->sequence_stored++] = index;
 }
 
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
@@ -1614,6 +2334,7 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
     context->CopyResource(staging, gpu_copy ? gpu_copy.Get() : source);
     if (device) device->Release();
     sample.buffer = staging;
+    sample.context = context;
     sample.bind = bind_ordinal;
     sample.after_present = last_present_frame.load(std::memory_order_relaxed);
     sample.wait = 0;
@@ -1623,9 +2344,10 @@ void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* sourc
 void pollConstantBufferSamples(ID3D11DeviceContext* context) {
     for (auto& sample : constant_buffer_samples) {
         if (!sample.ready.load(std::memory_order_acquire)) continue;
+        ID3D11DeviceContext* ctx = sample.context ? sample.context : context;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        const HRESULT result = context->Map(sample.buffer, 0, D3D11_MAP_READ,
-            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        const HRESULT result = ctx ? ctx->Map(sample.buffer, 0, D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) : E_FAIL;
         if (SUCCEEDED(result) && mapped.pData) {
             const auto* values = static_cast<const float*>(mapped.pData);
             if (sample.bind == 0 || sample.bind == 51 || sample.bind == 3) {
@@ -1708,7 +2430,7 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
                     EdpeLog(words);
                 }
             }
-            context->Unmap(sample.buffer, 0);
+            ctx->Unmap(sample.buffer, 0);
         } else if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++sample.wait < 120) {
             continue;
         } else {
@@ -1716,6 +2438,7 @@ void pollConstantBufferSamples(ID3D11DeviceContext* context) {
         }
         sample.buffer->Release();
         sample.buffer = nullptr;
+        sample.context = nullptr;
         sample.ready.store(false, std::memory_order_release);
         sample.claimed.store(false, std::memory_order_release);
     }
@@ -1773,19 +2496,27 @@ void takeCameraDeltaSource(ID3D11DeviceContext* context, unsigned long long fram
         scene_map_target.store(buffer, std::memory_order_release);
     }
     camera_delta_source.Attach(buffer);
+    camera_delta_source_context = context;
     camera_delta_source_frame = frame;
 }
 
 // Called when the scene-MRT interval ends: queue a 5376-byte GPU copy.
 void copyCameraDeltaSource(ID3D11DeviceContext* context) {
     if (!camera_delta_source) return;
+    ID3D11DeviceContext* srcCtx = camera_delta_source_context ? camera_delta_source_context : context;
+    if (!srcCtx) return;
     edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::CameraDeltaCopy);
     const auto source = std::move(camera_delta_source);
+    camera_delta_source_context = nullptr;
     if (camera_delta_count == kCameraDeltaRing) {
         ++camera_delta_dropped;
         return;
     }
     auto& slot = camera_delta_ring[(camera_delta_head + camera_delta_count) % kCameraDeltaRing];
+    if (slot.staging && slot.context != srcCtx) {
+        slot.staging.Reset();
+        slot.context = nullptr;
+    }
     if (!slot.staging) { // Created once per slot, never per frame.
         D3D11_BUFFER_DESC desc{};
         source->GetDesc(&desc);
@@ -1795,14 +2526,15 @@ void copyCameraDeltaSource(ID3D11DeviceContext* context) {
         desc.MiscFlags = 0;
         desc.StructureByteStride = 0;
         Microsoft::WRL::ComPtr<ID3D11Device> device;
-        context->GetDevice(&device);
+        srcCtx->GetDevice(&device);
         if (!device || FAILED(device->CreateBuffer(&desc, nullptr, &slot.staging))) {
             camera_delta_disabled = true;
             EdpeLog(L"EDPE: camera delta log disabled (staging creation failed)");
             return;
         }
+        slot.context = srcCtx;
     }
-    context->CopyResource(slot.staging.Get(), source.Get());
+    srcCtx->CopyResource(slot.staging.Get(), source.Get());
     slot.frame = camera_delta_source_frame;
     ++camera_delta_count;
 }
@@ -1811,15 +2543,16 @@ void copyCameraDeltaSource(ID3D11DeviceContext* context) {
 void pollCameraDeltaRing(ID3D11DeviceContext* context) {
     while (camera_delta_count) {
         auto& slot = camera_delta_ring[camera_delta_head];
+        ID3D11DeviceContext* ctx = slot.context ? slot.context : context;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        const HRESULT result = context->Map(slot.staging.Get(), 0, D3D11_MAP_READ,
-            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        const HRESULT result = ctx ? ctx->Map(slot.staging.Get(), 0, D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) : E_FAIL;
         if (result == DXGI_ERROR_WAS_STILL_DRAWING) return;
         if (SUCCEEDED(result) && mapped.pData) {
             edpe::CameraProjection camera{};
             const bool parsed = edpe::parseEliteCamera(static_cast<const float*>(mapped.pData),
                 5376 / sizeof(float), &camera);
-            context->Unmap(slot.staging.Get(), 0);
+            ctx->Unmap(slot.staging.Get(), 0);
             logCameraDelta(slot.frame, parsed, camera);
         } else {
             ++camera_delta_dropped;
@@ -1831,6 +2564,7 @@ void pollCameraDeltaRing(ID3D11DeviceContext* context) {
 
 void resetCameraDelta() {
     camera_delta_source.Reset();
+    camera_delta_source_context = nullptr;
     for (auto& slot : camera_delta_ring) slot = {};
     camera_delta_head = camera_delta_count = 0;
     camera_delta_taken_frame = ~0ull;
@@ -1887,7 +2621,7 @@ void queueCameraPairSample(ID3D11DeviceContext* context, unsigned sample_label) 
 
 void queueMotionDepth(ID3D11DeviceContext* context, ID3D11Texture2D* source,
     const D3D11_TEXTURE2D_DESC& source_desc, unsigned long long after_present) {
-    if (!motion_pair_active || after_present != camera_pair_armed_after + 1) return;
+    if (!motion_pair_active || after_present != camera_pair_sample_frames[1]) return;
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
     D3D11_TEXTURE2D_DESC desc = source_desc;
@@ -1915,7 +2649,7 @@ void queueMotionDepth(ID3D11DeviceContext* context, ID3D11Texture2D* source,
 
 void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
     if (!motion_pair_active || !motion_color_source ||
-        motion_color_frame + 1 != frame || motion_depth_frame != motion_color_frame)
+        frame <= motion_color_frame || motion_depth_frame != motion_color_frame)
         return;
     wchar_t transition[160];
     swprintf_s(transition,
@@ -2018,18 +2752,25 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
 }
 
 void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame) {
+    ID3D11DeviceContext* pairCtx = camera_pair_context ? camera_pair_context : activeSceneContext();
+    if (!pairCtx) pairCtx = context;
     for (auto& sample : camera_pair_depth) {
         ID3D11DepthStencilView* view = nullptr;
+        ID3D11DeviceContext* sampleCtx = nullptr;
         {
             std::lock_guard lock(seen_mutex);
-            if (sample.view && sample.after_present + 1 == frame) {
+            if (sample.view && frame > sample.after_present) {
                 view = sample.view;
                 sample.view = nullptr;
+                sampleCtx = sample.context ? sample.context : pairCtx;
             }
         }
-        if (!view) continue;
+        if (!view || !sampleCtx) {
+            if (view) view->Release();
+            continue;
+        }
         ID3D11DepthStencilView* bound = nullptr;
-        context->OMGetRenderTargets(0, nullptr, &bound);
+        sampleCtx->OMGetRenderTargets(0, nullptr, &bound);
         if (bound) {
             bound->Release();
             view->Release();
@@ -2058,8 +2799,8 @@ void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame
             continue;
         }
         ID3D11Device* device = nullptr;
-        context->GetDevice(&device);
-        queueMotionDepth(context, source, desc, sample.after_present);
+        sampleCtx->GetDevice(&device);
+        queueMotionDepth(sampleCtx, source, desc, sample.after_present);
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -2068,9 +2809,10 @@ void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame
         const HRESULT result = device ? device->CreateTexture2D(&desc, nullptr, &staging) : E_FAIL;
         if (device) device->Release();
         if (SUCCEEDED(result) && staging) {
-            context->CopyResource(staging, source); // One-shot full depth copy; no normal-frame readback.
+            sampleCtx->CopyResource(staging, source); // One-shot full depth copy; no normal-frame readback.
             std::lock_guard lock(seen_mutex);
             sample.staging = staging;
+            sample.context = sampleCtx;
             sample.width = desc.Width;
             sample.height = desc.Height;
             sample.wait = 0;
@@ -2079,16 +2821,17 @@ void queueCameraPairDepth(ID3D11DeviceContext* context, unsigned long long frame
         }
         source->Release();
     }
-    queueMotionColor(context, frame);
+    queueMotionColor(pairCtx, frame);
 }
 
 void pollCameraPairDepth(ID3D11DeviceContext* context) {
     std::lock_guard lock(seen_mutex);
     for (auto& sample : camera_pair_depth) {
         if (!sample.staging) continue;
+        ID3D11DeviceContext* ctx = sample.context ? sample.context : context;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        const HRESULT result = context->Map(sample.staging, 0, D3D11_MAP_READ,
-            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        const HRESULT result = ctx ? ctx->Map(sample.staging, 0, D3D11_MAP_READ,
+            D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) : E_FAIL;
         if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++sample.wait < 120) continue;
         if (SUCCEEDED(result) && mapped.pData) {
             float depth = 0;
@@ -2096,7 +2839,7 @@ void pollCameraPairDepth(ID3D11DeviceContext* context) {
                 static_cast<size_t>(sample.height / 2) * mapped.RowPitch +
                 static_cast<size_t>(sample.width / 2) * 8;
             std::memcpy(&depth, pixel, sizeof(depth));
-            context->Unmap(sample.staging, 0);
+            ctx->Unmap(sample.staging, 0);
             wchar_t message[160];
             swprintf_s(message,
                 L"EDPE: adjacent depth afterPresent=%llu centerValid=%u center=%.9g size=%ux%u",
@@ -2108,14 +2851,16 @@ void pollCameraPairDepth(ID3D11DeviceContext* context) {
         }
         sample.staging->Release();
         sample.staging = nullptr;
+        sample.context = nullptr;
     }
 }
 
 void pollMotionGrid(ID3D11DeviceContext* context) {
     if (!motion_grid_readback) return;
+    ID3D11DeviceContext* ctx = motion_grid_context ? motion_grid_context : context;
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    const HRESULT result = context->Map(motion_grid_readback.Get(), 0,
-        D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    const HRESULT result = ctx ? ctx->Map(motion_grid_readback.Get(), 0,
+        D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped) : E_FAIL;
     if (result == DXGI_ERROR_WAS_STILL_DRAWING && ++motion_grid_wait < 120) return;
     if (SUCCEEDED(result) && mapped.pData) {
         float min_x = std::numeric_limits<float>::infinity();
@@ -2138,7 +2883,7 @@ void pollMotionGrid(ID3D11DeviceContext* context) {
                 over_ten += magnitude > 10.0f;
             }
         }
-        context->Unmap(motion_grid_readback.Get(), 0);
+        ctx->Unmap(motion_grid_readback.Get(), 0);
         wchar_t message[192];
         swprintf_s(message,
             L"EDPE: motion candidate currentAfterPresent=%llu center=(%.6g,%.6g) pixels finite=%u",
@@ -2153,10 +2898,13 @@ void pollMotionGrid(ID3D11DeviceContext* context) {
         EdpeLog(L"EDPE: motion candidate grid unavailable (nonblocking readback failed)");
     }
     motion_grid_readback.Reset();
+    motion_grid_context = nullptr;
 }
 
-void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
+void tryMotionPair(ID3D11DeviceContext* fallback_context, unsigned long long frame) {
     if (!motion_pair_active) return;
+    ID3D11DeviceContext* context = camera_pair_context ? camera_pair_context : activeSceneContext();
+    if (!context) context = fallback_context;
     if (frame > camera_pair_armed_after + 120) {
         EdpeLog(L"EDPE: motion candidate unavailable (camera/depth pair timed out)");
         motion_pair_active = false;
@@ -2168,15 +2916,21 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
         motion_clean_color_target.Reset();
         return;
     }
-    if (motion_camera_frames[0] != camera_pair_armed_after ||
-        motion_camera_frames[1] != camera_pair_armed_after + 1 ||
-        motion_depth_frame != camera_pair_armed_after + 1 ||
+    if (camera_pair_sample_frames[0] == ~0ull ||
+        camera_pair_sample_frames[1] == ~0ull ||
+        motion_camera_frames[0] != camera_pair_sample_frames[0] ||
+        motion_camera_frames[1] != camera_pair_sample_frames[1] ||
+        motion_depth_frame != camera_pair_sample_frames[1] ||
         !motion_depth_view) return;
 
     D3D11_TEXTURE2D_DESC desc{};
     motion_depth->GetDesc(&desc);
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
+    static ID3D11Device* s_motion_pass_device = nullptr;
+    if (motion_pass && s_motion_pass_device != device.Get()) {
+        motion_pass.reset();
+    }
     if (!motion_pass) {
         auto candidate = std::make_unique<edpe::MotionPass>();
         if (!candidate->initialize(device.Get(), context)) {
@@ -2189,6 +2943,7 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
             return;
         }
         motion_pass = std::move(candidate);
+        s_motion_pass_device = device.Get();
     }
     const bool gpu_cameras = gpu_camera_pair[0] && gpu_camera_pair[1];
     const bool gpu_rendered = gpu_cameras && motion_pass->renderGpuCameras(
@@ -2236,6 +2991,7 @@ void tryMotionPair(ID3D11DeviceContext* context, unsigned long long frame) {
     if (FAILED(device->CreateTexture2D(&read_desc, nullptr, &motion_grid_readback))) {
         EdpeLog(L"EDPE: motion candidate unavailable (grid readback creation failed)");
     } else {
+        motion_grid_context = context;
         for (UINT row = 0; row < 5; ++row) for (UINT column = 0; column < 5; ++column) {
             const UINT x = (column * (desc.Width - 1) + 2) / 4;
             const UINT y = (row * (desc.Height - 1) + 2) / 4;
@@ -2286,8 +3042,140 @@ static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_backbuffer_copy_srv;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_copy_rtv;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlaa_input;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlaa_input_srv;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
+static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
+static ID3D11Texture2D* s_cached_backbuffer_ptr = nullptr;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_present;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_scene;
+// Keyed mutex protocol for the cross-device bridge (GPU-side synchronisation;
+// a bare Flush() does not order work between two D3D11 devices and caused
+// stale/torn frames = flicker):
+//   key 0: present device owns the texture   key 1: scene device owns it
+//   present: Acquire(0) -> copy backbuffer in -> Release(1)
+//   scene:   Acquire(1) -> reconstruct        -> Release(0)
+//   present: Acquire(0) -> copy result out    -> Release(0)
+static Microsoft::WRL::ComPtr<IDXGIKeyedMutex> s_shared_mutex_present;
+static Microsoft::WRL::ComPtr<IDXGIKeyedMutex> s_shared_mutex_scene;
+static ID3D11Device* s_shared_present_dev = nullptr;
+static ID3D11Device* s_shared_scene_dev = nullptr;
+static ID3D11Device* s_temporal_resources_device = nullptr;
+static unsigned long long s_last_reconstructed_frame = ~0ull;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_final_output_present;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_reconstructed_output;
 static edpe::TemporalFrameInputs s_last_temporal_inputs{};
 static unsigned long long s_last_temporal_inputs_frame = ~0ull;
+
+constexpr DWORD kBridgeTimeoutMs = 100;
+
+void resetSharedBackbufferBridge() {
+    s_shared_mutex_present.Reset();
+    s_shared_mutex_scene.Reset();
+    s_shared_bb_present.Reset();
+    s_shared_bb_scene.Reset();
+    s_shared_present_dev = nullptr;
+    s_shared_scene_dev = nullptr;
+}
+
+// Present device -> shared texture, then hands ownership to the scene device.
+bool bridgeCopyBackbufferIn(ID3D11DeviceContext* presentCtx, ID3D11Resource* presentBackbuffer) {
+    if (!s_shared_mutex_present || !s_shared_bb_present) return false;
+    if (s_shared_mutex_present->AcquireSync(0, kBridgeTimeoutMs) != S_OK) {
+        EdpeLog(L"EDPE: WARNING: shared bridge acquire (present->scene) timed out; resetting bridge");
+        resetSharedBackbufferBridge();
+        return false;
+    }
+    presentCtx->CopyResource(s_shared_bb_present.Get(), presentBackbuffer);
+    s_shared_mutex_present->ReleaseSync(1);
+    return true;
+}
+
+// Scene-device ownership of the shared texture for the duration of one pass.
+// Always hands the texture back (key 0) on release/destruction so the present
+// device can never deadlock, even on early returns.
+struct SceneBridgeLock {
+    bool held = false;
+    bool acquire() {
+        held = s_shared_mutex_scene && s_shared_mutex_scene->AcquireSync(1, kBridgeTimeoutMs) == S_OK;
+        if (!held) {
+            EdpeLog(L"EDPE: WARNING: shared bridge acquire (scene) timed out; resetting bridge");
+            resetSharedBackbufferBridge();
+        }
+        return held;
+    }
+    void release() {
+        if (held && s_shared_mutex_scene) s_shared_mutex_scene->ReleaseSync(0);
+        held = false;
+    }
+    ~SceneBridgeLock() { release(); }
+};
+
+// Shared texture -> present backbuffer. Caller must have released SceneBridgeLock.
+bool bridgeCopyResultOut(ID3D11DeviceContext* presentCtx, ID3D11Resource* presentBackbuffer) {
+    if (!s_shared_mutex_present || !s_shared_bb_present) return false;
+    if (s_shared_mutex_present->AcquireSync(0, kBridgeTimeoutMs) != S_OK) {
+        EdpeLog(L"EDPE: WARNING: shared bridge acquire (scene->present) timed out; resetting bridge");
+        resetSharedBackbufferBridge();
+        return false;
+    }
+    presentCtx->CopyResource(presentBackbuffer, s_shared_bb_present.Get());
+    s_shared_mutex_present->ReleaseSync(0);
+    return true;
+}
+
+bool ensureSharedBackbufferBridge(ID3D11Device* presentDevice, ID3D11Device* sceneDevice,
+    const D3D11_TEXTURE2D_DESC& bbDesc) {
+    if (!presentDevice || !sceneDevice) return false;
+    const DXGI_FORMAT fmt = concreteLdrColorFormat(bbDesc.Format);
+    if (s_shared_bb_present && s_shared_bb_scene &&
+        s_shared_present_dev == presentDevice && s_shared_scene_dev == sceneDevice) {
+        D3D11_TEXTURE2D_DESC cur{};
+        s_shared_bb_present->GetDesc(&cur);
+        if (cur.Width == bbDesc.Width && cur.Height == bbDesc.Height && cur.Format == fmt) {
+            return true;
+        }
+    }
+    resetSharedBackbufferBridge();
+
+    D3D11_TEXTURE2D_DESC sharedDesc{};
+    sharedDesc.Width = bbDesc.Width;
+    sharedDesc.Height = bbDesc.Height;
+    sharedDesc.MipLevels = 1;
+    sharedDesc.ArraySize = 1;
+    sharedDesc.Format = fmt;
+    sharedDesc.SampleDesc.Count = 1;
+    sharedDesc.Usage = D3D11_USAGE_DEFAULT;
+    sharedDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+    if (FAILED(presentDevice->CreateTexture2D(&sharedDesc, nullptr, &s_shared_bb_present))) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IDXGIResource> dxgiRes;
+    HANDLE sharedHandle = nullptr;
+    if (FAILED(s_shared_bb_present.As(&dxgiRes)) ||
+        FAILED(dxgiRes->GetSharedHandle(&sharedHandle)) || !sharedHandle) {
+        resetSharedBackbufferBridge();
+        return false;
+    }
+    if (FAILED(sceneDevice->OpenSharedResource(sharedHandle, __uuidof(ID3D11Texture2D),
+            reinterpret_cast<void**>(s_shared_bb_scene.GetAddressOf()))) ||
+        FAILED(s_shared_bb_present.As(&s_shared_mutex_present)) ||
+        FAILED(s_shared_bb_scene.As(&s_shared_mutex_scene))) {
+        resetSharedBackbufferBridge();
+        return false;
+    }
+    s_shared_present_dev = presentDevice;
+    s_shared_scene_dev = sceneDevice;
+    wchar_t msg[220];
+    swprintf_s(msg,
+        L"EDPE: initialized cross-device shared backbuffer bridge %ux%u format=%u (presentDev=%p -> sceneDev=%p)",
+        bbDesc.Width, bbDesc.Height, static_cast<unsigned>(fmt), presentDevice, sceneDevice);
+    EdpeLog(msg);
+    return true;
+}
+
+OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context);
 
 // - When render resolution == output resolution (DLAA), evaluates on the finished
 //   LDR backbuffer (tone mapped, HUD included).
@@ -2305,35 +3193,50 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const bool debug_view_active = s_jitter_debug_view.load(std::memory_order_relaxed);
     if ((!upscale_active && !debug_view_active) || !context || !backbuffer) return;
 
+    std::lock_guard<std::recursive_mutex> sceneLock(g_scene_ctx_mutex);
+    ID3D11DeviceContext* presentCtx = context;
+    ID3D11Texture2D* presentBackbuffer = backbuffer;
+
     const wchar_t* skip = nullptr;
     if (!motion_color_source || !scene_depth_source) skip = L"scene color/depth not observed";
     else if (motion_color_frame != rendered) skip = L"no scene MRT pass this frame";
-    else if (s_camera_frame != rendered) {
-        if (s_latest_unmapped_camera_valid && s_latest_unmapped_camera_frame == rendered) {
-            updateMainCamera(s_latest_unmapped_camera, rendered);
-        } else if (s_fallback_unmapped_camera_frame == rendered && ++s_auxiliary_rejection_streak >= 3) {
-            // Genuine camera cut persisted across >= 3 frames (e.g. external camera switch):
-            updateMainCamera(s_fallback_unmapped_camera, rendered);
-            s_auxiliary_rejection_streak = 0;
-        } else if (s_camera_now.scaleX > 0.0f) {
-            // Camera was not unmapped or only a 1-frame auxiliary probe ran this frame.
-            // Retain previous camera smoothly without resetting temporal history!
-            s_camera_previous = s_camera_now;
-            s_camera_previous_frame = s_camera_frame;
-            s_camera_frame = rendered;
-        } else {
-            skip = L"no main camera latched this frame";
-        }
+    else if (!s_has_staged_camera && s_camera_now.scaleX <= 0.0f) skip = L"no main camera latched this frame";
+
+    bool scene_cut = false;
+    if (!skip) {
+        commitMainCamera(rendered, scene_cut);
     }
     if (skip) {
-        if (++s_consecutive_skipped_frames > 2) {
+        if (upscale_active && s_last_reconstructed_output && s_last_reconstructed_frame != ~0ull &&
+            (rendered >= s_last_reconstructed_frame && rendered - s_last_reconstructed_frame <= 2)) {
+            Microsoft::WRL::ComPtr<ID3D11Device> lastDev;
+            s_last_reconstructed_output->GetDevice(&lastDev);
+            Microsoft::WRL::ComPtr<ID3D11Device> pbDev;
+            presentBackbuffer->GetDevice(&pbDev);
+            if (lastDev && pbDev && lastDev.Get() == pbDev.Get()) {
+                D3D11_TEXTURE2D_DESC curDesc{}, pbDesc{};
+                s_last_reconstructed_output->GetDesc(&curDesc);
+                presentBackbuffer->GetDesc(&pbDesc);
+                if (curDesc.Width == pbDesc.Width && curDesc.Height == pbDesc.Height && curDesc.Format == pbDesc.Format) {
+                    presentCtx->CopyResource(presentBackbuffer, s_last_reconstructed_output.Get());
+                    return;
+                }
+            }
+        }
+        if (++s_consecutive_skipped_frames > 4) {
             s_camera_reset = true;
+        }
+        if (upscale_active && (s_consecutive_skipped_frames == 10 || s_consecutive_skipped_frames % 600 == 0)) {
+            wchar_t msg[192];
+            swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu streak=%u (%ls)",
+                frame, s_consecutive_skipped_frames, skip);
+            EdpeLog(msg);
         }
         return;
     }
 
     D3D11_TEXTURE2D_DESC backbufferDesc{};
-    backbuffer->GetDesc(&backbufferDesc);
+    presentBackbuffer->GetDesc(&backbufferDesc);
     if (!backbufferDesc.Width || !backbufferDesc.Height || backbufferDesc.SampleDesc.Count != 1) return;
 
     D3D11_TEXTURE2D_DESC depthDesc{};
@@ -2341,6 +3244,47 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (!depthDesc.Width || !depthDesc.Height ||
         depthDesc.Width > backbufferDesc.Width || depthDesc.Height > backbufferDesc.Height) {
         return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device> presentDevice;
+    presentCtx->GetDevice(&presentDevice);
+    if (!presentDevice) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> sceneDevice;
+    scene_depth_source->GetDevice(&sceneDevice);
+    if (!sceneDevice) sceneDevice = presentDevice;
+
+    const bool crossDevice = (sceneDevice.Get() != presentDevice.Get());
+    SceneBridgeLock sceneBridgeLock;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> sceneCtxHolder;
+    if (crossDevice) {
+        sceneDevice->GetImmediateContext(&sceneCtxHolder);
+        if (!sceneCtxHolder) return;
+        if (!ensureSharedBackbufferBridge(presentDevice.Get(), sceneDevice.Get(), backbufferDesc)) {
+            return;
+        }
+        if (!bridgeCopyBackbufferIn(presentCtx, presentBackbuffer)) return;
+        if (!sceneBridgeLock.acquire()) return;
+        context = sceneCtxHolder.Get();
+        backbuffer = s_shared_bb_scene.Get();
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device = sceneDevice;
+    if (s_temporal_resources_device != device.Get()) {
+        s_dlaa_input.Reset();
+        s_dlaa_input_srv.Reset();
+        motion_depth.Reset();
+        motion_depth_view.Reset();
+        motion_pass.reset();
+        s_dlss_output_texture.Reset();
+        s_dlss_output_srv.Reset();
+        s_backbuffer_copy.Reset();
+        s_backbuffer_copy_srv.Reset();
+        s_backbuffer_copy_rtv.Reset();
+        s_backbuffer_rtv.Reset();
+        s_cached_backbuffer_ptr = nullptr;
+        ui_composite_pass.reset();
+        s_temporal_resources_device = device.Get();
     }
 
     const bool isSubNative = (depthDesc.Width < backbufferDesc.Width ||
@@ -2352,29 +3296,42 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const bool hdrInput = edpe::Config::instance().hdrInput;
     ID3D11Texture2D* colorSource = nullptr;
     if (hdrInput) {
-        if (scene_hdr_color_source && scene_hdr_color_frame == rendered) {
+        if (isSubNative && scene_hdr_color_source && scene_hdr_color_frame == rendered) {
             colorSource = scene_hdr_color_source.Get();
-        } else if (scene_ldr_source && scene_ldr_frame == rendered) {
+        } else if (isSubNative && scene_ldr_source && scene_ldr_frame == rendered) {
             colorSource = scene_ldr_source.Get();
         } else if (isSubNative && scene_ldr_source) {
             colorSource = scene_ldr_source.Get();
         } else if (!isSubNative) {
             colorSource = scene_hdr_color_source ? scene_hdr_color_source.Get() : backbuffer;
         } else {
-            if (++s_consecutive_skipped_frames > 2) {
+            if (++s_consecutive_skipped_frames > 4) {
                 s_camera_reset = true;
             }
             return;
         }
     } else {
-        if (scene_ldr_source && scene_ldr_frame == rendered) {
+        if (isSubNative && scene_ldr_source && scene_ldr_frame == rendered) {
             colorSource = scene_ldr_source.Get();
         } else if (isSubNative && scene_ldr_source) {
             colorSource = scene_ldr_source.Get();
         } else if (!isSubNative) {
-            colorSource = backbuffer;
+            const bool ldrAvailable = s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                                      scene_ldr_source;
+            colorSource = ldrAvailable ? scene_ldr_source.Get() : backbuffer;
+            static unsigned long long s_native_src_log = ~0ull;
+            if (s_native_src_log == ~0ull || frame >= s_native_src_log + 300) {
+                s_native_src_log = frame;
+                wchar_t msg[224];
+                swprintf_s(msg,
+                    L"EDPE: native color source frame=%llu preserveUi=%d ldrSource=%d ldrFrame=%llu chosen=%ls",
+                    frame, s_preserve_native_ui.load(std::memory_order_relaxed) ? 1 : 0,
+                    scene_ldr_source ? 1 : 0, scene_ldr_frame,
+                    ldrAvailable ? L"scene_ldr_source" : L"backbuffer");
+                EdpeLog(msg);
+            }
         } else {
-            if (++s_consecutive_skipped_frames > 2) {
+            if (++s_consecutive_skipped_frames > 4) {
                 s_camera_reset = true;
             }
             static unsigned long long s_last_ldr_log = ~0ull;
@@ -2420,10 +3377,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             frame, depthDesc.Width, depthDesc.Height, backbufferDesc.Width, backbufferDesc.Height);
         EdpeLog(msg);
     }
-
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
-    if (!device) return;
 
     const DXGI_FORMAT inputFormat = concreteLdrColorFormat(srcColorDesc.Format);
 
@@ -2487,10 +3440,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     ID3D11RenderTargetView* savedRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     ID3D11DepthStencilView* savedDsv = nullptr;
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, &savedDsv);
-    if (savedDsv) {
-        if (const auto rawSet = original.load(std::memory_order_acquire)) {
-            rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, nullptr);
-        }
+    const OMSetRenderTargetsFn rawSet = resolveOriginalOM(context);
+    if (savedDsv && rawSet) {
+        rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, nullptr);
     }
     struct RestoreTargetsGuard {
         ID3D11DeviceContext* ctx;
@@ -2506,7 +3458,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             }
             if (dsv) dsv->Release();
         }
-    } restoreTargets{context, original.load(std::memory_order_acquire), savedRtvs, savedDsv};
+    } restoreTargets{context, rawSet, savedRtvs, savedDsv};
 
     context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
 
@@ -2531,21 +3483,79 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
     if (!motionRes || FAILED(motionRes.As(&motionTexture))) return;
 
+    const unsigned scene_writes_this_eval = s_scene_writes_since_eval.exchange(0, std::memory_order_acq_rel);
+    const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0);
+    {
+        static unsigned long long s_zw_last_write_frame = 0;
+        static unsigned s_zw_budget = 0; // Unmap-stats logging is off: EdpeLog opens the file per line and costs frame time.
+        static unsigned s_zw_prev_maps = 0;
+        static UnmapFrameStats s_zw_ring[3]{};
+        static unsigned long long s_zw_ring_frame[3]{};
+        static unsigned s_zw_ring_count = 0;
+        const unsigned maps_now = scene_maps.load(std::memory_order_relaxed);
+        const unsigned maps_delta = maps_now - s_zw_prev_maps;
+        s_zw_prev_maps = maps_now;
+        auto logStats = [](const wchar_t* tag, unsigned long long fr, unsigned long long gap,
+                           unsigned maps, const UnmapFrameStats& s) {
+            wchar_t reasons[160]{};
+            size_t used = 0;
+            for (int r = 2; r < 12; ++r) {
+                if (!s.failReason[r]) continue;
+                const int n = swprintf_s(reasons + used, 160 - used, L"%ls%d:%u", used ? L"," : L"", r, s.failReason[r]);
+                if (n > 0) used += static_cast<size_t>(n);
+            }
+            wchar_t m[800];
+            swprintf_s(m,
+                L"EDPE %ls: frame=%llu gap=%llu maps=%u unmaps=%u parseFail=%u failReasons={%ls} blockOnly=%u firstFailIdx=%u gbufDone=%u nearLate=%u firstNearLateIdx=%u gbufStartIdx=%u acceptedIdx=%u probe=%u filterFail=%u stageDenied=%u accepted=%u rDist=%.3f rTrace=%.3f",
+                tag, fr, gap, maps, s.total, s.parseFail, reasons, s.blockOnly, s.firstFailIdx, s.gbufDone, s.nearLate,
+                s.firstNearLateIdx, s.gbufStartIdx, s.acceptedIdx, s.probe, s.filterFail, s.stageDenied,
+                s.accepted, s.lastRDist, s.lastRTrace);
+            EdpeLog(m);
+            const bool dumpOk = (tag[1] == L'N') && s.haveFirstOk;
+            const bool dumpFail = (tag[1] == L'W') && (gap == 1 || gap == 4) && s.haveFirstFail;
+            if (dumpOk || dumpFail) {
+                const float* w = dumpOk ? s.firstOkWords : s.firstFailWords;
+                wchar_t d[1100];
+                swprintf_s(d,
+                    L"EDPE ZD: %ls frame=%llu failReason=%d rot=[%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f] proj=[%.5f %.5f %.5f %.5f | %.5f %.5f %.5f %.5f | %.5f %.5f %.5f %.5f | %.5f %.5f %.5f %.5f]",
+                    dumpOk ? L"ok" : L"fail", fr, dumpOk ? 0 : s.firstFailReason,
+                    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11],
+                    w[12], w[13], w[14], w[15], w[16], w[17], w[18], w[19],
+                    w[20], w[21], w[22], w[23], w[24], w[25], w[26], w[27]);
+                EdpeLog(d);
+            }
+        };
+        if (has_fresh_scene_jitter) {
+            s_zw_last_write_frame = frame;
+            s_zw_ring[s_zw_ring_count % 3] = s_ustat;
+            s_zw_ring_frame[s_zw_ring_count % 3] = frame;
+            ++s_zw_ring_count;
+        } else if (s_zw_last_write_frame != 0 && frame - s_zw_last_write_frame < 40 && s_zw_budget > 0) {
+            const unsigned long long gap = frame - s_zw_last_write_frame;
+            if (gap == 1) {
+                const unsigned n = s_zw_ring_count < 3 ? s_zw_ring_count : 3;
+                for (unsigned k = 0; k < n; ++k) {
+                    const unsigned i = (s_zw_ring_count - n + k) % 3;
+                    logStats(L"ZN", s_zw_ring_frame[i], 0, 0, s_zw_ring[i]);
+                }
+            }
+            --s_zw_budget;
+            logStats(L"ZW", frame, gap, maps_delta, s_ustat);
+        }
+    }
+    s_scene_jitter_consumed.store(true, std::memory_order_release);
+
     float jx = 0.0f, jy = 0.0f;
-    if (s_jitter_injected_frame == rendered) {
+    if (has_fresh_scene_jitter && ContextCensusIsJitterActive()) {
         jx = s_injected_jitter.pixelX;
         jy = s_injected_jitter.pixelY;
         s_last_rendered_jitter = s_injected_jitter;
-    } else if (s_last_rendered_jitter.pixelX != 0.0f || s_last_rendered_jitter.pixelY != 0.0f) {
-        // Main camera was not unmapped this frame (stationary cockpit / no buffer update).
-        // The constant buffer on GPU still holds the previous frame's jitter!
-        jx = s_last_rendered_jitter.pixelX;
-        jy = s_last_rendered_jitter.pixelY;
     } else {
-        // No jitter was injected into the scene projection for this frame!
-        // Never pass phantom jitter to DLSS / FSR when the GPU rendered unjittered.
+        // Fallback when writes == 0: never pass stale jitter!
+        // Always pass exact (0.0, 0.0) to TAA/upscaler to avoid subpixel jumping/flickering.
         jx = 0.0f;
         jy = 0.0f;
+        s_last_rendered_jitter = {};
     }
 
     if (s_jitter_swap_xy.load(std::memory_order_relaxed)) {
@@ -2562,27 +3572,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const float mScaleX = (s_motion_invert_x.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
     const float mScaleY = (s_motion_invert_y.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
 
-    // Physical camera scene-cut detection based on position and rotation discontinuities.
-    // A true scene cut requires an abrupt discontinuous camera change:
-    // 1. First frame after initialization (no previous frame).
-    // 2. Abrupt orientation discontinuity (rotTrace < 2.0f, corresponding to > 45 degree turn).
-    // 3. Astronomical position teleport (moveDist > 5000.0f, e.g. supercruise drop / hyperspace).
-    // 4. Large position jump (> 50.0f) ONLY IF accompanied by an orientation deviation (rotTrace < 2.85f).
-    // Steady linear flight (rotTrace >= 2.85f) must NEVER trigger a scene cut regardless of velocity!
-    const float* c = s_camera_now.worldFromView;
-    const float* p = s_camera_previous.worldFromView;
-    const float dx = c[3] - p[3];
-    const float dy = c[7] - p[7];
-    const float dz = c[11] - p[11];
-    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    const float rotTrace = (c[0]*p[0] + c[4]*p[4] + c[8]*p[8]) +
-                           (c[1]*p[1] + c[5]*p[5] + c[9]*p[9]) +
-                           (c[2]*p[2] + c[6]*p[6] + c[10]*p[10]);
-    const bool orientation_cut = (rotTrace < 2.0f);
-    const bool teleport_cut = (moveDist > 5000.0f);
-    const bool translation_cut = (moveDist > 50.0f && rotTrace < 2.85f);
-    const bool scene_cut = (s_camera_previous_frame == ~0ull) || orientation_cut || teleport_cut || translation_cut;
-
     static LARGE_INTEGER s_last_upscale_qpc{};
     static LARGE_INTEGER s_upscale_freq{};
     if (s_upscale_freq.QuadPart == 0) QueryPerformanceFrequency(&s_upscale_freq);
@@ -2594,9 +3583,21 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                                    static_cast<double>(s_upscale_freq.QuadPart);
         if (measured_ms >= 0.5 && measured_ms <= 250.0) {
             dt_ms = static_cast<float>(measured_ms);
+            s_last_frame_dt = s_current_frame_dt;
+            s_current_frame_dt = dt_ms * 0.001f;
         }
     }
     s_last_upscale_qpc = now_qpc;
+
+    const float* c = s_camera_now.worldFromView;
+    const float* p = s_camera_previous.worldFromView;
+    const float dx = c[3] - p[3];
+    const float dy = c[7] - p[7];
+    const float dz = c[11] - p[11];
+    const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float rotTrace = edpe::cameraRotationTrace(s_camera_now, s_camera_previous);
+    const bool teleport_cut = (moveDist > 5000.0f);
+    scene_cut = scene_cut || (s_camera_previous_frame == ~0ull) || teleport_cut;
 
     edpe::TemporalFrameInputs inputs{};
     inputs.color = s_dlaa_input.Get();
@@ -2617,7 +3618,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.reset = s_camera_reset || scene_cut;
     inputs.cameraNow = s_camera_now;
     inputs.cameraPrevious = s_camera_previous;
-    inputs.sharpness = edpe::Config::instance().sharpness;
+    inputs.sharpness = s_sharpness.load(std::memory_order_relaxed);
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
     const bool isHdrColor = hdrInput &&
@@ -2635,11 +3636,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (!upscale_active) {
         s_camera_reset = false;
     } else {
-        static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
-        static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
-        static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
-        static ID3D11Texture2D* s_cached_backbuffer_ptr = nullptr;
-
         const DXGI_FORMAT bbFormat = concreteLdrColorFormat(backbufferDesc.Format);
         const DXGI_FORMAT outFormat = isHdrColor ? srcColorDesc.Format : bbFormat;
 
@@ -2722,6 +3718,21 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                                          s_dlss_output_srv && s_backbuffer_copy_srv &&
                                          s_dlaa_input_srv && s_backbuffer_rtv &&
                                          colorSource != backbuffer);
+            if (!canCompositeUi) {
+                static unsigned long long s_nocomp_log = ~0ull;
+                if (s_nocomp_log == ~0ull || frame >= s_nocomp_log + 300) {
+                    s_nocomp_log = frame;
+                    wchar_t cmsg[256];
+                    swprintf_s(cmsg,
+                        L"EDPE: UI composite disabled frame=%llu preserveUi=%d evalToIntermediate=%d dlssSrv=%d bbCopySrv=%d inputSrv=%d bbRtv=%d srcIsBackbuffer=%d",
+                        frame, s_preserve_native_ui.load(std::memory_order_relaxed) ? 1 : 0,
+                        evalDestination == s_dlss_output_texture.Get() ? 1 : 0,
+                        s_dlss_output_srv ? 1 : 0, s_backbuffer_copy_srv ? 1 : 0,
+                        s_dlaa_input_srv ? 1 : 0, s_backbuffer_rtv ? 1 : 0,
+                        colorSource == backbuffer ? 1 : 0);
+                    EdpeLog(cmsg);
+                }
+            }
             if (canCompositeUi) {
                 if (!ui_composite_pass) {
                     auto comp = std::make_unique<edpe::UiCompositePass>();
@@ -2752,10 +3763,12 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     }
                 } else if (!isHdrColor) {
                     context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                    compOk = true;
                 }
             } else if (evalDestination == s_dlss_output_texture.Get()) {
                 if (!isHdrColor) {
                     context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                    compOk = true;
                 } else {
                     if (!ui_composite_pass) {
                         auto comp = std::make_unique<edpe::UiCompositePass>();
@@ -2773,6 +3786,54 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                             depthDesc.Width, depthDesc.Height,
                             true);
                     }
+                }
+            } else {
+                compOk = true;
+            }
+
+            if (crossDevice) {
+                context->Flush();
+                sceneBridgeLock.release();
+                if (bridgeCopyResultOut(presentCtx, presentBackbuffer)) {
+                    s_last_final_output_present = s_shared_bb_present;
+                    s_last_reconstructed_frame = rendered;
+                    compOk = true;
+                } else {
+                    compOk = false;
+                }
+            } else {
+                s_last_final_output_present.Reset();
+                s_last_reconstructed_frame = rendered;
+            }
+
+            if (presentCtx && presentBackbuffer && presentDevice) {
+                bool needCreate = (!s_last_reconstructed_output);
+                if (s_last_reconstructed_output) {
+                    Microsoft::WRL::ComPtr<ID3D11Device> recDev;
+                    s_last_reconstructed_output->GetDevice(&recDev);
+                    if (!recDev || recDev.Get() != presentDevice.Get()) {
+                        needCreate = true;
+                    } else {
+                        D3D11_TEXTURE2D_DESC curDesc{}, pbDesc{};
+                        s_last_reconstructed_output->GetDesc(&curDesc);
+                        presentBackbuffer->GetDesc(&pbDesc);
+                        if (curDesc.Width != pbDesc.Width || curDesc.Height != pbDesc.Height || curDesc.Format != pbDesc.Format) {
+                            needCreate = true;
+                        }
+                    }
+                }
+                if (needCreate) {
+                    s_last_reconstructed_output.Reset();
+                    D3D11_TEXTURE2D_DESC roDesc{};
+                    presentBackbuffer->GetDesc(&roDesc);
+                    roDesc.Usage = D3D11_USAGE_DEFAULT;
+                    roDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    roDesc.CPUAccessFlags = 0;
+                    roDesc.MiscFlags = 0;
+                    presentDevice->CreateTexture2D(&roDesc, nullptr, &s_last_reconstructed_output);
+                }
+                if (s_last_reconstructed_output) {
+                    presentCtx->CopyResource(s_last_reconstructed_output.Get(), presentBackbuffer);
                 }
             }
         }
@@ -2822,23 +3883,25 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_last_writes = cur_writes;
 
         const unsigned phases = s_active_jitter_phases.load(std::memory_order_relaxed);
+        const unsigned long long scene_seq = jitter_frame_index.load(std::memory_order_relaxed);
 
         edpe::JitterFrameLog jlog{};
         jlog.frame = rendered;
+        jlog.timeMs = getJitterLogTimeMs();
         jlog.deltaMs = dt_ms;
-        jlog.phase = static_cast<unsigned>(rendered % (phases ? phases : 32));
+        jlog.phase = static_cast<unsigned>(scene_seq % (phases ? phases : 32));
         jlog.totalPhases = phases ? phases : 32;
         jlog.pixelX = s_injected_jitter.pixelX;
         jlog.pixelY = s_injected_jitter.pixelY;
         jlog.ndcX = s_injected_jitter.ndcX;
         jlog.ndcY = s_injected_jitter.ndcY;
-        jlog.injectedWrites = writes_this_frame;
+        jlog.injectedWrites = scene_writes_this_eval;
         jlog.rejections = jitter_rejection_count.load(std::memory_order_relaxed);
         jlog.evalJx = inputs.jitterX;
         jlog.evalJy = inputs.jitterY;
-        jlog.syncOk = (s_jitter_injected_frame == rendered);
+        jlog.syncOk = has_fresh_scene_jitter;
         jlog.cameraValid = (s_camera_now.scaleX > 0.0f);
-        jlog.heldJitter = (s_jitter_injected_frame != rendered && (s_last_rendered_jitter.pixelX != 0.0f || s_last_rendered_jitter.pixelY != 0.0f));
+        jlog.heldJitter = (scene_writes_this_eval == 0);
         jlog.sceneCut = scene_cut || s_camera_reset;
         jlog.camMoveDist = moveDist;
         jlog.camRotDeg = std::acos(std::clamp((rotTrace - 1.0f) * 0.5f, -1.0f, 1.0f)) * 57.29578f;
@@ -2852,18 +3915,50 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
     ID3D11Texture2D* backbuffer) {
     if (!context || !backbuffer) return;
 
+    ID3D11DeviceContext* presentCtx = context;
+    ID3D11Texture2D* presentBackbuffer = backbuffer;
+
     D3D11_TEXTURE2D_DESC bbDesc{};
-    backbuffer->GetDesc(&bbDesc);
+    presentBackbuffer->GetDesc(&bbDesc);
     if (!bbDesc.Width || !bbDesc.Height || bbDesc.SampleDesc.Count != 1) return;
 
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
-    if (!device) return;
+    Microsoft::WRL::ComPtr<ID3D11Device> presentDevice;
+    presentCtx->GetDevice(&presentDevice);
+    if (!presentDevice) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device = presentDevice;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> sceneCtxHolder;
+    const bool crossDevice = (s_temporal_resources_device &&
+                              s_temporal_resources_device != presentDevice.Get() &&
+                              s_last_temporal_inputs_frame == rendered);
+    SceneBridgeLock sceneBridgeLock;
+    if (crossDevice) {
+        s_temporal_resources_device->GetImmediateContext(&sceneCtxHolder);
+        if (!sceneCtxHolder || !ensureSharedBackbufferBridge(presentDevice.Get(), s_temporal_resources_device, bbDesc)) {
+            return;
+        }
+        if (!bridgeCopyBackbufferIn(presentCtx, presentBackbuffer)) return;
+        if (!sceneBridgeLock.acquire()) return;
+        context = sceneCtxHolder.Get();
+        backbuffer = s_shared_bb_scene.Get();
+        device = s_temporal_resources_device;
+    }
 
     static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_debug_input_copy;
     static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_debug_input_srv;
     static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_debug_backbuffer_rtv;
     static ID3D11Texture2D* s_debug_cached_backbuffer = nullptr;
+    static ID3D11Device* s_debug_pass_device = nullptr;
+    static std::unique_ptr<edpe::JitterDebugPass> s_jitter_debug_pass;
+
+    if (s_debug_pass_device != device.Get()) {
+        s_debug_input_copy.Reset();
+        s_debug_input_srv.Reset();
+        s_debug_backbuffer_rtv.Reset();
+        s_debug_cached_backbuffer = nullptr;
+        s_jitter_debug_pass.reset();
+        s_debug_pass_device = device.Get();
+    }
 
     if (s_debug_cached_backbuffer != backbuffer || !s_debug_backbuffer_rtv) {
         s_debug_cached_backbuffer = backbuffer;
@@ -2873,7 +3968,6 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         }
     }
 
-    static std::unique_ptr<edpe::JitterDebugPass> s_jitter_debug_pass;
     if (!s_jitter_debug_pass) {
         auto pass = std::make_unique<edpe::JitterDebugPass>();
         if (!pass->initialize(device.Get(), context)) {
@@ -2900,6 +3994,26 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         jx = s_last_temporal_inputs.jitterX;
         jy = s_last_temporal_inputs.jitterY;
         reset = s_last_temporal_inputs.reset;
+        float debugDtRatio = (s_last_frame_dt > 1e-5f) ? (s_current_frame_dt / s_last_frame_dt) : 1.0f;
+        if (s_camera_now.scaleX > 0.0f && s_camera_previous.scaleX > 0.0f &&
+            isReflectionOrAuxiliaryCamera(s_camera_now, s_camera_previous, s_prev_valid_velocity, debugDtRatio)) {
+            reset = true;
+        }
+        isHdr = s_last_temporal_inputs.colorIsHdr;
+    } else if (s_last_temporal_inputs.colorSrv != nullptr &&
+               rendered > s_last_temporal_inputs_frame &&
+               rendered - s_last_temporal_inputs_frame <= 2) {
+        // Cobra periodically runs a 1-frame secondary probe (~once per second) or drops a frame:
+        // retain previous valid HDR scene and motion inputs smoothly with zero jitter instead of
+        // violently switching to the SDR backbuffer copy and resetting history, which caused a 1-frame flash.
+        inputColorSrv = s_last_temporal_inputs.colorSrv;
+        motionSrv = s_last_temporal_inputs.motionSrv;
+        depthSrv = s_last_temporal_inputs.depthSrv;
+        renderW = s_last_temporal_inputs.renderWidth ? s_last_temporal_inputs.renderWidth : bbDesc.Width;
+        renderH = s_last_temporal_inputs.renderHeight ? s_last_temporal_inputs.renderHeight : bbDesc.Height;
+        jx = 0.0f;
+        jy = 0.0f;
+        reset = false;
         isHdr = s_last_temporal_inputs.colorIsHdr;
     } else {
         const DXGI_FORMAT typedFormat = concreteLdrColorFormat(bbDesc.Format);
@@ -2943,6 +4057,11 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         renderW, renderH,
         reset,
         isHdr);
+
+    if (crossDevice) {
+        sceneBridgeLock.release();
+        bridgeCopyResultOut(presentCtx, presentBackbuffer);
+    }
 
     auto& recorder = edpe::JitterViewRecorder::instance();
     if (recorder.isActive()) {
@@ -3004,21 +4123,14 @@ bool isMainSceneMrtDepth(const D3D11_TEXTURE2D_DESC& dd, UINT outW, UINT outH, b
     return true;
 }
 
-void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
+void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
-    const auto forward = original.load(std::memory_order_acquire);
-    if (s_in_edpe_present.load(std::memory_order_acquire)) {
-        forward(context, count, targets, dsv);
-        return;
+    if (g_is_evaluating_upscaler.load(std::memory_order_acquire)) return;
+    if (isObservedImmediateContext(context)) {
+        copyCameraDeltaSource(context);
+        rearmHudDrawProbe();
     }
-    if (context == observed_context.load(std::memory_order_acquire)) {
-        endVSBufferProbe();
-        endPipelineSample(context);
-    }
-    forward(context, count, targets, dsv);
-    if (context != observed_context.load(std::memory_order_acquire)) return;
-    copyCameraDeltaSource(context);
-    rearmHudDrawProbe();
+
     edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::OMSetRenderTargets);
     const bool reconstruction_active =
         edpe::UpscalerManager::instance().isReconstructionActive() ||
@@ -3055,7 +4167,9 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         } else if (is_hdr_slot0) {
             // Transitioned from 4-MRT G-buffer (Binds 1-3) to RTV0 deferred lighting/HUD (Binds 4-7)
             s_inside_main_scene.store(false, std::memory_order_release);
-            s_hdr_slot0_seen_frame = current_frame;
+            if (motion_color_frame == current_frame) {
+                s_hdr_slot0_seen_frame = current_frame;
+            }
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
         motion_color_bound = bound;
@@ -3096,14 +4210,18 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             }
         }
     }
+    PerContextData* ctxData = getOrCreateContextData(context);
+    if (!ctxData) return;
+
     if (!dsv) {
         if (sequence_active.load(std::memory_order_acquire)) {
             std::lock_guard lock(seen_mutex);
-            recordBind(-1);
+            recordBind(ctxData, -1);
         }
         return;
     }
     dsv_binds.fetch_add(1, std::memory_order_relaxed);
+    ctxData->dsv_binds.fetch_add(1, std::memory_order_relaxed);
 
     bool scene_mrt = false;
     if (count >= 4 && targets && targets[0] && targets[1] && targets[2] && targets[3]) {
@@ -3148,6 +4266,19 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         }
 
         if (is_main_scene) {
+            ID3D11Device* sceneDevice = nullptr;
+            context->GetDevice(&sceneDevice);
+            ID3D11Device* presentDev = s_present_device.load(std::memory_order_acquire);
+            if (sceneDevice && presentDev && sceneDevice != presentDev) {
+                static std::atomic<bool> s_warned_scene_dev{false};
+                if (!s_warned_scene_dev.exchange(true)) {
+                    wchar_t warnMsg[256];
+                    swprintf_s(warnMsg, L"EDPE: WARNING: scene device differs from present device (scene device=%p, present device=%p)",
+                        sceneDevice, presentDev);
+                    EdpeLog(warnMsg);
+                }
+            }
+            if (sceneDevice) sceneDevice->Release();
             s_inside_main_scene.store(true, std::memory_order_release);
             for (UINT slot = 0; slot < 4; ++slot) {
                 ID3D11Resource* gbRes = nullptr;
@@ -3179,10 +4310,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 }
             }
 
-            if (s_camera_frame != current_frame && s_latest_unmapped_camera_valid &&
-                s_latest_unmapped_camera_frame == current_frame) {
-                updateMainCamera(s_latest_unmapped_camera, current_frame);
-            }
+
         } else {
             s_inside_main_scene.store(false, std::memory_order_release);
         }
@@ -3197,30 +4325,54 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     bool camera_delta_take = false;
     {
         std::lock_guard lock(seen_mutex);
-        while (index < seen_count && seen[index].view != dsv) ++index;
-        if (index == seen.size()) {
-            if (sequence_active.load(std::memory_order_acquire)) recordBind(-3);
+        auto& ctx_seen = ctxData->seen;
+        size_t& ctx_seen_count = ctxData->seen_count;
+        while (index < ctx_seen_count && ctx_seen[index].view != dsv) ++index;
+        if (index == ctx_seen.size()) {
+            if (sequence_active.load(std::memory_order_acquire)) recordBind(ctxData, -3);
             return;
         }
-        if (index == seen_count) {
-            seen[seen_count++].view = dsv;
+        if (index == ctx_seen_count) {
+            ctx_seen[ctx_seen_count].view = dsv;
+            ID3D11Device* dev = nullptr;
+            dsv->GetDevice(&dev);
+            if (!dev) context->GetDevice(&dev);
+            ctx_seen[ctx_seen_count].owning_device = dev;
+            if (dev) dev->Release();
+            ID3D11Resource* init_res = nullptr;
+            dsv->GetResource(&init_res);
+            if (init_res) {
+                ID3D11Texture2D* init_tex = nullptr;
+                if (SUCCEEDED(init_res->QueryInterface(__uuidof(ID3D11Texture2D),
+                        reinterpret_cast<void**>(&init_tex)))) {
+                    D3D11_TEXTURE2D_DESC init_desc{};
+                    init_tex->GetDesc(&init_desc);
+                    ctx_seen[ctx_seen_count].texture_format = init_desc.Format;
+                    ctx_seen[ctx_seen_count].samples = init_desc.SampleDesc.Count;
+                    ctx_seen[ctx_seen_count].width = init_desc.Width;
+                    ctx_seen[ctx_seen_count].height = init_desc.Height;
+                    init_tex->Release();
+                }
+                init_res->Release();
+            }
+            ctx_seen_count++;
             first_bind = true;
         }
-        ++seen[index].interval_binds;
-        if (seen[index].texture_format == DXGI_FORMAT_R32G8X24_TYPELESS &&
-            seen[index].samples == 1) {
+        ++ctx_seen[index].interval_binds;
+        if (ctx_seen[index].texture_format == DXGI_FORMAT_R32G8X24_TYPELESS &&
+            ctx_seen[index].samples == 1) {
             const auto frame = current_frame;
-            if (seen[index].mrt_frame != frame) {
-                seen[index].mrt_hdr_view = nullptr;
-                seen[index].mrt_frame = frame;
+            if (ctx_seen[index].mrt_frame != frame) {
+                ctx_seen[index].mrt_hdr_view = nullptr;
+                ctx_seen[index].mrt_frame = frame;
             }
             ID3D11RenderTargetView* hdrRtv = nullptr;
-            if (is_main_scene) {
-                seen[index].mrt_hdr_view = targets[3];
-                hdrRtv = targets[3];
-            } else if (seen[index].mrt_hdr_view && count && targets &&
-                targets[0] == seen[index].mrt_hdr_view) {
-                seen[index].scene_match_frame = frame;
+            if (is_main_scene || scene_mrt) {
+                ctx_seen[index].mrt_hdr_view = targets[3];
+                if (is_main_scene) hdrRtv = targets[3];
+            } else if (ctx_seen[index].mrt_hdr_view && count && targets &&
+                targets[0] == ctx_seen[index].mrt_hdr_view) {
+                ctx_seen[index].scene_match_frame = frame;
                 hdrRtv = targets[0];
             } else if (count && targets && targets[0]) {
                 D3D11_RENDER_TARGET_VIEW_DESC rtvd{};
@@ -3244,15 +4396,16 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             }
             camera_delta_take = is_main_scene;
         }
-        if (sequence_active.load(std::memory_order_acquire)) recordBind(static_cast<int>(index));
-        if (snapshot_active == static_cast<int>(index) && !snapshot_view) {
+        if (sequence_active.load(std::memory_order_acquire)) recordBind(ctxData, static_cast<int>(index));
+        const bool is_snapshot_ctx = (!snapshot_target_context || snapshot_target_context == context);
+        if (is_snapshot_ctx && snapshot_active == static_cast<int>(index) && !snapshot_view) {
             dsv->AddRef();
             snapshot_view = dsv;
             snapshot_index = snapshot_active;
             snapshot_active = -1;
             snapshot_waiting.store(false, std::memory_order_release);
         }
-        if (snapshot_view == dsv && snapshot_index == static_cast<int>(index)) {
+        if (is_snapshot_ctx && snapshot_view == dsv && snapshot_index == static_cast<int>(index)) {
             auto* color = count && targets ? targets[0] : nullptr;
             if (color != snapshot_color_view) {
                 if (color) color->AddRef();
@@ -3265,22 +4418,30 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
             ++snapshot_bind_count;
             snapshot_probe_bind = snapshot_bind_count;
         }
-        if (camera_pair_target == static_cast<int>(index)) {
+        const bool is_pair_ctx = (!camera_pair_context || camera_pair_context == context);
+        if (is_pair_ctx && camera_pair_target == static_cast<int>(index)) {
             const auto frame = last_present_frame.load(std::memory_order_relaxed);
-            if (frame == camera_pair_armed_after || frame == camera_pair_armed_after + 1) {
+            if (frame >= camera_pair_armed_after && camera_pair_sample_frames[1] == ~0ull) {
                 if (camera_pair_bind_frame != frame) {
                     camera_pair_bind_frame = frame;
                     camera_pair_bind_count = 0;
                 }
                 if (++camera_pair_bind_count == 3 && is_main_scene &&
-                    seen[index].mrt_frame == frame && seen[index].mrt_hdr_view)
-                    camera_pair_sample = frame == camera_pair_armed_after
-                        ? kPairFirstSample : kPairSecondSample;
+                    ctx_seen[index].mrt_frame == frame && ctx_seen[index].mrt_hdr_view) {
+                    if (camera_pair_sample_frames[0] == ~0ull) {
+                        camera_pair_sample_frames[0] = frame;
+                        camera_pair_sample = kPairFirstSample;
+                    } else if (frame > camera_pair_sample_frames[0]) {
+                        camera_pair_sample_frames[1] = frame;
+                        camera_pair_sample = kPairSecondSample;
+                    }
+                }
                 if (camera_pair_sample) {
                     auto& depth = camera_pair_depth[camera_pair_sample - kPairFirstSample];
                     if (!depth.view && !depth.staging) {
                         dsv->AddRef();
                         depth.view = dsv;
+                        depth.context = context;
                         depth.after_present = frame;
                     }
                     if (motion_pair_active && camera_pair_sample == kPairSecondSample &&
@@ -3293,10 +4454,14 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
                 }
             }
         }
-        if (count && targets && targets[0] && !seen[index].color_logged) {
-            seen[index].color_logged = true;
+        if (count && targets && targets[0] && !ctx_seen[index].color_logged) {
+            ctx_seen[index].color_logged = true;
             first_color = true;
         }
+    }
+
+    if (context != observed_context.load(std::memory_order_acquire)) {
+        findSceneContextData(true);
     }
 
     if (hud_probe_begin) beginHudDrawProbe();
@@ -3329,8 +4494,28 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
     if (first_bind) {
         std::lock_guard lock(seen_mutex);
-        seen[index].texture_format = texture_desc.Format;
-        seen[index].samples = texture_desc.SampleDesc.Count;
+        ctxData->seen[index].texture_format = texture_desc.Format;
+        ctxData->seen[index].samples = texture_desc.SampleDesc.Count;
+        ctxData->seen[index].width = texture_desc.Width;
+        ctxData->seen[index].height = texture_desc.Height;
+        const UINT scW = s_swapchain_width.load(std::memory_order_relaxed);
+        const UINT scH = s_swapchain_height.load(std::memory_order_relaxed);
+        const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
+        const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
+        const UINT expectedW = sceneW ? sceneW : scW;
+        const UINT expectedH = sceneH ? sceneH : scH;
+        const bool has_rtv0 = (count >= 1 && targets && targets[0] != nullptr);
+        const bool is_dsv_format = (texture_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+                                    texture_desc.Format == DXGI_FORMAT_R24G8_TYPELESS);
+        const bool is_square_shadow = (scW > scH && texture_desc.Width == texture_desc.Height);
+
+        UINT curMaxW = ctxData->maxDsvWidth.load(std::memory_order_relaxed);
+        UINT curMaxH = ctxData->maxDsvHeight.load(std::memory_order_relaxed);
+        if (has_rtv0 && is_dsv_format && !is_square_shadow &&
+            (texture_desc.Width > curMaxW || (texture_desc.Width == curMaxW && texture_desc.Height > curMaxH))) {
+            ctxData->maxDsvWidth.store(texture_desc.Width, std::memory_order_relaxed);
+            ctxData->maxDsvHeight.store(texture_desc.Height, std::memory_order_relaxed);
+        }
     }
     D3D11_RENDER_TARGET_VIEW_DESC color_view{};
     D3D11_TEXTURE2D_DESC color_texture{};
@@ -3359,7 +4544,232 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         color_texture.Width, color_texture.Height,
         static_cast<unsigned>(color_view.Format), color_texture.BindFlags);
     EdpeLog(message);
+
 }
+
+thread_local bool s_in_om_detour = false;
+
+OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context) {
+    if (!context) return original.load(std::memory_order_acquire);
+    void** table = *reinterpret_cast<void***>(context);
+    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < cloneCount; ++i) {
+        if (s_cloned_contexts[i] &&
+            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
+            if (s_cloned_contexts[i]->orig_om && s_cloned_contexts[i]->orig_om != &observedOMSetRenderTargets)
+                return s_cloned_contexts[i]->orig_om;
+            table = s_cloned_contexts[i]->original_table;
+            break;
+        }
+    }
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_om &&
+            s_hooked_tables[i].orig_om != &observedOMSetRenderTargets) {
+            return s_hooked_tables[i].orig_om;
+        }
+    }
+    const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+    OMSetRenderTargetsFn forward = is_deferred
+        ? original_deferred_om.load(std::memory_order_acquire)
+        : original.load(std::memory_order_acquire);
+    if (!forward) forward = original.load(std::memory_order_acquire);
+    return forward;
+}
+
+OMSetRenderTargetsAndUnorderedAccessViewsFn resolveOriginalOMUav(ID3D11DeviceContext* context) {
+    if (!context) return original_om_uav.load(std::memory_order_acquire);
+    void** table = *reinterpret_cast<void***>(context);
+    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < cloneCount; ++i) {
+        if (s_cloned_contexts[i] &&
+            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
+            if (s_cloned_contexts[i]->orig_om_uav &&
+                s_cloned_contexts[i]->orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews)
+                return s_cloned_contexts[i]->orig_om_uav;
+            table = s_cloned_contexts[i]->original_table;
+            break;
+        }
+    }
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_om_uav &&
+            s_hooked_tables[i].orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews) {
+            return s_hooked_tables[i].orig_om_uav;
+        }
+    }
+    const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+    OMSetRenderTargetsAndUnorderedAccessViewsFn forward = is_deferred
+        ? original_deferred_om_uav.load(std::memory_order_acquire)
+        : original_om_uav.load(std::memory_order_acquire);
+    if (!forward) forward = original_om_uav.load(std::memory_order_acquire);
+    return forward;
+}
+
+
+
+void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, UINT count,
+    ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
+    OMSetRenderTargetsFn forward = resolveOriginalOM(context);
+    if (g_is_evaluating_upscaler.load(std::memory_order_acquire)) {
+        if (forward) forward(context, count, targets, dsv);
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+    if (s_in_om_detour) {
+        if (forward) forward(context, count, targets, dsv);
+        return;
+    }
+    struct DetourGuard {
+        DetourGuard() { s_in_om_detour = true; }
+        ~DetourGuard() { s_in_om_detour = false; }
+    } detour_guard;
+
+    s_count_om_set_render_targets.fetch_add(1, std::memory_order_relaxed);
+    logContextHookOnce(context, kOMSetRenderTargets, L"OMSetRenderTargets", s_log_om_imm, s_log_om_def);
+
+    PerContextData* ctxData = getOrCreateContextData(context);
+    const bool in_edpe = s_in_edpe_present.load(std::memory_order_acquire);
+    if (ctxData) {
+        ctxData->omCalls.fetch_add(1, std::memory_order_relaxed);
+        if (in_edpe) {
+            ctxData->edpeOmCalls.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ctxData->gameOmCalls.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (dsv) {
+            ctxData->nonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            if (in_edpe) {
+                ctxData->edpeNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ctxData->gameNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    if (in_edpe) {
+        if (forward) forward(context, count, targets, dsv);
+        return;
+    }
+    if (isObservedImmediateContext(context)) {
+        endVSBufferProbe();
+        endPipelineSample(context);
+    }
+    if (forward) forward(context, count, targets, dsv);
+
+    observeDepthStencilView(context, count, targets, dsv);
+}
+
+void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
+    ID3D11DeviceContext* context,
+    UINT numRTVs,
+    ID3D11RenderTargetView* const* targets,
+    ID3D11DepthStencilView* dsv,
+    UINT uavStartSlot,
+    UINT numUAVs,
+    ID3D11UnorderedAccessView* const* uavs,
+    const UINT* initialCounts) {
+    OMSetRenderTargetsAndUnorderedAccessViewsFn forward = resolveOriginalOMUav(context);
+    if (g_is_evaluating_upscaler.load(std::memory_order_acquire)) {
+        if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+    if (s_in_om_detour) {
+        if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
+        return;
+    }
+    struct DetourGuard {
+        DetourGuard() { s_in_om_detour = true; }
+        ~DetourGuard() { s_in_om_detour = false; }
+    } detour_guard;
+
+    s_count_om_set_rt_uav.fetch_add(1, std::memory_order_relaxed);
+    logContextHookOnce(context, kOMSetRenderTargetsAndUnorderedAccessViews,
+        L"OMSetRenderTargetsAndUnorderedAccessViews", s_log_om_uav_imm, s_log_om_uav_def);
+
+    PerContextData* ctxData = getOrCreateContextData(context);
+    const bool in_edpe = s_in_edpe_present.load(std::memory_order_acquire);
+    if (ctxData) {
+        ctxData->omUavCalls.fetch_add(1, std::memory_order_relaxed);
+        if (in_edpe) {
+            ctxData->edpeOmUavCalls.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ctxData->gameOmUavCalls.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (dsv) {
+            ctxData->nonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            if (in_edpe) {
+                ctxData->edpeNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ctxData->gameNonNullDsvCalls.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    if (in_edpe) {
+        if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
+        return;
+    }
+    if (isObservedImmediateContext(context)) {
+        endVSBufferProbe();
+        endPipelineSample(context);
+    }
+    if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
+
+    observeDepthStencilView(context, numRTVs, targets, dsv);
+}
+
+void STDMETHODCALLTYPE observedExecuteCommandList(
+    ID3D11DeviceContext* context,
+    ID3D11CommandList* pCommandList,
+    BOOL restoreContextState) {
+    s_count_execute_command_list.fetch_add(1, std::memory_order_relaxed);
+    logContextHookOnce(context, kExecuteCommandList, L"ExecuteCommandList", s_log_exec_imm, s_log_exec_def);
+
+    void** table = *reinterpret_cast<void***>(context);
+    ExecuteCommandListFn forward = nullptr;
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table) {
+            forward = s_hooked_tables[i].orig_exec;
+            break;
+        }
+    }
+    if (!forward) {
+        const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+        forward = is_deferred ? original_deferred_execute_command_list.load(std::memory_order_acquire)
+                              : original_execute_command_list.load(std::memory_order_acquire);
+        if (!forward) forward = original_execute_command_list.load(std::memory_order_acquire);
+    }
+    if (forward) forward(context, pCommandList, restoreContextState);
+}
+
+HRESULT STDMETHODCALLTYPE observedFinishCommandList(
+    ID3D11DeviceContext* context,
+    BOOL restoreDeferredContextState,
+    ID3D11CommandList** ppCommandList) {
+    s_count_finish_command_list.fetch_add(1, std::memory_order_relaxed);
+    logContextHookOnce(context, kFinishCommandList, L"FinishCommandList", s_log_finish_imm, s_log_finish_def);
+
+    void** table = *reinterpret_cast<void***>(context);
+    FinishCommandListFn forward = nullptr;
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].table == table) {
+            forward = s_hooked_tables[i].orig_finish;
+            break;
+        }
+    }
+    if (!forward) {
+        const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+        forward = is_deferred ? original_deferred_finish_command_list.load(std::memory_order_acquire)
+                              : original_finish_command_list.load(std::memory_order_acquire);
+        if (!forward) forward = original_finish_command_list.load(std::memory_order_acquire);
+    }
+    return forward ? forward(context, restoreDeferredContextState, ppCommandList) : E_FAIL;
+}
+
 
 bool patchSlot(void** table, size_t slot, void* expected, void* replacement) {
     DWORD old_protection = 0;
@@ -3373,6 +4783,7 @@ bool patchSlot(void** table, size_t slot, void* expected, void* replacement) {
 }
 
 void rearmContextHooks() {
+    if (g_is_evaluating_upscaler.load(std::memory_order_acquire)) return;
     if (!patched_table) return;
     const auto forward_om = original.load(std::memory_order_acquire);
     if (forward_om && patched_table[kOMSetRenderTargets] != reinterpret_cast<void*>(&observedOMSetRenderTargets)) {
@@ -3383,7 +4794,47 @@ void rearmContextHooks() {
         if (restored && !s_swap_logged) {
             s_swap_logged = true;
             EdpeLog(L"EDPE: DSV observer restored after context-state swap");
+
+            void* cur_om = patched_table[kOMSetRenderTargets];
+            void* exp_om = reinterpret_cast<void*>(&observedOMSetRenderTargets);
+            if (cur_om == exp_om) {
+                EdpeLog(L"EDPE: vtable slot 33 (OMSetRenderTargets) match");
+            } else {
+                wchar_t msg[160];
+                swprintf_s(msg, L"EDPE: vtable slot 33 (OMSetRenderTargets) mismatch current=%p expected=%p; re-patching", cur_om, exp_om);
+                EdpeLog(msg);
+                patchSlot(patched_table, kOMSetRenderTargets, cur_om, exp_om);
+            }
+
+            void* cur_uav = patched_table[kOMSetRenderTargetsAndUnorderedAccessViews];
+            void* exp_uav = reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews);
+            if (cur_uav == exp_uav) {
+                EdpeLog(L"EDPE: vtable slot 34 (OMSetRenderTargetsAndUAVs) match");
+            } else {
+                wchar_t msg[160];
+                swprintf_s(msg, L"EDPE: vtable slot 34 (OMSetRenderTargetsAndUAVs) mismatch current=%p expected=%p; re-patching", cur_uav, exp_uav);
+                EdpeLog(msg);
+                patchSlot(patched_table, kOMSetRenderTargetsAndUnorderedAccessViews, cur_uav, exp_uav);
+            }
         }
+    }
+    const auto forward_uav = original_om_uav.load(std::memory_order_acquire);
+    if (forward_uav && patched_table[kOMSetRenderTargetsAndUnorderedAccessViews] != reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews)) {
+        patchSlot(patched_table, kOMSetRenderTargetsAndUnorderedAccessViews,
+            patched_table[kOMSetRenderTargetsAndUnorderedAccessViews],
+            reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
+    }
+    const auto forward_exec = original_execute_command_list.load(std::memory_order_acquire);
+    if (forward_exec && patched_table[kExecuteCommandList] != reinterpret_cast<void*>(&observedExecuteCommandList)) {
+        patchSlot(patched_table, kExecuteCommandList,
+            patched_table[kExecuteCommandList],
+            reinterpret_cast<void*>(&observedExecuteCommandList));
+    }
+    const auto forward_finish = original_finish_command_list.load(std::memory_order_acquire);
+    if (forward_finish && patched_table[kFinishCommandList] != reinterpret_cast<void*>(&observedFinishCommandList)) {
+        patchSlot(patched_table, kFinishCommandList,
+            patched_table[kFinishCommandList],
+            reinterpret_cast<void*>(&observedFinishCommandList));
     }
     const auto forward_map = original_map.load(std::memory_order_acquire);
     if (forward_map && map_hook_active.load(std::memory_order_acquire) &&
@@ -3399,6 +4850,36 @@ void rearmContextHooks() {
             patched_table[kUnmap],
             reinterpret_cast<void*>(&observedUnmap));
     }
+
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    const bool map_active = map_hook_active.load(std::memory_order_acquire);
+    const bool unmap_active = unmap_hook_active.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        auto& entry = s_hooked_tables[i];
+        if (!entry.table) continue;
+        if (entry.orig_om &&
+            entry.table[kOMSetRenderTargets] != reinterpret_cast<void*>(&observedOMSetRenderTargets)) {
+            patchSlot(entry.table, kOMSetRenderTargets, entry.table[kOMSetRenderTargets],
+                reinterpret_cast<void*>(&observedOMSetRenderTargets));
+        }
+        if (entry.orig_om_uav &&
+            entry.table[kOMSetRenderTargetsAndUnorderedAccessViews] !=
+                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews)) {
+            patchSlot(entry.table, kOMSetRenderTargetsAndUnorderedAccessViews,
+                entry.table[kOMSetRenderTargetsAndUnorderedAccessViews],
+                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
+        }
+        if (map_active && entry.orig_map &&
+            entry.table[kMap] != reinterpret_cast<void*>(&observedMap)) {
+            patchSlot(entry.table, kMap, entry.table[kMap],
+                reinterpret_cast<void*>(&observedMap));
+        }
+        if (unmap_active && entry.orig_unmap &&
+            entry.table[kUnmap] != reinterpret_cast<void*>(&observedUnmap)) {
+            patchSlot(entry.table, kUnmap, entry.table[kUnmap],
+                reinterpret_cast<void*>(&observedUnmap));
+        }
+    }
 }
 } // namespace
 
@@ -3407,12 +4888,14 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_config_loaded = true;
         auto& cfg = edpe::Config::instance();
         cfg.load();
+        jitter_enabled.store(cfg.jitterEnabled, std::memory_order_relaxed);
         s_jitter_invert_x.store(cfg.jitterInvertX, std::memory_order_relaxed);
         s_jitter_invert_y.store(cfg.jitterInvertY, std::memory_order_relaxed);
         s_jitter_swap_xy.store(cfg.jitterSwapXY, std::memory_order_relaxed);
         s_jitter_scale.store(cfg.jitterScale, std::memory_order_relaxed);
         s_jitter_phase_count.store(cfg.jitterPhaseCount, std::memory_order_relaxed);
         s_preserve_native_ui.store(cfg.preserveNativeUi, std::memory_order_relaxed);
+        s_sharpness.store(cfg.sharpness, std::memory_order_relaxed);
         s_jitter_debug_view.store(cfg.jitterDebugView, std::memory_order_relaxed);
         s_jitter_debug_sensitivity.store(cfg.jitterDebugSensitivity, std::memory_order_relaxed);
         s_jitter_debug_threshold.store(cfg.jitterDebugThreshold, std::memory_order_relaxed);
@@ -3441,21 +4924,21 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         ~PresentScopeGuard() { s_in_edpe_present.store(false, std::memory_order_release); }
     } present_scope_guard;
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
-        auto* context = observed_context.load(std::memory_order_acquire);
+        auto* context = activeSceneContext();
         endHudDrawProbe();
         endVSBufferProbe();
         endPipelineSample(context);
         pollPipelineSamples(context);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain)
-        pollConstantBufferSamples(observed_context.load(std::memory_order_acquire));
+        pollConstantBufferSamples(activeSceneContext());
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
-        auto* context = observed_context.load(std::memory_order_acquire);
+        auto* context = activeSceneContext();
         copyCameraDeltaSource(context);
         pollCameraDeltaRing(context);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
-        auto* context = observed_context.load(std::memory_order_acquire);
+        auto* context = activeSceneContext();
         queueCameraPairDepth(context, frame);
         pollCameraPairDepth(context);
         pollMotionGrid(context);
@@ -3469,7 +4952,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         int finished_pair = -1;
         {
             std::lock_guard lock(seen_mutex);
-            if (camera_pair_target >= 0 && frame >= camera_pair_armed_after + 2) {
+            if (camera_pair_target >= 0 &&
+                ((camera_pair_sample_frames[1] != ~0ull && frame > camera_pair_sample_frames[1]) ||
+                 frame >= camera_pair_armed_after + 120)) {
                 finished_pair = camera_pair_target;
                 camera_pair_target = -1;
                 for (auto& sample : camera_pair_depth) {
@@ -3500,22 +4985,30 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain &&
         sequence_active.exchange(false, std::memory_order_acq_rel)) {
-        std::array<int, 64> sequence{};
-        size_t stored = 0;
-        unsigned transitions = 0;
-        {
-            std::lock_guard lock(seen_mutex);
-            sequence = bind_sequence;
-            stored = sequence_stored;
-            transitions = sequence_transitions;
-        }
-        wchar_t message[128];
-        swprintf_s(message, L"EDPE: DSV bind sequence frame=%llu transitions=%u stored=%zu",
-            frame, transitions, stored);
-        EdpeLog(message);
-        for (size_t i = 0; i < stored; ++i) {
-            swprintf_s(message, L"EDPE: DSV bind sequence %zu target=%d", i, sequence[i]);
+        const size_t ctxCount = s_tracked_context_count.load(std::memory_order_acquire);
+        bool any_logged = false;
+        for (size_t c = 0; c < ctxCount; ++c) {
+            auto* data = s_tracked_contexts[c].get();
+            if (!data) continue;
+            std::array<int, 64> sequence{};
+            size_t stored = 0;
+            unsigned transitions = 0;
+            {
+                std::lock_guard lock(seen_mutex);
+                sequence = data->bind_sequence;
+                stored = data->sequence_stored;
+                transitions = data->sequence_transitions;
+            }
+            if (transitions == 0 && (c + 1 < ctxCount || any_logged)) continue;
+            any_logged = true;
+            wchar_t message[160];
+            swprintf_s(message, L"EDPE: DSV bind sequence frame=%llu transitions=%u stored=%zu ctx=%p",
+                frame, transitions, stored, data->context);
             EdpeLog(message);
+            for (size_t i = 0; i < stored; ++i) {
+                swprintf_s(message, L"EDPE: DSV bind sequence %zu target=%d", i, sequence[i]);
+                EdpeLog(message);
+            }
         }
     }
     if (!attempted) {
@@ -3528,43 +5021,36 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         device->Release();
         if (!context) return;
         void** table = *reinterpret_cast<void***>(context);
-        auto forward = reinterpret_cast<OMSetRenderTargetsFn>(table[kOMSetRenderTargets]);
-        if (!forward) {
+        if (!table) {
             context->Release();
             return;
         }
-        original.store(forward, std::memory_order_release);
+
+        ContextCensusHookContext(context);
         observed_context.store(context, std::memory_order_release);
-        if (patchSlot(table, kOMSetRenderTargets, reinterpret_cast<void*>(forward),
-                reinterpret_cast<void*>(&observedOMSetRenderTargets))) {
-            patched_table = table;
-            observed_swap_chain = swap_chain;
-            DXGI_SWAP_CHAIN_DESC sc_init{};
-            if (SUCCEEDED(swap_chain->GetDesc(&sc_init))) {
-                s_swapchain_width.store(sc_init.BufferDesc.Width, std::memory_order_relaxed);
-                s_swapchain_height.store(sc_init.BufferDesc.Height, std::memory_order_relaxed);
-            }
-            EdpeLog(L"EDPE: OMSetRenderTargets DSV census armed");
-
-            auto map_forward = reinterpret_cast<MapFn>(table[kMap]);
-            auto unmap_forward = reinterpret_cast<UnmapFn>(table[kUnmap]);
-            if (map_forward) original_map.store(map_forward, std::memory_order_release);
-            if (unmap_forward) original_unmap.store(unmap_forward, std::memory_order_release);
-
-            bool map_ok = map_forward && patchSlot(table, kMap,
-                reinterpret_cast<void*>(map_forward), reinterpret_cast<void*>(&observedMap));
-            bool unmap_ok = unmap_forward && patchSlot(table, kUnmap,
-                reinterpret_cast<void*>(unmap_forward), reinterpret_cast<void*>(&observedUnmap));
-            map_hook_active.store(map_ok, std::memory_order_release);
-            unmap_hook_active.store(unmap_ok, std::memory_order_release);
-            wchar_t hook_msg[128];
-            swprintf_s(hook_msg, L"EDPE: Map/Unmap hooks armed map=%u unmap=%u", map_ok, unmap_ok);
-            EdpeLog(hook_msg);
-        } else {
-            observed_context.store(nullptr, std::memory_order_release);
-            context->Release();
-            EdpeLog(L"EDPE: OMSetRenderTargets DSV census unavailable");
+        patched_table = table;
+        observed_swap_chain = swap_chain;
+        DXGI_SWAP_CHAIN_DESC sc_init{};
+        if (SUCCEEDED(swap_chain->GetDesc(&sc_init))) {
+            s_swapchain_width.store(sc_init.BufferDesc.Width, std::memory_order_relaxed);
+            s_swapchain_height.store(sc_init.BufferDesc.Height, std::memory_order_relaxed);
         }
+        EdpeLog(L"EDPE: OMSetRenderTargets DSV census armed");
+
+        auto map_forward = reinterpret_cast<MapFn>(table[kMap]);
+        auto unmap_forward = reinterpret_cast<UnmapFn>(table[kUnmap]);
+        if (map_forward && map_forward != &observedMap) original_map.store(map_forward, std::memory_order_release);
+        if (unmap_forward && unmap_forward != &observedUnmap) original_unmap.store(unmap_forward, std::memory_order_release);
+
+        bool map_ok = map_forward && (map_forward == &observedMap || patchSlot(table, kMap,
+            reinterpret_cast<void*>(map_forward), reinterpret_cast<void*>(&observedMap)));
+        bool unmap_ok = unmap_forward && (unmap_forward == &observedUnmap || patchSlot(table, kUnmap,
+            reinterpret_cast<void*>(unmap_forward), reinterpret_cast<void*>(&observedUnmap)));
+        map_hook_active.store(map_ok, std::memory_order_release);
+        unmap_hook_active.store(unmap_ok, std::memory_order_release);
+        wchar_t hook_msg[128];
+        swprintf_s(hook_msg, L"EDPE: Map/Unmap hooks armed map=%u unmap=%u", map_ok, unmap_ok);
+        EdpeLog(hook_msg);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         rearmContextHooks();
@@ -3581,31 +5067,77 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 if (debug_view_active) {
                     renderJitterDebugView(context, rendered_frame, backbuffer.Get());
                 }
+                if (edpe::UpscalerManager::instance().isReconstructionActive() &&
+                    jittered_writes_count.load(std::memory_order_relaxed) == 0 &&
+                    motion_color_frame == rendered_frame) {
+                    static unsigned long long s_last_zero_write_warn = 0;
+                    if (rendered_frame > s_last_zero_write_warn + 60) {
+                        s_last_zero_write_warn = rendered_frame;
+                        wchar_t zMsg[256];
+                        swprintf_s(zMsg,
+                            L"EDPE: zero jitter writes on scene frame %llu (mrt_frame=%llu, hdr0_frame=%llu, has_staged=%d, staged_frame=%llu)",
+                            rendered_frame, motion_color_frame, s_hdr_slot0_seen_frame, (int)s_has_staged_camera, s_staged_camera_frame);
+                        EdpeLog(zMsg);
+                    }
+                }
+            }
+        }
+        // Fail open (AGENTS.md "Projection jitter"): Elite must never keep rendering a
+        // jittered image that reconstruction did not resolve this frame; the raw
+        // sub-pixel offset shows up as the whole image constantly shaking.
+        // Stand the jitter down with back-off until reconstruction works again.
+        if (s_last_reconstructed_frame == rendered_frame) {
+            s_jitter_standdown_until.store(0, std::memory_order_relaxed);
+            s_jitter_standdown_len = 2;
+            s_unreconstructed_jitter_streak = 0;
+        } else if (s_jitter_injected_frame == rendered_frame &&
+            !s_jitter_debug_view.load(std::memory_order_relaxed) &&
+            !jitter_test_override.load(std::memory_order_relaxed)) {
+            if (s_probe_seen_this_frame && !s_has_staged_camera) {
+                // Зондовий кадр без основної сцени: не накладаємо штраф standdown і не скидаємо фазу
+            } else if (++s_unreconstructed_jitter_streak >= 8) {
+                s_jitter_standdown_until.store(rendered_frame + 2ull, std::memory_order_relaxed);
+                wchar_t standdown_msg[200];
+                swprintf_s(standdown_msg, L"EDPE: jitter stood down for 2 frames (unreconstructed streak=%u)",
+                    s_unreconstructed_jitter_streak);
+                EdpeLog(standdown_msg);
+            }
+        }
+        s_probe_seen_this_frame = false;
+        s_ustat = UnmapFrameStats{};
+        if (!s_upscale_evaluated_this_frame) {
+            bool dummy_cut = false;
+            if (s_has_staged_camera && s_staged_camera_frame == rendered_frame) {
+                commitMainCamera(rendered_frame, dummy_cut);
             }
         }
         s_upscale_evaluated_this_frame = false;
         motion_color_first_exit_logged = false;
-        s_latest_unmapped_camera_valid = false;
+        s_has_staged_camera = false;
+        s_staged_from_in_scene = false;
+        s_hdr_slot0_seen_frame = ~0ull;
         s_jitter_injected_frame = ~0ull;
         clearTrackedMappedBuffers();
-        static unsigned s_watchdog_last_jitter_writes = 0;
-        static unsigned s_watchdog_no_jitter_frames = 0;
-        const unsigned cur_writes = jittered_writes_count.load(std::memory_order_relaxed);
+        clearRejectedResourceCache();
+        static uint64_t s_watchdog_last_camera_seen = 0;
+        static unsigned s_watchdog_no_camera_frames = 0;
+        const uint64_t cur_camera_seen = s_valid_camera_seen_counter.load(std::memory_order_relaxed);
         if (edpe::UpscalerManager::instance().isReconstructionActive()) {
-            if (cur_writes == s_watchdog_last_jitter_writes) {
+            if (cur_camera_seen == s_watchdog_last_camera_seen) {
                 if (scene_map_target.load(std::memory_order_relaxed) != nullptr) {
-                    if (++s_watchdog_no_jitter_frames >= 120) {
+                    if (++s_watchdog_no_camera_frames >= 120) {
                         scene_map_target.store(nullptr, std::memory_order_release);
-                        s_watchdog_no_jitter_frames = 0;
+                        clearRejectedResourceCache();
+                        s_watchdog_no_camera_frames = 0;
                     }
                 }
             } else {
-                s_watchdog_last_jitter_writes = cur_writes;
-                s_watchdog_no_jitter_frames = 0;
+                s_watchdog_last_camera_seen = cur_camera_seen;
+                s_watchdog_no_camera_frames = 0;
             }
         } else {
-            s_watchdog_last_jitter_writes = cur_writes;
-            s_watchdog_no_jitter_frames = 0;
+            s_watchdog_last_camera_seen = cur_camera_seen;
+            s_watchdog_no_camera_frames = 0;
         }
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
@@ -3621,7 +5153,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
         active_render_width = (sceneW > 0 && (!outW || sceneW <= outW)) ? sceneW : outW;
         active_render_height = (sceneH > 0 && (!outH || sceneH <= outH)) ? sceneH : outH;
-        if (active_render_width && active_render_height) {
+
+        if (active_render_width && active_render_height && jitter_frame_index.load(std::memory_order_relaxed) == 0) {
             std::lock_guard lock(jitter_mutex);
             const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
             unsigned phases = base_phases;
@@ -3631,14 +5164,13 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     std::lround(static_cast<float>(base_phases) * upscaleRatio * upscaleRatio), 8l, 256l));
             }
             s_active_jitter_phases.store(phases ? phases : 32, std::memory_order_relaxed);
-            auto jitter = edpe::projectionJitter(frame, active_render_width, active_render_height, phases);
+            auto jitter = edpe::projectionJitter(0, active_render_width, active_render_height, phases);
             const float scale = s_jitter_scale.load(std::memory_order_relaxed);
             jitter.pixelX *= scale;
             jitter.pixelY *= scale;
             jitter.ndcX *= scale;
             jitter.ndcY *= scale;
             active_projection_jitter = jitter;
-            jitter_frame_index.store(frame, std::memory_order_relaxed);
         }
 
         if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
@@ -3660,11 +5192,13 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             s_last_writes = cur_writes;
 
             const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
+            const unsigned long long scene_seq = jitter_frame_index.load(std::memory_order_relaxed);
             edpe::JitterFrameLog jlog{};
             jlog.frame = frame;
+            jlog.timeMs = getJitterLogTimeMs();
             jlog.deltaMs = dt_ms;
-            jlog.phase = static_cast<unsigned>(frame % (base_phases ? base_phases : 8));
-            jlog.totalPhases = base_phases ? base_phases : 8;
+            jlog.phase = static_cast<unsigned>(scene_seq % (base_phases ? base_phases : 32));
+            jlog.totalPhases = base_phases ? base_phases : 32;
             jlog.pixelX = s_injected_jitter.pixelX;
             jlog.pixelY = s_injected_jitter.pixelY;
             jlog.ndcX = s_injected_jitter.ndcX;
@@ -3673,46 +5207,95 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             jlog.rejections = jitter_rejection_count.load(std::memory_order_relaxed);
             jlog.evalJx = 0.0f;
             jlog.evalJy = 0.0f;
-            jlog.syncOk = (s_jitter_injected_frame == frame);
+            jlog.syncOk = (s_jitter_injected_frame == frame && writes_this_frame > 0);
             jlog.cameraValid = (s_camera_now.scaleX > 0.0f);
-            jlog.heldJitter = false;
+            jlog.heldJitter = (writes_this_frame == 0);
             jlog.sceneCut = false;
             edpe::JitterLogger::instance().pushFrame(jlog);
         }
     }
+    if (frame % 1024 == 0 && observed_swap_chain == swap_chain) {
+        wchar_t callMsg[256];
+        swprintf_s(callMsg,
+            L"EDPE: context calls frame=%llu OMSetRenderTargets=%llu OMSetRenderTargetsAndUnorderedAccessViews=%llu FinishCommandList=%llu ExecuteCommandList=%llu",
+            frame,
+            s_count_om_set_render_targets.load(std::memory_order_relaxed),
+            s_count_om_set_rt_uav.load(std::memory_order_relaxed),
+            s_count_finish_command_list.load(std::memory_order_relaxed),
+            s_count_execute_command_list.load(std::memory_order_relaxed));
+        EdpeLog(callMsg);
+
+        const size_t ctxCount = s_tracked_context_count.load(std::memory_order_acquire);
+        for (size_t i = 0; i < ctxCount; ++i) {
+            auto* data = s_tracked_contexts[i].get();
+            if (!data) continue;
+            const unsigned long long omCalls = data->omCalls.load(std::memory_order_relaxed);
+            const unsigned long long gameOm = data->gameOmCalls.load(std::memory_order_relaxed);
+            const unsigned long long ownOm = data->edpeOmCalls.load(std::memory_order_relaxed);
+            const unsigned long long uavCalls = data->omUavCalls.load(std::memory_order_relaxed);
+            const unsigned long long gameUav = data->gameOmUavCalls.load(std::memory_order_relaxed);
+            const unsigned long long ownUav = data->edpeOmUavCalls.load(std::memory_order_relaxed);
+            const unsigned long long dsvCalls = data->nonNullDsvCalls.load(std::memory_order_relaxed);
+            const unsigned long long gameDsv = data->gameNonNullDsvCalls.load(std::memory_order_relaxed);
+            const unsigned long long ownDsv = data->edpeNonNullDsvCalls.load(std::memory_order_relaxed);
+            const UINT maxW = data->maxDsvWidth.load(std::memory_order_relaxed);
+            const UINT maxH = data->maxDsvHeight.load(std::memory_order_relaxed);
+
+            wchar_t ctxMsg[512];
+            swprintf_s(ctxMsg,
+                L"EDPE: context census ctx=%p device=%p OMSetRenderTargets=%llu (game=%llu own=%llu) OMSetRenderTargetsAndUnorderedAccessViews=%llu (game=%llu own=%llu) omCalls=%llu dsvCalls=%llu (game=%llu own=%llu) maxDsv=%ux%u",
+                data->context, data->owningDevice,
+                omCalls, gameOm, ownOm,
+                uavCalls, gameUav, ownUav,
+                omCalls + uavCalls,
+                dsvCalls, gameDsv, ownDsv,
+                maxW, maxH);
+            EdpeLog(ctxMsg);
+        }
+        findSceneContextData(true);
+    }
     if (frame % 1024 == 0 && observed_swap_chain == swap_chain &&
         !edpe::UpscalerManager::instance().isReconstructionActive()) {
-        size_t distinct = 0;
-        std::array<unsigned long long, 32> counts{};
-        {
-            std::lock_guard lock(seen_mutex);
-            distinct = seen_count;
-            for (size_t i = 0; i < distinct; ++i) {
-                counts[i] = seen[i].interval_binds;
-                seen[i].interval_binds = 0;
-            }
-        }
-        wchar_t message[144];
-        swprintf_s(message, L"EDPE: DSV census frame=%llu binds=%llu unique=%zu slotActive=%u",
-            frame, dsv_binds.load(std::memory_order_relaxed), distinct,
-            patched_table && patched_table[kOMSetRenderTargets] ==
-                reinterpret_cast<void*>(&observedOMSetRenderTargets));
-        EdpeLog(message);
-        int busiest[4]{-1, -1, -1, -1};
-        unsigned long long binds[4]{};
-        for (size_t rank = 0; rank < 4; ++rank) {
-            for (size_t i = 0; i < distinct; ++i) {
-                if (counts[i] > binds[rank]) {
-                    binds[rank] = counts[i];
-                    busiest[rank] = static_cast<int>(i);
+        const size_t ctxCount = s_tracked_context_count.load(std::memory_order_acquire);
+        const unsigned slotActive = patched_table && patched_table[kOMSetRenderTargets] ==
+            reinterpret_cast<void*>(&observedOMSetRenderTargets);
+        for (size_t c = 0; c < ctxCount; ++c) {
+            auto* data = s_tracked_contexts[c].get();
+            if (!data) continue;
+            size_t distinct = 0;
+            std::array<unsigned long long, 32> counts{};
+            {
+                std::lock_guard lock(seen_mutex);
+                distinct = data->seen_count;
+                for (size_t i = 0; i < distinct; ++i) {
+                    counts[i] = data->seen[i].interval_binds;
+                    data->seen[i].interval_binds = 0;
                 }
             }
-            if (busiest[rank] >= 0) counts[busiest[rank]] = 0;
+            const unsigned long long ctxBinds = data->dsv_binds.load(std::memory_order_relaxed);
+            if (distinct == 0 && ctxBinds == 0 &&
+                data->context != observed_context.load(std::memory_order_acquire))
+                continue;
+            wchar_t message[192];
+            swprintf_s(message, L"EDPE: DSV census frame=%llu binds=%llu unique=%zu slotActive=%u ctx=%p",
+                frame, ctxBinds, distinct, slotActive, data->context);
+            EdpeLog(message);
+            int busiest[4]{-1, -1, -1, -1};
+            unsigned long long binds[4]{};
+            for (size_t rank = 0; rank < 4; ++rank) {
+                for (size_t i = 0; i < distinct; ++i) {
+                    if (counts[i] > binds[rank]) {
+                        binds[rank] = counts[i];
+                        busiest[rank] = static_cast<int>(i);
+                    }
+                }
+                if (busiest[rank] >= 0) counts[busiest[rank]] = 0;
+            }
+            swprintf_s(message, L"EDPE: DSV interval frame=%llu top=%d:%llu,%d:%llu,%d:%llu,%d:%llu ctx=%p",
+                frame, busiest[0], binds[0], busiest[1], binds[1],
+                busiest[2], binds[2], busiest[3], binds[3], data->context);
+            EdpeLog(message);
         }
-        swprintf_s(message, L"EDPE: DSV interval frame=%llu top=%d:%llu,%d:%llu,%d:%llu,%d:%llu",
-            frame, busiest[0], binds[0], busiest[1], binds[1],
-            busiest[2], binds[2], busiest[3], binds[3]);
-        EdpeLog(message);
     }
     edpe::Profiler::instance().onFrameEnd();
 }
@@ -3724,9 +5307,14 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
     {
         std::lock_guard lock(seen_mutex);
         if (arm_sequence) {
-            sequence_stored = 0;
-            sequence_transitions = 0;
-            sequence_last = -2;
+            const size_t ctxCount = s_tracked_context_count.load(std::memory_order_acquire);
+            for (size_t i = 0; i < ctxCount; ++i) {
+                if (auto* data = s_tracked_contexts[i].get()) {
+                    data->sequence_stored = 0;
+                    data->sequence_transitions = 0;
+                    data->sequence_last = -2;
+                }
+            }
             sequence_active.store(true, std::memory_order_release);
         }
         if (snapshot_queued >= 0) {
@@ -3742,6 +5330,7 @@ void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags) {
             camera_pair_target = camera_pair_queued;
             camera_pair_queued = -1;
             camera_pair_armed_after = last_present_frame.load(std::memory_order_relaxed);
+            camera_pair_sample_frames = {~0ull, ~0ull};
             camera_pair_bind_frame = ~0ull;
             camera_pair_bind_count = 0;
             motion_pair_active = motion_pair_queued;
@@ -3793,13 +5382,18 @@ bool ContextCensusBindSequenceAvailable() {
 }
 
 namespace {
-bool depthSnapshotAvailableLocked(unsigned index) {
-    if (!patched_table || index >= seen_count || snapshot_queued >= 0 ||
+bool depthSnapshotAvailableForContextLocked(const PerContextData* ctxData, unsigned index) {
+    if (!patched_table || !ctxData || index >= ctxData->seen_count || snapshot_queued >= 0 ||
         snapshot_active >= 0 || snapshot_view || camera_pair_queued >= 0 ||
         camera_pair_target >= 0 || camera_pair_depth[0].staging ||
         camera_pair_depth[1].staging || motion_pair_active ||
         motion_grid_readback) return false;
-    const auto& candidate = seen[index];
+    const auto& candidate = ctxData->seen[index];
+    const UINT scW = s_swapchain_width.load(std::memory_order_relaxed);
+    const UINT scH = s_swapchain_height.load(std::memory_order_relaxed);
+    if (scW > scH && candidate.width == candidate.height) {
+        return false;
+    }
     return candidate.samples == 1 &&
         (candidate.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS ||
          candidate.texture_format == DXGI_FORMAT_R24G8_TYPELESS);
@@ -3807,28 +5401,35 @@ bool depthSnapshotAvailableLocked(unsigned index) {
 }
 
 bool ContextCensusRequestDepthSnapshot(unsigned index) {
+    PerContextData* sceneCtx = findSceneContextData(false);
     std::lock_guard lock(seen_mutex);
-    if (!depthSnapshotAvailableLocked(index)) return false;
+    if (!depthSnapshotAvailableForContextLocked(sceneCtx, index)) return false;
+    snapshot_target_context = sceneCtx->context;
     snapshot_queued = static_cast<int>(index);
     return true;
 }
 
 bool ContextCensusDepthSnapshotAvailable(unsigned index) {
+    PerContextData* sceneCtx = findSceneContextData(false);
     std::lock_guard lock(seen_mutex);
-    return depthSnapshotAvailableLocked(index);
+    return depthSnapshotAvailableForContextLocked(sceneCtx, index);
 }
 
 bool ContextCensusRequestCameraPair(unsigned index) {
+    PerContextData* sceneCtx = findSceneContextData(false);
     std::lock_guard lock(seen_mutex);
-    if (!depthSnapshotAvailableLocked(index)) return false;
+    if (!depthSnapshotAvailableForContextLocked(sceneCtx, index)) return false;
+    camera_pair_context = sceneCtx->context;
     camera_pair_queued = static_cast<int>(index);
     return true;
 }
 
 bool ContextCensusRequestMotionPair(unsigned index) {
+    PerContextData* sceneCtx = findSceneContextData(false);
     std::lock_guard lock(seen_mutex);
-    if (!depthSnapshotAvailableLocked(index) ||
-        seen[index].texture_format != DXGI_FORMAT_R32G8X24_TYPELESS) return false;
+    if (!depthSnapshotAvailableForContextLocked(sceneCtx, index) ||
+        sceneCtx->seen[index].texture_format != DXGI_FORMAT_R32G8X24_TYPELESS) return false;
+    camera_pair_context = sceneCtx->context;
     camera_pair_queued = static_cast<int>(index);
     motion_pair_queued = true;
     return true;
@@ -3864,18 +5465,42 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionDepthSnapshot(UINT* width, UINT
 }
 
 int ContextCensusSceneDepthCandidate() {
+    PerContextData* sceneCtx = findSceneContextData(true);
     std::lock_guard lock(seen_mutex);
+    if (!sceneCtx) return -1;
     const auto frame = last_present_frame.load(std::memory_order_relaxed);
-    int candidate = -1;
-    for (size_t index = 0; index < seen_count; ++index) {
-        const auto match = seen[index].scene_match_frame;
+
+    int bestCandidate = -1;
+
+    for (size_t index = 0; index < sceneCtx->seen_count; ++index) {
+        const auto match = sceneCtx->seen[index].scene_match_frame;
         // Present can run between scene signature binds; keep a recent match stable.
         if (match == ~0ull || match > frame || frame - match > 32 ||
-            !depthSnapshotAvailableLocked(static_cast<unsigned>(index))) continue;
-        if (candidate >= 0) return -1; // Ambiguous: require manual selection.
-        candidate = static_cast<int>(index);
+            !depthSnapshotAvailableForContextLocked(sceneCtx, static_cast<unsigned>(index))) continue;
+
+        if (bestCandidate < 0) {
+            bestCandidate = static_cast<int>(index);
+            continue;
+        }
+
+        const auto& cand = sceneCtx->seen[index];
+        const auto& best = sceneCtx->seen[bestCandidate];
+        const int candPrio = (cand.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS) ? 1 : 0;
+        const int bestPrio = (best.texture_format == DXGI_FORMAT_R32G8X24_TYPELESS) ? 1 : 0;
+
+        if (candPrio > bestPrio) {
+            bestCandidate = static_cast<int>(index);
+        } else if (candPrio == bestPrio) {
+            if (cand.scene_match_frame > best.scene_match_frame) {
+                bestCandidate = static_cast<int>(index);
+            } else if (cand.scene_match_frame == best.scene_match_frame) {
+                if (index > static_cast<size_t>(bestCandidate)) {
+                    bestCandidate = static_cast<int>(index);
+                }
+            }
+        }
     }
-    return candidate;
+    return bestCandidate;
 }
 
 ID3D11DepthStencilView* ContextCensusTakeDepthSnapshot(unsigned* index,
@@ -3964,13 +5589,29 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         scene_hdr_color_frame = ~0ull;
         s_dlaa_input.Reset();
         s_dlaa_input_srv.Reset();
+        s_dlss_output_texture.Reset();
+        s_dlss_output_srv.Reset();
+        s_backbuffer_copy.Reset();
+        s_backbuffer_copy_srv.Reset();
+        s_backbuffer_copy_rtv.Reset();
+        s_backbuffer_rtv.Reset();
+        s_cached_backbuffer_ptr = nullptr;
+        resetSharedBackbufferBridge();
+        s_last_final_output_present.Reset();
+        s_last_reconstructed_output.Reset();
+        s_temporal_resources_device = nullptr;
+        s_last_reconstructed_frame = ~0ull;
         s_last_temporal_inputs = {};
         s_last_temporal_inputs_frame = ~0ull;
-        s_in_scene_camera_latched_frame = ~0ull;
         s_hdr_slot0_seen_frame = ~0ull;
         s_consecutive_skipped_frames = 0;
-        s_auxiliary_rejection_streak = 0;
-        s_fallback_unmapped_camera_frame = ~0ull;
+        s_has_staged_camera = false;
+        s_staged_from_in_scene = false;
+        s_staged_camera_frame = ~0ull;
+        s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+        s_prev_valid_velocity = {0.0f, 0.0f, 0.0f};
+        s_teleport_rejection_streak = 0;
+        s_cut_rejection_streak = 0;
         s_gbuffer_resources = {};
         s_observed_scene_width.store(0, std::memory_order_relaxed);
         s_observed_scene_height.store(0, std::memory_order_relaxed);
@@ -3987,9 +5628,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_color_bound = motion_color_rebound =
             motion_color_first_exit_logged = false;
         motion_grid_readback.Reset();
+        motion_grid_context = nullptr;
         motion_snapshot.Reset();
         motion_pass.reset();
         motion_camera_frames = {~0ull, ~0ull};
+        camera_pair_sample_frames = {~0ull, ~0ull};
         gpu_camera_pair = {};
         motion_depth_frame = ~0ull;
         camera_pair_bind_frame = ~0ull;
@@ -4005,19 +5648,62 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     for (auto& sample : constant_buffer_samples) {
         if (sample.buffer) sample.buffer->Release();
         sample.buffer = nullptr;
+        sample.context = nullptr;
         sample.ready.store(false, std::memory_order_release);
         sample.claimed.store(false, std::memory_order_release);
     }
     {
         std::lock_guard lock(seen_mutex);
         for (auto& sample : pipeline_samples) {
-            if (sample.active) observed_context.load(std::memory_order_acquire)->End(sample.query);
+            auto* end_ctx = sample.context ? sample.context : observed_context.load(std::memory_order_acquire);
+            if (sample.active && end_ctx) end_ctx->End(sample.query);
             if (sample.query) sample.query->Release();
             sample = {};
         }
     }
     endVSBufferProbe();
     resetCameraDelta();
+    for (size_t i = 0; i < s_cloned_context_count.load(std::memory_order_acquire); ++i) {
+        if (s_cloned_contexts[i] && s_cloned_contexts[i]->context && s_cloned_contexts[i]->original_table) {
+            *reinterpret_cast<void***>(s_cloned_contexts[i]->context) = s_cloned_contexts[i]->original_table;
+        }
+    }
+    for (size_t i = 0; i < s_hooked_table_count.load(std::memory_order_acquire); ++i) {
+        auto& entry = s_hooked_tables[i];
+        if (entry.table) {
+            if (entry.orig_om) {
+                patchSlot(entry.table, kOMSetRenderTargets,
+                    reinterpret_cast<void*>(&observedOMSetRenderTargets),
+                    reinterpret_cast<void*>(entry.orig_om));
+            }
+            if (entry.orig_om_uav) {
+                patchSlot(entry.table, kOMSetRenderTargetsAndUnorderedAccessViews,
+                    reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews),
+                    reinterpret_cast<void*>(entry.orig_om_uav));
+            }
+
+            if (entry.orig_exec) {
+                patchSlot(entry.table, kExecuteCommandList,
+                    reinterpret_cast<void*>(&observedExecuteCommandList),
+                    reinterpret_cast<void*>(entry.orig_exec));
+            }
+            if (entry.orig_finish) {
+                patchSlot(entry.table, kFinishCommandList,
+                    reinterpret_cast<void*>(&observedFinishCommandList),
+                    reinterpret_cast<void*>(entry.orig_finish));
+            }
+            if (entry.orig_map) {
+                patchSlot(entry.table, kMap,
+                    reinterpret_cast<void*>(&observedMap),
+                    reinterpret_cast<void*>(entry.orig_map));
+            }
+            if (entry.orig_unmap) {
+                patchSlot(entry.table, kUnmap,
+                    reinterpret_cast<void*>(&observedUnmap),
+                    reinterpret_cast<void*>(entry.orig_unmap));
+            }
+        }
+    }
     if (patched_table) {
         if (map_hook_active.exchange(false, std::memory_order_acq_rel)) {
             patchSlot(patched_table, kMap,
@@ -4029,9 +5715,6 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
                 reinterpret_cast<void*>(&observedUnmap),
                 reinterpret_cast<void*>(original_unmap.load(std::memory_order_acquire)));
         }
-        patchSlot(patched_table, kOMSetRenderTargets,
-            reinterpret_cast<void*>(&observedOMSetRenderTargets),
-            reinterpret_cast<void*>(original.load(std::memory_order_acquire)));
     }
     scene_map_target.store(nullptr, std::memory_order_release);
     scene_mapped_data.store(nullptr, std::memory_order_release);
@@ -4045,6 +5728,13 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
 
 void ContextCensusSetJitterEnabled(bool enabled) {
     jitter_enabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) {
+        s_jitter_standdown_until.store(0, std::memory_order_relaxed);
+        s_jitter_standdown_len = 60;
+    }
+    auto& cfg = edpe::Config::instance();
+    cfg.jitterEnabled = enabled;
+    cfg.save();
 }
 
 bool ContextCensusGetJitterEnabled() {
@@ -4052,6 +5742,9 @@ bool ContextCensusGetJitterEnabled() {
 }
 
 void ContextCensusSetJitterTestOverride(bool override) {
+    if (override) {
+        clearRejectedResourceCache();
+    }
     jitter_test_override.store(override, std::memory_order_relaxed);
 }
 
@@ -4063,6 +5756,7 @@ bool ContextCensusIsJitterActive() {
     if (!jitter_enabled.load(std::memory_order_relaxed)) return false;
     if (jitter_test_override.load(std::memory_order_relaxed)) return true;
     if (s_jitter_debug_view.load(std::memory_order_relaxed)) return true;
+    if (last_present_frame.load(std::memory_order_relaxed) < s_jitter_standdown_until.load(std::memory_order_relaxed)) return false;
     return edpe::UpscalerManager::instance().isReconstructionActive();
 }
 
@@ -4151,6 +5845,19 @@ void ContextCensusSetPreserveNativeUi(bool preserve) {
 }
 bool ContextCensusGetPreserveNativeUi() {
     return s_preserve_native_ui.load(std::memory_order_relaxed);
+}
+
+void ContextCensusSetSharpness(float sharpness) {
+    sharpness = std::clamp(sharpness, 0.0f, 1.0f);
+    s_sharpness.store(sharpness, std::memory_order_relaxed);
+    edpe::Config::instance().sharpness = sharpness;
+}
+
+float ContextCensusGetSharpness() {
+    if (!s_config_loaded) {
+        return edpe::Config::instance().sharpness;
+    }
+    return s_sharpness.load(std::memory_order_relaxed);
 }
 
 void ContextCensusSetZeroMotion(bool zero) {
@@ -4248,3 +5955,221 @@ int ContextCensusGetJitterDebugMode() {
     return s_jitter_debug_mode.load(std::memory_order_relaxed);
 }
 
+
+
+void ContextCensusHookContext(ID3D11DeviceContext* context) {
+    if (!context) return;
+    void** table = *reinterpret_cast<void***>(context);
+    if (!table) return;
+
+    {
+        const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
+        for (size_t i = 0; i < cloneCount; ++i) {
+            if (s_cloned_contexts[i] && s_cloned_contexts[i]->methods == table) {
+                table = s_cloned_contexts[i]->original_table;
+                break;
+            }
+        }
+    }
+
+    getOrCreateContextData(context);
+
+    bool alreadyHooked = false;
+    {
+        std::lock_guard lock(s_hooked_tables_mutex);
+        const size_t count = s_hooked_table_count.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < count; ++i) {
+            if (s_hooked_tables[i].table == table &&
+                table[kOMSetRenderTargets] == reinterpret_cast<void*>(&observedOMSetRenderTargets) &&
+                table[kOMSetRenderTargetsAndUnorderedAccessViews] ==
+                    reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews)) {
+                alreadyHooked = true;
+                break;
+            }
+        }
+    }
+
+    const bool is_immediate = (context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE);
+
+    bool sharedPatchOk = alreadyHooked;
+    if (!alreadyHooked) {
+        HookedTableEntry entry{};
+        entry.table = table;
+        entry.orig_om = reinterpret_cast<OMSetRenderTargetsFn>(table[kOMSetRenderTargets]);
+        entry.orig_om_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(
+            table[kOMSetRenderTargetsAndUnorderedAccessViews]);
+        entry.orig_exec = reinterpret_cast<ExecuteCommandListFn>(table[kExecuteCommandList]);
+        entry.orig_finish = reinterpret_cast<FinishCommandListFn>(table[kFinishCommandList]);
+
+        if (is_immediate) {
+            entry.orig_map = reinterpret_cast<MapFn>(table[kMap]);
+            entry.orig_unmap = reinterpret_cast<UnmapFn>(table[kUnmap]);
+        }
+
+        bool om_ok = (entry.orig_om == &observedOMSetRenderTargets);
+        if (entry.orig_om && entry.orig_om != &observedOMSetRenderTargets) {
+            original.store(entry.orig_om, std::memory_order_release);
+            om_ok = patchSlot(table, kOMSetRenderTargets, reinterpret_cast<void*>(entry.orig_om),
+                reinterpret_cast<void*>(&observedOMSetRenderTargets));
+        }
+        bool uav_ok = (entry.orig_om_uav == &observedOMSetRenderTargetsAndUnorderedAccessViews);
+        if (entry.orig_om_uav && entry.orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews) {
+            original_om_uav.store(entry.orig_om_uav, std::memory_order_release);
+            uav_ok = patchSlot(table, kOMSetRenderTargetsAndUnorderedAccessViews,
+                reinterpret_cast<void*>(entry.orig_om_uav),
+                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
+        }
+        if (entry.orig_exec && entry.orig_exec != &observedExecuteCommandList) {
+            original_execute_command_list.store(entry.orig_exec, std::memory_order_release);
+            patchSlot(table, kExecuteCommandList, reinterpret_cast<void*>(entry.orig_exec),
+                reinterpret_cast<void*>(&observedExecuteCommandList));
+        }
+
+        if (entry.orig_finish && entry.orig_finish != &observedFinishCommandList) {
+            original_finish_command_list.store(entry.orig_finish, std::memory_order_release);
+            patchSlot(table, kFinishCommandList, reinterpret_cast<void*>(entry.orig_finish),
+                reinterpret_cast<void*>(&observedFinishCommandList));
+        }
+        if (is_immediate) {
+            if (entry.orig_map && entry.orig_map != &observedMap) {
+                if (!original_map.load(std::memory_order_relaxed)) {
+                    original_map.store(entry.orig_map, std::memory_order_release);
+                }
+                if (map_hook_active.load(std::memory_order_acquire)) {
+                    patchSlot(table, kMap, reinterpret_cast<void*>(entry.orig_map),
+                        reinterpret_cast<void*>(&observedMap));
+                }
+            }
+            if (entry.orig_unmap && entry.orig_unmap != &observedUnmap) {
+                if (!original_unmap.load(std::memory_order_relaxed)) {
+                    original_unmap.store(entry.orig_unmap, std::memory_order_release);
+                }
+                if (unmap_hook_active.load(std::memory_order_acquire)) {
+                    patchSlot(table, kUnmap, reinterpret_cast<void*>(entry.orig_unmap),
+                        reinterpret_cast<void*>(&observedUnmap));
+                }
+            }
+        }
+        sharedPatchOk = om_ok && uav_ok;
+
+        std::lock_guard lock(s_hooked_tables_mutex);
+        const size_t count = s_hooked_table_count.load(std::memory_order_relaxed);
+        bool found = false;
+        for (size_t i = 0; i < count; ++i) {
+            if (s_hooked_tables[i].table == table) {
+                if (entry.orig_om != &observedOMSetRenderTargets) s_hooked_tables[i].orig_om = entry.orig_om;
+                if (entry.orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews)
+                    s_hooked_tables[i].orig_om_uav = entry.orig_om_uav;
+                if (entry.orig_exec != &observedExecuteCommandList) s_hooked_tables[i].orig_exec = entry.orig_exec;
+                if (entry.orig_finish != &observedFinishCommandList) s_hooked_tables[i].orig_finish = entry.orig_finish;
+
+                if (is_immediate) {
+                    if (entry.orig_map && entry.orig_map != &observedMap)
+                        s_hooked_tables[i].orig_map = entry.orig_map;
+                    if (entry.orig_unmap && entry.orig_unmap != &observedUnmap)
+                        s_hooked_tables[i].orig_unmap = entry.orig_unmap;
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found && count < kMaxHookedTables) {
+            s_hooked_tables[count] = entry;
+            s_hooked_table_count.store(count + 1, std::memory_order_release);
+        }
+    }
+
+    if (!sharedPatchOk) {
+        std::lock_guard lock(s_cloned_contexts_mutex);
+        const size_t cloneCount = s_cloned_context_count.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < cloneCount; ++i) {
+            if (s_cloned_contexts[i] && s_cloned_contexts[i]->context == context) return;
+        }
+        if (cloneCount < kMaxClonedContexts) {
+            auto clone = std::make_unique<ClonedContextVtable>();
+            clone->context = context;
+            clone->original_table = table;
+            clone->orig_om = reinterpret_cast<OMSetRenderTargetsFn>(table[kOMSetRenderTargets]);
+            clone->orig_om_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(
+                table[kOMSetRenderTargetsAndUnorderedAccessViews]);
+
+            if (is_immediate) {
+                clone->orig_map = reinterpret_cast<MapFn>(table[kMap]);
+                clone->orig_unmap = reinterpret_cast<UnmapFn>(table[kUnmap]);
+            }
+            std::memcpy(clone->methods, table, sizeof(clone->methods));
+            clone->methods[kOMSetRenderTargets] = reinterpret_cast<void*>(&observedOMSetRenderTargets);
+            clone->methods[kOMSetRenderTargetsAndUnorderedAccessViews] =
+                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews);
+
+            if (is_immediate && map_hook_active.load(std::memory_order_acquire)) {
+                clone->methods[kMap] = reinterpret_cast<void*>(&observedMap);
+            }
+            if (is_immediate && unmap_hook_active.load(std::memory_order_acquire)) {
+                clone->methods[kUnmap] = reinterpret_cast<void*>(&observedUnmap);
+            }
+            *reinterpret_cast<void***>(context) = clone->methods;
+            s_cloned_contexts[cloneCount] = std::move(clone);
+            s_cloned_context_count.store(cloneCount + 1, std::memory_order_release);
+            EdpeLog(L"EDPE: shared context vtable patch failed; installed per-context clone hook fallback");
+        }
+    }
+}
+
+void ContextCensusHookDeferredContext(ID3D11DeviceContext* context) {
+    if (!context) return;
+    ContextCensusHookContext(context);
+    void** table = *reinterpret_cast<void***>(context);
+    if (!table) return;
+
+    wchar_t msg[192];
+    swprintf_s(msg, L"EDPE: deferred context vtable hooked context=%p table=%p slot33=%p slot34=%p slot114=%p",
+        context, table, table[kOMSetRenderTargets], table[kOMSetRenderTargetsAndUnorderedAccessViews], table[kFinishCommandList]);
+    EdpeLog(msg);
+}
+
+void ContextCensusRegisterDevice(ID3D11Device* device, ID3D11DeviceContext* immContext) {
+    if (!device) return;
+    std::lock_guard lock(s_device_registry_mutex);
+    for (const auto& info : s_known_devices) {
+        if (info.device == device) return;
+    }
+    s_known_devices.push_back({device, immContext});
+}
+
+bool ContextCensusIsDeviceRegistered(ID3D11Device* device) {
+    if (!device) return false;
+    std::lock_guard lock(s_device_registry_mutex);
+    for (const auto& info : s_known_devices) {
+        if (info.device == device) return true;
+    }
+    return false;
+}
+
+void ContextCensusLogPresentDevice(IDXGISwapChain* swapChain, ID3D11Device* presentDevice) {
+    if (!presentDevice) return;
+    s_present_device.store(presentDevice, std::memory_order_release);
+    if (s_present_device_logged.exchange(true, std::memory_order_acq_rel)) return;
+
+    std::lock_guard lock(s_device_registry_mutex);
+    bool matched = false;
+    for (const auto& info : s_known_devices) {
+        if (info.device == presentDevice) {
+            matched = true;
+            break;
+        }
+    }
+    wchar_t msg[256];
+    if (matched) {
+        swprintf_s(msg, L"EDPE: Present swapchain=%p device=%p matched known device (total known: %zu)",
+            swapChain, presentDevice, s_known_devices.size());
+    } else {
+        swprintf_s(msg, L"EDPE: Present swapchain=%p device=%p not in known devices (total known: %zu)",
+            swapChain, presentDevice, s_known_devices.size());
+    }
+    EdpeLog(msg);
+}
+
+unsigned long long ContextCensusGetDsvBinds() {
+    return dsv_binds.load(std::memory_order_relaxed);
+}
