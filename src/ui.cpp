@@ -1614,9 +1614,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     const bool comparison_pending = ContextCensusIsComparisonCapturePending();
     const bool show_menu = menu_visible.load();
     const bool overlay_capture_pending = !ui.overlay_items.empty();
-    const bool show_perf = cfg.showPerfOverlay || comparison_pending || overlay_capture_pending;
+    const bool show_perf = cfg.showPerfOverlay || overlay_capture_pending;
 
-    if (!show_menu && !show_perf && !comparison_pending) {
+    if (!show_menu && !show_perf) {
         std::lock_guard lock(input_mutex);
         pending_input.clear();
         return;
@@ -1630,7 +1630,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGuiContext* previous = ImGui::GetCurrentContext();
     ImGui::SetCurrentContext(ui.imgui);
 
-    const bool draw_menu = show_menu && !comparison_pending && !overlay_capture_pending;
+    const bool draw_menu = show_menu && !overlay_capture_pending;
     ImGuiIO& io = ImGui::GetIO();
     io.MouseDrawCursor = draw_menu;
     if (draw_menu) {
@@ -1909,18 +1909,20 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::Separator();
     ImGui::TextUnformatted("Reconstruction Screenshot Comparison");
     const bool can_compare = backend_active && upscaler.isReconstructionActive();
-    if (!can_compare) ImGui::BeginDisabled();
+    const bool compare_running = ContextCensusIsComparisonCapturePending();
+    if (!can_compare || compare_running) ImGui::BeginDisabled();
     if (ImGui::Button("Capture All Upscaling Backends")) {
         ContextCensusRequestComparisonCapture();
     }
     if (ImGui::Checkbox("Include Performance HUD in comparison images", &cfg.captureOverlayInComparison)) {
         cfg.save();
     }
+    if (!can_compare || compare_running) ImGui::EndDisabled();
     if (!can_compare) {
-        ImGui::EndDisabled();
         ImGui::TextDisabled("Enable DLSS, DLAA, FSR or TAA to capture comparison");
-    } else if (ContextCensusIsComparisonCapturePending()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Comparison capture queued for next frame...");
+    } else if (compare_running) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%ls", ContextCensusComparisonProgress()[0] ?
+            ContextCensusComparisonProgress() : L"Comparison capture starting...");
     } else if (ui.last_comparison_saved[0] != L'\0') {
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%ls", ui.last_comparison_saved);
     }

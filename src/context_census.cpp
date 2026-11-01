@@ -1,3 +1,4 @@
+#include <chrono>
 #include "context_census.h"
 #include "crash_logger.h"
 #include "camera_delta.h"
@@ -3037,6 +3038,117 @@ DXGI_FORMAT concreteLdrColorFormat(DXGI_FORMAT fmt) {
 }
 
 static std::atomic<bool> s_comparison_capture_requested{false};
+
+// ---- Sequential comparison capture --------------------------------------------------------
+// For each available backend in turn: switch to it, let its temporal history settle, capture
+// "Before" (scene before reconstruction) and the reconstructed frame, then wait before the next
+// backend. The user's original backend/mode is restored at the end. Runs on the Present thread.
+namespace {
+enum class CmpPhase { Switch, Warmup, Wait };
+struct CmpSequence {
+    bool active = false;
+    std::vector<edpe::UpscalerBackend> list;
+    size_t idx = 0;
+    CmpPhase phase = CmpPhase::Switch;
+    int warmFrames = 0;
+    std::chrono::steady_clock::time_point phaseStart{};
+    std::chrono::steady_clock::time_point waitUntil{};
+    edpe::UpscalerBackend origBackend = edpe::UpscalerBackend::None;
+    edpe::UpscaleMode origMode = edpe::UpscaleMode::Native;
+};
+CmpSequence s_cmp_seq;
+wchar_t s_cmp_progress[96]{};
+constexpr int kCmpWarmupFrames = 16;
+constexpr auto kCmpWaitBetween = std::chrono::seconds(5);
+constexpr auto kCmpWarmupTimeout = std::chrono::seconds(8);
+
+const wchar_t* cmpBackendName(edpe::UpscalerBackend b) {
+    return b == edpe::UpscalerBackend::NvidiaDlss ? L"DLSS" :
+           b == edpe::UpscalerBackend::AmdFsr ? L"FSR" :
+           b == edpe::UpscalerBackend::Taa ? L"TAA" : L"None";
+}
+
+int cmpBackendId(edpe::UpscalerBackend b) {
+    return b == edpe::UpscalerBackend::NvidiaDlss ? 1 :
+           b == edpe::UpscalerBackend::AmdFsr ? 2 :
+           b == edpe::UpscalerBackend::Taa ? 3 : 0;
+}
+
+void cmpFinish(edpe::UpscalerManager& up) {
+    up.setBackend(s_cmp_seq.origBackend);
+    up.setMode(s_cmp_seq.origMode);
+    up.requestReset();
+    s_cmp_seq.active = false;
+    s_cmp_seq.list.clear();
+    s_cmp_progress[0] = L'\0';
+    s_comparison_capture_requested.store(false, std::memory_order_release);
+    EdpeLog(L"EDPE: sequential comparison capture finished; original upscaler restored");
+}
+} // namespace
+
+static void advanceComparisonSequence() {
+    using clock = std::chrono::steady_clock;
+    auto& up = edpe::UpscalerManager::instance();
+    auto& s = s_cmp_seq;
+    if (!s.active) {
+        if (!s_comparison_capture_requested.load(std::memory_order_acquire)) return;
+        s.list.clear();
+        if (up.isReconstructionActive()) {
+            for (auto b : { edpe::UpscalerBackend::NvidiaDlss, edpe::UpscalerBackend::AmdFsr, edpe::UpscalerBackend::Taa }) {
+                if (up.isBackendAvailable(b)) s.list.push_back(b);
+            }
+        }
+        if (s.list.empty()) {
+            s_comparison_capture_requested.store(false, std::memory_order_release);
+            EdpeLog(L"EDPE: comparison capture ignored (no active reconstruction or no backends)");
+            return;
+        }
+        s.origBackend = up.getBackend();
+        s.origMode = up.getMode();
+        s.idx = 0;
+        s.phase = CmpPhase::Switch;
+        s.active = true;
+        EdpeLog(L"EDPE: sequential comparison capture started");
+    }
+    const auto now = clock::now();
+    switch (s.phase) {
+    case CmpPhase::Switch: {
+        if (s.idx >= s.list.size()) {
+            cmpFinish(up);
+            return;
+        }
+        const auto b = s.list[s.idx];
+        up.setBackend(b);
+        up.setMode(edpe::UpscaleMode::NativeAA);
+        up.requestReset();
+        s.warmFrames = kCmpWarmupFrames;
+        s.phaseStart = now;
+        s.phase = CmpPhase::Warmup;
+        swprintf_s(s_cmp_progress, L"Capturing %ls (%zu/%zu)...", cmpBackendName(b), s.idx + 1, s.list.size());
+        break;
+    }
+    case CmpPhase::Warmup:
+        if (now - s.phaseStart > kCmpWarmupTimeout) {
+            wchar_t msg[128];
+            swprintf_s(msg, L"EDPE: comparison capture skipped %ls (no reconstructed frames)", cmpBackendName(s.list[s.idx]));
+            EdpeLog(msg);
+            ++s.idx;
+            s.phase = CmpPhase::Switch;
+        }
+        break;
+    case CmpPhase::Wait: {
+        const auto left = std::chrono::duration_cast<std::chrono::seconds>(s.waitUntil - now).count();
+        if (now >= s.waitUntil) {
+            ++s.idx;
+            s.phase = CmpPhase::Switch;
+        } else {
+            swprintf_s(s_cmp_progress, L"Waiting %lld s before next backend (%zu/%zu done)...",
+                static_cast<long long>(left) + 1, s.idx + 1, s.list.size());
+        }
+        break;
+    }
+    }
+}
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_backbuffer_copy;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_backbuffer_copy_srv;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_copy_rtv;
@@ -3801,118 +3913,28 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 compOk = true;
             }
 
-            if (ContextCensusIsComparisonCapturePending()) {
-                // Temporal backends need accumulated history for a fair comparison:
-                // warm up every inactive backend for N frames, then capture.
-                constexpr int kCompWarmupFrames = 16;
-                static int s_comp_warmup_left = -1;
-                const bool compFirstWarmup = (s_comp_warmup_left < 0);
-                if (compFirstWarmup) s_comp_warmup_left = kCompWarmupFrames;
-                const bool compWarming = (s_comp_warmup_left > 0);
-                if (compWarming) --s_comp_warmup_left;
-                if (!compWarming) {
-                    ContextCensusConsumeComparisonCaptureRequest();
-                    s_comp_warmup_left = -1;
-                }
-                SYSTEMTIME captureTime{};
-                GetLocalTime(&captureTime);
-
-                // 1. Queue "Before" (the scene before any reconstruction)
-                if (s_backbuffer_copy) {
-                    if (!compWarming) UiQueueComparisonItem(context, L"Before", s_backbuffer_copy.Get(), &captureTime, 0);
-                }
-
-                // 2. Queue active backend (already evaluated into backbuffer)
-                const auto activeBackend = upscaler.getBackend();
-                const wchar_t* activeName = (activeBackend == edpe::UpscalerBackend::NvidiaDlss) ? L"DLSS" :
-                                            (activeBackend == edpe::UpscalerBackend::AmdFsr) ? L"FSR" :
-                                            (activeBackend == edpe::UpscalerBackend::Taa) ? L"TAA" : L"Active";
-                auto backendToId = [](edpe::UpscalerBackend b) {
-                    return b == edpe::UpscalerBackend::NvidiaDlss ? 1 :
-                           b == edpe::UpscalerBackend::AmdFsr ? 2 :
-                           b == edpe::UpscalerBackend::Taa ? 3 : 0;
-                };
-                if (!compWarming) UiQueueComparisonItem(context, activeName, backbuffer, &captureTime, backendToId(activeBackend));
-
-                // 3. Evaluate and queue each other available backend
-                struct BackendCandidate {
-                    edpe::UpscalerBackend backend;
-                    const wchar_t* name;
-                };
-                const BackendCandidate candidates[] = {
-                    { edpe::UpscalerBackend::NvidiaDlss, L"DLSS" },
-                    { edpe::UpscalerBackend::AmdFsr, L"FSR" },
-                    { edpe::UpscalerBackend::Taa, L"TAA" }
-                };
-
-                if (s_comp_eval_tex) {
-                    D3D11_TEXTURE2D_DESC cur{};
-                    s_comp_eval_tex->GetDesc(&cur);
-                    if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height || cur.Format != outFormat) {
-                        s_comp_eval_tex.Reset();
-                        s_comp_eval_srv.Reset();
-                        s_comp_eval_rtv.Reset();
+            if (s_cmp_seq.active && s_cmp_seq.phase == CmpPhase::Warmup &&
+                s_cmp_seq.idx < s_cmp_seq.list.size() &&
+                upscaler.getBackend() == s_cmp_seq.list[s_cmp_seq.idx]) {
+                if (s_cmp_seq.warmFrames > 0) {
+                    --s_cmp_seq.warmFrames;
+                } else {
+                    // Capture "Before" (scene before reconstruction) and the reconstructed frame
+                    // (already in `backbuffer`, with native UI composited when active).
+                    const auto activeBackend = upscaler.getBackend();
+                    const wchar_t* activeName = cmpBackendName(activeBackend);
+                    SYSTEMTIME captureTime{};
+                    GetLocalTime(&captureTime);
+                    if (s_backbuffer_copy) {
+                        wchar_t beforeName[48];
+                        swprintf_s(beforeName, L"Before-%ls", activeName);
+                        UiQueueComparisonItem(context, beforeName, s_backbuffer_copy.Get(), &captureTime, 0);
                     }
-                }
-                if (!s_comp_eval_tex) {
-                    D3D11_TEXTURE2D_DESC td = backbufferDesc;
-                    td.Format = outFormat;
-                    td.Usage = D3D11_USAGE_DEFAULT;
-                    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-                    if (SUCCEEDED(device->CreateTexture2D(&td, nullptr, &s_comp_eval_tex))) {
-                        device->CreateShaderResourceView(s_comp_eval_tex.Get(), nullptr, &s_comp_eval_srv);
-                        device->CreateRenderTargetView(s_comp_eval_tex.Get(), nullptr, &s_comp_eval_rtv);
-                    }
-                }
-
-                const bool needUiComp = canCompositeUi && ui_composite_pass;
-                if (needUiComp) {
-                    if (s_comp_final_tex) {
-                        D3D11_TEXTURE2D_DESC cur{};
-                        s_comp_final_tex->GetDesc(&cur);
-                        if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height || cur.Format != bbFormat) {
-                            s_comp_final_tex.Reset();
-                            s_comp_final_rtv.Reset();
-                        }
-                    }
-                    if (!s_comp_final_tex) {
-                        D3D11_TEXTURE2D_DESC td = backbufferDesc;
-                        td.Format = bbFormat;
-                        td.Usage = D3D11_USAGE_DEFAULT;
-                        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-                        if (SUCCEEDED(device->CreateTexture2D(&td, nullptr, &s_comp_final_tex))) {
-                            device->CreateRenderTargetView(s_comp_final_tex.Get(), nullptr, &s_comp_final_rtv);
-                        }
-                    }
-                }
-
-                edpe::TemporalFrameInputs compInputs = inputs;
-                compInputs.reset = inputs.reset || compFirstWarmup;
-
-                for (const auto& cand : candidates) {
-                    if (cand.backend == activeBackend) continue;
-                    if (!upscaler.isBackendAvailable(cand.backend)) continue;
-                    if (!s_comp_eval_tex) continue;
-                    if (!upscaler.isBackendModeSupported(cand.backend)) continue;
-
-                    const bool evalOk = upscaler.evaluateBackend(cand.backend, context, compInputs,
-                        s_comp_eval_rtv.Get(), s_comp_eval_tex.Get());
-                    if (!evalOk || compWarming) continue;
-
-                    ID3D11Texture2D* texToCapture = s_comp_eval_tex.Get();
-                    if (needUiComp && s_comp_final_tex && s_comp_final_rtv && s_comp_eval_srv) {
-                        if (ui_composite_pass->composite(context,
-                                s_comp_eval_srv.Get(),
-                                s_backbuffer_copy_srv.Get(),
-                                s_dlaa_input_srv.Get(),
-                                s_comp_final_rtv.Get(),
-                                backbufferDesc.Width, backbufferDesc.Height,
-                                depthDesc.Width, depthDesc.Height,
-                                isHdrColor)) {
-                            texToCapture = s_comp_final_tex.Get();
-                        }
-                    }
-                    UiQueueComparisonItem(context, cand.name, texToCapture, &captureTime, backendToId(cand.backend));
+                    UiQueueComparisonItem(context, activeName, backbuffer, &captureTime, cmpBackendId(activeBackend));
+                    const bool lastBackend = (s_cmp_seq.idx + 1 >= s_cmp_seq.list.size());
+                    s_cmp_seq.waitUntil = std::chrono::steady_clock::now() +
+                        (lastBackend ? std::chrono::seconds(0) : kCmpWaitBetween);
+                    s_cmp_seq.phase = CmpPhase::Wait;
                 }
             }
 
@@ -5186,6 +5208,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     reinterpret_cast<void**>(backbuffer.GetAddressOf())))) {
                 s_swapchain_backbuffer.store(backbuffer.Get(), std::memory_order_relaxed);
                 const bool debug_view_active = s_jitter_debug_view.load(std::memory_order_relaxed);
+                advanceComparisonSequence();
                 if (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active) {
                     tryTemporalUpscale(context, rendered_frame, backbuffer.Get());
                 }
@@ -6030,6 +6053,10 @@ void ContextCensusRequestComparisonCapture() {
 
 bool ContextCensusIsComparisonCapturePending() {
     return s_comparison_capture_requested.load(std::memory_order_acquire);
+}
+
+const wchar_t* ContextCensusComparisonProgress() {
+    return s_cmp_progress;
 }
 
 bool ContextCensusConsumeComparisonCaptureRequest() {
