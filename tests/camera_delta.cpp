@@ -183,5 +183,23 @@ int main() {
     if (!edpe::matchesAnchorPrediction(matchingCand, identity(), anchorVel, 1.0f)) return 38;
     if (edpe::matchesAnchorPrediction(cockpitHeadProbe, identity(), anchorVel, 1.0f)) return 39;
 
+    // 18. 180-deg rear-facing cockpit mirror probe (0.1364m, ~179.2 deg yaw):
+    auto rearMirrorProbe = yawed(179.2f);
+    rearMirrorProbe.worldFromView[7] = 0.1098f;
+    rearMirrorProbe.worldFromView[11] = 0.0809f;
+    if (!edpe::isRearOrAuxiliaryProbe(rearMirrorProbe, identity())) return 40;
+    if (!edpe::isStereoEyeOrIpdProbe(rearMirrorProbe, identity())) return 41;
+    if (!edpe::isReflectionOrAuxiliaryCamera(rearMirrorProbe, identity())) return 42;
+
+    // 19. Pure 180-deg inverted view at same location (rotTrace ~ -1.0, dist = 0):
+    auto invertedView = yawed(180.0f);
+    if (!edpe::isRearOrAuxiliaryProbe(invertedView, identity())) return 43;
+    if (!edpe::isStereoEyeOrIpdProbe(invertedView, identity())) return 44;
+
+    // 20. Real 180-deg ship turnaround at 50m distance (MUST NOT be identified as rear/aux probe):
+    auto shipTurnaround = yawed(180.0f);
+    shipTurnaround.worldFromView[11] = 50.0f;
+    if (edpe::isRearOrAuxiliaryProbe(shipTurnaround, identity())) return 45;
+
     return 0;
 }

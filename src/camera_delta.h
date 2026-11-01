@@ -68,7 +68,51 @@ inline bool matchesAnchorPrediction(
     }
     const float r = std::clamp(dtRatio, 0.25f, 4.0f);
     const Vec3 predicted = cameraPosition(anchor) + velocity * r;
-    return length(cameraPosition(cand) - predicted) < 0.03f;
+    return length(cameraPosition(cand) - predicted) < 0.045f;
+}
+
+inline bool isRearOrAuxiliaryProbe(
+    const CameraProjection& candidate,
+    const CameraProjection& baseline,
+    const Vec3& last_velocity = {0.0f, 0.0f, 0.0f},
+    float dtRatio = 1.0f)
+{
+    if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) {
+        return false;
+    }
+
+    const Vec3 candPos = cameraPosition(candidate);
+    const Vec3 prevPos = cameraPosition(baseline);
+    const float rawDist = length(candPos - prevPos);
+
+    // 1. IPD-гармоніки (1x 68.2 мм, 2x 136.4 мм, 4x 272.8 мм) незалежно від кута орієнтації:
+    if (rawDist >= 0.032f && rawDist <= 0.36f) {
+        const float d68  = std::fabs(rawDist - 0.0682f);
+        const float d136 = std::fabs(rawDist - 0.1364f);
+        const float d273 = std::fabs(rawDist - 0.2728f);
+        if (d68 < 0.008f || d136 < 0.008f || d273 < 0.008f) {
+            return true;
+        }
+
+        const float clampedDtRatio = std::clamp(dtRatio, 0.25f, 4.0f);
+        const Vec3 predictedPos = prevPos + (last_velocity * clampedDtRatio);
+        const float resDist = length(candPos - predictedPos);
+        const float r68  = std::fabs(resDist - 0.0682f);
+        const float r136 = std::fabs(resDist - 0.1364f);
+        const float r273 = std::fabs(resDist - 0.2728f);
+        if (r68 < 0.008f || r136 < 0.008f || r273 < 0.008f) {
+            return true;
+        }
+    }
+
+    // 2. Дзеркальний зонд заднього огляду / ліхтаря кабіни:
+    // Розгортання ~180 град (rotTrace < 0.5f) біля положення пілота (rawDist < 1.5м)
+    const float rotTrace = cameraRotationTrace(candidate, baseline);
+    if (rotTrace < 0.5f && rawDist < 1.5f) {
+        return true;
+    }
+
+    return false;
 }
 
 inline bool isStereoEyeOrIpdProbe(
@@ -79,6 +123,11 @@ inline bool isStereoEyeOrIpdProbe(
 {
     if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) {
         return false;
+    }
+
+    // 0. Зонд заднього огляду або IPD-гармоніка (відсікає 180° інвертований зонд)
+    if (isRearOrAuxiliaryProbe(candidate, baseline, last_velocity, dtRatio)) {
+        return true;
     }
 
     // 1. Дозволяємо плавне обертання корабля між кадрами (rotTrace > 2.985f ≈ до 10 град/кадр)
