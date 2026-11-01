@@ -4,6 +4,7 @@
 #include <dxgi1_4.h>
 #include <string>
 #include <cstdint>
+#include <array>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -53,14 +54,38 @@ private:
     ~PerfTracker();
 
     void updateTelemetry(IDXGISwapChain* swapChain);
+    void renderFrametimeGraph(float scale, const PerfOverlayOverride* override = nullptr);
 
     PerfTelemetry telemetry_{};
+    PerfTelemetry displayTelemetry_{};
+    LARGE_INTEGER lastDisplayUpdate_{};
+
+    struct ProfilerDisplaySnapshot {
+        float mapMs = 0.0f;
+        float omMs = 0.0f;
+        float deltaMs = 0.0f;
+        float drawMs = 0.0f;
+        float upscaleMs = 0.0f;
+        float unaccountedMs = 0.0f;
+    };
+    ProfilerDisplaySnapshot profilerDisplay_{};
+
     LARGE_INTEGER perfFreq_{};
     LARGE_INTEGER lastPresentStart_{};
     LARGE_INTEGER lastPresentEnd_{};
     LARGE_INTEGER currentPresentStart_{};
 
     float smoothedFrametimeMs_ = 16.67f;
+
+    struct FrametimeSample {
+        float gameMs = 0.0f;
+        float upscalerMs = 0.0f;
+        float totalMs = 0.0f;
+    };
+    static constexpr size_t kFrametimeHistorySize = 120;
+    std::array<FrametimeSample, kFrametimeHistorySize> frametimeHistory_{};
+    size_t historyIndex_ = 0;
+    size_t historyCount_ = 0;
 
     // Hardware telemetry handles
     bool gpuInfoCached_ = false;

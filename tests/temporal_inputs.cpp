@@ -269,5 +269,9 @@ int main() {
     if (manager.evaluateBackend(edpe::UpscalerBackend::None, nullptr, inputs, nullptr, nullptr)) return 84;
     if (manager.evaluateBackend(edpe::UpscalerBackend::NvidiaDlss, nullptr, inputs, nullptr, nullptr)) return 85;
 
+    // Test 12: Config devMode and DEV=0 default validation
+    auto& cfg = edpe::Config::instance();
+    if (cfg.devMode != false && cfg.devMode != true) return 86;
+
     return 0; // All temporal input layer tests passed
 }

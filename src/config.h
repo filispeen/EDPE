@@ -100,6 +100,12 @@ public:
         perfOverlayPosX = static_cast<float>(_wtof(buf));
         GetPrivateProfileStringW(L"Overlay", L"PosY", L"-1.0", buf, 64, path.c_str());
         perfOverlayPosY = static_cast<float>(_wtof(buf));
+
+        int devVal = GetPrivateProfileIntW(L"Overlay", L"DEV", -1, path.c_str());
+        if (devVal < 0) {
+            devVal = GetPrivateProfileIntW(L"General", L"DEV", 0, path.c_str());
+        }
+        devMode = (devVal > 0);
     }
 
     void save() {
@@ -152,6 +158,7 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"PosX", buf, path.c_str());
         swprintf_s(buf, L"%.1f", perfOverlayPosY);
         WritePrivateProfileStringW(L"Overlay", L"PosY", buf, path.c_str());
+        WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -266,6 +273,7 @@ public:
     float uiScale = 1.0f;
     float perfOverlayPosX = -1.0f;
     float perfOverlayPosY = -1.0f;
+    bool devMode = false;
 };
 
 } // namespace edpe

@@ -17,6 +17,7 @@
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -159,48 +160,56 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         return true;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F5) return true;
-    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-        wparam == VK_F6 && !(lparam & (1LL << 30))) {
-        all_captures_requested.store(true);
-        EdpeLog(L"EDPE: F6 pressed — One-Shot Capture requested for all buffers");
-        return true;
+
+    auto& cfg = edpe::Config::instance();
+
+    if (cfg.devMode) {
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            wparam == VK_F6 && !(lparam & (1LL << 30))) {
+            all_captures_requested.store(true);
+            EdpeLog(L"EDPE: F6 pressed — One-Shot Capture requested for all buffers");
+            return true;
+        }
+        if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F6) return true;
     }
-    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F6) return true;
+
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
         wparam == VK_F7 && !(lparam & (1LL << 30))) {
-        auto& cfg = edpe::Config::instance();
         cfg.showPerfOverlay = !cfg.showPerfOverlay;
         cfg.save();
         EdpeLog(cfg.showPerfOverlay ? L"EDPE: F7 pressed — Performance HUD enabled" : L"EDPE: F7 pressed — Performance HUD disabled");
         return true;
     }
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F7) return true;
-    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-        wparam == VK_F8 && !(lparam & (1LL << 30))) {
-        ContextCensusToggleJitterDebugView();
-        const bool active = ContextCensusGetJitterDebugView();
-        auto& cfg = edpe::Config::instance();
-        cfg.jitterDebugView = active;
-        cfg.save();
-        EdpeLog(active ? L"EDPE: F8 pressed — Jitter Debug View enabled" : L"EDPE: F8 pressed — Jitter Debug View disabled");
-        return true;
-    }
-    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F8) return true;
-    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-        wparam == VK_F9 && !(lparam & (1LL << 30))) {
-        auto& recorder = edpe::JitterViewRecorder::instance();
-        if (recorder.isSaving()) {
-            EdpeLog(L"EDPE: jitter recorder is still flushing previous capture to disk");
-        } else if (recorder.isIdle()) {
-            EdpeLog(L"EDPE: F9 pressed - Jitter View recording started");
-            recorder.startRecording();
-        } else if (recorder.isRecording()) {
-            EdpeLog(L"EDPE: F9 pressed - stopping Jitter View recording");
-            recorder.stopRecording();
+
+    if (cfg.devMode) {
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            wparam == VK_F8 && !(lparam & (1LL << 30))) {
+            ContextCensusToggleJitterDebugView();
+            const bool active = ContextCensusGetJitterDebugView();
+            cfg.jitterDebugView = active;
+            cfg.save();
+            EdpeLog(active ? L"EDPE: F8 pressed — Jitter Debug View enabled" : L"EDPE: F8 pressed — Jitter Debug View disabled");
+            return true;
         }
-        return true;
+        if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F8) return true;
+
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            wparam == VK_F9 && !(lparam & (1LL << 30))) {
+            auto& recorder = edpe::JitterViewRecorder::instance();
+            if (recorder.isSaving()) {
+                EdpeLog(L"EDPE: jitter recorder is still flushing previous capture to disk");
+            } else if (recorder.isIdle()) {
+                EdpeLog(L"EDPE: F9 pressed - Jitter View recording started");
+                recorder.startRecording();
+            } else if (recorder.isRecording()) {
+                EdpeLog(L"EDPE: F9 pressed - stopping Jitter View recording");
+                recorder.stopRecording();
+            }
+            return true;
+        }
+        if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F9) return true;
     }
-    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F9) return true;
     if (menu_visible.load()) {
         if (message == WM_INPUT) return true;
         if (message == WM_SETCURSOR) {
@@ -1664,7 +1673,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     bool window_open = true;
     if (draw_menu) {
-        ImGui::Begin("EDPE \xE2\x80\x94 Elite Dangerous Performance Enhanced", &window_open);
+        ImGui::Begin("EDPE | Elite Dangerous Performance Enhanced", &window_open);
         ImGui::Text("Version: %s", edpe::kVersion);
         auto& upscaler = edpe::UpscalerManager::instance();
         const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);
@@ -1905,9 +1914,10 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::Text("GPU Reconstruction Time: %.3f ms", diag.gpuTimeMs);
     }
 
-    // Comparison Screenshot Button
-    ImGui::Separator();
-    ImGui::TextUnformatted("Reconstruction Screenshot Comparison");
+    if (cfg.devMode) {
+        // Comparison Screenshot Button
+        ImGui::Separator();
+        ImGui::TextUnformatted("Reconstruction Screenshot Comparison");
     const bool can_compare = backend_active && upscaler.isReconstructionActive();
     const bool compare_running = ContextCensusIsComparisonCapturePending();
     if (!can_compare || compare_running) ImGui::BeginDisabled();
@@ -2130,7 +2140,41 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
         ui.pending_backbuffer_capture = true;
     }
-    ImGui::TextUnformatted("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter");
+    } // if (cfg.devMode)
+
+    const float footerHeight = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 4.0f;
+    if (ImGui::GetContentRegionAvail().y > footerHeight) {
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetContentRegionAvail().y - footerHeight));
+    }
+
+    ImGui::Separator();
+    if (cfg.devMode) {
+        ImGui::TextUnformatted("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter");
+    } else {
+        ImGui::TextUnformatted("F5: menu | F7: perf HUD");
+    }
+
+    ImGui::SameLine();
+    const char* authorLabel = "by FILISPEEN";
+    const char* authorUrl = "https://github.com/filispeen";
+    const float authorWidth = ImGui::CalcTextSize(authorLabel).x;
+    if (ImGui::GetContentRegionAvail().x > authorWidth + 8.0f) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - authorWidth);
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.75f, 1.0f, 1.0f));
+    ImGui::TextUnformatted(authorLabel);
+    ImGui::PopStyleColor();
+
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        const ImVec2 pMin = ImGui::GetItemRectMin();
+        const ImVec2 pMax = ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(pMin.x, pMax.y), ImVec2(pMax.x, pMax.y), IM_COL32(100, 190, 255, 255));
+        ImGui::SetTooltip("Open %s", authorUrl);
+    }
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        ShellExecuteA(nullptr, "open", authorUrl, nullptr, nullptr, SW_SHOWNORMAL);
+    }
     ImGui::End();
     if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);

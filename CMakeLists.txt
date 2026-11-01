@@ -82,7 +82,7 @@ add_library(EDPE_IMGUI STATIC
     external/imgui/backends/imgui_impl_dx11.cpp)
 target_include_directories(EDPE_IMGUI PUBLIC external/imgui external/imgui/backends)
 target_compile_definitions(EDPE_IMGUI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(EDPE_DXGI PRIVATE EDPE_IMGUI d3dcompiler dxguid dbghelp)
+target_link_libraries(EDPE_DXGI PRIVATE EDPE_IMGUI d3dcompiler dxguid dbghelp shell32)
 
 if(EDPE_HAVE_NGX)
     target_include_directories(EDPE_DXGI PRIVATE "${NGX_SDK_DIR}/include")

@@ -9,6 +9,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <windows.h>
+#include "profiler.h"
 
 namespace edpe {
 
@@ -50,6 +51,7 @@ public:
         sharpness = static_cast<float>(_wtof(sharpnessBuf));
         if (sharpness < 0.0f || sharpness > 1.0f) sharpness = 0.0f;
 
+        jitterEnabled = GetPrivateProfileIntW(L"Jitter", L"Enabled", 1, path.c_str()) != 0;
         jitterInvertX = GetPrivateProfileIntW(L"Jitter", L"InvertX", 0, path.c_str()) != 0;
         jitterInvertY = GetPrivateProfileIntW(L"Jitter", L"InvertY", 0, path.c_str()) != 0;
         jitterSwapXY = GetPrivateProfileIntW(L"Jitter", L"SwapXY", 0, path.c_str()) != 0;
@@ -80,6 +82,9 @@ public:
         if (motionScale < 0.0f || motionScale > 2.0f) motionScale = 1.0f;
 
         showPerfOverlay = GetPrivateProfileIntW(L"Overlay", L"ShowPerfOverlay", 0, path.c_str()) != 0;
+        captureOverlayInComparison = GetPrivateProfileIntW(L"Overlay", L"CaptureOverlayInComparison", 0, path.c_str()) != 0;
+        enableProfiler = GetPrivateProfileIntW(L"Overlay", L"EnableProfiler", 0, path.c_str()) != 0;
+        Profiler::instance().setEnabled(enableProfiler);
         perfOverlayCorner = GetPrivateProfileIntW(L"Overlay", L"Corner", 0, path.c_str());
         if (perfOverlayCorner < 0 || perfOverlayCorner > 3) perfOverlayCorner = 0;
 
@@ -87,10 +92,20 @@ public:
         perfOverlayScale = static_cast<float>(_wtof(buf));
         if (perfOverlayScale < 0.5f || perfOverlayScale > 3.0f) perfOverlayScale = 1.0f;
 
+        GetPrivateProfileStringW(L"Overlay", L"UiScale", L"1.0", buf, 64, path.c_str());
+        uiScale = static_cast<float>(_wtof(buf));
+        if (uiScale < 0.5f || uiScale > 2.5f) uiScale = 1.0f;
+
         GetPrivateProfileStringW(L"Overlay", L"PosX", L"-1.0", buf, 64, path.c_str());
         perfOverlayPosX = static_cast<float>(_wtof(buf));
         GetPrivateProfileStringW(L"Overlay", L"PosY", L"-1.0", buf, 64, path.c_str());
         perfOverlayPosY = static_cast<float>(_wtof(buf));
+
+        int devVal = GetPrivateProfileIntW(L"Overlay", L"DEV", -1, path.c_str());
+        if (devVal < 0) {
+            devVal = GetPrivateProfileIntW(L"General", L"DEV", 0, path.c_str());
+        }
+        devMode = (devVal > 0);
     }
 
     void save() {
@@ -107,6 +122,7 @@ public:
         swprintf_s(sharpnessBuf, L"%.2f", sharpness);
         WritePrivateProfileStringW(L"Upscaler", L"Sharpness", sharpnessBuf, path.c_str());
 
+        WritePrivateProfileStringW(L"Jitter", L"Enabled", jitterEnabled ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"InvertX", jitterInvertX ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"InvertY", jitterInvertY ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"SwapXY", jitterSwapXY ? L"1" : L"0", path.c_str());
@@ -130,13 +146,19 @@ public:
         WritePrivateProfileStringW(L"Motion", L"Scale", buf, path.c_str());
 
         WritePrivateProfileStringW(L"Overlay", L"ShowPerfOverlay", showPerfOverlay ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"Overlay", L"CaptureOverlayInComparison", captureOverlayInComparison ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"Overlay", L"EnableProfiler", enableProfiler ? L"1" : L"0", path.c_str());
+        Profiler::instance().setEnabled(enableProfiler);
         WritePrivateProfileStringW(L"Overlay", L"Corner", std::to_wstring(perfOverlayCorner).c_str(), path.c_str());
         swprintf_s(buf, L"%.2f", perfOverlayScale);
         WritePrivateProfileStringW(L"Overlay", L"Scale", buf, path.c_str());
+        swprintf_s(buf, L"%.2f", uiScale);
+        WritePrivateProfileStringW(L"Overlay", L"UiScale", buf, path.c_str());
         swprintf_s(buf, L"%.1f", perfOverlayPosX);
         WritePrivateProfileStringW(L"Overlay", L"PosX", buf, path.c_str());
         swprintf_s(buf, L"%.1f", perfOverlayPosY);
         WritePrivateProfileStringW(L"Overlay", L"PosY", buf, path.c_str());
+        WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -226,6 +248,7 @@ public:
     bool preserveNativeUi = true;
     bool hdrInput = false;
 
+    bool jitterEnabled = true;
     bool jitterInvertX = false;
     bool jitterInvertY = false;
     bool jitterSwapXY = false;
@@ -243,10 +266,14 @@ public:
     float motionScale = 1.0f;
 
     bool showPerfOverlay = false;
+    bool captureOverlayInComparison = false;
+    bool enableProfiler = false;
     int perfOverlayCorner = 0; // 0=Top-Left, 1=Top-Right, 2=Bottom-Left, 3=Bottom-Right
     float perfOverlayScale = 1.0f;
+    float uiScale = 1.0f;
     float perfOverlayPosX = -1.0f;
     float perfOverlayPosY = -1.0f;
+    bool devMode = false;
 };
 
 } // namespace edpe

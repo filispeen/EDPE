@@ -140,6 +140,40 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
     // Game frametime is time spent by game engine before upscaler / composite
     telemetry_.gameFrametimeMs = (std::max)(0.0f, telemetry_.totalFrametimeMs - telemetry_.upscalerFrametimeMs);
 
+    FrametimeSample sample;
+    sample.gameMs = telemetry_.gameFrametimeMs;
+    sample.upscalerMs = telemetry_.upscalerFrametimeMs;
+    sample.totalMs = telemetry_.totalFrametimeMs;
+    frametimeHistory_[historyIndex_] = sample;
+    historyIndex_ = (historyIndex_ + 1) % kFrametimeHistorySize;
+    if (historyCount_ < kFrametimeHistorySize) {
+        historyCount_++;
+    }
+
+    // Rate-limit display telemetry & profiler updates to ~66.66 ms (~15 FPS) to keep numbers readable and reduce UI overhead
+    auto updateDisplaySnapshots = [this]() {
+        displayTelemetry_ = telemetry_;
+        if (Profiler::instance().isEnabled()) {
+            profilerDisplay_.mapMs = Profiler::instance().getAvgMs(ProfileZone::MapUnmap);
+            profilerDisplay_.omMs = Profiler::instance().getAvgMs(ProfileZone::OMSetRenderTargets);
+            profilerDisplay_.deltaMs = Profiler::instance().getAvgMs(ProfileZone::CameraDeltaCopy);
+            profilerDisplay_.drawMs = Profiler::instance().getAvgMs(ProfileZone::DrawProbe);
+            profilerDisplay_.upscaleMs = Profiler::instance().getAvgMs(ProfileZone::TemporalUpscale);
+            const float measuredSum = profilerDisplay_.mapMs + profilerDisplay_.omMs + profilerDisplay_.deltaMs + profilerDisplay_.drawMs;
+            profilerDisplay_.unaccountedMs = (std::max)(0.0f, displayTelemetry_.gameFrametimeMs - measuredSum);
+        }
+    };
+
+    if (perfFreq_.QuadPart > 0) {
+        const double elapsedDisplayMs = static_cast<double>(now.QuadPart - lastDisplayUpdate_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
+        if (lastDisplayUpdate_.QuadPart == 0 || elapsedDisplayMs >= 66.66) {
+            updateDisplaySnapshots();
+            lastDisplayUpdate_ = now;
+        }
+    } else {
+        updateDisplaySnapshots();
+    }
+
     // Rate-limit hardware telemetry to ~4 times per second (250 ms)
     if (perfFreq_.QuadPart > 0) {
         const double elapsedSinceUpdateMs = static_cast<double>(now.QuadPart - lastTelemetryUpdate_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
@@ -199,6 +233,87 @@ void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
         telemetry_.gpuUsagePct = cachedGpuUsage_.load(std::memory_order_relaxed);
     } else {
         telemetry_.gpuUsagePct = (std::min)(100u, static_cast<uint32_t>((telemetry_.totalFrametimeMs / 16.67f) * 60.0f));
+    }
+}
+
+void PerfTracker::renderFrametimeGraph(float scale, const PerfOverlayOverride* override) {
+    ImGui::Spacing();
+
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float graphWidth = (availW > 180.0f * scale) ? availW : 240.0f * scale;
+    const float graphHeight = 42.0f * scale;
+    const ImVec2 graphSize(graphWidth, graphHeight);
+
+    const ImVec2 pMin = ImGui::GetCursorScreenPos();
+    const ImVec2 pMax = ImVec2(pMin.x + graphSize.x, pMin.y + graphSize.y);
+    ImGui::Dummy(graphSize);
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    if (!drawList) return;
+
+    // Background & border
+    drawList->AddRectFilled(pMin, pMax, IM_COL32(20, 22, 27, 230), 2.0f * scale);
+    drawList->AddRect(pMin, pMax, IM_COL32(70, 75, 85, 180), 2.0f * scale);
+
+    const size_t count = historyCount_;
+    const size_t startIndex = (count < kFrametimeHistorySize) ? 0 : historyIndex_;
+
+    // Calculate vertical scaling with headroom
+    float maxMs = 20.0f;
+    for (size_t i = 0; i < count; ++i) {
+        const auto& s = frametimeHistory_[(startIndex + i) % kFrametimeHistorySize];
+        if (s.totalMs > maxMs) maxMs = s.totalMs;
+        if (s.gameMs > maxMs) maxMs = s.gameMs;
+    }
+    maxMs = (std::min)(maxMs * 1.15f, 120.0f);
+
+    const float innerH = graphHeight - 4.0f * scale;
+    const float bottomY = pMax.y - 2.0f * scale;
+
+    // Reference grid line at 16.67ms (60 FPS)
+    if (maxMs >= 16.67f) {
+        const float y60 = bottomY - (16.67f / maxMs) * innerH;
+        drawList->AddLine(ImVec2(pMin.x, y60), ImVec2(pMax.x, y60), IM_COL32(90, 95, 105, 120), 1.0f);
+    }
+    // Reference grid line at 33.33ms (30 FPS)
+    if (maxMs >= 33.33f) {
+        const float y30 = bottomY - (33.33f / maxMs) * innerH;
+        drawList->AddLine(ImVec2(pMin.x, y30), ImVec2(pMax.x, y30), IM_COL32(90, 95, 105, 120), 1.0f);
+    }
+
+    if (count < 2) return;
+
+    // 1. Total Frametime: Orange
+    for (size_t i = 0; i < count - 1; ++i) {
+        const auto& s0 = frametimeHistory_[(startIndex + i) % kFrametimeHistorySize];
+        const auto& s1 = frametimeHistory_[(startIndex + i + 1) % kFrametimeHistorySize];
+        const float x0 = pMin.x + (static_cast<float>(i) / static_cast<float>(count - 1)) * graphWidth;
+        const float x1 = pMin.x + (static_cast<float>(i + 1) / static_cast<float>(count - 1)) * graphWidth;
+        const float y0 = bottomY - ((std::clamp)(s0.totalMs, 0.0f, maxMs) / maxMs) * innerH;
+        const float y1 = bottomY - ((std::clamp)(s1.totalMs, 0.0f, maxMs) / maxMs) * innerH;
+        drawList->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(255, 150, 20, 255), 1.6f * scale);
+    }
+
+    // 2. Game Frametime: White
+    for (size_t i = 0; i < count - 1; ++i) {
+        const auto& s0 = frametimeHistory_[(startIndex + i) % kFrametimeHistorySize];
+        const auto& s1 = frametimeHistory_[(startIndex + i + 1) % kFrametimeHistorySize];
+        const float x0 = pMin.x + (static_cast<float>(i) / static_cast<float>(count - 1)) * graphWidth;
+        const float x1 = pMin.x + (static_cast<float>(i + 1) / static_cast<float>(count - 1)) * graphWidth;
+        const float y0 = bottomY - ((std::clamp)(s0.gameMs, 0.0f, maxMs) / maxMs) * innerH;
+        const float y1 = bottomY - ((std::clamp)(s1.gameMs, 0.0f, maxMs) / maxMs) * innerH;
+        drawList->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(255, 255, 255, 240), 1.2f * scale);
+    }
+
+    // 3. Upscaler Frametime: Cyan
+    for (size_t i = 0; i < count - 1; ++i) {
+        const auto& s0 = frametimeHistory_[(startIndex + i) % kFrametimeHistorySize];
+        const auto& s1 = frametimeHistory_[(startIndex + i + 1) % kFrametimeHistorySize];
+        const float x0 = pMin.x + (static_cast<float>(i) / static_cast<float>(count - 1)) * graphWidth;
+        const float x1 = pMin.x + (static_cast<float>(i + 1) / static_cast<float>(count - 1)) * graphWidth;
+        const float y0 = bottomY - ((std::clamp)(s0.upscalerMs, 0.0f, maxMs) / maxMs) * innerH;
+        const float y1 = bottomY - ((std::clamp)(s1.upscalerMs, 0.0f, maxMs) / maxMs) * innerH;
+        drawList->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(0, 240, 240, 255), 1.2f * scale);
     }
 }
 
@@ -274,40 +389,49 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
         ImGui::Separator();
 
         // 1. FPS with color coding
-        const ImVec4 fpsColor = (telemetry_.fps >= 58.0f) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) :
-                                (telemetry_.fps >= 30.0f) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) :
-                                                            ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+        const float shownFps = override ? telemetry_.fps : displayTelemetry_.fps;
+        const ImVec4 fpsColor = (shownFps >= 58.0f) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) :
+                                (shownFps >= 30.0f) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) :
+                                                      ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
         ImGui::Text("FPS:                ");
         ImGui::SameLine();
-        ImGui::TextColored(fpsColor, "%.1f FPS", telemetry_.fps);
+        ImGui::TextColored(fpsColor, "%.1f FPS", shownFps);
 
         // 2. Frametimes
-        ImGui::Text("Game Frametime:     %.2f ms", telemetry_.gameFrametimeMs);
+        const float shownGameMs = override ? (std::max)(0.0f, telemetry_.totalFrametimeMs - override->upscalerMs)
+                                           : displayTelemetry_.gameFrametimeMs;
+        ImGui::Text("Game Frametime:     ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%6.2f ms", shownGameMs);
 
         auto& upscaler = UpscalerManager::instance();
         UpscalerBackend shownBackend = upscaler.getBackend();
         bool upscalerActive = upscaler.isReconstructionActive();
-        float shownUpscalerMs = telemetry_.upscalerFrametimeMs;
+        float shownUpscalerMs = override ? override->upscalerMs : displayTelemetry_.upscalerFrametimeMs;
         if (override) {
             shownBackend = (override->backendId == 1) ? UpscalerBackend::NvidiaDlss :
                            (override->backendId == 2) ? UpscalerBackend::AmdFsr :
                            (override->backendId == 3) ? UpscalerBackend::Taa : UpscalerBackend::None;
             upscalerActive = (shownBackend != UpscalerBackend::None);
-            shownUpscalerMs = override->upscalerMs;
         }
 
+        ImGui::Text("Upscaler Frametime: ");
+        ImGui::SameLine();
         if (upscalerActive && shownUpscalerMs > 0.0f) {
             const char* backendShort = (shownBackend == UpscalerBackend::Taa) ? "TAA" :
                                        (shownBackend == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
-            ImGui::Text("Upscaler Frametime: ");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.85f, 1.0f), "%.2f ms (%s)",
+            ImGui::TextColored(ImVec4(0.0f, 0.95f, 0.95f, 1.0f), "%6.2f ms (%s)",
                 shownUpscalerMs, backendShort);
         } else {
-            ImGui::Text("Upscaler Frametime: 0.00 ms (Bypass)");
+            ImGui::TextColored(ImVec4(0.0f, 0.95f, 0.95f, 1.0f), "%6.2f ms (Bypass)", 0.0f);
         }
 
-        ImGui::Text("Total Frametime:    %.2f ms", telemetry_.totalFrametimeMs);
+        const float shownTotalMs = override ? telemetry_.totalFrametimeMs : displayTelemetry_.totalFrametimeMs;
+        ImGui::Text("Total Frametime:    ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.60f, 0.05f, 1.0f), "%6.2f ms", shownTotalMs);
+
+        renderFrametimeGraph(scale, override);
 
         ImGui::Separator();
 
@@ -377,19 +501,12 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
         if (cfg.enableProfiler) {
             ImGui::Separator();
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Profiler (120f avg):");
-            const float mapMs = Profiler::instance().getAvgMs(ProfileZone::MapUnmap);
-            const float omMs = Profiler::instance().getAvgMs(ProfileZone::OMSetRenderTargets);
-            const float deltaMs = Profiler::instance().getAvgMs(ProfileZone::CameraDeltaCopy);
-            const float drawMs = Profiler::instance().getAvgMs(ProfileZone::DrawProbe);
-            const float upscaleMs = Profiler::instance().getAvgMs(ProfileZone::TemporalUpscale);
-            const float measuredSum = mapMs + omMs + deltaMs + drawMs;
-            const float unaccountedMs = (std::max)(0.0f, telemetry_.gameFrametimeMs - measuredSum);
-            ImGui::Text("  Map/Unmap (CB/Jitter): %.3f ms", mapMs);
-            ImGui::Text("  OMSetRenderTargets:    %.3f ms", omMs);
-            ImGui::Text("  Camera Delta Copy:     %.3f ms", deltaMs);
-            ImGui::Text("  HUD Draw Probe:        %.3f ms", drawMs);
-            ImGui::Text("  Upscale Prep & Eval:   %.3f ms", upscaleMs);
-            ImGui::Text("  Unaccounted (Game):    %.3f ms", unaccountedMs);
+            ImGui::Text("  Map/Unmap (CB/Jitter): %6.3f ms", profilerDisplay_.mapMs);
+            ImGui::Text("  OMSetRenderTargets:    %6.3f ms", profilerDisplay_.omMs);
+            ImGui::Text("  Camera Delta Copy:     %6.3f ms", profilerDisplay_.deltaMs);
+            ImGui::Text("  HUD Draw Probe:        %6.3f ms", profilerDisplay_.drawMs);
+            ImGui::Text("  Upscale Prep & Eval:   %6.3f ms", profilerDisplay_.upscaleMs);
+            ImGui::Text("  Unaccounted (Game):    %6.3f ms", profilerDisplay_.unaccountedMs);
         }
     }
     ImGui::End();
