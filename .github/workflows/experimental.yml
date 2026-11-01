@@ -1,6 +1,7 @@
 name: Experimental Build
 
 on:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -79,17 +80,12 @@ jobs:
         run: |
           cmake --build build --config Release --parallel
 
-      - name: Run Tests
-        shell: pwsh
-        run: |
-          ctest --test-dir build -C Release --output-on-failure
-
       - name: Prepare Experimental Package
         id: package
         shell: pwsh
         run: |
           $buildNum = "${{ github.run_number }}"
-          $tag = "experimental-build-$buildNum"
+          $tag = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { "experimental-build-$buildNum" }
           $pkgDir = "EDPE-package"
           New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
 
@@ -130,7 +126,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: exp-build-${{ github.run_number }}
+          tag_name: ${{ (startsWith(github.ref_name, 'exp') || startsWith(github.ref_name, 'experimental')) && github.ref_name || format('exp-build-{0}', github.run_number) }}
           target_commitish: ${{ github.sha }}
           name: EDPE Experimental Build #${{ github.run_number }}
           files: |

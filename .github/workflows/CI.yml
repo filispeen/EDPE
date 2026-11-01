@@ -2,6 +2,12 @@ name: CI
 
 on:
   push:
+  workflow_dispatch:
+    inputs:
+      experimental:
+        description: 'Publish experimental release'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -17,17 +23,6 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 1
-
-      - name: Read tag message
-        id: tagmsg
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          git fetch --depth=1 origin "+refs/tags/${tag}:refs/tags/${tag}"
-          $msg = (git tag -l --format='%(contents)' $tag | Out-String).Trim()
-          Set-Content -Path "tag-message.md" -Value $msg -Encoding utf8
-          Write-Host "Tag message:"
-          Write-Host $msg
 
       - name: Cache NVIDIA DLSS SDK
         id: cache-dlss
@@ -94,3 +89,21 @@ jobs:
         shell: pwsh
         run: |
           ctest --test-dir build -C Release --output-on-failure
+
+  release:
+    name: Publish Release
+    needs: CI
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
+    permissions:
+      contents: write
+
+  experimental:
+    name: Publish Experimental
+    needs: CI
+    if: (github.ref_type == 'tag' && (startsWith(github.ref_name, 'exp') || startsWith(github.ref_name, 'experimental'))) || inputs.experimental == true
+    uses: ./.github/workflows/experimental.yml
+    secrets: inherit
+    permissions:
+      contents: write
