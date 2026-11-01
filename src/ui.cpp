@@ -319,6 +319,7 @@ void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int
             kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" :
             kind == UiState::CaptureKind::ComparisonBefore ? L"comparison before" :
             kind == UiState::CaptureKind::ComparisonAfter ? L"comparison after" :
+            kind == UiState::CaptureKind::Comparison ? L"comparison" :
             L"backbuffer",
             desc.Width, desc.Height, static_cast<unsigned>(desc.Format));
         EdpeLog(msg);
@@ -727,7 +728,7 @@ void pollFrameCapture() {
                         req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
                     break;
                 case UiState::CaptureKind::Comparison:
-                    swprintf_s(name, L"%02u-%02u-%02u-%ls.png",
+                    swprintf_s(name, L"%02u-%02u-%02u-%ls.bmp",
                         req.timestamp.wDay, req.timestamp.wMonth, req.timestamp.wYear % 100,
                         req.custom_name.c_str());
                     break;
@@ -750,60 +751,6 @@ void pollFrameCapture() {
                 }
 
                 const auto path = folder / name;
-                if (req.kind == UiState::CaptureKind::Comparison) {
-                    std::vector<unsigned char> rgba(static_cast<size_t>(req.width) * req.height * 4);
-                    for (UINT y = 0; y < req.height; ++y) {
-                        const auto* source = static_cast<const unsigned char*>(mapped.pData) +
-                            static_cast<size_t>(y) * mapped.RowPitch;
-                        auto* dstRow = rgba.data() + static_cast<size_t>(y) * req.width * 4;
-                        for (UINT x = 0; x < req.width; ++x) {
-                            if (req.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-                                uint32_t val = 0;
-                                std::memcpy(&val, source + 4 * x, sizeof(val));
-                                dstRow[4 * x + 0] = static_cast<unsigned char>((val & 0x3FF) >> 2);
-                                dstRow[4 * x + 1] = static_cast<unsigned char>(((val >> 10) & 0x3FF) >> 2);
-                                dstRow[4 * x + 2] = static_cast<unsigned char>(((val >> 20) & 0x3FF) >> 2);
-                                dstRow[4 * x + 3] = 255;
-                            } else if (req.format == DXGI_FORMAT_B8G8R8A8_UNORM || req.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
-                                const auto* pixel = source + 4 * x;
-                                dstRow[4 * x + 0] = pixel[2];
-                                dstRow[4 * x + 1] = pixel[1];
-                                dstRow[4 * x + 2] = pixel[0];
-                                dstRow[4 * x + 3] = pixel[3];
-                            } else if (req.format == DXGI_FORMAT_R11G11B10_FLOAT) {
-                                uint32_t val = 0;
-                                std::memcpy(&val, source + 4 * x, sizeof(val));
-                                const float cr = edpe::decodeFloat11(val & 0x7FF);
-                                const float cg = edpe::decodeFloat11((val >> 11) & 0x7FF);
-                                const float cb = edpe::decodeFloat10((val >> 22) & 0x3FF);
-                                dstRow[4 * x + 0] = edpe::toneMapSrgb(cr);
-                                dstRow[4 * x + 1] = edpe::toneMapSrgb(cg);
-                                dstRow[4 * x + 2] = edpe::toneMapSrgb(cb);
-                                dstRow[4 * x + 3] = 255;
-                            } else if (req.format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-                                const auto* px = reinterpret_cast<const uint16_t*>(source + 8 * x);
-                                dstRow[4 * x + 0] = edpe::toneMapSrgb(edpe::halfToFloat(px[0]));
-                                dstRow[4 * x + 1] = edpe::toneMapSrgb(edpe::halfToFloat(px[1]));
-                                dstRow[4 * x + 2] = edpe::toneMapSrgb(edpe::halfToFloat(px[2]));
-                                dstRow[4 * x + 3] = 255;
-                            } else {
-                                const auto* pixel = source + 4 * x;
-                                dstRow[4 * x + 0] = pixel[0];
-                                dstRow[4 * x + 1] = pixel[1];
-                                dstRow[4 * x + 2] = pixel[2];
-                                dstRow[4 * x + 3] = pixel[3];
-                            }
-                        }
-                    }
-                    if (edpe::saveRgbaToPng(path, rgba.data(), req.width, req.height, req.width * 4)) {
-                        wchar_t log_msg[256];
-                        swprintf_s(log_msg, L"EDPE: comparison capture saved %ls", path.wstring().c_str());
-                        EdpeLog(log_msg);
-                        swprintf_s(ui.last_comparison_saved, L"Saved %ls to comparison\\", name);
-                    } else {
-                        EdpeLog(L"EDPE: comparison PNG capture write failed");
-                    }
-                } else {
                 std::ofstream file(path, std::ios::binary);
                 const DWORD image_bytes = req.width * req.height * 4;
                 BITMAPFILEHEADER header{};
@@ -908,7 +855,7 @@ void pollFrameCapture() {
                                 row[4 * x + 2] = px[0];
                                 row[4 * x + 3] = 255;
                             }
-                        }            } else { // Backbuffer, ComparisonBefore, ComparisonAfter
+                        }            } else { // Backbuffer, ComparisonBefore, ComparisonAfter, Comparison
                         for (UINT x = 0; x < req.width; ++x) {
                             if (req.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
                                 uint32_t val = 0;
@@ -919,9 +866,10 @@ void pollFrameCapture() {
                                 row[4 * x + 3] = 255;
                             } else {
                                 const auto* pixel = source + 4 * x;
-                                row[4 * x + 0] = req.format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[2] : pixel[0];
+                                const bool isRgba = (req.format == DXGI_FORMAT_R8G8B8A8_UNORM || req.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || req.format == DXGI_FORMAT_R8G8B8A8_TYPELESS);
+                                row[4 * x + 0] = isRgba ? pixel[2] : pixel[0];
                                 row[4 * x + 1] = pixel[1];
-                                row[4 * x + 2] = req.format == DXGI_FORMAT_R8G8B8A8_UNORM ? pixel[0] : pixel[2];
+                                row[4 * x + 2] = isRgba ? pixel[0] : pixel[2];
                                 row[4 * x + 3] = 255;
                             }
                         }
@@ -938,15 +886,17 @@ void pollFrameCapture() {
                         req.kind == UiState::CaptureKind::EarlyHdr ? L"early HDR" :
                         req.kind == UiState::CaptureKind::ComparisonBefore ? L"comparison before" :
                         req.kind == UiState::CaptureKind::ComparisonAfter ? L"comparison after" :
+                        req.kind == UiState::CaptureKind::Comparison ? L"comparison" :
                         L"frame",
                         path.wstring().c_str());
                     EdpeLog(log_msg);
                     if (req.kind == UiState::CaptureKind::ComparisonAfter) {
                         swprintf_s(ui.last_comparison_saved, L"Saved %ls", name);
+                    } else if (req.kind == UiState::CaptureKind::Comparison) {
+                        swprintf_s(ui.last_comparison_saved, L"Saved %ls to comparison\\", name);
                     }
                 } else {
                     EdpeLog(L"EDPE: capture file write failed");
-                }
                 }
             }
             stagContext->Unmap(req.staging, 0);
