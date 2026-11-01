@@ -10,6 +10,7 @@ The initial focus is temporal upscaling and anti-aliasing:
 * NVIDIA DLAA;
 * NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising);
 * AMD FSR temporal upscaling / Native AA;
+* Intel XeSS Super Resolution / Native AA;
 * native D3D11 TAA;
 * vendor-neutral reconstruction infrastructure.
 
@@ -112,14 +113,15 @@ Instead use shared EDPE-produced temporal inputs:
                        +----------------------+
                        |
                        v
-              TemporalFrameInputs
-                       |
-             +---------+---------+
-             |                   |
-             v                   v
-        NVIDIA DLSS          AMD FSR
-             |                   |
-             +---------+---------+
+                        TemporalFrameInputs
+                                 |
+              +---------+--------+--------+---------+
+              |                  |                  |
+              v                  v                  v
+         NVIDIA DLSS          AMD FSR           Intel XeSS
+         (DLAA / SR)       (NativeAA / SR)    (NativeAA / SR)
+              |                  |                  |
+              +---------+--------+--------+---------+
                        |
                        v
               Native-res scene
@@ -153,12 +155,16 @@ Conceptually:
 enum class UpscalerBackend {
     None,
     NvidiaDlss,
-    AmdFsr
+    AmdFsr,
+    IntelXess,
+    Taa
 };
 
 enum class UpscaleMode {
     Native,
     NativeAA,
+    UltraQualityPlus,
+    UltraQuality,
     Quality,
     Balanced,
     Performance,
@@ -648,7 +654,129 @@ Do not choose based solely on implementation convenience.
 
 ---
 
-# 13. AMD Frame Generation
+# 13. Intel references
+
+Use current official:
+
+```text
+Intel XeSS SDK (libxess)
+Intel GPUOpen / GitHub (intel/xess)
+XeSS D3D12 headers (xess.h, xess_d3d12.h)
+Intel XeSS API documentation
+Intel Arc / XMX documentation
+Universal DP4a fallback documentation
+```
+
+as source of truth for Intel XeSS temporal reconstruction.
+
+Relevant technologies include:
+
+* **Intel XeSS Super Resolution (SR):** AI-based temporal upscaler running high-quality neural network models;
+* **Intel XeSS Native AA:** 1.0x native anti-aliasing reconstruction mode (introduced in XeSS 1.3+), analogous to DLAA and FSR Native AA;
+* **Intel XMX (Xe Matrix Extensions):** Hardware-accelerated systolic matrix execution on Intel Arc (Alchemist, Battlemage, Celestial) GPUs;
+* **Universal DP4a Model:** 8-bit integer dot product fallback model running on any vendor GPU (NVIDIA Pascal/Turing/Ampere/Ada, AMD RDNA/RDNA2/RDNA3, older Intel Iris/UHD);
+* **Dynamic Model Selection:** Dynamic runtime discovery of XMX vs. DP4a model via `xessGetProperties`.
+
+Do not assume XeSS requires an Intel GPU. The universal DP4a fallback is vendor-agnostic and provides high-quality AI reconstruction on AMD and older NVIDIA hardware lacking Tensor Cores.
+
+---
+
+# 14. Intel XeSS upscaling
+
+EDPE should eventually offer:
+
+```text
+XeSS Native AA
+XeSS Ultra Quality Plus
+XeSS Ultra Quality
+XeSS Quality
+XeSS Balanced
+XeSS Performance
+XeSS Ultra Performance
+```
+
+where supported by the selected XeSS SDK version.
+
+XeSS must consume the same EDPE temporal reconstruction inputs as DLSS, FSR, and Native TAA:
+
+```text
+Color (HDR or tone-mapped LDR)
+Depth (inverted reversed-Z compatible via flags)
+Motion vectors (screen-space, render or output resolution)
+Subpixel jitter (Halton 2,3)
+Render size
+Output size
+Frame delta
+Exposure scale / texture
+Responsive / reactive mask
+History reset
+```
+
+Build a dedicated Intel backend (`IntelUpscalerBackend`) behind the generic `IUpscalerBackend` interface.
+
+Do not spread `xess_*` types or `libxess` link dependencies into the engine context hooks or generic upscaler manager.
+
+---
+
+# 15. Intel XeSS D3D11 strategy
+
+Because the official Intel XeSS SDK (`libxess`) natively targets Direct3D 12 (`xessD3D12CreateContext`), executing XeSS in a D3D11 game like Elite Dangerous requires an explicit interoperability strategy.
+
+Evaluate two primary implementation routes:
+
+## Route A — D3D11-to-D3D12 Interop Bridge (Preferred)
+
+Leverage the Phase 13 shared resource infrastructure:
+
+```text
+Elite D3D11 render targets (Color, Depth, Motion)
+         |
+shared NT handles / key-mutex synchronization
+         |
+EDPE D3D12 device & command queue
+         |
+libxess execution (xessD3D12Execute)
+         |
+shared back to D3D11 swapchain backbuffer
+```
+
+Advantages:
+
+```text
+uses official, uncompromised libxess SDK distribution directly
+direct support for both XMX and DP4a kernels
+shares presentation and device-bridge foundation with Frame Generation
+cleanest forward compatibility with future XeSS SDK releases
+```
+
+Risks:
+
+```text
+requires robust zero-copy DXGI keyed-mutex / shared fence synchronization
+interop overhead must be kept under ~0.3 ms
+```
+
+## Route B — Community / Proxy D3D11 XeSS Wrapper
+
+Investigate standalone D3D11 XeSS wrapper patterns (such as OptiScaler's DX11-to-DX12 proxy layer or native D3D11 shims):
+
+Advantages:
+
+```text
+simplified initial testing within D3D11 abstraction
+allows early validation of motion vector and depth conventions prior to full D3D12 presenter completion
+```
+
+Risks:
+
+```text
+divergence from official Intel SDK updates
+extra copy overhead if intermediate staging buffers cannot be eliminated
+```
+
+---
+
+# 16. AMD Frame Generation
 
 AMD FSR Frame Generation is a later experimental phase.
 
@@ -694,7 +822,7 @@ Generated frames improve displayed motion smoothness but are not equivalent to n
 
 ---
 
-# 14. Frame Generation common inputs
+# 17. Frame Generation common inputs
 
 Build a vendor-neutral description of FG inputs.
 
@@ -730,7 +858,7 @@ Do not let that leak into the high-level EDPE renderer state.
 
 ---
 
-# 15. HUD-less rendering becomes mandatory for FG
+# 18. HUD-less rendering becomes mandatory for FG
 
 For temporal upscaling, native HUD separation is an image-quality improvement.
 
@@ -778,7 +906,7 @@ reactive mask
 
 ---
 
-# 16. Dear ImGui
+# 19. Dear ImGui
 
 Use **Dear ImGui** for EDPE configuration.
 
@@ -807,14 +935,19 @@ Rendering
 [ ] Enabled
 
 Upscaler
-[ Native           ]
-[ NVIDIA DLAA      ]
-[ NVIDIA DLSS      ]
-[ AMD FSR NativeAA ]
-[ AMD FSR          ]
+[ Native            ]
+[ NVIDIA DLAA       ]
+[ NVIDIA DLSS       ]
+[ AMD FSR NativeAA  ]
+[ AMD FSR           ]
+[ Intel XeSS Native ]
+[ Intel XeSS        ]
+[ Native D3D11 TAA  ]
 
 Quality
 [ Native AA         ]
+[ Ultra Quality +   ]
+[ Ultra Quality     ]
 [ Quality           ]
 [ Balanced          ]
 [ Performance       ]
@@ -822,6 +955,9 @@ Quality
 
 NVIDIA DLSS preset
 [ Auto | J | K | L | M ]
+
+Intel XeSS model
+[ Auto | XMX | DP4a ]
 
 Frame Generation
 [ Off               ]
@@ -878,7 +1014,7 @@ Never mislabel generated frames as additional game simulation frames.
 
 ---
 
-# 17. Project layout
+# 20. Project layout
 
 Suggested architecture:
 
@@ -892,7 +1028,8 @@ Suggested architecture:
 ├── external/
 │   ├── imgui/
 │   ├── nvidia/
-│   └── amd/
+│   ├── amd/
+│   └── intel/
 │
 ├── src/
 │   ├── dllmain.cpp
@@ -928,10 +1065,19 @@ Suggested architecture:
 │   │   │   ├── dlss.cpp
 │   │   │   └── dlss_resources.cpp
 │   │   │
-│   │   └── amd/
-│   │       ├── fsr.cpp
-│   │       ├── fsr_context.cpp
-│   │       └── fsr_resources.cpp
+│   │   ├── amd/
+│   │   │   ├── fsr.cpp
+│   │   │   ├── fsr_context.cpp
+│   │   │   └── fsr_resources.cpp
+│   │   │
+│   │   ├── intel/
+│   │   │   ├── xess.cpp
+│   │   │   ├── xess_context.cpp
+│   │   │   └── xess_resources.cpp
+│   │   │
+│   │   └── taa/
+│   │       ├── taa.cpp
+│   │       └── taa_resources.cpp
 │   │
 │   ├── framegen/
 │   │   ├── framegen.h
@@ -979,7 +1125,7 @@ Create modules only when the implementation reaches them.
 
 ---
 
-# 18. Git workflow
+# 21. Git workflow
 
 Git history is part of the project deliverable.
 
@@ -1028,7 +1174,7 @@ Use descriptive messages.
 
 ---
 
-# 19. Versioning and tags
+# 22. Versioning and tags
 
 EDPE uses:
 
@@ -1108,7 +1254,7 @@ Never force-move an existing release tag without explicit approval.
 
 ---
 
-# 20. Phase 0 — reconnaissance
+# 23. Phase 0 — reconnaissance
 
 Before implementing reconstruction:
 
@@ -1138,7 +1284,7 @@ Do not alter output yet.
 
 ---
 
-# 21. Phase 1 — D3D11 injection
+# 24. Phase 1 — D3D11 injection
 
 Implement:
 
@@ -1162,7 +1308,7 @@ Create `v0.0.1` once the first coherent working milestone exists and no earlier 
 
 ---
 
-# 22. Phase 2 — resource census
+# 25. Phase 2 — resource census
 
 Instrument:
 
@@ -1204,7 +1350,7 @@ Do not classify resources solely by dimensions.
 
 ---
 
-# 23. Phase 3 — scene depth
+# 26. Phase 3 — scene depth
 
 Identify the real scene depth.
 
@@ -1231,7 +1377,7 @@ Do not feed unverified depth to either DLSS or FSR.
 
 ---
 
-# 24. Phase 4 — camera and projection
+# 27. Phase 4 — camera and projection
 
 Locate:
 
@@ -1256,7 +1402,7 @@ docs/camera-reconstruction.md
 
 ---
 
-# 25. Phase 5 — projection jitter
+# 28. Phase 5 — projection jitter
 
 Implement temporal projection jitter.
 
@@ -1280,7 +1426,7 @@ automatic disable when reconstruction fails
 
 ---
 
-# 26. Phase 6 — motion vectors
+# 29. Phase 6 — motion vectors
 
 Initial texture:
 
@@ -1328,7 +1474,7 @@ using EDVR as a reference.
 
 ---
 
-# 27. Phase 7 — shared temporal input layer
+# 30. Phase 7 — shared temporal input layer
 
 Before maintaining multiple upscalers, formalize EDPE-owned resources:
 
@@ -1355,7 +1501,7 @@ Commit this abstraction independently.
 
 ---
 
-# 28. Phase 8 — NVIDIA DLAA
+# 31. Phase 8 — NVIDIA DLAA
 
 Implement NVIDIA first at native resolution.
 
@@ -1393,7 +1539,7 @@ Do not proceed merely because NGX returned success.
 
 ---
 
-# 29. Phase 9 — NVIDIA DLSS Super Resolution
+# 32. Phase 9 — NVIDIA DLSS Super Resolution
 
 Enable:
 
@@ -1418,7 +1564,7 @@ Real GPU savings require Cobra to render fewer scene pixels.
 
 ---
 
-# 30. Phase 10 — true render-scale control
+# 33. Phase 10 — true render-scale control
 
 Investigate in this order:
 
@@ -1440,7 +1586,7 @@ Swapchain should remain native.
 
 ---
 
-# 31. Phase 11 — AMD FSR upscaling
+# 34. Phase 11 — AMD FSR upscaling
 
 Once EDPE's temporal inputs are independently validated, implement AMD FSR.
 
@@ -1497,7 +1643,7 @@ before deciding which is the production EDPE AMD path.
 
 ---
 
-# 32. Phase 12 — native-resolution HUD
+# 35. Phase 12 — native-resolution HUD
 
 Investigate HUD separation.
 
@@ -1530,7 +1676,7 @@ This phase significantly improves SR quality and is a prerequisite for productio
 
 ---
 
-# 33. Phase 13 — D3D11 / D3D12 interoperability research
+# 36. Phase 13 — D3D11 / D3D12 interoperability research
 
 Do not start FG before this point.
 
@@ -1567,7 +1713,7 @@ If interop cost removes the performance benefit, stop and document the result be
 
 ---
 
-# 34. Phase 14 — AMD Frame Generation prototype
+# 37. Phase 14 — AMD Frame Generation prototype
 
 AMD FG is a reasonable first FG research target because FSR Frame Generation is intentionally separated from the upscaler.
 
@@ -1601,7 +1747,7 @@ disocclusion artifacts
 
 ---
 
-# 35. Phase 15 — NVIDIA Streamline / DLSS Frame Generation
+# 38. Phase 15 — NVIDIA Streamline / DLSS Frame Generation
 
 Integrate Streamline only after D3D12 presentation/interop is understood.
 
@@ -1646,7 +1792,7 @@ MFG multiplier
 
 ---
 
-# 36. Phase 16 — NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)
+# 39. Phase 16 — NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)
 
 Investigate and prototype NVIDIA DLSS Ray Reconstruction / Neural Radiance Denoiser (DLSS-NR / DLSS-RR) support via NVIDIA NGX (`NVSDK_NGX_Feature_RayReconstruction`) or Streamline (`SL_FEATURE_DLSS_RR`).
 
@@ -1677,7 +1823,43 @@ Goals:
 
 ---
 
-# 37. Frame pacing
+# 40. Phase 17 — Intel XeSS (Xe Super Sampling) temporal upscaling & Native AA
+
+Implement Intel XeSS (Xe Super Sampling) temporal upscaling and XeSS Native AA as a first-class reconstruction backend within the EDPE multi-upscaler architecture.
+
+XeSS provides AI-based neural network temporal reconstruction with broad hardware compatibility:
+* **Intel Arc GPUs:** accelerated via XMX (Xe Matrix Extensions) systolic arrays;
+* **NVIDIA / AMD / non-Arc GPUs:** accelerated via universal 8-bit integer DP4a instructions, allowing GeForce GTX/RTX, Radeon RX, and other non-Tensor hardware to run AI-driven temporal reconstruction.
+
+Requirements and execution:
+
+1. **SDK Integration & Licensing:**
+   Integrate Intel XeSS SDK (`libxess.dll`, headers `xess.h`, `xess_d3d12.h`). Ensure binary redistribution compliance and dynamic loading so EDPE does not hard-crash if `libxess.dll` is missing.
+2. **D3D11 / D3D12 Execution:**
+   Utilize the Phase 13 D3D11/D3D12 interoperability bridge (shared NT handles / keyed mutex synchronization) to pass EDPE scene textures (`scene_ldr_source` or HDR, DSV #2 reversed-Z depth, and screen-space motion vectors) to the D3D12 XeSS context (`xessD3D12Execute`).
+3. **Temporal Convention Translation:**
+   - Map EDPE Halton (2,3) subpixel jitter to XeSS jitter parameters;
+   - Pass inverted reversed-Z depth with `XESS_FLAG_INVERTED_DEPTH`;
+   - Supply camera-depth motion vectors in render-resolution screen-space coordinates;
+   - Configure exposure scale (auto-exposure or manual scale);
+   - Wire history reset flags on camera cuts and scene transitions.
+4. **Quality Modes:**
+   Expose full XeSS quality range:
+   - `XeSS Native AA` (1.0x render scale, anti-aliasing only);
+   - `Ultra Quality Plus` (1.3x);
+   - `Ultra Quality` (1.5x / 1.4x);
+   - `Quality` (1.7x);
+   - `Balanced` (2.0x);
+   - `Performance` (2.3x);
+   - `Ultra Performance` (3.0x).
+5. **Hardware Model Detection & Diagnostics:**
+   Query `xessGetProperties` to report active model (XMX vs DP4a) and driver status in Dear ImGui and `edpe.log`.
+6. **Fail-Open Fallback:**
+   If XeSS initialization, model loading, or D3D12 bridge dispatch fails, gracefully stand down, disable jitter, and fall back to native rendering or Native TAA without game disruption.
+
+---
+
+# 41. Frame pacing
 
 Frame Generation requires its own diagnostics.
 
@@ -1700,7 +1882,7 @@ A generated frame is not a new simulation frame.
 
 ---
 
-# 38. Latency controls
+# 42. Latency controls
 
 FG must be paired with vendor-appropriate latency handling.
 
@@ -1729,7 +1911,7 @@ status fields.
 
 ---
 
-# 39. Runtime compatibility matrix
+# 43. Runtime compatibility matrix
 
 EDPE should construct capability state dynamically.
 
@@ -1740,6 +1922,9 @@ NVIDIA DLSS SR       Available
 NVIDIA DLAA          Available
 NVIDIA DLSS-NR       Experimental / Capability-gated
 AMD FSR              Available
+Intel XeSS (XMX)     Available (Intel Arc)
+Intel XeSS (DP4a)    Available (Universal fallback)
+Native D3D11 TAA     Available
 NVIDIA Frame Gen     Unavailable: D3D12 bridge disabled
 AMD Frame Gen        Experimental
 ```
@@ -1752,7 +1937,7 @@ Explain the reason in Dear ImGui.
 
 ---
 
-# 40. Diagnostics
+# 44. Diagnostics
 
 Log:
 
@@ -1783,7 +1968,7 @@ Measure separately:
 ```text
 depth preparation
 motion generation
-DLSS/FSR upscale
+DLSS/FSR/XeSS upscale
 HUD composition
 D3D11/D3D12 interop
 Frame Generation
@@ -1794,7 +1979,7 @@ Never block the render thread waiting for GPU queries.
 
 ---
 
-# 41. Failure behavior
+# 45. Failure behavior
 
 Every feature must fail open.
 
@@ -1820,7 +2005,7 @@ Do not black-screen the game because a vendor SDK rejects an input.
 
 ---
 
-# 42. Performance rules
+# 46. Performance rules
 
 Avoid:
 
@@ -1849,7 +2034,7 @@ stable backend contexts
 
 ---
 
-# 43. Scope exclusions for initial versions
+# 47. Scope exclusions for initial versions
 
 Not initial-release requirements:
 
@@ -1864,13 +2049,13 @@ network modifications
 anti-cheat bypassing
 ```
 
-Unlike earlier development revisions, **Frame Generation and DLSS-NR (Ray Reconstruction) are no longer excluded from the overall EDPE roadmap**.
+Unlike earlier development revisions, **Frame Generation, DLSS-NR (Ray Reconstruction), and Intel XeSS are part of the overall EDPE roadmap**.
 
-They are explicitly planned experimental later phases (Phases 13–16).
+They are explicitly planned experimental later phases (Phases 13–17).
 
 ---
 
-# 44. Development philosophy
+# 48. Development philosophy
 
 Every significant graphics claim must be labelled:
 
@@ -1903,7 +2088,7 @@ guess
 
 ---
 
-# 45. Initial serious milestone
+# 49. Initial serious milestone
 
 First major temporal milestone:
 
@@ -1923,7 +2108,7 @@ Elite Dangerous 2D
 
 ---
 
-# 46. Multi-upscaler milestone
+# 50. Multi-upscaler milestone
 
 Next major target:
 
@@ -1932,6 +2117,9 @@ NVIDIA DLAA
 NVIDIA DLSS SR
 AMD FSR Native AA
 AMD FSR SR
+Intel XeSS Native AA
+Intel XeSS SR
+Native D3D11 TAA
 
 sharing the same:
 
@@ -1949,7 +2137,7 @@ It is a **vendor-neutral Elite Dangerous temporal reconstruction framework**.
 
 ---
 
-# 47. Frame Generation milestone
+# 51. Frame Generation milestone
 
 Only after:
 
@@ -1983,7 +2171,7 @@ capability detection
 
 ---
 
-# 48. Final target
+# 52. Final target
 
 A mature EDPE UI may look approximately like:
 

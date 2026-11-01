@@ -74,6 +74,7 @@ As of **November 2026 (`v0.6.0`)**, EDPE has achieved:
 | **12** | **Native-Resolution HUD Separation** | 🟡 **Partial** (Works with menus; cockpit UI refined) | Native-res HUD composited over upscaled DLSS/FSR 3D scene (`UiCompositePass`), protecting cockpit/UI crispness. |
 | **13–15** | **D3D11/D3D12 Interop & Frame Generation** | 🔬 **Research** | NVIDIA DLSS Frame Generation (Streamline) & AMD FSR Frame Generation via interop bridge. |
 | **16** | **NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)** | 🔬 **Research** | AI-driven Ray Reconstruction / neural denoising replacing hand-tuned temporal filters for reflections and lighting via NGX Ray Reconstruction. |
+| **17** | **Intel XeSS Super Resolution & Native AA** | 🔬 **Planned / Research** | Intel XeSS 1.3+ AI temporal upscaler with dual-engine execution: Intel XMX hardware acceleration on Arc and universal DP4a fallback across all vendors via D3D11/D3D12 bridge. |
 
 See [STATUS.md](STATUS.md) for verified facts and [PLAN.md](PLAN.md) for the complete roadmap.
 

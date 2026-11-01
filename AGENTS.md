@@ -18,6 +18,9 @@ NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)
 AMD FSR Native AA
 AMD FSR Super Resolution
 
+Intel XeSS Native AA
+Intel XeSS Super Resolution
+
 Native D3D11 TAA
 
 Experimental later phases:
@@ -96,11 +99,11 @@ EDPE temporal input generation
         v
 shared TemporalFrameInputs
         |
-        +----------------------+
-        |                      |
-        v                      v
- NVIDIA backend            AMD backend
- DLAA / DLSS              FSR NativeAA / SR
+        +----------------------+----------------------+
+        |                      |                      |
+        v                      v                      v
+ NVIDIA backend            AMD backend            Intel backend
+ DLAA / DLSS              FSR NativeAA / SR       XeSS NativeAA / SR
         |                      |
         +----------+-----------+
                    |
@@ -181,7 +184,9 @@ Use a backend abstraction conceptually equivalent to:
 enum class UpscalerBackend {
     None,
     NvidiaDlss,
-    AmdFsr
+    AmdFsr,
+    IntelXess,
+    Taa
 };
 ```
 
@@ -378,6 +383,36 @@ Determine code provenance and licensing before reusing anything.
 
 ---
 
+# Intel references
+
+Use current official Intel documentation, headers, and SDK releases as the final source of truth for Intel XeSS behavior.
+
+Relevant technologies include:
+
+```text
+Intel XeSS SDK (libxess)
+Intel XeSS Super Resolution
+Intel XeSS Native AA (XeSS 1.3+)
+Intel XMX (Xe Matrix Extensions) hardware acceleration
+Universal DP4a fallback execution
+```
+
+Validate:
+
+```text
+D3D12 requirements and D3D11/D3D12 interoperability path
+motion vectors (format, jitter-free, screen-space scale)
+inverted reversed-Z depth compatibility
+subpixel projection jitter sequence
+exposure scale handling
+reactive and responsive mask support
+dynamic model selection (XMX on Intel Arc vs DP4a on NVIDIA/AMD/older Intel GPUs)
+```
+
+---
+
+
+
 # Dear ImGui
 
 Dear ImGui is EDPE's primary runtime control surface.
@@ -410,6 +445,8 @@ NVIDIA DLAA
 NVIDIA DLSS
 AMD FSR Native AA
 AMD FSR
+Intel XeSS Native AA
+Intel XeSS
 
 Quality:
 Native AA

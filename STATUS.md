@@ -36,6 +36,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
 | 16. NVIDIA DLSS-NR | **Not started** | Research phase for G-buffer normal/roughness extraction and NGX Ray Reconstruction / neural denoising integration. |
+| 17. Intel XeSS upscaling | **Planned / Research** | Intel XeSS 1.3+ temporal upscaling (XeSS Native AA and Super Resolution). Dual-model support: XMX matrix acceleration on Intel Arc GPUs and universal DP4a fallback on NVIDIA/AMD GPUs. Investigating D3D11-to-D3D12 interop bridge (via Phase 13) vs proxy wrapper execution. |
 
 ---
 
