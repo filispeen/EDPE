@@ -407,6 +407,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
     ep.Feature.pInColor = colorIn;
     ep.Feature.pInOutput = outputUav;
+    ep.Feature.InSharpness = std::clamp(params.sharpness, 0.0f, 1.0f);
     ep.pInDepth = depthIn;
     ep.pInMotionVectors = motionIn;
     ep.InJitterOffsetX = params.jitterX;

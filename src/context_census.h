@@ -81,6 +81,8 @@ void ContextCensusSetMotionScale(float scale);
 float ContextCensusGetMotionScale();
 void ContextCensusSetPreserveNativeUi(bool preserve);
 bool ContextCensusGetPreserveNativeUi();
+void ContextCensusSetSharpness(float sharpness);
+float ContextCensusGetSharpness();
 void ContextCensusGetSceneRenderSize(UINT* outWidth, UINT* outHeight);
 void ContextCensusRequestComparisonCapture();
 bool ContextCensusIsComparisonCapturePending();

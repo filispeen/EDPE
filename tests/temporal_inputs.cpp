@@ -131,6 +131,9 @@ int main() {
     // Check reset translation
     inputs.reset = true;
     if (!edpe::translateToNvidia(inputs, &nvParams, &reason) || !nvParams.inReset) return 24;
+    inputs.sharpness = 0.5f;
+    if (!edpe::translateToNvidia(inputs, &nvParams, &reason) || std::fabs(nvParams.sharpness - 0.5f) > 1e-6f) return 83;
+    inputs.sharpness = 0.0f;
     inputs.reset = false;
 
     // -------------------------------------------------------------------------

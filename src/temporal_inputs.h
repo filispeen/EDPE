@@ -207,6 +207,7 @@ struct NvidiaDlssInputParams {
     bool motionJittered = false;  // NVSDK_NGX_DLSS_Feature_Flags_MVJittered
     bool isHdr = true;            // NVSDK_NGX_DLSS_Feature_Flags_IsHDR
     bool inReset = false;         // InReset = 1 on scene cut or camera jump
+    float sharpness = 0.0f;
     float frameTimeMs = 0.0f;
 };
 
@@ -235,6 +236,7 @@ inline bool translateToNvidia(const TemporalFrameInputs& inputs,
     outParams->motionJittered = inputs.motionJittered;
     outParams->isHdr = inputs.colorIsHdr;
     outParams->inReset = inputs.reset;
+    outParams->sharpness = inputs.sharpness;
     outParams->frameTimeMs = inputs.frameTimeMs;
     return true;
 }

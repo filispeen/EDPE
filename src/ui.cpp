@@ -1342,6 +1342,7 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     {
         auto& cfg = edpe::Config::instance();
         cfg.load();
+        ContextCensusSetSharpness(cfg.sharpness);
         edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
         if (cfg.upscalerBackend == 1 &&
             edpe::UpscalerManager::instance().isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss)) {
@@ -1653,6 +1654,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     const bool backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
     const bool nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
     const bool amd_active = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
+    const bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
+
 
     if (!nvidia_active) ImGui::BeginDisabled();
 
@@ -1674,6 +1677,27 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     if (!nvidia_active) ImGui::EndDisabled();
 
+    // Sharpening
+    if (!backend_active) ImGui::BeginDisabled();
+    float curSharpness = ContextCensusGetSharpness();
+    if (ImGui::SliderFloat("Sharpening", &curSharpness, 0.0f, 1.0f, "%.2f")) {
+        ContextCensusSetSharpness(curSharpness);
+        cfg.save();
+    }
+    if (backend_active && curSharpness > 0.0f) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset##Sharpness")) {
+            ContextCensusSetSharpness(0.0f);
+            cfg.save();
+        }
+    }
+    if (!backend_active) {
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("Sharpening requires an active upscaler backend");
+    } else if (taa_active) {
+        ImGui::TextDisabled("(TAA uses Catmull-Rom reconstruction; vendor sharpening applies to DLSS and FSR)");
+    }
+
     DXGI_SWAP_CHAIN_DESC scDesc{};
     swap_chain->GetDesc(&scDesc);
     const UINT outW = scDesc.BufferDesc.Width;
@@ -1687,7 +1711,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     const float activeScalePct = outW ? (100.0f * static_cast<float>(sceneW) / static_cast<float>(outW)) : 100.0f;
     const bool isSr = (sceneW < outW || sceneH < outH);
 
-    const bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
+
     const auto& diag = upscaler.getDiagnostics();
     const uint32_t dsvBinds = ContextCensusGetDsvBinds();
     const bool isReconActive = nvidia_active ? edpe::NgxContext::has_evaluated()

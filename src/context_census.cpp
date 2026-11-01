@@ -839,6 +839,7 @@ std::atomic<float> s_jitter_scale{1.0f};
 std::atomic<unsigned> s_jitter_phase_count{32};
 std::atomic<unsigned> s_active_jitter_phases{32};
 std::atomic<bool> s_preserve_native_ui{true};
+std::atomic<float> s_sharpness{0.0f};
 
 std::atomic<bool> s_jitter_debug_view{false};
 std::atomic<float> s_jitter_debug_sensitivity{1.5f};
@@ -3616,7 +3617,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.reset = s_camera_reset || scene_cut;
     inputs.cameraNow = s_camera_now;
     inputs.cameraPrevious = s_camera_previous;
-    inputs.sharpness = edpe::Config::instance().sharpness;
+    inputs.sharpness = s_sharpness.load(std::memory_order_relaxed);
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
     const bool isHdrColor = hdrInput &&
@@ -4883,6 +4884,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_jitter_scale.store(cfg.jitterScale, std::memory_order_relaxed);
         s_jitter_phase_count.store(cfg.jitterPhaseCount, std::memory_order_relaxed);
         s_preserve_native_ui.store(cfg.preserveNativeUi, std::memory_order_relaxed);
+        s_sharpness.store(cfg.sharpness, std::memory_order_relaxed);
         s_jitter_debug_view.store(cfg.jitterDebugView, std::memory_order_relaxed);
         s_jitter_debug_sensitivity.store(cfg.jitterDebugSensitivity, std::memory_order_relaxed);
         s_jitter_debug_threshold.store(cfg.jitterDebugThreshold, std::memory_order_relaxed);
@@ -5831,6 +5833,19 @@ void ContextCensusSetPreserveNativeUi(bool preserve) {
 }
 bool ContextCensusGetPreserveNativeUi() {
     return s_preserve_native_ui.load(std::memory_order_relaxed);
+}
+
+void ContextCensusSetSharpness(float sharpness) {
+    sharpness = std::clamp(sharpness, 0.0f, 1.0f);
+    s_sharpness.store(sharpness, std::memory_order_relaxed);
+    edpe::Config::instance().sharpness = sharpness;
+}
+
+float ContextCensusGetSharpness() {
+    if (!s_config_loaded) {
+        return edpe::Config::instance().sharpness;
+    }
+    return s_sharpness.load(std::memory_order_relaxed);
 }
 
 void ContextCensusSetZeroMotion(bool zero) {
