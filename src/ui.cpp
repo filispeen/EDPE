@@ -72,6 +72,15 @@ struct UiState {
     ID3D11ShaderResourceView* early_color_srv = nullptr;
     ID3D11ShaderResourceView* motion_srv = nullptr;
     std::vector<TextureCaptureRequest> pending_captures;
+    // Comparison frames waiting for the performance HUD to be drawn onto them
+    // (drawn in UiOnPresent, then handed to the normal BMP capture queue).
+    struct OverlayCaptureItem {
+        ID3D11Texture2D* texture = nullptr;
+        ID3D11RenderTargetView* rtv = nullptr;
+        std::wstring name;
+        SYSTEMTIME time{};
+    };
+    std::vector<OverlayCaptureItem> overlay_items;
     unsigned capture_serial = 0;
     bool pending_backbuffer_capture = false;
     bool pending_backbuffer_capture_on_motion = false;
@@ -460,7 +469,53 @@ void queueComparisonItemInternal(ID3D11DeviceContext* context, const wchar_t* na
     } else {
         GetLocalTime(&now);
     }
+    if (edpe::Config::instance().captureOverlayInComparison && ui.overlay_items.size() < 8) {
+        ID3D11Device* texDevice = nullptr;
+        texture->GetDevice(&texDevice);
+        const bool sameDevice = texDevice && texDevice == ui.device;
+        if (texDevice) texDevice->Release();
+        if (sameDevice) {
+            D3D11_TEXTURE2D_DESC desc{};
+            texture->GetDesc(&desc);
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+            desc.CPUAccessFlags = 0;
+            desc.MiscFlags = 0;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            ID3D11Texture2D* copy = nullptr;
+            ID3D11RenderTargetView* rtv = nullptr;
+            if (SUCCEEDED(ui.device->CreateTexture2D(&desc, nullptr, &copy)) && copy &&
+                SUCCEEDED(ui.device->CreateRenderTargetView(copy, nullptr, &rtv)) && rtv) {
+                context->CopyResource(copy, texture);
+                ui.overlay_items.push_back({copy, rtv, name ? name : L"", now});
+                return;
+            }
+            if (rtv) rtv->Release();
+            if (copy) copy->Release();
+            EdpeLog(L"EDPE: comparison overlay target unavailable; capturing without HUD");
+        } else {
+            EdpeLog(L"EDPE: comparison frame on another device; capturing without HUD");
+        }
+    }
     queueTextureCapture(texture, UiState::CaptureKind::Comparison, -1, &now, name);
+}
+
+// Draws the current Dear ImGui frame (performance HUD) onto each pending comparison
+// frame and queues it for BMP readback. With drawOverlay=false frames are queued as-is.
+void flushOverlayCaptures(bool drawOverlay) {
+    if (ui.overlay_items.empty()) return;
+    ImDrawData* drawData = drawOverlay ? ImGui::GetDrawData() : nullptr;
+    for (auto& item : ui.overlay_items) {
+        if (drawData && ui.context) {
+            ui.context->OMSetRenderTargets(1, &item.rtv, nullptr);
+            ImGui_ImplDX11_RenderDrawData(drawData);
+        }
+        queueTextureCapture(item.texture, UiState::CaptureKind::Comparison, -1, &item.time, item.name.c_str());
+        item.rtv->Release();
+        item.texture->Release();
+    }
+    ui.overlay_items.clear();
 }
 
 void queueComparisonCaptureInternal(ID3D11DeviceContext* context, ID3D11Texture2D* beforeTex, ID3D11Texture2D* afterTex) {
@@ -1540,7 +1595,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     auto& cfg = edpe::Config::instance();
     const bool comparison_pending = ContextCensusIsComparisonCapturePending();
     const bool show_menu = menu_visible.load();
-    const bool show_perf = cfg.showPerfOverlay || comparison_pending;
+    const bool overlay_capture_pending = !ui.overlay_items.empty();
+    const bool show_perf = cfg.showPerfOverlay || comparison_pending || overlay_capture_pending;
 
     if (!show_menu && !show_perf && !comparison_pending) {
         std::lock_guard lock(input_mutex);
@@ -1549,13 +1605,14 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     if (!ui.backbuffer_rtv && !createBackbufferView(swap_chain)) {
         EdpeLog(L"EDPE: overlay backbuffer view unavailable; presenting original frame");
+        flushOverlayCaptures(false);
         return;
     }
 
     ImGuiContext* previous = ImGui::GetCurrentContext();
     ImGui::SetCurrentContext(ui.imgui);
 
-    const bool draw_menu = show_menu && !comparison_pending;
+    const bool draw_menu = show_menu && !comparison_pending && !overlay_capture_pending;
     ImGuiIO& io = ImGui::GetIO();
     io.MouseDrawCursor = draw_menu;
     if (draw_menu) {
@@ -1837,6 +1894,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (!can_compare) ImGui::BeginDisabled();
     if (ImGui::Button("Capture All Upscaling Backends")) {
         ContextCensusRequestComparisonCapture();
+    }
+    if (ImGui::Checkbox("Include Performance HUD in comparison images", &cfg.captureOverlayInComparison)) {
+        cfg.save();
     }
     if (!can_compare) {
         ImGui::EndDisabled();
@@ -2169,6 +2229,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ID3D11Texture2D* copy_tex = ContextCensusGetBackbufferCopyTexture();
     ui.context->OMSetRenderTargets(1, &ui.backbuffer_rtv, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    flushOverlayCaptures(true);
 
     ui.context->OMSetRenderTargets(1, &previous_rtv, previous_dsv);
     if (previous_rtv) previous_rtv->Release();

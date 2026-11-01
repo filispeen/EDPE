@@ -82,6 +82,7 @@ public:
         if (motionScale < 0.0f || motionScale > 2.0f) motionScale = 1.0f;
 
         showPerfOverlay = GetPrivateProfileIntW(L"Overlay", L"ShowPerfOverlay", 0, path.c_str()) != 0;
+        captureOverlayInComparison = GetPrivateProfileIntW(L"Overlay", L"CaptureOverlayInComparison", 0, path.c_str()) != 0;
         enableProfiler = GetPrivateProfileIntW(L"Overlay", L"EnableProfiler", 0, path.c_str()) != 0;
         Profiler::instance().setEnabled(enableProfiler);
         perfOverlayCorner = GetPrivateProfileIntW(L"Overlay", L"Corner", 0, path.c_str());
@@ -139,6 +140,7 @@ public:
         WritePrivateProfileStringW(L"Motion", L"Scale", buf, path.c_str());
 
         WritePrivateProfileStringW(L"Overlay", L"ShowPerfOverlay", showPerfOverlay ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"Overlay", L"CaptureOverlayInComparison", captureOverlayInComparison ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Overlay", L"EnableProfiler", enableProfiler ? L"1" : L"0", path.c_str());
         Profiler::instance().setEnabled(enableProfiler);
         WritePrivateProfileStringW(L"Overlay", L"Corner", std::to_wstring(perfOverlayCorner).c_str(), path.c_str());
@@ -257,6 +259,7 @@ public:
     float motionScale = 1.0f;
 
     bool showPerfOverlay = false;
+    bool captureOverlayInComparison = false;
     bool enableProfiler = false;
     int perfOverlayCorner = 0; // 0=Top-Left, 1=Top-Right, 2=Bottom-Left, 3=Bottom-Right
     float perfOverlayScale = 1.0f;
