@@ -1,6 +1,7 @@
 #include "capture_format.h"
 
 #include <cmath>
+#include <fstream>
 #include <iostream>
 
 int main() {
@@ -74,6 +75,28 @@ int main() {
     // High HDR brightness (100.0f): mapped ~ 0.99 -> ~254 or 255
     uint8_t srgb100 = edpe::toneMapSrgb(100.0f);
     if (srgb100 < 250) return 52;
+
+    // 7. saveRgbaToPng tests
+    const uint32_t testW = 2;
+    const uint32_t testH = 2;
+    const uint32_t testPixels[4] = {
+        0xFF0000FF, // R=255, G=0, B=0, A=255
+        0xFF00FF00, // R=0, G=255, B=0, A=255
+        0xFFFF0000, // R=0, G=0, B=255, A=255
+        0xFFFFFFFF  // White
+    };
+    std::filesystem::path testPath = std::filesystem::temp_directory_path() / "edpe_png_test.png";
+    std::filesystem::remove(testPath);
+    if (!edpe::saveRgbaToPng(testPath, testPixels, testW, testH, testW * 4)) return 70;
+    if (!std::filesystem::exists(testPath)) return 71;
+
+    std::ifstream checkFile(testPath, std::ios::binary);
+    char magic[8]{};
+    checkFile.read(magic, 8);
+    checkFile.close();
+    std::filesystem::remove(testPath);
+    const unsigned char expectedMagic[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (std::memcmp(magic, expectedMagic, 8) != 0) return 72;
 
     return 0;
 }

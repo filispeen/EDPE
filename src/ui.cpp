@@ -44,6 +44,7 @@ struct UiState {
         SceneColor,
         EarlyHdr,
         Backbuffer,
+        Comparison,
         ComparisonBefore,
         ComparisonAfter,
     };
@@ -57,6 +58,7 @@ struct UiState {
         CaptureKind kind = CaptureKind::Depth;
         int index = -1;
         SYSTEMTIME timestamp{};
+        std::wstring custom_name;
     };
 
     IDXGISwapChain* swap_chain = nullptr; // Weak: the game's Release owns its lifetime.
@@ -273,7 +275,7 @@ void releaseMotionSnapshot() {
 
 
 void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int index = -1,
-    const SYSTEMTIME* customTime = nullptr) {
+    const SYSTEMTIME* customTime = nullptr, const wchar_t* customName = nullptr) {
     if (!source || !ui.device || !ui.context) return;
     D3D11_TEXTURE2D_DESC desc{};
     source->GetDesc(&desc);
@@ -282,7 +284,7 @@ void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int
         EdpeLog(L"EDPE: texture capture skipped (unsupported layout or dimensions)");
         return;
     }
-    if (ui.pending_captures.size() >= 8) {
+    if (ui.pending_captures.size() >= 16) {
         EdpeLog(L"EDPE: texture capture skipped (too many pending captures)");
         return;
     }
@@ -307,7 +309,8 @@ void queueTextureCapture(ID3D11Texture2D* source, UiState::CaptureKind kind, int
         } else {
             GetLocalTime(&t);
         }
-        ui.pending_captures.push_back({staging, desc.Format, desc.Width, desc.Height, 0, kind, index, t});
+        std::wstring cname = customName ? customName : L"";
+        ui.pending_captures.push_back({staging, desc.Format, desc.Width, desc.Height, 0, kind, index, t, std::move(cname)});
         wchar_t msg[128];
         swprintf_s(msg, L"EDPE: queued %ls capture %ux%u format=%u",
             kind == UiState::CaptureKind::Depth ? L"depth" :
@@ -441,8 +444,8 @@ void queueTextureCaptureFromSrv(ID3D11ShaderResourceView* srv, UiState::CaptureK
     }
 }
 
-void queueComparisonCaptureInternal(ID3D11DeviceContext* context, ID3D11Texture2D* beforeTex, ID3D11Texture2D* afterTex) {
-    if (!beforeTex || !afterTex || !context) return;
+void queueComparisonItemInternal(ID3D11DeviceContext* context, const wchar_t* name, ID3D11Texture2D* texture, const SYSTEMTIME* customTime) {
+    if (!texture || !context) return;
     if (!ui.device) {
         context->GetDevice(&ui.device);
     }
@@ -451,9 +454,20 @@ void queueComparisonCaptureInternal(ID3D11DeviceContext* context, ID3D11Texture2
         ui.context->AddRef();
     }
     SYSTEMTIME now{};
+    if (customTime) {
+        now = *customTime;
+    } else {
+        GetLocalTime(&now);
+    }
+    queueTextureCapture(texture, UiState::CaptureKind::Comparison, -1, &now, name);
+}
+
+void queueComparisonCaptureInternal(ID3D11DeviceContext* context, ID3D11Texture2D* beforeTex, ID3D11Texture2D* afterTex) {
+    if (!beforeTex || !afterTex || !context) return;
+    SYSTEMTIME now{};
     GetLocalTime(&now);
-    queueTextureCapture(beforeTex, UiState::CaptureKind::ComparisonBefore, -1, &now);
-    queueTextureCapture(afterTex, UiState::CaptureKind::ComparisonAfter, -1, &now);
+    queueComparisonItemInternal(context, L"Before", beforeTex, &now);
+    queueComparisonItemInternal(context, L"After", afterTex, &now);
 }
 
 void pollFrameCapture() {
@@ -461,19 +475,23 @@ void pollFrameCapture() {
 
     wchar_t executable[MAX_PATH]{};
     const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
-    std::filesystem::path folder;
+    std::filesystem::path baseDir;
     if (length && length < MAX_PATH) {
-        std::error_code error;
-        folder = std::filesystem::path(executable).parent_path() / L"edpe-captures";
-        std::filesystem::create_directories(folder, error);
-        if (error) {
-            EdpeLog(L"EDPE: capture directory unavailable");
-            folder.clear();
-        }
+        baseDir = std::filesystem::path(executable).parent_path();
+    } else {
+        baseDir = std::filesystem::current_path();
     }
 
     for (auto it = ui.pending_captures.begin(); it != ui.pending_captures.end();) {
         auto& req = *it;
+        const bool isComparison = (req.kind == UiState::CaptureKind::Comparison);
+        std::filesystem::path folder = isComparison ? (baseDir / L"comparison") : (baseDir / L"edpe-captures");
+        std::error_code dirErr;
+        std::filesystem::create_directories(folder, dirErr);
+        if (dirErr) {
+            EdpeLog(L"EDPE: capture directory unavailable");
+            folder.clear();
+        }
         ID3D11Device* stagDevice = nullptr;
         ID3D11DeviceContext* stagContext = nullptr;
         if (req.staging) req.staging->GetDevice(&stagDevice);
@@ -708,6 +726,11 @@ void pollFrameCapture() {
                         req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay, req.timestamp.wHour, req.timestamp.wMinute,
                         req.timestamp.wSecond, req.timestamp.wMilliseconds, ++ui.capture_serial);
                     break;
+                case UiState::CaptureKind::Comparison:
+                    swprintf_s(name, L"%02u-%02u-%02u-%ls.png",
+                        req.timestamp.wDay, req.timestamp.wMonth, req.timestamp.wYear % 100,
+                        req.custom_name.c_str());
+                    break;
                 case UiState::CaptureKind::ComparisonBefore:
                     swprintf_s(name, L"capture-%04u%02u%02u-%02u%02u%02u-before.bmp",
                         req.timestamp.wYear, req.timestamp.wMonth, req.timestamp.wDay,
@@ -727,6 +750,60 @@ void pollFrameCapture() {
                 }
 
                 const auto path = folder / name;
+                if (req.kind == UiState::CaptureKind::Comparison) {
+                    std::vector<unsigned char> rgba(static_cast<size_t>(req.width) * req.height * 4);
+                    for (UINT y = 0; y < req.height; ++y) {
+                        const auto* source = static_cast<const unsigned char*>(mapped.pData) +
+                            static_cast<size_t>(y) * mapped.RowPitch;
+                        auto* dstRow = rgba.data() + static_cast<size_t>(y) * req.width * 4;
+                        for (UINT x = 0; x < req.width; ++x) {
+                            if (req.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                                uint32_t val = 0;
+                                std::memcpy(&val, source + 4 * x, sizeof(val));
+                                dstRow[4 * x + 0] = static_cast<unsigned char>((val & 0x3FF) >> 2);
+                                dstRow[4 * x + 1] = static_cast<unsigned char>(((val >> 10) & 0x3FF) >> 2);
+                                dstRow[4 * x + 2] = static_cast<unsigned char>(((val >> 20) & 0x3FF) >> 2);
+                                dstRow[4 * x + 3] = 255;
+                            } else if (req.format == DXGI_FORMAT_B8G8R8A8_UNORM || req.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+                                const auto* pixel = source + 4 * x;
+                                dstRow[4 * x + 0] = pixel[2];
+                                dstRow[4 * x + 1] = pixel[1];
+                                dstRow[4 * x + 2] = pixel[0];
+                                dstRow[4 * x + 3] = pixel[3];
+                            } else if (req.format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                                uint32_t val = 0;
+                                std::memcpy(&val, source + 4 * x, sizeof(val));
+                                const float cr = edpe::decodeFloat11(val & 0x7FF);
+                                const float cg = edpe::decodeFloat11((val >> 11) & 0x7FF);
+                                const float cb = edpe::decodeFloat10((val >> 22) & 0x3FF);
+                                dstRow[4 * x + 0] = edpe::toneMapSrgb(cr);
+                                dstRow[4 * x + 1] = edpe::toneMapSrgb(cg);
+                                dstRow[4 * x + 2] = edpe::toneMapSrgb(cb);
+                                dstRow[4 * x + 3] = 255;
+                            } else if (req.format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                                const auto* px = reinterpret_cast<const uint16_t*>(source + 8 * x);
+                                dstRow[4 * x + 0] = edpe::toneMapSrgb(edpe::halfToFloat(px[0]));
+                                dstRow[4 * x + 1] = edpe::toneMapSrgb(edpe::halfToFloat(px[1]));
+                                dstRow[4 * x + 2] = edpe::toneMapSrgb(edpe::halfToFloat(px[2]));
+                                dstRow[4 * x + 3] = 255;
+                            } else {
+                                const auto* pixel = source + 4 * x;
+                                dstRow[4 * x + 0] = pixel[0];
+                                dstRow[4 * x + 1] = pixel[1];
+                                dstRow[4 * x + 2] = pixel[2];
+                                dstRow[4 * x + 3] = pixel[3];
+                            }
+                        }
+                    }
+                    if (edpe::saveRgbaToPng(path, rgba.data(), req.width, req.height, req.width * 4)) {
+                        wchar_t log_msg[256];
+                        swprintf_s(log_msg, L"EDPE: comparison capture saved %ls", path.wstring().c_str());
+                        EdpeLog(log_msg);
+                        swprintf_s(ui.last_comparison_saved, L"Saved %ls to comparison\\", name);
+                    } else {
+                        EdpeLog(L"EDPE: comparison PNG capture write failed");
+                    }
+                } else {
                 std::ofstream file(path, std::ios::binary);
                 const DWORD image_bytes = req.width * req.height * 4;
                 BITMAPFILEHEADER header{};
@@ -869,6 +946,7 @@ void pollFrameCapture() {
                     }
                 } else {
                     EdpeLog(L"EDPE: capture file write failed");
+                }
                 }
             }
             stagContext->Unmap(req.staging, 0);
@@ -1807,16 +1885,16 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui::TextUnformatted("Reconstruction Screenshot Comparison");
     const bool can_compare = backend_active && upscaler.isReconstructionActive();
     if (!can_compare) ImGui::BeginDisabled();
-    if (ImGui::Button("Capture Before & After Reconstruction (2x BMP)")) {
+    if (ImGui::Button("Capture All Upscaling Backends")) {
         ContextCensusRequestComparisonCapture();
     }
     if (!can_compare) {
         ImGui::EndDisabled();
-        ImGui::TextDisabled("Enable DLSS, DLAA or FSR to capture comparison");
+        ImGui::TextDisabled("Enable DLSS, DLAA, FSR or TAA to capture comparison");
     } else if (ContextCensusIsComparisonCapturePending()) {
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Comparison capture queued for next frame...");
     } else if (ui.last_comparison_saved[0] != L'\0') {
-        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%ls (and -before.bmp)", ui.last_comparison_saved);
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%ls", ui.last_comparison_saved);
     }
 
     if (!nvidia_available) {
@@ -2139,24 +2217,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ui.context->OMGetRenderTargets(1, &previous_rtv, &previous_dsv);
 
     ID3D11Texture2D* copy_tex = ContextCensusGetBackbufferCopyTexture();
-    ID3D11RenderTargetView* copy_rtv = ContextCensusGetBackbufferCopyRtv();
-
-    if (comparison_pending && copy_rtv && copy_tex) {
-        ui.context->OMSetRenderTargets(1, &copy_rtv, nullptr);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    }
-
     ui.context->OMSetRenderTargets(1, &ui.backbuffer_rtv, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-
-    if (comparison_pending && copy_tex) {
-        ID3D11Texture2D* backbuffer = nullptr;
-        if (SUCCEEDED(swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backbuffer)))) {
-            ContextCensusConsumeComparisonCaptureRequest();
-            UiQueueComparisonCapture(ui.context, copy_tex, backbuffer);
-            backbuffer->Release();
-        }
-    }
 
     ui.context->OMSetRenderTargets(1, &previous_rtv, previous_dsv);
     if (previous_rtv) previous_rtv->Release();
@@ -2180,6 +2242,10 @@ void UiOnRelease(IUnknown* object) {
 }
 
 bool UiMenuVisible() { return menu_visible.load(); }
+
+void UiQueueComparisonItem(ID3D11DeviceContext* context, const wchar_t* name, ID3D11Texture2D* texture, const SYSTEMTIME* customTime) {
+    queueComparisonItemInternal(context, name, texture, customTime);
+}
 
 void UiQueueComparisonCapture(ID3D11DeviceContext* context, ID3D11Texture2D* beforeTex, ID3D11Texture2D* afterTex) {
     queueComparisonCaptureInternal(context, beforeTex, afterTex);

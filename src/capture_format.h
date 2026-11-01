@@ -4,7 +4,21 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace edpe {
 
@@ -95,6 +109,76 @@ inline uint8_t toneMapSrgb(float c) noexcept {
     const float mapped = c / (c + 1.0f);
     const float srgb = std::pow(mapped, 1.0f / 2.2f);
     return static_cast<uint8_t>(std::clamp(srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
+}
+
+// Encodes a 32-bit RGBA pixel buffer to a PNG image file using Windows Imaging Component (WIC).
+inline bool saveRgbaToPng(const std::filesystem::path& path, const void* pixels,
+                          uint32_t width, uint32_t height, uint32_t stride) noexcept {
+    if (!pixels || width == 0 || height == 0 || stride < width * 4) {
+        return false;
+    }
+
+    std::error_code ec;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool needCoUninit = (hrCo == S_OK || hrCo == S_FALSE);
+
+    bool success = false;
+    do {
+        Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&factory));
+        if (FAILED(hr) || !factory) break;
+
+        Microsoft::WRL::ComPtr<IWICStream> stream;
+        hr = factory->CreateStream(&stream);
+        if (FAILED(hr) || !stream) break;
+
+        hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+        if (FAILED(hr)) break;
+
+        Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
+        hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+        if (FAILED(hr) || !encoder) break;
+
+        hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+        if (FAILED(hr)) break;
+
+        Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+        hr = encoder->CreateNewFrame(&frame, nullptr);
+        if (FAILED(hr) || !frame) break;
+
+        hr = frame->Initialize(nullptr);
+        if (FAILED(hr)) break;
+
+        hr = frame->SetSize(width, height);
+        if (FAILED(hr)) break;
+
+        WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppRGBA;
+        hr = frame->SetPixelFormat(&pixelFormat);
+        if (FAILED(hr)) break;
+
+        const UINT bufferSize = stride * height;
+        hr = frame->WritePixels(height, stride, bufferSize,
+                                static_cast<BYTE*>(const_cast<void*>(pixels)));
+        if (FAILED(hr)) break;
+
+        hr = frame->Commit();
+        if (FAILED(hr)) break;
+
+        hr = encoder->Commit();
+        if (SUCCEEDED(hr)) {
+            success = true;
+        }
+    } while (false);
+
+    if (needCoUninit) {
+        CoUninitialize();
+    }
+    return success;
 }
 
 } // namespace edpe

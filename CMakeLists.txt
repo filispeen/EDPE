@@ -57,6 +57,7 @@ add_library(EDPE_DXGI SHARED
     src/ngx_context.cpp
     src/upscaler_backend.cpp
     src/taa_pass.cpp
+    src/sharpen_pass.cpp
     src/jitter_logger.cpp
     src/jitter_debug_pass.cpp
     src/jitter_view_recorder.cpp
@@ -81,7 +82,7 @@ add_library(EDPE_IMGUI STATIC
     external/imgui/backends/imgui_impl_dx11.cpp)
 target_include_directories(EDPE_IMGUI PUBLIC external/imgui external/imgui/backends)
 target_compile_definitions(EDPE_IMGUI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(EDPE_DXGI PRIVATE EDPE_IMGUI d3dcompiler dxguid dbghelp)
+target_link_libraries(EDPE_DXGI PRIVATE EDPE_IMGUI d3dcompiler dxguid dbghelp windowscodecs ole32)
 
 if(EDPE_HAVE_NGX)
     target_include_directories(EDPE_DXGI PRIVATE "${NGX_SDK_DIR}/include")
@@ -114,8 +115,9 @@ add_test(NAME camera_delta COMMAND camera_delta_test)
 add_executable(capture_format_test tests/capture_format.cpp)
 target_compile_features(capture_format_test PRIVATE cxx_std_20)
 target_include_directories(capture_format_test PRIVATE src)
+target_link_libraries(capture_format_test PRIVATE windowscodecs ole32)
 add_test(NAME capture_format COMMAND capture_format_test)
-add_executable(temporal_inputs_test tests/temporal_inputs.cpp src/upscaler_backend.cpp src/ngx_context.cpp src/log.cpp src/taa_pass.cpp)
+add_executable(temporal_inputs_test tests/temporal_inputs.cpp src/upscaler_backend.cpp src/ngx_context.cpp src/log.cpp src/taa_pass.cpp src/sharpen_pass.cpp)
 target_compile_features(temporal_inputs_test PRIVATE cxx_std_20)
 target_compile_definitions(temporal_inputs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(temporal_inputs_test PRIVATE src)

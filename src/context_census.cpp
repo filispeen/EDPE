@@ -3040,6 +3040,11 @@ static std::atomic<bool> s_comparison_capture_requested{false};
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_backbuffer_copy;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_backbuffer_copy_srv;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_copy_rtv;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_comp_eval_tex;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_comp_eval_srv;
+static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_comp_eval_rtv;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_comp_final_tex;
+static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_comp_final_rtv;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlaa_input;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlaa_input_srv;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
@@ -3281,6 +3286,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_backbuffer_copy.Reset();
         s_backbuffer_copy_srv.Reset();
         s_backbuffer_copy_rtv.Reset();
+        s_comp_eval_tex.Reset();
+        s_comp_eval_srv.Reset();
+        s_comp_eval_rtv.Reset();
+        s_comp_final_tex.Reset();
+        s_comp_final_rtv.Reset();
         s_backbuffer_rtv.Reset();
         s_cached_backbuffer_ptr = nullptr;
         ui_composite_pass.reset();
@@ -3789,6 +3799,101 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 }
             } else {
                 compOk = true;
+            }
+
+            if (ContextCensusIsComparisonCapturePending()) {
+                ContextCensusConsumeComparisonCaptureRequest();
+                SYSTEMTIME captureTime{};
+                GetLocalTime(&captureTime);
+
+                // 1. Queue "Before" (the scene before any reconstruction)
+                if (s_backbuffer_copy) {
+                    UiQueueComparisonItem(context, L"Before", s_backbuffer_copy.Get(), &captureTime);
+                }
+
+                // 2. Queue active backend (already evaluated into backbuffer)
+                const auto activeBackend = upscaler.getBackend();
+                const wchar_t* activeName = (activeBackend == edpe::UpscalerBackend::NvidiaDlss) ? L"DLSS" :
+                                            (activeBackend == edpe::UpscalerBackend::AmdFsr) ? L"FSR" :
+                                            (activeBackend == edpe::UpscalerBackend::Taa) ? L"TAA" : L"Active";
+                UiQueueComparisonItem(context, activeName, backbuffer, &captureTime);
+
+                // 3. Evaluate and queue each other available backend
+                struct BackendCandidate {
+                    edpe::UpscalerBackend backend;
+                    const wchar_t* name;
+                };
+                const BackendCandidate candidates[] = {
+                    { edpe::UpscalerBackend::NvidiaDlss, L"DLSS" },
+                    { edpe::UpscalerBackend::AmdFsr, L"FSR" },
+                    { edpe::UpscalerBackend::Taa, L"TAA" }
+                };
+
+                if (s_comp_eval_tex) {
+                    D3D11_TEXTURE2D_DESC cur{};
+                    s_comp_eval_tex->GetDesc(&cur);
+                    if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height || cur.Format != outFormat) {
+                        s_comp_eval_tex.Reset();
+                        s_comp_eval_srv.Reset();
+                        s_comp_eval_rtv.Reset();
+                    }
+                }
+                if (!s_comp_eval_tex) {
+                    D3D11_TEXTURE2D_DESC td = backbufferDesc;
+                    td.Format = outFormat;
+                    td.Usage = D3D11_USAGE_DEFAULT;
+                    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+                    if (SUCCEEDED(device->CreateTexture2D(&td, nullptr, &s_comp_eval_tex))) {
+                        device->CreateShaderResourceView(s_comp_eval_tex.Get(), nullptr, &s_comp_eval_srv);
+                        device->CreateRenderTargetView(s_comp_eval_tex.Get(), nullptr, &s_comp_eval_rtv);
+                    }
+                }
+
+                const bool needUiComp = canCompositeUi && ui_composite_pass;
+                if (needUiComp) {
+                    if (s_comp_final_tex) {
+                        D3D11_TEXTURE2D_DESC cur{};
+                        s_comp_final_tex->GetDesc(&cur);
+                        if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height || cur.Format != bbFormat) {
+                            s_comp_final_tex.Reset();
+                            s_comp_final_rtv.Reset();
+                        }
+                    }
+                    if (!s_comp_final_tex) {
+                        D3D11_TEXTURE2D_DESC td = backbufferDesc;
+                        td.Format = bbFormat;
+                        td.Usage = D3D11_USAGE_DEFAULT;
+                        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                        if (SUCCEEDED(device->CreateTexture2D(&td, nullptr, &s_comp_final_tex))) {
+                            device->CreateRenderTargetView(s_comp_final_tex.Get(), nullptr, &s_comp_final_rtv);
+                        }
+                    }
+                }
+
+                for (const auto& cand : candidates) {
+                    if (cand.backend == activeBackend) continue;
+                    if (!upscaler.isBackendAvailable(cand.backend)) continue;
+                    if (!s_comp_eval_tex) continue;
+
+                    const bool evalOk = upscaler.evaluateBackend(cand.backend, context, inputs,
+                        s_comp_eval_rtv.Get(), s_comp_eval_tex.Get());
+                    if (!evalOk) continue;
+
+                    ID3D11Texture2D* texToCapture = s_comp_eval_tex.Get();
+                    if (needUiComp && s_comp_final_tex && s_comp_final_rtv && s_comp_eval_srv) {
+                        if (ui_composite_pass->composite(context,
+                                s_comp_eval_srv.Get(),
+                                s_backbuffer_copy_srv.Get(),
+                                s_dlaa_input_srv.Get(),
+                                s_comp_final_rtv.Get(),
+                                backbufferDesc.Width, backbufferDesc.Height,
+                                depthDesc.Width, depthDesc.Height,
+                                isHdrColor)) {
+                            texToCapture = s_comp_final_tex.Get();
+                        }
+                    }
+                    UiQueueComparisonItem(context, cand.name, texToCapture, &captureTime);
+                }
             }
 
             if (crossDevice) {
@@ -5594,6 +5699,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_backbuffer_copy.Reset();
         s_backbuffer_copy_srv.Reset();
         s_backbuffer_copy_rtv.Reset();
+        s_comp_eval_tex.Reset();
+        s_comp_eval_srv.Reset();
+        s_comp_eval_rtv.Reset();
+        s_comp_final_tex.Reset();
+        s_comp_final_rtv.Reset();
         s_backbuffer_rtv.Reset();
         s_cached_backbuffer_ptr = nullptr;
         resetSharedBackbufferBridge();

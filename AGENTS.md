@@ -601,6 +601,8 @@ EDPE uses:
 vMAJOR.MINOR.PATCH
 ```
 
+PATCH can be count by amount of fixes/changes per commit or commits
+
 The repository is expected to begin without tags.
 
 If no tags exist, the first stable EDPE milestone must be:

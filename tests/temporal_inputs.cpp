@@ -265,5 +265,9 @@ int main() {
     inputs.reactiveMaskSrv = nullptr;
     if (!inputs.isValid(&reason)) return 82;
 
+    // Test 11: evaluateBackend safety
+    if (manager.evaluateBackend(edpe::UpscalerBackend::None, nullptr, inputs, nullptr, nullptr)) return 84;
+    if (manager.evaluateBackend(edpe::UpscalerBackend::NvidiaDlss, nullptr, inputs, nullptr, nullptr)) return 85;
+
     return 0; // All temporal input layer tests passed
 }

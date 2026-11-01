@@ -621,6 +621,7 @@ bool UpscalerManager::initialize(ID3D11Device* device, ID3D11DeviceContext* cont
     nvidiaBackend_.initialize(device, context);
     amdBackend_.initialize(device, context);
     taaBackend_.initialize(device, context);
+    sharpenPass_.initialize(device, context);
 
     if (device) {
         D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
@@ -642,6 +643,7 @@ void UpscalerManager::shutdown() {
     nvidiaBackend_.shutdown();
     amdBackend_.shutdown();
     taaBackend_.shutdown();
+    sharpenPass_.shutdown();
 
     for (auto& slot : timingRing_) {
         slot = {};
@@ -831,6 +833,16 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     {
         EvaluatingUpscalerGuard evalGuard;
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
+        if (evalSuccess && currentBackendType_ != UpscalerBackend::AmdFsr && inputs.sharpness > 0.0f) {
+            ID3D11Texture2D* sharpenTarget = destinationTexture ? destinationTexture : inputs.color;
+            if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr)) {
+                static bool s_sharpenFailLogged = false;
+                if (!s_sharpenFailLogged) {
+                    s_sharpenFailLogged = true;
+                    EdpeLog(L"EDPE: sharpen pass failed; output left unsharpened");
+                }
+            }
+        }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     if (evalSuccess) {
@@ -877,6 +889,39 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         diagnostics_.gpuTimeMs);
     pendingReset_ = false;
     return true;
+}
+
+bool UpscalerManager::evaluateBackend(UpscalerBackend backendType,
+    ID3D11DeviceContext* context,
+    const TemporalFrameInputs& inputs,
+    ID3D11RenderTargetView* destinationRtv,
+    ID3D11Texture2D* destinationTexture) {
+    if (backendType == UpscalerBackend::None || !isBackendAvailable(backendType)) {
+        return false;
+    }
+    auto* backend = getBackendInstance(backendType);
+    if (!backend) return false;
+
+    if (inputs.reset) {
+        backend->resetHistory();
+    }
+
+    bool evalSuccess = false;
+    {
+        EvaluatingUpscalerGuard evalGuard;
+        evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
+        if (evalSuccess && backendType != UpscalerBackend::AmdFsr && inputs.sharpness > 0.0f) {
+            ID3D11Texture2D* sharpenTarget = destinationTexture ? destinationTexture : inputs.color;
+            if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr)) {
+                static bool s_sharpenFailLogged = false;
+                if (!s_sharpenFailLogged) {
+                    s_sharpenFailLogged = true;
+                    EdpeLog(L"EDPE: sharpen pass failed; output left unsharpened");
+                }
+            }
+        }
+    }
+    return evalSuccess;
 }
 
 } // namespace edpe

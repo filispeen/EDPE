@@ -2,6 +2,7 @@
 
 #include "temporal_inputs.h"
 #include "taa_pass.h"
+#include "sharpen_pass.h"
 
 
 #include <cstdint>
@@ -203,6 +204,12 @@ public:
         ID3D11RenderTargetView* destinationRtv,
         ID3D11Texture2D* destinationTexture);
 
+    bool evaluateBackend(UpscalerBackend backendType,
+        ID3D11DeviceContext* context,
+        const TemporalFrameInputs& inputs,
+        ID3D11RenderTargetView* destinationRtv,
+        ID3D11Texture2D* destinationTexture);
+
     void requestReset() { pendingReset_ = true; }
 
     const UpscalerDiagnostics& getDiagnostics() const { return diagnostics_; }
@@ -224,6 +231,7 @@ private:
     NvidiaUpscalerBackend nvidiaBackend_;
     AmdUpscalerBackend amdBackend_;
     TaaUpscalerBackend taaBackend_;
+    SharpenPass sharpenPass_;
 
     struct GpuTimingSlot {
         Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
