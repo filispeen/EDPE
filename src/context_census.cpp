@@ -1715,7 +1715,65 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     std::memcpy(&s_ustat.firstFailWords[12], &words[1080], 16 * sizeof(float));
                 }
             }
-            if (parse_ok) {
+            // Cobra sometimes rewrites rows 932..943 with another orientation (cubemap faces)
+            // while the projection block 1080..1095 still carries the pilot's current projection
+            // and rotation. The strict parser rejects those writes (codes 7, 8, 10). Build the
+            // camera from the block orientation so the pilot pose keeps updating every frame.
+            bool block_cam_ok = false;
+            if (!parse_ok && (parse_fail_reason == 7 || parse_fail_reason == 8 || parse_fail_reason == 10) &&
+                s_camera_now.scaleX > 0.0f &&
+                !(s_hdr_slot0_seen_frame == cur_frame && motion_color_frame == cur_frame)) {
+                bool finite_block = true;
+                for (size_t i = 1080; i < 1096; ++i)
+                    if (!std::isfinite(words[i])) { finite_block = false; break; }
+                if (finite_block) {
+                    double xl = 0, yl = 0;
+                    for (size_t row = 0; row < 3; ++row) {
+                        xl += static_cast<double>(words[1080 + row * 4]) * words[1080 + row * 4];
+                        yl += static_cast<double>(words[1081 + row * 4]) * words[1081 + row * 4];
+                    }
+                    const double bsx = std::sqrt(xl), bsy = std::sqrt(yl);
+                    bool ok =
+                        std::fabs(bsx - s_camera_now.scaleX) < 2e-3 &&
+                        std::fabs(bsy - s_camera_now.scaleY) < 2e-3 &&
+                        std::fabs(words[1094] - s_camera_now.depthB) < 1e-4f &&
+                        std::fabs(words[1082]) <= 0.002f && std::fabs(words[1086]) <= 0.002f &&
+                        std::fabs(words[1090]) <= 0.002f && std::fabs(words[1092]) <= 0.002f &&
+                        std::fabs(words[1093]) <= 0.002f && std::fabs(words[1095]) <= 0.002f;
+                    if (ok) {
+                        double col[3][3];
+                        for (size_t row = 0; row < 3; ++row) {
+                            col[0][row] = words[1080 + row * 4] / bsx;
+                            col[1][row] = words[1081 + row * 4] / bsy;
+                            col[2][row] = words[1083 + row * 4];
+                        }
+                        for (int a = 0; a < 3 && ok; ++a) {
+                            const double len = col[a][0] * col[a][0] + col[a][1] * col[a][1] + col[a][2] * col[a][2];
+                            if (len < 0.98 || len > 1.02) ok = false;
+                            for (int b = 0; b < a && ok; ++b) {
+                                const double dp = col[a][0] * col[b][0] + col[a][1] * col[b][1] + col[a][2] * col[b][2];
+                                if (std::fabs(dp) > 0.02) ok = false;
+                            }
+                        }
+                    }
+                    if (ok) {
+                        edpe::CameraProjection bc = s_camera_now;
+                        for (size_t row = 0; row < 3; ++row) {
+                            bc.worldFromView[row * 4] = static_cast<float>(words[1080 + row * 4] / bsx);
+                            bc.worldFromView[row * 4 + 1] = static_cast<float>(words[1081 + row * 4] / bsy);
+                            bc.worldFromView[row * 4 + 2] = words[1083 + row * 4];
+                        }
+                        bc.scaleX = static_cast<float>(bsx);
+                        bc.scaleY = static_cast<float>(bsy);
+                        bc.depthB = words[1094];
+                        edpe::cameraSetPosition(bc, edpe::cameraPosition(s_camera_now) + s_last_valid_velocity);
+                        parsed_camera = bc;
+                        block_cam_ok = true;
+                        ++s_ustat.blockOnly;
+                    }
+                }
+            }
+            if (parse_ok || block_cam_ok) {
                 const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
                 const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
 
@@ -1850,7 +1908,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             s_last_diag_unmap_frame = cur_frame;
                             s_diag_unmap_count = 0;
                         }
-                        if (++s_diag_unmap_count <= 2) {
+                        static unsigned s_diag_total_logged = 0;
+                        if (++s_diag_unmap_count <= 2 && s_diag_total_logged < 40) {
+                            ++s_diag_total_logged;
                             const edpe::Vec3 candPos = edpe::cameraPosition(parsed_camera);
                             const edpe::Vec3 nowPos = edpe::cameraPosition(s_camera_now);
                             const float rDist = edpe::length(candPos - nowPos);
@@ -1880,32 +1940,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 ++s_ustat.parseFail;
             }
 
-            // Fallback: Cobra sometimes rewrites rows 932..943 with another orientation while
-            // the projection block 1080..1095 still carries the pilot's projection. The strict
-            // parser rejects those writes (codes 7, 8, 10) and the main pass then runs unjittered.
-            bool block_only_pilot = false;
-            if (!parse_ok && (parse_fail_reason == 7 || parse_fail_reason == 8 || parse_fail_reason == 10) &&
-                s_camera_now.scaleX > 0.0f &&
-                !(s_hdr_slot0_seen_frame == cur_frame && motion_color_frame == cur_frame)) {
-                bool finite_block = true;
-                for (size_t i = 1080; i < 1096; ++i)
-                    if (!std::isfinite(words[i])) { finite_block = false; break; }
-                if (finite_block) {
-                    double xl = 0, yl = 0;
-                    for (size_t row = 0; row < 3; ++row) {
-                        xl += static_cast<double>(words[1080 + row * 4]) * words[1080 + row * 4];
-                        yl += static_cast<double>(words[1081 + row * 4]) * words[1081 + row * 4];
-                    }
-                    block_only_pilot =
-                        std::fabs(std::sqrt(xl) - s_camera_now.scaleX) < 2e-3 &&
-                        std::fabs(std::sqrt(yl) - s_camera_now.scaleY) < 2e-3 &&
-                        std::fabs(words[1094] - s_camera_now.depthB) < 1e-4f &&
-                        std::fabs(words[1082]) <= 0.002f && std::fabs(words[1086]) <= 0.002f &&
-                        std::fabs(words[1090]) <= 0.002f && std::fabs(words[1092]) <= 0.002f &&
-                        std::fabs(words[1093]) <= 0.002f && std::fabs(words[1095]) <= 0.002f;
-                }
-                if (block_only_pilot) ++s_ustat.blockOnly;
-            }
+            const bool block_only_pilot = block_cam_ok;
             const bool jitter_candidate = is_main_camera || block_only_pilot;
 
             // Phase 5: Projection jitter injection into words 1080..1095
@@ -3450,7 +3485,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0);
     {
         static unsigned long long s_zw_last_write_frame = 0;
-        static unsigned s_zw_budget = 900;
+        static unsigned s_zw_budget = 0; // Unmap-stats logging is off: EdpeLog opens the file per line and costs frame time.
         static unsigned s_zw_prev_maps = 0;
         static UnmapFrameStats s_zw_ring[3]{};
         static unsigned long long s_zw_ring_frame[3]{};
