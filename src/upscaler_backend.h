@@ -210,6 +210,9 @@ public:
         ID3D11RenderTargetView* destinationRtv,
         ID3D11Texture2D* destinationTexture);
 
+    bool isBackendModeSupported(UpscalerBackend backendType) const;
+    void resetBackendHistory(UpscalerBackend backendType);
+
     void requestReset() { pendingReset_ = true; }
 
     const UpscalerDiagnostics& getDiagnostics() const { return diagnostics_; }

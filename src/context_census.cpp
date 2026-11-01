@@ -3802,13 +3802,24 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             }
 
             if (ContextCensusIsComparisonCapturePending()) {
-                ContextCensusConsumeComparisonCaptureRequest();
+                // Temporal backends need accumulated history for a fair comparison:
+                // warm up every inactive backend for N frames, then capture.
+                constexpr int kCompWarmupFrames = 16;
+                static int s_comp_warmup_left = -1;
+                const bool compFirstWarmup = (s_comp_warmup_left < 0);
+                if (compFirstWarmup) s_comp_warmup_left = kCompWarmupFrames;
+                const bool compWarming = (s_comp_warmup_left > 0);
+                if (compWarming) --s_comp_warmup_left;
+                if (!compWarming) {
+                    ContextCensusConsumeComparisonCaptureRequest();
+                    s_comp_warmup_left = -1;
+                }
                 SYSTEMTIME captureTime{};
                 GetLocalTime(&captureTime);
 
                 // 1. Queue "Before" (the scene before any reconstruction)
                 if (s_backbuffer_copy) {
-                    UiQueueComparisonItem(context, L"Before", s_backbuffer_copy.Get(), &captureTime);
+                    if (!compWarming) UiQueueComparisonItem(context, L"Before", s_backbuffer_copy.Get(), &captureTime);
                 }
 
                 // 2. Queue active backend (already evaluated into backbuffer)
@@ -3816,7 +3827,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 const wchar_t* activeName = (activeBackend == edpe::UpscalerBackend::NvidiaDlss) ? L"DLSS" :
                                             (activeBackend == edpe::UpscalerBackend::AmdFsr) ? L"FSR" :
                                             (activeBackend == edpe::UpscalerBackend::Taa) ? L"TAA" : L"Active";
-                UiQueueComparisonItem(context, activeName, backbuffer, &captureTime);
+                if (!compWarming) UiQueueComparisonItem(context, activeName, backbuffer, &captureTime);
 
                 // 3. Evaluate and queue each other available backend
                 struct BackendCandidate {
@@ -3870,14 +3881,18 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     }
                 }
 
+                edpe::TemporalFrameInputs compInputs = inputs;
+                compInputs.reset = inputs.reset || compFirstWarmup;
+
                 for (const auto& cand : candidates) {
                     if (cand.backend == activeBackend) continue;
                     if (!upscaler.isBackendAvailable(cand.backend)) continue;
                     if (!s_comp_eval_tex) continue;
+                    if (!upscaler.isBackendModeSupported(cand.backend)) continue;
 
-                    const bool evalOk = upscaler.evaluateBackend(cand.backend, context, inputs,
+                    const bool evalOk = upscaler.evaluateBackend(cand.backend, context, compInputs,
                         s_comp_eval_rtv.Get(), s_comp_eval_tex.Get());
-                    if (!evalOk) continue;
+                    if (!evalOk || compWarming) continue;
 
                     ID3D11Texture2D* texToCapture = s_comp_eval_tex.Get();
                     if (needUiComp && s_comp_final_tex && s_comp_final_rtv && s_comp_eval_srv) {

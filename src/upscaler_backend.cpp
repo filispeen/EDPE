@@ -901,6 +901,7 @@ bool UpscalerManager::evaluateBackend(UpscalerBackend backendType,
     }
     auto* backend = getBackendInstance(backendType);
     if (!backend) return false;
+    if (!backend->isModeSupported(currentMode_)) return false;
 
     if (inputs.reset) {
         backend->resetHistory();
@@ -922,6 +923,29 @@ bool UpscalerManager::evaluateBackend(UpscalerBackend backendType,
         }
     }
     return evalSuccess;
+}
+
+bool UpscalerManager::isBackendModeSupported(UpscalerBackend backendType) const {
+    if (backendType == UpscalerBackend::None || !isBackendAvailable(backendType)) {
+        return false;
+    }
+    switch (backendType) {
+    case UpscalerBackend::NvidiaDlss:
+        return nvidiaBackend_.isModeSupported(currentMode_);
+    case UpscalerBackend::AmdFsr:
+        return amdBackend_.isModeSupported(currentMode_);
+    case UpscalerBackend::Taa:
+        return taaBackend_.isModeSupported(currentMode_);
+    default:
+        return false;
+    }
+}
+
+void UpscalerManager::resetBackendHistory(UpscalerBackend backendType) {
+    if (backendType == UpscalerBackend::None) return;
+    if (auto* backend = getBackendInstance(backendType)) {
+        backend->resetHistory();
+    }
 }
 
 } // namespace edpe
