@@ -98,6 +98,7 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     params.outputTexel[0] = 1.0f / static_cast<float>(outputWidth);
     params.outputTexel[1] = 1.0f / static_cast<float>(outputHeight);
     params.flags[0] = isHdr ? 1.0f : 0.0f;
+    params.flags[1] = (renderWidth == outputWidth && renderHeight == outputHeight) ? 1.0f : 0.0f;
 
     context_->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &params, 0, 0);
 

@@ -3279,7 +3279,20 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         } else if (isSubNative && scene_ldr_source) {
             colorSource = scene_ldr_source.Get();
         } else if (!isSubNative) {
-            colorSource = backbuffer;
+            const bool ldrAvailable = s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                                      scene_ldr_source;
+            colorSource = ldrAvailable ? scene_ldr_source.Get() : backbuffer;
+            static unsigned long long s_native_src_log = ~0ull;
+            if (s_native_src_log == ~0ull || frame >= s_native_src_log + 300) {
+                s_native_src_log = frame;
+                wchar_t msg[224];
+                swprintf_s(msg,
+                    L"EDPE: native color source frame=%llu preserveUi=%d ldrSource=%d ldrFrame=%llu chosen=%ls",
+                    frame, s_preserve_native_ui.load(std::memory_order_relaxed) ? 1 : 0,
+                    scene_ldr_source ? 1 : 0, scene_ldr_frame,
+                    ldrAvailable ? L"scene_ldr_source" : L"backbuffer");
+                EdpeLog(msg);
+            }
         } else {
             if (++s_consecutive_skipped_frames > 4) {
                 s_camera_reset = true;
@@ -3653,12 +3666,26 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (upscaler.evaluate(context, inputs, nullptr, evalDestination)) {
             s_camera_reset = false;
 
-            const bool canCompositeUi = (isSubNative &&
-                                         s_preserve_native_ui.load(std::memory_order_relaxed) &&
+            const bool canCompositeUi = (s_preserve_native_ui.load(std::memory_order_relaxed) &&
                                          evalDestination == s_dlss_output_texture.Get() &&
                                          s_dlss_output_srv && s_backbuffer_copy_srv &&
                                          s_dlaa_input_srv && s_backbuffer_rtv &&
                                          colorSource != backbuffer);
+            if (!canCompositeUi) {
+                static unsigned long long s_nocomp_log = ~0ull;
+                if (s_nocomp_log == ~0ull || frame >= s_nocomp_log + 300) {
+                    s_nocomp_log = frame;
+                    wchar_t cmsg[256];
+                    swprintf_s(cmsg,
+                        L"EDPE: UI composite disabled frame=%llu preserveUi=%d evalToIntermediate=%d dlssSrv=%d bbCopySrv=%d inputSrv=%d bbRtv=%d srcIsBackbuffer=%d",
+                        frame, s_preserve_native_ui.load(std::memory_order_relaxed) ? 1 : 0,
+                        evalDestination == s_dlss_output_texture.Get() ? 1 : 0,
+                        s_dlss_output_srv ? 1 : 0, s_backbuffer_copy_srv ? 1 : 0,
+                        s_dlaa_input_srv ? 1 : 0, s_backbuffer_rtv ? 1 : 0,
+                        colorSource == backbuffer ? 1 : 0);
+                    EdpeLog(cmsg);
+                }
+            }
             if (canCompositeUi) {
                 if (!ui_composite_pass) {
                     auto comp = std::make_unique<edpe::UiCompositePass>();
