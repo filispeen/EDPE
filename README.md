@@ -4,9 +4,9 @@
 
 [![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version)](https://github.com/filispeen/EDPE/releases/latest)
 [![CI](https://github.com/filispeen/EDPE/actions/workflows/CI.yml/badge.svg)](https://github.com/filispeen/EDPE/actions/workflows/CI.yml)
-[![Status](https://img.shields.io/badge/status-Cross--Device%20%26%20UI%20Composite%20Verified-success.svg)](STATUS.md)
+[![Status](https://img.shields.io/badge/status-v0.6.0%20Verified%20In--Game-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-11%2F11%20Passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-12%2F12%20Passing-brightgreen.svg)]()
 
 </div>
 
@@ -16,10 +16,15 @@ Elite Dangerous natively lacks modern temporal reconstruction technologies in it
 
 ---
 
-## Current Status: Milestone `v0.5.0` (Cross-Device Rendering, Native UI Composite Pass & Advanced Camera Staging)
+## Current Status: Milestone `v0.6.0` (Frametime Graph, Multi-Backend Benchmark & Developer Mode)
 
-As of **November 2026 (`v0.5.0`)**, EDPE has achieved:
+As of **November 2026 (`v0.6.0`)**, EDPE has achieved:
 
+* **Real-Time Frametime Graph in Performance HUD (`F7`):** Multi-curve 120-sample rolling history graph rendered directly in the HUD overlay, displaying Total Frametime (Orange), Game Frametime (White), and Upscaler/Reconstruction Frametime (Cyan) with 60 FPS (16.67 ms) and 30 FPS (33.33 ms) grid reference lines. Color-coded numerical metrics are padded with leading spaces for stable, non-jumping readouts.
+* **Multi-Backend Comparison Benchmark Tool:** Automated sequential capture across all upscaler backends (`Native / Bypass`, `NVIDIA DLSS / DLAA`, `AMD FSR Native AA / SR`, `Native D3D11 TAA`) with 5-second backend warmup. Saves uncompressed comparison frames with optional on-frame HUD telemetry and GPU reconstruction time stamps directly to `edpe-captures/comparison/`.
+* **Rate-Limited Telemetry & QPC Profiler:** Display telemetry and QPC profiler metrics are rate-limited to 66.66 ms (~15 Hz), preventing number flickering and reducing UI render overhead on the GPU and CPU at high frame rates.
+* **Developer Mode Toggle (`DEV=0` / `DEV=1`):** User-friendly menu simplification for regular players (`DEV=0` by default in `edpe.ini`). Hides developer capture/tuning controls and selectively gates developer hotkeys (`F6`, `F8`, `F9`), leaving a clean interface with `F5: menu | F7: perf HUD`.
+* **Sticky Bottom Footer & UI Refinements:** Menu footer dynamically anchors to the bottom edge of the Dear ImGui window, featuring a clickable author link (`by FILISPEEN`) linking directly to GitHub.
 * **Cross-Device Scene Rendering & Multi-GPU Interop:** Native support for multi-device and cross-adapter rendering pipelines (such as RTX 4080 systems in Odyssey) using DXGI Keyed Mutex synchronization, completely resolving the issue where DLAA remained stuck in bypass mode (Issue #5).
 * **Native UI Composite Pass (`UiCompositePass`):** Dedicated graphics pass that isolates native-resolution HUD, cockpits, holograms, and menus from the pre-UI scene LDR buffer and composites them cleanly over the reconstructed DLAA/DLSS/FSR world.
 * **Auxiliary Camera & Eye Probe Filtering:** High-precision rejection filters for secondary camera views (stereo eye probes, rear mirror probes, sagittal cockpit head probes, canopy reflections, IPD probes), eliminating camera deadlock, periodic 1-second strobing, and view-axis disorientation.
@@ -49,7 +54,7 @@ As of **November 2026 (`v0.5.0`)**, EDPE has achieved:
 * **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA / FSR Native AA / TAA (at 1.0x) or DLSS / FSR Super Resolution (at < 1.0x).
 * **Native UI Protection & Composite:** Dedicated shader pass (`UiCompositePass`) preserves native-resolution HUD, text, cockpits, and menus, seamlessly compositing them over reconstructed DLSS/FSR frames.
 * **Synchronized 5-Buffer GPU Capture (`F6`):** One-shot capture of all 5 engine buffers (`color`, `motion`, `depth`, `early-color` emissive, `frame`) from the exact same frame using non-blocking asynchronous GPU readback (`D3D11_MAP_FLAG_DO_NOT_WAIT`), saved to `edpe-captures/`.
-* **Automated Test Suite:** 11 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy hooks, GPU motion passes, jitter reports, and UI composition.
+* **Automated Test Suite:** 12 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy hooks, GPU motion passes, jitter reports, crash logger, and UI composition.
 
 ---
 
@@ -135,10 +140,10 @@ EDPE enforces a strict separation: Elite-specific engine reverse-engineering bel
 | Hotkey | Action | Description |
 |:---:|:---|:---|
 | **`F5`** | **Toggle EDPE Menu** | Opens/closes the Dear ImGui control panel. When closed, all mouse and keyboard inputs pass freely to the game. |
-| **`F6`** | **One-Shot Synchronized Capture** | Captures all 5 rendering buffers (`color`, `motion`, `depth`, `early-color`, `frame`) from the exact same frame to `edpe-captures/`. |
-| **`F7`** | **Toggle Performance HUD** | Toggles the real-time telemetry overlay (FPS, frametimes, GPU adapter, GPU usage %, dedicated VRAM). |
-| **`F8`** | **Toggle Jitter Debug View** | Toggles the real-time visual overlay for subpixel jitter inspection. |
-| **`F9`** | **Record Jitter Diagnostics** | Starts recording subpixel jitter, luma, and camera motion telemetry to `jitter_view.log`. |
+| **`F6`** | **One-Shot Synchronized Capture** | *(DEV Mode)* Captures all 5 rendering buffers (`color`, `motion`, `depth`, `early-color`, `frame`) from the exact same frame to `edpe-captures/`. |
+| **`F7`** | **Toggle Performance HUD** | Toggles the real-time telemetry overlay (FPS, frametimes, frametime history graph, GPU adapter, GPU usage %, dedicated VRAM). |
+| **`F8`** | **Toggle Jitter Debug View** | *(DEV Mode)* Toggles the real-time visual overlay for subpixel jitter inspection. |
+| **`F9`** | **Record Jitter Diagnostics** | *(DEV Mode)* Starts recording subpixel jitter, luma, and camera motion telemetry to `jitter_view.log`. |
 | **`Insert`** | **Game Pass-Through** | Configured to pass transparently to the original game window procedure. |
 
 ### Dear ImGui Control Panel Features (`F5`)
@@ -203,8 +208,10 @@ ShowPerfOverlay=1   ; Toggle real-time performance telemetry HUD (F7)
 EnableProfiler=0    ; High-precision QPC per-pass execution profiler
 Corner=1            ; 0 = Top-Left, 1 = Top-Right, 2 = Bottom-Left, 3 = Bottom-Right
 Scale=1.50          ; HUD scale multiplier (0.5x - 2.0x)
+UiScale=1.00        ; Menu UI scale multiplier (0.5x - 2.5x)
 PosX=1900.0         ; Custom dragged X position (-1.0 = use corner default)
 PosY=496.0          ; Custom dragged Y position (-1.0 = use corner default)
+DEV=0               ; 0 = Standard gamer mode (hides dev tools, gates F6/F8/F9), 1 = Full developer mode
 ```
 
 Runtime diagnostics and initialization events are written to `edpe.log` beside the game executable.
@@ -252,7 +259,7 @@ The build produces:
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
 ```
-All 11 automated unit and integration tests should pass:
+All 12 automated unit and integration tests should pass:
 * `temporal_math`: Halton sequence generation, projection math, matrix rejection bounds.
 * `camera_delta`: Camera displacement and scene reset detection.
 * `capture_format`: Half-float, float11/10 unpackers, depth contrast, Reinhard tone mapping.
@@ -261,6 +268,7 @@ All 11 automated unit and integration tests should pass:
 * `ui_composite`: Native-resolution UI preservation and alpha blending pass.
 * `dxbc_fanout`: Shader bytecode interception and hash validation.
 * `jitter_view_report`: Subpixel jitter diagnostics and luma correlation verification.
+* `crash_logger`: Minidump generation and fault-injection safety verification.
 * `proxy_smoke`: DLL proxy loading and swapchain hook smoke checks.
 * `proxy_shader_probe`: Shader bytecode interception verification.
 * `proxy_alias_smoke`: Consolidated `dxgi.dll` staged loading smoke checks.
