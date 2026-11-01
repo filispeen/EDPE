@@ -106,7 +106,6 @@ public:
         if (path.empty()) return;
 
         WritePrivateProfileStringW(L"Upscaler", L"Backend", std::to_wstring(upscalerBackend).c_str(), path.c_str());
-        WritePrivateProfileStringW(L"Upscaler", L"Mode", std::to_wstring(upscaleMode).c_str(), path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"Preset", std::to_wstring(dlssPreset).c_str(), path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"AutoSyncEliteConfig", autoSyncEliteConfig ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Upscaler", L"PreserveNativeUi", preserveNativeUi ? L"1" : L"0", path.c_str());

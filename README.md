@@ -4,7 +4,7 @@
 
 [![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version)](https://github.com/filispeen/EDPE/releases/latest)
 [![CI](https://github.com/filispeen/EDPE/actions/workflows/CI.yml/badge.svg)](https://github.com/filispeen/EDPE/actions/workflows/CI.yml)
-[![Status](https://img.shields.io/badge/status-Hot%20Path%20CPU%20Optimized%20%26%20Input%20Isolated-success.svg)](STATUS.md)
+[![Status](https://img.shields.io/badge/status-Cross--Device%20%26%20UI%20Composite%20Verified-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
 [![Tests](https://img.shields.io/badge/tests-11%2F11%20Passing-brightgreen.svg)]()
 
@@ -16,9 +16,17 @@ Elite Dangerous natively lacks modern temporal reconstruction technologies in it
 
 ---
 
-## Current Status: Milestone `v0.4.8` (Hot-Path CPU Optimization, Input Isolation & Consolidated DXGI Proxy)
+## Current Status: Milestone `v0.5.0` (Cross-Device Rendering, Native UI Composite Pass & Advanced Camera Staging)
 
-As of **October 2026 (`v0.4.8`)**, EDPE has achieved:
+As of **November 2026 (`v0.5.0`)**, EDPE has achieved:
+
+* **Cross-Device Scene Rendering & Multi-GPU Interop:** Native support for multi-device and cross-adapter rendering pipelines (such as RTX 4080 systems in Odyssey) using DXGI Keyed Mutex synchronization, completely resolving the issue where DLAA remained stuck in bypass mode (Issue #5).
+* **Native UI Composite Pass (`UiCompositePass`):** Dedicated graphics pass that isolates native-resolution HUD, cockpits, holograms, and menus from the pre-UI scene LDR buffer and composites them cleanly over the reconstructed DLAA/DLSS/FSR world.
+* **Auxiliary Camera & Eye Probe Filtering:** High-precision rejection filters for secondary camera views (stereo eye probes, rear mirror probes, sagittal cockpit head probes, canopy reflections, IPD probes), eliminating camera deadlock, periodic 1-second strobing, and view-axis disorientation.
+* **Two-Phase Camera Staging & Kinematic Prediction:** 2nd-order kinematic probe filtering with forward anchor prediction and pilot camera fallback derived directly from the projection block when rows 932-943 are incoherent.
+* **Runtime Sharpening Control:** Real-time interactive sharpening slider (0.0-1.0) in the Dear ImGui overlay (`F5`) wired directly to upscaler backends (NVIDIA NGX / AMD FidelityFX).
+* **Subpixel Jitter & Strobe Stability:** Synchronized Halton (2,3) jitter sign conventions and fail-open stand-down, resolving image vibration, ghosting streaks, and teleport recovery during camera cuts.
+* **Performance HUD Reliability:** Fixed 0.0 FPS and frametime latching during and after loading screens.
 
 * **Consolidated DXGI Proxy (`dxgi.dll`):** Single drop-in proxy library handling DXGI swapchain observation, D3D11 device creation hooks, temporal reconstruction, and runtime overlay management without black screens, crashes, or rendering artifacts.
 * **Hot-Path CPU Overhead Elimination:** Eliminated large FPS drops during active temporal reconstruction (TAA, DLAA, DLSS). Constant buffer discovery in `Map()` terminates immediately upon identifying the scene camera; `Unmap()` skips untracked resources without stale buffer checks; HUD draw probes are armed once rather than re-armed each frame.
@@ -155,14 +163,21 @@ Pressing **`F6`** saves five synchronized 32-bit BMP images in `edpe-captures/` 
 
 ## Configuration (`edpe.ini`)
 
-EDPE automatically reads and writes configuration parameters from `edpe.ini` located in the game directory:
+EDPE automatically reads and writes configuration parameters from `edpe.ini` located in the game directory.
+
+> **Note on Upscaling Mode:** The upscaling mode is automatically determined by Elite Dangerous's in-game Supersampling setting (`Options -> Graphics -> Display -> Supersampling` or `<SSAAMultiplier>` in `Custom.4.4.fxcfg`):
+> * `1.0x`: Native AA (NVIDIA DLAA / AMD FSR Native AA / Native D3D11 TAA)
+> * `0.67x`: Quality (~1.5x upscaling)
+> * `0.58x`: Balanced (~1.7x upscaling)
+> * `0.50x`: Performance (~2.0x upscaling)
+> * `0.33x`: Ultra Performance (~3.0x upscaling)
+>
+> EDPE continuously inspects the internal 3D scene render dimensions against the presentation swapchain, dynamically configuring the upscaler mode without requiring manual mode configuration.
 
 ```ini
 [Upscaler]
 ; Upscaler backend: 0 = Native (Bypass), 1 = NVIDIA DLSS/DLAA, 2 = AMD FSR, 3 = Native D3D11 TAA
 Backend=1
-; Upscale mode: 0 = Native, 1 = NativeAA (DLAA), 2 = Quality, 3 = Balanced, 4 = Performance, 5 = Ultra Performance
-Mode=1
 ; DLSS Preset: 0 = Auto, 1 = J, 2 = K, 3 = L, 4 = M
 Preset=0
 AutoSyncEliteConfig=1

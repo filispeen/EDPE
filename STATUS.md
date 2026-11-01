@@ -1,6 +1,6 @@
 # EDPE Status — Elite Dangerous Performance Enhanced
 
-**Last updated:** 2026-10-16
+**Last updated:** 2026-11-01
 
 This file documents **verified facts only**. Unverified claims, hypotheses, or speculative results are not recorded here. See `AGENTS.md` and `PLAN.md` for project governance and roadmap.
 
@@ -8,10 +8,10 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Repository
 
-- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling), `v0.3.5` (verified in-game AMD FSR 3.1.2 Native AA & SR, Performance HUD, input leak isolation), `v0.4.0` (verified in-game native D3D11 TAA reconstruction backend, HUD scaling and mouse dragging), `v0.4.1` (verified in-game native TAA stabilization, subpixel de-jittering, Karis clipping, cockpit depth stabilization), `v0.4.4` (verified in-game analytical skybox/star rotational motion vectors at infinity, elimination of star erasure during ship maneuvers, star bloom/corona motion coherence and artifact resolution across all reconstruction backends), `v0.4.6` (verified in-game canopy reflection sub-camera filtering, elimination of TAA docked station pulsing, adaptive stationary variance scaling, Performance HUD mouse cursor isolation when overlay is closed)
+- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling), `v0.3.5` (verified in-game AMD FSR 3.1.2 Native AA & SR, Performance HUD, input leak isolation), `v0.4.0` (verified in-game native D3D11 TAA reconstruction backend, HUD scaling and mouse dragging), `v0.4.1` (verified in-game native TAA stabilization, subpixel de-jittering, Karis clipping, cockpit depth stabilization), `v0.4.4` (verified in-game analytical skybox/star rotational motion vectors at infinity, elimination of star erasure during ship maneuvers, star bloom/corona motion coherence and artifact resolution across all reconstruction backends), `v0.4.6` (verified in-game canopy reflection sub-camera filtering, elimination of TAA docked station pulsing, adaptive stationary variance scaling, Performance HUD mouse cursor isolation when overlay is closed), `v0.4.7` (HOTAS/DirectInput isolation), `v0.4.8` (hot-path CPU overhead elimination), `v0.4.9` (crash logger and diagnostics subsystem), `v0.4.10` (AMD driver 26.10.1 FSR fix & UI scale slider), `v0.5.0` (cross-device scene rendering & DXGI Keyed Mutex, native UI composite pass, auxiliary camera/eye probe filtering, 2nd-order kinematic probe filter, pilot camera projection fallback, sharpening control)
 - **Build artifacts:** Consolidated `dxgi.dll` deployed beside `EliteDangerous64.exe`; staged in `build/stage/`
-- **Source:** `src/` contains 12 C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, etc.); `tools/` contains standalone NGX probe
-- **Test suite:** 10 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `dxbc_fanout`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
+- **Source:** `src/` contains modular C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, `ui_composite_pass.cpp`, `crash_logger.cpp`, etc.); `tools/` contains standalone probes
+- **Test suite:** 11 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `dxbc_fanout`, `jitter_view_report`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
 
 ---
 

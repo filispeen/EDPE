@@ -63,28 +63,21 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build
-          key: edpe-build-${{ runner.os }}-v1-${{ hashFiles('CMakeLists.txt', '.gitmodules', 'src/**', 'external/imgui/**', 'tests/**', 'tools/**') }}
+          key: edpe-build-${{ runner.os }}-v1-${{ github.ref_name }}-${{ hashFiles('CMakeLists.txt', '.gitmodules', 'src/**', 'external/imgui/**', 'tests/**', 'tools/**') }}
           restore-keys: |
+            edpe-build-${{ runner.os }}-v1-${{ github.ref_name }}-
             edpe-build-${{ runner.os }}-v1-
 
       - name: Configure CMake
-        if: steps.cache-build.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ver = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
           cmake -S . -B build -A x64 -DEDPE_VERSION="$ver"
 
       - name: Build EDPE (Release)
-        if: steps.cache-build.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           cmake --build build --config Release --parallel
-
-      - name: Using Cached Build
-        if: steps.cache-build.outputs.cache-hit == 'true'
-        shell: pwsh
-        run: |
-          Write-Host "Exact cache hit for build directory. Reusing cached build (compilation skipped)."
 
       - name: Run Tests
         shell: pwsh
