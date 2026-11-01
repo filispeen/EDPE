@@ -3819,7 +3819,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
                 // 1. Queue "Before" (the scene before any reconstruction)
                 if (s_backbuffer_copy) {
-                    if (!compWarming) UiQueueComparisonItem(context, L"Before", s_backbuffer_copy.Get(), &captureTime);
+                    if (!compWarming) UiQueueComparisonItem(context, L"Before", s_backbuffer_copy.Get(), &captureTime, 0);
                 }
 
                 // 2. Queue active backend (already evaluated into backbuffer)
@@ -3827,7 +3827,12 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 const wchar_t* activeName = (activeBackend == edpe::UpscalerBackend::NvidiaDlss) ? L"DLSS" :
                                             (activeBackend == edpe::UpscalerBackend::AmdFsr) ? L"FSR" :
                                             (activeBackend == edpe::UpscalerBackend::Taa) ? L"TAA" : L"Active";
-                if (!compWarming) UiQueueComparisonItem(context, activeName, backbuffer, &captureTime);
+                auto backendToId = [](edpe::UpscalerBackend b) {
+                    return b == edpe::UpscalerBackend::NvidiaDlss ? 1 :
+                           b == edpe::UpscalerBackend::AmdFsr ? 2 :
+                           b == edpe::UpscalerBackend::Taa ? 3 : 0;
+                };
+                if (!compWarming) UiQueueComparisonItem(context, activeName, backbuffer, &captureTime, backendToId(activeBackend));
 
                 // 3. Evaluate and queue each other available backend
                 struct BackendCandidate {
@@ -3907,7 +3912,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                             texToCapture = s_comp_final_tex.Get();
                         }
                     }
-                    UiQueueComparisonItem(context, cand.name, texToCapture, &captureTime);
+                    UiQueueComparisonItem(context, cand.name, texToCapture, &captureTime, backendToId(cand.backend));
                 }
             }
 

@@ -650,6 +650,9 @@ void UpscalerManager::shutdown() {
     }
     timingWriteIndex_ = 0;
     lastGpuTimeMs_ = 0.0f;
+    for (auto& bt : backendTiming_) {
+        bt = {};
+    }
     evalCount_ = 0;
 
     device_ = nullptr;
@@ -907,6 +910,38 @@ bool UpscalerManager::evaluateBackend(UpscalerBackend backendType,
         backend->resetHistory();
     }
 
+    // Non-blocking per-backend GPU timing so each comparison image can show its own cost.
+    BackendTiming* bt = nullptr;
+    const auto backendIdx = static_cast<size_t>(backendType);
+    if (context && device_ && backendIdx < kBackendCount) {
+        bt = &backendTiming_[backendIdx];
+        if (!bt->slot.disjoint) {
+            D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+            D3D11_QUERY_DESC tsDesc{ D3D11_QUERY_TIMESTAMP, 0 };
+            device_->CreateQuery(&disjointDesc, &bt->slot.disjoint);
+            device_->CreateQuery(&tsDesc, &bt->slot.start);
+            device_->CreateQuery(&tsDesc, &bt->slot.end);
+        }
+        if (bt->slot.inFlight && bt->slot.disjoint && bt->slot.start && bt->slot.end) {
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
+            UINT64 tStart = 0, tEnd = 0;
+            if (context->GetData(bt->slot.disjoint.Get(), &disjointData, sizeof(disjointData), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+                context->GetData(bt->slot.start.Get(), &tStart, sizeof(tStart), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+                context->GetData(bt->slot.end.Get(), &tEnd, sizeof(tEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
+                if (!disjointData.Disjoint && disjointData.Frequency > 0 && tEnd >= tStart) {
+                    bt->lastMs = static_cast<float>(static_cast<double>(tEnd - tStart) * 1000.0 /
+                        static_cast<double>(disjointData.Frequency));
+                }
+                bt->slot.inFlight = false;
+            }
+        }
+    }
+    const bool canQueryGpu = bt && !bt->slot.inFlight && bt->slot.disjoint && bt->slot.start && bt->slot.end;
+    if (canQueryGpu) {
+        context->Begin(bt->slot.disjoint.Get());
+        context->End(bt->slot.start.Get());
+    }
+
     bool evalSuccess = false;
     {
         EvaluatingUpscalerGuard evalGuard;
@@ -921,6 +956,11 @@ bool UpscalerManager::evaluateBackend(UpscalerBackend backendType,
                 }
             }
         }
+    }
+    if (canQueryGpu) {
+        context->End(bt->slot.end.Get());
+        context->End(bt->slot.disjoint.Get());
+        bt->slot.inFlight = true;
     }
     return evalSuccess;
 }

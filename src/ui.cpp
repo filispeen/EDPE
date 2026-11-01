@@ -79,6 +79,8 @@ struct UiState {
         ID3D11RenderTargetView* rtv = nullptr;
         std::wstring name;
         SYSTEMTIME time{};
+        int backendId = -1;  // 0 = Before, 1 = DLSS, 2 = FSR, 3 = TAA, -1 = live HUD values
+        float upscalerMs = 0.0f;
     };
     std::vector<OverlayCaptureItem> overlay_items;
     unsigned capture_serial = 0;
@@ -454,7 +456,7 @@ void queueTextureCaptureFromSrv(ID3D11ShaderResourceView* srv, UiState::CaptureK
     }
 }
 
-void queueComparisonItemInternal(ID3D11DeviceContext* context, const wchar_t* name, ID3D11Texture2D* texture, const SYSTEMTIME* customTime) {
+void queueComparisonItemInternal(ID3D11DeviceContext* context, const wchar_t* name, ID3D11Texture2D* texture, const SYSTEMTIME* customTime, int backendId = -1) {
     if (!texture || !context) return;
     if (!ui.device) {
         context->GetDevice(&ui.device);
@@ -488,7 +490,13 @@ void queueComparisonItemInternal(ID3D11DeviceContext* context, const wchar_t* na
             if (SUCCEEDED(ui.device->CreateTexture2D(&desc, nullptr, &copy)) && copy &&
                 SUCCEEDED(ui.device->CreateRenderTargetView(copy, nullptr, &rtv)) && rtv) {
                 context->CopyResource(copy, texture);
-                ui.overlay_items.push_back({copy, rtv, name ? name : L"", now});
+                float upscalerMs = 0.0f;
+                if (backendId > 0) {
+                    const auto backend = (backendId == 1) ? edpe::UpscalerBackend::NvidiaDlss :
+                                         (backendId == 2) ? edpe::UpscalerBackend::AmdFsr : edpe::UpscalerBackend::Taa;
+                    upscalerMs = edpe::UpscalerManager::instance().getBackendGpuTimeMs(backend);
+                }
+                ui.overlay_items.push_back({copy, rtv, name ? name : L"", now, backendId, upscalerMs});
                 return;
             }
             if (rtv) rtv->Release();
@@ -505,11 +513,21 @@ void queueComparisonItemInternal(ID3D11DeviceContext* context, const wchar_t* na
 // frame and queues it for BMP readback. With drawOverlay=false frames are queued as-is.
 void flushOverlayCaptures(bool drawOverlay) {
     if (ui.overlay_items.empty()) return;
-    ImDrawData* drawData = drawOverlay ? ImGui::GetDrawData() : nullptr;
+    auto& cfg = edpe::Config::instance();
     for (auto& item : ui.overlay_items) {
-        if (drawData && ui.context) {
+        if (drawOverlay && ui.context) {
+            // One dedicated ImGui frame per image so each shows its own backend's information.
+            edpe::PerfOverlayOverride ov{};
+            ov.backendId = item.backendId > 0 ? item.backendId : 0;
+            ov.upscalerMs = item.upscalerMs;
+            ImGui_ImplDX11_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
+            edpe::PerfTracker::instance().renderOverlay(false, cfg.perfOverlayCorner, cfg.perfOverlayScale,
+                item.backendId >= 0 ? &ov : nullptr);
+            ImGui::Render();
             ui.context->OMSetRenderTargets(1, &item.rtv, nullptr);
-            ImGui_ImplDX11_RenderDrawData(drawData);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         }
         queueTextureCapture(item.texture, UiState::CaptureKind::Comparison, -1, &item.time, item.name.c_str());
         item.rtv->Release();
@@ -522,7 +540,7 @@ void queueComparisonCaptureInternal(ID3D11DeviceContext* context, ID3D11Texture2
     if (!beforeTex || !afterTex || !context) return;
     SYSTEMTIME now{};
     GetLocalTime(&now);
-    queueComparisonItemInternal(context, L"Before", beforeTex, &now);
+    queueComparisonItemInternal(context, L"Before", beforeTex, &now, 0);
     queueComparisonItemInternal(context, L"After", afterTex, &now);
 }
 
@@ -2254,8 +2272,8 @@ void UiOnRelease(IUnknown* object) {
 
 bool UiMenuVisible() { return menu_visible.load(); }
 
-void UiQueueComparisonItem(ID3D11DeviceContext* context, const wchar_t* name, ID3D11Texture2D* texture, const SYSTEMTIME* customTime) {
-    queueComparisonItemInternal(context, name, texture, customTime);
+void UiQueueComparisonItem(ID3D11DeviceContext* context, const wchar_t* name, ID3D11Texture2D* texture, const SYSTEMTIME* customTime, int backendId) {
+    queueComparisonItemInternal(context, name, texture, customTime, backendId);
 }
 
 void UiQueueComparisonCapture(ID3D11DeviceContext* context, ID3D11Texture2D* beforeTex, ID3D11Texture2D* afterTex) {

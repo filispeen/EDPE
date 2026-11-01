@@ -202,7 +202,7 @@ void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
     }
 }
 
-void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
+void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const PerfOverlayOverride* override) {
     auto& cfg = edpe::Config::instance();
     const float PAD = 10.0f;
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -285,15 +285,24 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
         ImGui::Text("Game Frametime:     %.2f ms", telemetry_.gameFrametimeMs);
 
         auto& upscaler = UpscalerManager::instance();
-        const bool upscalerActive = upscaler.isReconstructionActive();
+        UpscalerBackend shownBackend = upscaler.getBackend();
+        bool upscalerActive = upscaler.isReconstructionActive();
+        float shownUpscalerMs = telemetry_.upscalerFrametimeMs;
+        if (override) {
+            shownBackend = (override->backendId == 1) ? UpscalerBackend::NvidiaDlss :
+                           (override->backendId == 2) ? UpscalerBackend::AmdFsr :
+                           (override->backendId == 3) ? UpscalerBackend::Taa : UpscalerBackend::None;
+            upscalerActive = (shownBackend != UpscalerBackend::None);
+            shownUpscalerMs = override->upscalerMs;
+        }
 
-        if (upscalerActive && telemetry_.upscalerFrametimeMs > 0.0f) {
-            const char* backendShort = (upscaler.getBackend() == UpscalerBackend::Taa) ? "TAA" :
-                                       (upscaler.getBackend() == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
+        if (upscalerActive && shownUpscalerMs > 0.0f) {
+            const char* backendShort = (shownBackend == UpscalerBackend::Taa) ? "TAA" :
+                                       (shownBackend == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
             ImGui::Text("Upscaler Frametime: ");
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.85f, 1.0f), "%.2f ms (%s)",
-                telemetry_.upscalerFrametimeMs, backendShort);
+                shownUpscalerMs, backendShort);
         } else {
             ImGui::Text("Upscaler Frametime: 0.00 ms (Bypass)");
         }
@@ -304,8 +313,8 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
 
         // 3. Upscaler & Resolution Info
         if (upscalerActive) {
-            const bool isAmd = (upscaler.getBackend() == UpscalerBackend::AmdFsr);
-            const bool isTaa = (upscaler.getBackend() == UpscalerBackend::Taa);
+            const bool isAmd = (shownBackend == UpscalerBackend::AmdFsr);
+            const bool isTaa = (shownBackend == UpscalerBackend::Taa);
             const bool isSr = (telemetry_.renderWidth < telemetry_.outputWidth || telemetry_.renderHeight < telemetry_.outputHeight);
 
             const char* upscalerName = isTaa ? "TAA" :
@@ -338,7 +347,7 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale) {
                 telemetry_.renderWidth, telemetry_.renderHeight,
                 telemetry_.outputWidth, telemetry_.outputHeight, scalePct);
         } else {
-            ImGui::Text("Upscaler:           Bypass (Native)");
+            ImGui::Text(override ? "Upscaler:           Off (Before reconstruction)" : "Upscaler:           Bypass (Native)");
             ImGui::Text("Resolution:         %ux%u -> %ux%u (100.0%%)",
                 telemetry_.outputWidth, telemetry_.outputHeight,
                 telemetry_.outputWidth, telemetry_.outputHeight);

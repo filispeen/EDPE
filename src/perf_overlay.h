@@ -29,6 +29,12 @@ struct PerfTelemetry {
     uint64_t vramTotalBytes = 0;
 };
 
+// Replaces the live upscaler information in the HUD (used when stamping comparison images).
+struct PerfOverlayOverride {
+    int backendId = 0;        // 0 = none/before reconstruction, 1 = DLSS/DLAA, 2 = FSR, 3 = TAA
+    float upscalerMs = 0.0f;  // GPU time of that backend
+};
+
 class PerfTracker {
 public:
     static PerfTracker& instance();
@@ -38,7 +44,7 @@ public:
 
     const PerfTelemetry& getTelemetry() const { return telemetry_; }
 
-    void renderOverlay(bool isMenuOpen, int corner, float scale = 1.0f);
+    void renderOverlay(bool isMenuOpen, int corner, float scale = 1.0f, const PerfOverlayOverride* override = nullptr);
     void initNvml();
     void shutdown();
 

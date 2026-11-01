@@ -217,6 +217,14 @@ public:
 
     const UpscalerDiagnostics& getDiagnostics() const { return diagnostics_; }
 
+    // Last measured GPU time (ms) of the given backend. The active backend reports its live
+    // value; other backends report the last time measured by evaluateBackend (comparison capture).
+    float getBackendGpuTimeMs(UpscalerBackend backendType) const {
+        if (backendType == currentBackendType_) return diagnostics_.gpuTimeMs;
+        const auto idx = static_cast<size_t>(backendType);
+        return idx < kBackendCount ? backendTiming_[idx].lastMs : 0.0f;
+    }
+
 private:
     UpscalerManager();
     ~UpscalerManager() = default;
@@ -247,6 +255,14 @@ private:
     size_t timingWriteIndex_ = 0;
     float lastGpuTimeMs_ = 0.0f;
     unsigned evalCount_{0};
+
+    // Per-backend async GPU timing for evaluateBackend (indexed by UpscalerBackend value).
+    static constexpr size_t kBackendCount = 4;
+    struct BackendTiming {
+        GpuTimingSlot slot;
+        float lastMs = 0.0f;
+    };
+    BackendTiming backendTiming_[kBackendCount]{};
 
     UpscalerDiagnostics diagnostics_{};
 };
