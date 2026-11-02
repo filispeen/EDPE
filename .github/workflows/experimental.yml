@@ -106,12 +106,9 @@ jobs:
 
           # Generate SHA256 checksum
           $sha256 = (Get-FileHash -Path $archiveName -Algorithm SHA256).Hash
-          "$sha256  $archiveName" | Set-Content -Path "$archiveName.sha256" -Encoding utf8
 
           Write-Host "Created archive: $archiveName (SHA-256: $sha256)"
-
           "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "sha256_name=$archiveName.sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
@@ -119,7 +116,6 @@ jobs:
           name: EDPE-experimental-build-${{ github.run_number }}-windows-x64
           path: |
             ${{ steps.package.outputs.archive_name }}
-            ${{ steps.package.outputs.sha256_name }}
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -131,7 +127,6 @@ jobs:
           name: EDPE Experimental Build #${{ github.run_number }}
           files: |
             ${{ steps.package.outputs.archive_name }}
-            ${{ steps.package.outputs.sha256_name }}
           generate_release_notes: true
           draft: false
           prerelease: true
