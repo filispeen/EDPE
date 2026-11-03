@@ -86,7 +86,7 @@ public:
         enableProfiler = GetPrivateProfileIntW(L"Overlay", L"EnableProfiler", 0, path.c_str()) != 0;
         Profiler::instance().setEnabled(enableProfiler);
         perfOverlayCorner = GetPrivateProfileIntW(L"Overlay", L"Corner", 0, path.c_str());
-        if (perfOverlayCorner < 0 || perfOverlayCorner > 5) perfOverlayCorner = 0;
+        if (perfOverlayCorner < 0 || perfOverlayCorner > 7) perfOverlayCorner = 0;
 
         GetPrivateProfileStringW(L"Overlay", L"Scale", L"1.0", buf, 64, path.c_str());
         perfOverlayScale = static_cast<float>(_wtof(buf));
@@ -285,7 +285,7 @@ public:
     bool showPerfOverlay = false;
     bool captureOverlayInComparison = false;
     bool enableProfiler = false;
-    int perfOverlayCorner = 0; // 0=Top-Left, 1=Top-Center, 2=Top-Right, 3=Bottom-Left, 4=Bottom-Center, 5=Bottom-Right
+    int perfOverlayCorner = 0; // 0=Top-Left, 1=Top, 2=Top-Right, 3=Left, 4=Right, 5=Bottom-Left, 6=Bottom, 7=Bottom-Right
     float perfOverlayScale = 1.0f;
     float uiScale = 1.0f;
     float perfOverlayPosX = -1.0f;

@@ -1790,27 +1790,46 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 }
             }
 
-            const char* const pos_labels[6] = {
-                "Top-Left", "Top-Center", "Top-Right",
-                "Bottom-Left", "Bottom-Center", "Bottom-Right"
+            static const int s_grid_to_index[3][3] = {
+                { 0, 1, 2 },
+                { 3, -1, 4 },
+                { 5, 6, 7 }
+            };
+            static const char* const s_pos_labels[8] = {
+                "Top-Left", "Top", "Top-Right",
+                "Left",            "Right",
+                "Bottom-Left", "Bottom", "Bottom-Right"
             };
             const float total_avail = ImGui::GetContentRegionAvail().x;
             const float spacing = ImGui::GetStyle().ItemSpacing.x;
             const float btn_w = (std::max)(40.0f, std::floor((total_avail - spacing * 2.0f) / 3.0f));
 
-            for (int row = 0; row < 2; ++row) {
+            for (int row = 0; row < 3; ++row) {
                 for (int col = 0; col < 3; ++col) {
-                    const int idx = row * 3 + col;
                     if (col > 0) {
                         ImGui::SameLine();
                     }
+                    const int idx = s_grid_to_index[row][col];
+                    if (idx < 0) {
+                        if (is_dragged) {
+                            if (ImGui::Button("Reset", ImVec2(btn_w, 0.0f))) {
+                                cfg.perfOverlayPosX = -1.0f;
+                                cfg.perfOverlayPosY = -1.0f;
+                                cfg.save();
+                            }
+                        } else {
+                            ImGui::Dummy(ImVec2(btn_w, ImGui::GetFrameHeight()));
+                        }
+                        continue;
+                    }
+
                     const bool is_selected = (!is_dragged && cfg.perfOverlayCorner == idx);
                     if (is_selected) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.90f, 0.90f));
                         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.65f, 1.00f, 1.00f));
                         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.45f, 0.80f, 1.00f));
                     }
-                    if (ImGui::Button(pos_labels[idx], ImVec2(btn_w, 0.0f))) {
+                    if (ImGui::Button(s_pos_labels[idx], ImVec2(btn_w, 0.0f))) {
                         cfg.perfOverlayCorner = idx;
                         cfg.perfOverlayPosX = -1.0f;
                         cfg.perfOverlayPosY = -1.0f;
