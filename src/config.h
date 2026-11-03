@@ -106,6 +106,8 @@ public:
             devVal = GetPrivateProfileIntW(L"General", L"DEV", 0, path.c_str());
         }
         devMode = (devVal > 0);
+
+        reusePrimaryDevice = GetPrivateProfileIntW(L"Experimental", L"ReusePrimaryDevice", 0, path.c_str()) != 0;
     }
 
     void save() {
@@ -159,6 +161,8 @@ public:
         swprintf_s(buf, L"%.1f", perfOverlayPosY);
         WritePrivateProfileStringW(L"Overlay", L"PosY", buf, path.c_str());
         WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
+
+        WritePrivateProfileStringW(L"Experimental", L"ReusePrimaryDevice", reusePrimaryDevice ? L"1" : L"0", path.c_str());
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -274,6 +278,8 @@ public:
     float perfOverlayPosX = -1.0f;
     float perfOverlayPosY = -1.0f;
     bool devMode = false;
+
+    bool reusePrimaryDevice = false;
 };
 
 } // namespace edpe

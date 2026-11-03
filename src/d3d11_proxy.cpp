@@ -18,6 +18,10 @@
 #include <set>
 #include <tuple>
 #include <windows.h>
+#include <dxgi.h>
+#include <vector>
+
+void ObserveDxgiSwapChain(IDXGISwapChain* swap_chain);
 
 namespace {
 using CreateVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*,
@@ -110,6 +114,55 @@ HRESULT STDMETHODCALLTYPE observedCreateDeferredContext(ID3D11Device* device,
         ContextCensusHookDeferredContext(*ppDeferredContext);
     }
     return result;
+}
+
+std::mutex s_device_track_mutex;
+Microsoft::WRL::ComPtr<ID3D11Device> s_primary_device;
+Microsoft::WRL::ComPtr<ID3D11DeviceContext> s_primary_context;
+LUID s_primary_luid{};
+bool s_has_primary_device = false;
+std::atomic<unsigned> s_device_create_call_count{0};
+
+void logDeviceCreationCall(const wchar_t* apiName, IDXGIAdapter* adapter, D3D_DRIVER_TYPE driverType,
+    UINT flags, const D3D_FEATURE_LEVEL* featureLevels, UINT featureLevelCount, UINT sdkVersion) {
+    const unsigned callNum = ++s_device_create_call_count;
+    std::wstring adapterDesc = L"null";
+    LUID adpLuid{};
+    if (adapter) {
+        DXGI_ADAPTER_DESC desc{};
+        if (SUCCEEDED(adapter->GetDesc(&desc))) {
+            adapterDesc = desc.Description;
+            adpLuid = desc.AdapterLuid;
+        } else {
+            adapterDesc = L"valid-adapter-no-desc";
+        }
+    }
+    std::wstring flStr;
+    if (featureLevels && featureLevelCount > 0) {
+        for (UINT i = 0; i < featureLevelCount; ++i) {
+            wchar_t hex[16];
+            swprintf_s(hex, L"0x%X ", static_cast<unsigned>(featureLevels[i]));
+            flStr += hex;
+        }
+    } else {
+        flStr = L"[default]";
+    }
+
+    void* stack[8]{};
+    USHORT frames = CaptureStackBackTrace(1, 8, stack, nullptr);
+    std::wstring stackStr;
+    for (USHORT i = 0; i < frames; ++i) {
+        wchar_t frameHex[24];
+        swprintf_s(frameHex, L"%p ", stack[i]);
+        stackStr += frameHex;
+    }
+
+    wchar_t msg[512];
+    swprintf_s(msg,
+        L"EDPE: [DeviceCreate #%u] %ls: adapter=%p (\"%ls\" luid=%08x:%08x) driverType=%d flags=0x%X sdk=0x%X featureLevels=[%ls] thread=%u stack=[%ls]",
+        callNum, apiName, adapter, adapterDesc.c_str(), adpLuid.HighPart, adpLuid.LowPart,
+        static_cast<int>(driverType), flags, sdkVersion, flStr.c_str(), GetCurrentThreadId(), stackStr.c_str());
+    EdpeLog(msg);
 }
 
 bool armShaderProbe() {
@@ -264,6 +317,17 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
         static_cast<unsigned>(fl), flags, GetCurrentThreadId());
     EdpeLog(message);
 
+    {
+        std::lock_guard lock(s_device_track_mutex);
+        if (!s_has_primary_device) {
+            s_primary_device = device;
+            s_primary_context = immContext.Get();
+            s_primary_luid = adapterLuid;
+            s_has_primary_device = true;
+            EdpeLog(L"EDPE: registered primary D3D11 device");
+        }
+    }
+
     hookShaderCreation(device);
     ContextCensusRegisterDevice(device, immContext.Get());
     if (immContext) {
@@ -311,6 +375,44 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
         GetProcAddress(system_d3d11, "D3D11CreateDevice"));
     if (!create_device) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
 
+    logDeviceCreationCall(L"D3D11CreateDevice", adapter, driver_type, flags,
+        feature_levels, feature_level_count, sdk_version);
+
+    if (edpe::Config::instance().reusePrimaryDevice) {
+        flags &= ~D3D11_CREATE_DEVICE_SINGLETHREADED;
+        if (driver_type == D3D_DRIVER_TYPE_HARDWARE || driver_type == D3D_DRIVER_TYPE_UNKNOWN) {
+            std::lock_guard lock(s_device_track_mutex);
+            if (s_has_primary_device && s_primary_device &&
+                SUCCEEDED(s_primary_device->GetDeviceRemovedReason())) {
+                LUID reqLuid{};
+                if (adapter) {
+                    DXGI_ADAPTER_DESC aDesc{};
+                    if (SUCCEEDED(adapter->GetDesc(&aDesc))) reqLuid = aDesc.AdapterLuid;
+                }
+                if (!adapter || (reqLuid.LowPart == s_primary_luid.LowPart && reqLuid.HighPart == s_primary_luid.HighPart)) {
+                    if (device || context) {
+                        wchar_t rMsg[256];
+                        swprintf_s(rMsg, L"EDPE: D3D11CreateDevice REUSING primary device %p (ctx=%p) for thread=%u",
+                            s_primary_device.Get(), s_primary_context.Get(), GetCurrentThreadId());
+                        EdpeLog(rMsg);
+                    }
+                    if (device) {
+                        *device = s_primary_device.Get();
+                        s_primary_device->AddRef();
+                    }
+                    if (context) {
+                        *context = s_primary_context.Get();
+                        if (s_primary_context) s_primary_context->AddRef();
+                    }
+                    if (feature_level) {
+                        *feature_level = s_primary_device->GetFeatureLevel();
+                    }
+                    return S_OK;
+                }
+            }
+        }
+    }
+
     const HRESULT result = create_device(adapter, driver_type, software, flags,
         feature_levels, feature_level_count, sdk_version, device, feature_level, context);
     if (SUCCEEDED(result) && device && *device) {
@@ -353,6 +455,69 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDeviceAndSwapChain(
         GetProcAddress(system_d3d11, "D3D11CreateDeviceAndSwapChain"));
     if (!create_device_and_swap_chain) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
 
+    logDeviceCreationCall(L"D3D11CreateDeviceAndSwapChain", pAdapter, DriverType, Flags,
+        pFeatureLevels, FeatureLevels, SDKVersion);
+
+    if (edpe::Config::instance().reusePrimaryDevice) {
+        Flags &= ~D3D11_CREATE_DEVICE_SINGLETHREADED;
+        if (DriverType == D3D_DRIVER_TYPE_HARDWARE || DriverType == D3D_DRIVER_TYPE_UNKNOWN) {
+            std::lock_guard lock(s_device_track_mutex);
+            if (s_has_primary_device && s_primary_device &&
+                SUCCEEDED(s_primary_device->GetDeviceRemovedReason())) {
+                LUID reqLuid{};
+                if (pAdapter) {
+                    DXGI_ADAPTER_DESC aDesc{};
+                    if (SUCCEEDED(pAdapter->GetDesc(&aDesc))) reqLuid = aDesc.AdapterLuid;
+                }
+                if (!pAdapter || (reqLuid.LowPart == s_primary_luid.LowPart && reqLuid.HighPart == s_primary_luid.HighPart)) {
+                    if (ppSwapChain && pSwapChainDesc) {
+                        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDev;
+                        Microsoft::WRL::ComPtr<IDXGIAdapter> dxgiAdp;
+                        Microsoft::WRL::ComPtr<IDXGIFactory> dxgiFac;
+                        if (SUCCEEDED(s_primary_device.As(&dxgiDev)) &&
+                            SUCCEEDED(dxgiDev->GetAdapter(&dxgiAdp)) &&
+                            SUCCEEDED(dxgiAdp->GetParent(IID_PPV_ARGS(&dxgiFac)))) {
+                            DXGI_SWAP_CHAIN_DESC scDesc = *pSwapChainDesc;
+                            HRESULT hr = dxgiFac->CreateSwapChain(s_primary_device.Get(), &scDesc, ppSwapChain);
+                            if (SUCCEEDED(hr) && *ppSwapChain) {
+                                ObserveDxgiSwapChain(*ppSwapChain);
+                                wchar_t rMsg[256];
+                                swprintf_s(rMsg, L"EDPE: D3D11CreateDeviceAndSwapChain REUSING primary device %p for swapchain %p",
+                                    s_primary_device.Get(), static_cast<void*>(*ppSwapChain));
+                                EdpeLog(rMsg);
+                                if (ppDevice) {
+                                    *ppDevice = s_primary_device.Get();
+                                    s_primary_device->AddRef();
+                                }
+                                if (ppImmediateContext) {
+                                    *ppImmediateContext = s_primary_context.Get();
+                                    if (s_primary_context) s_primary_context->AddRef();
+                                }
+                                if (pFeatureLevel) {
+                                    *pFeatureLevel = s_primary_device->GetFeatureLevel();
+                                }
+                                return S_OK;
+                            }
+                        }
+                    } else if (!ppSwapChain && !pSwapChainDesc) {
+                        if (ppDevice) {
+                            *ppDevice = s_primary_device.Get();
+                            s_primary_device->AddRef();
+                        }
+                        if (ppImmediateContext) {
+                            *ppImmediateContext = s_primary_context.Get();
+                            if (s_primary_context) s_primary_context->AddRef();
+                        }
+                        if (pFeatureLevel) {
+                            *pFeatureLevel = s_primary_device->GetFeatureLevel();
+                        }
+                        return S_OK;
+                    }
+                }
+            }
+        }
+    }
+
     const HRESULT result = create_device_and_swap_chain(pAdapter, DriverType, Software, Flags,
         pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
     if (SUCCEEDED(result)) {
@@ -361,6 +526,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDeviceAndSwapChain(
                 Flags, (pFeatureLevel && *pFeatureLevel) ? *pFeatureLevel : static_cast<D3D_FEATURE_LEVEL>(0));
         }
         if (ppSwapChain && *ppSwapChain) {
+            ObserveDxgiSwapChain(*ppSwapChain);
             wchar_t scMsg[192];
             swprintf_s(scMsg, L"EDPE: swapchain created swapchain=%p device=%p",
                 static_cast<void*>(*ppSwapChain), static_cast<void*>(ppDevice ? *ppDevice : nullptr));

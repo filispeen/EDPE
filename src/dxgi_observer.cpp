@@ -86,6 +86,7 @@ ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
 HRESULT STDMETHODCALLTYPE observedResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_count,
     UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
     UiOnResize(swap_chain);
+    ContextCensusOnResize(swap_chain);
     const auto original = reinterpret_cast<ResizeBuffersFn>(tableOf(swap_chain)->original[kResizeBuffers]);
     return original(swap_chain, buffer_count, width, height, format, flags);
 }
@@ -250,6 +251,11 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
 }
 
 void observeSwapChain(IDXGISwapChain* swap_chain) {
+    if (!swap_chain) return;
+    void** current_vtable = *reinterpret_cast<void***>(swap_chain);
+    if (current_vtable && current_vtable[kPresent] == reinterpret_cast<void*>(&observedPresent)) {
+        return;
+    }
     if (!hookObject(swap_chain, swapChainMethods(swap_chain), kPresent,
             reinterpret_cast<void*>(&observedPresent))) {
         OutputDebugStringW(L"EDPE: swapchain observation disabled (allocation failed)\n");
@@ -259,12 +265,21 @@ void observeSwapChain(IDXGISwapChain* swap_chain) {
 }
 } // namespace
 
+void ObserveDxgiSwapChain(IDXGISwapChain* swap_chain) {
+    observeSwapChain(swap_chain);
+}
+
 void ObserveDxgiFactory(REFIID iid, void* factory) {
+    if (!factory) return;
     if (iid != __uuidof(IDXGIFactory) && iid != __uuidof(IDXGIFactory1) &&
         iid != __uuidof(IDXGIFactory2) && iid != __uuidof(IDXGIFactory3) &&
         iid != __uuidof(IDXGIFactory4) && iid != __uuidof(IDXGIFactory5) &&
         iid != __uuidof(IDXGIFactory6) && iid != __uuidof(IDXGIFactory7)) return;
     auto* object = static_cast<IDXGIFactory1*>(factory);
+    void** current_vtable = *reinterpret_cast<void***>(object);
+    if (current_vtable && current_vtable[kCreateSwapChain] == reinterpret_cast<void*>(&observedCreateSwapChain)) {
+        return;
+    }
     const size_t method_count = factoryMethods(object);
     if (!hookObject(object, method_count, kCreateSwapChain,
             reinterpret_cast<void*>(&observedCreateSwapChain))) {
