@@ -1692,9 +1692,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             const char* reset_btn_text = "Reset Position";
             const float spacing = ImGui::GetStyle().ItemSpacing.x;
             const float button_width = is_dragged ? (ImGui::CalcTextSize(reset_btn_text).x + ImGui::GetStyle().FramePadding.x * 2.0f) : 0.0f;
+            const float label_width = ImGui::CalcTextSize("HUD Position").x + ImGui::GetStyle().ItemInnerSpacing.x;
 
             if (is_dragged) {
-                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - button_width - spacing);
+                const float avail = ImGui::GetContentRegionAvail().x - button_width - label_width - spacing;
+                ImGui::SetNextItemWidth((std::max)(80.0f, avail));
             }
             if (ImGui::Combo("HUD Position", &cfg.perfOverlayCorner, hud_corners, IM_ARRAYSIZE(hud_corners))) {
                 cfg.perfOverlayPosX = -1.0f;
@@ -1773,6 +1775,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                     cfg.upscalerBackend = 0;
                     cfg.save();
                 }
+                edpe::PerfTracker::instance().updateCachedStats();
             }
 
             if (!nvidia_active) ImGui::BeginDisabled();
@@ -1792,6 +1795,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 edpe::NgxContext::set_preset(newPreset);
                 cfg.dlssPreset = static_cast<int>(newPreset);
                 cfg.save();
+                edpe::PerfTracker::instance().updateCachedStats();
             }
             if (!nvidia_active) ImGui::EndDisabled();
 
@@ -1913,6 +1917,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 bool jitter_enabled = ContextCensusGetJitterEnabled();
                 if (ImGui::Checkbox("Enable Projection Jitter (Halton 2,3)", &jitter_enabled)) {
                     ContextCensusSetJitterEnabled(jitter_enabled);
+                    edpe::Config::instance().jitterEnabled = jitter_enabled;
+                    edpe::Config::instance().save();
                 }
                 bool jitter_override = ContextCensusGetJitterTestOverride();
                 if (ImGui::Checkbox("Force Jitter test override (subpixel vibration test)", &jitter_override)) {
@@ -2087,10 +2093,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ImGui::TextWrapped("F5: menu | F7: perf HUD");
         }
 
-        if (!cfg.devMode) {
-            ImGui::TextDisabled("(Settings auto-saved)");
-            ImGui::SameLine();
-        }
+        ImGui::TextDisabled("(Settings auto-saved)");
+        ImGui::SameLine();
 
         const char* authorLabel = "by FILISPEEN";
         const char* authorUrl = "https://github.com/filispeen";

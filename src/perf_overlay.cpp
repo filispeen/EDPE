@@ -200,7 +200,7 @@ float PerfTracker::calculateOnePercentLow() const {
     const size_t numSlowest = (std::max)(size_t(1), static_cast<size_t>(std::ceil(validCount * 0.01f)));
 
     // Partition so the first `numSlowest` elements are the largest (worst) frametimes in descending order
-    std::nth_element(times.begin(), times.begin() + numSlowest, times.begin() + validCount, std::greater<float>());
+    std::nth_element(times.begin(), times.begin() + (numSlowest - 1), times.begin() + validCount, std::greater<float>());
 
     // Compute the average of the slowest 1% frametimes (1% Low Average) to stabilize spikes
     float sumSlowestMs = 0.0f;
@@ -258,10 +258,14 @@ void PerfTracker::updateCachedStats() {
     snprintf(cachedStats_.totalFtLine, sizeof(cachedStats_.totalFtLine),
         "%6.2f ms", cachedStats_.totalFrametimeMs);
 
-    const uint32_t rW = cachedStats_.renderWidth;
-    const uint32_t rH = cachedStats_.renderHeight;
+    uint32_t rW = cachedStats_.renderWidth;
+    uint32_t rH = cachedStats_.renderHeight;
     const uint32_t oW = cachedStats_.outputWidth;
     const uint32_t oH = cachedStats_.outputHeight;
+    if ((rW == 0 || rH == 0) && (oW > 0 && oH > 0)) {
+        rW = oW;
+        rH = oH;
+    }
     const float scalePct = (oW > 0) ? (100.0f * static_cast<float>(rW) / static_cast<float>(oW)) : 100.0f;
     const bool isSr = (rW < oW || rH < oH);
 

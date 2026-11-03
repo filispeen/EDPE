@@ -87,6 +87,8 @@ public:
     void renderOverlay(bool isMenuOpen, int corner, float scale = 1.0f, const PerfOverlayOverride* override = nullptr);
     void initNvml();
     void shutdown();
+    void updateCachedStats();
+    void refreshCachedStats() { updateCachedStats(); }
 
 private:
     PerfTracker();
@@ -95,7 +97,6 @@ private:
     void updateTelemetry(IDXGISwapChain* swapChain);
     void renderFrametimeGraph(float scale, const PerfOverlayOverride* override = nullptr);
     float calculateOnePercentLow() const;
-    void updateCachedStats();
 
     PerfTelemetry telemetry_{};
     CachedTelemetryStats cachedStats_{};
