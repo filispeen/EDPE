@@ -1748,13 +1748,25 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ImGui::SetNextWindowPos(ImVec2(defX, 20.0f), ImGuiCond_FirstUseEver);
             }
 
-            const float targetW = (cfg.menuWidth >= 200.0f) ? (std::min)(cfg.menuWidth, display.x > 0.0f ? display.x - 20.0f : cfg.menuWidth) : defW;
+            // Target width scales directly with uiScale so elements and window scale in sync
+            const float targetW = defW;
             // Height is ALWAYS 0.0f (auto-fit to elements by default)
             ImGui::SetNextWindowSize(ImVec2(targetW, 0.0f), ImGuiCond_Always);
         }
 
         ImGui::Begin("EDPE | Elite Dangerous Performance Enhanced", &window_open, ImGuiWindowFlags_AlwaysAutoResize);
+        const char* edpeRepoUrl = "https://github.com/filispeen/EDPE";
         ImGui::Text("Version: %s", edpe::kVersion);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            const ImVec2 pMin = ImGui::GetItemRectMin();
+            const ImVec2 pMax = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(pMin.x, pMax.y), ImVec2(pMax.x, pMax.y), IM_COL32(100, 190, 255, 255));
+            ImGui::SetTooltip("Open %s", edpeRepoUrl);
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            ShellExecuteA(nullptr, "open", edpeRepoUrl, nullptr, nullptr, SW_SHOWNORMAL);
+        }
         auto& upscaler = edpe::UpscalerManager::instance();
         const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);
         const bool amd_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::AmdFsr);
@@ -1764,8 +1776,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             if (ImGui::Checkbox("Show Performance HUD (FPS, Frametimes, GPU, VRAM)", &cfg.showPerfOverlay)) {
                 cfg.save();
             }
-            ImGui::SameLine();
-            ImGui::TextDisabled("(Hotkey: F7)");
 
             const char* hud_corners[] = { "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right" };
             const bool is_dragged = (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f);
@@ -1795,22 +1805,16 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 cfg.save();
             }
-            if (ImGui::SliderFloat("UI Scale", &cfg.uiScale, 0.5f, 2.5f, "%.2fx")) {
-                applyUiScale(cfg.uiScale);
-            }
+            ImGui::SliderFloat("UI Scale", &cfg.uiScale, 0.5f, 2.5f, "%.2fx");
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 cfg.save();
             }
 
-            ImGui::TextDisabled("Font: ProggyForever (Scalable Vector)");
-
-            const bool menu_customized = (cfg.menuPosX >= 0.0f || cfg.menuWidth >= 0.0f);
+            const bool menu_customized = (cfg.menuPosX >= 0.0f || cfg.menuPosY >= 0.0f);
             if (menu_customized) {
-                if (ImGui::Button("Reset Menu Size & Position")) {
+                if (ImGui::Button("Reset Menu Position")) {
                     cfg.menuPosX = -1.0f;
                     cfg.menuPosY = -1.0f;
-                    cfg.menuWidth = -1.0f;
-                    cfg.menuHeight = -1.0f;
                     s_reset_menu_layout = true;
                     cfg.save();
                 }
@@ -2102,14 +2106,15 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
             // Section 4: Debug Views & Diagnostics
             if (ImGui::CollapsingHeader("Debug Views & Diagnostics")) {
-                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Subpixel Jitter Debug View (Hotkey: F8)");
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Subpixel Jitter Debug View");
                 bool debug_view = ContextCensusGetJitterDebugView();
-                if (ImGui::Checkbox("Enable Jitter Debug View (Grayscale Scene + Green Jitter Pixels)", &debug_view)) {
+                if (ImGui::Checkbox("Enable Jitter Debug View", &debug_view)) {
                     ContextCensusSetJitterDebugView(debug_view);
                     auto& cfg = edpe::Config::instance();
                     cfg.jitterDebugView = debug_view;
                     cfg.save();
                 }
+                TextDisabledWrapped("Grayscale scene with green jitter-affected pixels");
                 if (debug_view) {
                     float sens = ContextCensusGetJitterDebugSensitivity();
                     if (ImGui::SliderFloat("Jitter Sensitivity", &sens, 0.1f, 5.0f, "%.2fx")) {
@@ -2165,16 +2170,15 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 }
 
                 ImGui::Separator();
-                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Cockpit HUD & UI Mask Debug View (Hotkey: F10)");
-                ImGui::TextDisabled("(HUD & reactive mask debug visualizer planned for Phase 12)");
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Cockpit HUD & UI Mask Debug View");
+                TextDisabledWrapped("(HUD & reactive mask debug visualizer planned for Phase 12)");
 
                 ImGui::Separator();
                 ImGui::TextUnformatted("Buffer Diagnostic Dumps:");
-                if (ImGui::Button("Capture ALL buffers (diagnostic dump, F6)")) {
+                if (ImGui::Button("Capture ALL buffers (diagnostic dump)")) {
                     all_captures_requested.store(true, std::memory_order_release);
                 }
-                ImGui::SameLine();
-                ImGui::TextUnformatted("(color, motion, depth, emission, frame)");
+                TextDisabledWrapped("(color, motion, depth, emission, frame)");
                 if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
                     ui.pending_backbuffer_capture = true;
                 }
@@ -2184,10 +2188,33 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::Spacing();
 
         ImGui::Separator();
-        if (cfg.devMode) {
-            ImGui::TextWrapped("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter | F10: HUD debug");
-        } else {
-            ImGui::TextWrapped("F5: menu | F7: perf HUD");
+
+        static const char* const s_devBinds[] = {
+            "F5: menu", "F6: capture", "F7: perf HUD",
+            "F8: jitter view", "F9: record jitter", "F10: HUD debug"
+        };
+        static const char* const s_userBinds[] = {
+            "F5: menu", "F7: perf HUD"
+        };
+
+        const char* const* binds = cfg.devMode ? s_devBinds : s_userBinds;
+        const int bindCount = cfg.devMode ? IM_ARRAYSIZE(s_devBinds) : IM_ARRAYSIZE(s_userBinds);
+        const float sepWidth = ImGui::CalcTextSize(" | ").x;
+
+        for (int i = 0; i < bindCount; ++i) {
+            const float itemWidth = ImGui::CalcTextSize(binds[i]).x;
+            if (i > 0) {
+                const float lastRight = ImGui::GetItemRectMax().x;
+                const float windowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+                const float remaining = windowRight - lastRight;
+
+                if (remaining >= (sepWidth + itemWidth)) {
+                    ImGui::SameLine(0.0f, 0.0f);
+                    ImGui::TextDisabled(" | ");
+                    ImGui::SameLine(0.0f, 0.0f);
+                }
+            }
+            ImGui::TextUnformatted(binds[i]);
         }
 
         ImGui::TextDisabled("(Settings auto-saved)");

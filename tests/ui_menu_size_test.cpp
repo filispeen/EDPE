@@ -10,6 +10,9 @@ int main() {
     io.DisplaySize = ImVec2(2560.0f, 1440.0f);
     io.IniFilename = nullptr;
 
+    ImFont* font = io.Fonts->AddFontDefaultVector();
+    io.FontDefault = font;
+
     unsigned char* pixels;
     int w, h;
     io.Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
@@ -44,7 +47,31 @@ int main() {
 
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::Text("F5: menu | F7: perf HUD");
+
+        // Keybinds with token-level wrapping
+        const char* const binds[] = {
+            "F5: menu", "F6: capture", "F7: perf HUD",
+            "F8: jitter view", "F9: record jitter", "F10: HUD debug"
+        };
+        const int bindCount = sizeof(binds) / sizeof(binds[0]);
+        const float sepWidth = ImGui::CalcTextSize(" | ").x;
+
+        for (int i = 0; i < bindCount; ++i) {
+            const float itemWidth = ImGui::CalcTextSize(binds[i]).x;
+            if (i > 0) {
+                const float lastRight = ImGui::GetItemRectMax().x;
+                const float windowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+                const float remaining = windowRight - lastRight;
+
+                if (remaining >= (sepWidth + itemWidth)) {
+                    ImGui::SameLine(0.0f, 0.0f);
+                    ImGui::TextDisabled(" | ");
+                    ImGui::SameLine(0.0f, 0.0f);
+                }
+            }
+            ImGui::TextUnformatted(binds[i]);
+        }
+
         ImGui::TextDisabled("(Settings auto-saved)");
 
         ImGui::End();
@@ -52,29 +79,25 @@ int main() {
 
         if (frame == 3) {
             ImGuiWindow* win = ImGui::FindWindowByName("EDPE | Elite Dangerous Performance Enhanced");
-            printf("Frame 3 (Default): Width=%.1f (expected %.1f), Height=%.1f (expected < 250)\n", win->Size.x, defW, win->Size.y);
+            assert(win != nullptr);
             assert(win->Size.x == defW);
-            assert(win->Size.y < 250.0f);
-
-            // Open header 2
+            assert(win->Size.y < 300.0f);
             header2Open = true;
         } else if (frame == 7) {
             ImGuiWindow* win = ImGui::FindWindowByName("EDPE | Elite Dangerous Performance Enhanced");
-            printf("Frame 7 (Expanded): Width=%.1f, Height=%.1f (expected > 500)\n", win->Size.x, win->Size.y);
+            assert(win != nullptr);
             assert(win->Size.x == defW);
             assert(win->Size.y > 500.0f);
-
-            // Close header 2
             header2Open = false;
         } else if (frame == 11) {
             ImGuiWindow* win = ImGui::FindWindowByName("EDPE | Elite Dangerous Performance Enhanced");
-            printf("Frame 11 (Collapsed back): Width=%.1f, Height=%.1f (expected < 250)\n", win->Size.x, win->Size.y);
+            assert(win != nullptr);
             assert(win->Size.x == defW);
-            assert(win->Size.y < 250.0f);
+            assert(win->Size.y < 300.0f);
         }
     }
 
     ImGui::DestroyContext(ctx);
-    printf("Exact EDPE Menu auto-size test passed perfectly!\n");
+    printf("Exact EDPE Menu auto-size and keybind wrapping tests passed perfectly!\n");
     return 0;
 }
