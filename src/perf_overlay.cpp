@@ -528,10 +528,18 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
         break;
     }
 
+    static int s_last_corner = -1;
+    static bool s_was_custom_pos = false;
+    const bool corner_changed = (s_last_corner != corner);
+    const bool snap_to_corner = (s_was_custom_pos && cfg.perfOverlayPosX < 0.0f) || (cfg.perfOverlayPosX < 0.0f && corner_changed);
+    s_last_corner = corner;
+
     if (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f) {
         ImGui::SetNextWindowPos(ImVec2(cfg.perfOverlayPosX, cfg.perfOverlayPosY), isMenuOpen ? ImGuiCond_Appearing : ImGuiCond_Always);
+        s_was_custom_pos = true;
     } else {
-        ImGui::SetNextWindowPos(window_pos, isMenuOpen ? ImGuiCond_Appearing : ImGuiCond_Always, window_pos_pivot);
+        ImGui::SetNextWindowPos(window_pos, (!isMenuOpen || snap_to_corner) ? ImGuiCond_Always : ImGuiCond_Appearing, window_pos_pivot);
+        s_was_custom_pos = false;
     }
     ImGui::SetNextWindowBgAlpha(0.70f);
 
@@ -546,24 +554,18 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
 
     if (ImGui::Begin("##EDPE_PerfOverlay", nullptr, window_flags)) {
         if (isMenuOpen) {
-            const ImVec2 curPos = ImGui::GetWindowPos();
-            static bool s_hud_pos_dirty = false;
+            static bool s_is_dragging_hud = false;
             if ((ImGui::IsWindowHovered() || ImGui::IsWindowFocused()) && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                if (std::fabs(curPos.x - cfg.perfOverlayPosX) > 0.5f || std::fabs(curPos.y - cfg.perfOverlayPosY) > 0.5f) {
-                    cfg.perfOverlayPosX = curPos.x;
-                    cfg.perfOverlayPosY = curPos.y;
-                    s_hud_pos_dirty = true;
-                }
-            } else if (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f) {
-                if (std::fabs(curPos.x - cfg.perfOverlayPosX) > 0.5f || std::fabs(curPos.y - cfg.perfOverlayPosY) > 0.5f) {
-                    cfg.perfOverlayPosX = curPos.x;
-                    cfg.perfOverlayPosY = curPos.y;
-                    s_hud_pos_dirty = true;
-                }
+                s_is_dragging_hud = true;
             }
-            if (s_hud_pos_dirty && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                cfg.save();
-                s_hud_pos_dirty = false;
+            if (s_is_dragging_hud && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                const ImVec2 curPos = ImGui::GetWindowPos();
+                if (std::fabs(curPos.x - cfg.perfOverlayPosX) > 0.5f || std::fabs(curPos.y - cfg.perfOverlayPosY) > 0.5f) {
+                    cfg.perfOverlayPosX = curPos.x;
+                    cfg.perfOverlayPosY = curPos.y;
+                    cfg.save();
+                }
+                s_is_dragging_hud = false;
             }
         }
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "EDPE Performance HUD");

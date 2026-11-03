@@ -134,7 +134,6 @@ std::vector<InputMessage> render_input;
 ImGuiStyle s_base_imgui_style;
 bool s_base_style_initialized = false;
 static bool s_reset_menu_layout = false;
-static bool s_menu_layout_dirty = false;
 
 void TextDisabledWrapped(const char* text) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
@@ -1395,10 +1394,6 @@ static void applyUiScale(float scale) {
 }
 
 void shutdownUi() {
-    if (s_menu_layout_dirty) {
-        edpe::Config::instance().save();
-        s_menu_layout_dirty = false;
-    }
     menu_visible.store(false);
     if (ui.window && ui.original_wndproc &&
         reinterpret_cast<WNDPROC>(GetWindowLongPtrW(ui.window, GWLP_WNDPROC)) == edpeWndProc) {
@@ -1709,38 +1704,36 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     bool window_open = true;
     if (draw_menu) {
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        const float defW = (std::min)(540.0f * uiScale, display.x > 0.0f ? display.x - 40.0f : 540.0f);
+        const float maxH = (display.y > 100.0f) ? (display.y - 40.0f) : 1080.0f;
+        ImGui::SetNextWindowSizeConstraints(ImVec2(300.0f * uiScale, 80.0f), ImVec2(display.x > 0.0f ? display.x : 3840.0f, maxH));
+
         if (s_reset_menu_layout) {
-            const ImVec2 display = ImGui::GetIO().DisplaySize;
-            const float defW = (std::min)(540.0f * uiScale, display.x > 0.0f ? display.x - 40.0f : 540.0f);
-            const float defH = (std::min)(650.0f * uiScale, display.y > 0.0f ? display.y - 40.0f : 650.0f);
             const float defX = (display.x > defW) ? (display.x - defW) * 0.5f : 20.0f;
-            const float defY = (display.y > defH) ? (display.y - defH) * 0.5f : 20.0f;
+            const float defY = 20.0f;
             ImGui::SetNextWindowPos(ImVec2(defX, defY), ImGuiCond_Always);
-            ImGui::SetNextWindowSize(ImVec2(defW, defH), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(defW, 0.0f), ImGuiCond_Always);
             s_reset_menu_layout = false;
         } else {
             if (cfg.menuPosX >= 0.0f && cfg.menuPosY >= 0.0f) {
-                const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
                 float posX = cfg.menuPosX;
                 float posY = cfg.menuPosY;
-                if (displaySize.x > 100.0f && displaySize.y > 100.0f) {
-                    posX = (std::min)(posX, displaySize.x - 60.0f);
-                    posY = (std::min)(posY, displaySize.y - 40.0f);
+                if (display.x > 100.0f && display.y > 100.0f) {
+                    posX = (std::min)(posX, display.x - 60.0f);
+                    posY = (std::min)(posY, display.y - 40.0f);
                     posX = (std::max)(0.0f, posX);
                     posY = (std::max)(0.0f, posY);
                 }
                 ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_FirstUseEver);
+            } else {
+                const float defX = (display.x > defW) ? (display.x - defW) * 0.5f : 20.0f;
+                ImGui::SetNextWindowPos(ImVec2(defX, 20.0f), ImGuiCond_FirstUseEver);
             }
-            if (cfg.menuWidth >= 200.0f && cfg.menuHeight >= 150.0f) {
-                const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
-                float width = cfg.menuWidth;
-                float height = cfg.menuHeight;
-                if (displaySize.x > 100.0f && displaySize.y > 100.0f) {
-                    width = (std::min)(width, displaySize.x);
-                    height = (std::min)(height, displaySize.y);
-                }
-                ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_FirstUseEver);
-            }
+
+            const float targetW = (cfg.menuWidth >= 200.0f) ? (std::min)(cfg.menuWidth, display.x > 0.0f ? display.x - 20.0f : cfg.menuWidth) : defW;
+            // Height is ALWAYS 0.0f (auto-fit to elements by default)
+            ImGui::SetNextWindowSize(ImVec2(targetW, 0.0f), ImGuiCond_Always);
         }
 
         ImGui::Begin("EDPE | Elite Dangerous Performance Enhanced", &window_open);
@@ -2205,30 +2198,33 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ShellExecuteA(nullptr, "open", authorUrl, nullptr, nullptr, SW_SHOWNORMAL);
         }
 
-        const ImVec2 curPos = ImGui::GetWindowPos();
-        const ImVec2 curSize = ImGui::GetWindowSize();
-        const bool isCollapsed = ImGui::IsWindowCollapsed();
-
-        if (!isCollapsed) {
-            const bool posChanged = (cfg.menuPosX < 0.0f) ||
-                (std::fabs(curPos.x - cfg.menuPosX) > 1.0f || std::fabs(curPos.y - cfg.menuPosY) > 1.0f);
-            const bool sizeChanged = (cfg.menuWidth < 0.0f) ||
-                (std::fabs(curSize.x - cfg.menuWidth) > 1.0f || std::fabs(curSize.y - cfg.menuHeight) > 1.0f);
-
-            if (posChanged || sizeChanged) {
-                cfg.menuPosX = curPos.x;
-                cfg.menuPosY = curPos.y;
-                cfg.menuWidth = curSize.x;
-                cfg.menuHeight = curSize.y;
-                s_menu_layout_dirty = true;
-            }
+        static bool s_is_interacting_menu = false;
+        if ((ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) || ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            s_is_interacting_menu = true;
         }
 
         ImGui::End();
 
-        if (s_menu_layout_dirty && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-            cfg.save();
-            s_menu_layout_dirty = false;
+        if (s_is_interacting_menu && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            const ImVec2 curPos = ImGui::GetWindowPos();
+            const ImVec2 curSize = ImGui::GetWindowSize();
+            bool changed = false;
+
+            if (std::fabs(curPos.x - cfg.menuPosX) > 1.0f || std::fabs(curPos.y - cfg.menuPosY) > 1.0f) {
+                cfg.menuPosX = curPos.x;
+                cfg.menuPosY = curPos.y;
+                changed = true;
+            }
+            if (std::fabs(curSize.x - cfg.menuWidth) > 1.0f) {
+                cfg.menuWidth = curSize.x;
+                changed = true;
+            }
+
+            if (changed) {
+                cfg.save();
+            }
+            s_is_interacting_menu = false;
         }
     if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);
@@ -2334,10 +2330,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     } // if (draw_menu)
     if (draw_menu && !window_open) {
-        if (s_menu_layout_dirty) {
-            cfg.save();
-            s_menu_layout_dirty = false;
-        }
         menu_visible.store(false);
         io.ClearInputKeys();
         io.ClearInputMouse();
