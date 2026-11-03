@@ -12,6 +12,7 @@ public:
                    ID3D11ShaderResourceView* dlssReconstruction,
                    ID3D11ShaderResourceView* gameBackbufferWithUi,
                    ID3D11ShaderResourceView* lowResWorld,
+                   ID3D11ShaderResourceView* hudMask,
                    ID3D11RenderTargetView* targetBackbufferRtv,
                    UINT outputWidth, UINT outputHeight,
                    UINT renderWidth, UINT renderHeight,
@@ -25,6 +26,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixelShader_;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> linearSampler_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constantBuffer_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> dummyMaskTex_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> dummyMaskSrv_;
 };
 
 } // namespace edpe

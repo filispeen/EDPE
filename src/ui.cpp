@@ -195,6 +195,17 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
         if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F8) return true;
 
         if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            wparam == VK_F10 && !(lparam & (1LL << 30))) {
+            ContextCensusToggleHudDebugView();
+            const bool active = ContextCensusGetHudDebugView();
+            cfg.hudDebugView = active;
+            cfg.save();
+            EdpeLog(active ? L"EDPE: F10 pressed — Cockpit HUD & UI Debug View enabled" : L"EDPE: F10 pressed — Cockpit HUD & UI Debug View disabled");
+            return true;
+        }
+        if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F10) return true;
+
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
             wparam == VK_F9 && !(lparam & (1LL << 30))) {
             auto& recorder = edpe::JitterViewRecorder::instance();
             if (recorder.isSaving()) {
@@ -2132,6 +2143,52 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
 
     ImGui::Separator();
+    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Cockpit HUD & UI Mask Debug View (Hotkey: F10)");
+    bool hud_debug_view = ContextCensusGetHudDebugView();
+    if (ImGui::Checkbox("Enable HUD & UI Debug View (Grayscale Scene + Amber HUD / Cyan UI)", &hud_debug_view)) {
+        ContextCensusSetHudDebugView(hud_debug_view);
+        auto& cfg = edpe::Config::instance();
+        cfg.hudDebugView = hud_debug_view;
+        cfg.save();
+    }
+    if (hud_debug_view) {
+        float opacity = ContextCensusGetHudDebugOpacity();
+        if (ImGui::SliderFloat("HUD Mask Opacity", &opacity, 0.1f, 3.0f, "%.2fx")) {
+            ContextCensusSetHudDebugOpacity(opacity);
+            auto& cfg = edpe::Config::instance();
+            cfg.hudDebugOpacity = opacity;
+            cfg.save();
+        }
+        float thresh = ContextCensusGetHudDebugThreshold();
+        if (ImGui::SliderFloat("UI Diff Threshold", &thresh, 0.002f, 0.1f, "%.3f")) {
+            ContextCensusSetHudDebugThreshold(thresh);
+            auto& cfg = edpe::Config::instance();
+            cfg.hudDebugThreshold = thresh;
+            cfg.save();
+        }
+        int mode = ContextCensusGetHudDebugMode();
+        const char* const hud_modes[] = {
+            "Combined (Cockpit HUD + Menu UI)",
+            "Cockpit Holographic HUD Only",
+            "Menu 2D UI Diff Only",
+            "Split Heatmap (Amber=HUD, Cyan=UI, Yellow=Both)",
+            "Binary Mask Only"
+        };
+        if (ImGui::Combo("HUD Debug Mode", &mode, hud_modes, IM_ARRAYSIZE(hud_modes))) {
+            ContextCensusSetHudDebugMode(mode);
+            auto& cfg = edpe::Config::instance();
+            cfg.hudDebugMode = mode;
+            cfg.save();
+        }
+
+        const float coverage = ContextCensusGetHudMaskCoverage();
+        const unsigned draws = ContextCensusGetHudDrawsReplayed();
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+            "Cockpit HUD: %u replayed draws | Coverage: %.2f%%", draws, coverage);
+        ImGui::TextDisabled("Amber = Cockpit Holographic HUD (Pass 35)  |  Cyan = Menu 2D UI Diff");
+    }
+
+    ImGui::Separator();
     if (ImGui::Button("Capture ALL buffers (diagnostic dump, F6)")) {
         all_captures_requested.store(true, std::memory_order_release);
     }
@@ -2149,7 +2206,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     ImGui::Separator();
     if (cfg.devMode) {
-        ImGui::TextUnformatted("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter");
+        ImGui::TextUnformatted("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter | F10: HUD debug");
     } else {
         ImGui::TextUnformatted("F5: menu | F7: perf HUD");
     }

@@ -73,6 +73,16 @@ public:
         jitterDebugMode = GetPrivateProfileIntW(L"Jitter", L"DebugMode", 0, path.c_str());
         if (jitterDebugMode < 0 || jitterDebugMode > 3) jitterDebugMode = 0;
 
+        hudDebugView = GetPrivateProfileIntW(L"HUD", L"DebugView", 0, path.c_str()) != 0;
+        GetPrivateProfileStringW(L"HUD", L"DebugOpacity", L"1.0", buf, 64, path.c_str());
+        hudDebugOpacity = static_cast<float>(_wtof(buf));
+        if (hudDebugOpacity < 0.1f || hudDebugOpacity > 5.0f) hudDebugOpacity = 1.0f;
+        GetPrivateProfileStringW(L"HUD", L"DebugThreshold", L"0.02", buf, 64, path.c_str());
+        hudDebugThreshold = static_cast<float>(_wtof(buf));
+        if (hudDebugThreshold < 0.001f || hudDebugThreshold > 0.5f) hudDebugThreshold = 0.02f;
+        hudDebugMode = GetPrivateProfileIntW(L"HUD", L"DebugMode", 0, path.c_str());
+        if (hudDebugMode < 0 || hudDebugMode > 4) hudDebugMode = 0;
+
         zeroMotionVectors = GetPrivateProfileIntW(L"Motion", L"ZeroMotion", 0, path.c_str()) != 0;
         motionInvertX = GetPrivateProfileIntW(L"Motion", L"InvertX", 0, path.c_str()) != 0;
         motionInvertY = GetPrivateProfileIntW(L"Motion", L"InvertY", 0, path.c_str()) != 0;
@@ -138,6 +148,13 @@ public:
         swprintf_s(buf, L"%.3f", jitterDebugThreshold);
         WritePrivateProfileStringW(L"Jitter", L"DebugThreshold", buf, path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"DebugMode", std::to_wstring(jitterDebugMode).c_str(), path.c_str());
+
+        WritePrivateProfileStringW(L"HUD", L"DebugView", hudDebugView ? L"1" : L"0", path.c_str());
+        swprintf_s(buf, L"%.2f", hudDebugOpacity);
+        WritePrivateProfileStringW(L"HUD", L"DebugOpacity", buf, path.c_str());
+        swprintf_s(buf, L"%.3f", hudDebugThreshold);
+        WritePrivateProfileStringW(L"HUD", L"DebugThreshold", buf, path.c_str());
+        WritePrivateProfileStringW(L"HUD", L"DebugMode", std::to_wstring(hudDebugMode).c_str(), path.c_str());
 
         WritePrivateProfileStringW(L"Motion", L"ZeroMotion", zeroMotionVectors ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Motion", L"InvertX", motionInvertX ? L"1" : L"0", path.c_str());
@@ -259,6 +276,11 @@ public:
     float jitterDebugSensitivity = 1.5f;
     float jitterDebugThreshold = 0.02f;
     int jitterDebugMode = 0;
+
+    bool hudDebugView = false;
+    float hudDebugOpacity = 1.0f;
+    float hudDebugThreshold = 0.02f;
+    int hudDebugMode = 0;
 
     bool zeroMotionVectors = false;
     bool motionInvertX = false;

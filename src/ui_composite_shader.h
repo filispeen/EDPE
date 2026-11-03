@@ -6,6 +6,7 @@ inline constexpr char kUiCompositeShader[] = R"hlsl(
 Texture2D<float4> tDlss : register(t0);
 Texture2D<float4> tGame : register(t1);
 Texture2D<float4> tLowWorld : register(t2);
+Texture2D<float4> tHudMask : register(t3);
 SamplerState sLinear : register(s0);
 
 cbuffer CompositeParams : register(b0) {
@@ -35,6 +36,7 @@ VSOutput vs_main(uint id : SV_VertexID) {
 
 float4 ps_main(VSOutput pin) : SV_Target {
     int3 pixelPos = int3(pin.pos.xy, 0);
+    float hudMask = tHudMask.SampleLevel(sLinear, pin.uv, 0).r;
 
     [branch]
     if (flags.y > 0.5 && flags.x < 0.5) {
@@ -100,6 +102,11 @@ float4 ps_main(VSOutput pin) : SV_Target {
 
     float3 deltaUi = (cGame - cLow) - alphaUi * (cDlss - cLow);
     float3 finalColor = cDlss + uiMask * deltaUi;
+
+    [branch]
+    if (flags.x < 0.5) {
+        finalColor = lerp(finalColor, cGame, hudMask);
+    }
 
     return float4(saturate(finalColor), 1.0);
 }

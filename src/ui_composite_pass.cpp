@@ -1,6 +1,7 @@
 #include "ui_composite_pass.h"
 #include "ui_composite_shader.h"
 
+#include <cstdint>
 #include <d3dcompiler.h>
 
 namespace edpe {
@@ -70,6 +71,20 @@ bool UiCompositePass::initialize(ID3D11Device* device, ID3D11DeviceContext* cont
         return false;
     }
 
+    D3D11_TEXTURE2D_DESC dummyDesc{};
+    dummyDesc.Width = dummyDesc.Height = 1;
+    dummyDesc.MipLevels = dummyDesc.ArraySize = 1;
+    dummyDesc.Format = DXGI_FORMAT_R8_UNORM;
+    dummyDesc.SampleDesc.Count = 1;
+    dummyDesc.Usage = D3D11_USAGE_DEFAULT;
+    dummyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    const uint8_t zero = 0;
+    D3D11_SUBRESOURCE_DATA dummyInit{&zero, sizeof(uint8_t), 0};
+    if (FAILED(device->CreateTexture2D(&dummyDesc, &dummyInit, &dummyMaskTex_)) ||
+        FAILED(device->CreateShaderResourceView(dummyMaskTex_.Get(), nullptr, &dummyMaskSrv_))) {
+        return false;
+    }
+
     device_ = device;
     return true;
 }
@@ -78,6 +93,7 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     ID3D11ShaderResourceView* dlssReconstruction,
     ID3D11ShaderResourceView* gameBackbufferWithUi,
     ID3D11ShaderResourceView* lowResWorld,
+    ID3D11ShaderResourceView* hudMask,
     ID3D11RenderTargetView* targetBackbufferRtv,
     UINT outputWidth, UINT outputHeight,
     UINT renderWidth, UINT renderHeight,
@@ -106,7 +122,8 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     context_->SwapDeviceContextState(state_.Get(), &prior);
 
     auto* rtv = targetBackbufferRtv;
-    ID3D11ShaderResourceView* srvs[3] = {dlssReconstruction, gameBackbufferWithUi, lowResWorld};
+    auto* activeHudMask = hudMask ? hudMask : dummyMaskSrv_.Get();
+    ID3D11ShaderResourceView* srvs[4] = {dlssReconstruction, gameBackbufferWithUi, lowResWorld, activeHudMask};
     ID3D11Buffer* cb = constantBuffer_.Get();
     auto* sampler = linearSampler_.Get();
 
@@ -119,14 +136,14 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
     context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
-    context_->PSSetShaderResources(0, 3, srvs);
+    context_->PSSetShaderResources(0, 4, srvs);
     context_->PSSetSamplers(0, 1, &sampler);
     context_->PSSetConstantBuffers(0, 1, &cb);
 
     context_->Draw(3, 0);
 
-    ID3D11ShaderResourceView* nullSrvs[3] = {nullptr, nullptr, nullptr};
-    context_->PSSetShaderResources(0, 3, nullSrvs);
+    ID3D11ShaderResourceView* nullSrvs[4] = {nullptr, nullptr, nullptr, nullptr};
+    context_->PSSetShaderResources(0, 4, nullSrvs);
     ID3D11RenderTargetView* nullRtv = nullptr;
     context_->OMSetRenderTargets(1, &nullRtv, nullptr);
 
