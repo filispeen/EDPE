@@ -150,6 +150,15 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
         historyCount_++;
     }
 
+    // Rate-limit hardware telemetry to ~4 times per second (250 ms) BEFORE updating cached display strings
+    if (perfFreq_.QuadPart > 0) {
+        const double elapsedSinceUpdateMs = static_cast<double>(now.QuadPart - lastTelemetryUpdate_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
+        if (lastTelemetryUpdate_.QuadPart == 0 || elapsedSinceUpdateMs >= 250.0) {
+            updateTelemetry(swapChain);
+            lastTelemetryUpdate_ = now;
+        }
+    }
+
     // Rate-limit display telemetry & profiler updates to 66.67 ms (15 Hz / 15 FPS) using high-resolution steady_clock
     const auto nowTime = std::chrono::steady_clock::now();
     const double elapsedCacheMs = (lastCacheUpdate_.time_since_epoch().count() == 0)
@@ -159,15 +168,6 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
     if (elapsedCacheMs >= 66.67) {
         updateCachedStats();
         lastCacheUpdate_ = nowTime;
-    }
-
-    // Rate-limit hardware telemetry to ~4 times per second (250 ms)
-    if (perfFreq_.QuadPart > 0) {
-        const double elapsedSinceUpdateMs = static_cast<double>(now.QuadPart - lastTelemetryUpdate_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
-        if (lastTelemetryUpdate_.QuadPart == 0 || elapsedSinceUpdateMs >= 250.0) {
-            updateTelemetry(swapChain);
-            lastTelemetryUpdate_ = now;
-        }
     }
 }
 

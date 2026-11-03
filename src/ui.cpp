@@ -209,6 +209,13 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
             return true;
         }
         if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F9) return true;
+
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            wparam == VK_F10 && !(lparam & (1LL << 30))) {
+            EdpeLog(L"EDPE: F10 pressed — Cockpit HUD & UI Mask Debug View (Phase 12 feature)");
+            return true;
+        }
+        if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F10) return true;
     }
     if (menu_visible.load()) {
         if (message == WM_INPUT) return true;
@@ -1724,9 +1731,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
 
         // 2. Upscaler & Image Quality (Open by default)
-        const bool backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
-        const bool nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
-        const bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
+        bool backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
+        bool nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
+        bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
 
         if (ImGui::CollapsingHeader("Upscaler & Image Quality", ImGuiTreeNodeFlags_DefaultOpen)) {
             const auto& cached_tel = edpe::PerfTracker::instance().getCachedTelemetry();
@@ -1775,6 +1782,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                     cfg.upscalerBackend = 0;
                     cfg.save();
                 }
+                backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
+                nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
+                taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
                 edpe::PerfTracker::instance().updateCachedStats();
             }
 
@@ -1830,6 +1840,14 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ImGui::TextDisabled("AMD FSR reason: %ls",
                     upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::AmdFsr));
             }
+
+            bool preserve_ui = ContextCensusGetPreserveNativeUi();
+            if (ImGui::Checkbox("Preserve Native UI (Composite in Super Resolution)", &preserve_ui)) {
+                ContextCensusSetPreserveNativeUi(preserve_ui);
+                edpe::Config::instance().save();
+            }
+            ImGui::TextDisabled("Composites native-resolution cockpit HUD & UI over reconstructed scene");
+
             ImGui::BeginDisabled();
             ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
             ImGui::EndDisabled();
@@ -2060,13 +2078,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 }
 
                 ImGui::Separator();
-                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Cockpit HUD & UI Mask Debug View");
-                bool preserve_ui = ContextCensusGetPreserveNativeUi();
-                if (ImGui::Checkbox("Preserve Native UI (Composite in Super Resolution)", &preserve_ui)) {
-                    ContextCensusSetPreserveNativeUi(preserve_ui);
-                    edpe::Config::instance().save();
-                }
-                ImGui::TextDisabled("Composites native-resolution cockpit HUD & UI over reconstructed scene");
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Cockpit HUD & UI Mask Debug View (Hotkey: F10)");
+                ImGui::TextDisabled("(HUD & reactive mask debug visualizer planned for Phase 12)");
 
                 ImGui::Separator();
                 ImGui::TextUnformatted("Buffer Diagnostic Dumps:");
@@ -2088,7 +2101,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
         ImGui::Separator();
         if (cfg.devMode) {
-            ImGui::TextWrapped("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter");
+            ImGui::TextWrapped("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter | F10: HUD debug");
         } else {
             ImGui::TextWrapped("F5: menu | F7: perf HUD");
         }
