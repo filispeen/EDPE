@@ -237,7 +237,7 @@ void PerfTracker::updateCachedStats() {
                             (cachedStats_.fps >= 30.0f) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) :
                                                           ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
     snprintf(cachedStats_.fpsLine, sizeof(cachedStats_.fpsLine),
-        "FPS: %.1f | 1%% Low: %.1f FPS", cachedStats_.fps, cachedStats_.onePercentLowFps);
+        "FPS: %5.1f | 1%% Low: %5.1f FPS", cachedStats_.fps, cachedStats_.onePercentLowFps);
 
     snprintf(cachedStats_.gameFtLine, sizeof(cachedStats_.gameFtLine),
         "%6.2f ms", cachedStats_.gameFrametimeMs);
@@ -245,15 +245,9 @@ void PerfTracker::updateCachedStats() {
     auto& upscaler = UpscalerManager::instance();
     UpscalerBackend shownBackend = upscaler.getBackend();
     bool upscalerActive = upscaler.isReconstructionActive();
-    if (upscalerActive && cachedStats_.upscalerFrametimeMs > 0.0f) {
-        const char* backendShort = (shownBackend == UpscalerBackend::Taa) ? "TAA" :
-                                   (shownBackend == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
-        snprintf(cachedStats_.upscalerFtLine, sizeof(cachedStats_.upscalerFtLine),
-            "%6.2f ms (%s)", cachedStats_.upscalerFrametimeMs, backendShort);
-    } else {
-        snprintf(cachedStats_.upscalerFtLine, sizeof(cachedStats_.upscalerFtLine),
-            "%6.2f ms (Bypass)", 0.0f);
-    }
+    const float upscalerMs = (upscalerActive && cachedStats_.upscalerFrametimeMs > 0.0f) ? cachedStats_.upscalerFrametimeMs : 0.0f;
+    snprintf(cachedStats_.upscalerFtLine, sizeof(cachedStats_.upscalerFtLine),
+        "%6.2f ms", upscalerMs);
 
     snprintf(cachedStats_.totalFtLine, sizeof(cachedStats_.totalFtLine),
         "%6.2f ms", cachedStats_.totalFrametimeMs);
@@ -407,13 +401,12 @@ void PerfTracker::renderFrametimeGraph(float scale, const PerfOverlayOverride* o
     ImGui::Spacing();
 
     const float availW = ImGui::GetContentRegionAvail().x;
-    const float graphWidth = (availW > 180.0f * scale) ? availW : 240.0f * scale;
+    const float graphWidth = (availW > 40.0f) ? availW : 240.0f * scale;
     const float graphHeight = 42.0f * scale;
-    const ImVec2 graphSize(graphWidth, graphHeight);
 
     const ImVec2 pMin = ImGui::GetCursorScreenPos();
-    const ImVec2 pMax = ImVec2(pMin.x + graphSize.x, pMin.y + graphSize.y);
-    ImGui::Dummy(graphSize);
+    const ImVec2 pMax = ImVec2(pMin.x + graphWidth, pMin.y + graphHeight);
+    ImGui::Dummy(ImVec2(0.0f, graphHeight));
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     if (!drawList) return;
@@ -551,13 +544,6 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
         window_flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs;
     }
 
-    const bool customScale = (scale > 0.49f && std::fabs(scale - 1.0f) > 0.01f);
-    if (customScale) {
-        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * scale);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * scale, 8.0f * scale));
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f * scale, 3.0f * scale));
-    }
-
     if (ImGui::Begin("##EDPE_PerfOverlay", nullptr, window_flags)) {
         if (isMenuOpen) {
             const ImVec2 curPos = ImGui::GetWindowPos();
@@ -584,7 +570,7 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
                                     (telemetry_.fps >= 30.0f) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) :
                                                                 ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
             ImGui::PushStyleColor(ImGuiCol_Text, fpsColor);
-            ImGui::Text("FPS: %.1f | 1%% Low: %.1f FPS", telemetry_.fps, telemetry_.fps);
+            ImGui::Text("FPS: %5.1f | 1%% Low: %5.1f FPS", telemetry_.fps, telemetry_.fps);
             ImGui::PopStyleColor();
         } else {
             ImGui::PushStyleColor(ImGuiCol_Text, cachedStats_.fpsColor);
@@ -606,8 +592,7 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.95f, 0.95f, 1.0f));
         if (override) {
-            ImGui::Text("%6.2f ms (%s)", override->upscalerMs,
-                (override->backendId == 3) ? "TAA" : (override->backendId == 2) ? "FSR" : "DLSS/DLAA");
+            ImGui::Text("%6.2f ms", override->upscalerMs);
         } else {
             ImGui::TextUnformatted(cachedStats_.upscalerFtLine);
         }
@@ -671,11 +656,6 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
         }
     }
     ImGui::End();
-
-    if (customScale) {
-        ImGui::PopStyleVar(2);
-        ImGui::PopFont();
-    }
 }
 
 } // namespace edpe

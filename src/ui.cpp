@@ -131,6 +131,14 @@ std::atomic<bool> all_captures_requested{false};
 std::mutex input_mutex;
 std::vector<InputMessage> pending_input;
 std::vector<InputMessage> render_input;
+ImGuiStyle s_base_imgui_style;
+bool s_base_style_initialized = false;
+
+void TextDisabledWrapped(const char* text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+}
 
 bool isInputMessage(UINT message) {
     if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) return true;
@@ -539,7 +547,11 @@ void flushOverlayCaptures(bool drawOverlay) {
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
-            edpe::PerfTracker::instance().renderOverlay(false, cfg.perfOverlayCorner, cfg.perfOverlayScale,
+            const float hudScale = std::clamp(cfg.perfOverlayScale, 0.5f, 2.5f);
+            ImGui::GetStyle() = s_base_imgui_style;
+            ImGui::GetStyle().ScaleAllSizes(hudScale);
+            ImGui::GetIO().FontGlobalScale = hudScale;
+            edpe::PerfTracker::instance().renderOverlay(false, cfg.perfOverlayCorner, hudScale,
                 item.backendId >= 0 ? &ov : nullptr);
             ImGui::Render();
             ui.context->OMSetRenderTargets(1, &item.rtv, nullptr);
@@ -1364,9 +1376,6 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
     srcDevice->Release();
 }
 
-static ImGuiStyle s_base_imgui_style;
-static bool s_base_style_initialized = false;
-
 static void applyUiScale(float scale) {
     if (!ui.imgui) return;
     ImGuiContext* previous = ImGui::GetCurrentContext();
@@ -1674,9 +1683,23 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    if (show_perf) {
-        edpe::PerfTracker::instance().renderOverlay(draw_menu, cfg.perfOverlayCorner, cfg.perfOverlayScale);
+    if (!s_base_style_initialized) {
+        s_base_imgui_style = ImGui::GetStyle();
+        s_base_style_initialized = true;
     }
+
+    if (show_perf) {
+        const float hudScale = std::clamp(cfg.perfOverlayScale, 0.5f, 2.5f);
+        ImGui::GetStyle() = s_base_imgui_style;
+        ImGui::GetStyle().ScaleAllSizes(hudScale);
+        ImGui::GetIO().FontGlobalScale = hudScale;
+        edpe::PerfTracker::instance().renderOverlay(draw_menu, cfg.perfOverlayCorner, hudScale);
+    }
+
+    const float uiScale = std::clamp(cfg.uiScale, 0.5f, 2.5f);
+    ImGui::GetStyle() = s_base_imgui_style;
+    ImGui::GetStyle().ScaleAllSizes(uiScale);
+    ImGui::GetIO().FontGlobalScale = uiScale;
 
     bool window_open = true;
     if (draw_menu) {
@@ -1741,7 +1764,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ImGui::TextUnformatted(cached_tel.reconStatusLine);
             ImGui::PopStyleColor();
             ImGui::TextUnformatted(cached_tel.resLine);
-            ImGui::TextDisabled("Upscaling quality ratios are controlled via in-game Graphics > Supersampling (< 1.0x enables upscaling, 1.0x uses Native AA).");
+            TextDisabledWrapped("Upscaling quality ratios are controlled via in-game Graphics > Supersampling (< 1.0x enables upscaling, 1.0x uses Native AA).");
 
             ImGui::Spacing();
 
@@ -1829,7 +1852,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ImGui::EndDisabled();
                 ImGui::TextDisabled("Sharpening requires an active upscaler backend");
             } else if (taa_active) {
-                ImGui::TextDisabled("(TAA uses Catmull-Rom reconstruction; vendor sharpening applies to DLSS and FSR)");
+                TextDisabledWrapped("(TAA uses Catmull-Rom reconstruction; vendor sharpening applies to DLSS and FSR)");
             }
 
             if (!nvidia_available) {
@@ -1846,7 +1869,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ContextCensusSetPreserveNativeUi(preserve_ui);
                 edpe::Config::instance().save();
             }
-            ImGui::TextDisabled("Composites native-resolution cockpit HUD & UI over reconstructed scene");
+            TextDisabledWrapped("Composites native-resolution cockpit HUD & UI over reconstructed scene");
 
             ImGui::BeginDisabled();
             ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
