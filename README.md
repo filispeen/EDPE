@@ -85,48 +85,34 @@ See [STATUS.md](STATUS.md) for verified facts and [PLAN.md](PLAN.md) for the com
 
 EDPE enforces a strict separation: Elite-specific engine reverse-engineering belongs to EDPE; vendor-specific reconstruction logic lives behind modular backend interfaces.
 
-```text
-               Elite Dangerous (Cobra Engine D3D11)
-                                |
-                                v
-                      EDPE Proxy Injection
-                           (dxgi.dll)
-                                |
-        +-----------------------+-----------------------+
-        |                                               |
-        v                                               v
- Context Census & CB0 Tracking                 Swapchain Observer
-  - Reverse-Z Depth (DSV #2)                    - Backbuffer tracking
-  - Camera matrices (CB0 Map/Unmap)             - First-Present hook
-  - Emissive glow pass (RTV3)                   - WndProc message handler
-        |                                               |
-        v                                               |
- Temporal Input Generation                              |
-  - Halton (2,3) projection jitter                      |
-  - GPU camera-depth motion vectors                     |
-        |                                               |
-        +-----------------------+-----------------------+
-                                |
-                                v
-                  Shared TemporalFrameInputs
-           (color, depth, motion, jitter, camera)
-                                |
-        +-----------------------+-----------------------+
-        |                       |                       |
-        v                       v                       v
-  NVIDIA Backend           AMD Backend             Native TAA
-(NGX DLAA / DLSS SR)   (FSR Native AA / SR)  (D3D11 Reconstruction)
-        |                       |                       |
-        +-----------------------+-----------------------+
-                                |
-                                v
-                     Reconstructed 3D Scene
-                                |
-                                v
-                     Dear ImGui Overlay (F5)
-                                |
-                                v
-                       IDXGISwapChain::Present
+```mermaid
+flowchart TD
+    Game["Elite Dangerous (Cobra Engine D3D11)"] --> Proxy["EDPE Proxy Injection<br/>(dxgi.dll)"]
+
+    Proxy --> Census["Context Census & CB0 Tracking<br/>• Reverse-Z Depth (DSV #2)<br/>• Camera matrices (CB0 Map/Unmap)<br/>• Emissive glow pass (RTV3)"]
+    Proxy --> Swapchain["Swapchain Observer<br/>• Backbuffer tracking<br/>• First-Present hook<br/>• WndProc message handler"]
+
+    Census --> TemporalGen["Temporal Input Generation<br/>• Halton (2,3) projection jitter<br/>• GPU camera-depth motion vectors"]
+
+    TemporalGen --> SharedInputs["Shared TemporalFrameInputs<br/>(color, depth, motion, jitter, camera)"]
+    Swapchain --> SharedInputs
+
+    subgraph Backends ["Reconstruction Backends"]
+        Nvidia["NVIDIA Backend<br/>(NGX DLAA / DLSS SR)"]
+        Amd["AMD Backend<br/>(FSR Native AA / SR)"]
+        Taa["Native TAA<br/>(D3D11 Reconstruction)"]
+    end
+
+    SharedInputs --> Nvidia
+    SharedInputs --> Amd
+    SharedInputs --> Taa
+
+    Nvidia --> Reconstructed["Reconstructed 3D Scene"]
+    Amd --> Reconstructed
+    Taa --> Reconstructed
+
+    Reconstructed --> ImGui["Dear ImGui Overlay (F5)"]
+    ImGui --> Present["IDXGISwapChain::Present"]
 ```
 
 ### Core Architectural Principles
