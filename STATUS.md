@@ -173,9 +173,9 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 - **Per-Frame Draw Interception:**
   - Armed per-frame while reconstruction is active (`edpe::UpscalerManager::instance().isReconstructionActive()`).
   - Hooks remain installed across frames without vtable thrashing or per-frame hooking overhead.
-  - Hot-path gated by `motion_color_bound` (single CPU branch for non-HUD draws).
+  - Hot-path gated by `s_hud_mask_active_pass` and `motion_pair_active` (single CPU branch for non-HUD draws).
 - **HUD Mask Generation:**
-  - Matched HUD draws are replayed into `s_hud_mask_rtv` (`R8_UNORM`, render resolution) using constant 1.0 PS and additive blend (`ONE + ONE`).
+  - Matched HUD draws are replayed into `s_hud_mask_rtv` (`R11G11B10_FLOAT`, render resolution) using the game's bound HUD shaders and an alpha/additive blend filter that skips subtractive/min-op dark backing quads.
   - Cleared once per frame on entry to RTV0 deferred lighting/HUD.
 - **UI Composite Pass Integration:**
   - Mask SRV bound as 4th SRV (`t3`).

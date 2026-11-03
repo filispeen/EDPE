@@ -119,7 +119,7 @@ flowchart TD
     - `VS=0xF512712C40D93C12`, `PS=0x4A71EB0D34E9F2EF`
     - `VS=0x8C091FFD08644E02`, `PS=0x70F56E2EB7032E1A`
 - **EDPE action**:
-  - Replays every matched cockpit HUD draw into `s_hud_mask_rtv` (`R8_UNORM`, render resolution) using constant-output PS (`float4(1,1,1,1)`) and additive blend (`ONE + ONE`).
+  - Replays every matched cockpit HUD draw into `s_hud_mask_rtv` (`R11G11B10_FLOAT`, render resolution) using the game's bound HUD shaders and an alpha/additive blend filter that skips subtractive/min-op dark backing quads.
   - Clears the HUD mask once per frame on entry to RTV0 lighting/HUD.
   - Passes the resulting `s_hud_mask_srv` into `UiCompositePass::composite` (`t3`) so cockpit holographic HUD draws are composed crisply from game backbuffer pixels rather than blurred/ghosted through DLSS/FSR.
 
@@ -191,9 +191,9 @@ edpe::PerfTracker::instance().onPresentEnd();
   - **SRV 0**: `s_dlss_output_srv` (Temporally upscaled/reconstructed 3D world).
   - **SRV 1**: `s_backbuffer_copy_srv` (Copy of game backbuffer before upscaler evaluation, containing native-resolution Cobra HUD).
   - **SRV 2**: `s_dlaa_input_srv` (Low-resolution 3D world input).
-  - **SRV 3**: `s_hud_mask_srv` (Low-resolution R8 cockpit holographic HUD coverage mask, register `t3`).
+  - **SRV 3**: `s_hud_mask_srv` (Low-resolution `R11G11B10_FLOAT` cockpit holographic HUD mask, register `t3`).
   - **Sampler 0**: Bilinear clamp sampler (`linearSampler_`).
-  - **CB 0**: `CompositeParams` (renderSize, renderTexel, outputSize, outputTexel, isHdr flag).
+  - **CB 0**: `CompositeParams` (renderSize, renderTexel, outputSize, outputTexel, isHdr flag, preserveUi flag).
   - **RTV**: `targetBackbufferRtv` (Output swapchain backbuffer).
 - **Mathematical operation**: Compares high-resolution game backbuffer with the upsampled low-res world to isolate pure UI alpha and color for menu UI (`|gameBackbuffer - lowResWorld|`), combined with the cockpit HUD mask via `uiMask = max(uiMask, hudMask)`. For pixels covered by the HUD mask, the shader outputs `cGame` directly, preserving holographic flight instruments without DLSS/FSR ghosting. Evaluates non-blocking coverage readback and logs `EDPE: HUD mask coverage=<percent>% frame=<n>` every 300 frames.
 
@@ -235,7 +235,7 @@ edpe::PerfTracker::instance().onPresentEnd();
 | **Main Scene 4-MRT Geometry** | Scene Pass (`OMSetRenderTargets`) | Engine Hook | Elite mesh geometry | 4 RTVs + Depth (`depth-dsv2`) | Elite scene VS/PS | [`observedOMSetRenderTargets`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L2841) |
 | **Emissive / Illumination Capture** | G-Buffer Exit (`OMSetRenderTargets`, diagnostic) | Engine Hook | RTV3 (`R11G11B10F`) | `motion_early_color_view` | `CopyResource` | [`captureEarlyMotionColor`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L1845) |
 | **Deferred Lighting / Pre-HUD Color** | Lighting Pass (`OMSetRenderTargets`) | Engine Hook | G-Buffer + lights | Single RTV0 (`R11G11B10F` / LDR) | Elite lighting PS | [src/context_census.cpp:2932-2959](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L2932-L2959) |
-| **Cockpit HUD Draw Interception & Replay** | UI Passes (`Draw*` hooks, per-frame) | Engine Hook | UI & glass meshes | `s_hud_mask_rtv` (`R8_UNORM`) | `kHudMaskShader` (constant 1.0 PS, additive blend) | [`observeHudDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp), [`replayHudDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp) |
+| **Cockpit HUD Draw Interception & Replay** | UI Passes (`Draw*` hooks, per-frame) | Engine Hook | UI & glass meshes | `s_hud_mask_rtv` (`R11G11B10_FLOAT`) | Game's bound HUD VS/PS (additive/alpha blend filter) | [`observeHudDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp), [`replayHudDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp) |
 | **Motion Vector Generation** | Present (`tryTemporalUpscale`) | EDPE Pass | `motion_depth` (`R32F`), CB 32f | `motionTexture` (`R16G16F`) | `kMotionShader` (`vs_5_0`, `ps_5_0`) | [`MotionPass::render`](file:///F:/Code/%D0%A1++/EDPE/src/motion_pass.cpp#L48) |
 | **Temporal Upscaler / Reconstruct** | Present (`tryTemporalUpscale`) | EDPE Pass | Color, Depth, Motion, Jitter | `outputTexture_` / Backbuffer | DLSS / FSR / `kTaaShader` | [`UpscalerManager::evaluate`](file:///F:/Code/%D0%A1++/EDPE/src/upscaler_backend.cpp#L695) |
 | **Native UI Composition** | Present (`tryTemporalUpscale`) | EDPE Pass | Upscaled SRV, Backbuffer SRV, Low-res SRV, HUD Mask SRV | Backbuffer RTV | `kUiCompositeShader` (`vs_main`, `ps_main`) | [`UiCompositePass::composite`](file:///F:/Code/%D0%A1++/EDPE/src/ui_composite_pass.cpp) |

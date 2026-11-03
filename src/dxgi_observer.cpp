@@ -86,6 +86,7 @@ ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
 HRESULT STDMETHODCALLTYPE observedResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_count,
     UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
     UiOnResize(swap_chain);
+    ContextCensusOnResize(swap_chain);
     const auto original = reinterpret_cast<ResizeBuffersFn>(tableOf(swap_chain)->original[kResizeBuffers]);
     return original(swap_chain, buffer_count, width, height, format, flags);
 }

@@ -34,6 +34,7 @@ bool ContextCensusIsDeviceRegistered(ID3D11Device* device);
 void ContextCensusLogPresentDevice(IDXGISwapChain* swapChain, ID3D11Device* presentDevice);
 unsigned long long ContextCensusGetDsvBinds();
 void ContextCensusOnSwapChainRelease(IUnknown* object);
+void ContextCensusOnResize(IDXGISwapChain* swap_chain);
 bool ContextCensusRequestBindSequence();
 bool ContextCensusBindSequenceAvailable();
 bool ContextCensusRequestDepthSnapshot(unsigned index);

@@ -198,6 +198,8 @@ bool HudDebugPass::render(ID3D11DeviceContext* context,
 
     ID3D11ShaderResourceView* nullSrvs[4] = { nullptr, nullptr, nullptr, nullptr };
     context_->PSSetShaderResources(0, 4, nullSrvs);
+    ID3D11RenderTargetView* nullRtv = nullptr;
+    context_->OMSetRenderTargets(1, &nullRtv, nullptr);
 
     if (state_) {
         context_->SwapDeviceContextState(prior.Get(), nullptr);
