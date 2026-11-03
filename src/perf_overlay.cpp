@@ -547,18 +547,23 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
     if (ImGui::Begin("##EDPE_PerfOverlay", nullptr, window_flags)) {
         if (isMenuOpen) {
             const ImVec2 curPos = ImGui::GetWindowPos();
+            static bool s_hud_pos_dirty = false;
             if ((ImGui::IsWindowHovered() || ImGui::IsWindowFocused()) && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                 if (std::fabs(curPos.x - cfg.perfOverlayPosX) > 0.5f || std::fabs(curPos.y - cfg.perfOverlayPosY) > 0.5f) {
                     cfg.perfOverlayPosX = curPos.x;
                     cfg.perfOverlayPosY = curPos.y;
-                    cfg.save();
+                    s_hud_pos_dirty = true;
                 }
             } else if (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f) {
                 if (std::fabs(curPos.x - cfg.perfOverlayPosX) > 0.5f || std::fabs(curPos.y - cfg.perfOverlayPosY) > 0.5f) {
                     cfg.perfOverlayPosX = curPos.x;
                     cfg.perfOverlayPosY = curPos.y;
-                    cfg.save();
+                    s_hud_pos_dirty = true;
                 }
+            }
+            if (s_hud_pos_dirty && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                cfg.save();
+                s_hud_pos_dirty = false;
             }
         }
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "EDPE Performance HUD");

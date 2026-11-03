@@ -101,6 +101,15 @@ public:
         GetPrivateProfileStringW(L"Overlay", L"PosY", L"-1.0", buf, 64, path.c_str());
         perfOverlayPosY = static_cast<float>(_wtof(buf));
 
+        GetPrivateProfileStringW(L"Overlay", L"MenuPosX", L"-1.0", buf, 64, path.c_str());
+        menuPosX = static_cast<float>(_wtof(buf));
+        GetPrivateProfileStringW(L"Overlay", L"MenuPosY", L"-1.0", buf, 64, path.c_str());
+        menuPosY = static_cast<float>(_wtof(buf));
+        GetPrivateProfileStringW(L"Overlay", L"MenuWidth", L"-1.0", buf, 64, path.c_str());
+        menuWidth = static_cast<float>(_wtof(buf));
+        GetPrivateProfileStringW(L"Overlay", L"MenuHeight", L"-1.0", buf, 64, path.c_str());
+        menuHeight = static_cast<float>(_wtof(buf));
+
         int devVal = GetPrivateProfileIntW(L"Overlay", L"DEV", -1, path.c_str());
         if (devVal < 0) {
             devVal = GetPrivateProfileIntW(L"General", L"DEV", 0, path.c_str());
@@ -158,6 +167,14 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"PosX", buf, path.c_str());
         swprintf_s(buf, L"%.1f", perfOverlayPosY);
         WritePrivateProfileStringW(L"Overlay", L"PosY", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", menuPosX);
+        WritePrivateProfileStringW(L"Overlay", L"MenuPosX", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", menuPosY);
+        WritePrivateProfileStringW(L"Overlay", L"MenuPosY", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", menuWidth);
+        WritePrivateProfileStringW(L"Overlay", L"MenuWidth", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", menuHeight);
+        WritePrivateProfileStringW(L"Overlay", L"MenuHeight", buf, path.c_str());
         WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
     }
 
@@ -273,6 +290,10 @@ public:
     float uiScale = 1.0f;
     float perfOverlayPosX = -1.0f;
     float perfOverlayPosY = -1.0f;
+    float menuPosX = -1.0f;
+    float menuPosY = -1.0f;
+    float menuWidth = -1.0f;
+    float menuHeight = -1.0f;
     bool devMode = false;
 };
 
