@@ -37,6 +37,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
 | 16. NVIDIA DLSS-NR | **Not started** | Research phase for G-buffer normal/roughness extraction and NGX Ray Reconstruction / neural denoising integration. |
 | 17. Intel XeSS upscaling | **Planned / Research** | Intel XeSS 1.3+ temporal upscaling (XeSS Native AA and Super Resolution). Dual-model support: XMX matrix acceleration on Intel Arc GPUs and universal DP4a fallback on NVIDIA/AMD GPUs. Investigating D3D11-to-D3D12 interop bridge (via Phase 13) vs proxy wrapper execution. |
+| 18. Third-party mod compatibility (ReShade, EDHM, 3Dmigoto) | **Planned / Architecture defined** | Proxy DLL chaining architecture for transparent co-existence with ReShade and EDHM (3Dmigoto). Non-destructive HUD heuristics resilient to shader overrides, post-upscale ReShade injection order, and depth buffer alignment. |
 
 ---
 

@@ -34,6 +34,7 @@ The injector must eventually:
 * execute the selected temporal upscaler;
 * reconstruct a native-resolution image from a lower-resolution scene;
 * preserve HUD/UI at native resolution where feasible;
+* support seamless co-existence and proxy chaining with popular third-party tools and mods (ReShade post-processing, EDHM / 3Dmigoto cockpit HUD customization, Special K, RTSS);
 * expose configuration through **Dear ImGui**;
 * provide GPU timing and debug views;
 * support safe runtime switching;
@@ -1039,6 +1040,7 @@ Suggested architecture:
 │   │   ├── dxgi_hook.cpp
 │   │   ├── present_hook.cpp
 │   │   ├── device_hook.cpp
+│   │   ├── proxy_chain.cpp
 │   │   └── wndproc_hook.cpp
 │   │
 │   ├── renderer/
@@ -1859,7 +1861,107 @@ Requirements and execution:
 
 ---
 
-# 41. Frame pacing
+# 41. Phase 18 — Third-party mod & ecosystem compatibility (ReShade, EDHM, 3Dmigoto, overlays)
+
+Ensure robust, out-of-the-box compatibility and co-existence with essential Elite Dangerous visual mods and community graphics tools, specifically **ReShade**, **EDHM (Elite Dangerous HUD Mod)**, **3Dmigoto**, and standard overlays (**RTSS**, **Special K**, **Steam/Discord**).
+
+Many pilots rely on EDHM to customize cockpits/menus and ReShade for stylized post-processing or color grading. EDPE must not force players into an either/or choice: temporal reconstruction must co-exist cleanly with these tools.
+
+Key architectural requirements and technical execution:
+
+### 1. Proxy DLL Chaining Architecture (`edpe.ini` `[Proxy]`)
+- **DLL Name Collision Resolution:**
+  Elite Dangerous loads proxy DLLs placed in the game directory (`elite-dangerous-odyssey-64/`). Since EDPE, ReShade, and EDHM/3Dmigoto all commonly masquerade as `dxgi.dll` or `d3d11.dll`, EDPE provides a configurable DLL proxy chaining loader.
+- **Configuration & Auto-Discovery:**
+  In `edpe.ini`:
+  ```ini
+  [Proxy]
+  EnableProxyChain=1
+  ; Target DLL to chain into (relative filename or absolute path).
+  ; Examples: ReShade64.dll, d3d11_edhm.dll, dxgi_chain.dll
+  ProxyDll=ReShade64.dll
+  ```
+  If `ProxyDll` is not explicitly set but known third-party binaries are present in the directory (e.g. `ReShade64.dll`, `dxgi_reshade.dll`, `d3d11_edhm.dll`), EDPE can auto-detect and chain into them automatically.
+- **Export Forwarding & Transparent VTable Delegation:**
+  `EDPE.dll` exports all necessary DXGI / D3D11 factory and device entry points (`CreateDXGIFactory`, `CreateDXGIFactory1`, `CreateDXGIFactory2`, `DXGIDeclareAdapterRemovalSupport`, `D3D11CreateDevice`, `D3D11CreateDeviceAndSwapChain`).
+  When chaining is active, EDPE forwards the creation call down to the chained proxy DLL, intercepts the resulting interface pointers (wrapping or observing them), and retains its own lightweight hooks.
+- **Fail-Open Fallback:**
+  If the chained proxy DLL fails to load, is corrupt, or is missing exports, EDPE logs the diagnostic error and transparently falls back to the genuine Windows system DLL (`system32\dxgi.dll` / `system32\d3d11.dll`) without crashing.
+
+### 2. Render Pipeline & Hook Execution Ordering
+The execution order between EDPE and third-party tools is mathematically critical to image quality:
+
+```text
+Game Scene Draw Calls (Low-Res 3D World)
+                 │
+                 ▼
+EDPE Latches Scene Color, Depth (DSV #2), Camera Constants & Jitter
+                 │
+                 ▼
+EDHM / 3Dmigoto Shaders Modify Cockpit & HUD Elements
+                 │
+                 ▼
+EDPE Temporal Reconstruction (DLSS / FSR / XeSS) Evaluates 3D World
+                 │
+                 ▼
+EDPE UiCompositePass Composites Native-Res Cockpit/UI over Reconstructed World
+                 │
+                 ▼
+ReShade Post-Processing Pass (Color Grading, Bloom, CRT, Sharpening)
+                 │
+                 ▼
+EDPE Dear ImGui & ReShade Overlays
+                 │
+                 ▼
+IDXGISwapChain::Present
+```
+
+- **Post-Upscale ReShade Execution:**
+  ReShade shader passes **must execute after EDPE temporal reconstruction and UI composition**.
+  Running temporal upscaling on top of an image already altered by ReShade post-processing (film grain, bloom, chromatic aberration, color grading) severely corrupts temporal history, generates smear artifacts, and breaks motion vectors.
+  Conversely, executing ReShade on the high-resolution reconstructed frame guarantees pristine post-processing fidelity.
+- **ReShade Depth Buffer Alignment:**
+  ReShade effects utilizing scene depth (e.g., MXAO, RTGI, Depth of Field) need access to the authoritative depth buffer.
+  EDPE identifies DSV #2 (`DXGI_FORMAT_R32G8X24_TYPELESS`, reversed-Z) and provides documentation/configuration guidance for ReShade's generic depth add-on, eliminating depth-buffer hunting conflicts.
+
+### 3. EDHM (Elite Dangerous HUD Mod) / 3Dmigoto Interoperability
+- **Dynamic Shader Override Resiliency:**
+  EDHM uses 3Dmigoto to intercept and replace pixel/vertex shaders for cockpit panels, HUD holograms, and cabin lighting.
+  EDPE's Phase 12 (native-resolution HUD extraction and reactive mask pass) must **not** rely on brittle single pixel shader hashes that change when EDHM modifies shaders.
+  Instead, HUD classification must combine multi-criteria heuristics:
+  - Render target formats and binding order;
+  - Depth-stencil states (e.g. depth write disabled, depth test configurations typical of UI passes);
+  - Alpha / additive blend states;
+  - Constant buffer size and layout (e.g. cockpit UI projection transforms);
+  - Optional configurable EDHM shader hash wildcards/ranges.
+- **Preservation of Custom Cockpit Themes:**
+  EDPE isolates the native-resolution UI elements and composites them cleanly over the upscaled 3D exterior scene, preserving custom EDHM color palettes and cabin glow while rendering the space background with temporal clarity.
+
+### 4. Cooperative Window & Input Routing (WndProc Chain)
+- Hook `WndProc` cleanly using standard message procedure subclassing (`SetWindowLongPtrW` / `CallWindowProcW`).
+- When the EDPE menu is inactive, immediately forward all mouse, keyboard, and joystick events down the chain without delay, preventing input lag or dropped keystrokes in ReShade (`Home` key), EDHM (`F11`), or Elite flight controls.
+- When EDPE's Dear ImGui menu is open, handle mouse interaction within the ImGui window and cleanly pass through non-conflicting inputs.
+
+### 5. Runtime Diagnostics & Third-Party Tool Detection
+- During initialization, inspect loaded modules in the process memory space.
+- Detect and log the presence of:
+  - `ReShade64.dll` / `ReShade.ini`
+  - `d3d11.dll` / `3Dmigoto` / `EDHM_UI.exe`
+  - `RTSSHooks64.dll` (RivaTuner Statistics Server)
+  - `SpecialK64.dll`
+  - `gameoverlayrenderer64.dll` (Steam)
+  - `DiscordHook64.dll`
+- Expose third-party mod status in Dear ImGui and `edpe.log`:
+  ```text
+  Proxy Chaining:       Enabled (ReShade64.dll)
+  Detected Hooks:       EDHM (3Dmigoto), RTSS
+  Hook Order:           OK (Scene -> EDHM -> EDPE SR -> ReShade -> Present)
+  ```
+- If an incompatible hook ordering or conflicting DLL override is detected, display a helpful suggestion in the Dear ImGui status panel.
+
+---
+
+# 42. Frame pacing
 
 Frame Generation requires its own diagnostics.
 
@@ -1882,7 +1984,7 @@ A generated frame is not a new simulation frame.
 
 ---
 
-# 42. Latency controls
+# 43. Latency controls
 
 FG must be paired with vendor-appropriate latency handling.
 
@@ -1911,7 +2013,7 @@ status fields.
 
 ---
 
-# 43. Runtime compatibility matrix
+# 44. Runtime compatibility matrix
 
 EDPE should construct capability state dynamically.
 
@@ -1927,6 +2029,8 @@ Intel XeSS (DP4a)    Available (Universal fallback)
 Native D3D11 TAA     Available
 NVIDIA Frame Gen     Unavailable: D3D12 bridge disabled
 AMD Frame Gen        Experimental
+Proxy DLL Chaining   Available / Configured (ReShade64.dll)
+EDHM Co-existence    Active (Heuristic HUD isolation)
 ```
 
 Use vendor API capability queries wherever possible.
@@ -1937,7 +2041,7 @@ Explain the reason in Dear ImGui.
 
 ---
 
-# 44. Diagnostics
+# 45. Diagnostics
 
 Log:
 
@@ -1961,6 +2065,8 @@ history reset
 resource recreation
 interop state
 fallback reason
+proxy chaining status
+detected third-party hooks
 ```
 
 Measure separately:
@@ -1979,7 +2085,7 @@ Never block the render thread waiting for GPU queries.
 
 ---
 
-# 45. Failure behavior
+# 46. Failure behavior
 
 Every feature must fail open.
 
@@ -2005,7 +2111,7 @@ Do not black-screen the game because a vendor SDK rejects an input.
 
 ---
 
-# 46. Performance rules
+# 47. Performance rules
 
 Avoid:
 
@@ -2034,7 +2140,7 @@ stable backend contexts
 
 ---
 
-# 47. Scope exclusions for initial versions
+# 48. Scope exclusions for initial versions
 
 Not initial-release requirements:
 
@@ -2049,13 +2155,13 @@ network modifications
 anti-cheat bypassing
 ```
 
-Unlike earlier development revisions, **Frame Generation, DLSS-NR (Ray Reconstruction), and Intel XeSS are part of the overall EDPE roadmap**.
+Unlike earlier development revisions, **Frame Generation, DLSS-NR (Ray Reconstruction), Intel XeSS, and third-party mod compatibility (ReShade, EDHM, 3Dmigoto)** are part of the overall EDPE roadmap.
 
-They are explicitly planned experimental later phases (Phases 13–17).
+They are explicitly planned later phases (Phases 13–18).
 
 ---
 
-# 48. Development philosophy
+# 49. Development philosophy
 
 Every significant graphics claim must be labelled:
 
@@ -2088,7 +2194,7 @@ guess
 
 ---
 
-# 49. Initial serious milestone
+# 50. Initial serious milestone
 
 First major temporal milestone:
 
@@ -2108,7 +2214,7 @@ Elite Dangerous 2D
 
 ---
 
-# 50. Multi-upscaler milestone
+# 51. Multi-upscaler milestone
 
 Next major target:
 
@@ -2137,7 +2243,7 @@ It is a **vendor-neutral Elite Dangerous temporal reconstruction framework**.
 
 ---
 
-# 51. Frame Generation milestone
+# 52. Frame Generation milestone
 
 Only after:
 
@@ -2171,7 +2277,7 @@ capability detection
 
 ---
 
-# 52. Final target
+# 53. Final target
 
 A mature EDPE UI may look approximately like:
 

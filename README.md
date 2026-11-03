@@ -75,6 +75,7 @@ As of **November 2026 (`v0.6.0`)**, EDPE has achieved:
 | **13–15** | **D3D11/D3D12 Interop & Frame Generation** | 🔬 **Research** | NVIDIA DLSS Frame Generation (Streamline) & AMD FSR Frame Generation via interop bridge. |
 | **16** | **NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)** | 🔬 **Research** | AI-driven Ray Reconstruction / neural denoising replacing hand-tuned temporal filters for reflections and lighting via NGX Ray Reconstruction. |
 | **17** | **Intel XeSS Super Resolution & Native AA** | 🔬 **Planned / Research** | Intel XeSS 1.3+ AI temporal upscaler with dual-engine execution: Intel XMX hardware acceleration on Arc and universal DP4a fallback across all vendors via D3D11/D3D12 bridge. |
+| **18** | **Third-Party Mod Compatibility (ReShade, EDHM, 3Dmigoto)** | 📋 **Planned** | Proxy DLL chaining (`edpe.ini` `[Proxy]`), post-upscale ReShade injection, non-destructive HUD heuristics for EDHM custom colors, and cooperative input routing. |
 
 See [STATUS.md](STATUS.md) for verified facts and [PLAN.md](PLAN.md) for the complete roadmap.
 
@@ -327,7 +328,7 @@ EDPE/
 ## Important Documentation References
 
 * [STATUS.md](STATUS.md): Up-to-date verified empirical facts, test results, and milestone logs.
-* [PLAN.md](PLAN.md): Detailed 15-phase architectural roadmap.
+* [PLAN.md](PLAN.md): Detailed 18-phase architectural roadmap.
 * [AGENTS.md](AGENTS.md): Project governance, architecture constraints, and contribution rules.
 * [render-pipeline-observations.md](docs/render-pipeline-observations.md): Reverse-engineering findings on Elite's MRT layout, depth buffers, and lighting passes.
 * [nvidia-dlaa-input-contract.md](docs/nvidia-dlaa-input-contract.md): Specifications for NVIDIA NGX DLAA integration.
