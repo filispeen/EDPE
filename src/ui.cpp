@@ -1753,7 +1753,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ImGui::SetNextWindowSize(ImVec2(targetW, 0.0f), ImGuiCond_Always);
         }
 
-        ImGui::Begin("EDPE | Elite Dangerous Performance Enhanced", &window_open);
+        ImGui::Begin("EDPE | Elite Dangerous Performance Enhanced", &window_open, ImGuiWindowFlags_AlwaysAutoResize);
         ImGui::Text("Version: %s", edpe::kVersion);
         auto& upscaler = edpe::UpscalerManager::instance();
         const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);
@@ -2181,10 +2181,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             }
         } // if (cfg.devMode)
 
-        const float footerHeight = ImGui::GetTextLineHeightWithSpacing() * 2.0f + ImGui::GetStyle().ItemSpacing.y + 4.0f;
-        if (ImGui::GetContentRegionAvail().y > footerHeight) {
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetContentRegionAvail().y - footerHeight));
-        }
+        ImGui::Spacing();
 
         ImGui::Separator();
         if (cfg.devMode) {
@@ -2223,20 +2220,13 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             s_is_interacting_menu = true;
         }
 
-        ImGui::End();
-
         if (s_is_interacting_menu && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
             const ImVec2 curPos = ImGui::GetWindowPos();
-            const ImVec2 curSize = ImGui::GetWindowSize();
             bool changed = false;
 
             if (std::fabs(curPos.x - cfg.menuPosX) > 1.0f || std::fabs(curPos.y - cfg.menuPosY) > 1.0f) {
                 cfg.menuPosX = curPos.x;
                 cfg.menuPosY = curPos.y;
-                changed = true;
-            }
-            if (std::fabs(curSize.x - cfg.menuWidth) > 1.0f) {
-                cfg.menuWidth = curSize.x;
                 changed = true;
             }
 
@@ -2245,6 +2235,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             }
             s_is_interacting_menu = false;
         }
+
+        ImGui::End();
     if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);
         if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
