@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cfloat>
 #include <cstdio>
 #include <windows.h>
 
@@ -283,16 +284,28 @@ void PerfTracker::updateCachedStats() {
     WideCharToMultiByte(CP_UTF8, 0, cachedStats_.gpuName.c_str(), -1, gpuNameUtf8, sizeof(gpuNameUtf8), nullptr, nullptr);
     const char* gpuDisplayName = gpuNameUtf8[0] ? gpuNameUtf8 : "Direct3D 11 Adapter";
     if (cachedStats_.gpuLoadAvailable) {
-        snprintf(cachedStats_.gpuLine, sizeof(cachedStats_.gpuLine), "%s (%u%%)", gpuDisplayName, cachedStats_.gpuUsagePct);
+        if (cachedStats_.gpuUsagePct >= 100) {
+            snprintf(cachedStats_.gpuLine, sizeof(cachedStats_.gpuLine), "%s (100%%)", gpuDisplayName);
+        } else if (cachedStats_.gpuUsagePct >= 10) {
+            snprintf(cachedStats_.gpuLine, sizeof(cachedStats_.gpuLine), "%s (%u%%) ", gpuDisplayName, cachedStats_.gpuUsagePct);
+        } else {
+            snprintf(cachedStats_.gpuLine, sizeof(cachedStats_.gpuLine), "%s (%u%%)  ", gpuDisplayName, cachedStats_.gpuUsagePct);
+        }
     } else {
-        snprintf(cachedStats_.gpuLine, sizeof(cachedStats_.gpuLine), "%s (N/A)", gpuDisplayName);
+        snprintf(cachedStats_.gpuLine, sizeof(cachedStats_.gpuLine), "%s (N/A) ", gpuDisplayName);
     }
 
     if (cachedStats_.vramTotalBytes > 0) {
         const double usedGb = static_cast<double>(cachedStats_.vramUsedBytes) / (1024.0 * 1024.0 * 1024.0);
         const double totalGb = static_cast<double>(cachedStats_.vramTotalBytes) / (1024.0 * 1024.0 * 1024.0);
-        const float pct = static_cast<float>(100.0 * static_cast<double>(cachedStats_.vramUsedBytes) / static_cast<double>(cachedStats_.vramTotalBytes));
-        snprintf(cachedStats_.vramLine, sizeof(cachedStats_.vramLine), "%.2f / %.2f GB (%u%%)", usedGb, totalGb, static_cast<unsigned>(pct));
+        const unsigned pct = static_cast<unsigned>(100.0 * static_cast<double>(cachedStats_.vramUsedBytes) / static_cast<double>(cachedStats_.vramTotalBytes));
+        if (pct >= 100) {
+            snprintf(cachedStats_.vramLine, sizeof(cachedStats_.vramLine), "%.2f / %.2f GB (100%%)", usedGb, totalGb);
+        } else if (pct >= 10) {
+            snprintf(cachedStats_.vramLine, sizeof(cachedStats_.vramLine), "%.2f / %.2f GB (%u%%) ", usedGb, totalGb, pct);
+        } else {
+            snprintf(cachedStats_.vramLine, sizeof(cachedStats_.vramLine), "%.2f / %.2f GB (%u%%)  ", usedGb, totalGb, pct);
+        }
     } else if (cachedStats_.vramUsedBytes > 0) {
         const double usedMb = static_cast<double>(cachedStats_.vramUsedBytes) / (1024.0 * 1024.0);
         snprintf(cachedStats_.vramLine, sizeof(cachedStats_.vramLine), "%.1f MB", usedMb);
@@ -559,6 +572,19 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
     }
     ImGui::SetNextWindowBgAlpha(0.70f);
 
+    static float s_max_overlay_width = 0.0f;
+    static float s_last_scale = -1.0f;
+    static int s_last_backend = -1;
+    const int cur_backend = static_cast<int>(edpe::UpscalerManager::instance().getBackend());
+    if (std::fabs(scale - s_last_scale) > 0.01f || cur_backend != s_last_backend) {
+        s_max_overlay_width = 0.0f;
+        s_last_scale = scale;
+        s_last_backend = cur_backend;
+    }
+    if (s_max_overlay_width > 0.0f) {
+        ImGui::SetNextWindowSizeConstraints(ImVec2(s_max_overlay_width, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
+    }
+
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoDecoration |
                                    ImGuiWindowFlags_AlwaysAutoResize |
                                    ImGuiWindowFlags_NoSavedSettings |
@@ -569,6 +595,11 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
     }
 
     if (ImGui::Begin("##EDPE_PerfOverlay", nullptr, window_flags)) {
+        const float curW = ImGui::GetWindowWidth();
+        if (curW > s_max_overlay_width) {
+            s_max_overlay_width = curW;
+        }
+
         if (isMenuOpen) {
             static bool s_is_dragging_hud = false;
             if ((ImGui::IsWindowHovered() || ImGui::IsWindowFocused()) && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
