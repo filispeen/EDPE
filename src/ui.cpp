@@ -1777,28 +1777,48 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 cfg.save();
             }
 
-            const char* hud_corners[] = { "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right" };
+            ImGui::TextUnformatted("HUD Position Preset:");
             const bool is_dragged = (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f);
-            const char* reset_btn_text = "Reset Position";
-            const float spacing = ImGui::GetStyle().ItemSpacing.x;
-            const float button_width = is_dragged ? (ImGui::CalcTextSize(reset_btn_text).x + ImGui::GetStyle().FramePadding.x * 2.0f) : 0.0f;
-            const float label_width = ImGui::CalcTextSize("HUD Position").x + ImGui::GetStyle().ItemInnerSpacing.x;
-
-            if (is_dragged) {
-                const float avail = ImGui::GetContentRegionAvail().x - button_width - label_width - spacing;
-                ImGui::SetNextItemWidth((std::max)(80.0f, avail));
-            }
-            if (ImGui::Combo("HUD Position", &cfg.perfOverlayCorner, hud_corners, IM_ARRAYSIZE(hud_corners))) {
-                cfg.perfOverlayPosX = -1.0f;
-                cfg.perfOverlayPosY = -1.0f;
-                cfg.save();
-            }
             if (is_dragged) {
                 ImGui::SameLine();
-                if (ImGui::Button(reset_btn_text)) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "(Custom Dragged)");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset Position")) {
                     cfg.perfOverlayPosX = -1.0f;
                     cfg.perfOverlayPosY = -1.0f;
                     cfg.save();
+                }
+            }
+
+            const char* const pos_labels[6] = {
+                "Top-Left", "Top-Center", "Top-Right",
+                "Bottom-Left", "Bottom-Center", "Bottom-Right"
+            };
+            const float total_avail = ImGui::GetContentRegionAvail().x;
+            const float spacing = ImGui::GetStyle().ItemSpacing.x;
+            const float btn_w = (std::max)(40.0f, std::floor((total_avail - spacing * 2.0f) / 3.0f));
+
+            for (int row = 0; row < 2; ++row) {
+                for (int col = 0; col < 3; ++col) {
+                    const int idx = row * 3 + col;
+                    if (col > 0) {
+                        ImGui::SameLine();
+                    }
+                    const bool is_selected = (!is_dragged && cfg.perfOverlayCorner == idx);
+                    if (is_selected) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.90f, 0.90f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.65f, 1.00f, 1.00f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.45f, 0.80f, 1.00f));
+                    }
+                    if (ImGui::Button(pos_labels[idx], ImVec2(btn_w, 0.0f))) {
+                        cfg.perfOverlayCorner = idx;
+                        cfg.perfOverlayPosX = -1.0f;
+                        cfg.perfOverlayPosY = -1.0f;
+                        cfg.save();
+                    }
+                    if (is_selected) {
+                        ImGui::PopStyleColor(3);
+                    }
                 }
             }
             ImGui::SliderFloat("HUD Scale", &cfg.perfOverlayScale, 0.5f, 2.5f, "%.2fx");

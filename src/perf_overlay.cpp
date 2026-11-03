@@ -509,15 +509,23 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
     ImVec2 window_pos, window_pos_pivot;
 
     switch (corner) {
-    case 1: // Top-Right
+    case 1: // Top-Center
+        window_pos = ImVec2(work_pos.x + work_size.x * 0.5f, work_pos.y + PAD);
+        window_pos_pivot = ImVec2(0.5f, 0.0f);
+        break;
+    case 2: // Top-Right
         window_pos = ImVec2(work_pos.x + work_size.x - PAD, work_pos.y + PAD);
         window_pos_pivot = ImVec2(1.0f, 0.0f);
         break;
-    case 2: // Bottom-Left
+    case 3: // Bottom-Left
         window_pos = ImVec2(work_pos.x + PAD, work_pos.y + work_size.y - PAD);
         window_pos_pivot = ImVec2(0.0f, 1.0f);
         break;
-    case 3: // Bottom-Right
+    case 4: // Bottom-Center
+        window_pos = ImVec2(work_pos.x + work_size.x * 0.5f, work_pos.y + work_size.y - PAD);
+        window_pos_pivot = ImVec2(0.5f, 1.0f);
+        break;
+    case 5: // Bottom-Right
         window_pos = ImVec2(work_pos.x + work_size.x - PAD, work_pos.y + work_size.y - PAD);
         window_pos_pivot = ImVec2(1.0f, 1.0f);
         break;
