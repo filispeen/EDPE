@@ -15,7 +15,7 @@ cbuffer HudDebugConstants : register(b0) {
 };
 
 Texture2D<float4> currentFrame   : register(t0); // Current rendered frame / backbuffer
-Texture2D<float>  hudMask        : register(t1); // Low-res R8 cockpit HUD mask
+Texture2D<float4> hudMask        : register(t1); // Cockpit HUD replay mask
 Texture2D<float4> lowResWorld    : register(t2); // Low-res 3D world input (s_dlaa_input_srv)
 Texture2D<float4> gameBackbuffer : register(t3); // High-res game backbuffer (s_backbuffer_copy_srv)
 
@@ -35,25 +35,27 @@ VSOutput vs_main(uint id : SV_VertexID) {
     return o;
 }
 
-float3 NormalizeColor(float3 c) {
-    c = max(c, 0.0);
-    return (debugParams.w > 0.5) ? (c / (1.0 + c)) : saturate(c);
+float3 toLdr(float3 c) {
+    float3 mapped = max(c, 0.0) / (1.0 + max(c, 0.0));
+    return pow(mapped, 1.0 / 2.2);
 }
 
 float4 ps_main(VSOutput pin) : SV_Target {
     float2 uv = pin.uv;
-    float3 rawColor = NormalizeColor(currentFrame.SampleLevel(pointSampler, uv, 0).rgb);
+    float3 rawColor = saturate(currentFrame.SampleLevel(pointSampler, uv, 0).rgb);
 
     // Dimmed grayscale scene background (identical to Subpixel Jitter Debug View)
     float luma = dot(rawColor, float3(0.299, 0.587, 0.114));
     float3 grayBg = float3(luma, luma, luma) * 0.35;
 
-    // 1. Cockpit Holographic HUD mask (Pass 35 R8 replay mask)
-    float hudVal = hudMask.SampleLevel(linearSampler, uv, 0).r;
+    // 1. Cockpit Holographic HUD mask (Pass 35 replay mask)
+    float4 hSample = hudMask.SampleLevel(linearSampler, uv, 0);
+    float hudVal = saturate(max(hSample.r, max(hSample.g, hSample.b)));
 
     // 2. Menu 2D UI diff mask (|gameBackbuffer - lowResWorld|)
-    float3 gameSample = NormalizeColor(gameBackbuffer.SampleLevel(linearSampler, uv, 0).rgb);
-    float3 lowSample  = NormalizeColor(lowResWorld.SampleLevel(linearSampler, uv, 0).rgb);
+    float3 gameSample = saturate(gameBackbuffer.SampleLevel(linearSampler, uv, 0).rgb);
+    float3 lowRaw     = lowResWorld.SampleLevel(linearSampler, uv, 0).rgb;
+    float3 lowSample  = (debugParams.w > 0.5) ? toLdr(lowRaw) : saturate(lowRaw);
     float3 delta = abs(gameSample - lowSample);
     float diffMax = max(delta.r, max(delta.g, delta.b));
     float threshold = max(debugParams.y, 0.001);

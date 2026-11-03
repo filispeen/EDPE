@@ -2148,7 +2148,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (ImGui::Checkbox("Enable HUD & UI Debug View (Grayscale Scene + Amber HUD / Cyan UI)", &hud_debug_view)) {
         ContextCensusSetHudDebugView(hud_debug_view);
         auto& cfg = edpe::Config::instance();
-        cfg.hudDebugView = hud_debug_view;
         cfg.save();
     }
     if (hud_debug_view) {
@@ -2156,14 +2155,12 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (ImGui::SliderFloat("HUD Mask Opacity", &opacity, 0.1f, 3.0f, "%.2fx")) {
             ContextCensusSetHudDebugOpacity(opacity);
             auto& cfg = edpe::Config::instance();
-            cfg.hudDebugOpacity = opacity;
             cfg.save();
         }
         float thresh = ContextCensusGetHudDebugThreshold();
         if (ImGui::SliderFloat("UI Diff Threshold", &thresh, 0.002f, 0.1f, "%.3f")) {
             ContextCensusSetHudDebugThreshold(thresh);
             auto& cfg = edpe::Config::instance();
-            cfg.hudDebugThreshold = thresh;
             cfg.save();
         }
         int mode = ContextCensusGetHudDebugMode();
@@ -2177,7 +2174,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (ImGui::Combo("HUD Debug Mode", &mode, hud_modes, IM_ARRAYSIZE(hud_modes))) {
             ContextCensusSetHudDebugMode(mode);
             auto& cfg = edpe::Config::instance();
-            cfg.hudDebugMode = mode;
             cfg.save();
         }
 

@@ -91,6 +91,7 @@ static std::atomic<unsigned long long> s_rendered_scene_frame_id{0};
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<OMSetRenderTargetsFn> original_deferred_om{nullptr};
+OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context);
 std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_om_uav{nullptr};
 std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_deferred_om_uav{nullptr};
 std::atomic<ExecuteCommandListFn> original_execute_command_list{nullptr};
@@ -692,6 +693,7 @@ std::unique_ptr<edpe::UiCompositePass> ui_composite_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
 UINT motion_snapshot_width = 0;
 UINT motion_snapshot_height = 0;
+static ID3D11Device* s_hud_mask_device = nullptr;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> s_hud_mask_texture;
 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_hud_mask_rtv;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_hud_mask_srv;
@@ -1113,11 +1115,26 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
 }
 
 bool isGlassShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
-    return (vs_hash == 0xF512712C40D93C12ull && ps_hash == 0x4A71EB0D34E9F2EFull);
+    return (vs_hash == 0xF512712C40D93C12ull && ps_hash == 0x4A71EB0D34E9F2EFull) ||
+           (vs_hash == 0x8C091FFD08644E02ull && ps_hash == 0x70F56E2EB7032E1Aull);
 }
 
 void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     if (!device || width == 0 || height == 0) return;
+    if (s_hud_mask_device != device) {
+        s_hud_mask_texture.Reset();
+        s_hud_mask_rtv.Reset();
+        s_hud_mask_srv.Reset();
+        s_hud_mask_ps.Reset();
+        s_hud_mask_blend.Reset();
+        s_hud_mask_ds_state.Reset();
+        s_hud_mask_staging.Reset();
+        s_hud_mask_width = 0;
+        s_hud_mask_height = 0;
+        s_hud_mask_staging_width = 0;
+        s_hud_mask_staging_height = 0;
+        s_hud_mask_device = device;
+    }
     if (s_hud_mask_texture && s_hud_mask_width == width && s_hud_mask_height == height) {
         return;
     }
@@ -1130,7 +1147,7 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     td.Height = height;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8_UNORM;
+    td.Format = DXGI_FORMAT_R11G11B10_FLOAT;
     td.SampleDesc.Count = 1;
     td.SampleDesc.Quality = 0;
     td.Usage = D3D11_USAGE_DEFAULT;
@@ -1142,30 +1159,18 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     }
 
     D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-    rtvDesc.Format = DXGI_FORMAT_R8_UNORM;
+    rtvDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
     rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
     device->CreateRenderTargetView(s_hud_mask_texture.Get(), &rtvDesc, &s_hud_mask_rtv);
 
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Format = DXGI_FORMAT_R8_UNORM;
+    srvDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
     srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = 1;
     device->CreateShaderResourceView(s_hud_mask_texture.Get(), &srvDesc, &s_hud_mask_srv);
 
     s_hud_mask_width = width;
     s_hud_mask_height = height;
-
-    if (!s_hud_mask_ps) {
-        static constexpr char kHudMaskShader[] =
-            "float4 ps_main() : SV_Target {\n"
-            "    return float4(1.0f, 1.0f, 1.0f, 1.0f);\n"
-            "}\n";
-        Microsoft::WRL::ComPtr<ID3DBlob> blob;
-        if (SUCCEEDED(D3DCompile(kHudMaskShader, sizeof(kHudMaskShader) - 1, nullptr, nullptr, nullptr,
-                                 "ps_main", "ps_4_0", 0, 0, &blob, nullptr))) {
-            device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_hud_mask_ps);
-        }
-    }
 
     if (!s_hud_mask_blend) {
         D3D11_BLEND_DESC bd{};
@@ -1189,12 +1194,26 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     }
 
     wchar_t msg[128];
-    swprintf_s(msg, L"EDPE: allocated HUD mask target %ux%u R8_UNORM", width, height);
+    swprintf_s(msg, L"EDPE: allocated HUD mask target %ux%u R11G11B10_FLOAT", width, height);
     EdpeLog(msg);
 }
 
 void ensureHudMaskStaging(ID3D11Device* device, UINT width, UINT height) {
     if (!device || width == 0 || height == 0) return;
+    if (s_hud_mask_device != device) {
+        s_hud_mask_texture.Reset();
+        s_hud_mask_rtv.Reset();
+        s_hud_mask_srv.Reset();
+        s_hud_mask_ps.Reset();
+        s_hud_mask_blend.Reset();
+        s_hud_mask_ds_state.Reset();
+        s_hud_mask_staging.Reset();
+        s_hud_mask_width = 0;
+        s_hud_mask_height = 0;
+        s_hud_mask_staging_width = 0;
+        s_hud_mask_staging_height = 0;
+        s_hud_mask_device = device;
+    }
     if (s_hud_mask_staging && s_hud_mask_staging_width == width && s_hud_mask_staging_height == height) {
         return;
     }
@@ -1204,7 +1223,7 @@ void ensureHudMaskStaging(ID3D11Device* device, UINT width, UINT height) {
     desc.Height = height;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -1216,7 +1235,7 @@ void ensureHudMaskStaging(ID3D11Device* device, UINT width, UINT height) {
 
 void replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT instance_count,
                    UINT start_index_or_vertex, INT base_vertex, UINT start_instance) {
-    if (!context || !s_hud_mask_rtv || !s_hud_mask_ps || !s_hud_mask_blend) return;
+    if (!context || !s_hud_mask_rtv || !s_hud_mask_blend) return;
 
     ID3D11RenderTargetView* orig_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth;
@@ -1228,10 +1247,13 @@ void replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         return;
     }
 
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> original_ps;
-    ID3D11ClassInstance* ps_instances[256]{};
-    UINT num_ps_instances = 256;
-    context->PSGetShader(original_ps.GetAddressOf(), ps_instances, &num_ps_instances);
+    const OMSetRenderTargetsFn set_targets = resolveOriginalOM(context);
+    if (!set_targets) {
+        for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+            if (orig_rtvs[i]) orig_rtvs[i]->Release();
+        }
+        return;
+    }
 
     Microsoft::WRL::ComPtr<ID3D11BlendState> original_blend;
     FLOAT original_blend_factor[4]{};
@@ -1243,8 +1265,7 @@ void replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     context->OMGetDepthStencilState(original_ds.GetAddressOf(), &original_stencil_ref);
 
     ID3D11RenderTargetView* mask = s_hud_mask_rtv.Get();
-    context->OMSetRenderTargets(1, &mask, depth.Get());
-    context->PSSetShader(s_hud_mask_ps.Get(), nullptr, 0);
+    set_targets(context, 1, &mask, depth.Get());
     const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     context->OMSetBlendState(s_hud_mask_blend.Get(), blend_factor, 0xFFFFFFFF);
     if (s_hud_mask_ds_state) {
@@ -1275,17 +1296,12 @@ void replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     }
     ++s_hud_draws_replayed_frame;
 
-    context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, orig_rtvs, depth.Get());
+    set_targets(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, orig_rtvs, depth.Get());
     for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
         if (orig_rtvs[i]) orig_rtvs[i]->Release();
     }
-    context->PSSetShader(original_ps.Get(), ps_instances, num_ps_instances);
     context->OMSetBlendState(original_blend.Get(), original_blend_factor, original_sample_mask);
     context->OMSetDepthStencilState(original_ds.Get(), original_stencil_ref);
-
-    for (UINT i = 0; i < num_ps_instances; ++i) {
-        if (ps_instances[i]) ps_instances[i]->Release();
-    }
 }
 
 HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
@@ -3645,6 +3661,18 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_backbuffer_rtv.Reset();
         s_cached_backbuffer_ptr = nullptr;
         ui_composite_pass.reset();
+        s_hud_mask_texture.Reset();
+        s_hud_mask_rtv.Reset();
+        s_hud_mask_srv.Reset();
+        s_hud_mask_ps.Reset();
+        s_hud_mask_blend.Reset();
+        s_hud_mask_ds_state.Reset();
+        s_hud_mask_staging.Reset();
+        s_hud_mask_width = 0;
+        s_hud_mask_height = 0;
+        s_hud_mask_staging_width = 0;
+        s_hud_mask_staging_height = 0;
+        s_hud_mask_device = nullptr;
         s_temporal_resources_device = device.Get();
     }
 
@@ -3821,28 +3849,31 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
     } restoreTargets{context, rawSet, savedRtvs, savedDsv};
 
-    context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
-
-    if (!motion_pass) {
-        auto candidate = std::make_unique<edpe::MotionPass>();
-        if (!candidate->initialize(device.Get(), context)) return;
-        motion_pass = std::move(candidate);
-    }
-
-    if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
-        motion_pass->clear(context);
-    } else {
-        // Render motion vectors at render resolution using current and previous camera projections
-        motion_pass->render(motion_depth_view.Get(),
-            s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height);
-    }
-
-    if (!motion_pass->output()) return;
-
-    Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
-    motion_pass->output()->GetResource(&motionRes);
+    const bool need_motion = upscale_active || s_jitter_debug_view.load(std::memory_order_relaxed);
     Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
-    if (!motionRes || FAILED(motionRes.As(&motionTexture))) return;
+    if (need_motion) {
+        context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
+
+        if (!motion_pass) {
+            auto candidate = std::make_unique<edpe::MotionPass>();
+            if (!candidate->initialize(device.Get(), context)) return;
+            motion_pass = std::move(candidate);
+        }
+
+        if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
+            motion_pass->clear(context);
+        } else {
+            // Render motion vectors at render resolution using current and previous camera projections
+            motion_pass->render(motion_depth_view.Get(),
+                s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height);
+        }
+
+        if (!motion_pass->output()) return;
+
+        Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
+        motion_pass->output()->GetResource(&motionRes);
+        if (!motionRes || FAILED(motionRes.As(&motionTexture))) return;
+    }
 
     const unsigned scene_writes_this_eval = s_scene_writes_since_eval.exchange(0, std::memory_order_acq_rel);
     const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0);
@@ -3965,8 +3996,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.colorSrv = s_dlaa_input_srv.Get();
     inputs.depth = motion_depth.Get();
     inputs.depthSrv = motion_depth_view.Get();
-    inputs.motionVectors = motionTexture.Get();
-    inputs.motionSrv = motion_pass->output();
+    inputs.motionVectors = motionTexture ? motionTexture.Get() : nullptr;
+    inputs.motionSrv = (motion_pass && need_motion) ? motion_pass->output() : nullptr;
     inputs.renderWidth = depthDesc.Width;
     inputs.renderHeight = depthDesc.Height;
     inputs.outputWidth = backbufferDesc.Width;
@@ -3988,8 +4019,13 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                              srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
     inputs.colorIsHdr = isHdrColor;
 
-    inputs.reactiveMask = nullptr;
-    inputs.reactiveMaskSrv = nullptr;
+    if (s_hud_mask_texture && s_hud_mask_width == depthDesc.Width && s_hud_mask_height == depthDesc.Height) {
+        inputs.reactiveMask = s_hud_mask_texture.Get();
+        inputs.reactiveMaskSrv = s_hud_mask_srv.Get();
+    } else {
+        inputs.reactiveMask = nullptr;
+        inputs.reactiveMaskSrv = nullptr;
+    }
 
     s_last_temporal_inputs = inputs;
     s_last_temporal_inputs_frame = rendered;
@@ -4123,48 +4159,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                             isHdrColor ? L"HDR" : L"LDR");
                         EdpeLog(cmsg);
                     }
-                    s_hud_mask_latest_draws.store(s_hud_draws_replayed_frame, std::memory_order_relaxed);
-                    const bool hud_debug_active = s_hud_debug_view.load(std::memory_order_relaxed);
-                    const unsigned check_interval = hud_debug_active ? 30 : 300;
-                    if (s_hud_mask_texture && (frame % check_interval == 0)) {
-                        Microsoft::WRL::ComPtr<ID3D11Device> dev;
-                        context->GetDevice(&dev);
-                        if (dev) {
-                            ensureHudMaskStaging(dev.Get(), s_hud_mask_width, s_hud_mask_height);
-                            if (s_hud_mask_staging) {
-                                context->CopyResource(s_hud_mask_staging.Get(), s_hud_mask_texture.Get());
-                                s_hud_mask_coverage_pending_frame = frame;
-                            }
-                        }
-                    }
-                    if (s_hud_mask_staging && s_hud_mask_coverage_pending_frame != ~0ull &&
-                        frame > s_hud_mask_coverage_pending_frame) {
-                        D3D11_MAPPED_SUBRESOURCE mapped{};
-                        const HRESULT hr = context->Map(s_hud_mask_staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-                        if (SUCCEEDED(hr)) {
-                            size_t nonZero = 0;
-                            const size_t totalPixels = static_cast<size_t>(s_hud_mask_staging_width) * s_hud_mask_staging_height;
-                            const auto* ptr = static_cast<const uint8_t*>(mapped.pData);
-                            for (UINT y = 0; y < s_hud_mask_staging_height; ++y) {
-                                const auto* row = ptr + y * mapped.RowPitch;
-                                for (UINT x = 0; x < s_hud_mask_staging_width; ++x) {
-                                    if (row[x] > 0) ++nonZero;
-                                }
-                            }
-                            context->Unmap(s_hud_mask_staging.Get(), 0);
-                            const float coverage = (totalPixels > 0) ? (static_cast<float>(nonZero) * 100.0f / totalPixels) : 0.0f;
-                            s_hud_mask_latest_coverage.store(coverage, std::memory_order_relaxed);
-                            if (s_hud_mask_coverage_pending_frame % 300 == 0) {
-                                wchar_t msg[128];
-                                swprintf_s(msg, L"EDPE: HUD mask coverage=%.2f%% frame=%llu", coverage, s_hud_mask_coverage_pending_frame);
-                                EdpeLog(msg);
-                            }
-                            s_hud_mask_coverage_pending_frame = ~0ull;
-                        } else if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
-                            s_hud_mask_coverage_pending_frame = ~0ull;
-                        }
-                    }
-                } else if (!isHdrColor) {
+                    } else if (!isHdrColor) {
                     context->CopyResource(backbuffer, s_dlss_output_texture.Get());
                     compOk = true;
                 }
@@ -4611,6 +4606,15 @@ void renderHudDebugView(ID3D11DeviceContext* context, unsigned long long rendere
     const float threshold = s_hud_debug_threshold.load(std::memory_order_relaxed);
     const int mode = s_hud_debug_mode.load(std::memory_order_relaxed);
 
+    bool isHdr = false;
+    if (s_dlaa_input) {
+        D3D11_TEXTURE2D_DESC td{};
+        s_dlaa_input->GetDesc(&td);
+        isHdr = (td.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
+                 td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                 td.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
+    }
+
     s_hud_debug_pass->render(context,
         currentFrameSrv,
         hudMaskSrv,
@@ -4619,7 +4623,7 @@ void renderHudDebugView(ID3D11DeviceContext* context, unsigned long long rendere
         s_hud_debug_backbuffer_rtv.Get(),
         bbDesc.Width, bbDesc.Height,
         renderW, renderH,
-        opacity, threshold, mode, false);
+        opacity, threshold, mode, isHdr);
 
     if (crossDevice) {
         sceneBridgeLock.release();
@@ -5666,6 +5670,63 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 if (hud_debug_active) {
                     renderHudDebugView(context, rendered_frame, backbuffer.Get());
                 }
+                s_hud_mask_latest_draws.store(s_hud_draws_replayed_frame, std::memory_order_relaxed);
+                if (s_hud_draws_replayed_frame == 0) {
+                    s_hud_mask_latest_coverage.store(0.0f, std::memory_order_relaxed);
+                    s_hud_mask_coverage_pending_frame = ~0ull;
+                } else {
+                    const unsigned check_interval = hud_debug_active ? 30 : 300;
+                    if (s_hud_mask_texture && (rendered_frame % check_interval == 0)) {
+                        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+                        context->GetDevice(&dev);
+                        if (dev) {
+                            ensureHudMaskStaging(dev.Get(), s_hud_mask_width, s_hud_mask_height);
+                            if (s_hud_mask_staging) {
+                                context->CopyResource(s_hud_mask_staging.Get(), s_hud_mask_texture.Get());
+                                s_hud_mask_coverage_pending_frame = rendered_frame;
+                            }
+                        }
+                    }
+                    if (s_hud_mask_staging && s_hud_mask_coverage_pending_frame != ~0ull &&
+                        rendered_frame > s_hud_mask_coverage_pending_frame) {
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        const HRESULT hr = context->Map(s_hud_mask_staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+                        if (SUCCEEDED(hr)) {
+                            size_t nonZero = 0;
+                            const size_t totalPixels = static_cast<size_t>(s_hud_mask_staging_width) * s_hud_mask_staging_height;
+                            const auto* ptr = static_cast<const uint8_t*>(mapped.pData);
+                            D3D11_TEXTURE2D_DESC stagingDesc{};
+                            s_hud_mask_staging->GetDesc(&stagingDesc);
+                            const size_t bytesPerPixel = (stagingDesc.Format == DXGI_FORMAT_R8_UNORM) ? 1 : 4;
+                            if (bytesPerPixel == 1) {
+                                for (UINT y = 0; y < s_hud_mask_staging_height; ++y) {
+                                    const auto* row = ptr + y * mapped.RowPitch;
+                                    for (UINT x = 0; x < s_hud_mask_staging_width; ++x) {
+                                        if (row[x] > 0) ++nonZero;
+                                    }
+                                }
+                            } else {
+                                for (UINT y = 0; y < s_hud_mask_staging_height; ++y) {
+                                    const auto* row = reinterpret_cast<const uint32_t*>(ptr + y * mapped.RowPitch);
+                                    for (UINT x = 0; x < s_hud_mask_staging_width; ++x) {
+                                        if (row[x] != 0) ++nonZero;
+                                    }
+                                }
+                            }
+                            context->Unmap(s_hud_mask_staging.Get(), 0);
+                            const float coverage = (totalPixels > 0) ? (static_cast<float>(nonZero) * 100.0f / totalPixels) : 0.0f;
+                            s_hud_mask_latest_coverage.store(coverage, std::memory_order_relaxed);
+                            if (s_hud_mask_coverage_pending_frame % 300 == 0) {
+                                wchar_t msg[128];
+                                swprintf_s(msg, L"EDPE: HUD mask coverage=%.2f%% frame=%llu", coverage, s_hud_mask_coverage_pending_frame);
+                                EdpeLog(msg);
+                            }
+                            s_hud_mask_coverage_pending_frame = ~0ull;
+                        } else if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+                            s_hud_mask_coverage_pending_frame = ~0ull;
+                        }
+                    }
+                }
                 if (edpe::UpscalerManager::instance().isReconstructionActive() &&
                     jittered_writes_count.load(std::memory_order_relaxed) == 0 &&
                     motion_color_frame == rendered_frame) {
@@ -5718,6 +5779,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_hdr_slot0_seen_frame = ~0ull;
         s_jitter_injected_frame = ~0ull;
         s_hud_mask_cleared_for_frame = false;
+        hud_first_match_seen = false;
+        s_hud_draws_replayed_frame = 0;
         clearTrackedMappedBuffers();
         clearRejectedResourceCache();
         static uint64_t s_watchdog_last_camera_seen = 0;
@@ -6203,6 +6266,19 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_comp_final_rtv.Reset();
         s_backbuffer_rtv.Reset();
         s_cached_backbuffer_ptr = nullptr;
+        s_hud_mask_texture.Reset();
+        s_hud_mask_rtv.Reset();
+        s_hud_mask_srv.Reset();
+        s_hud_mask_ps.Reset();
+        s_hud_mask_blend.Reset();
+        s_hud_mask_ds_state.Reset();
+        s_hud_mask_staging.Reset();
+        s_hud_mask_width = 0;
+        s_hud_mask_height = 0;
+        s_hud_mask_staging_width = 0;
+        s_hud_mask_staging_height = 0;
+        s_hud_mask_device = nullptr;
+        ui_composite_pass.reset();
         resetSharedBackbufferBridge();
         s_last_final_output_present.Reset();
         s_last_reconstructed_output.Reset();
@@ -6311,6 +6387,9 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
             }
         }
     }
+    endHudDrawProbe();
+    hud_draw_hook_mask = 0;
+    hud_draw_probe_active.store(false, std::memory_order_release);
     if (patched_table) {
         if (map_hook_active.exchange(false, std::memory_order_acq_rel)) {
             patchSlot(patched_table, kMap,

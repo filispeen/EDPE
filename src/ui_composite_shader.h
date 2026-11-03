@@ -36,7 +36,8 @@ VSOutput vs_main(uint id : SV_VertexID) {
 
 float4 ps_main(VSOutput pin) : SV_Target {
     int3 pixelPos = int3(pin.pos.xy, 0);
-    float hudMask = tHudMask.SampleLevel(sLinear, pin.uv, 0).r;
+    float4 hSample = tHudMask.SampleLevel(sLinear, pin.uv, 0);
+    float hudMask = saturate(max(hSample.r, max(hSample.g, hSample.b)));
 
     [branch]
     if (flags.y > 0.5 && flags.x < 0.5) {
@@ -49,6 +50,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
         float3 darken = saturate(gameN / max(lowN, 0.002));
         float3 isDark = step(gameN + 0.0005, lowN);
         float3 t = lerp(float3(1.0 - a, 1.0 - a, 1.0 - a), darken, isDark);
+        t *= (1.0 - saturate(hudMask));
         return float4(saturate(gameN + t * (dlssN - lowN)), 1.0);
     }
 
@@ -103,10 +105,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 deltaUi = (cGame - cLow) - alphaUi * (cDlss - cLow);
     float3 finalColor = cDlss + uiMask * deltaUi;
 
-    [branch]
-    if (flags.x < 0.5) {
-        finalColor = lerp(finalColor, cGame, hudMask);
-    }
+    finalColor = lerp(finalColor, cGame, saturate(hudMask));
 
     return float4(saturate(finalColor), 1.0);
 }

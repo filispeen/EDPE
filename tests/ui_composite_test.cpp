@@ -197,5 +197,42 @@ int main() {
     // Row 3 should be game orange (R ~ 255, G ~ 128, B ~ 0) preserved by hudMask!
     if (mr3 < 200 || mg3 < 100 || mb3 > 50) return 22; // HUD mask pixel mismatch (not preserved)
 
+    // Test 5: HUD mask composite path at native resolution (renderSize == outputSize == 4x4)
+    // Game backbuffer and low-res world both contain orange in rows 2-3 (diff == 0!).
+    // DLSS reconstruction is green. Without hudMask, native path would output DLSS green.
+    // With hudMask enabled for bottom half (rows 2-3), orange pixels from cGame must be preserved.
+    D3D11_TEXTURE2D_DESC mask4Desc = outDesc;
+    mask4Desc.Format = DXGI_FORMAT_R8_UNORM;
+    std::array<uint8_t, 16> mask4Pixels{};
+    for (int i = 0; i < 8; ++i) mask4Pixels[i] = 0;
+    for (int i = 8; i < 16; ++i) mask4Pixels[i] = 255;
+    D3D11_SUBRESOURCE_DATA mask4Init{mask4Pixels.data(), 4 * sizeof(uint8_t), 0};
+
+    ComPtr<ID3D11Texture2D> mask4Tex;
+    ComPtr<ID3D11ShaderResourceView> mask4Srv;
+    if (FAILED(device->CreateTexture2D(&mask4Desc, &mask4Init, &mask4Tex)) ||
+        FAILED(device->CreateShaderResourceView(mask4Tex.Get(), nullptr, &mask4Srv))) {
+        return 23;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameHudSrv.Get(), gameHudSrv.Get(),
+        mask4Srv.Get(), targetRtv.Get(), 4, 4, 4, 4);
+    if (!ok) return 24;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 25;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t nmr0 = rows[0], nmg0 = rows[1], nmb0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t nmr3 = lastRow[0], nmg3 = lastRow[1], nmb3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0: DLSS green (R ~ 0, G ~ 255, B ~ 0)
+    if (nmg0 < 200 || nmr0 > 50 || nmb0 > 50) return 26; // Native HUD mask world pixel mismatch
+    // Row 3: Game orange (R ~ 255, G ~ 128, B ~ 0) preserved by hudMask despite diff == 0!
+    if (nmr3 < 200 || nmg3 < 100 || nmb3 > 50) return 27; // Native HUD mask pixel mismatch (not preserved)
+
     return 0;
 }
+
