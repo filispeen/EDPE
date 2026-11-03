@@ -1709,11 +1709,14 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                     cfg.save();
                 }
             }
-            if (ImGui::SliderFloat("HUD Scale", &cfg.perfOverlayScale, 0.5f, 2.5f, "%.2fx")) {
+            ImGui::SliderFloat("HUD Scale", &cfg.perfOverlayScale, 0.5f, 2.5f, "%.2fx");
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
                 cfg.save();
             }
             if (ImGui::SliderFloat("UI Scale", &cfg.uiScale, 0.5f, 2.5f, "%.2fx")) {
                 applyUiScale(cfg.uiScale);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
                 cfg.save();
             }
         }
@@ -1721,60 +1724,15 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         // 2. Upscaler & Image Quality (Open by default)
         const bool backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
         const bool nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
-        const bool amd_active = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
         const bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
 
         if (ImGui::CollapsingHeader("Upscaler & Image Quality", ImGuiTreeNodeFlags_DefaultOpen)) {
             const auto& cached_tel = edpe::PerfTracker::instance().getCachedTelemetry();
-            UINT outW = cached_tel.outputWidth;
-            UINT outH = cached_tel.outputHeight;
-            if (!outW || !outH) {
-                DXGI_SWAP_CHAIN_DESC scDesc{};
-                if (swap_chain && SUCCEEDED(swap_chain->GetDesc(&scDesc))) {
-                    outW = scDesc.BufferDesc.Width;
-                    outH = scDesc.BufferDesc.Height;
-                }
-            }
-            UINT sceneW = cached_tel.renderWidth;
-            UINT sceneH = cached_tel.renderHeight;
-            if (!sceneW || !sceneH) {
-                sceneW = outW;
-                sceneH = outH;
-            }
-            const float activeScalePct = outW ? (100.0f * static_cast<float>(sceneW) / static_cast<float>(outW)) : 100.0f;
-            const bool isSr = (sceneW < outW || sceneH < outH);
-
-            const uint32_t dsvBinds = ContextCensusGetDsvBinds();
-            const bool isReconActive = nvidia_active ? edpe::NgxContext::has_evaluated()
-                                                    : (upscaler.isReconstructionActive() && upscaler.hasEvaluated());
-
-            if (backend_active) {
-                const char* backendName = taa_active ? "Native D3D11" : (amd_active ? "AMD" : "NVIDIA");
-                const char* techName = taa_active
-                    ? (isSr ? "TAA Super Resolution" : "TAA Native AA")
-                    : (amd_active ? (isSr ? "FSR Super Resolution" : "FSR Native AA")
-                                  : (isSr ? "DLSS Super Resolution" : "DLAA"));
-                if (isReconActive) {
-                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-                        "Reconstruction: %s %s Active",
-                        backendName, techName);
-                } else if (dsvBinds == 0) {
-                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
-                        "Reconstruction: %s %s (Initialized, no depth found)",
-                        backendName, techName);
-                } else {
-                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-                        "Reconstruction: %s %s (Standby)",
-                        backendName, techName);
-                }
-                ImGui::Text("Resolution: Scene %ux%u -> Output %ux%u (%.1f%%)",
-                    sceneW, sceneH, outW, outH, activeScalePct);
-                ImGui::TextDisabled("Upscaling quality ratios are controlled via in-game Graphics > Supersampling (< 1.0x enables upscaling, 1.0x uses Native AA).");
-            } else {
-                ImGui::Text("Reconstruction: Inactive (Scene %ux%u -> Output %ux%u)",
-                    sceneW, sceneH, outW, outH);
-                ImGui::TextDisabled("Upscaling quality ratios are controlled via in-game Graphics > Supersampling (< 1.0x enables upscaling, 1.0x uses Native AA).");
-            }
+            ImGui::PushStyleColor(ImGuiCol_Text, cached_tel.reconStatusColor);
+            ImGui::TextUnformatted(cached_tel.reconStatusLine);
+            ImGui::PopStyleColor();
+            ImGui::TextUnformatted(cached_tel.resLine);
+            ImGui::TextDisabled("Upscaling quality ratios are controlled via in-game Graphics > Supersampling (< 1.0x enables upscaling, 1.0x uses Native AA).");
 
             ImGui::Spacing();
 
@@ -1842,6 +1800,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             float curSharpness = ContextCensusGetSharpness();
             if (ImGui::SliderFloat("Sharpening", &curSharpness, 0.0f, 1.0f, "%.2f")) {
                 ContextCensusSetSharpness(curSharpness);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
                 cfg.save();
             }
             if (backend_active && curSharpness > 0.0f) {
@@ -1980,6 +1940,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 float j_scale = ContextCensusGetJitterScale();
                 if (ImGui::SliderFloat("Jitter Scale", &j_scale, 0.0f, 2.0f, "%.2f")) {
                     ContextCensusSetJitterScale(j_scale);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
                     edpe::Config::instance().save();
                 }
                 ImGui::SetItemTooltip("1.0 = standard, 0.0 = disable");
@@ -1987,6 +1949,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 int j_phases = static_cast<int>(ContextCensusGetJitterPhaseCount());
                 if (ImGui::SliderInt("Jitter Phase Cycle", &j_phases, 0, 128)) {
                     ContextCensusSetJitterPhaseCount(static_cast<unsigned>(j_phases));
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
                     edpe::Config::instance().save();
                 }
                 ImGui::SetItemTooltip("default: 8, standard Halton");
@@ -2013,6 +1977,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 float m_scale = ContextCensusGetMotionScale();
                 if (ImGui::SliderFloat("Motion Scale", &m_scale, 0.0f, 2.0f, "%.2f")) {
                     ContextCensusSetMotionScale(m_scale);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
                     edpe::Config::instance().save();
                 }
 
@@ -2039,14 +2005,18 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                         ContextCensusSetJitterDebugSensitivity(sens);
                         auto& cfg = edpe::Config::instance();
                         cfg.jitterDebugSensitivity = sens;
-                        cfg.save();
+                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        edpe::Config::instance().save();
                     }
                     float thresh = ContextCensusGetJitterDebugThreshold();
                     if (ImGui::SliderFloat("Jitter Threshold", &thresh, 0.002f, 0.1f, "%.3f")) {
                         ContextCensusSetJitterDebugThreshold(thresh);
                         auto& cfg = edpe::Config::instance();
                         cfg.jitterDebugThreshold = thresh;
-                        cfg.save();
+                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        edpe::Config::instance().save();
                     }
                     int mode = ContextCensusGetJitterDebugMode();
                     const char* const modes[] = {

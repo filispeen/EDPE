@@ -196,20 +196,23 @@ float PerfTracker::calculateOnePercentLow() const {
         return telemetry_.fps;
     }
 
-    std::sort(times.begin(), times.begin() + validCount);
+    // Number of slowest samples in top 1% (at least 1 sample)
+    const size_t numSlowest = (std::max)(size_t(1), static_cast<size_t>(std::ceil(validCount * 0.01f)));
 
-    // 99th percentile frametime (1% slowest frames in window)
-    const size_t p99Idx = static_cast<size_t>((std::min)(
-        static_cast<size_t>(std::floor(validCount * 0.99f)),
-        validCount - 1
-    ));
+    // Partition so the first `numSlowest` elements are the largest (worst) frametimes in descending order
+    std::nth_element(times.begin(), times.begin() + numSlowest, times.begin() + validCount, std::greater<float>());
 
-    const float p99Ms = times[p99Idx];
-    if (p99Ms <= 0.001f) {
+    // Compute the average of the slowest 1% frametimes (1% Low Average) to stabilize spikes
+    float sumSlowestMs = 0.0f;
+    for (size_t i = 0; i < numSlowest; ++i) {
+        sumSlowestMs += times[i];
+    }
+    const float avgSlowestMs = sumSlowestMs / static_cast<float>(numSlowest);
+    if (avgSlowestMs <= 0.001f) {
         return telemetry_.fps;
     }
 
-    const float oneLow = 1000.0f / p99Ms;
+    const float oneLow = 1000.0f / avgSlowestMs;
     return (telemetry_.fps > 0.0f) ? (std::min)(telemetry_.fps, oneLow) : oneLow;
 }
 
@@ -225,8 +228,115 @@ void PerfTracker::updateCachedStats() {
     cachedStats_.outputHeight = telemetry_.outputHeight;
     cachedStats_.gpuName = telemetry_.gpuName;
     cachedStats_.gpuUsagePct = telemetry_.gpuUsagePct;
+    cachedStats_.gpuLoadAvailable = telemetry_.gpuLoadAvailable;
     cachedStats_.vramUsedBytes = telemetry_.vramUsedBytes;
     cachedStats_.vramTotalBytes = telemetry_.vramTotalBytes;
+
+    // Pre-format all telemetry strings at 15 Hz / 66.67 ms for zero per-frame UI formatting overhead
+    cachedStats_.fpsColor = (cachedStats_.fps >= 58.0f) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) :
+                            (cachedStats_.fps >= 30.0f) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) :
+                                                          ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+    snprintf(cachedStats_.fpsLine, sizeof(cachedStats_.fpsLine),
+        "FPS: %.1f | 1%% Low: %.1f FPS", cachedStats_.fps, cachedStats_.onePercentLowFps);
+
+    snprintf(cachedStats_.gameFtLine, sizeof(cachedStats_.gameFtLine),
+        "%6.2f ms", cachedStats_.gameFrametimeMs);
+
+    auto& upscaler = UpscalerManager::instance();
+    UpscalerBackend shownBackend = upscaler.getBackend();
+    bool upscalerActive = upscaler.isReconstructionActive();
+    if (upscalerActive && cachedStats_.upscalerFrametimeMs > 0.0f) {
+        const char* backendShort = (shownBackend == UpscalerBackend::Taa) ? "TAA" :
+                                   (shownBackend == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
+        snprintf(cachedStats_.upscalerFtLine, sizeof(cachedStats_.upscalerFtLine),
+            "%6.2f ms (%s)", cachedStats_.upscalerFrametimeMs, backendShort);
+    } else {
+        snprintf(cachedStats_.upscalerFtLine, sizeof(cachedStats_.upscalerFtLine),
+            "%6.2f ms (Bypass)", 0.0f);
+    }
+
+    snprintf(cachedStats_.totalFtLine, sizeof(cachedStats_.totalFtLine),
+        "%6.2f ms", cachedStats_.totalFrametimeMs);
+
+    const uint32_t rW = cachedStats_.renderWidth;
+    const uint32_t rH = cachedStats_.renderHeight;
+    const uint32_t oW = cachedStats_.outputWidth;
+    const uint32_t oH = cachedStats_.outputHeight;
+    const float scalePct = (oW > 0) ? (100.0f * static_cast<float>(rW) / static_cast<float>(oW)) : 100.0f;
+    const bool isSr = (rW < oW || rH < oH);
+
+    if (upscalerActive) {
+        const bool isAmd = (shownBackend == UpscalerBackend::AmdFsr);
+        const bool isTaa = (shownBackend == UpscalerBackend::Taa);
+        if (isTaa) {
+            snprintf(cachedStats_.upscalerInfoLine, sizeof(cachedStats_.upscalerInfoLine), "TAA (%.1f%%)", scalePct);
+        } else if (isAmd) {
+            snprintf(cachedStats_.upscalerInfoLine, sizeof(cachedStats_.upscalerInfoLine), "%s (%.1f%%)",
+                isSr ? "AMD FSR SR" : "AMD FSR Native AA", scalePct);
+        } else {
+            snprintf(cachedStats_.upscalerInfoLine, sizeof(cachedStats_.upscalerInfoLine), "%s (%.1f%%)",
+                isSr ? "NVIDIA DLSS" : "NVIDIA DLAA", scalePct);
+        }
+    } else {
+        snprintf(cachedStats_.upscalerInfoLine, sizeof(cachedStats_.upscalerInfoLine), "Bypass (Native) (100.0%%)");
+    }
+
+    char gpuNameUtf8[128]{};
+    WideCharToMultiByte(CP_UTF8, 0, cachedStats_.gpuName.c_str(), -1, gpuNameUtf8, sizeof(gpuNameUtf8), nullptr, nullptr);
+    const char* gpuDisplayName = gpuNameUtf8[0] ? gpuNameUtf8 : "Direct3D 11 Adapter";
+    if (cachedStats_.gpuLoadAvailable) {
+        snprintf(cachedStats_.gpuLine, sizeof(cachedStats_.gpuLine), "%s (%u%%)", gpuDisplayName, cachedStats_.gpuUsagePct);
+    } else {
+        snprintf(cachedStats_.gpuLine, sizeof(cachedStats_.gpuLine), "%s (N/A)", gpuDisplayName);
+    }
+
+    if (cachedStats_.vramTotalBytes > 0) {
+        const double usedGb = static_cast<double>(cachedStats_.vramUsedBytes) / (1024.0 * 1024.0 * 1024.0);
+        const double totalGb = static_cast<double>(cachedStats_.vramTotalBytes) / (1024.0 * 1024.0 * 1024.0);
+        const float pct = static_cast<float>(100.0 * static_cast<double>(cachedStats_.vramUsedBytes) / static_cast<double>(cachedStats_.vramTotalBytes));
+        snprintf(cachedStats_.vramLine, sizeof(cachedStats_.vramLine), "%.2f / %.2f GB (%u%%)", usedGb, totalGb, static_cast<unsigned>(pct));
+    } else if (cachedStats_.vramUsedBytes > 0) {
+        const double usedMb = static_cast<double>(cachedStats_.vramUsedBytes) / (1024.0 * 1024.0);
+        snprintf(cachedStats_.vramLine, sizeof(cachedStats_.vramLine), "%.1f MB", usedMb);
+    } else {
+        snprintf(cachedStats_.vramLine, sizeof(cachedStats_.vramLine), "N/A");
+    }
+
+    snprintf(cachedStats_.resLine, sizeof(cachedStats_.resLine),
+        "Resolution: Scene %ux%u -> Output %ux%u (%.1f%%)", rW, rH, oW, oH, scalePct);
+
+    const bool backend_active = (shownBackend != UpscalerBackend::None);
+    const bool nvidia_active = (shownBackend == UpscalerBackend::NvidiaDlss);
+    const bool amd_active = (shownBackend == UpscalerBackend::AmdFsr);
+    const bool taa_active = (shownBackend == UpscalerBackend::Taa);
+    const uint32_t dsvBinds = ContextCensusGetDsvBinds();
+    const bool isReconActive = nvidia_active ? edpe::NgxContext::has_evaluated()
+                                            : (upscaler.isReconstructionActive() && upscaler.hasEvaluated());
+
+    if (backend_active) {
+        const char* backendName = taa_active ? "Native D3D11" : (amd_active ? "AMD" : "NVIDIA");
+        const char* techName = taa_active
+            ? (isSr ? "TAA Super Resolution" : "TAA Native AA")
+            : (amd_active ? (isSr ? "FSR Super Resolution" : "FSR Native AA")
+                          : (isSr ? "DLSS Super Resolution" : "DLAA"));
+        if (isReconActive) {
+            cachedStats_.reconStatusColor = ImVec4(0.2f, 1.0f, 0.2f, 1.0f);
+            snprintf(cachedStats_.reconStatusLine, sizeof(cachedStats_.reconStatusLine),
+                "Reconstruction: %s %s Active", backendName, techName);
+        } else if (dsvBinds == 0) {
+            cachedStats_.reconStatusColor = ImVec4(1.0f, 0.8f, 0.2f, 1.0f);
+            snprintf(cachedStats_.reconStatusLine, sizeof(cachedStats_.reconStatusLine),
+                "Reconstruction: %s %s (Initialized, no depth found)", backendName, techName);
+        } else {
+            cachedStats_.reconStatusColor = ImVec4(0.7f, 0.7f, 0.7f, 1.0f);
+            snprintf(cachedStats_.reconStatusLine, sizeof(cachedStats_.reconStatusLine),
+                "Reconstruction: %s %s (Standby)", backendName, techName);
+        }
+    } else {
+        cachedStats_.reconStatusColor = ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
+        snprintf(cachedStats_.reconStatusLine, sizeof(cachedStats_.reconStatusLine),
+            "Reconstruction: Inactive (Scene %ux%u -> Output %ux%u)", rW, rH, oW, oH);
+    }
 
     if (Profiler::instance().isEnabled()) {
         profilerDisplay_.mapMs = Profiler::instance().getAvgMs(ProfileZone::MapUnmap);
@@ -282,8 +392,10 @@ void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
     // 3. GPU Utilization Percentage (%)
     if (nvmlAvailable_ && nvmlDevice_) {
         telemetry_.gpuUsagePct = cachedGpuUsage_.load(std::memory_order_relaxed);
+        telemetry_.gpuLoadAvailable = true;
     } else {
-        telemetry_.gpuUsagePct = (std::min)(100u, static_cast<uint32_t>((telemetry_.totalFrametimeMs / 16.67f) * 60.0f));
+        telemetry_.gpuUsagePct = 0;
+        telemetry_.gpuLoadAvailable = false;
     }
 }
 
@@ -306,8 +418,9 @@ void PerfTracker::renderFrametimeGraph(float scale, const PerfOverlayOverride* o
     drawList->AddRectFilled(pMin, pMax, IM_COL32(20, 22, 27, 230), 2.0f * scale);
     drawList->AddRect(pMin, pMax, IM_COL32(70, 75, 85, 180), 2.0f * scale);
 
-    const size_t count = historyCount_;
-    const size_t startIndex = (count < kFrametimeHistorySize) ? 0 : historyIndex_;
+    const size_t totalCount = historyCount_;
+    const size_t count = (std::min)(totalCount, kGraphSampleCount);
+    const size_t startIndex = (historyIndex_ + kFrametimeHistorySize - count) % kFrametimeHistorySize;
 
     // Calculate vertical scaling with headroom
     float maxMs = 20.0f;
@@ -461,97 +574,56 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "EDPE Performance HUD");
         ImGui::Separator();
 
-        // 1. FPS with 1% Low FPS (color-coded green, throttled at 66.67 ms)
-        const float shownFps = override ? telemetry_.fps : cachedStats_.fps;
-        const float shownOnePercentLow = override ? telemetry_.fps : cachedStats_.onePercentLowFps;
-        const ImVec4 fpsColor = (shownFps >= 58.0f) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) :
-                                (shownFps >= 30.0f) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) :
-                                                      ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-        ImGui::TextColored(fpsColor, "FPS: %.1f | 1% Low: %.1f FPS", shownFps, shownOnePercentLow);
-
-        // 2. Frametimes (reading exclusively from 66.67 ms throttled cache)
-        const float shownGameMs = override ? (std::max)(0.0f, telemetry_.totalFrametimeMs - override->upscalerMs)
-                                           : cachedStats_.gameFrametimeMs;
-        ImGui::Text("Game Frametime:     ");
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%6.2f ms", shownGameMs);
-
-        auto& upscaler = UpscalerManager::instance();
-        UpscalerBackend shownBackend = upscaler.getBackend();
-        bool upscalerActive = upscaler.isReconstructionActive();
-        float shownUpscalerMs = override ? override->upscalerMs : cachedStats_.upscalerFrametimeMs;
+        // 1. FPS with 1% Low FPS (pre-formatted at 66.67 ms, zero-overhead TextUnformatted)
         if (override) {
-            shownBackend = (override->backendId == 1) ? UpscalerBackend::NvidiaDlss :
-                           (override->backendId == 2) ? UpscalerBackend::AmdFsr :
-                           (override->backendId == 3) ? UpscalerBackend::Taa : UpscalerBackend::None;
-            upscalerActive = (shownBackend != UpscalerBackend::None);
-        }
-
-        ImGui::Text("Upscaler Frametime: ");
-        ImGui::SameLine();
-        if (upscalerActive && shownUpscalerMs > 0.0f) {
-            const char* backendShort = (shownBackend == UpscalerBackend::Taa) ? "TAA" :
-                                       (shownBackend == UpscalerBackend::AmdFsr) ? "FSR" : "DLSS/DLAA";
-            ImGui::TextColored(ImVec4(0.0f, 0.95f, 0.95f, 1.0f), "%6.2f ms (%s)",
-                shownUpscalerMs, backendShort);
+            const ImVec4 fpsColor = (telemetry_.fps >= 58.0f) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) :
+                                    (telemetry_.fps >= 30.0f) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) :
+                                                                ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, fpsColor);
+            ImGui::Text("FPS: %.1f | 1%% Low: %.1f FPS", telemetry_.fps, telemetry_.fps);
+            ImGui::PopStyleColor();
         } else {
-            ImGui::TextColored(ImVec4(0.0f, 0.95f, 0.95f, 1.0f), "%6.2f ms (Bypass)", 0.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, cachedStats_.fpsColor);
+            ImGui::TextUnformatted(cachedStats_.fpsLine);
+            ImGui::PopStyleColor();
         }
 
-        const float shownTotalMs = override ? telemetry_.totalFrametimeMs : cachedStats_.totalFrametimeMs;
-        ImGui::Text("Total Frametime:    ");
+        // 2. Frametimes (pre-formatted at 66.67 ms, zero-overhead TextUnformatted)
+        ImGui::TextUnformatted("Game Frametime:     ");
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.60f, 0.05f, 1.0f), "%6.2f ms", shownTotalMs);
+        if (override) {
+            const float shownGameMs = (std::max)(0.0f, telemetry_.totalFrametimeMs - override->upscalerMs);
+            ImGui::Text("%6.2f ms", shownGameMs);
+        } else {
+            ImGui::TextUnformatted(cachedStats_.gameFtLine);
+        }
+
+        ImGui::TextUnformatted("Upscaler Frametime: ");
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.95f, 0.95f, 1.0f));
+        if (override) {
+            ImGui::Text("%6.2f ms (%s)", override->upscalerMs,
+                (override->backendId == 3) ? "TAA" : (override->backendId == 2) ? "FSR" : "DLSS/DLAA");
+        } else {
+            ImGui::TextUnformatted(cachedStats_.upscalerFtLine);
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::TextUnformatted("Total Frametime:    ");
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.60f, 0.05f, 1.0f));
+        if (override) {
+            ImGui::Text("%6.2f ms", telemetry_.totalFrametimeMs);
+        } else {
+            ImGui::TextUnformatted(cachedStats_.totalFtLine);
+        }
+        ImGui::PopStyleColor();
 
         renderFrametimeGraph(scale, override);
 
         ImGui::Separator();
 
         // 3. Consolidated Hardware section (3 column-aligned rows via ImGui::BeginTable)
-        const uint32_t rW = cachedStats_.renderWidth;
-        const uint32_t rH = cachedStats_.renderHeight;
-        const uint32_t oW = cachedStats_.outputWidth;
-        const uint32_t oH = cachedStats_.outputHeight;
-        const float scalePct = (oW > 0) ? (100.0f * static_cast<float>(rW) / static_cast<float>(oW)) : 100.0f;
-        const bool isSr = (rW < oW || rH < oH);
-
-        char upscalerBuf[128]{};
-        if (upscalerActive) {
-            const bool isAmd = (shownBackend == UpscalerBackend::AmdFsr);
-            const bool isTaa = (shownBackend == UpscalerBackend::Taa);
-            if (isTaa) {
-                snprintf(upscalerBuf, sizeof(upscalerBuf), "TAA (%.1f%%)", scalePct);
-            } else if (isAmd) {
-                snprintf(upscalerBuf, sizeof(upscalerBuf), "%s (%.1f%%)",
-                    isSr ? "AMD FSR SR" : "AMD FSR Native AA", scalePct);
-            } else {
-                snprintf(upscalerBuf, sizeof(upscalerBuf), "%s (%.1f%%)",
-                    isSr ? "NVIDIA DLSS" : "NVIDIA DLAA", scalePct);
-            }
-        } else {
-            snprintf(upscalerBuf, sizeof(upscalerBuf), "%s (100.0%%)",
-                override ? "Off (Before reconstruction)" : "Bypass (Native)");
-        }
-
-        char gpuNameUtf8[128]{};
-        WideCharToMultiByte(CP_UTF8, 0, cachedStats_.gpuName.c_str(), -1, gpuNameUtf8, sizeof(gpuNameUtf8), nullptr, nullptr);
-        const char* gpuDisplayName = gpuNameUtf8[0] ? gpuNameUtf8 : "Direct3D 11 Adapter";
-        char gpuBuf[160]{};
-        snprintf(gpuBuf, sizeof(gpuBuf), "%s (%u%%)", gpuDisplayName, cachedStats_.gpuUsagePct);
-
-        char vramBuf[128]{};
-        if (cachedStats_.vramTotalBytes > 0) {
-            const double usedGb = static_cast<double>(cachedStats_.vramUsedBytes) / (1024.0 * 1024.0 * 1024.0);
-            const double totalGb = static_cast<double>(cachedStats_.vramTotalBytes) / (1024.0 * 1024.0 * 1024.0);
-            const float pct = static_cast<float>(100.0 * static_cast<double>(cachedStats_.vramUsedBytes) / static_cast<double>(cachedStats_.vramTotalBytes));
-            snprintf(vramBuf, sizeof(vramBuf), "%.2f / %.2f GB (%u%%)", usedGb, totalGb, static_cast<unsigned>(pct));
-        } else if (cachedStats_.vramUsedBytes > 0) {
-            const double usedMb = static_cast<double>(cachedStats_.vramUsedBytes) / (1024.0 * 1024.0);
-            snprintf(vramBuf, sizeof(vramBuf), "%.1f MB", usedMb);
-        } else {
-            snprintf(vramBuf, sizeof(vramBuf), "N/A");
-        }
-
         if (ImGui::BeginTable("##PerfHudDetails", 2, ImGuiTableFlags_None)) {
             ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("Upscaler:  ").x);
             ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
@@ -560,19 +632,25 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
             ImGui::TableSetColumnIndex(0);
             ImGui::TextUnformatted("Upscaler:");
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "%s", upscalerBuf);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 1.0f, 0.4f, 1.0f));
+            if (override) {
+                ImGui::TextUnformatted(override->backendId >= 0 ? "Comparison Capture" : "Off (Before reconstruction)");
+            } else {
+                ImGui::TextUnformatted(cachedStats_.upscalerInfoLine);
+            }
+            ImGui::PopStyleColor();
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             ImGui::TextUnformatted("GPU:");
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(gpuBuf);
+            ImGui::TextUnformatted(cachedStats_.gpuLine);
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             ImGui::TextUnformatted("VRAM:");
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(vramBuf);
+            ImGui::TextUnformatted(cachedStats_.vramLine);
 
             ImGui::EndTable();
         }
