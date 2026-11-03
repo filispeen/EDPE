@@ -150,28 +150,15 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
         historyCount_++;
     }
 
-    // Rate-limit display telemetry & profiler updates to ~66.66 ms (~15 FPS) to keep numbers readable and reduce UI overhead
-    auto updateDisplaySnapshots = [this]() {
-        displayTelemetry_ = telemetry_;
-        if (Profiler::instance().isEnabled()) {
-            profilerDisplay_.mapMs = Profiler::instance().getAvgMs(ProfileZone::MapUnmap);
-            profilerDisplay_.omMs = Profiler::instance().getAvgMs(ProfileZone::OMSetRenderTargets);
-            profilerDisplay_.deltaMs = Profiler::instance().getAvgMs(ProfileZone::CameraDeltaCopy);
-            profilerDisplay_.drawMs = Profiler::instance().getAvgMs(ProfileZone::DrawProbe);
-            profilerDisplay_.upscaleMs = Profiler::instance().getAvgMs(ProfileZone::TemporalUpscale);
-            const float measuredSum = profilerDisplay_.mapMs + profilerDisplay_.omMs + profilerDisplay_.deltaMs + profilerDisplay_.drawMs;
-            profilerDisplay_.unaccountedMs = (std::max)(0.0f, displayTelemetry_.gameFrametimeMs - measuredSum);
-        }
-    };
+    // Rate-limit display telemetry & profiler updates to 66.67 ms (15 Hz / 15 FPS) using high-resolution steady_clock
+    const auto nowTime = std::chrono::steady_clock::now();
+    const double elapsedCacheMs = (lastCacheUpdate_.time_since_epoch().count() == 0)
+        ? 1000.0
+        : std::chrono::duration<double, std::milli>(nowTime - lastCacheUpdate_).count();
 
-    if (perfFreq_.QuadPart > 0) {
-        const double elapsedDisplayMs = static_cast<double>(now.QuadPart - lastDisplayUpdate_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
-        if (lastDisplayUpdate_.QuadPart == 0 || elapsedDisplayMs >= 66.66) {
-            updateDisplaySnapshots();
-            lastDisplayUpdate_ = now;
-        }
-    } else {
-        updateDisplaySnapshots();
+    if (elapsedCacheMs >= 66.67) {
+        updateCachedStats();
+        lastCacheUpdate_ = nowTime;
     }
 
     // Rate-limit hardware telemetry to ~4 times per second (250 ms)
@@ -186,6 +173,70 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
 
 void PerfTracker::onPresentEnd() {
     QueryPerformanceCounter(&lastPresentEnd_);
+}
+
+float PerfTracker::calculateOnePercentLow() const {
+    if (historyCount_ < 5) {
+        return telemetry_.fps;
+    }
+
+    std::array<float, kFrametimeHistorySize> times{};
+    size_t validCount = 0;
+    const size_t count = historyCount_;
+    const size_t startIndex = (count < kFrametimeHistorySize) ? 0 : historyIndex_;
+
+    for (size_t i = 0; i < count; ++i) {
+        const float t = frametimeHistory_[(startIndex + i) % kFrametimeHistorySize].totalMs;
+        if (t > 0.5f && t < 1000.0f) {
+            times[validCount++] = t;
+        }
+    }
+
+    if (validCount < 5) {
+        return telemetry_.fps;
+    }
+
+    std::sort(times.begin(), times.begin() + validCount);
+
+    // 99th percentile frametime (1% slowest frames in window)
+    const size_t p99Idx = static_cast<size_t>((std::min)(
+        static_cast<size_t>(std::floor(validCount * 0.99f)),
+        validCount - 1
+    ));
+
+    const float p99Ms = times[p99Idx];
+    if (p99Ms <= 0.001f) {
+        return telemetry_.fps;
+    }
+
+    const float oneLow = 1000.0f / p99Ms;
+    return (telemetry_.fps > 0.0f) ? (std::min)(telemetry_.fps, oneLow) : oneLow;
+}
+
+void PerfTracker::updateCachedStats() {
+    cachedStats_.fps = telemetry_.fps;
+    cachedStats_.onePercentLowFps = calculateOnePercentLow();
+    cachedStats_.gameFrametimeMs = telemetry_.gameFrametimeMs;
+    cachedStats_.upscalerFrametimeMs = telemetry_.upscalerFrametimeMs;
+    cachedStats_.totalFrametimeMs = telemetry_.totalFrametimeMs;
+    cachedStats_.renderWidth = telemetry_.renderWidth;
+    cachedStats_.renderHeight = telemetry_.renderHeight;
+    cachedStats_.outputWidth = telemetry_.outputWidth;
+    cachedStats_.outputHeight = telemetry_.outputHeight;
+    cachedStats_.gpuName = telemetry_.gpuName;
+    cachedStats_.gpuUsagePct = telemetry_.gpuUsagePct;
+    cachedStats_.vramUsedBytes = telemetry_.vramUsedBytes;
+    cachedStats_.vramTotalBytes = telemetry_.vramTotalBytes;
+
+    if (Profiler::instance().isEnabled()) {
+        profilerDisplay_.mapMs = Profiler::instance().getAvgMs(ProfileZone::MapUnmap);
+        profilerDisplay_.omMs = Profiler::instance().getAvgMs(ProfileZone::OMSetRenderTargets);
+        profilerDisplay_.deltaMs = Profiler::instance().getAvgMs(ProfileZone::CameraDeltaCopy);
+        profilerDisplay_.drawMs = Profiler::instance().getAvgMs(ProfileZone::DrawProbe);
+        profilerDisplay_.upscaleMs = Profiler::instance().getAvgMs(ProfileZone::TemporalUpscale);
+        const float measuredSum = profilerDisplay_.mapMs + profilerDisplay_.omMs + profilerDisplay_.deltaMs + profilerDisplay_.drawMs;
+        profilerDisplay_.unaccountedMs = (std::max)(0.0f, cachedStats_.gameFrametimeMs - measuredSum);
+    }
 }
 
 void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
@@ -270,15 +321,37 @@ void PerfTracker::renderFrametimeGraph(float scale, const PerfOverlayOverride* o
     const float innerH = graphHeight - 4.0f * scale;
     const float bottomY = pMax.y - 2.0f * scale;
 
-    // Reference grid line at 16.67ms (60 FPS)
-    if (maxMs >= 16.67f) {
-        const float y60 = bottomY - (16.67f / maxMs) * innerH;
-        drawList->AddLine(ImVec2(pMin.x, y60), ImVec2(pMax.x, y60), IM_COL32(90, 95, 105, 120), 1.0f);
+    // Helper to draw horizontal dashed reference lines across the graph
+    auto drawDashedHLine = [&](float y, ImU32 col, float dash, float gap) {
+        float x = pMin.x + 2.0f * scale;
+        const float xEnd = pMax.x - 2.0f * scale;
+        while (x < xEnd) {
+            const float nextX = (std::min)(x + dash, xEnd);
+            drawList->AddLine(ImVec2(x, y), ImVec2(nextX, y), col, 1.0f);
+            x += dash + gap;
+        }
+    };
+
+    // 1. Reference line at 8.3 ms (120 FPS)
+    if (maxMs >= 8.3f) {
+        const float y83 = bottomY - (8.3f / maxMs) * innerH;
+        drawDashedHLine(y83, IM_COL32(110, 115, 125, 120), 4.0f * scale, 3.0f * scale);
+        const char* label83 = "8.3 ms";
+        const ImVec2 size83 = ImGui::CalcTextSize(label83);
+        const float label83X = pMax.x - size83.x - 4.0f * scale;
+        const float label83Y = (std::max)(pMin.y + 1.0f * scale, y83 - size83.y);
+        drawList->AddText(ImVec2(label83X, label83Y), IM_COL32(140, 145, 155, 160), label83);
     }
-    // Reference grid line at 33.33ms (30 FPS)
-    if (maxMs >= 33.33f) {
-        const float y30 = bottomY - (33.33f / maxMs) * innerH;
-        drawList->AddLine(ImVec2(pMin.x, y30), ImVec2(pMax.x, y30), IM_COL32(90, 95, 105, 120), 1.0f);
+
+    // 2. Reference line at 16.6 ms (60 FPS)
+    if (maxMs >= 16.6f) {
+        const float y166 = bottomY - (16.6f / maxMs) * innerH;
+        drawDashedHLine(y166, IM_COL32(110, 115, 125, 120), 4.0f * scale, 3.0f * scale);
+        const char* label166 = "16.6 ms";
+        const ImVec2 size166 = ImGui::CalcTextSize(label166);
+        const float label166X = pMax.x - size166.x - 4.0f * scale;
+        const float label166Y = (std::max)(pMin.y + 1.0f * scale, y166 - size166.y);
+        drawList->AddText(ImVec2(label166X, label166Y), IM_COL32(140, 145, 155, 160), label166);
     }
 
     if (count < 2) return;
@@ -388,18 +461,17 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "EDPE Performance HUD");
         ImGui::Separator();
 
-        // 1. FPS with color coding
-        const float shownFps = override ? telemetry_.fps : displayTelemetry_.fps;
+        // 1. FPS with 1% Low FPS (color-coded green, throttled at 66.67 ms)
+        const float shownFps = override ? telemetry_.fps : cachedStats_.fps;
+        const float shownOnePercentLow = override ? telemetry_.fps : cachedStats_.onePercentLowFps;
         const ImVec4 fpsColor = (shownFps >= 58.0f) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) :
                                 (shownFps >= 30.0f) ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f) :
                                                       ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-        ImGui::Text("FPS:                ");
-        ImGui::SameLine();
-        ImGui::TextColored(fpsColor, "%.1f FPS", shownFps);
+        ImGui::TextColored(fpsColor, "FPS: %.1f | 1% Low: %.1f FPS", shownFps, shownOnePercentLow);
 
-        // 2. Frametimes
+        // 2. Frametimes (reading exclusively from 66.67 ms throttled cache)
         const float shownGameMs = override ? (std::max)(0.0f, telemetry_.totalFrametimeMs - override->upscalerMs)
-                                           : displayTelemetry_.gameFrametimeMs;
+                                           : cachedStats_.gameFrametimeMs;
         ImGui::Text("Game Frametime:     ");
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%6.2f ms", shownGameMs);
@@ -407,7 +479,7 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
         auto& upscaler = UpscalerManager::instance();
         UpscalerBackend shownBackend = upscaler.getBackend();
         bool upscalerActive = upscaler.isReconstructionActive();
-        float shownUpscalerMs = override ? override->upscalerMs : displayTelemetry_.upscalerFrametimeMs;
+        float shownUpscalerMs = override ? override->upscalerMs : cachedStats_.upscalerFrametimeMs;
         if (override) {
             shownBackend = (override->backendId == 1) ? UpscalerBackend::NvidiaDlss :
                            (override->backendId == 2) ? UpscalerBackend::AmdFsr :
@@ -426,7 +498,7 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
             ImGui::TextColored(ImVec4(0.0f, 0.95f, 0.95f, 1.0f), "%6.2f ms (Bypass)", 0.0f);
         }
 
-        const float shownTotalMs = override ? telemetry_.totalFrametimeMs : displayTelemetry_.totalFrametimeMs;
+        const float shownTotalMs = override ? telemetry_.totalFrametimeMs : cachedStats_.totalFrametimeMs;
         ImGui::Text("Total Frametime:    ");
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.60f, 0.05f, 1.0f), "%6.2f ms", shownTotalMs);
@@ -435,67 +507,74 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
 
         ImGui::Separator();
 
-        // 3. Upscaler & Resolution Info
+        // 3. Consolidated Hardware section (3 column-aligned rows via ImGui::BeginTable)
+        const uint32_t rW = cachedStats_.renderWidth;
+        const uint32_t rH = cachedStats_.renderHeight;
+        const uint32_t oW = cachedStats_.outputWidth;
+        const uint32_t oH = cachedStats_.outputHeight;
+        const float scalePct = (oW > 0) ? (100.0f * static_cast<float>(rW) / static_cast<float>(oW)) : 100.0f;
+        const bool isSr = (rW < oW || rH < oH);
+
+        char upscalerBuf[128]{};
         if (upscalerActive) {
             const bool isAmd = (shownBackend == UpscalerBackend::AmdFsr);
             const bool isTaa = (shownBackend == UpscalerBackend::Taa);
-            const bool isSr = (telemetry_.renderWidth < telemetry_.outputWidth || telemetry_.renderHeight < telemetry_.outputHeight);
-
-            const char* upscalerName = isTaa ? "TAA" :
-                                       isAmd ? (isSr ? "AMD FSR SR" : "AMD FSR Native AA")
-                                             : (isSr ? "NVIDIA DLSS" : "NVIDIA DLAA");
-
-            char presetBuf[64]{};
             if (isTaa) {
-                snprintf(presetBuf, sizeof(presetBuf), "(%s)", isSr ? "Super Resolution" : "Native AA");
-            } else if (!isAmd) {
-                const uint32_t p = NgxContext::get_preset();
-                const char* pName = (p == 10) ? "Preset J" :
-                                    (p == 11) ? "Preset K" :
-                                    (p == 12) ? "Preset L" :
-                                    (p == 13) ? "Preset M" : "Auto (Preset K)";
-                snprintf(presetBuf, sizeof(presetBuf), "(%s)", pName);
+                snprintf(upscalerBuf, sizeof(upscalerBuf), "TAA (%.1f%%)", scalePct);
+            } else if (isAmd) {
+                snprintf(upscalerBuf, sizeof(upscalerBuf), "%s (%.1f%%)",
+                    isSr ? "AMD FSR SR" : "AMD FSR Native AA", scalePct);
             } else {
-                snprintf(presetBuf, sizeof(presetBuf), "(%s)", isSr ? "Super Resolution" : "Native AA");
+                snprintf(upscalerBuf, sizeof(upscalerBuf), "%s (%.1f%%)",
+                    isSr ? "NVIDIA DLSS" : "NVIDIA DLAA", scalePct);
             }
-
-            ImGui::Text("Upscaler:           ");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "%s %s", upscalerName, presetBuf);
-
-            const float scalePct = telemetry_.outputWidth > 0
-                ? (100.0f * static_cast<float>(telemetry_.renderWidth) / static_cast<float>(telemetry_.outputWidth))
-                : 100.0f;
-
-            ImGui::Text("Resolution:         %ux%u -> %ux%u (%.1f%%)",
-                telemetry_.renderWidth, telemetry_.renderHeight,
-                telemetry_.outputWidth, telemetry_.outputHeight, scalePct);
         } else {
-            ImGui::Text(override ? "Upscaler:           Off (Before reconstruction)" : "Upscaler:           Bypass (Native)");
-            ImGui::Text("Resolution:         %ux%u -> %ux%u (100.0%%)",
-                telemetry_.outputWidth, telemetry_.outputHeight,
-                telemetry_.outputWidth, telemetry_.outputHeight);
+            snprintf(upscalerBuf, sizeof(upscalerBuf), "%s (100.0%%)",
+                override ? "Off (Before reconstruction)" : "Bypass (Native)");
         }
 
-        ImGui::Separator();
-
-        // 4. GPU Info
         char gpuNameUtf8[128]{};
-        WideCharToMultiByte(CP_UTF8, 0, telemetry_.gpuName.c_str(), -1, gpuNameUtf8, sizeof(gpuNameUtf8), nullptr, nullptr);
-        ImGui::Text("Current GPU:        %s", gpuNameUtf8[0] ? gpuNameUtf8 : "Direct3D 11 Adapter");
+        WideCharToMultiByte(CP_UTF8, 0, cachedStats_.gpuName.c_str(), -1, gpuNameUtf8, sizeof(gpuNameUtf8), nullptr, nullptr);
+        const char* gpuDisplayName = gpuNameUtf8[0] ? gpuNameUtf8 : "Direct3D 11 Adapter";
+        char gpuBuf[160]{};
+        snprintf(gpuBuf, sizeof(gpuBuf), "%s (%u%%)", gpuDisplayName, cachedStats_.gpuUsagePct);
 
-        // 5. GPU Usage
-        ImGui::Text("GPU Usage:          %u %%", telemetry_.gpuUsagePct);
+        char vramBuf[128]{};
+        if (cachedStats_.vramTotalBytes > 0) {
+            const double usedGb = static_cast<double>(cachedStats_.vramUsedBytes) / (1024.0 * 1024.0 * 1024.0);
+            const double totalGb = static_cast<double>(cachedStats_.vramTotalBytes) / (1024.0 * 1024.0 * 1024.0);
+            const float pct = static_cast<float>(100.0 * static_cast<double>(cachedStats_.vramUsedBytes) / static_cast<double>(cachedStats_.vramTotalBytes));
+            snprintf(vramBuf, sizeof(vramBuf), "%.2f / %.2f GB (%u%%)", usedGb, totalGb, static_cast<unsigned>(pct));
+        } else if (cachedStats_.vramUsedBytes > 0) {
+            const double usedMb = static_cast<double>(cachedStats_.vramUsedBytes) / (1024.0 * 1024.0);
+            snprintf(vramBuf, sizeof(vramBuf), "%.1f MB", usedMb);
+        } else {
+            snprintf(vramBuf, sizeof(vramBuf), "N/A");
+        }
 
-        // 6. VRAM Usage
-        if (telemetry_.vramTotalBytes > 0) {
-            const double usedGb = static_cast<double>(telemetry_.vramUsedBytes) / (1024.0 * 1024.0 * 1024.0);
-            const double totalGb = static_cast<double>(telemetry_.vramTotalBytes) / (1024.0 * 1024.0 * 1024.0);
-            const float pct = static_cast<float>(100.0 * static_cast<double>(telemetry_.vramUsedBytes) / static_cast<double>(telemetry_.vramTotalBytes));
-            ImGui::Text("VRAM Usage:         %.2f / %.2f GB (%u %%)", usedGb, totalGb, static_cast<unsigned>(pct));
-        } else if (telemetry_.vramUsedBytes > 0) {
-            const double usedMb = static_cast<double>(telemetry_.vramUsedBytes) / (1024.0 * 1024.0);
-            ImGui::Text("VRAM Usage:         %.1f MB", usedMb);
+        if (ImGui::BeginTable("##PerfHudDetails", 2, ImGuiTableFlags_None)) {
+            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("Upscaler:  ").x);
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted("Upscaler:");
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "%s", upscalerBuf);
+
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted("GPU:");
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(gpuBuf);
+
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted("VRAM:");
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(vramBuf);
+
+            ImGui::EndTable();
         }
 
         if (cfg.enableProfiler) {

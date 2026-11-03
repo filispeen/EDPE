@@ -9,8 +9,29 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <chrono>
 
 namespace edpe {
+
+// Throttled (15 Hz / 66.67 ms) telemetry snapshot consumed by all text metrics in both overlays
+struct CachedTelemetryStats {
+    float fps = 0.0f;
+    float onePercentLowFps = 0.0f;
+    float gameFrametimeMs = 0.0f;
+    float upscalerFrametimeMs = 0.0f;
+    float totalFrametimeMs = 0.0f;
+
+    uint32_t renderWidth = 0;
+    uint32_t renderHeight = 0;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
+
+    std::wstring gpuName;
+    uint32_t gpuUsagePct = 0;
+
+    uint64_t vramUsedBytes = 0;
+    uint64_t vramTotalBytes = 0;
+};
 
 struct PerfTelemetry {
     float fps = 0.0f;
@@ -44,6 +65,8 @@ public:
     void onPresentEnd();
 
     const PerfTelemetry& getTelemetry() const { return telemetry_; }
+    const CachedTelemetryStats& getCachedTelemetry() const { return cachedStats_; }
+    const CachedTelemetryStats& getCachedStats() const { return cachedStats_; }
 
     void renderOverlay(bool isMenuOpen, int corner, float scale = 1.0f, const PerfOverlayOverride* override = nullptr);
     void initNvml();
@@ -55,10 +78,12 @@ private:
 
     void updateTelemetry(IDXGISwapChain* swapChain);
     void renderFrametimeGraph(float scale, const PerfOverlayOverride* override = nullptr);
+    float calculateOnePercentLow() const;
+    void updateCachedStats();
 
     PerfTelemetry telemetry_{};
-    PerfTelemetry displayTelemetry_{};
-    LARGE_INTEGER lastDisplayUpdate_{};
+    CachedTelemetryStats cachedStats_{};
+    std::chrono::steady_clock::time_point lastCacheUpdate_{};
 
     struct ProfilerDisplaySnapshot {
         float mapMs = 0.0f;
