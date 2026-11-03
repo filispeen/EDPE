@@ -165,6 +165,12 @@ target_compile_definitions(crash_logger_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMA
 target_include_directories(crash_logger_test PRIVATE src)
 target_link_libraries(crash_logger_test PRIVATE dbghelp dxgi)
 add_test(NAME crash_logger COMMAND crash_logger_test)
+add_executable(ui_menu_size_test tests/ui_menu_size_test.cpp)
+target_compile_features(ui_menu_size_test PRIVATE cxx_std_20)
+target_include_directories(ui_menu_size_test PRIVATE external/imgui)
+target_link_libraries(ui_menu_size_test PRIVATE EDPE_IMGUI)
+add_test(NAME ui_menu_size COMMAND ui_menu_size_test)
+
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)
 target_link_libraries(proxy_smoke PRIVATE d3dcompiler)

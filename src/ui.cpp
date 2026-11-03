@@ -72,6 +72,7 @@ struct UiState {
     ID3D11ShaderResourceView* color_srv = nullptr;
     ID3D11ShaderResourceView* early_color_srv = nullptr;
     ID3D11ShaderResourceView* motion_srv = nullptr;
+    ImFont* font_proggy_forever = nullptr;
     std::vector<TextureCaptureRequest> pending_captures;
     // Comparison frames waiting for the performance HUD to be drawn onto them
     // (drawn in UiOnPresent, then handed to the normal BMP capture queue).
@@ -551,7 +552,8 @@ void flushOverlayCaptures(bool drawOverlay) {
             const float hudScale = std::clamp(cfg.perfOverlayScale, 0.5f, 2.5f);
             ImGui::GetStyle() = s_base_imgui_style;
             ImGui::GetStyle().ScaleAllSizes(hudScale);
-            ImGui::GetIO().FontGlobalScale = hudScale;
+            ImGui::GetStyle().FontScaleMain = hudScale;
+            ImGui::GetIO().FontGlobalScale = 1.0f;
             edpe::PerfTracker::instance().renderOverlay(false, cfg.perfOverlayCorner, hudScale,
                 item.backendId >= 0 ? &ov : nullptr);
             ImGui::Render();
@@ -1387,9 +1389,10 @@ static void applyUiScale(float scale) {
     }
     scale = std::clamp(scale, 0.5f, 2.5f);
     ImGuiIO& io = ImGui::GetIO();
-    io.FontGlobalScale = scale;
+    io.FontGlobalScale = 1.0f;
     ImGui::GetStyle() = s_base_imgui_style;
     ImGui::GetStyle().ScaleAllSizes(scale);
+    ImGui::GetStyle().FontScaleMain = scale;
     ImGui::SetCurrentContext(previous);
 }
 
@@ -1440,9 +1443,16 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     ImGuiContext* previous = ImGui::GetCurrentContext();
     ui.imgui = ImGui::CreateContext();
     if (!ui.imgui) return false;
-    ImGui::GetIO().IniFilename = nullptr;
-    ImGui::GetIO().MouseDrawCursor = false;
-    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.MouseDrawCursor = false;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    ui.font_proggy_forever = io.Fonts->AddFontDefaultVector();
+    io.FontDefault = ui.font_proggy_forever;
+    io.FontGlobalScale = 1.0f;
+    s_base_imgui_style = ImGui::GetStyle();
+    s_base_imgui_style.FontScaleMain = 1.0f;
+    s_base_style_initialized = true;
     const bool win32_ready = ImGui_ImplWin32_Init(ui.window);
     const bool dx11_ready = win32_ready && ImGui_ImplDX11_Init(ui.device, ui.context);
     ImGui::SetCurrentContext(previous);
@@ -1507,6 +1517,11 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::Taa);
             edpe::UpscalerManager::instance().setMode(edpe::UpscaleMode::NativeAA);
         }
+    }
+    if (ui.font_proggy_forever) {
+        wchar_t fontMsg[128];
+        swprintf_s(fontMsg, L"EDPE: ProggyForever vector font initialized (%hs)", ui.font_proggy_forever->GetDebugName());
+        EdpeLog(fontMsg);
     }
     EdpeLog(L"EDPE: Dear ImGui ready; F5 toggles menu");
     return true;
@@ -1693,14 +1708,16 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         const float hudScale = std::clamp(cfg.perfOverlayScale, 0.5f, 2.5f);
         ImGui::GetStyle() = s_base_imgui_style;
         ImGui::GetStyle().ScaleAllSizes(hudScale);
-        ImGui::GetIO().FontGlobalScale = hudScale;
+        ImGui::GetStyle().FontScaleMain = hudScale;
+        ImGui::GetIO().FontGlobalScale = 1.0f;
         edpe::PerfTracker::instance().renderOverlay(draw_menu, cfg.perfOverlayCorner, hudScale);
     }
 
     const float uiScale = std::clamp(cfg.uiScale, 0.5f, 2.5f);
     ImGui::GetStyle() = s_base_imgui_style;
     ImGui::GetStyle().ScaleAllSizes(uiScale);
-    ImGui::GetIO().FontGlobalScale = uiScale;
+    ImGui::GetStyle().FontScaleMain = uiScale;
+    ImGui::GetIO().FontGlobalScale = 1.0f;
 
     bool window_open = true;
     if (draw_menu) {
@@ -1784,6 +1801,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 cfg.save();
             }
+
+            ImGui::TextDisabled("Font: ProggyForever (Scalable Vector)");
 
             const bool menu_customized = (cfg.menuPosX >= 0.0f || cfg.menuWidth >= 0.0f);
             if (menu_customized) {
