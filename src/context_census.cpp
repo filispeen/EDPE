@@ -1282,9 +1282,19 @@ void replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     if (original_blend) {
         D3D11_BLEND_DESC origBlendDesc{};
         original_blend->GetDesc(&origBlendDesc);
+        if ((origBlendDesc.RenderTarget[0].RenderTargetWriteMask & 0x7) == 0 ||
+            (origBlendDesc.RenderTarget[0].BlendEnable &&
+             (origBlendDesc.RenderTarget[0].SrcBlend == D3D11_BLEND_ZERO ||
+              origBlendDesc.RenderTarget[0].BlendOp == D3D11_BLEND_OP_SUBTRACT ||
+              origBlendDesc.RenderTarget[0].BlendOp == D3D11_BLEND_OP_REV_SUBTRACT))) {
+            for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+                if (orig_rtvs[i]) orig_rtvs[i]->Release();
+            }
+            return;
+        }
         if (origBlendDesc.RenderTarget[0].BlendEnable &&
             (origBlendDesc.RenderTarget[0].SrcBlend == D3D11_BLEND_SRC_ALPHA ||
-             origBlendDesc.RenderTarget[0].SrcBlend == D3D11_BLEND_INV_SRC_ALPHA)) {
+             origBlendDesc.RenderTarget[0].SrcBlend == D3D11_BLEND_SRC_ALPHA_SAT)) {
             blend_to_use = s_hud_mask_blend_alpha.Get();
         }
     }
@@ -1331,6 +1341,7 @@ void replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
 
 HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
+        (!s_hud_mask_active_pass && !motion_pair_active) ||
         !motion_color_source || !motion_color_bound) return HudDrawResult::None;
 
     struct DrawProbeTimer {
@@ -4151,7 +4162,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                         s_dlss_output_srv.Get(),
                         s_backbuffer_copy_srv.Get(),
                         s_dlaa_input_srv.Get(),
-                        s_hud_mask_srv.Get(),
+                        (s_hud_draws_replayed_frame > 0 && s_hud_mask_width == depthDesc.Width && s_hud_mask_height == depthDesc.Height) ? s_hud_mask_srv.Get() : nullptr,
                         s_backbuffer_rtv.Get(),
                         backbufferDesc.Width, backbufferDesc.Height,
                         depthDesc.Width, depthDesc.Height,
@@ -4186,13 +4197,14 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     if (ui_composite_pass) {
                         compOk = ui_composite_pass->composite(context,
                             s_dlss_output_srv.Get(),
-                            s_backbuffer_copy_srv.Get(),
-                            s_dlaa_input_srv.Get(),
+                            nullptr,
+                            nullptr,
                             nullptr,
                             s_backbuffer_rtv.Get(),
                             backbufferDesc.Width, backbufferDesc.Height,
                             depthDesc.Width, depthDesc.Height,
-                            true);
+                            /*isHdr=*/true,
+                            /*preserveUi=*/false);
                     }
                 }
             } else {
@@ -4606,7 +4618,7 @@ void renderHudDebugView(ID3D11DeviceContext* context, unsigned long long rendere
     }
 
     ID3D11ShaderResourceView* lowResWorldSrv = s_dlaa_input_srv ? s_dlaa_input_srv.Get() : nullptr;
-    ID3D11ShaderResourceView* hudMaskSrv = s_hud_mask_srv ? s_hud_mask_srv.Get() : nullptr;
+    ID3D11ShaderResourceView* hudMaskSrv = (s_hud_draws_replayed_frame > 0 && s_hud_mask_srv) ? s_hud_mask_srv.Get() : nullptr;
 
     const UINT renderW = s_hud_mask_width ? s_hud_mask_width : bbDesc.Width;
     const UINT renderH = s_hud_mask_height ? s_hud_mask_height : bbDesc.Height;
@@ -4703,6 +4715,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         s_jitter_debug_view.load(std::memory_order_relaxed) ||
         s_hud_debug_view.load(std::memory_order_relaxed);
     const auto current_frame = last_present_frame.load(std::memory_order_relaxed);
+    s_hud_mask_active_pass = false;
     if ((motion_pair_active || reconstruction_active) && motion_color_source &&
         motion_color_frame == current_frame) {
         bool bound = false;
@@ -4719,6 +4732,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             sameRenderTargetResource(targets[0], motion_color_source.Get()) &&
             (non_null_count < 4 || (count > 3 && targets[3] == nullptr));
 
+        s_hud_mask_active_pass = false;
         if (motion_color_bound && !bound) {
             // Main scene G-buffer pass has completed and unbound!
             s_inside_main_scene.store(false, std::memory_order_release);
@@ -5720,7 +5734,10 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                                     for (UINT y = 0; y < s_hud_mask_staging_height; ++y) {
                                         const auto* row = reinterpret_cast<const uint32_t*>(ptr + y * mapped.RowPitch);
                                         for (UINT x = 0; x < s_hud_mask_staging_width; ++x) {
-                                            if (row[x] != 0) ++nonZero;
+                                            const uint32_t v = row[x];
+                                            if ((v & 0x7FFu) >= 0x1D2u || ((v >> 11) & 0x7FFu) >= 0x1D2u || ((v >> 22) & 0x3FFu) >= 0x0E9u) {
+                                                ++nonZero;
+                                            }
                                         }
                                     }
                                 }

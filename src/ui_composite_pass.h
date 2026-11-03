@@ -16,7 +16,8 @@ public:
                    ID3D11RenderTargetView* targetBackbufferRtv,
                    UINT outputWidth, UINT outputHeight,
                    UINT renderWidth, UINT renderHeight,
-                   bool isHdr = false);
+                   bool isHdr = false,
+                   bool preserveUi = true);
 
 private:
     Microsoft::WRL::ComPtr<ID3D11Device> device_;

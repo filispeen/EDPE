@@ -36,6 +36,13 @@ VSOutput vs_main(uint id : SV_VertexID) {
 
 float4 ps_main(VSOutput pin) : SV_Target {
     int3 pixelPos = int3(pin.pos.xy, 0);
+
+    if (flags.z < 0.5) {
+        float3 cOut = tDlss.Load(pixelPos).rgb;
+        if (flags.x > 0.5) cOut = toLdr(cOut);
+        return float4(saturate(cOut), 1.0);
+    }
+
     float4 hSample = tHudMask.SampleLevel(sLinear, pin.uv, 0);
     float hudRaw = max(hSample.r, max(hSample.g, hSample.b));
     float hudMask = smoothstep(0.005, 0.08, hudRaw);

@@ -277,6 +277,64 @@ int main() {
     // Row 3: Game orange (R ~ 255, G ~ 128, B ~ 0) fully boosted to weight 1.0 despite weak signal
     if (wmr3 < 200 || wmg3 < 100 || wmb3 > 50) return 35;
 
+    // Test 7: preserveUi = false (LDR, nullptr game backbuffer and low-res world)
+    ok = pass.composite(context.Get(), dlssSrv.Get(), nullptr, nullptr, nullptr,
+        targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/false);
+    if (!ok) return 36;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 37;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t noUiR0 = rows[0], noUiG0 = rows[1], noUiB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t noUiR3 = lastRow[0], noUiG3 = lastRow[1], noUiB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Both row 0 and row 3 must be pure DLSS green (no UI overlay)
+    if (noUiG0 < 200 || noUiR0 > 50 || noUiB0 > 50) return 38;
+    if (noUiG3 < 200 || noUiR3 > 50 || noUiB3 > 50) return 39;
+
+    // Test 8: preserveUi = false (HDR tone-mapping path)
+    ok = pass.composite(context.Get(), dlssSrv.Get(), nullptr, nullptr, nullptr,
+        targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/true, /*preserveUi=*/false);
+    if (!ok) return 40;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 41;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t noUiHdrR0 = rows[0], noUiHdrG0 = rows[1], noUiHdrB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t noUiHdrR3 = lastRow[0], noUiHdrG3 = lastRow[1], noUiHdrB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Both row 0 and row 3 must be DLSS green tone-mapped to LDR
+    if (noUiHdrG0 < 150 || noUiHdrR0 > 50 || noUiHdrB0 > 50) return 42;
+    if (noUiHdrG3 < 150 || noUiHdrR3 > 50 || noUiHdrB3 > 50) return 43;
+
+    // Test 9: preserveUi = false ignores gameHudSrv and mask4Srv even if supplied
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameHudSrv.Get(), gameHudSrv.Get(),
+        mask4Srv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/false);
+    if (!ok) return 44;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 45;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t ignoreR3 = lastRow[0], ignoreG3 = lastRow[1], ignoreB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 3 must still be DLSS green, NOT game orange
+    if (ignoreG3 < 200 || ignoreR3 > 50 || ignoreB3 > 50) return 46;
+
+    // Test 10: preserveUi = true must fail when gameBackbufferWithUi is null
+    if (pass.composite(context.Get(), dlssSrv.Get(), nullptr, lowSrv.Get(), nullptr,
+            targetRtv.Get(), 4, 4, 2, 2, false, true)) {
+        return 47;
+    }
+
     return 0;
 }
 

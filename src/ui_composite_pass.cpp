@@ -97,10 +97,14 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     ID3D11RenderTargetView* targetBackbufferRtv,
     UINT outputWidth, UINT outputHeight,
     UINT renderWidth, UINT renderHeight,
-    bool isHdr) {
-    if (!device_ || !context_ || !dlssReconstruction || !gameBackbufferWithUi ||
-        !lowResWorld || !targetBackbufferRtv || !outputWidth || !outputHeight ||
-        !renderWidth || !renderHeight) {
+    bool isHdr,
+    bool preserveUi) {
+    if (!device_ || !context_ || !dlssReconstruction || !targetBackbufferRtv ||
+        !outputWidth || !outputHeight || !renderWidth || !renderHeight) {
+        return false;
+    }
+    if (preserveUi && (!gameBackbufferWithUi ||
+        !lowResWorld)) {
         return false;
     }
 
@@ -115,6 +119,7 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     params.outputTexel[1] = 1.0f / static_cast<float>(outputHeight);
     params.flags[0] = isHdr ? 1.0f : 0.0f;
     params.flags[1] = (renderWidth == outputWidth && renderHeight == outputHeight) ? 1.0f : 0.0f;
+    params.flags[2] = preserveUi ? 1.0f : 0.0f;
 
     context_->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &params, 0, 0);
 
@@ -123,7 +128,9 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
 
     auto* rtv = targetBackbufferRtv;
     auto* activeHudMask = hudMask ? hudMask : dummyMaskSrv_.Get();
-    ID3D11ShaderResourceView* srvs[4] = {dlssReconstruction, gameBackbufferWithUi, lowResWorld, activeHudMask};
+    auto* activeGameBackbuffer = (!preserveUi || !gameBackbufferWithUi) ? dlssReconstruction : gameBackbufferWithUi;
+    auto* activeLowResWorld = (!preserveUi || !lowResWorld) ? dlssReconstruction : lowResWorld;
+    ID3D11ShaderResourceView* srvs[4] = {dlssReconstruction, activeGameBackbuffer, activeLowResWorld, activeHudMask};
     ID3D11Buffer* cb = constantBuffer_.Get();
     auto* sampler = linearSampler_.Get();
 
