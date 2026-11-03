@@ -51,7 +51,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // 1. Cockpit Holographic HUD mask (Pass 35 replay mask)
     float4 hSample = hudMask.SampleLevel(linearSampler, uv, 0);
     float hudRaw = max(hSample.r, max(hSample.g, hSample.b));
-    float hudVal = smoothstep(0.005, 0.08, hudRaw);
+    float hudVal = smoothstep(0.002, 0.025, hudRaw);
 
     // 2. Menu 2D UI diff mask (|gameBackbuffer - lowResWorld|)
     float3 gameSample = saturate(gameBackbuffer.SampleLevel(linearSampler, uv, 0).rgb);

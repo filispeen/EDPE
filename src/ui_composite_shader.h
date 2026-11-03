@@ -43,9 +43,23 @@ float4 ps_main(VSOutput pin) : SV_Target {
         return float4(saturate(cOut), 1.0);
     }
 
-    float4 hSample = tHudMask.SampleLevel(sLinear, pin.uv, 0);
-    float hudRaw = max(hSample.r, max(hSample.g, hSample.b));
-    float hudMask = smoothstep(0.005, 0.08, hudRaw);
+    // Dilate the Pass 35 HUD mask across a 3x3 render-texel neighborhood so thin
+    // anti-aliased HUD strokes and the 1-pixel halo where temporal upscalers smear
+    // the HUD during camera motion/jitter are replaced cleanly from tGame.
+    float4 hC  = tHudMask.SampleLevel(sLinear, pin.uv, 0);
+    float4 hN  = tHudMask.SampleLevel(sLinear, pin.uv + float2(0.0, -renderTexel.y), 0);
+    float4 hS  = tHudMask.SampleLevel(sLinear, pin.uv + float2(0.0,  renderTexel.y), 0);
+    float4 hE  = tHudMask.SampleLevel(sLinear, pin.uv + float2( renderTexel.x, 0.0), 0);
+    float4 hW  = tHudMask.SampleLevel(sLinear, pin.uv + float2(-renderTexel.x, 0.0), 0);
+    float4 hNE = tHudMask.SampleLevel(sLinear, pin.uv + float2( renderTexel.x, -renderTexel.y), 0);
+    float4 hNW = tHudMask.SampleLevel(sLinear, pin.uv + float2(-renderTexel.x, -renderTexel.y), 0);
+    float4 hSE = tHudMask.SampleLevel(sLinear, pin.uv + float2( renderTexel.x,  renderTexel.y), 0);
+    float4 hSW = tHudMask.SampleLevel(sLinear, pin.uv + float2(-renderTexel.x,  renderTexel.y), 0);
+    float4 hCard = max(max(hN, hS), max(hE, hW));
+    float4 hDiag = max(max(hNE, hNW), max(hSE, hSW));
+    float4 hMax  = max(hC, max(hCard * 0.90, hDiag * 0.75));
+    float hudRaw = max(hMax.r, max(hMax.g, hMax.b));
+    float hudMask = smoothstep(0.002, 0.025, hudRaw);
 
     [branch]
     if (flags.y > 0.5 && flags.x < 0.5) {
