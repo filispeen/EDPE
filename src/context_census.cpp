@@ -697,12 +697,13 @@ static ID3D11Device* s_hud_mask_device = nullptr;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> s_hud_mask_texture;
 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_hud_mask_rtv;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_hud_mask_srv;
-Microsoft::WRL::ComPtr<ID3D11PixelShader> s_hud_mask_ps;
-Microsoft::WRL::ComPtr<ID3D11BlendState> s_hud_mask_blend;
+Microsoft::WRL::ComPtr<ID3D11BlendState> s_hud_mask_blend_add;
+Microsoft::WRL::ComPtr<ID3D11BlendState> s_hud_mask_blend_alpha;
 Microsoft::WRL::ComPtr<ID3D11DepthStencilState> s_hud_mask_ds_state;
 UINT s_hud_mask_width = 0;
 UINT s_hud_mask_height = 0;
 bool s_hud_mask_cleared_for_frame = false;
+bool s_hud_mask_active_pass = false;
 unsigned s_hud_draws_replayed_frame = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> s_hud_mask_staging;
 UINT s_hud_mask_staging_width = 0;
@@ -1119,21 +1120,28 @@ bool isGlassShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
            (vs_hash == 0x8C091FFD08644E02ull && ps_hash == 0x70F56E2EB7032E1Aull);
 }
 
+static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
+    s_hud_mask_texture.Reset();
+    s_hud_mask_rtv.Reset();
+    s_hud_mask_srv.Reset();
+    s_hud_mask_blend_add.Reset();
+    s_hud_mask_blend_alpha.Reset();
+    s_hud_mask_ds_state.Reset();
+    s_hud_mask_staging.Reset();
+    s_hud_mask_width = 0;
+    s_hud_mask_height = 0;
+    s_hud_mask_staging_width = 0;
+    s_hud_mask_staging_height = 0;
+    s_hud_mask_cleared_for_frame = false;
+    s_hud_mask_active_pass = false;
+    s_hud_mask_coverage_pending_frame = ~0ull;
+    s_hud_mask_device = newDevice;
+}
+
 void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     if (!device || width == 0 || height == 0) return;
     if (s_hud_mask_device != device) {
-        s_hud_mask_texture.Reset();
-        s_hud_mask_rtv.Reset();
-        s_hud_mask_srv.Reset();
-        s_hud_mask_ps.Reset();
-        s_hud_mask_blend.Reset();
-        s_hud_mask_ds_state.Reset();
-        s_hud_mask_staging.Reset();
-        s_hud_mask_width = 0;
-        s_hud_mask_height = 0;
-        s_hud_mask_staging_width = 0;
-        s_hud_mask_staging_height = 0;
-        s_hud_mask_device = device;
+        resetHudMaskResources(device);
     }
     if (s_hud_mask_texture && s_hud_mask_width == width && s_hud_mask_height == height) {
         return;
@@ -1172,7 +1180,7 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     s_hud_mask_width = width;
     s_hud_mask_height = height;
 
-    if (!s_hud_mask_blend) {
+    if (!s_hud_mask_blend_add) {
         D3D11_BLEND_DESC bd{};
         bd.RenderTarget[0].BlendEnable = TRUE;
         bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
@@ -1182,7 +1190,19 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
         bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
         bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-        device->CreateBlendState(&bd, &s_hud_mask_blend);
+        device->CreateBlendState(&bd, &s_hud_mask_blend_add);
+    }
+    if (!s_hud_mask_blend_alpha) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        device->CreateBlendState(&bd, &s_hud_mask_blend_alpha);
     }
     if (!s_hud_mask_ds_state) {
         D3D11_DEPTH_STENCIL_DESC dsd{};
@@ -1200,24 +1220,18 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
 
 void ensureHudMaskStaging(ID3D11Device* device, UINT width, UINT height) {
     if (!device || width == 0 || height == 0) return;
-    if (s_hud_mask_device != device) {
-        s_hud_mask_texture.Reset();
-        s_hud_mask_rtv.Reset();
-        s_hud_mask_srv.Reset();
-        s_hud_mask_ps.Reset();
-        s_hud_mask_blend.Reset();
-        s_hud_mask_ds_state.Reset();
+    if (s_hud_mask_staging) {
+        Microsoft::WRL::ComPtr<ID3D11Device> stagingDev;
+        s_hud_mask_staging->GetDevice(&stagingDev);
+        if (stagingDev.Get() == device &&
+            s_hud_mask_staging_width == width &&
+            s_hud_mask_staging_height == height) {
+            return;
+        }
         s_hud_mask_staging.Reset();
-        s_hud_mask_width = 0;
-        s_hud_mask_height = 0;
         s_hud_mask_staging_width = 0;
         s_hud_mask_staging_height = 0;
-        s_hud_mask_device = device;
     }
-    if (s_hud_mask_staging && s_hud_mask_staging_width == width && s_hud_mask_staging_height == height) {
-        return;
-    }
-    s_hud_mask_staging.Reset();
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = width;
     desc.Height = height;
@@ -1235,7 +1249,7 @@ void ensureHudMaskStaging(ID3D11Device* device, UINT width, UINT height) {
 
 void replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT instance_count,
                    UINT start_index_or_vertex, INT base_vertex, UINT start_instance) {
-    if (!context || !s_hud_mask_rtv || !s_hud_mask_blend) return;
+    if (!context || !s_hud_mask_rtv || !s_hud_mask_blend_add || !s_hud_mask_blend_alpha || !s_hud_mask_active_pass) return;
 
     ID3D11RenderTargetView* orig_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth;
@@ -1264,10 +1278,21 @@ void replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     UINT original_stencil_ref = 0;
     context->OMGetDepthStencilState(original_ds.GetAddressOf(), &original_stencil_ref);
 
+    ID3D11BlendState* blend_to_use = s_hud_mask_blend_add.Get();
+    if (original_blend) {
+        D3D11_BLEND_DESC origBlendDesc{};
+        original_blend->GetDesc(&origBlendDesc);
+        if (origBlendDesc.RenderTarget[0].BlendEnable &&
+            (origBlendDesc.RenderTarget[0].SrcBlend == D3D11_BLEND_SRC_ALPHA ||
+             origBlendDesc.RenderTarget[0].SrcBlend == D3D11_BLEND_INV_SRC_ALPHA)) {
+            blend_to_use = s_hud_mask_blend_alpha.Get();
+        }
+    }
+
     ID3D11RenderTargetView* mask = s_hud_mask_rtv.Get();
     set_targets(context, 1, &mask, depth.Get());
     const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    context->OMSetBlendState(s_hud_mask_blend.Get(), blend_factor, 0xFFFFFFFF);
+    context->OMSetBlendState(blend_to_use, blend_factor, 0xFFFFFFFF);
     if (s_hud_mask_ds_state) {
         context->OMSetDepthStencilState(s_hud_mask_ds_state.Get(), 0);
     }
@@ -1407,7 +1432,7 @@ HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT insta
                 captureEarlyMotionColor(context, true);
             }
         }
-        return HudDrawResult::HudReplay;
+        return s_hud_mask_active_pass ? HudDrawResult::HudReplay : HudDrawResult::None;
     }
     return HudDrawResult::None;
 }
@@ -3661,18 +3686,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_backbuffer_rtv.Reset();
         s_cached_backbuffer_ptr = nullptr;
         ui_composite_pass.reset();
-        s_hud_mask_texture.Reset();
-        s_hud_mask_rtv.Reset();
-        s_hud_mask_srv.Reset();
-        s_hud_mask_ps.Reset();
-        s_hud_mask_blend.Reset();
-        s_hud_mask_ds_state.Reset();
-        s_hud_mask_staging.Reset();
-        s_hud_mask_width = 0;
-        s_hud_mask_height = 0;
-        s_hud_mask_staging_width = 0;
-        s_hud_mask_staging_height = 0;
-        s_hud_mask_device = nullptr;
+        resetHudMaskResources(nullptr);
         s_temporal_resources_device = device.Get();
     }
 
@@ -4019,13 +4033,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                              srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
     inputs.colorIsHdr = isHdrColor;
 
-    if (s_hud_mask_texture && s_hud_mask_width == depthDesc.Width && s_hud_mask_height == depthDesc.Height) {
-        inputs.reactiveMask = s_hud_mask_texture.Get();
-        inputs.reactiveMaskSrv = s_hud_mask_srv.Get();
-    } else {
-        inputs.reactiveMask = nullptr;
-        inputs.reactiveMaskSrv = nullptr;
-    }
+    inputs.reactiveMask = nullptr;
+    inputs.reactiveMaskSrv = nullptr;
 
     s_last_temporal_inputs = inputs;
     s_last_temporal_inputs_frame = rendered;
@@ -4179,7 +4188,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                             s_dlss_output_srv.Get(),
                             s_backbuffer_copy_srv.Get(),
                             s_dlaa_input_srv.Get(),
-                            s_hud_mask_srv.Get(),
+                            nullptr,
                             s_backbuffer_rtv.Get(),
                             backbufferDesc.Width, backbufferDesc.Height,
                             depthDesc.Width, depthDesc.Height,
@@ -4728,7 +4737,10 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             if (motion_color_frame == current_frame) {
                 s_hdr_slot0_seen_frame = current_frame;
             }
-            if (reconstruction_active) {
+            s_hud_mask_active_pass = reconstruction_active &&
+                (s_preserve_native_ui.load(std::memory_order_relaxed) ||
+                 s_hud_debug_view.load(std::memory_order_relaxed));
+            if (s_hud_mask_active_pass) {
                 if (!hud_draw_hook_mask) {
                     beginHudDrawProbe();
                 }
@@ -5674,56 +5686,56 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 if (s_hud_draws_replayed_frame == 0) {
                     s_hud_mask_latest_coverage.store(0.0f, std::memory_order_relaxed);
                     s_hud_mask_coverage_pending_frame = ~0ull;
-                } else {
-                    const unsigned check_interval = hud_debug_active ? 30 : 300;
-                    if (s_hud_mask_texture && (rendered_frame % check_interval == 0)) {
-                        Microsoft::WRL::ComPtr<ID3D11Device> dev;
-                        context->GetDevice(&dev);
-                        if (dev) {
-                            ensureHudMaskStaging(dev.Get(), s_hud_mask_width, s_hud_mask_height);
+                } else if (s_hud_mask_texture && s_hud_mask_device) {
+                    Microsoft::WRL::ComPtr<ID3D11DeviceContext> hudCtx;
+                    s_hud_mask_device->GetImmediateContext(&hudCtx);
+                    if (hudCtx) {
+                        const unsigned check_interval = hud_debug_active ? 30 : 300;
+                        if (rendered_frame % check_interval == 0) {
+                            ensureHudMaskStaging(s_hud_mask_device, s_hud_mask_width, s_hud_mask_height);
                             if (s_hud_mask_staging) {
-                                context->CopyResource(s_hud_mask_staging.Get(), s_hud_mask_texture.Get());
+                                hudCtx->CopyResource(s_hud_mask_staging.Get(), s_hud_mask_texture.Get());
                                 s_hud_mask_coverage_pending_frame = rendered_frame;
                             }
                         }
-                    }
-                    if (s_hud_mask_staging && s_hud_mask_coverage_pending_frame != ~0ull &&
-                        rendered_frame > s_hud_mask_coverage_pending_frame) {
-                        D3D11_MAPPED_SUBRESOURCE mapped{};
-                        const HRESULT hr = context->Map(s_hud_mask_staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-                        if (SUCCEEDED(hr)) {
-                            size_t nonZero = 0;
-                            const size_t totalPixels = static_cast<size_t>(s_hud_mask_staging_width) * s_hud_mask_staging_height;
-                            const auto* ptr = static_cast<const uint8_t*>(mapped.pData);
-                            D3D11_TEXTURE2D_DESC stagingDesc{};
-                            s_hud_mask_staging->GetDesc(&stagingDesc);
-                            const size_t bytesPerPixel = (stagingDesc.Format == DXGI_FORMAT_R8_UNORM) ? 1 : 4;
-                            if (bytesPerPixel == 1) {
-                                for (UINT y = 0; y < s_hud_mask_staging_height; ++y) {
-                                    const auto* row = ptr + y * mapped.RowPitch;
-                                    for (UINT x = 0; x < s_hud_mask_staging_width; ++x) {
-                                        if (row[x] > 0) ++nonZero;
+                        if (s_hud_mask_staging && s_hud_mask_coverage_pending_frame != ~0ull &&
+                            rendered_frame > s_hud_mask_coverage_pending_frame) {
+                            D3D11_MAPPED_SUBRESOURCE mapped{};
+                            const HRESULT hr = hudCtx->Map(s_hud_mask_staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+                            if (SUCCEEDED(hr)) {
+                                size_t nonZero = 0;
+                                const size_t totalPixels = static_cast<size_t>(s_hud_mask_staging_width) * s_hud_mask_staging_height;
+                                const auto* ptr = static_cast<const uint8_t*>(mapped.pData);
+                                D3D11_TEXTURE2D_DESC stagingDesc{};
+                                s_hud_mask_staging->GetDesc(&stagingDesc);
+                                const size_t bytesPerPixel = (stagingDesc.Format == DXGI_FORMAT_R8_UNORM) ? 1 : 4;
+                                if (bytesPerPixel == 1) {
+                                    for (UINT y = 0; y < s_hud_mask_staging_height; ++y) {
+                                        const auto* row = ptr + y * mapped.RowPitch;
+                                        for (UINT x = 0; x < s_hud_mask_staging_width; ++x) {
+                                            if (row[x] > 0) ++nonZero;
+                                        }
+                                    }
+                                } else {
+                                    for (UINT y = 0; y < s_hud_mask_staging_height; ++y) {
+                                        const auto* row = reinterpret_cast<const uint32_t*>(ptr + y * mapped.RowPitch);
+                                        for (UINT x = 0; x < s_hud_mask_staging_width; ++x) {
+                                            if (row[x] != 0) ++nonZero;
+                                        }
                                     }
                                 }
-                            } else {
-                                for (UINT y = 0; y < s_hud_mask_staging_height; ++y) {
-                                    const auto* row = reinterpret_cast<const uint32_t*>(ptr + y * mapped.RowPitch);
-                                    for (UINT x = 0; x < s_hud_mask_staging_width; ++x) {
-                                        if (row[x] != 0) ++nonZero;
-                                    }
+                                hudCtx->Unmap(s_hud_mask_staging.Get(), 0);
+                                const float coverage = (totalPixels > 0) ? (static_cast<float>(nonZero) * 100.0f / totalPixels) : 0.0f;
+                                s_hud_mask_latest_coverage.store(coverage, std::memory_order_relaxed);
+                                if (s_hud_mask_coverage_pending_frame % 300 == 0) {
+                                    wchar_t msg[128];
+                                    swprintf_s(msg, L"EDPE: HUD mask coverage=%.2f%% frame=%llu", coverage, s_hud_mask_coverage_pending_frame);
+                                    EdpeLog(msg);
                                 }
+                                s_hud_mask_coverage_pending_frame = ~0ull;
+                            } else if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+                                s_hud_mask_coverage_pending_frame = ~0ull;
                             }
-                            context->Unmap(s_hud_mask_staging.Get(), 0);
-                            const float coverage = (totalPixels > 0) ? (static_cast<float>(nonZero) * 100.0f / totalPixels) : 0.0f;
-                            s_hud_mask_latest_coverage.store(coverage, std::memory_order_relaxed);
-                            if (s_hud_mask_coverage_pending_frame % 300 == 0) {
-                                wchar_t msg[128];
-                                swprintf_s(msg, L"EDPE: HUD mask coverage=%.2f%% frame=%llu", coverage, s_hud_mask_coverage_pending_frame);
-                                EdpeLog(msg);
-                            }
-                            s_hud_mask_coverage_pending_frame = ~0ull;
-                        } else if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
-                            s_hud_mask_coverage_pending_frame = ~0ull;
                         }
                     }
                 }
@@ -5779,6 +5791,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_hdr_slot0_seen_frame = ~0ull;
         s_jitter_injected_frame = ~0ull;
         s_hud_mask_cleared_for_frame = false;
+        s_hud_mask_active_pass = false;
         hud_first_match_seen = false;
         s_hud_draws_replayed_frame = 0;
         clearTrackedMappedBuffers();
@@ -6266,18 +6279,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_comp_final_rtv.Reset();
         s_backbuffer_rtv.Reset();
         s_cached_backbuffer_ptr = nullptr;
-        s_hud_mask_texture.Reset();
-        s_hud_mask_rtv.Reset();
-        s_hud_mask_srv.Reset();
-        s_hud_mask_ps.Reset();
-        s_hud_mask_blend.Reset();
-        s_hud_mask_ds_state.Reset();
-        s_hud_mask_staging.Reset();
-        s_hud_mask_width = 0;
-        s_hud_mask_height = 0;
-        s_hud_mask_staging_width = 0;
-        s_hud_mask_staging_height = 0;
-        s_hud_mask_device = nullptr;
+        resetHudMaskResources(nullptr);
         ui_composite_pass.reset();
         resetSharedBackbufferBridge();
         s_last_final_output_present.Reset();

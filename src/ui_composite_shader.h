@@ -37,7 +37,8 @@ VSOutput vs_main(uint id : SV_VertexID) {
 float4 ps_main(VSOutput pin) : SV_Target {
     int3 pixelPos = int3(pin.pos.xy, 0);
     float4 hSample = tHudMask.SampleLevel(sLinear, pin.uv, 0);
-    float hudMask = saturate(max(hSample.r, max(hSample.g, hSample.b)));
+    float hudRaw = max(hSample.r, max(hSample.g, hSample.b));
+    float hudMask = smoothstep(0.005, 0.08, hudRaw);
 
     [branch]
     if (flags.y > 0.5 && flags.x < 0.5) {

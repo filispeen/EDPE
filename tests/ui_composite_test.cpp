@@ -2,6 +2,7 @@
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -232,6 +233,49 @@ int main() {
     if (nmg0 < 200 || nmr0 > 50 || nmb0 > 50) return 26; // Native HUD mask world pixel mismatch
     // Row 3: Game orange (R ~ 255, G ~ 128, B ~ 0) preserved by hudMask despite diff == 0!
     if (nmr3 < 200 || nmg3 < 100 || nmb3 > 50) return 27; // Native HUD mask pixel mismatch (not preserved)
+
+    // Test 6a: CPU verification of HUD mask threshold & boost formula
+    auto smoothstepCalc = [](float edge0, float edge1, float x) {
+        float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    };
+    if (smoothstepCalc(0.005f, 0.08f, 0.001f) != 0.0f) return 28; // Noise < 0.005 cut to 0.0
+    if (smoothstepCalc(0.005f, 0.08f, 0.08f) != 1.0f) return 29;  // Edge reached 1.0
+    if (smoothstepCalc(0.005f, 0.08f, 0.15f) != 1.0f) return 30;  // Weak linear HDR HUD (0.15) gives 1.0
+
+    // Test 6b: GPU composite with weak linear HDR HUD signal (hudRaw ~ 0.15)
+    // Mask value 38 / 255.0 = ~0.149. Under the old saturate() formula, this would only blend
+    // 15% orange and 85% green. Under smoothstep(0.005, 0.08, hudRaw), hudMask reaches 1.0,
+    // so row 3 must be pure game orange (R ~ 255, G ~ 128, B ~ 0).
+    std::array<uint8_t, 16> weakMaskPixels{};
+    for (int i = 0; i < 8; ++i) weakMaskPixels[i] = 0;
+    for (int i = 8; i < 16; ++i) weakMaskPixels[i] = 38;
+    D3D11_SUBRESOURCE_DATA weakMaskInit{weakMaskPixels.data(), 4 * sizeof(uint8_t), 0};
+
+    ComPtr<ID3D11Texture2D> weakMaskTex;
+    ComPtr<ID3D11ShaderResourceView> weakMaskSrv;
+    if (FAILED(device->CreateTexture2D(&mask4Desc, &weakMaskInit, &weakMaskTex)) ||
+        FAILED(device->CreateShaderResourceView(weakMaskTex.Get(), nullptr, &weakMaskSrv))) {
+        return 31;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameHudSrv.Get(), gameHudSrv.Get(),
+        weakMaskSrv.Get(), targetRtv.Get(), 4, 4, 4, 4);
+    if (!ok) return 32;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 33;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t wmr0 = rows[0], wmg0 = rows[1], wmb0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t wmr3 = lastRow[0], wmg3 = lastRow[1], wmb3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0: DLSS green (R ~ 0, G ~ 255, B ~ 0)
+    if (wmg0 < 200 || wmr0 > 50 || wmb0 > 50) return 34;
+    // Row 3: Game orange (R ~ 255, G ~ 128, B ~ 0) fully boosted to weight 1.0 despite weak signal
+    if (wmr3 < 200 || wmg3 < 100 || wmb3 > 50) return 35;
 
     return 0;
 }
