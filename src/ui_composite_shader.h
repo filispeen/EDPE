@@ -43,23 +43,54 @@ float4 ps_main(VSOutput pin) : SV_Target {
         return float4(saturate(cOut), 1.0);
     }
 
-    // Dilate the Pass 35 HUD mask across a 3x3 render-texel neighborhood so thin
-    // anti-aliased HUD strokes and the 1-pixel halo where temporal upscalers smear
-    // the HUD during camera motion/jitter are replaced cleanly from tGame.
-    float4 hC  = tHudMask.SampleLevel(sLinear, pin.uv, 0);
-    float4 hN  = tHudMask.SampleLevel(sLinear, pin.uv + float2(0.0, -renderTexel.y), 0);
-    float4 hS  = tHudMask.SampleLevel(sLinear, pin.uv + float2(0.0,  renderTexel.y), 0);
-    float4 hE  = tHudMask.SampleLevel(sLinear, pin.uv + float2( renderTexel.x, 0.0), 0);
-    float4 hW  = tHudMask.SampleLevel(sLinear, pin.uv + float2(-renderTexel.x, 0.0), 0);
-    float4 hNE = tHudMask.SampleLevel(sLinear, pin.uv + float2( renderTexel.x, -renderTexel.y), 0);
-    float4 hNW = tHudMask.SampleLevel(sLinear, pin.uv + float2(-renderTexel.x, -renderTexel.y), 0);
-    float4 hSE = tHudMask.SampleLevel(sLinear, pin.uv + float2( renderTexel.x,  renderTexel.y), 0);
-    float4 hSW = tHudMask.SampleLevel(sLinear, pin.uv + float2(-renderTexel.x,  renderTexel.y), 0);
-    float4 hCard = max(max(hN, hS), max(hE, hW));
-    float4 hDiag = max(max(hNE, hNW), max(hSE, hSW));
-    float4 hMax  = max(hC, max(hCard * 0.90, hDiag * 0.75));
-    float hudRaw = max(hMax.r, max(hMax.g, hMax.b));
-    float hudMask = smoothstep(0.002, 0.025, hudRaw);
+    // Sample Pass 35 HUD mask at exact pixel center without spatial dilation so
+    // 3D background pixels surrounding HUD text/lines are never replaced with jittered tGame.
+    float4 hSample = tHudMask.SampleLevel(sLinear, pin.uv, 0);
+    float hudRaw = max(hSample.r, max(hSample.g, hSample.b));
+    float hudMask = smoothstep(0.005, 0.08, hudRaw);
+
+    if (hudMask > 0.0) {
+        // Distinguish sharp/opaque HUD elements (text, numbers, icons, reticle lines)
+        // from flat translucent HUD panels where 3D geometry edges are visible behind the panel.
+        float3 hC_ldr = toLdr(hSample.rgb);
+        float3 hN_ldr = toLdr(tHudMask.SampleLevel(sLinear, pin.uv + float2(0.0, -renderTexel.y), 0).rgb);
+        float3 hS_ldr = toLdr(tHudMask.SampleLevel(sLinear, pin.uv + float2(0.0,  renderTexel.y), 0).rgb);
+        float3 hE_ldr = toLdr(tHudMask.SampleLevel(sLinear, pin.uv + float2( renderTexel.x, 0.0), 0).rgb);
+        float3 hW_ldr = toLdr(tHudMask.SampleLevel(sLinear, pin.uv + float2(-renderTexel.x, 0.0), 0).rgb);
+        float3 hMin = min(hC_ldr, min(min(hN_ldr, hS_ldr), min(hE_ldr, hW_ldr)));
+        float3 hMax = max(hC_ldr, max(max(hN_ldr, hS_ldr), max(hE_ldr, hW_ldr)));
+        float3 hDiff = hMax - hMin;
+        float hudRange = max(hDiff.r, max(hDiff.g, hDiff.b));
+        float hudOpaque = smoothstep(0.08, 0.25, hudRaw);
+
+        int maxW = (int)renderSize.x - 1;
+        int maxH = (int)renderSize.y - 1;
+        int2 pC = clamp((int2)floor(pin.uv * renderSize), int2(0, 0), int2(maxW, maxH));
+        int2 pN = clamp(pC + int2(0, -1), int2(0, 0), int2(maxW, maxH));
+        int2 pS = clamp(pC + int2(0,  1), int2(0, 0), int2(maxW, maxH));
+        int2 pE = clamp(pC + int2( 1, 0), int2(0, 0), int2(maxW, maxH));
+        int2 pW = clamp(pC + int2(-1, 0), int2(0, 0), int2(maxW, maxH));
+        float3 lC = tLowWorld.Load(int3(pC, 0)).rgb;
+        float3 lN = tLowWorld.Load(int3(pN, 0)).rgb;
+        float3 lS = tLowWorld.Load(int3(pS, 0)).rgb;
+        float3 lE = tLowWorld.Load(int3(pE, 0)).rgb;
+        float3 lW = tLowWorld.Load(int3(pW, 0)).rgb;
+        if (flags.x > 0.5) {
+            lC = toLdr(lC);
+            lN = toLdr(lN);
+            lS = toLdr(lS);
+            lE = toLdr(lE);
+            lW = toLdr(lW);
+        }
+        float3 lMin = min(lC, min(min(lN, lS), min(lE, lW)));
+        float3 lMax = max(lC, max(max(lN, lS), max(lE, lW)));
+        float3 lDiff = lMax - lMin;
+        float lowRange = max(lDiff.r, max(lDiff.g, lDiff.b));
+
+        float bgOnlyEdge = max(0.0, lowRange - hudRange * 2.0);
+        float bgEdgeFactor = smoothstep(0.02, 0.10, bgOnlyEdge);
+        hudMask *= lerp(1.0, hudOpaque, bgEdgeFactor);
+    }
 
     [branch]
     if (flags.y > 0.5 && flags.x < 0.5) {

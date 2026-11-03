@@ -12,6 +12,7 @@ cbuffer Camera : register(b0) {
     float4 info;   // depthB, width, height, unused
 };
 Texture2D<float> sceneDepth : register(t0);
+Texture2D<float4> hudMask : register(t1);
 cbuffer EliteNow : register(b1) { float4 currentWords[336]; };
 cbuffer ElitePrevious : register(b2) { float4 previousWords[336]; };
 
@@ -24,6 +25,14 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
     float4 current2, float4 prior0, float4 prior1, float4 prior2,
     float4 projection, float depthB, bool clampCockpit) {
     if (info.y <= 0 || info.z <= 0 || projection.x <= 0 || projection.y <= 0) return 0;
+    float hudScale = 1.0;
+    if (clampCockpit) {
+        float3 hud = hudMask.Load(int3(int2(pixel.xy), 0)).rgb;
+        float hudRaw = max(hud.r, max(hud.g, hud.b));
+        float hudLock = smoothstep(0.01, 0.08, hudRaw);
+        if (hudLock >= 0.999) return 0.0;
+        hudScale = 1.0 - hudLock;
+    }
     float depth = sceneDepth.Load(int3(int2(pixel.xy), 0));
 
     // 1. Skybox, distant stars, nebula, celestial background, and star bloom:
@@ -46,7 +55,7 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
         float2 priorNdc = projection.zw * priorRay.xy / priorRay.z;
         float2 priorPixel = float2((priorNdc.x + 1.0) * info.y * 0.5,
                                    (1.0 - priorNdc.y) * info.z * 0.5);
-        return priorPixel - pixel.xy;
+        return (priorPixel - pixel.xy) * hudScale;
     }
 
     // 2. Cockpit interior (pilot dashboard, controls, instruments, cockpit lights):
@@ -70,7 +79,7 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
     float2 priorNdc = projection.zw * prior.xy / prior.z;
     float2 priorPixel = float2((priorNdc.x + 1.0) * info.y * 0.5,
                                (1.0 - priorNdc.y) * info.z * 0.5);
-    return priorPixel - pixel.xy;
+    return (priorPixel - pixel.xy) * hudScale;
 }
 
 float2 ps(float4 pixel : SV_POSITION) : SV_Target {

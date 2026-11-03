@@ -3950,8 +3950,13 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             motion_pass->clear(context);
         } else {
             // Render motion vectors at render resolution using current and previous camera projections
+            ID3D11ShaderResourceView* motionHudMaskSrv =
+                (s_hud_draws_replayed_frame > 0 && s_hud_mask_width == depthDesc.Width && s_hud_mask_height == depthDesc.Height)
+                    ? s_hud_mask_srv.Get()
+                    : nullptr;
             motion_pass->render(motion_depth_view.Get(),
-                s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height);
+                s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
+                motionHudMaskSrv);
         }
 
         if (!motion_pass->output()) return;
