@@ -1777,33 +1777,41 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 cfg.save();
             }
 
-            ImGui::TextUnformatted("HUD Position Preset:");
+            static const char* const s_pos_tooltips[8] = {
+                "Top-Left", "Top", "Top-Right",
+                "Left",            "Right",
+                "Bottom-Left", "Bottom", "Bottom-Right"
+            };
+            static const char* const s_button_ids[8] = {
+                "##hud_pos_tl", "##hud_pos_t", "##hud_pos_tr",
+                "##hud_pos_l",                 "##hud_pos_r",
+                "##hud_pos_bl", "##hud_pos_b", "##hud_pos_br"
+            };
+            static const int s_grid_to_index[3][3] = {
+                { 0, 1, 2 },
+                { 3, -1, 4 },
+                { 5, 6, 7 }
+            };
+
             const bool is_dragged = (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f);
             if (is_dragged) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "(Custom Dragged)");
+                ImGui::TextUnformatted("HUD Position: Custom (Dragged)");
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Reset Position")) {
                     cfg.perfOverlayPosX = -1.0f;
                     cfg.perfOverlayPosY = -1.0f;
                     cfg.save();
                 }
+            } else {
+                const int c = (cfg.perfOverlayCorner >= 0 && cfg.perfOverlayCorner < 8) ? cfg.perfOverlayCorner : 0;
+                ImGui::Text("HUD Position: %s", s_pos_tooltips[c]);
             }
 
-            static const int s_grid_to_index[3][3] = {
-                { 0, 1, 2 },
-                { 3, -1, 4 },
-                { 5, 6, 7 }
-            };
-            static const char* const s_pos_labels[8] = {
-                "Top-Left", "Top", "Top-Right",
-                "Left",            "Right",
-                "Bottom-Left", "Bottom", "Bottom-Right"
-            };
-            const float total_avail = ImGui::GetContentRegionAvail().x;
-            const float spacing = ImGui::GetStyle().ItemSpacing.x;
-            const float btn_w = (std::max)(40.0f, std::floor((total_avail - spacing * 2.0f) / 3.0f));
+            const float btn_size = std::floor(22.0f * (cfg.uiScale >= 0.5f ? cfg.uiScale : 1.0f));
+            const ImVec2 square_size(btn_size, btn_size);
+            const float grid_spacing = std::floor(4.0f * (cfg.uiScale >= 0.5f ? cfg.uiScale : 1.0f));
 
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(grid_spacing, grid_spacing));
             for (int row = 0; row < 3; ++row) {
                 for (int col = 0; col < 3; ++col) {
                     if (col > 0) {
@@ -1811,15 +1819,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                     }
                     const int idx = s_grid_to_index[row][col];
                     if (idx < 0) {
-                        if (is_dragged) {
-                            if (ImGui::Button("Reset", ImVec2(btn_w, 0.0f))) {
-                                cfg.perfOverlayPosX = -1.0f;
-                                cfg.perfOverlayPosY = -1.0f;
-                                cfg.save();
-                            }
-                        } else {
-                            ImGui::Dummy(ImVec2(btn_w, ImGui::GetFrameHeight()));
-                        }
+                        ImGui::Dummy(square_size);
                         continue;
                     }
 
@@ -1829,17 +1829,22 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.65f, 1.00f, 1.00f));
                         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.45f, 0.80f, 1.00f));
                     }
-                    if (ImGui::Button(s_pos_labels[idx], ImVec2(btn_w, 0.0f))) {
+                    if (ImGui::Button(s_button_ids[idx], square_size)) {
                         cfg.perfOverlayCorner = idx;
                         cfg.perfOverlayPosX = -1.0f;
                         cfg.perfOverlayPosY = -1.0f;
                         cfg.save();
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s", s_pos_tooltips[idx]);
                     }
                     if (is_selected) {
                         ImGui::PopStyleColor(3);
                     }
                 }
             }
+            ImGui::PopStyleVar(); // ItemSpacing
+            ImGui::Spacing();
             ImGui::SliderFloat("HUD Scale", &cfg.perfOverlayScale, 0.5f, 2.5f, "%.2fx");
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 cfg.save();
