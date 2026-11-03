@@ -2162,11 +2162,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             }
         } // if (cfg.devMode)
 
-        const float footerHeight = ImGui::GetTextLineHeightWithSpacing() * 2.0f + ImGui::GetStyle().ItemSpacing.y + 4.0f;
-        if (ImGui::GetContentRegionAvail().y > footerHeight) {
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetContentRegionAvail().y - footerHeight));
-        }
-
+        ImGui::Spacing();
         ImGui::Separator();
         if (cfg.devMode) {
             ImGui::TextWrapped("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter | F10: HUD debug");
