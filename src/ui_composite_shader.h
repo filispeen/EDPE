@@ -53,15 +53,19 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // The diff mask is completely bypassed so the reconstructed world is NEVER replaced with jittered tGame!
     if (flags.w > 0.5) {
         float3 cDlss = tDlss.Load(pixelPos).rgb;
-        if (flags.x > 0.5) {
-            cDlss = toLdr(cDlss);
-        }
         float4 hSample = tHudMask.Load(pixelPos);
-        float3 hudColor = (flags.x > 0.5) ? toLdr(hSample.rgb) : hSample.rgb;
-        float hudIntensity = max(hudColor.r, max(hudColor.g, hudColor.b));
-        float dim = saturate(hudIntensity * 0.5);
-        float3 finalColor = saturate(cDlss * (1.0 - dim) + hudColor);
-        return float4(finalColor, 1.0);
+        float hudTransmittance = saturate(hSample.a);
+
+        if (flags.x > 0.5) {
+            // HDR mode: both cDlss and hSample.rgb are in linear HDR space.
+            // Composite linearly in HDR, then tonemap together to LDR!
+            float3 combinedHdr = cDlss * hudTransmittance + hSample.rgb;
+            return float4(toLdr(combinedHdr), 1.0);
+        } else {
+            // SDR mode: already in LDR.
+            float3 finalColor = saturate(cDlss * hudTransmittance + hSample.rgb);
+            return float4(finalColor, 1.0);
+        }
     }
 
     // Sample Pass 35 HUD mask at exact pixel center without spatial dilation so
@@ -180,10 +184,8 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 finalColor = cDlss + uiMask * deltaUi;
 
     if (flags.w > 0.5) {
-        float3 hudColor = (flags.x > 0.5) ? toLdr(hSample.rgb) : hSample.rgb;
-        float hudIntensity = max(hudColor.r, max(hudColor.g, hudColor.b));
-        float dim = saturate(hudIntensity * 0.5);
-        finalColor = saturate(finalColor * (1.0 - dim) + hudColor);
+        float3 combined = finalColor * saturate(hSample.a) + hSample.rgb;
+        finalColor = (flags.x > 0.5) ? toLdr(combined) : saturate(combined);
     } else {
         finalColor = lerp(finalColor, cGame, saturate(hudMask));
     }

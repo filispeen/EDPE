@@ -709,6 +709,9 @@ Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_hud_mask_rtv;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_hud_mask_srv;
 Microsoft::WRL::ComPtr<ID3D11BlendState> s_hud_mask_blend_add;
 Microsoft::WRL::ComPtr<ID3D11BlendState> s_hud_mask_blend_alpha;
+Microsoft::WRL::ComPtr<ID3D11BlendState> s_hud_mask_blend_premul;
+Microsoft::WRL::ComPtr<ID3D11BlendState> s_hud_mask_blend_opaque;
+Microsoft::WRL::ComPtr<ID3D11BlendState> s_hud_mask_blend_darken;
 Microsoft::WRL::ComPtr<ID3D11DepthStencilState> s_hud_mask_ds_state;
 Microsoft::WRL::ComPtr<ID3D11DepthStencilState> s_hud_mask_ds_state_no_depth;
 UINT s_hud_mask_width = 0;
@@ -1118,14 +1121,17 @@ enum class HudDrawResult {
 };
 
 bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
-    // Verified against gameplay.rdc Pass 35 (30 cockpit holographic HUD draws) + EDVR legacy pairs
-    return (vs_hash == 0x81216C77F90DEDD6ull && ps_hash == 0xAB82734FE19EFB9Dull) || // Text, icons, gauges (12 draws in Pass 35)
-           (vs_hash == 0x2CECEC3065EF0D4Aull && ps_hash == 0xA4D03619D631B186ull) || // Holographic panels & radar (16 draws in Pass 35)
-           (vs_hash == 0x5559BD94B6852E83ull && ps_hash == 0xEA02FAC2BD6C643Cull) || // Target ship 3D hologram (1 draw in Pass 35)
-           (vs_hash == 0x5559BD94B6852E83ull && ps_hash == 0xE95634B0F61D218Full) || // Player ship 3D hologram (1 draw in Pass 35)
-           (vs_hash == 0x81216C77F90DEDD6ull && ps_hash == 0xA2965EC2931A39C8ull) || // EDVR legacy pair 2
-           (vs_hash == 0xB7790CBFC6554097ull && ps_hash == 0x8DEF46452FA459F5ull) || // EDVR legacy pair 1
-           (vs_hash == 0xE508648660A352B2ull && ps_hash == 0x63ABD86359B57D01ull);   // EDVR legacy pair 3
+    // Holographic cockpit panels, gauges, radar, text, icons, backing quads (matched by VS hash)
+    if (vs_hash == 0x81216C77F90DEDD6ull || // Cockpit holo panels (all PS variants: text, icons, lit, unlit, backing)
+        vs_hash == 0x1989E6D3B405FDE0ull || // Cockpit holo panels (GUI fx variant)
+        vs_hash == 0x2CECEC3065EF0D4Aull || // Holographic panels & radar
+        vs_hash == 0xB7790CBFC6554097ull || // Flight HUD
+        vs_hash == 0xE508648660A352B2ull || // Target sprite
+        vs_hash == 0x5559BD94B6852E83ull) { // 3D ship hologram sphere
+        return true;
+    }
+    return (vs_hash == 0x81216C77F90DEDD6ull && ps_hash == 0xAB82734FE19EFB9Dull) ||
+           (vs_hash == 0x2CECEC3065EF0D4Aull && ps_hash == 0xA4D03619D631B186ull);
 }
 
 bool isGlassShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
@@ -1140,6 +1146,9 @@ static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
     s_hud_mask_srv.Reset();
     s_hud_mask_blend_add.Reset();
     s_hud_mask_blend_alpha.Reset();
+    s_hud_mask_blend_premul.Reset();
+    s_hud_mask_blend_opaque.Reset();
+    s_hud_mask_blend_darken.Reset();
     s_hud_mask_ds_state.Reset();
     s_hud_mask_ds_state_no_depth.Reset();
     s_hud_mask_staging.Reset();
@@ -1176,7 +1185,7 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     td.Height = height;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     td.SampleDesc.Count = 1;
     td.SampleDesc.Quality = 0;
     td.Usage = D3D11_USAGE_DEFAULT;
@@ -1192,12 +1201,12 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     device->CreateTexture2D(&prevTd, nullptr, &s_hud_mask_prev_texture);
 
     D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
-    rtvDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    rtvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
     device->CreateRenderTargetView(s_hud_mask_texture.Get(), &rtvDesc, &s_hud_mask_rtv);
 
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    srvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = 1;
     device->CreateShaderResourceView(s_hud_mask_texture.Get(), &srvDesc, &s_hud_mask_srv);
@@ -1211,8 +1220,8 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
         bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
         bd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
         bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE; // Transmittance untouched: T' = T
         bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         device->CreateBlendState(&bd, &s_hud_mask_blend_add);
@@ -1221,13 +1230,49 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
         D3D11_BLEND_DESC bd{};
         bd.RenderTarget[0].BlendEnable = TRUE;
         bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
-        bd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
         bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; // T' = T * (1 - a)
         bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         device->CreateBlendState(&bd, &s_hud_mask_blend_alpha);
+    }
+    if (!s_hud_mask_blend_premul) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; // T' = T * (1 - a)
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        device->CreateBlendState(&bd, &s_hud_mask_blend_premul);
+    }
+    if (!s_hud_mask_blend_opaque) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO; // Opaque: T' = 0
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        device->CreateBlendState(&bd, &s_hud_mask_blend_opaque);
+    }
+    if (!s_hud_mask_blend_darken) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; // Darkening: T' = T * (1 - a)
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        device->CreateBlendState(&bd, &s_hud_mask_blend_darken);
     }
     if (!s_hud_mask_ds_state) {
         D3D11_DEPTH_STENCIL_DESC dsd{};
@@ -1247,7 +1292,7 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     }
 
     wchar_t msg[128];
-    swprintf_s(msg, L"EDPE: allocated HUD mask target %ux%u R11G11B10_FLOAT", width, height);
+    swprintf_s(msg, L"EDPE: allocated HUD mask target %ux%u R16G16B16A16_FLOAT", width, height);
     EdpeLog(msg);
 }
 
@@ -1270,7 +1315,7 @@ void ensureHudMaskStaging(ID3D11Device* device, UINT width, UINT height) {
     desc.Height = height;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -1314,23 +1359,32 @@ void replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     context->OMGetDepthStencilState(original_ds.GetAddressOf(), &original_stencil_ref);
 
     ID3D11BlendState* blend_to_use = s_hud_mask_blend_add.Get();
-    if (original_blend) {
+    if (!original_blend) {
+        blend_to_use = s_hud_mask_blend_opaque.Get();
+    } else {
         D3D11_BLEND_DESC origBlendDesc{};
         original_blend->GetDesc(&origBlendDesc);
-        if ((origBlendDesc.RenderTarget[0].RenderTargetWriteMask & 0x7) == 0 ||
-            (origBlendDesc.RenderTarget[0].BlendEnable &&
-             (origBlendDesc.RenderTarget[0].SrcBlend == D3D11_BLEND_ZERO ||
-              origBlendDesc.RenderTarget[0].BlendOp == D3D11_BLEND_OP_SUBTRACT ||
-              origBlendDesc.RenderTarget[0].BlendOp == D3D11_BLEND_OP_REV_SUBTRACT ||
-              origBlendDesc.RenderTarget[0].BlendOp == D3D11_BLEND_OP_MIN))) {
+        const auto& rt0 = origBlendDesc.RenderTarget[0];
+        if (rt0.RenderTargetWriteMask == 0) {
             for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
                 if (orig_rtvs[i]) orig_rtvs[i]->Release();
             }
             return;
         }
-        if (origBlendDesc.RenderTarget[0].BlendEnable &&
-            (origBlendDesc.RenderTarget[0].SrcBlend == D3D11_BLEND_SRC_ALPHA ||
-             origBlendDesc.RenderTarget[0].SrcBlend == D3D11_BLEND_SRC_ALPHA_SAT)) {
+
+        if (!rt0.BlendEnable) {
+            blend_to_use = s_hud_mask_blend_opaque.Get();
+        } else if (rt0.SrcBlend == D3D11_BLEND_ZERO) {
+            // Multiplicative darkening / backing quad
+            blend_to_use = s_hud_mask_blend_darken.Get();
+        } else if (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA) {
+            blend_to_use = s_hud_mask_blend_premul.Get();
+        } else if ((rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA || rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA_SAT) &&
+                   (rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA || rt0.DestBlend == D3D11_BLEND_INV_SRC_COLOR)) {
+            blend_to_use = s_hud_mask_blend_alpha.Get();
+        } else if (rt0.DestBlend == D3D11_BLEND_ONE) {
+            blend_to_use = s_hud_mask_blend_add.Get();
+        } else {
             blend_to_use = s_hud_mask_blend_alpha.Get();
         }
     }
@@ -5060,7 +5114,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                     }
                 }
                 if (s_hud_mask_rtv && !s_hud_mask_cleared_for_frame) {
-                    const float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                     context->ClearRenderTargetView(s_hud_mask_rtv.Get(), clearColor);
                     s_hud_mask_cleared_for_frame = true;
                     s_hud_draws_replayed_frame = 0;
@@ -5850,7 +5904,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     }
                     s_hud_draws_replayed_frame = s_hud_mask_last_valid_draws;
                 } else {
-                    const float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                     context->ClearRenderTargetView(s_hud_mask_rtv.Get(), clearColor);
                     s_hud_draws_replayed_frame = 0;
                 }
@@ -6044,15 +6098,14 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                                 const size_t totalPixels = static_cast<size_t>(s_hud_mask_staging_width) * s_hud_mask_staging_height;
                                 const auto* ptr = static_cast<const uint8_t*>(mapped.pData);
                                 for (UINT y = 0; y < s_hud_mask_staging_height; ++y) {
-                                    const auto* row = reinterpret_cast<const uint32_t*>(ptr + y * mapped.RowPitch);
+                                    const auto* row = reinterpret_cast<const uint16_t*>(ptr + y * mapped.RowPitch);
                                     for (UINT x = 0; x < s_hud_mask_staging_width; ++x) {
-                                        const uint32_t v = row[x];
-                                        const uint32_t r = v & 0x7FFu;
-                                        const uint32_t g = (v >> 11) & 0x7FFu;
-                                        const uint32_t b = (v >> 22) & 0x3FFu;
-                                        if ((r >= 0x1D2u && r <= 0x7C0u) ||
-                                            (g >= 0x1D2u && g <= 0x7C0u) ||
-                                            (b >= 0x0E9u && b <= 0x3E0u)) {
+                                        const uint16_t r = row[x * 4 + 0];
+                                        const uint16_t g = row[x * 4 + 1];
+                                        const uint16_t b = row[x * 4 + 2];
+                                        const uint16_t a = row[x * 4 + 3];
+                                        // Non-zero color or transmittance < ~0.95 (half-float 0x3BC0 is ~0.94)
+                                        if (r > 0x1000 || g > 0x1000 || b > 0x1000 || a < 0x3BC0) {
                                             ++nonZero;
                                         }
                                     }
