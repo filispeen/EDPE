@@ -1,0 +1,135 @@
+name: Bug report
+description: Report a rendering, stability, or performance problem in EDPE
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check existing issues first. Attach logs and media to this issue instead of committing them to the repository.
+
+  - type: input
+    id: version
+    attributes:
+      label: EDPE version
+      description: Shown in the overlay, or the release tag you downloaded.
+      placeholder: v0.6.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Upscaler backend
+      options:
+        - Native / Bypass
+        - NVIDIA DLAA
+        - NVIDIA DLSS
+        - AMD FSR Native AA
+        - AMD FSR Super Resolution
+        - Native D3D11 TAA
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: quality
+    attributes:
+      label: Quality mode and render scale
+      placeholder: DLSS Quality, 67%
+    validations:
+      required: false
+
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: GPU, driver version, Windows version, and whether you use multiple GPUs.
+      placeholder: |
+        GPU: RTX 4080
+        Driver: 
+        Windows: 11 23H2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: game_mode
+    attributes:
+      label: Game mode
+      options:
+        - Odyssey, flat screen
+        - Odyssey, VR
+        - Horizons, flat screen
+        - Horizons, VR
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Problem type
+      options:
+        - Flickering or strobing
+        - Ghosting or smearing
+        - HUD or UI corruption
+        - Black screen or bypass stuck
+        - Crash or hang
+        - FPS drop or stutter
+        - Input or HOTAS problem
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happens
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Where in the game it happens (menu, station, supercruise, planet, cockpit) and how to trigger it.
+      placeholder: |
+        1. 
+        2. 
+        3. 
+    validations:
+      required: true
+
+  - type: textarea
+    id: frequency
+    attributes:
+      label: Frequency
+      description: Always, periodic (for example once per second), or random. Does it happen with the Native / Bypass backend too?
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: edpe.log and edpe.ini
+      description: Drag and drop the files here. For long logs, attach the file instead of pasting.
+    validations:
+      required: true
+
+  - type: textarea
+    id: media
+    attributes:
+      label: Video, screenshots, or RenderDoc capture
+      description: Optional. A short video or a .rdc capture of a bad frame helps a lot.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I used a DLL produced by an official release or a successful build
+          required: true
+        - label: I searched existing issues
+          required: true

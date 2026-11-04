@@ -1,0 +1,60 @@
+name: Feature request
+description: Suggest an improvement or a new feature for EDPE
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check existing issues and `PLAN.md` first. The feature may already be planned.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is missing or annoying right now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What should EDPE do? Include UI, hotkeys, or `edpe.ini` options if relevant.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Upscaler backend (DLSS, FSR, XeSS, TAA)
+        - Overlay or menu
+        - Performance HUD or telemetry
+        - Camera, jitter, or motion vectors
+        - HUD or UI handling
+        - VR
+        - Configuration
+        - Build, CI, or release
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other approaches or workarounds you considered.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues
+          required: true
+        - label: The feature stays within EDPE scope (graphics API observation, no game binary, game logic, or network changes)
+          required: true
