@@ -99,23 +99,29 @@ flowchart TD
 - **Render targets**: Single RTV0 (`DXGI_FORMAT_R11G11B10_FLOAT` for HDR scene target, or `DXGI_FORMAT_R8G8B8A8_UNORM` / `R10G10B10A2_UNORM` for LDR scene target).
 - **EDPE action**: Stores `scene_hdr_color_source` ([line 2954](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L2954)) or `scene_ldr_source` ([line 2822](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L2822)). This provides the clean, jittered 3D scene color buffer consumed by [`tryTemporalUpscale`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L2214-L2228) prior to cockpit HUD composition.
 
-### Pass 4: Cockpit HUD Draw Interception & Canopy Glass Replay (One-Shot Diagnostic Probe)
-- **Hook mechanism**: [`beginHudDrawProbe`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L913-L942) hooks `DrawIndexed` ([slot 12](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L36)), `Draw` ([slot 13](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L37)), `DrawIndexedInstanced` ([slot 20](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L40)), `DrawInstanced` ([slot 21](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L41)), storing original pointers in [`original_draw_*`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L66-L71).
-- **Trigger point**: Armed during a one-shot `motion_pair_active` diagnostic capture ([`observedOMSetRenderTargets`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L3002-L3017)) when Cobra issues draw calls on `motion_color_source`, then disarmed via [`endHudDrawProbe`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L962-L994). (Not active during normal per-frame `reconstruction_active` upscaling.)
+### Pass 4: Cockpit HUD Draw Interception, Additive Mask Generation & Canopy Glass Replay
+- **Hook mechanism**: [`beginHudDrawProbe`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp) hooks `DrawIndexed` (slot 12), `Draw` (slot 13), `DrawIndexedInstanced` (slot 20), `DrawInstanced` (slot 21), storing original pointers in `original_draw_*`.
+- **Trigger point**: Armed per-frame while reconstruction is active (`edpe::UpscalerManager::instance().isReconstructionActive()`) as well as during one-shot `motion_pair_active` diagnostic captures. Hooks remain installed across frames during active reconstruction without vtable thrashing, and are disarmed via `endHudDrawProbe` when reconstruction stands down.
+- **Hot-path overhead**: Gated per draw by `motion_color_bound` (only true during HDR target rendering), adding a single CPU branch for non-HUD draws.
 - **Code locations**:
-  - Draw hook dispatches: [`observedDraw*`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L853-L911)
-  - Shader hash identification: [`observeHudDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L570-L654)
-  - Canopy glass replay: [`replayGlassDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L656-L683)
+  - Draw hook dispatches: `observedDraw*`
+  - Shader hash identification: `observeHudDraw`
+  - HUD mask replay: `replayHudDraw`
+  - Canopy glass replay: `replayGlassDraw`
 - **Shaders matched**:
-  - Cockpit HUD UI pairs:
-    - `VS=0xB7790CBFC6554097`, `PS=0x8DEF46452FA459F5`
-    - `VS=0x81216C77F90DEDD6`, `PS=0xA2965EC2931A39C8`
-    - `VS=0xE508648660A352B2`, `PS=0x63ABD86359B57D01`
-  - Canopy glass shader pair:
+  - Cockpit Holographic HUD pairs (verified against `gameplay.rdc` Pass 35 / 50, 30 draws):
+    - `VS=0x81216C77F90DEDD6`, `PS=0xAB82734FE19EFB9D`: Text, icons, gauges (12 draws)
+    - `VS=0x2CECEC3065EF0D4A`, `PS=0xA4D03619D631B186`: Holographic panels, center radar (16 draws)
+    - `VS=0x5559BD94B6852E83`, `PS=0xEA02FAC2BD6C643C`: Target ship 3D hologram (1 draw)
+    - `VS=0x5559BD94B6852E83`, `PS=0xE95634B0F61D218F`: Player ship 3D hologram (1 draw)
+    - EDVR legacy pairs: `0xB7790CBFC6554097 / 0x8DEF46452FA459F5`, `0x81216C77F90DEDD6 / 0xA2965EC2931A39C8`, `0xE508648660A352B2 / 0x63ABD86359B57D01`
+  - Canopy glass shader pairs:
     - `VS=0xF512712C40D93C12`, `PS=0x4A71EB0D34E9F2EF`
+    - `VS=0x8C091FFD08644E02`, `PS=0x70F56E2EB7032E1A`
 - **EDPE action**:
-  - Immediately before the first matched HUD draw during the probe, executes [`captureEarlyMotionColor(context, true)`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L652) to retain a pristine copy of the HDR world before UI contamination.
-  - Replays canopy glass back-face stencil draws onto `motion_clean_color_target` via [`replayGlassDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L656-L683) during the diagnostic probe.
+  - Replays every matched cockpit HUD draw into `s_hud_mask_rtv` (`R11G11B10_FLOAT`, render resolution) using the game's bound HUD shaders and an alpha/additive blend filter that skips subtractive/min-op dark backing quads.
+  - Clears the HUD mask once per frame on entry to RTV0 lighting/HUD.
+  - Passes the resulting `s_hud_mask_srv` into `UiCompositePass::composite` (`t3`) so cockpit holographic HUD draws are composed crisply from game backbuffer pixels rather than blurred/ghosted through DLSS/FSR.
 
 ---
 
@@ -185,10 +191,11 @@ edpe::PerfTracker::instance().onPresentEnd();
   - **SRV 0**: `s_dlss_output_srv` (Temporally upscaled/reconstructed 3D world).
   - **SRV 1**: `s_backbuffer_copy_srv` (Copy of game backbuffer before upscaler evaluation, containing native-resolution Cobra HUD).
   - **SRV 2**: `s_dlaa_input_srv` (Low-resolution 3D world input).
+  - **SRV 3**: `s_hud_mask_srv` (Low-resolution `R11G11B10_FLOAT` cockpit holographic HUD mask, register `t3`).
   - **Sampler 0**: Bilinear clamp sampler (`linearSampler_`).
-  - **CB 0**: `CompositeParams` (renderSize, renderTexel, outputSize, outputTexel, isHdr flag).
+  - **CB 0**: `CompositeParams` (renderSize, renderTexel, outputSize, outputTexel, isHdr flag, preserveUi flag).
   - **RTV**: `targetBackbufferRtv` (Output swapchain backbuffer).
-- **Mathematical operation**: Compares high-resolution game backbuffer with the upsampled low-res world to isolate pure UI alpha and color, then blends the crisp native-resolution UI onto the upscaled 3D scene without scaling blur or UI jitter.
+- **Mathematical operation**: Compares high-resolution game backbuffer with the upsampled low-res world to isolate pure UI alpha and color for menu UI (`|gameBackbuffer - lowResWorld|`), combined with the cockpit HUD mask via `uiMask = max(uiMask, hudMask)`. For pixels covered by the HUD mask, the shader outputs `cGame` directly, preserving holographic flight instruments without DLSS/FSR ghosting. Evaluates non-blocking coverage readback and logs `EDPE: HUD mask coverage=<percent>% frame=<n>` every 300 frames.
 
 ### Pass 4: Subpixel Jitter / Motion Debug View Pass
 - **Class**: [`edpe::JitterDebugPass`](file:///F:/Code/%D0%A1++/EDPE/src/jitter_debug_pass.h#L9-L44)
@@ -228,11 +235,12 @@ edpe::PerfTracker::instance().onPresentEnd();
 | **Main Scene 4-MRT Geometry** | Scene Pass (`OMSetRenderTargets`) | Engine Hook | Elite mesh geometry | 4 RTVs + Depth (`depth-dsv2`) | Elite scene VS/PS | [`observedOMSetRenderTargets`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L2841) |
 | **Emissive / Illumination Capture** | G-Buffer Exit (`OMSetRenderTargets`, diagnostic) | Engine Hook | RTV3 (`R11G11B10F`) | `motion_early_color_view` | `CopyResource` | [`captureEarlyMotionColor`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L1845) |
 | **Deferred Lighting / Pre-HUD Color** | Lighting Pass (`OMSetRenderTargets`) | Engine Hook | G-Buffer + lights | Single RTV0 (`R11G11B10F` / LDR) | Elite lighting PS | [src/context_census.cpp:2932-2959](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L2932-L2959) |
-| **HUD & Canopy Glass Draw Probe** | UI Passes (`Draw*` hooks, diagnostic) | Engine Hook | UI & glass meshes | RTV0 / `motion_clean_color_target` | Elite UI/glass PS | [`observeHudDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L570), [`replayGlassDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp#L656) |
+| **Cockpit HUD Draw Interception & Replay** | UI Passes (`Draw*` hooks, per-frame) | Engine Hook | UI & glass meshes | `s_hud_mask_rtv` (`R11G11B10_FLOAT`) | Game's bound HUD VS/PS (additive/alpha blend filter) | [`observeHudDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp), [`replayHudDraw`](file:///F:/Code/%D0%A1++/EDPE/src/context_census.cpp) |
 | **Motion Vector Generation** | Present (`tryTemporalUpscale`) | EDPE Pass | `motion_depth` (`R32F`), CB 32f | `motionTexture` (`R16G16F`) | `kMotionShader` (`vs_5_0`, `ps_5_0`) | [`MotionPass::render`](file:///F:/Code/%D0%A1++/EDPE/src/motion_pass.cpp#L48) |
 | **Temporal Upscaler / Reconstruct** | Present (`tryTemporalUpscale`) | EDPE Pass | Color, Depth, Motion, Jitter | `outputTexture_` / Backbuffer | DLSS / FSR / `kTaaShader` | [`UpscalerManager::evaluate`](file:///F:/Code/%D0%A1++/EDPE/src/upscaler_backend.cpp#L695) |
-| **Native UI Composition** | Present (`tryTemporalUpscale`) | EDPE Pass | Upscaled SRV, Backbuffer SRV, Low-res SRV | Backbuffer RTV | `kUiCompositeShader` (`vs_main`, `ps_main`) | [`UiCompositePass::composite`](file:///F:/Code/%D0%A1++/EDPE/src/ui_composite_pass.cpp#L77) |
+| **Native UI Composition** | Present (`tryTemporalUpscale`) | EDPE Pass | Upscaled SRV, Backbuffer SRV, Low-res SRV, HUD Mask SRV | Backbuffer RTV | `kUiCompositeShader` (`vs_main`, `ps_main`) | [`UiCompositePass::composite`](file:///F:/Code/%D0%A1++/EDPE/src/ui_composite_pass.cpp) |
 | **Subpixel Jitter Debug View** | Present (`renderJitterDebugView`) | EDPE Pass | Backbuffer copy, History SRV, Motion SRV | Backbuffer RTV | `kJitterDebugShader` (`vs_main`, `ps_main`) | [`JitterDebugPass::render`](file:///F:/Code/%D0%A1++/EDPE/src/jitter_debug_pass.cpp#L157) |
+| **Cockpit HUD & UI Debug View** | Present (`renderHudDebugView`) | EDPE Pass | Backbuffer copy, Low-res SRV, HUD Mask SRV | Backbuffer RTV | `kHudDebugShader` (`vs_main`, `ps_main`) | [`HudDebugPass::render`](file:///F:/Code/%D0%A1++/EDPE/src/hud_debug_pass.cpp) |
 | **Dear ImGui & Perf Overlay** | Present (`UiOnPresent`) | EDPE Pass | ImGui draw lists, font atlas | Backbuffer RTV | ImGui DX11 vertex/pixel shaders | [`UiOnPresent`](file:///F:/Code/%D0%A1++/EDPE/src/ui.cpp#L971), [`ImGui_ImplDX11_RenderDrawData`](file:///F:/Code/%D0%A1++/EDPE/src/ui.cpp#L1637) |
 
 ---
@@ -276,3 +284,24 @@ The report summary calculates:
 - `mv_null_frames`, `depth_null_frames`, `hist_realloc_frames`, `unique_in_fmt`: Input stability tallies.
 
 
+
+---
+
+## 7. Cockpit HUD & UI Mask Debug View (`F10`)
+
+The Cockpit HUD & UI Mask Debug View (`F10`, [`edpe::HudDebugPass`](file:///F:/Code/%D0%A1++/EDPE/src/hud_debug_pass.h)) provides runtime visual inspection of the cockpit holographic HUD mask and menu 2D UI composition channels:
+
+### Visual Modes:
+- **Mode 0 (Combined)**: Cockpit holographic HUD and 2D menu UI combined in Neon Amber (`float3(1.0, 0.55, 0.05)`) over dimmed grayscale game scene (`luma * 0.35`).
+- **Mode 1 (Cockpit Holographic HUD Only)**: Isolates Pass 35 replayed draws mask in Neon Amber.
+- **Mode 2 (Menu 2D UI Diff Only)**: Isolates native 2D menu diff (`|gameBackbuffer - lowResWorld| > threshold`) in Neon Cyan (`float3(0.05, 0.85, 1.0)`).
+- **Mode 3 (Split Heatmap)**: Neon Amber for Cockpit HUD, Neon Cyan for Menu UI, Neon Yellow for overlap.
+- **Mode 4 (Binary Mask)**: Pure black background with full mask in Amber.
+
+### Interactive Controls (Dear ImGui):
+- `Enable HUD & UI Debug View` toggle (hotkey `F10` in Dev Mode).
+- `HUD Mask Opacity` slider (`0.10x` – `3.00x`, default `1.00x`).
+- `UI Diff Threshold` slider (`0.002` – `0.100`, default `0.020`).
+- `HUD Debug Mode` dropdown (Modes 0–4).
+- Real-time readout of replayed HUD draw count and GPU mask coverage percentage.
+- Configuration persisted to `edpe.ini` under `[HUD]`.

@@ -2,6 +2,7 @@
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -67,7 +68,7 @@ int main() {
     context->RSSetViewports(1, &prior_viewport);
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
 
-    bool ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), lowSrv.Get(),
+    bool ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), lowSrv.Get(), nullptr,
         targetRtv.Get(), 4, 4, 2, 2);
     if (!ok) return 4;
 
@@ -107,7 +108,7 @@ int main() {
 
     // Test 2: Native resolution composite (renderSize == outputSize == 4x4)
     // Low-res world is 4x4 pure green (dlssSrv), game backbuffer has UI on bottom rows
-    ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), dlssSrv.Get(),
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), dlssSrv.Get(), nullptr,
         targetRtv.Get(), 4, 4, 4, 4);
     if (!ok) return 10;
 
@@ -124,7 +125,7 @@ int main() {
     if (nr3 < 200 || ng3 < 200 || nb3 < 200) return 13; // native UI pixel mismatch
 
     // Test 3: HDR native resolution composite (isHdr = true)
-    ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), dlssSrv.Get(),
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), dlssSrv.Get(), nullptr,
         targetRtv.Get(), 4, 4, 4, 4, true);
     if (!ok) return 14;
 
@@ -140,5 +141,200 @@ int main() {
     if (hg0 < 150 || hr0 > 50 || hb0 > 50) return 16; // HDR world pixel mismatch
     if (hr3 < 150 || hg3 < 150 || hb3 < 150) return 17; // HDR UI pixel mismatch
 
+    // Test 4: HUD mask composite path
+    // In this test, row 1 of low-res world (2x2) and rows 2-3 of game backbuffer (4x4)
+    // both contain orange (255, 128, 0). Because diff is 0, normal UI diff would output DLSS (green).
+    // The HUD mask is set to 255 for row 1 of the 2x2 mask (covering bottom half of output).
+    // The composite pass must output cGame (orange) for row 3, and DLSS (green) for row 0.
+    D3D11_TEXTURE2D_DESC maskDesc{};
+    maskDesc.Width = maskDesc.Height = 2;
+    maskDesc.MipLevels = maskDesc.ArraySize = 1;
+    maskDesc.Format = DXGI_FORMAT_R8_UNORM;
+    maskDesc.SampleDesc.Count = 1;
+    maskDesc.Usage = D3D11_USAGE_DEFAULT;
+    maskDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    std::array<uint8_t, 4> maskPixels = {0, 0, 255, 255}; // top row 0, bottom row 255
+    D3D11_SUBRESOURCE_DATA maskInit{maskPixels.data(), 2 * sizeof(uint8_t), 0};
+
+    // Low-res world with orange in bottom row (matches game orange, so diff is 0!)
+    // 0xAABBGGRR: Orange is R=255, G=128, B=0 -> 0xFF0080FF
+    std::array<uint32_t, 4> lowHudPixels = {0xFF00FF00, 0xFF00FF00, 0xFF0080FF, 0xFF0080FF};
+    D3D11_SUBRESOURCE_DATA lowHudInit{lowHudPixels.data(), 2 * sizeof(uint32_t), 0};
+
+    // Game backbuffer: top rows green, bottom rows orange
+    std::array<uint32_t, 16> gameHudPixels{};
+    for (int i = 0; i < 8; ++i) gameHudPixels[i] = 0xFF00FF00;
+    for (int i = 8; i < 16; ++i) gameHudPixels[i] = 0xFF0080FF;
+    D3D11_SUBRESOURCE_DATA gameHudInit{gameHudPixels.data(), 4 * sizeof(uint32_t), 0};
+
+    ComPtr<ID3D11Texture2D> maskTex, lowHudTex, gameHudTex;
+    ComPtr<ID3D11ShaderResourceView> maskSrv, lowHudSrv, gameHudSrv;
+
+    if (FAILED(device->CreateTexture2D(&maskDesc, &maskInit, &maskTex)) ||
+        FAILED(device->CreateShaderResourceView(maskTex.Get(), nullptr, &maskSrv)) ||
+        FAILED(device->CreateTexture2D(&lowDesc, &lowHudInit, &lowHudTex)) ||
+        FAILED(device->CreateShaderResourceView(lowHudTex.Get(), nullptr, &lowHudSrv)) ||
+        FAILED(device->CreateTexture2D(&outDesc, &gameHudInit, &gameHudTex)) ||
+        FAILED(device->CreateShaderResourceView(gameHudTex.Get(), nullptr, &gameHudSrv))) {
+        return 18;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameHudSrv.Get(), lowHudSrv.Get(),
+        maskSrv.Get(), targetRtv.Get(), 4, 4, 2, 2);
+    if (!ok) return 19;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 20;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t mr0 = rows[0], mg0 = rows[1], mb0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t mr3 = lastRow[0], mg3 = lastRow[1], mb3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0 should be DLSS green (R ~ 0, G ~ 255, B ~ 0)
+    if (mg0 < 200 || mr0 > 50 || mb0 > 50) return 21; // HUD mask world pixel mismatch
+    // Row 3 should be game orange (R ~ 255, G ~ 128, B ~ 0) preserved by hudMask!
+    if (mr3 < 200 || mg3 < 100 || mb3 > 50) return 22; // HUD mask pixel mismatch (not preserved)
+
+    // Test 5: HUD mask composite path at native resolution (renderSize == outputSize == 4x4)
+    // Game backbuffer and low-res world both contain orange in rows 2-3 (diff == 0!).
+    // DLSS reconstruction is green. Without hudMask, native path would output DLSS green.
+    // With hudMask enabled for bottom half (rows 2-3), orange pixels from cGame must be preserved.
+    D3D11_TEXTURE2D_DESC mask4Desc = outDesc;
+    mask4Desc.Format = DXGI_FORMAT_R8_UNORM;
+    std::array<uint8_t, 16> mask4Pixels{};
+    for (int i = 0; i < 8; ++i) mask4Pixels[i] = 0;
+    for (int i = 8; i < 16; ++i) mask4Pixels[i] = 255;
+    D3D11_SUBRESOURCE_DATA mask4Init{mask4Pixels.data(), 4 * sizeof(uint8_t), 0};
+
+    ComPtr<ID3D11Texture2D> mask4Tex;
+    ComPtr<ID3D11ShaderResourceView> mask4Srv;
+    if (FAILED(device->CreateTexture2D(&mask4Desc, &mask4Init, &mask4Tex)) ||
+        FAILED(device->CreateShaderResourceView(mask4Tex.Get(), nullptr, &mask4Srv))) {
+        return 23;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameHudSrv.Get(), gameHudSrv.Get(),
+        mask4Srv.Get(), targetRtv.Get(), 4, 4, 4, 4);
+    if (!ok) return 24;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 25;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t nmr0 = rows[0], nmg0 = rows[1], nmb0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t nmr3 = lastRow[0], nmg3 = lastRow[1], nmb3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0: DLSS green (R ~ 0, G ~ 255, B ~ 0)
+    if (nmg0 < 200 || nmr0 > 50 || nmb0 > 50) return 26; // Native HUD mask world pixel mismatch
+    // Row 3: Game orange (R ~ 255, G ~ 128, B ~ 0) preserved by hudMask despite diff == 0!
+    if (nmr3 < 200 || nmg3 < 100 || nmb3 > 50) return 27; // Native HUD mask pixel mismatch (not preserved)
+
+    // Test 6a: CPU verification of HUD mask threshold & boost formula
+    auto smoothstepCalc = [](float edge0, float edge1, float x) {
+        float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    };
+    if (smoothstepCalc(0.005f, 0.08f, 0.001f) != 0.0f) return 28; // Noise < 0.005 cut to 0.0
+    if (smoothstepCalc(0.005f, 0.08f, 0.08f) != 1.0f) return 29;  // Edge reached 1.0
+    if (smoothstepCalc(0.005f, 0.08f, 0.15f) != 1.0f) return 30;  // Weak linear HDR HUD (0.15) gives 1.0
+
+    // Test 6b: GPU composite with weak linear HDR HUD signal (hudRaw ~ 0.15)
+    // Mask value 38 / 255.0 = ~0.149. Under the old saturate() formula, this would only blend
+    // 15% orange and 85% green. Under smoothstep(0.005, 0.08, hudRaw), hudMask reaches 1.0,
+    // so row 3 must be pure game orange (R ~ 255, G ~ 128, B ~ 0).
+    std::array<uint8_t, 16> weakMaskPixels{};
+    for (int i = 0; i < 8; ++i) weakMaskPixels[i] = 0;
+    for (int i = 8; i < 16; ++i) weakMaskPixels[i] = 38;
+    D3D11_SUBRESOURCE_DATA weakMaskInit{weakMaskPixels.data(), 4 * sizeof(uint8_t), 0};
+
+    ComPtr<ID3D11Texture2D> weakMaskTex;
+    ComPtr<ID3D11ShaderResourceView> weakMaskSrv;
+    if (FAILED(device->CreateTexture2D(&mask4Desc, &weakMaskInit, &weakMaskTex)) ||
+        FAILED(device->CreateShaderResourceView(weakMaskTex.Get(), nullptr, &weakMaskSrv))) {
+        return 31;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameHudSrv.Get(), gameHudSrv.Get(),
+        weakMaskSrv.Get(), targetRtv.Get(), 4, 4, 4, 4);
+    if (!ok) return 32;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 33;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t wmr0 = rows[0], wmg0 = rows[1], wmb0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t wmr3 = lastRow[0], wmg3 = lastRow[1], wmb3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0: DLSS green (R ~ 0, G ~ 255, B ~ 0)
+    if (wmg0 < 200 || wmr0 > 50 || wmb0 > 50) return 34;
+    // Row 3: Game orange (R ~ 255, G ~ 128, B ~ 0) fully boosted to weight 1.0 despite weak signal
+    if (wmr3 < 200 || wmg3 < 100 || wmb3 > 50) return 35;
+
+    // Test 7: preserveUi = false (LDR, nullptr game backbuffer and low-res world)
+    ok = pass.composite(context.Get(), dlssSrv.Get(), nullptr, nullptr, nullptr,
+        targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/false);
+    if (!ok) return 36;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 37;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t noUiR0 = rows[0], noUiG0 = rows[1], noUiB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t noUiR3 = lastRow[0], noUiG3 = lastRow[1], noUiB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Both row 0 and row 3 must be pure DLSS green (no UI overlay)
+    if (noUiG0 < 200 || noUiR0 > 50 || noUiB0 > 50) return 38;
+    if (noUiG3 < 200 || noUiR3 > 50 || noUiB3 > 50) return 39;
+
+    // Test 8: preserveUi = false (HDR tone-mapping path)
+    ok = pass.composite(context.Get(), dlssSrv.Get(), nullptr, nullptr, nullptr,
+        targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/true, /*preserveUi=*/false);
+    if (!ok) return 40;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 41;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t noUiHdrR0 = rows[0], noUiHdrG0 = rows[1], noUiHdrB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t noUiHdrR3 = lastRow[0], noUiHdrG3 = lastRow[1], noUiHdrB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Both row 0 and row 3 must be DLSS green tone-mapped to LDR
+    if (noUiHdrG0 < 150 || noUiHdrR0 > 50 || noUiHdrB0 > 50) return 42;
+    if (noUiHdrG3 < 150 || noUiHdrR3 > 50 || noUiHdrB3 > 50) return 43;
+
+    // Test 9: preserveUi = false ignores gameHudSrv and mask4Srv even if supplied
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameHudSrv.Get(), gameHudSrv.Get(),
+        mask4Srv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/false);
+    if (!ok) return 44;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 45;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t ignoreR3 = lastRow[0], ignoreG3 = lastRow[1], ignoreB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 3 must still be DLSS green, NOT game orange
+    if (ignoreG3 < 200 || ignoreR3 > 50 || ignoreB3 > 50) return 46;
+
+    // Test 10: preserveUi = true must fail when gameBackbufferWithUi is null
+    if (pass.composite(context.Get(), dlssSrv.Get(), nullptr, lowSrv.Get(), nullptr,
+            targetRtv.Get(), 4, 4, 2, 2, false, true)) {
+        return 47;
+    }
+
     return 0;
 }
+

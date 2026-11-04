@@ -103,3 +103,16 @@ float ContextCensusGetJitterDebugThreshold();
 void ContextCensusSetJitterDebugMode(int mode);
 int ContextCensusGetJitterDebugMode();
 
+// Cockpit HUD & UI Mask Debug View (Full-screen grayscale game scene + amber HUD & cyan UI mask pixels)
+void ContextCensusSetHudDebugView(bool enable);
+bool ContextCensusGetHudDebugView();
+void ContextCensusToggleHudDebugView();
+void ContextCensusSetHudDebugOpacity(float opacity);
+float ContextCensusGetHudDebugOpacity();
+void ContextCensusSetHudDebugThreshold(float threshold);
+float ContextCensusGetHudDebugThreshold();
+void ContextCensusSetHudDebugMode(int mode);
+int ContextCensusGetHudDebugMode();
+float ContextCensusGetHudMaskCoverage();
+unsigned ContextCensusGetHudDrawsReplayed();
+

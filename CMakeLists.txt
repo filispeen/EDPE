@@ -61,6 +61,7 @@ add_library(EDPE_DXGI SHARED
     src/jitter_logger.cpp
     src/jitter_debug_pass.cpp
     src/jitter_view_recorder.cpp
+    src/hud_debug_pass.cpp
     src/dxgi_proxy.def
 )
 target_compile_features(EDPE_DXGI PRIVATE cxx_std_20)
@@ -149,6 +150,12 @@ target_compile_definitions(ui_composite_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMA
 target_include_directories(ui_composite_test PRIVATE src)
 target_link_libraries(ui_composite_test PRIVATE d3d11 d3dcompiler)
 add_test(NAME ui_composite COMMAND ui_composite_test)
+add_executable(hud_debug_test tests/hud_debug_test.cpp src/hud_debug_pass.cpp)
+target_compile_features(hud_debug_test PRIVATE cxx_std_20)
+target_compile_definitions(hud_debug_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(hud_debug_test PRIVATE src)
+target_link_libraries(hud_debug_test PRIVATE d3d11 d3dcompiler)
+add_test(NAME hud_debug COMMAND hud_debug_test)
 add_executable(dxbc_fanout_test tests/dxbc_fanout.cpp src/dxbc_hash.cpp)
 target_compile_features(dxbc_fanout_test PRIVATE cxx_std_20)
 target_compile_definitions(dxbc_fanout_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
