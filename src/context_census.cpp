@@ -631,6 +631,8 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_depth_source;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_ldr_source;
 unsigned long long scene_ldr_frame = ~0ull;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> s_recent_scene_ldr_source;
+unsigned long long s_recent_scene_ldr_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_hdr_color_source;
 unsigned long long scene_hdr_color_frame = ~0ull;
 std::array<ID3D11Resource*, 4> s_gbuffer_resources{}; // Weak; compared within current frame only.
@@ -3163,15 +3165,15 @@ static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
 static ID3D11Texture2D* s_cached_backbuffer_ptr = nullptr;
+static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_debug_backbuffer_rtv;
+static ID3D11Texture2D* s_debug_cached_backbuffer = nullptr;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_present;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_scene;
 // Keyed mutex protocol for the cross-device bridge (GPU-side synchronisation;
-// a bare Flush() does not order work between two D3D11 devices and caused
-// stale/torn frames = flicker):
-//   key 0: present device owns the texture   key 1: scene device owns it
-//   present: Acquire(0) -> copy backbuffer in -> Release(1)
-//   scene:   Acquire(1) -> reconstruct        -> Release(0)
-//   present: Acquire(0) -> copy result out    -> Release(0)
+// uses single key 0 on both devices to avoid alternating-key deadlocks on timeout):
+//   present: Acquire(0, 500) -> copy in (if needed) -> Release(0)
+//   scene:   Acquire(0, 500) -> reconstruct         -> Release(0)
+//   present: Acquire(0, 500) -> copy result out     -> Release(0)
 static Microsoft::WRL::ComPtr<IDXGIKeyedMutex> s_shared_mutex_present;
 static Microsoft::WRL::ComPtr<IDXGIKeyedMutex> s_shared_mutex_scene;
 static ID3D11Device* s_shared_present_dev = nullptr;
@@ -3183,7 +3185,23 @@ static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_reconstructed_output;
 static edpe::TemporalFrameInputs s_last_temporal_inputs{};
 static unsigned long long s_last_temporal_inputs_frame = ~0ull;
 
-constexpr DWORD kBridgeTimeoutMs = 100;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_debounced_offscreen_color;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_pending_offscreen_color;
+static bool s_has_debounced_source = false;
+static bool s_debounced_is_backbuffer = false;
+static bool s_pending_is_backbuffer = false;
+static unsigned s_pending_source_streak = 0;
+
+void resetTemporalPathDebounce() {
+    s_debounced_offscreen_color.Reset();
+    s_pending_offscreen_color.Reset();
+    s_has_debounced_source = false;
+    s_debounced_is_backbuffer = false;
+    s_pending_is_backbuffer = false;
+    s_pending_source_streak = 0;
+}
+
+constexpr DWORD kBridgeTimeoutMs = 500;
 
 void resetSharedBackbufferBridge() {
     s_shared_mutex_present.Reset();
@@ -3194,7 +3212,7 @@ void resetSharedBackbufferBridge() {
     s_shared_scene_dev = nullptr;
 }
 
-// Present device -> shared texture, then hands ownership to the scene device.
+// Present device -> shared texture, then releases key 0.
 bool bridgeCopyBackbufferIn(ID3D11DeviceContext* presentCtx, ID3D11Resource* presentBackbuffer) {
     if (!s_shared_mutex_present || !s_shared_bb_present) return false;
     if (s_shared_mutex_present->AcquireSync(0, kBridgeTimeoutMs) != S_OK) {
@@ -3203,17 +3221,17 @@ bool bridgeCopyBackbufferIn(ID3D11DeviceContext* presentCtx, ID3D11Resource* pre
         return false;
     }
     presentCtx->CopyResource(s_shared_bb_present.Get(), presentBackbuffer);
-    s_shared_mutex_present->ReleaseSync(1);
+    presentCtx->Flush();
+    s_shared_mutex_present->ReleaseSync(0);
     return true;
 }
 
 // Scene-device ownership of the shared texture for the duration of one pass.
-// Always hands the texture back (key 0) on release/destruction so the present
-// device can never deadlock, even on early returns.
+// Always uses key 0 on acquire and release so the present device can never deadlock.
 struct SceneBridgeLock {
     bool held = false;
     bool acquire() {
-        held = s_shared_mutex_scene && s_shared_mutex_scene->AcquireSync(1, kBridgeTimeoutMs) == S_OK;
+        held = s_shared_mutex_scene && s_shared_mutex_scene->AcquireSync(0, kBridgeTimeoutMs) == S_OK;
         if (!held) {
             EdpeLog(L"EDPE: WARNING: shared bridge acquire (scene) timed out; resetting bridge");
             resetSharedBackbufferBridge();
@@ -3221,8 +3239,10 @@ struct SceneBridgeLock {
         return held;
     }
     void release() {
-        if (held && s_shared_mutex_scene) s_shared_mutex_scene->ReleaseSync(0);
-        held = false;
+        if (held && s_shared_mutex_scene) {
+            s_shared_mutex_scene->ReleaseSync(0);
+            held = false;
+        }
     }
     ~SceneBridgeLock() { release(); }
 };
@@ -3371,44 +3391,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     scene_depth_source->GetDevice(&sceneDevice);
     if (!sceneDevice) sceneDevice = presentDevice;
 
-    const bool crossDevice = (sceneDevice.Get() != presentDevice.Get());
-    SceneBridgeLock sceneBridgeLock;
-    Microsoft::WRL::ComPtr<ID3D11DeviceContext> sceneCtxHolder;
-    if (crossDevice) {
-        sceneDevice->GetImmediateContext(&sceneCtxHolder);
-        if (!sceneCtxHolder) return;
-        if (!ensureSharedBackbufferBridge(presentDevice.Get(), sceneDevice.Get(), backbufferDesc)) {
-            return;
-        }
-        if (!bridgeCopyBackbufferIn(presentCtx, presentBackbuffer)) return;
-        if (!sceneBridgeLock.acquire()) return;
-        context = sceneCtxHolder.Get();
-        backbuffer = s_shared_bb_scene.Get();
-    }
-
-    Microsoft::WRL::ComPtr<ID3D11Device> device = sceneDevice;
-    if (s_temporal_resources_device != device.Get()) {
-        s_dlaa_input.Reset();
-        s_dlaa_input_srv.Reset();
-        motion_depth.Reset();
-        motion_depth_view.Reset();
-        motion_pass.reset();
-        s_dlss_output_texture.Reset();
-        s_dlss_output_srv.Reset();
-        s_backbuffer_copy.Reset();
-        s_backbuffer_copy_srv.Reset();
-        s_backbuffer_copy_rtv.Reset();
-        s_comp_eval_tex.Reset();
-        s_comp_eval_srv.Reset();
-        s_comp_eval_rtv.Reset();
-        s_comp_final_tex.Reset();
-        s_comp_final_rtv.Reset();
-        s_backbuffer_rtv.Reset();
-        s_cached_backbuffer_ptr = nullptr;
-        ui_composite_pass.reset();
-        s_temporal_resources_device = device.Get();
-    }
-
     const bool isSubNative = (depthDesc.Width < backbufferDesc.Width ||
                               depthDesc.Height < backbufferDesc.Height);
     const auto desiredMode = (isSubNative && upscaler.getBackend() != edpe::UpscalerBackend::Taa)
@@ -3416,16 +3398,23 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         : edpe::UpscaleMode::NativeAA;
     upscaler.setMode(desiredMode);
     const bool hdrInput = edpe::Config::instance().hdrInput;
-    ID3D11Texture2D* colorSource = nullptr;
+
+    ID3D11Texture2D* ldrCandidate = nullptr;
+    if (scene_ldr_source) {
+        ldrCandidate = scene_ldr_source.Get();
+    } else if (s_recent_scene_ldr_source && rendered >= s_recent_scene_ldr_frame &&
+               (rendered - s_recent_scene_ldr_frame <= 2)) {
+        ldrCandidate = s_recent_scene_ldr_source.Get();
+    }
+
+    ID3D11Texture2D* rawColorChoice = nullptr;
     if (hdrInput) {
         if (isSubNative && scene_hdr_color_source && scene_hdr_color_frame == rendered) {
-            colorSource = scene_hdr_color_source.Get();
-        } else if (isSubNative && scene_ldr_source && scene_ldr_frame == rendered) {
-            colorSource = scene_ldr_source.Get();
-        } else if (isSubNative && scene_ldr_source) {
-            colorSource = scene_ldr_source.Get();
+            rawColorChoice = scene_hdr_color_source.Get();
+        } else if (isSubNative && ldrCandidate) {
+            rawColorChoice = ldrCandidate;
         } else if (!isSubNative) {
-            colorSource = scene_hdr_color_source ? scene_hdr_color_source.Get() : backbuffer;
+            rawColorChoice = scene_hdr_color_source ? scene_hdr_color_source.Get() : presentBackbuffer;
         } else {
             if (++s_consecutive_skipped_frames > 4) {
                 s_camera_reset = true;
@@ -3433,14 +3422,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             return;
         }
     } else {
-        if (isSubNative && scene_ldr_source && scene_ldr_frame == rendered) {
-            colorSource = scene_ldr_source.Get();
-        } else if (isSubNative && scene_ldr_source) {
-            colorSource = scene_ldr_source.Get();
+        if (isSubNative && ldrCandidate) {
+            rawColorChoice = ldrCandidate;
         } else if (!isSubNative) {
-            const bool ldrAvailable = s_preserve_native_ui.load(std::memory_order_relaxed) &&
-                                      scene_ldr_source;
-            colorSource = ldrAvailable ? scene_ldr_source.Get() : backbuffer;
+            const bool ldrAvailable = s_preserve_native_ui.load(std::memory_order_relaxed) && ldrCandidate;
+            rawColorChoice = ldrAvailable ? ldrCandidate : presentBackbuffer;
             static unsigned long long s_native_src_log = ~0ull;
             if (s_native_src_log == ~0ull || frame >= s_native_src_log + 300) {
                 s_native_src_log = frame;
@@ -3448,7 +3434,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 swprintf_s(msg,
                     L"EDPE: native color source frame=%llu preserveUi=%d ldrSource=%d ldrFrame=%llu chosen=%ls",
                     frame, s_preserve_native_ui.load(std::memory_order_relaxed) ? 1 : 0,
-                    scene_ldr_source ? 1 : 0, scene_ldr_frame,
+                    ldrCandidate ? 1 : 0, scene_ldr_frame,
                     ldrAvailable ? L"scene_ldr_source" : L"backbuffer");
                 EdpeLog(msg);
             }
@@ -3469,26 +3455,133 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     }
     s_consecutive_skipped_frames = 0;
 
+    // Apply debounce hysteresis filter to prevent flapping between scene target and backbuffer
+    const bool rawIsBackbuffer = (rawColorChoice == presentBackbuffer);
+    if (s_has_debounced_source && !s_debounced_is_backbuffer) {
+        bool validDebounced = false;
+        if (s_debounced_offscreen_color) {
+            Microsoft::WRL::ComPtr<ID3D11Device> debDev;
+            s_debounced_offscreen_color->GetDevice(&debDev);
+            D3D11_TEXTURE2D_DESC debDesc{};
+            s_debounced_offscreen_color->GetDesc(&debDesc);
+            validDebounced = (debDev.Get() == sceneDevice.Get() &&
+                              debDesc.Width == depthDesc.Width &&
+                              debDesc.Height == depthDesc.Height);
+        }
+        if (!validDebounced || isSubNative != (depthDesc.Width < backbufferDesc.Width || depthDesc.Height < backbufferDesc.Height)) {
+            resetTemporalPathDebounce();
+        }
+    } else if (s_has_debounced_source && s_debounced_is_backbuffer && isSubNative) {
+        resetTemporalPathDebounce();
+    }
+
+    ID3D11Texture2D* chosenColor = nullptr;
+    if (!s_has_debounced_source) {
+        s_has_debounced_source = true;
+        s_debounced_is_backbuffer = rawIsBackbuffer;
+        s_debounced_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+        s_pending_is_backbuffer = rawIsBackbuffer;
+        s_pending_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+        s_pending_source_streak = 0;
+        chosenColor = rawColorChoice;
+    } else if (rawIsBackbuffer == s_debounced_is_backbuffer &&
+               (rawIsBackbuffer || rawColorChoice == s_debounced_offscreen_color.Get())) {
+        s_pending_is_backbuffer = rawIsBackbuffer;
+        s_pending_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+        s_pending_source_streak = 0;
+        chosenColor = rawColorChoice;
+    } else {
+        if (rawIsBackbuffer == s_pending_is_backbuffer &&
+            (rawIsBackbuffer || rawColorChoice == s_pending_offscreen_color.Get())) {
+            ++s_pending_source_streak;
+        } else {
+            s_pending_is_backbuffer = rawIsBackbuffer;
+            s_pending_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+            s_pending_source_streak = 1;
+        }
+
+        if (s_pending_source_streak >= 3) {
+            s_debounced_is_backbuffer = rawIsBackbuffer;
+            s_debounced_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+            s_pending_source_streak = 0;
+            s_camera_reset = true;
+            chosenColor = rawColorChoice;
+            EdpeLog(L"EDPE: debounced color source switched, DLSS history reset triggered");
+        } else {
+            chosenColor = s_debounced_is_backbuffer ? presentBackbuffer : s_debounced_offscreen_color.Get();
+        }
+    }
+
     D3D11_TEXTURE2D_DESC srcColorDesc{};
-    colorSource->GetDesc(&srcColorDesc);
-    if (srcColorDesc.Width != depthDesc.Width || srcColorDesc.Height != depthDesc.Height) {
-        if (!isSubNative && colorSource != backbuffer) {
-            colorSource = backbuffer;
-            colorSource->GetDesc(&srcColorDesc);
-            if (srcColorDesc.Width != depthDesc.Width || srcColorDesc.Height != depthDesc.Height) {
+    if (chosenColor != presentBackbuffer) {
+        chosenColor->GetDesc(&srcColorDesc);
+        if (srcColorDesc.Width != depthDesc.Width || srcColorDesc.Height != depthDesc.Height) {
+            if (!isSubNative) {
+                chosenColor = presentBackbuffer;
+            } else {
+                static unsigned long long s_last_dim_log = ~0ull;
+                if (s_last_dim_log == ~0ull || frame >= s_last_dim_log + 300) {
+                    s_last_dim_log = frame;
+                    wchar_t msg[192];
+                    swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu (color %ux%u != depth %ux%u)",
+                        frame, srcColorDesc.Width, srcColorDesc.Height, depthDesc.Width, depthDesc.Height);
+                    EdpeLog(msg);
+                }
                 return;
             }
-        } else {
-            static unsigned long long s_last_dim_log = ~0ull;
-            if (s_last_dim_log == ~0ull || frame >= s_last_dim_log + 300) {
-                s_last_dim_log = frame;
-                wchar_t msg[192];
-                swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu (color %ux%u != depth %ux%u)",
-                    frame, srcColorDesc.Width, srcColorDesc.Height, depthDesc.Width, depthDesc.Height);
-                EdpeLog(msg);
-            }
+        }
+    }
+
+    const bool chosenIsBackbuffer = (chosenColor == presentBackbuffer);
+    const bool preserveUi = s_preserve_native_ui.load(std::memory_order_relaxed);
+    const bool needBackbufferIn = preserveUi || chosenIsBackbuffer || hdrInput || s_cmp_seq.active;
+
+    const bool crossDevice = (sceneDevice.Get() != presentDevice.Get());
+    SceneBridgeLock sceneBridgeLock;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> sceneCtxHolder;
+    if (crossDevice) {
+        sceneDevice->GetImmediateContext(&sceneCtxHolder);
+        if (!sceneCtxHolder) return;
+        if (!ensureSharedBackbufferBridge(presentDevice.Get(), sceneDevice.Get(), backbufferDesc)) {
             return;
         }
+        if (needBackbufferIn) {
+            if (!bridgeCopyBackbufferIn(presentCtx, presentBackbuffer)) return;
+        }
+        if (!sceneBridgeLock.acquire()) return;
+        context = sceneCtxHolder.Get();
+        backbuffer = s_shared_bb_scene.Get();
+    }
+
+    ID3D11Texture2D* colorSource = chosenIsBackbuffer ? backbuffer : chosenColor;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device = sceneDevice;
+    if (s_temporal_resources_device != device.Get()) {
+        s_dlaa_input.Reset();
+        s_dlaa_input_srv.Reset();
+        motion_depth.Reset();
+        motion_depth_view.Reset();
+        motion_pass.reset();
+        s_dlss_output_texture.Reset();
+        s_dlss_output_srv.Reset();
+        s_backbuffer_copy.Reset();
+        s_backbuffer_copy_srv.Reset();
+        s_backbuffer_copy_rtv.Reset();
+        s_comp_eval_tex.Reset();
+        s_comp_eval_srv.Reset();
+        s_comp_eval_rtv.Reset();
+        s_comp_final_tex.Reset();
+        s_comp_final_rtv.Reset();
+        s_backbuffer_rtv.Reset();
+        s_cached_backbuffer_ptr = nullptr;
+        resetTemporalPathDebounce();
+        ui_composite_pass.reset();
+        s_temporal_resources_device = device.Get();
+    }
+
+    colorSource->GetDesc(&srcColorDesc);
+    if (srcColorDesc.Width != depthDesc.Width || srcColorDesc.Height != depthDesc.Height) {
+        return;
     }
 
     static bool s_first_exec_logged = false;
@@ -4000,6 +4093,32 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 s_prev_is_hdr != isHdrColor ||
                 s_prev_eval_intermediate != evalToIntermediate ||
                 s_prev_comp_ok != compOk) {
+                wchar_t diffBuf[256] = L"";
+                if (!s_path_state_valid) {
+                    wcscpy_s(diffBuf, L"init");
+                } else {
+                    int pos = 0;
+                    if (s_prev_color_source != colorSource) {
+                        pos += swprintf_s(diffBuf + pos, sizeof(diffBuf)/sizeof(diffBuf[0]) - pos,
+                            L"src(%p->%p) ", s_prev_color_source, colorSource);
+                    }
+                    if (s_prev_color_format != srcColorDesc.Format) {
+                        pos += swprintf_s(diffBuf + pos, sizeof(diffBuf)/sizeof(diffBuf[0]) - pos,
+                            L"fmt(%u->%u) ", (unsigned)s_prev_color_format, (unsigned)srcColorDesc.Format);
+                    }
+                    if (s_prev_is_hdr != isHdrColor) {
+                        pos += swprintf_s(diffBuf + pos, sizeof(diffBuf)/sizeof(diffBuf[0]) - pos,
+                            L"hdr(%d->%d) ", s_prev_is_hdr ? 1 : 0, isHdrColor ? 1 : 0);
+                    }
+                    if (s_prev_eval_intermediate != evalToIntermediate) {
+                        pos += swprintf_s(diffBuf + pos, sizeof(diffBuf)/sizeof(diffBuf[0]) - pos,
+                            L"eval(%d->%d) ", s_prev_eval_intermediate ? 1 : 0, evalToIntermediate ? 1 : 0);
+                    }
+                    if (s_prev_comp_ok != compOk) {
+                        pos += swprintf_s(diffBuf + pos, sizeof(diffBuf)/sizeof(diffBuf[0]) - pos,
+                            L"comp(%d->%d) ", s_prev_comp_ok ? 1 : 0, compOk ? 1 : 0);
+                    }
+                }
                 s_path_state_valid = true;
                 s_prev_color_source = colorSource;
                 s_prev_color_format = srcColorDesc.Format;
@@ -4008,14 +4127,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 s_prev_comp_ok = compOk;
                 if (s_path_log_count < 200) {
                     ++s_path_log_count;
-                    wchar_t pmsg[192];
+                    wchar_t pmsg[384];
                     swprintf_s(pmsg,
-                        L"EDPE: temporal path change frame=%llu src=%p fmt=%u hdr=%d eval=%d comp=%d",
+                        L"EDPE: temporal path change frame=%llu src=%p fmt=%u hdr=%d eval=%d comp=%d [reason: %ls]",
                         frame, static_cast<const void*>(colorSource),
                         static_cast<unsigned>(srcColorDesc.Format),
                         isHdrColor ? 1 : 0,
                         evalToIntermediate ? 1 : 0,
-                        compOk ? 1 : 0);
+                        compOk ? 1 : 0,
+                        diffBuf);
                     EdpeLog(pmsg);
                 }
             }
@@ -4093,8 +4213,6 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
 
     static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_debug_input_copy;
     static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_debug_input_srv;
-    static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_debug_backbuffer_rtv;
-    static ID3D11Texture2D* s_debug_cached_backbuffer = nullptr;
     static ID3D11Device* s_debug_pass_device = nullptr;
     static std::unique_ptr<edpe::JitterDebugPass> s_jitter_debug_pass;
 
@@ -4206,6 +4324,7 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         isHdr);
 
     if (crossDevice) {
+        context->Flush();
         sceneBridgeLock.release();
         bridgeCopyResultOut(presentCtx, presentBackbuffer);
     }
@@ -4322,8 +4441,10 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         motion_color_bound = bound;
 
         if (bound) {
-            scene_ldr_source.Reset();
-            scene_ldr_frame = ~0ull;
+            if (scene_ldr_frame != current_frame) {
+                scene_ldr_source.Reset();
+                scene_ldr_frame = ~0ull;
+            }
         } else if (count >= 1 && targets && targets[0] && scene_ldr_frame != current_frame &&
                    s_hdr_slot0_seen_frame == current_frame) {
             const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
@@ -4349,6 +4470,8 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                                 td.SampleDesc.Count == 1 && isLdrSceneColorFormat(td.Format)) {
                                 scene_ldr_source = tex0;
                                 scene_ldr_frame = current_frame;
+                                s_recent_scene_ldr_source = tex0;
+                                s_recent_scene_ldr_frame = current_frame;
                             }
                         }
                     }
@@ -5709,6 +5832,21 @@ extern "C" BOOL WINAPI EdpeRequestBindSequence() {
     return ContextCensusRequestBindSequence();
 }
 
+void ContextCensusOnResize(IDXGISwapChain* swap_chain) {
+    if (swap_chain != observed_swap_chain) return;
+    std::lock_guard<std::recursive_mutex> sceneLock(g_scene_ctx_mutex);
+    std::lock_guard lock(seen_mutex);
+    s_backbuffer_rtv.Reset();
+    s_cached_backbuffer_ptr = nullptr;
+    s_debug_backbuffer_rtv.Reset();
+    s_debug_cached_backbuffer = nullptr;
+    s_swapchain_backbuffer.store(nullptr, std::memory_order_relaxed);
+    resetTemporalPathDebounce();
+    resetSharedBackbufferBridge();
+    s_last_final_output_present.Reset();
+    s_last_reconstructed_output.Reset();
+}
+
 void ContextCensusOnSwapChainRelease(IUnknown* object) {
     if (object != observed_swap_chain) return;
     {
@@ -5733,6 +5871,9 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         scene_depth_source.Reset();
         scene_ldr_source.Reset();
         scene_ldr_frame = ~0ull;
+        s_recent_scene_ldr_source.Reset();
+        s_recent_scene_ldr_frame = ~0ull;
+        resetTemporalPathDebounce();
         scene_hdr_color_source.Reset();
         scene_hdr_color_frame = ~0ull;
         s_dlaa_input.Reset();
@@ -5749,6 +5890,8 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_comp_final_rtv.Reset();
         s_backbuffer_rtv.Reset();
         s_cached_backbuffer_ptr = nullptr;
+        s_debug_backbuffer_rtv.Reset();
+        s_debug_cached_backbuffer = nullptr;
         resetSharedBackbufferBridge();
         s_last_final_output_present.Reset();
         s_last_reconstructed_output.Reset();

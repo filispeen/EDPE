@@ -3,6 +3,7 @@
 
 #include <d3dcompiler.h>
 #include <algorithm>
+#include <cwchar>
 
 namespace edpe {
 
@@ -81,27 +82,33 @@ float4 ps_main(VSOutput i) : SV_Target {
 }
 )";
 
+static DXGI_FORMAT toConcreteRtvFormat(DXGI_FORMAT fmt) {
+    switch (fmt) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return DXGI_FORMAT_R11G11B10_FLOAT;
+    case DXGI_FORMAT_R16G16_TYPELESS:
+        return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    default:
+        return fmt;
+    }
+}
+
 } // namespace
 
 bool SharpenPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
     if (!device || !context || device_ ||
-        device->GetFeatureLevel() < D3D_FEATURE_LEVEL_11_0 ||
-        context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) {
+        device->GetFeatureLevel() < D3D_FEATURE_LEVEL_11_0) {
         return false;
-    }
-
-    Microsoft::WRL::ComPtr<ID3D11Device1> device1;
-    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1))) ||
-        FAILED(context->QueryInterface(IID_PPV_ARGS(&context_)))) {
-        return false;
-    }
-
-    const auto level = device->GetFeatureLevel();
-    const UINT flags = (device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED)
-        ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED : 0;
-    if (FAILED(device1->CreateDeviceContextState(flags, &level, 1, D3D11_SDK_VERSION,
-            __uuidof(ID3D11Device1), nullptr, &state_))) {
-        state_.Reset();
     }
 
     Microsoft::WRL::ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
@@ -136,7 +143,6 @@ bool SharpenPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context)
 }
 
 void SharpenPass::shutdown() {
-    state_.Reset();
     vertexShader_.Reset();
     pixelShader_.Reset();
     constantBuffer_.Reset();
@@ -144,7 +150,9 @@ void SharpenPass::shutdown() {
     sourceSrv_.Reset();
     stagingTarget_.Reset();
     stagingRtv_.Reset();
-    context_.Reset();
+    cachedTarget_ = nullptr;
+    cachedRtv_.Reset();
+    cachedDesc_ = {};
     device_ = nullptr;
     width_ = 0;
     height_ = 0;
@@ -155,8 +163,10 @@ void SharpenPass::shutdown() {
 bool SharpenPass::ensureResources(const D3D11_TEXTURE2D_DESC& desc, bool directTarget) {
     if (!device_ || desc.Width == 0 || desc.Height == 0) return false;
 
+    const DXGI_FORMAT concreteFormat = toConcreteRtvFormat(desc.Format);
+
     if (sourceTexture_ && width_ == desc.Width && height_ == desc.Height &&
-        format_ == desc.Format && direct_ == directTarget) {
+        format_ == concreteFormat && direct_ == directTarget) {
         return true;
     }
 
@@ -173,52 +183,141 @@ bool SharpenPass::ensureResources(const D3D11_TEXTURE2D_DESC& desc, bool directT
     td.Height = desc.Height;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = desc.Format;
+    td.Format = concreteFormat;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-    if (FAILED(device_->CreateTexture2D(&td, nullptr, &sourceTexture_)) ||
-        FAILED(device_->CreateShaderResourceView(sourceTexture_.Get(), nullptr, &sourceSrv_))) {
+    HRESULT hr = device_->CreateTexture2D(&td, nullptr, &sourceTexture_);
+    if (FAILED(hr)) {
+        wchar_t msg[192];
+        swprintf_s(msg, L"EDPE: sharpen ensureResources CreateTexture2D(source) failed: hr=0x%08X removed=0x%08X",
+            static_cast<unsigned>(hr), static_cast<unsigned>(device_->GetDeviceRemovedReason()));
+        EdpeLog(msg);
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = concreteFormat;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    hr = device_->CreateShaderResourceView(sourceTexture_.Get(), &srvDesc, &sourceSrv_);
+    if (FAILED(hr)) {
+        wchar_t msg[192];
+        swprintf_s(msg, L"EDPE: sharpen ensureResources CreateShaderResourceView failed: hr=0x%08X removed=0x%08X",
+            static_cast<unsigned>(hr), static_cast<unsigned>(device_->GetDeviceRemovedReason()));
+        EdpeLog(msg);
         sourceTexture_.Reset();
-        sourceSrv_.Reset();
         return false;
     }
 
     if (!directTarget) {
         td.BindFlags = D3D11_BIND_RENDER_TARGET;
-        if (FAILED(device_->CreateTexture2D(&td, nullptr, &stagingTarget_)) ||
-            FAILED(device_->CreateRenderTargetView(stagingTarget_.Get(), nullptr, &stagingRtv_))) {
+        hr = device_->CreateTexture2D(&td, nullptr, &stagingTarget_);
+        if (FAILED(hr)) {
+            wchar_t msg[192];
+            swprintf_s(msg, L"EDPE: sharpen ensureResources CreateTexture2D(staging) failed: hr=0x%08X removed=0x%08X",
+                static_cast<unsigned>(hr), static_cast<unsigned>(device_->GetDeviceRemovedReason()));
+            EdpeLog(msg);
+            sourceTexture_.Reset();
+            sourceSrv_.Reset();
+            return false;
+        }
+
+        D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+        rtvDesc.Format = concreteFormat;
+        rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        rtvDesc.Texture2D.MipSlice = 0;
+        hr = device_->CreateRenderTargetView(stagingTarget_.Get(), &rtvDesc, &stagingRtv_);
+        if (FAILED(hr)) {
+            wchar_t msg[192];
+            swprintf_s(msg, L"EDPE: sharpen ensureResources CreateRenderTargetView(staging) failed: hr=0x%08X removed=0x%08X",
+                static_cast<unsigned>(hr), static_cast<unsigned>(device_->GetDeviceRemovedReason()));
+            EdpeLog(msg);
             sourceTexture_.Reset();
             sourceSrv_.Reset();
             stagingTarget_.Reset();
-            stagingRtv_.Reset();
             return false;
         }
     }
 
     width_ = desc.Width;
     height_ = desc.Height;
-    format_ = desc.Format;
+    format_ = concreteFormat;
     direct_ = directTarget;
     return true;
 }
 
 bool SharpenPass::apply(ID3D11DeviceContext* context, ID3D11Texture2D* target, float sharpness, bool hdr) {
-    if (!device_ || !context || !target || sharpness <= 0.0f) return false;
+    if (!device_ || !context || !target || sharpness <= 0.0f) {
+        if (device_) {
+            wchar_t msg[192];
+            swprintf_s(msg, L"EDPE: sharpen apply invalid params: dev=%p ctx=%p target=%p sharp=%.2f",
+                device_, context, target, sharpness);
+            EdpeLog(msg);
+        }
+        return false;
+    }
 
     D3D11_TEXTURE2D_DESC desc{};
     target->GetDesc(&desc);
-    if (desc.SampleDesc.Count > 1) return false;
+    if (desc.SampleDesc.Count > 1) {
+        EdpeLog(L"EDPE: sharpen apply failed: MSAA target not supported");
+        return false;
+    }
 
     const bool direct = (desc.BindFlags & D3D11_BIND_RENDER_TARGET) != 0;
-    if (!ensureResources(desc, direct)) return false;
+    if (!ensureResources(desc, direct)) {
+        EdpeLog(L"EDPE: sharpen apply failed: ensureResources returned false");
+        return false;
+    }
 
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> localRtv;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> tempRtv;
     ID3D11RenderTargetView* targetRtv = nullptr;
     if (direct) {
-        if (FAILED(device_->CreateRenderTargetView(target, nullptr, &localRtv))) return false;
-        targetRtv = localRtv.Get();
+        const DXGI_FORMAT concreteFormat = toConcreteRtvFormat(desc.Format);
+        D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+        rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        rtvDesc.Texture2D.MipSlice = 0;
+        rtvDesc.Format = concreteFormat;
+        const D3D11_RENDER_TARGET_VIEW_DESC* pRtvDesc = (rtvDesc.Format != desc.Format) ? &rtvDesc : nullptr;
+
+        const bool cacheable = (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+        if (cacheable) {
+            if (target != cachedTarget_ || !cachedRtv_ ||
+                cachedDesc_.Width != desc.Width || cachedDesc_.Height != desc.Height ||
+                cachedDesc_.Format != desc.Format) {
+                cachedRtv_.Reset();
+                cachedTarget_ = target;
+                cachedDesc_ = desc;
+
+                HRESULT hr = device_->CreateRenderTargetView(target, pRtvDesc, &cachedRtv_);
+                if (FAILED(hr)) {
+                    wchar_t msg[256];
+                    swprintf_s(msg, L"EDPE: sharpen apply CreateRenderTargetView(target) failed: hr=0x%08X removed=0x%08X format=%u concrete=%u",
+                        static_cast<unsigned>(hr), static_cast<unsigned>(device_->GetDeviceRemovedReason()),
+                        static_cast<unsigned>(desc.Format), static_cast<unsigned>(concreteFormat));
+                    EdpeLog(msg);
+                    cachedTarget_ = nullptr;
+                    return false;
+                }
+            }
+            targetRtv = cachedRtv_.Get();
+        } else {
+            cachedRtv_.Reset();
+            cachedTarget_ = nullptr;
+            HRESULT hr = device_->CreateRenderTargetView(target, pRtvDesc, &tempRtv);
+            if (FAILED(hr)) {
+                wchar_t msg[256];
+                swprintf_s(msg, L"EDPE: sharpen apply CreateRenderTargetView(target) failed: hr=0x%08X removed=0x%08X format=%u concrete=%u",
+                    static_cast<unsigned>(hr), static_cast<unsigned>(device_->GetDeviceRemovedReason()),
+                    static_cast<unsigned>(desc.Format), static_cast<unsigned>(concreteFormat));
+                EdpeLog(msg);
+                return false;
+            }
+            targetRtv = tempRtv.Get();
+        }
     } else {
         targetRtv = stagingRtv_.Get();
     }
@@ -232,18 +331,68 @@ bool SharpenPass::apply(ID3D11DeviceContext* context, ID3D11Texture2D* target, f
     cb.params[3] = hdr ? 1.0f : 0.0f;
     context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cb, 0, 0);
 
-    Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
-    if (state_ && context_) {
-        context_->SwapDeviceContextState(state_.Get(), &prior);
-    }
+    // Save previous pipeline state manually (without ID3DDeviceContextState)
+    UINT origVpCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    D3D11_VIEWPORT origVps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    context->RSGetViewports(&origVpCount, origVps);
 
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> origRs;
+    context->RSGetState(&origRs);
+
+    Microsoft::WRL::ComPtr<ID3D11BlendState> origBs;
+    FLOAT origBlendFactor[4]{};
+    UINT origSampleMask = 0xFFFFFFFF;
+    context->OMGetBlendState(&origBs, origBlendFactor, &origSampleMask);
+
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> origDss;
+    UINT origStencilRef = 0;
+    context->OMGetDepthStencilState(&origDss, &origStencilRef);
+
+    ID3D11RenderTargetView* origRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    ID3D11DepthStencilView* origDsv = nullptr;
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, &origDsv);
+
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> origInputLayout;
+    context->IAGetInputLayout(&origInputLayout);
+
+    D3D11_PRIMITIVE_TOPOLOGY origTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    context->IAGetPrimitiveTopology(&origTopology);
+
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> origVs;
+    context->VSGetShader(&origVs, nullptr, nullptr);
+
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> origPs;
+    context->PSGetShader(&origPs, nullptr, nullptr);
+
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> origGs;
+    context->GSGetShader(&origGs, nullptr, nullptr);
+
+    Microsoft::WRL::ComPtr<ID3D11HullShader> origHs;
+    context->HSGetShader(&origHs, nullptr, nullptr);
+
+    Microsoft::WRL::ComPtr<ID3D11DomainShader> origDs;
+    context->DSGetShader(&origDs, nullptr, nullptr);
+
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> origPsSrv;
+    context->PSGetShaderResources(0, 1, &origPsSrv);
+
+    Microsoft::WRL::ComPtr<ID3D11Buffer> origPsCb;
+    context->PSGetConstantBuffers(0, 1, &origPsCb);
+
+    // Bind sharpen pipeline state
     const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(desc.Width), static_cast<float>(desc.Height), 0.0f, 1.0f};
     context->RSSetViewports(1, &vp);
+    context->RSSetState(nullptr);
+    context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    context->OMSetDepthStencilState(nullptr, 0);
     context->OMSetRenderTargets(1, &targetRtv, nullptr);
     context->IASetInputLayout(nullptr);
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context->VSSetShader(vertexShader_.Get(), nullptr, 0);
     context->PSSetShader(pixelShader_.Get(), nullptr, 0);
+    if (origGs) context->GSSetShader(nullptr, nullptr, 0);
+    if (origHs) context->HSSetShader(nullptr, nullptr, 0);
+    if (origDs) context->DSSetShader(nullptr, nullptr, 0);
 
     ID3D11ShaderResourceView* srvs[1] = { sourceSrv_.Get() };
     context->PSSetShaderResources(0, 1, srvs);
@@ -252,14 +401,35 @@ bool SharpenPass::apply(ID3D11DeviceContext* context, ID3D11Texture2D* target, f
 
     context->Draw(3, 0);
 
+    // Mandatory unbind
     ID3D11ShaderResourceView* nullSrv[1] = { nullptr };
     context->PSSetShaderResources(0, 1, nullSrv);
-    ID3D11RenderTargetView* nullRtv = nullptr;
-    context->OMSetRenderTargets(1, &nullRtv, nullptr);
+    ID3D11RenderTargetView* nullRtv[1] = { nullptr };
+    context->OMSetRenderTargets(1, nullRtv, nullptr);
 
-    if (state_ && prior && context_) {
-        context_->SwapDeviceContextState(prior.Get(), nullptr);
+    // Restore original pipeline state
+    if (origVpCount > 0) {
+        context->RSSetViewports(origVpCount, origVps);
     }
+    context->RSSetState(origRs.Get());
+    context->OMSetBlendState(origBs.Get(), origBlendFactor, origSampleMask);
+    context->OMSetDepthStencilState(origDss.Get(), origStencilRef);
+    context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, origDsv);
+    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+        if (origRtvs[i]) origRtvs[i]->Release();
+    }
+    if (origDsv) origDsv->Release();
+    context->IASetInputLayout(origInputLayout.Get());
+    context->IASetPrimitiveTopology(origTopology);
+    context->VSSetShader(origVs.Get(), nullptr, 0);
+    context->PSSetShader(origPs.Get(), nullptr, 0);
+    if (origGs) context->GSSetShader(origGs.Get(), nullptr, 0);
+    if (origHs) context->HSSetShader(origHs.Get(), nullptr, 0);
+    if (origDs) context->DSSetShader(origDs.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* srvToRestore = origPsSrv.Get();
+    context->PSSetShaderResources(0, 1, &srvToRestore);
+    ID3D11Buffer* cbToRestore = origPsCb.Get();
+    context->PSSetConstantBuffers(0, 1, &cbToRestore);
 
     if (!direct) {
         context->CopyResource(target, stagingTarget_.Get());

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <d3d11.h>
-#include <d3d11_1.h>
 #include <wrl/client.h>
 #include <cstdint>
 
@@ -23,8 +22,6 @@ private:
     bool ensureResources(const D3D11_TEXTURE2D_DESC& desc, bool directTarget);
 
     ID3D11Device* device_ = nullptr;
-    Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context_;
-    Microsoft::WRL::ComPtr<ID3DDeviceContextState> state_;
 
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vertexShader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixelShader_;
@@ -34,6 +31,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> sourceSrv_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingTarget_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> stagingRtv_;
+
+    ID3D11Texture2D* cachedTarget_ = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> cachedRtv_;
+    D3D11_TEXTURE2D_DESC cachedDesc_{};
 
     uint32_t width_ = 0;
     uint32_t height_ = 0;
