@@ -727,6 +727,9 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> s_hud_mask_staging;
 UINT s_hud_mask_staging_width = 0;
 UINT s_hud_mask_staging_height = 0;
 unsigned long long s_hud_mask_coverage_pending_frame = ~0ull;
+static Microsoft::WRL::ComPtr<ID3D11Buffer> s_clean_camera_cb;
+static unsigned long long s_clean_camera_frame = ~0ull;
+static std::atomic<unsigned> s_clean_camera_substitutions{0};
 unsigned motion_grid_wait = 0;
 unsigned motion_hook_watch = 0;
 struct PairDepthSample {
@@ -1119,7 +1122,8 @@ void probeWorldShaderFanout(ID3D11DeviceContext* context,
 enum class HudDrawResult {
     None,
     GlassReplay,
-    HudReplay
+    HudReplay,
+    HudJitterCancel
 };
 
 bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
@@ -1142,6 +1146,9 @@ bool isGlassShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
 }
 
 static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
+    s_clean_camera_cb.Reset();
+    s_clean_camera_frame = ~0ull;
+    s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
     s_hud_mask_texture.Reset();
     s_hud_mask_prev_texture.Reset();
     s_hud_mask_rtv.Reset();
@@ -1163,6 +1170,7 @@ static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
     s_hud_mask_active_pass = false;
     s_hud_mask_active_frame = ~0ull;
     s_hud_draws_replayed_frame = 0;
+    s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
     s_hud_mask_last_valid_frame = ~0ull;
     s_hud_mask_last_valid_draws = 0;
     s_hud_mask_coverage_pending_frame = ~0ull;
@@ -1490,7 +1498,7 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
 
 HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
-        (!s_hud_mask_active_pass && !motion_pair_active) ||
+        (!s_hud_mask_active_pass && !motion_pair_active && !ContextCensusIsJitterActive()) ||
         !motion_color_source || !motion_color_bound) return HudDrawResult::None;
 
     struct DrawProbeTimer {
@@ -1602,6 +1610,9 @@ HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT insta
             if (false) {
                 captureEarlyMotionColor(context, true);
             }
+        }
+        if (s_clean_camera_cb && (s_clean_camera_frame == motion_color_frame || s_clean_camera_frame + 1 >= motion_color_frame)) {
+            return HudDrawResult::HudJitterCancel;
         }
         return s_hud_mask_active_pass ? HudDrawResult::HudReplay : HudDrawResult::None;
     }
@@ -1822,7 +1833,29 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
         redirected = replayHudDraw(context, 'I', count, 1, start, base, 0);
     }
     if (!redirected) {
+        ID3D11Buffer* clean_cb = (hudResult == HudDrawResult::HudJitterCancel) ? s_clean_camera_cb.Get() : nullptr;
+        ID3D11Buffer* orig_cb = nullptr;
+        if (clean_cb) {
+            context->VSGetConstantBuffers(1, 1, &orig_cb);
+            if (orig_cb) {
+                D3D11_BUFFER_DESC bd{};
+                orig_cb->GetDesc(&bd);
+                if (bd.ByteWidth == 5376) {
+                    context->VSSetConstantBuffers(1, 1, &clean_cb);
+                    s_clean_camera_substitutions.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    orig_cb->Release();
+                    orig_cb = nullptr;
+                }
+            }
+        }
+
         original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
+
+        if (clean_cb && orig_cb) {
+            context->VSSetConstantBuffers(1, 1, &orig_cb);
+            orig_cb->Release();
+        }
         if (immediate) rearmHudDrawProbe();
     }
 }
@@ -1842,7 +1875,29 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
         redirected = replayHudDraw(context, 'D', count, 1, start, 0, 0);
     }
     if (!redirected) {
+        ID3D11Buffer* clean_cb = (hudResult == HudDrawResult::HudJitterCancel) ? s_clean_camera_cb.Get() : nullptr;
+        ID3D11Buffer* orig_cb = nullptr;
+        if (clean_cb) {
+            context->VSGetConstantBuffers(1, 1, &orig_cb);
+            if (orig_cb) {
+                D3D11_BUFFER_DESC bd{};
+                orig_cb->GetDesc(&bd);
+                if (bd.ByteWidth == 5376) {
+                    context->VSSetConstantBuffers(1, 1, &clean_cb);
+                    s_clean_camera_substitutions.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    orig_cb->Release();
+                    orig_cb = nullptr;
+                }
+            }
+        }
+
         original_draw.load(std::memory_order_acquire)(context, count, start);
+
+        if (clean_cb && orig_cb) {
+            context->VSSetConstantBuffers(1, 1, &orig_cb);
+            orig_cb->Release();
+        }
         if (immediate) rearmHudDrawProbe();
     }
 }
@@ -1866,8 +1921,30 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
             start_index, base_vertex, start_instance);
     }
     if (!redirected) {
+        ID3D11Buffer* clean_cb = (hudResult == HudDrawResult::HudJitterCancel) ? s_clean_camera_cb.Get() : nullptr;
+        ID3D11Buffer* orig_cb = nullptr;
+        if (clean_cb) {
+            context->VSGetConstantBuffers(1, 1, &orig_cb);
+            if (orig_cb) {
+                D3D11_BUFFER_DESC bd{};
+                orig_cb->GetDesc(&bd);
+                if (bd.ByteWidth == 5376) {
+                    context->VSSetConstantBuffers(1, 1, &clean_cb);
+                    s_clean_camera_substitutions.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    orig_cb->Release();
+                    orig_cb = nullptr;
+                }
+            }
+        }
+
         original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
             index_count, instance_count, start_index, base_vertex, start_instance);
+
+        if (clean_cb && orig_cb) {
+            context->VSSetConstantBuffers(1, 1, &orig_cb);
+            orig_cb->Release();
+        }
         if (immediate) rearmHudDrawProbe();
         if (hudResult == HudDrawResult::GlassReplay) {
             replayGlassDraw(context, index_count, instance_count,
@@ -1892,8 +1969,30 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         redirected = replayHudDraw(context, 'N', vertex_count, instance_count, start_vertex, 0, start_instance);
     }
     if (!redirected) {
+        ID3D11Buffer* clean_cb = (hudResult == HudDrawResult::HudJitterCancel) ? s_clean_camera_cb.Get() : nullptr;
+        ID3D11Buffer* orig_cb = nullptr;
+        if (clean_cb) {
+            context->VSGetConstantBuffers(1, 1, &orig_cb);
+            if (orig_cb) {
+                D3D11_BUFFER_DESC bd{};
+                orig_cb->GetDesc(&bd);
+                if (bd.ByteWidth == 5376) {
+                    context->VSSetConstantBuffers(1, 1, &clean_cb);
+                    s_clean_camera_substitutions.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    orig_cb->Release();
+                    orig_cb = nullptr;
+                }
+            }
+        }
+
         original_draw_instanced.load(std::memory_order_acquire)(context,
             vertex_count, instance_count, start_vertex, start_instance);
+
+        if (clean_cb && orig_cb) {
+            context->VSSetConstantBuffers(1, 1, &orig_cb);
+            orig_cb->Release();
+        }
         if (immediate) rearmHudDrawProbe();
     }
 }
@@ -2446,6 +2545,22 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
                     float jittered_block[16]{};
                     if (edpe::jitterEliteProjectionBlock(&mutable_words[1080], jittered_block, jitter)) {
+                        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+                        context->GetDevice(&dev);
+                        if (dev) {
+                            if (!s_clean_camera_cb) {
+                                D3D11_BUFFER_DESC cbd{};
+                                cbd.ByteWidth = 5376;
+                                cbd.Usage = D3D11_USAGE_DEFAULT;
+                                cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                                dev->CreateBuffer(&cbd, nullptr, &s_clean_camera_cb);
+                            }
+                            if (s_clean_camera_cb) {
+                                context->UpdateSubresource(s_clean_camera_cb.Get(), 0, nullptr, mutable_words, 0, 0);
+                                s_clean_camera_frame = cur_frame;
+                            }
+                        }
+
                         std::memcpy(&mutable_words[1080], jittered_block, sizeof(jittered_block));
                         s_injected_jitter = jitter;
                         s_last_rendered_jitter = jitter;
@@ -5088,6 +5203,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             s_hud_mask_active_pass = false;
             s_hud_mask_cleared_for_frame = false;
             s_hud_draws_replayed_frame = 0;
+    s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
         }
         if ((motion_pair_active || reconstruction_active) && motion_color_source &&
             motion_color_frame == current_frame) {
@@ -5125,6 +5241,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             }
             s_hud_mask_active_pass =
                 (upscale_active && s_preserve_native_ui.load(std::memory_order_relaxed)) ||
+                ContextCensusIsJitterActive() ||
                 s_hud_debug_view.load(std::memory_order_relaxed);
             if (s_hud_mask_active_pass) {
                 if (!hud_draw_hook_mask) {
@@ -5953,6 +6070,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                     context->ClearRenderTargetView(s_hud_mask_rtv.Get(), clearColor);
                     s_hud_draws_replayed_frame = 0;
+    s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
                 }
             } else if (can_retain_prev_hud &&
                        s_hud_draws_replayed_frame < (s_hud_mask_last_valid_draws + 1) / 2 &&
@@ -6226,6 +6344,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_hud_mask_active_pass = false;
         hud_first_match_seen = false;
         s_hud_draws_replayed_frame = 0;
+    s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
         clearTrackedMappedBuffers();
         clearRejectedResourceCache();
         static uint64_t s_watchdog_last_camera_seen = 0;
@@ -7155,7 +7274,8 @@ float ContextCensusGetHudMaskCoverage() {
 }
 
 unsigned ContextCensusGetHudDrawsReplayed() {
-    return s_hud_mask_latest_draws.load(std::memory_order_relaxed);
+    const unsigned subs = s_clean_camera_substitutions.load(std::memory_order_relaxed);
+    return subs > 0 ? subs : s_hud_mask_latest_draws.load(std::memory_order_relaxed);
 }
 
 
