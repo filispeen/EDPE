@@ -86,7 +86,7 @@ public:
         enableProfiler = GetPrivateProfileIntW(L"Overlay", L"EnableProfiler", 0, path.c_str()) != 0;
         Profiler::instance().setEnabled(enableProfiler);
         perfOverlayCorner = GetPrivateProfileIntW(L"Overlay", L"Corner", 0, path.c_str());
-        if (perfOverlayCorner < 0 || perfOverlayCorner > 3) perfOverlayCorner = 0;
+        if (perfOverlayCorner < 0 || perfOverlayCorner > 7) perfOverlayCorner = 0;
 
         GetPrivateProfileStringW(L"Overlay", L"Scale", L"1.0", buf, 64, path.c_str());
         perfOverlayScale = static_cast<float>(_wtof(buf));
@@ -100,6 +100,15 @@ public:
         perfOverlayPosX = static_cast<float>(_wtof(buf));
         GetPrivateProfileStringW(L"Overlay", L"PosY", L"-1.0", buf, 64, path.c_str());
         perfOverlayPosY = static_cast<float>(_wtof(buf));
+
+        GetPrivateProfileStringW(L"Overlay", L"MenuPosX", L"-1.0", buf, 64, path.c_str());
+        menuPosX = static_cast<float>(_wtof(buf));
+        GetPrivateProfileStringW(L"Overlay", L"MenuPosY", L"-1.0", buf, 64, path.c_str());
+        menuPosY = static_cast<float>(_wtof(buf));
+        GetPrivateProfileStringW(L"Overlay", L"MenuWidth", L"-1.0", buf, 64, path.c_str());
+        menuWidth = static_cast<float>(_wtof(buf));
+        GetPrivateProfileStringW(L"Overlay", L"MenuHeight", L"-1.0", buf, 64, path.c_str());
+        menuHeight = static_cast<float>(_wtof(buf));
 
         int devVal = GetPrivateProfileIntW(L"Overlay", L"DEV", -1, path.c_str());
         if (devVal < 0) {
@@ -158,6 +167,14 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"PosX", buf, path.c_str());
         swprintf_s(buf, L"%.1f", perfOverlayPosY);
         WritePrivateProfileStringW(L"Overlay", L"PosY", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", menuPosX);
+        WritePrivateProfileStringW(L"Overlay", L"MenuPosX", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", menuPosY);
+        WritePrivateProfileStringW(L"Overlay", L"MenuPosY", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", menuWidth);
+        WritePrivateProfileStringW(L"Overlay", L"MenuWidth", buf, path.c_str());
+        swprintf_s(buf, L"%.1f", menuHeight);
+        WritePrivateProfileStringW(L"Overlay", L"MenuHeight", buf, path.c_str());
         WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
     }
 
@@ -268,11 +285,15 @@ public:
     bool showPerfOverlay = false;
     bool captureOverlayInComparison = false;
     bool enableProfiler = false;
-    int perfOverlayCorner = 0; // 0=Top-Left, 1=Top-Right, 2=Bottom-Left, 3=Bottom-Right
+    int perfOverlayCorner = 0; // 0=Top-Left, 1=Top, 2=Top-Right, 3=Left, 4=Right, 5=Bottom-Left, 6=Bottom, 7=Bottom-Right
     float perfOverlayScale = 1.0f;
     float uiScale = 1.0f;
     float perfOverlayPosX = -1.0f;
     float perfOverlayPosY = -1.0f;
+    float menuPosX = -1.0f;
+    float menuPosY = -1.0f;
+    float menuWidth = -1.0f;
+    float menuHeight = -1.0f;
     bool devMode = false;
 };
 

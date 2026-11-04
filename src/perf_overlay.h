@@ -9,8 +9,44 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <chrono>
+#include <imgui.h>
 
 namespace edpe {
+
+// Throttled (15 Hz / 66.67 ms) telemetry snapshot consumed by all text metrics in both overlays
+struct CachedTelemetryStats {
+    float fps = 0.0f;
+    float onePercentLowFps = 0.0f;
+    float gameFrametimeMs = 0.0f;
+    float upscalerFrametimeMs = 0.0f;
+    float totalFrametimeMs = 0.0f;
+
+    uint32_t renderWidth = 0;
+    uint32_t renderHeight = 0;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
+
+    std::wstring gpuName;
+    uint32_t gpuUsagePct = 0;
+    bool gpuLoadAvailable = false;
+
+    uint64_t vramUsedBytes = 0;
+    uint64_t vramTotalBytes = 0;
+
+    // Pre-formatted strings (updated at 15 Hz / 66.67 ms) for zero-overhead per-frame rendering
+    char fpsLine[64]{};
+    char gameFtLine[64]{};
+    char upscalerFtLine[64]{};
+    char totalFtLine[64]{};
+    char upscalerInfoLine[96]{};
+    char gpuLine[96]{};
+    char vramLine[64]{};
+    char resLine[96]{};
+    char reconStatusLine[96]{};
+    ImVec4 fpsColor{0.2f, 1.0f, 0.2f, 1.0f};
+    ImVec4 reconStatusColor{0.2f, 1.0f, 0.2f, 1.0f};
+};
 
 struct PerfTelemetry {
     float fps = 0.0f;
@@ -25,6 +61,7 @@ struct PerfTelemetry {
 
     std::wstring gpuName;
     uint32_t gpuUsagePct = 0;
+    bool gpuLoadAvailable = false;
 
     uint64_t vramUsedBytes = 0;
     uint64_t vramTotalBytes = 0;
@@ -44,10 +81,14 @@ public:
     void onPresentEnd();
 
     const PerfTelemetry& getTelemetry() const { return telemetry_; }
+    const CachedTelemetryStats& getCachedTelemetry() const { return cachedStats_; }
+    const CachedTelemetryStats& getCachedStats() const { return cachedStats_; }
 
     void renderOverlay(bool isMenuOpen, int corner, float scale = 1.0f, const PerfOverlayOverride* override = nullptr);
     void initNvml();
     void shutdown();
+    void updateCachedStats();
+    void refreshCachedStats() { updateCachedStats(); }
 
 private:
     PerfTracker();
@@ -55,10 +96,11 @@ private:
 
     void updateTelemetry(IDXGISwapChain* swapChain);
     void renderFrametimeGraph(float scale, const PerfOverlayOverride* override = nullptr);
+    float calculateOnePercentLow() const;
 
     PerfTelemetry telemetry_{};
-    PerfTelemetry displayTelemetry_{};
-    LARGE_INTEGER lastDisplayUpdate_{};
+    CachedTelemetryStats cachedStats_{};
+    std::chrono::steady_clock::time_point lastCacheUpdate_{};
 
     struct ProfilerDisplaySnapshot {
         float mapMs = 0.0f;
@@ -82,7 +124,8 @@ private:
         float upscalerMs = 0.0f;
         float totalMs = 0.0f;
     };
-    static constexpr size_t kFrametimeHistorySize = 120;
+    static constexpr size_t kFrametimeHistorySize = 360;
+    static constexpr size_t kGraphSampleCount = 120;
     std::array<FrametimeSample, kFrametimeHistorySize> frametimeHistory_{};
     size_t historyIndex_ = 0;
     size_t historyCount_ = 0;

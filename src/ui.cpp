@@ -72,6 +72,7 @@ struct UiState {
     ID3D11ShaderResourceView* color_srv = nullptr;
     ID3D11ShaderResourceView* early_color_srv = nullptr;
     ID3D11ShaderResourceView* motion_srv = nullptr;
+    ImFont* font_proggy_forever = nullptr;
     std::vector<TextureCaptureRequest> pending_captures;
     // Comparison frames waiting for the performance HUD to be drawn onto them
     // (drawn in UiOnPresent, then handed to the normal BMP capture queue).
@@ -131,6 +132,15 @@ std::atomic<bool> all_captures_requested{false};
 std::mutex input_mutex;
 std::vector<InputMessage> pending_input;
 std::vector<InputMessage> render_input;
+ImGuiStyle s_base_imgui_style;
+bool s_base_style_initialized = false;
+static bool s_reset_menu_layout = false;
+
+void TextDisabledWrapped(const char* text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+}
 
 bool isInputMessage(UINT message) {
     if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) return true;
@@ -209,6 +219,13 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
             return true;
         }
         if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F9) return true;
+
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+            wparam == VK_F10 && !(lparam & (1LL << 30))) {
+            EdpeLog(L"EDPE: F10 pressed — Cockpit HUD & UI Mask Debug View (Phase 12 feature)");
+            return true;
+        }
+        if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F10) return true;
     }
     if (menu_visible.load()) {
         if (message == WM_INPUT) return true;
@@ -532,7 +549,12 @@ void flushOverlayCaptures(bool drawOverlay) {
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
-            edpe::PerfTracker::instance().renderOverlay(false, cfg.perfOverlayCorner, cfg.perfOverlayScale,
+            const float hudScale = std::clamp(cfg.perfOverlayScale, 0.5f, 2.5f);
+            ImGui::GetStyle() = s_base_imgui_style;
+            ImGui::GetStyle().ScaleAllSizes(hudScale);
+            ImGui::GetStyle().FontScaleMain = hudScale;
+            ImGui::GetIO().FontGlobalScale = 1.0f;
+            edpe::PerfTracker::instance().renderOverlay(false, cfg.perfOverlayCorner, hudScale,
                 item.backendId >= 0 ? &ov : nullptr);
             ImGui::Render();
             ui.context->OMSetRenderTargets(1, &item.rtv, nullptr);
@@ -1357,9 +1379,6 @@ void captureColorSnapshot(ID3D11RenderTargetView* view, unsigned index) {
     srcDevice->Release();
 }
 
-static ImGuiStyle s_base_imgui_style;
-static bool s_base_style_initialized = false;
-
 static void applyUiScale(float scale) {
     if (!ui.imgui) return;
     ImGuiContext* previous = ImGui::GetCurrentContext();
@@ -1370,9 +1389,10 @@ static void applyUiScale(float scale) {
     }
     scale = std::clamp(scale, 0.5f, 2.5f);
     ImGuiIO& io = ImGui::GetIO();
-    io.FontGlobalScale = scale;
+    io.FontGlobalScale = 1.0f;
     ImGui::GetStyle() = s_base_imgui_style;
     ImGui::GetStyle().ScaleAllSizes(scale);
+    ImGui::GetStyle().FontScaleMain = scale;
     ImGui::SetCurrentContext(previous);
 }
 
@@ -1423,9 +1443,16 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     ImGuiContext* previous = ImGui::GetCurrentContext();
     ui.imgui = ImGui::CreateContext();
     if (!ui.imgui) return false;
-    ImGui::GetIO().IniFilename = nullptr;
-    ImGui::GetIO().MouseDrawCursor = false;
-    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.MouseDrawCursor = false;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    ui.font_proggy_forever = io.Fonts->AddFontDefaultVector();
+    io.FontDefault = ui.font_proggy_forever;
+    io.FontGlobalScale = 1.0f;
+    s_base_imgui_style = ImGui::GetStyle();
+    s_base_imgui_style.FontScaleMain = 1.0f;
+    s_base_style_initialized = true;
     const bool win32_ready = ImGui_ImplWin32_Init(ui.window);
     const bool dx11_ready = win32_ready && ImGui_ImplDX11_Init(ui.device, ui.context);
     ImGui::SetCurrentContext(previous);
@@ -1490,6 +1517,11 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::Taa);
             edpe::UpscalerManager::instance().setMode(edpe::UpscaleMode::NativeAA);
         }
+    }
+    if (ui.font_proggy_forever) {
+        wchar_t fontMsg[128];
+        swprintf_s(fontMsg, L"EDPE: ProggyForever vector font initialized (%hs)", ui.font_proggy_forever->GetDebugName());
+        EdpeLog(fontMsg);
     }
     EdpeLog(L"EDPE: Dear ImGui ready; F5 toggles menu");
     return true;
@@ -1667,515 +1699,615 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    if (show_perf) {
-        edpe::PerfTracker::instance().renderOverlay(draw_menu, cfg.perfOverlayCorner, cfg.perfOverlayScale);
+    if (!s_base_style_initialized) {
+        s_base_imgui_style = ImGui::GetStyle();
+        s_base_style_initialized = true;
     }
+
+    if (show_perf) {
+        const float hudScale = std::clamp(cfg.perfOverlayScale, 0.5f, 2.5f);
+        ImGui::GetStyle() = s_base_imgui_style;
+        ImGui::GetStyle().ScaleAllSizes(hudScale);
+        ImGui::GetStyle().FontScaleMain = hudScale;
+        ImGui::GetIO().FontGlobalScale = 1.0f;
+        edpe::PerfTracker::instance().renderOverlay(draw_menu, cfg.perfOverlayCorner, hudScale);
+    }
+
+    const float uiScale = std::clamp(cfg.uiScale, 0.5f, 2.5f);
+    ImGui::GetStyle() = s_base_imgui_style;
+    ImGui::GetStyle().ScaleAllSizes(uiScale);
+    ImGui::GetStyle().FontScaleMain = uiScale;
+    ImGui::GetIO().FontGlobalScale = 1.0f;
 
     bool window_open = true;
     if (draw_menu) {
-        ImGui::Begin("EDPE | Elite Dangerous Performance Enhanced", &window_open);
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        const float defW = (std::min)(540.0f * uiScale, display.x > 0.0f ? display.x - 40.0f : 540.0f);
+        const float maxH = (display.y > 100.0f) ? (display.y - 40.0f) : 1080.0f;
+        ImGui::SetNextWindowSizeConstraints(ImVec2(300.0f * uiScale, 80.0f), ImVec2(display.x > 0.0f ? display.x : 3840.0f, maxH));
+
+        if (s_reset_menu_layout) {
+            const float defX = (display.x > defW) ? (display.x - defW) * 0.5f : 20.0f;
+            const float defY = 20.0f;
+            ImGui::SetNextWindowPos(ImVec2(defX, defY), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(defW, 0.0f), ImGuiCond_Always);
+            s_reset_menu_layout = false;
+        } else {
+            if (cfg.menuPosX >= 0.0f && cfg.menuPosY >= 0.0f) {
+                float posX = cfg.menuPosX;
+                float posY = cfg.menuPosY;
+                if (display.x > 100.0f && display.y > 100.0f) {
+                    posX = (std::min)(posX, display.x - 60.0f);
+                    posY = (std::min)(posY, display.y - 40.0f);
+                    posX = (std::max)(0.0f, posX);
+                    posY = (std::max)(0.0f, posY);
+                }
+                ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_FirstUseEver);
+            } else {
+                const float defX = (display.x > defW) ? (display.x - defW) * 0.5f : 20.0f;
+                ImGui::SetNextWindowPos(ImVec2(defX, 20.0f), ImGuiCond_FirstUseEver);
+            }
+
+            // Target width scales directly with uiScale so elements and window scale in sync
+            const float targetW = defW;
+            // Height is ALWAYS 0.0f (auto-fit to elements by default)
+            ImGui::SetNextWindowSize(ImVec2(targetW, 0.0f), ImGuiCond_Always);
+        }
+
+        ImGui::Begin("EDPE | Elite Dangerous Performance Enhanced", &window_open, ImGuiWindowFlags_AlwaysAutoResize);
+        const char* edpeRepoUrl = "https://github.com/filispeen/EDPE";
         ImGui::Text("Version: %s", edpe::kVersion);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            const ImVec2 pMin = ImGui::GetItemRectMin();
+            const ImVec2 pMax = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(pMin.x, pMax.y), ImVec2(pMax.x, pMax.y), IM_COL32(100, 190, 255, 255));
+            ImGui::SetTooltip("Open %s", edpeRepoUrl);
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            ShellExecuteA(nullptr, "open", edpeRepoUrl, nullptr, nullptr, SW_SHOWNORMAL);
+        }
         auto& upscaler = edpe::UpscalerManager::instance();
         const bool nvidia_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::NvidiaDlss);
         const bool amd_available = upscaler.isBackendAvailable(edpe::UpscalerBackend::AmdFsr);
 
-    // Performance HUD Controls
-    ImGui::Separator();
-    ImGui::TextUnformatted("Performance HUD Overlay");
-    if (ImGui::Checkbox("Show Performance HUD (FPS, Frametimes, GPU, VRAM)", &cfg.showPerfOverlay)) {
-        cfg.save();
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(Hotkey: F7)");
-
-    const char* hud_corners[] = { "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right" };
-    if (ImGui::Combo("HUD Position", &cfg.perfOverlayCorner, hud_corners, IM_ARRAYSIZE(hud_corners))) {
-        cfg.perfOverlayPosX = -1.0f;
-        cfg.perfOverlayPosY = -1.0f;
-        cfg.save();
-    }
-    if (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f) {
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Reset Dragged Position")) {
-            cfg.perfOverlayPosX = -1.0f;
-            cfg.perfOverlayPosY = -1.0f;
-            cfg.save();
-        }
-    }
-    if (ImGui::SliderFloat("HUD Scale", &cfg.perfOverlayScale, 0.5f, 2.5f, "%.2fx")) {
-        cfg.save();
-    }
-    if (ImGui::SliderFloat("UI Scale", &cfg.uiScale, 0.5f, 2.5f, "%.2fx")) {
-        applyUiScale(cfg.uiScale);
-        cfg.save();
-    }
-
-    const auto& live_tel = edpe::PerfTracker::instance().getTelemetry();
-    ImGui::Text("Stats: %.1f FPS | Total: %.2f ms (Game: %.2f ms, Upscaler: %.2f ms)",
-        live_tel.fps, live_tel.totalFrametimeMs, live_tel.gameFrametimeMs, live_tel.upscalerFrametimeMs);
-
-    if (upscaler.isReconstructionActive()) {
-        const bool isAmd = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
-        const bool isTaa = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
-        const bool isSr = (live_tel.renderWidth < live_tel.outputWidth || live_tel.renderHeight < live_tel.outputHeight);
-        const char* uName = isTaa ? "TAA" :
-                            isAmd ? (isSr ? "AMD FSR SR" : "AMD FSR Native AA")
-                                  : (isSr ? "NVIDIA DLSS" : "NVIDIA DLAA");
-        char pBuf[64]{};
-        if (isTaa || isAmd) {
-            snprintf(pBuf, sizeof(pBuf), "(%s)", isSr ? "Super Resolution" : "Native AA");
-        } else {
-            const uint32_t p = edpe::NgxContext::get_preset();
-            const char* pName = (p == 10) ? "Preset J" :
-                                (p == 11) ? "Preset K" :
-                                (p == 12) ? "Preset L" :
-                                (p == 13) ? "Preset M" : "Auto (Preset K)";
-            snprintf(pBuf, sizeof(pBuf), "(%s)", pName);
-        }
-        ImGui::Text("Reconstruction: %s %s [%ux%u -> %ux%u]",
-            uName, pBuf, live_tel.renderWidth, live_tel.renderHeight, live_tel.outputWidth, live_tel.outputHeight);
-    } else {
-        ImGui::Text("Reconstruction: Bypass (Native) [%ux%u -> %ux%u]",
-            live_tel.outputWidth, live_tel.outputHeight, live_tel.outputWidth, live_tel.outputHeight);
-    }
-
-    ImGui::Text("Hardware: %ls | Load: %u%%",
-        live_tel.gpuName.empty() ? L"Direct3D 11 Adapter" : live_tel.gpuName.c_str(), live_tel.gpuUsagePct);
-    if (live_tel.vramTotalBytes > 0) {
-        ImGui::Text("VRAM: %.2f / %.2f GB (%u%%)",
-            static_cast<double>(live_tel.vramUsedBytes) / (1024.0 * 1024.0 * 1024.0),
-            static_cast<double>(live_tel.vramTotalBytes) / (1024.0 * 1024.0 * 1024.0),
-            static_cast<unsigned>(100.0 * live_tel.vramUsedBytes / live_tel.vramTotalBytes));
-    }
-    ImGui::Separator();
-
-    // Upscaler backend selector
-    const char* upscaler_items[] = {
-        "Native (Bypass)",
-        nvidia_available ? "NVIDIA DLSS / DLAA" : "NVIDIA DLSS / DLAA (unavailable)",
-        amd_available ? "AMD FSR (Native AA / SR)" : "AMD FSR (unavailable)",
-        "TAA (Temporal Anti-Aliasing)"
-    };
-    int current_backend_idx = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) ? 1 :
-                              (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) ? 2 :
-                              (upscaler.getBackend() == edpe::UpscalerBackend::Taa) ? 3 : 0;
-
-    if (ImGui::Combo("Upscaler Backend", &current_backend_idx, upscaler_items, IM_ARRAYSIZE(upscaler_items))) {
-        if (current_backend_idx == 1) {
-            if (nvidia_available) {
-                upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
-                upscaler.setMode(edpe::UpscaleMode::NativeAA);
-                cfg.upscalerBackend = 1;
+        // 1. HUD & UI Scaling (Open by default)
+        if (ImGui::CollapsingHeader("HUD & UI Scaling", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::Checkbox("Show Performance HUD (FPS, Frametimes, GPU, VRAM)", &cfg.showPerfOverlay)) {
                 cfg.save();
             }
-        } else if (current_backend_idx == 2) {
-            if (amd_available) {
-                upscaler.setBackend(edpe::UpscalerBackend::AmdFsr);
-                upscaler.setMode(edpe::UpscaleMode::NativeAA);
-                cfg.upscalerBackend = 2;
-                cfg.save();
-            }
-        } else if (current_backend_idx == 3) {
-            upscaler.setBackend(edpe::UpscalerBackend::Taa);
-            upscaler.setMode(edpe::UpscaleMode::NativeAA);
-            cfg.upscalerBackend = 3;
-            cfg.save();
-        } else {
-            upscaler.setBackend(edpe::UpscalerBackend::None);
-            upscaler.setMode(edpe::UpscaleMode::Native);
-            cfg.upscalerBackend = 0;
-            cfg.save();
-        }
-    }
 
-    const bool backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
-    const bool nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
-    const bool amd_active = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
-    const bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
+            static const char* const s_pos_tooltips[8] = {
+                "Top-Left", "Top", "Top-Right",
+                "Left",            "Right",
+                "Bottom-Left", "Bottom", "Bottom-Right"
+            };
+            static const char* const s_button_ids[8] = {
+                "##hud_pos_tl", "##hud_pos_t", "##hud_pos_tr",
+                "##hud_pos_l",                 "##hud_pos_r",
+                "##hud_pos_bl", "##hud_pos_b", "##hud_pos_br"
+            };
+            static const int s_grid_to_index[3][3] = {
+                { 0, 1, 2 },
+                { 3, -1, 4 },
+                { 5, 6, 7 }
+            };
 
-
-    if (!nvidia_active) ImGui::BeginDisabled();
-
-    // NVIDIA DLSS Preset selector
-    const char* preset_items[] = {
-        "Auto (Preset K)",
-        "Preset J (Transformer)",
-        "Preset K (Transformer)",
-        "Preset L",
-        "Preset M"
-    };
-    const uint32_t curPreset = edpe::NgxContext::get_preset();
-    int preset_idx = (curPreset >= 10u && curPreset <= 13u) ? static_cast<int>(curPreset - 9u) : 0;
-    if (ImGui::Combo("NVIDIA DLSS Preset", &preset_idx, preset_items, IM_ARRAYSIZE(preset_items))) {
-        const uint32_t newPreset = (preset_idx == 0) ? 0u : static_cast<uint32_t>(preset_idx + 9);
-        edpe::NgxContext::set_preset(newPreset);
-        cfg.dlssPreset = static_cast<int>(newPreset);
-        cfg.save();
-    }
-    if (!nvidia_active) ImGui::EndDisabled();
-
-    // Sharpening
-    if (!backend_active) ImGui::BeginDisabled();
-    float curSharpness = ContextCensusGetSharpness();
-    if (ImGui::SliderFloat("Sharpening", &curSharpness, 0.0f, 1.0f, "%.2f")) {
-        ContextCensusSetSharpness(curSharpness);
-        cfg.save();
-    }
-    if (backend_active && curSharpness > 0.0f) {
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Reset##Sharpness")) {
-            ContextCensusSetSharpness(0.0f);
-            cfg.save();
-        }
-    }
-    if (!backend_active) {
-        ImGui::EndDisabled();
-        ImGui::TextDisabled("Sharpening requires an active upscaler backend");
-    } else if (taa_active) {
-        ImGui::TextDisabled("(TAA uses Catmull-Rom reconstruction; vendor sharpening applies to DLSS and FSR)");
-    }
-
-    DXGI_SWAP_CHAIN_DESC scDesc{};
-    swap_chain->GetDesc(&scDesc);
-    const UINT outW = scDesc.BufferDesc.Width;
-    const UINT outH = scDesc.BufferDesc.Height;
-    UINT sceneW = 0, sceneH = 0;
-    ContextCensusGetSceneRenderSize(&sceneW, &sceneH);
-    if (!sceneW || !sceneH) {
-        sceneW = outW;
-        sceneH = outH;
-    }
-    const float activeScalePct = outW ? (100.0f * static_cast<float>(sceneW) / static_cast<float>(outW)) : 100.0f;
-    const bool isSr = (sceneW < outW || sceneH < outH);
-
-
-    const auto& diag = upscaler.getDiagnostics();
-    const uint32_t dsvBinds = ContextCensusGetDsvBinds();
-    const bool isReconActive = nvidia_active ? edpe::NgxContext::has_evaluated()
-                                            : (upscaler.isReconstructionActive() && upscaler.hasEvaluated());
-    if (backend_active) {
-        const char* backendName = taa_active ? "Native D3D11" : (amd_active ? "AMD" : "NVIDIA");
-        const char* techName = taa_active
-            ? (isSr ? "TAA Super Resolution" : "TAA Native AA")
-            : (amd_active ? (isSr ? "FSR Super Resolution" : "FSR Native AA")
-                          : (isSr ? "DLSS Super Resolution" : "DLAA"));
-        if (isReconActive) {
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-                "Reconstruction: %s %s Active",
-                backendName, techName);
-        } else if (dsvBinds == 0) {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
-                "Reconstruction: %s %s (Initialized, no depth found)",
-                backendName, techName);
-        } else {
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-                "Reconstruction: %s %s (Standby)",
-                backendName, techName);
-        }
-        ImGui::Text("Resolution: Scene %ux%u -> Output %ux%u (%.1f%%)",
-            sceneW, sceneH, outW, outH, activeScalePct);
-        ImGui::Text("Active Mode: %ls",
-            edpe::getUpscaleModeName(upscaler.getMode()));
-        if (isSr) {
-            ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
-                "Scaling is automatically driven by game Supersampling (< 1.0x).");
-        } else {
-            if (isReconActive) {
-                ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
-                    "Native 1:1 render detected -> %s antialiasing active.",
-                    taa_active ? "TAA" : (amd_active ? "FSR Native AA" : "DLAA"));
-            } else if (dsvBinds == 0) {
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
-                    "Native 1:1 render detected -> %s initialized, no depth found.",
-                    taa_active ? "TAA" : (amd_active ? "FSR Native AA" : "DLAA"));
+            const bool is_dragged = (cfg.perfOverlayPosX >= 0.0f && cfg.perfOverlayPosY >= 0.0f);
+            if (is_dragged) {
+                ImGui::TextUnformatted("HUD Position: Custom (Dragged)");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset Position")) {
+                    cfg.perfOverlayPosX = -1.0f;
+                    cfg.perfOverlayPosY = -1.0f;
+                    cfg.save();
+                }
             } else {
-                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-                    "Native 1:1 render detected -> %s standby.",
-                    taa_active ? "TAA" : (amd_active ? "FSR Native AA" : "DLAA"));
+                const int c = (cfg.perfOverlayCorner >= 0 && cfg.perfOverlayCorner < 8) ? cfg.perfOverlayCorner : 0;
+                ImGui::Text("HUD Position: %s", s_pos_tooltips[c]);
+            }
+
+            const float btn_size = std::floor(22.0f * (cfg.uiScale >= 0.5f ? cfg.uiScale : 1.0f));
+            const ImVec2 square_size(btn_size, btn_size);
+            const float grid_spacing = std::floor(4.0f * (cfg.uiScale >= 0.5f ? cfg.uiScale : 1.0f));
+
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(grid_spacing, grid_spacing));
+            for (int row = 0; row < 3; ++row) {
+                for (int col = 0; col < 3; ++col) {
+                    if (col > 0) {
+                        ImGui::SameLine();
+                    }
+                    const int idx = s_grid_to_index[row][col];
+                    if (idx < 0) {
+                        ImGui::Dummy(square_size);
+                        continue;
+                    }
+
+                    const bool is_selected = (!is_dragged && cfg.perfOverlayCorner == idx);
+                    if (is_selected) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.90f, 0.90f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.65f, 1.00f, 1.00f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.45f, 0.80f, 1.00f));
+                    }
+                    if (ImGui::Button(s_button_ids[idx], square_size)) {
+                        cfg.perfOverlayCorner = idx;
+                        cfg.perfOverlayPosX = -1.0f;
+                        cfg.perfOverlayPosY = -1.0f;
+                        cfg.save();
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s", s_pos_tooltips[idx]);
+                    }
+                    if (is_selected) {
+                        ImGui::PopStyleColor(3);
+                    }
+                }
+            }
+            ImGui::PopStyleVar(); // ItemSpacing
+            ImGui::Spacing();
+            ImGui::SliderFloat("HUD Scale", &cfg.perfOverlayScale, 0.5f, 2.5f, "%.2fx");
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                cfg.save();
+            }
+            ImGui::SliderFloat("UI Scale", &cfg.uiScale, 0.5f, 2.5f, "%.2fx");
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                cfg.save();
+            }
+
+            const bool menu_customized = (cfg.menuPosX >= 0.0f || cfg.menuPosY >= 0.0f);
+            if (menu_customized) {
+                if (ImGui::Button("Reset Menu Position")) {
+                    cfg.menuPosX = -1.0f;
+                    cfg.menuPosY = -1.0f;
+                    s_reset_menu_layout = true;
+                    cfg.save();
+                }
             }
         }
-    } else {
-        ImGui::Text("Reconstruction: Inactive (Scene %ux%u -> Output %ux%u)",
-            sceneW, sceneH, outW, outH);
-    }
 
-    if (backend_active) {
-        if (dsvBinds == 0) {
-            ImGui::Text("Status: Initialized, no depth found");
-        } else if (isReconActive) {
-            ImGui::Text("Status: Active");
-        } else {
-            ImGui::Text("Status: %ls", diag.statusMessage);
+        // 2. Upscaler & Image Quality (Open by default)
+        bool backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
+        bool nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
+        bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
+
+        if (ImGui::CollapsingHeader("Upscaler & Image Quality", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const auto& cached_tel = edpe::PerfTracker::instance().getCachedTelemetry();
+            ImGui::PushStyleColor(ImGuiCol_Text, cached_tel.reconStatusColor);
+            ImGui::TextUnformatted(cached_tel.reconStatusLine);
+            ImGui::PopStyleColor();
+            ImGui::TextUnformatted(cached_tel.resLine);
+            TextDisabledWrapped("Upscaling quality ratios are controlled via in-game Graphics > Supersampling (< 1.0x enables upscaling, 1.0x uses Native AA).");
+
+            ImGui::Spacing();
+
+            // Upscaler backend selector
+            const char* upscaler_items[] = {
+                "Native (Bypass)",
+                nvidia_available ? "NVIDIA DLSS / DLAA" : "NVIDIA DLSS / DLAA (unavailable)",
+                amd_available ? "AMD FSR (Native AA / SR)" : "AMD FSR (unavailable)",
+                "TAA (Temporal Anti-Aliasing)"
+            };
+            int current_backend_idx = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) ? 1 :
+                                      (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) ? 2 :
+                                      (upscaler.getBackend() == edpe::UpscalerBackend::Taa) ? 3 : 0;
+
+            if (ImGui::Combo("Upscaler Backend", &current_backend_idx, upscaler_items, IM_ARRAYSIZE(upscaler_items))) {
+                if (current_backend_idx == 1) {
+                    if (nvidia_available) {
+                        upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
+                        upscaler.setMode(edpe::UpscaleMode::NativeAA);
+                        cfg.upscalerBackend = 1;
+                        cfg.save();
+                    }
+                } else if (current_backend_idx == 2) {
+                    if (amd_available) {
+                        upscaler.setBackend(edpe::UpscalerBackend::AmdFsr);
+                        upscaler.setMode(edpe::UpscaleMode::NativeAA);
+                        cfg.upscalerBackend = 2;
+                        cfg.save();
+                    }
+                } else if (current_backend_idx == 3) {
+                    upscaler.setBackend(edpe::UpscalerBackend::Taa);
+                    upscaler.setMode(edpe::UpscaleMode::NativeAA);
+                    cfg.upscalerBackend = 3;
+                    cfg.save();
+                } else {
+                    upscaler.setBackend(edpe::UpscalerBackend::None);
+                    upscaler.setMode(edpe::UpscaleMode::Native);
+                    cfg.upscalerBackend = 0;
+                    cfg.save();
+                }
+                backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
+                nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
+                taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
+                edpe::PerfTracker::instance().updateCachedStats();
+            }
+
+            if (!nvidia_active) ImGui::BeginDisabled();
+
+            // NVIDIA DLSS Preset selector
+            const char* preset_items[] = {
+                "Auto (Preset K)",
+                "Preset J (Transformer)",
+                "Preset K (Transformer)",
+                "Preset L",
+                "Preset M"
+            };
+            const uint32_t curPreset = edpe::NgxContext::get_preset();
+            int preset_idx = (curPreset >= 10u && curPreset <= 13u) ? static_cast<int>(curPreset - 9u) : 0;
+            if (ImGui::Combo("NVIDIA DLSS Preset", &preset_idx, preset_items, IM_ARRAYSIZE(preset_items))) {
+                const uint32_t newPreset = (preset_idx == 0) ? 0u : static_cast<uint32_t>(preset_idx + 9);
+                edpe::NgxContext::set_preset(newPreset);
+                cfg.dlssPreset = static_cast<int>(newPreset);
+                cfg.save();
+                edpe::PerfTracker::instance().updateCachedStats();
+            }
+            if (!nvidia_active) ImGui::EndDisabled();
+
+            // Sharpening
+            if (!backend_active) ImGui::BeginDisabled();
+            float curSharpness = ContextCensusGetSharpness();
+            if (ImGui::SliderFloat("Sharpening", &curSharpness, 0.0f, 1.0f, "%.2f")) {
+                ContextCensusSetSharpness(curSharpness);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                cfg.save();
+            }
+            if (backend_active && curSharpness > 0.0f) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset##Sharpness")) {
+                    ContextCensusSetSharpness(0.0f);
+                    cfg.save();
+                }
+            }
+            if (!backend_active) {
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("Sharpening requires an active upscaler backend");
+            } else if (taa_active) {
+                TextDisabledWrapped("(TAA uses Catmull-Rom reconstruction; vendor sharpening applies to DLSS and FSR)");
+            }
+
+            if (!nvidia_available) {
+                ImGui::TextDisabled("NVIDIA DLSS/DLAA reason: %ls",
+                    upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
+            }
+            if (!amd_available) {
+                ImGui::TextDisabled("AMD FSR reason: %ls",
+                    upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::AmdFsr));
+            }
+
+            bool preserve_ui = ContextCensusGetPreserveNativeUi();
+            if (ImGui::Checkbox("Preserve Native UI (Composite in Super Resolution)", &preserve_ui)) {
+                ContextCensusSetPreserveNativeUi(preserve_ui);
+                edpe::Config::instance().save();
+            }
+            TextDisabledWrapped("Composites native-resolution cockpit HUD & UI over reconstructed scene");
+
+            ImGui::BeginDisabled();
+            ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
+            ImGui::EndDisabled();
         }
-    } else {
-        ImGui::Text("Status: %ls", diag.statusMessage);
-    }
-    if (diag.didRun) {
-        ImGui::Text("GPU Reconstruction Time: %.3f ms", diag.gpuTimeMs);
-    }
 
-    if (cfg.devMode) {
-        // Comparison Screenshot Button
+        // Dev Mode Collapsible Sections (Collapsed by default)
+        if (cfg.devMode) {
+            // Section 1: Reconstruction Screenshot Comparison
+            if (ImGui::CollapsingHeader("Reconstruction Screenshot Comparison")) {
+                const bool can_compare = backend_active && upscaler.isReconstructionActive();
+                const bool compare_running = ContextCensusIsComparisonCapturePending();
+                if (!can_compare || compare_running) ImGui::BeginDisabled();
+                if (ImGui::Button("Capture All Upscaling Backends")) {
+                    ContextCensusRequestComparisonCapture();
+                }
+                if (ImGui::Checkbox("Include Performance HUD in comparison images", &cfg.captureOverlayInComparison)) {
+                    cfg.save();
+                }
+                if (!can_compare || compare_running) ImGui::EndDisabled();
+                if (!can_compare) {
+                    ImGui::TextDisabled("Enable DLSS, DLAA, FSR or TAA to capture comparison");
+                } else if (compare_running) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%ls", ContextCensusComparisonProgress()[0] ?
+                        ContextCensusComparisonProgress() : L"Comparison capture starting...");
+                } else if (ui.last_comparison_saved[0] != L'\0') {
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%ls", ui.last_comparison_saved);
+                }
+
+                ImGui::Separator();
+                const bool sequence_available = ContextCensusBindSequenceAvailable();
+                if (!sequence_available) ImGui::BeginDisabled();
+                if (ImGui::Button("Capture DSV bind order (one frame)")) ContextCensusRequestBindSequence();
+                if (!sequence_available) ImGui::EndDisabled();
+                if (!sequence_available) ImGui::TextDisabled("Waiting for DSV observer or capture completion");
+                ImGui::InputInt("Depth candidate index", &ui.depth_candidate);
+                const bool depth_available = ui.depth_candidate >= 0 &&
+                    ContextCensusDepthSnapshotAvailable(static_cast<unsigned>(ui.depth_candidate));
+                if (!depth_available) ImGui::BeginDisabled();
+                if (ImGui::Button("Capture depth candidate (one frame)"))
+                    ContextCensusRequestDepthSnapshot(static_cast<unsigned>(ui.depth_candidate));
+                if (!depth_available) ImGui::EndDisabled();
+                if (!depth_available) ImGui::TextDisabled("Choose a bound R32G8X24/R24G8 single-sample DSV, or wait");
+                const int scene_candidate = ContextCensusSceneDepthCandidate();
+                if (scene_candidate < 0) ImGui::BeginDisabled();
+                if (ImGui::Button("Capture scene candidate (experimental)")) {
+                    ui.depth_candidate = scene_candidate;
+                    ContextCensusRequestDepthSnapshot(static_cast<unsigned>(scene_candidate));
+                }
+                if (ImGui::Button("Capture adjacent camera frames (experimental)"))
+                    ContextCensusRequestCameraPair(static_cast<unsigned>(scene_candidate));
+                if (ImGui::Button("Capture motion candidate (experimental)") &&
+                    ContextCensusRequestMotionPair(static_cast<unsigned>(scene_candidate))) {
+                    releaseMotionSnapshot();
+                    releaseColorSnapshot();
+                    releaseEarlyColorSnapshot();
+                }
+                if (scene_candidate < 0) ImGui::EndDisabled();
+                if (scene_candidate < 0) ImGui::TextDisabled("No unique recent scene MRT/HDR signature; use manual index");
+                if (ui.depth_srv) {
+                    ImGui::Text("Depth snapshot: DSV #%d (%ux%u)",
+                        ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
+                    if (!ui.depth_window_open && ImGui::Button("Show depth snapshot")) ui.depth_window_open = true;
+                }
+                if (ui.color_srv) {
+                    ImGui::Text("Scene color candidate: DSV #%d (%ux%u)",
+                        ui.color_snapshot_index, ui.color_width, ui.color_height);
+                    if (!ui.color_window_open && ImGui::Button("Show scene color snapshot")) ui.color_window_open = true;
+                }
+                if (ui.early_color_srv) {
+                    ImGui::Text("Emissive (Early HDR) candidate: %ux%u", ui.early_color_width,
+                        ui.early_color_height);
+                    if (!ui.early_color_window_open && ImGui::Button("Show emissive / glow snapshot"))
+                        ui.early_color_window_open = true;
+                }
+                if (ui.motion_srv) {
+                    ImGui::Text("Motion candidate: %ux%u, current to previous pixels",
+                        ui.motion_width, ui.motion_height);
+                    if (!ui.motion_window_open && ImGui::Button("Show motion snapshot"))
+                        ui.motion_window_open = true;
+                }
+            }
+
+            // Section 2: Jitter & Motion Tuning (DLAA Stability)
+            if (ImGui::CollapsingHeader("Jitter & Motion Tuning (DLAA Stability)")) {
+                bool jitter_enabled = ContextCensusGetJitterEnabled();
+                if (ImGui::Checkbox("Enable Projection Jitter (Halton 2,3)", &jitter_enabled)) {
+                    ContextCensusSetJitterEnabled(jitter_enabled);
+                    edpe::Config::instance().jitterEnabled = jitter_enabled;
+                    edpe::Config::instance().save();
+                }
+                bool jitter_override = ContextCensusGetJitterTestOverride();
+                if (ImGui::Checkbox("Force Jitter test override (subpixel vibration test)", &jitter_override)) {
+                    ContextCensusSetJitterTestOverride(jitter_override);
+                }
+
+                bool j_inv_x = ContextCensusGetJitterInvertX();
+                if (ImGui::Checkbox("Invert Jitter X (pass -JitterX to DLSS)", &j_inv_x)) {
+                    ContextCensusSetJitterInvertX(j_inv_x);
+                    edpe::Config::instance().save();
+                }
+                ImGui::SameLine();
+                bool j_inv_y = ContextCensusGetJitterInvertY();
+                if (ImGui::Checkbox("Invert Jitter Y (pass -JitterY to DLSS)", &j_inv_y)) {
+                    ContextCensusSetJitterInvertY(j_inv_y);
+                    edpe::Config::instance().save();
+                }
+
+                bool j_swap = ContextCensusGetJitterSwapXY();
+                if (ImGui::Checkbox("Swap Jitter X/Y", &j_swap)) {
+                    ContextCensusSetJitterSwapXY(j_swap);
+                    edpe::Config::instance().save();
+                }
+
+                float j_scale = ContextCensusGetJitterScale();
+                if (ImGui::SliderFloat("Jitter Scale", &j_scale, 0.0f, 2.0f, "%.2f")) {
+                    ContextCensusSetJitterScale(j_scale);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    edpe::Config::instance().save();
+                }
+                ImGui::SetItemTooltip("1.0 = standard, 0.0 = disable");
+
+                int j_phases = static_cast<int>(ContextCensusGetJitterPhaseCount());
+                if (ImGui::SliderInt("Jitter Phase Cycle", &j_phases, 0, 128)) {
+                    ContextCensusSetJitterPhaseCount(static_cast<unsigned>(j_phases));
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    edpe::Config::instance().save();
+                }
+                ImGui::SetItemTooltip("default: 8, standard Halton");
+            }
+
+            // Section 3: Motion Vectors Tuning
+            if (ImGui::CollapsingHeader("Motion Vectors Tuning")) {
+                bool zero_mv = ContextCensusGetZeroMotion();
+                if (ImGui::Checkbox("Zero Motion Vectors (Force stationary 0,0)", &zero_mv)) {
+                    ContextCensusSetZeroMotion(zero_mv);
+                    edpe::Config::instance().save();
+                }
+                bool m_inv_x = ContextCensusGetMotionInvertX();
+                if (ImGui::Checkbox("Invert Motion X", &m_inv_x)) {
+                    ContextCensusSetMotionInvertX(m_inv_x);
+                    edpe::Config::instance().save();
+                }
+                ImGui::SameLine();
+                bool m_inv_y = ContextCensusGetMotionInvertY();
+                if (ImGui::Checkbox("Invert Motion Y", &m_inv_y)) {
+                    ContextCensusSetMotionInvertY(m_inv_y);
+                    edpe::Config::instance().save();
+                }
+                float m_scale = ContextCensusGetMotionScale();
+                if (ImGui::SliderFloat("Motion Scale", &m_scale, 0.0f, 2.0f, "%.2f")) {
+                    ContextCensusSetMotionScale(m_scale);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    edpe::Config::instance().save();
+                }
+
+                if (ImGui::Button("Save Tuning to edpe.ini")) {
+                    edpe::Config::instance().save();
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("(Settings auto-saved)");
+            }
+
+            // Section 4: Debug Views & Diagnostics
+            if (ImGui::CollapsingHeader("Debug Views & Diagnostics")) {
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Subpixel Jitter Debug View");
+                bool debug_view = ContextCensusGetJitterDebugView();
+                if (ImGui::Checkbox("Enable Jitter Debug View", &debug_view)) {
+                    ContextCensusSetJitterDebugView(debug_view);
+                    auto& cfg = edpe::Config::instance();
+                    cfg.jitterDebugView = debug_view;
+                    cfg.save();
+                }
+                TextDisabledWrapped("Grayscale scene with green jitter-affected pixels");
+                if (debug_view) {
+                    float sens = ContextCensusGetJitterDebugSensitivity();
+                    if (ImGui::SliderFloat("Jitter Sensitivity", &sens, 0.1f, 5.0f, "%.2fx")) {
+                        ContextCensusSetJitterDebugSensitivity(sens);
+                        auto& cfg = edpe::Config::instance();
+                        cfg.jitterDebugSensitivity = sens;
+                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        edpe::Config::instance().save();
+                    }
+                    float thresh = ContextCensusGetJitterDebugThreshold();
+                    if (ImGui::SliderFloat("Jitter Threshold", &thresh, 0.002f, 0.1f, "%.3f")) {
+                        ContextCensusSetJitterDebugThreshold(thresh);
+                        auto& cfg = edpe::Config::instance();
+                        cfg.jitterDebugThreshold = thresh;
+                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        edpe::Config::instance().save();
+                    }
+                    int mode = ContextCensusGetJitterDebugMode();
+                    const char* const modes[] = {
+                        "Hybrid (Spatial Shift + Temporal Pulse)",
+                        "Spatial Jitter Shift Only",
+                        "Temporal Pulse Only",
+                        "Binary Mask Only"
+                    };
+                    if (ImGui::Combo("Debug Mode", &mode, modes, IM_ARRAYSIZE(modes))) {
+                        ContextCensusSetJitterDebugMode(mode);
+                        auto& cfg = edpe::Config::instance();
+                        cfg.jitterDebugMode = mode;
+                        cfg.save();
+                    }
+
+                    auto& recorder = edpe::JitterViewRecorder::instance();
+                    const bool can_record = recorder.isIdle();
+                    if (!can_record) ImGui::BeginDisabled();
+                    if (ImGui::Button("Record Jitter View (5s)")) {
+                        recorder.startRecording();
+                    }
+                    if (!can_record) ImGui::EndDisabled();
+
+                    if (recorder.isRecording()) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+                            "Recording %.1f / 5.0 s", recorder.getRecordingElapsedSeconds());
+                    } else if (recorder.isDraining() || recorder.isWriting()) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Recording 5.0 / 5.0 s");
+                    } else if (recorder.hasSavedLog()) {
+                        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
+                            "Saved jitter_view.log (%zu frames)", recorder.getLastSavedFrameCount());
+                    }
+
+                    ImGui::TextDisabled("Grayscale = game scene  |  Green pixels = subpixel jitter affected");
+                }
+
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Cockpit HUD & UI Mask Debug View");
+                TextDisabledWrapped("(HUD & reactive mask debug visualizer planned for Phase 12)");
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Buffer Diagnostic Dumps:");
+                if (ImGui::Button("Capture ALL buffers (diagnostic dump)")) {
+                    all_captures_requested.store(true, std::memory_order_release);
+                }
+                TextDisabledWrapped("(color, motion, depth, emission, frame)");
+                if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
+                    ui.pending_backbuffer_capture = true;
+                }
+            }
+        } // if (cfg.devMode)
+
+        ImGui::Spacing();
+
         ImGui::Separator();
-        ImGui::TextUnformatted("Reconstruction Screenshot Comparison");
-    const bool can_compare = backend_active && upscaler.isReconstructionActive();
-    const bool compare_running = ContextCensusIsComparisonCapturePending();
-    if (!can_compare || compare_running) ImGui::BeginDisabled();
-    if (ImGui::Button("Capture All Upscaling Backends")) {
-        ContextCensusRequestComparisonCapture();
-    }
-    if (ImGui::Checkbox("Include Performance HUD in comparison images", &cfg.captureOverlayInComparison)) {
-        cfg.save();
-    }
-    if (!can_compare || compare_running) ImGui::EndDisabled();
-    if (!can_compare) {
-        ImGui::TextDisabled("Enable DLSS, DLAA, FSR or TAA to capture comparison");
-    } else if (compare_running) {
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%ls", ContextCensusComparisonProgress()[0] ?
-            ContextCensusComparisonProgress() : L"Comparison capture starting...");
-    } else if (ui.last_comparison_saved[0] != L'\0') {
-        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%ls", ui.last_comparison_saved);
-    }
 
-    if (!nvidia_available) {
-        ImGui::TextDisabled("NVIDIA DLSS/DLAA reason: %ls",
-            upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
-    }
-    if (!amd_available) {
-        ImGui::TextDisabled("AMD FSR reason: %ls",
-            upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::AmdFsr));
-    }
-    ImGui::BeginDisabled();
-    ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
-    ImGui::EndDisabled();
-    const bool sequence_available = ContextCensusBindSequenceAvailable();
-    if (!sequence_available) ImGui::BeginDisabled();
-    if (ImGui::Button("Capture DSV bind order (one frame)")) ContextCensusRequestBindSequence();
-    if (!sequence_available) ImGui::EndDisabled();
-    if (!sequence_available) ImGui::TextDisabled("Waiting for DSV observer or capture completion");
-    ImGui::InputInt("Depth candidate index", &ui.depth_candidate);
-    const bool depth_available = ui.depth_candidate >= 0 &&
-        ContextCensusDepthSnapshotAvailable(static_cast<unsigned>(ui.depth_candidate));
-    if (!depth_available) ImGui::BeginDisabled();
-    if (ImGui::Button("Capture depth candidate (one frame)"))
-        ContextCensusRequestDepthSnapshot(static_cast<unsigned>(ui.depth_candidate));
-    if (!depth_available) ImGui::EndDisabled();
-    if (!depth_available) ImGui::TextDisabled("Choose a bound R32G8X24/R24G8 single-sample DSV, or wait");
-    const int scene_candidate = ContextCensusSceneDepthCandidate();
-    if (scene_candidate < 0) ImGui::BeginDisabled();
-    if (ImGui::Button("Capture scene candidate (experimental)")) {
-        ui.depth_candidate = scene_candidate;
-        ContextCensusRequestDepthSnapshot(static_cast<unsigned>(scene_candidate));
-    }
-    if (ImGui::Button("Capture adjacent camera frames (experimental)"))
-        ContextCensusRequestCameraPair(static_cast<unsigned>(scene_candidate));
-    if (ImGui::Button("Capture motion candidate (experimental)") &&
-        ContextCensusRequestMotionPair(static_cast<unsigned>(scene_candidate))) {
-        releaseMotionSnapshot();
-        releaseColorSnapshot();
-        releaseEarlyColorSnapshot();
-    }
-    if (scene_candidate < 0) ImGui::EndDisabled();
-    if (scene_candidate < 0) ImGui::TextDisabled("No unique recent scene MRT/HDR signature; use manual index");
-    if (ui.depth_srv) {
-        ImGui::Text("Depth snapshot: DSV #%d (%ux%u)",
-            ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
-        if (!ui.depth_window_open && ImGui::Button("Show depth snapshot")) ui.depth_window_open = true;
-    }
-    if (ui.color_srv) {
-        ImGui::Text("Scene color candidate: DSV #%d (%ux%u)",
-            ui.color_snapshot_index, ui.color_width, ui.color_height);
-        if (!ui.color_window_open && ImGui::Button("Show scene color snapshot")) ui.color_window_open = true;
-    }
-    if (ui.early_color_srv) {
-        ImGui::Text("Emissive (Early HDR) candidate: %ux%u", ui.early_color_width,
-            ui.early_color_height);
-        if (!ui.early_color_window_open && ImGui::Button("Show emissive / glow snapshot"))
-            ui.early_color_window_open = true;
-    }
-    if (ui.motion_srv) {
-        ImGui::Text("Motion candidate: %ux%u, current to previous pixels",
-            ui.motion_width, ui.motion_height);
-        if (!ui.motion_window_open && ImGui::Button("Show motion snapshot"))
-            ui.motion_window_open = true;
-    }
-    ImGui::Separator();
-    ImGui::TextUnformatted("Projection Jitter & Motion Tuning (DLAA Stability)");
-    bool jitter_enabled = ContextCensusGetJitterEnabled();
-    if (ImGui::Checkbox("Enable Projection Jitter (Halton 2,3)", &jitter_enabled)) {
-        ContextCensusSetJitterEnabled(jitter_enabled);
-    }
-    bool jitter_override = ContextCensusGetJitterTestOverride();
-    if (ImGui::Checkbox("Force Jitter test override (subpixel vibration test)", &jitter_override)) {
-        ContextCensusSetJitterTestOverride(jitter_override);
-    }
-
-    bool j_inv_x = ContextCensusGetJitterInvertX();
-    if (ImGui::Checkbox("Invert Jitter X (pass -JitterX to DLSS)", &j_inv_x)) {
-        ContextCensusSetJitterInvertX(j_inv_x);
-        edpe::Config::instance().save();
-    }
-    ImGui::SameLine();
-    bool j_inv_y = ContextCensusGetJitterInvertY();
-    if (ImGui::Checkbox("Invert Jitter Y (pass -JitterY to DLSS)", &j_inv_y)) {
-        ContextCensusSetJitterInvertY(j_inv_y);
-        edpe::Config::instance().save();
-    }
-
-    bool j_swap = ContextCensusGetJitterSwapXY();
-    if (ImGui::Checkbox("Swap Jitter X/Y", &j_swap)) {
-        ContextCensusSetJitterSwapXY(j_swap);
-        edpe::Config::instance().save();
-    }
-
-    float j_scale = ContextCensusGetJitterScale();
-    if (ImGui::SliderFloat("Jitter Scale (1.0 = standard, 0.0 = disable)", &j_scale, 0.0f, 2.0f, "%.2f")) {
-        ContextCensusSetJitterScale(j_scale);
-        edpe::Config::instance().save();
-    }
-
-    int j_phases = static_cast<int>(ContextCensusGetJitterPhaseCount());
-    if (ImGui::SliderInt("Jitter Phase Cycle (default: 8, standard Halton)", &j_phases, 0, 128)) {
-        ContextCensusSetJitterPhaseCount(static_cast<unsigned>(j_phases));
-        edpe::Config::instance().save();
-    }
-
-    bool preserve_ui = ContextCensusGetPreserveNativeUi();
-    if (ImGui::Checkbox("Preserve Native UI (Composite in Super Resolution)", &preserve_ui)) {
-        ContextCensusSetPreserveNativeUi(preserve_ui);
-        edpe::Config::instance().save();
-    }
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Motion Vectors Tuning");
-    bool zero_mv = ContextCensusGetZeroMotion();
-    if (ImGui::Checkbox("Zero Motion Vectors (Force stationary 0,0)", &zero_mv)) {
-        ContextCensusSetZeroMotion(zero_mv);
-        edpe::Config::instance().save();
-    }
-    bool m_inv_x = ContextCensusGetMotionInvertX();
-    if (ImGui::Checkbox("Invert Motion X", &m_inv_x)) {
-        ContextCensusSetMotionInvertX(m_inv_x);
-        edpe::Config::instance().save();
-    }
-    ImGui::SameLine();
-    bool m_inv_y = ContextCensusGetMotionInvertY();
-    if (ImGui::Checkbox("Invert Motion Y", &m_inv_y)) {
-        ContextCensusSetMotionInvertY(m_inv_y);
-        edpe::Config::instance().save();
-    }
-    float m_scale = ContextCensusGetMotionScale();
-    if (ImGui::SliderFloat("Motion Scale", &m_scale, 0.0f, 2.0f, "%.2f")) {
-        ContextCensusSetMotionScale(m_scale);
-        edpe::Config::instance().save();
-    }
-
-    if (ImGui::Button("Save Tuning to edpe.ini")) {
-        edpe::Config::instance().save();
-    }    ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Subpixel Jitter Debug View (Hotkey: F8)");
-    bool debug_view = ContextCensusGetJitterDebugView();
-    if (ImGui::Checkbox("Enable Jitter Debug View (Grayscale Scene + Green Jitter Pixels)", &debug_view)) {
-        ContextCensusSetJitterDebugView(debug_view);
-        auto& cfg = edpe::Config::instance();
-        cfg.jitterDebugView = debug_view;
-        cfg.save();
-    }
-    if (debug_view) {
-        float sens = ContextCensusGetJitterDebugSensitivity();
-        if (ImGui::SliderFloat("Jitter Sensitivity", &sens, 0.1f, 5.0f, "%.2fx")) {
-            ContextCensusSetJitterDebugSensitivity(sens);
-            auto& cfg = edpe::Config::instance();
-            cfg.jitterDebugSensitivity = sens;
-            cfg.save();
-        }
-        float thresh = ContextCensusGetJitterDebugThreshold();
-        if (ImGui::SliderFloat("Jitter Threshold", &thresh, 0.002f, 0.1f, "%.3f")) {
-            ContextCensusSetJitterDebugThreshold(thresh);
-            auto& cfg = edpe::Config::instance();
-            cfg.jitterDebugThreshold = thresh;
-            cfg.save();
-        }
-        int mode = ContextCensusGetJitterDebugMode();
-        const char* const modes[] = {
-            "Hybrid (Spatial Shift + Temporal Pulse)",
-            "Spatial Jitter Shift Only",
-            "Temporal Pulse Only",
-            "Binary Mask Only"
+        static const char* const s_devBinds[] = {
+            "F5: menu", "F6: capture", "F7: perf HUD",
+            "F8: jitter view", "F9: record jitter", "F10: HUD debug"
         };
-        if (ImGui::Combo("Debug Mode", &mode, modes, IM_ARRAYSIZE(modes))) {
-            ContextCensusSetJitterDebugMode(mode);
-            auto& cfg = edpe::Config::instance();
-            cfg.jitterDebugMode = mode;
-            cfg.save();
+        static const char* const s_userBinds[] = {
+            "F5: menu", "F7: perf HUD"
+        };
+
+        const char* const* binds = cfg.devMode ? s_devBinds : s_userBinds;
+        const int bindCount = cfg.devMode ? IM_ARRAYSIZE(s_devBinds) : IM_ARRAYSIZE(s_userBinds);
+        const float sepWidth = ImGui::CalcTextSize(" | ").x;
+
+        for (int i = 0; i < bindCount; ++i) {
+            const float itemWidth = ImGui::CalcTextSize(binds[i]).x;
+            if (i > 0) {
+                const float lastRight = ImGui::GetItemRectMax().x;
+                const float windowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+                const float remaining = windowRight - lastRight;
+
+                if (remaining >= (sepWidth + itemWidth)) {
+                    ImGui::SameLine(0.0f, 0.0f);
+                    ImGui::TextDisabled(" | ");
+                    ImGui::SameLine(0.0f, 0.0f);
+                }
+            }
+            ImGui::TextUnformatted(binds[i]);
         }
 
-        auto& recorder = edpe::JitterViewRecorder::instance();
-        const bool can_record = recorder.isIdle();
-        if (!can_record) ImGui::BeginDisabled();
-        if (ImGui::Button("Record Jitter View (5s)")) {
-            recorder.startRecording();
+        ImGui::TextDisabled("(Settings auto-saved)");
+        ImGui::SameLine();
+
+        const char* authorLabel = "by FILISPEEN";
+        const char* authorUrl = "https://github.com/filispeen";
+        const float authorWidth = ImGui::CalcTextSize(authorLabel).x;
+        if (ImGui::GetContentRegionAvail().x > authorWidth + 8.0f) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - authorWidth);
         }
-        if (!can_record) ImGui::EndDisabled();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.75f, 1.0f, 1.0f));
+        ImGui::TextUnformatted(authorLabel);
+        ImGui::PopStyleColor();
 
-        if (recorder.isRecording()) {
-            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
-                "Recording %.1f / 5.0 s", recorder.getRecordingElapsedSeconds());
-        } else if (recorder.isDraining() || recorder.isWriting()) {
-            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Recording 5.0 / 5.0 s");
-        } else if (recorder.hasSavedLog()) {
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-                "Saved jitter_view.log (%zu frames)", recorder.getLastSavedFrameCount());
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            const ImVec2 pMin = ImGui::GetItemRectMin();
+            const ImVec2 pMax = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(pMin.x, pMax.y), ImVec2(pMax.x, pMax.y), IM_COL32(100, 190, 255, 255));
+            ImGui::SetTooltip("Open %s", authorUrl);
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            ShellExecuteA(nullptr, "open", authorUrl, nullptr, nullptr, SW_SHOWNORMAL);
         }
 
-        ImGui::TextDisabled("Grayscale = game scene  |  Green pixels = subpixel jitter affected");
-    }
+        static bool s_is_interacting_menu = false;
+        if ((ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) || ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            s_is_interacting_menu = true;
+        }
 
-    ImGui::Separator();
-    if (ImGui::Button("Capture ALL buffers (diagnostic dump, F6)")) {
-        all_captures_requested.store(true, std::memory_order_release);
-    }
-    ImGui::SameLine();
-    ImGui::TextUnformatted("(color, motion, depth, emission, frame)");
-    if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
-        ui.pending_backbuffer_capture = true;
-    }
-    } // if (cfg.devMode)
+        if (s_is_interacting_menu && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            const ImVec2 curPos = ImGui::GetWindowPos();
+            bool changed = false;
 
-    const float footerHeight = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 4.0f;
-    if (ImGui::GetContentRegionAvail().y > footerHeight) {
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ImGui::GetContentRegionAvail().y - footerHeight));
-    }
+            if (std::fabs(curPos.x - cfg.menuPosX) > 1.0f || std::fabs(curPos.y - cfg.menuPosY) > 1.0f) {
+                cfg.menuPosX = curPos.x;
+                cfg.menuPosY = curPos.y;
+                changed = true;
+            }
 
-    ImGui::Separator();
-    if (cfg.devMode) {
-        ImGui::TextUnformatted("F5: menu | F6: capture | F7: perf HUD | F8: jitter view | F9: record jitter");
-    } else {
-        ImGui::TextUnformatted("F5: menu | F7: perf HUD");
-    }
+            if (changed) {
+                cfg.save();
+            }
+            s_is_interacting_menu = false;
+        }
 
-    ImGui::SameLine();
-    const char* authorLabel = "by FILISPEEN";
-    const char* authorUrl = "https://github.com/filispeen";
-    const float authorWidth = ImGui::CalcTextSize(authorLabel).x;
-    if (ImGui::GetContentRegionAvail().x > authorWidth + 8.0f) {
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - authorWidth);
-    }
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.75f, 1.0f, 1.0f));
-    ImGui::TextUnformatted(authorLabel);
-    ImGui::PopStyleColor();
-
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        const ImVec2 pMin = ImGui::GetItemRectMin();
-        const ImVec2 pMax = ImGui::GetItemRectMax();
-        ImGui::GetWindowDrawList()->AddLine(ImVec2(pMin.x, pMax.y), ImVec2(pMax.x, pMax.y), IM_COL32(100, 190, 255, 255));
-        ImGui::SetTooltip("Open %s", authorUrl);
-    }
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-        ShellExecuteA(nullptr, "open", authorUrl, nullptr, nullptr, SW_SHOWNORMAL);
-    }
-    ImGui::End();
+        ImGui::End();
     if (draw_menu && ui.depth_srv && ui.depth_window_open) {
         placeSnapshotWindow(0, ui.early_color_srv || ui.motion_srv || ui.color_srv ? 1 : 0);
         if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
