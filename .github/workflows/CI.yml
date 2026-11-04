@@ -6,6 +6,10 @@ on:
       - '**.md'
   workflow_dispatch:
     inputs:
+      rc:
+        description: 'Publish as Release Candidate (Pre-release)'
+        type: boolean
+        default: false
       experimental:
         description: 'Publish experimental release'
         type: boolean
@@ -95,8 +99,10 @@ jobs:
   release:
     name: Publish Release
     needs: CI
-    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    if: (github.ref_type == 'tag' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'rc'))) || inputs.rc == true
     uses: ./.github/workflows/release.yml
+    with:
+      prerelease: ${{ inputs.rc == true || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
     secrets: inherit
     permissions:
       contents: write
