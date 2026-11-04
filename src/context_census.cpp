@@ -1503,7 +1503,7 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
 
 HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT instances) {
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
-        (!s_hud_mask_active_pass && !motion_pair_active && !ContextCensusIsJitterActive()) ||
+        (!s_hud_mask_active_pass && !motion_pair_active) ||
         !motion_color_source || !motion_color_bound) return HudDrawResult::None;
 
     struct DrawProbeTimer {
@@ -1610,7 +1610,8 @@ HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT insta
             hud_first_match_seen = true;
 
             // 1. Відновлюємо незсунутий CB1 рівно 1 раз на старті Pass 35 через DYNAMIC буфер (без GPU stall)
-            if (ContextCensusIsJitterActive() && s_has_clean_cb1_data && s_clean_camera_frame == motion_color_frame) {
+            if (s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                ContextCensusIsJitterActive() && s_has_clean_cb1_data && s_clean_camera_frame == motion_color_frame) {
                 if (!s_clean_camera_cb) {
                     Microsoft::WRL::ComPtr<ID3D11Device> dev;
                     context->GetDevice(&dev);
@@ -1646,20 +1647,9 @@ HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT insta
                 }
             }
 
-            // 2. Перевіряємо, чи ми в режимі нативної роздільної здатності (DLAA), перш ніж копіювати сцену
-            D3D11_TEXTURE2D_DESC dDesc{};
-            if (scene_depth_source) scene_depth_source->GetDesc(&dDesc);
-            const UINT swapW = s_swapchain_width.load(std::memory_order_relaxed);
-            const UINT swapH = s_swapchain_height.load(std::memory_order_relaxed);
-            const bool isNativeResDlaa = edpe::UpscalerManager::instance().isReconstructionActive() &&
-                                         (swapW == 0 || (dDesc.Width == swapW && dDesc.Height == swapH));
-
             if (motion_pair_active || s_hud_mask_active_pass ||
-                s_preserve_native_ui.load(std::memory_order_relaxed) || isNativeResDlaa) {
+                s_preserve_native_ui.load(std::memory_order_relaxed)) {
                 captureEarlyMotionColor(context, true);
-                if (isNativeResDlaa) {
-                    tryInPipelineDlaa(context);
-                }
             }
         }
         return s_hud_mask_active_pass ? HudDrawResult::HudReplay : HudDrawResult::None;
@@ -2502,9 +2492,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 }
                 if (valid_projection) {
-                    if (hud_first_match_seen) {
-                        // Pass 35 (Cockpit HUD) вже активний: пропускаємо інжекцію джиттеру,
-                        // щоб голограми корабля/цілі та HUD зберегли свої рідні матриці та чисту проекцію.
+                    if (hud_first_match_seen && s_preserve_native_ui.load(std::memory_order_relaxed)) {
+                        // Pass 35 (Cockpit HUD) вже активний і увімкнено Preserve Native UI:
+                        // пропускаємо інжекцію джиттеру для стабілізації HUD.
                         s_clean_camera_substitutions.fetch_add(1, std::memory_order_relaxed);
                     } else {
                         edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
@@ -5407,18 +5397,11 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             if (motion_color_frame == current_frame) {
                 s_hdr_slot0_seen_frame = current_frame;
             }
-            D3D11_TEXTURE2D_DESC desc{};
-            if (scene_depth_source) scene_depth_source->GetDesc(&desc);
-            const UINT swapW = s_swapchain_width.load(std::memory_order_relaxed);
-            const UINT swapH = s_swapchain_height.load(std::memory_order_relaxed);
-            const bool is_in_pipeline_dlaa = upscale_active &&
-                (swapW == 0 || (desc.Width == swapW && desc.Height == swapH));
-
             s_hud_mask_active_pass =
-                (upscale_active && s_preserve_native_ui.load(std::memory_order_relaxed) && !is_in_pipeline_dlaa) ||
+                (upscale_active && s_preserve_native_ui.load(std::memory_order_relaxed)) ||
                 s_hud_debug_view.load(std::memory_order_relaxed);
 
-            if (s_hud_mask_active_pass || is_in_pipeline_dlaa || ContextCensusIsJitterActive()) {
+            if (s_hud_mask_active_pass) {
                 if (!hud_draw_hook_mask) {
                     beginHudDrawProbe();
                 } else {
