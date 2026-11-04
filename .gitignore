@@ -11,3 +11,4 @@
 CODER_PROMPT.md
 ngx_probe_log.txt
 *.patch
+*.rdc
