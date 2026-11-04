@@ -27,7 +27,11 @@ body:
         - NVIDIA DLSS
         - AMD FSR Native AA
         - AMD FSR Super Resolution
-        - Native D3D11 TAA
+        - Native TAA
+        - TAA with upscaling
+        - All of them
+        - With any AA
+        - With any upscaler
         - Not sure
     validations:
       required: true
@@ -57,9 +61,9 @@ body:
     attributes:
       label: Game mode
       options:
-        - Odyssey, flat screen
+        - Odyssey, desktop
         - Odyssey, VR
-        - Horizons, flat screen
+        - Horizons, desktop
         - Horizons, VR
     validations:
       required: true
