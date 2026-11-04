@@ -1632,7 +1632,7 @@ against DLSS where possible.
 This phase must explicitly evaluate:
 
 ```text
-EDVR-style D3D11 backend
+D3D11 backend
 
 vs.
 

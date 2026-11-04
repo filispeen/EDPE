@@ -335,6 +335,44 @@ int main() {
         return 47;
     }
 
+    // Test 11: isNativeHud path (flags.w == 1.0) with native R11G11B10_FLOAT HUD texture
+    // In this test, dlssReconstruction, gameBackbuffer, and lowResWorld are all pure DLSS green.
+    // gameBackbuffer has NO orange (diff == 0 everywhere).
+    // nativeHudTex has orange HUD in rows 2-3 (DXGI_FORMAT_R11G11B10_FLOAT).
+    // Under native HUD path, orange HUD must be composited cleanly without needing game orange!
+    D3D11_TEXTURE2D_DESC nativeHudDesc = outDesc;
+    nativeHudDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    const uint32_t orangeFloatPacked = (0x3C0u) | (0x380u << 11);
+    std::array<uint32_t, 16> nativeHudPixels{};
+    for (int i = 0; i < 8; ++i) nativeHudPixels[i] = 0;
+    for (int i = 8; i < 16; ++i) nativeHudPixels[i] = orangeFloatPacked;
+    D3D11_SUBRESOURCE_DATA nativeHudInit{nativeHudPixels.data(), 4 * sizeof(uint32_t), 0};
+
+    ComPtr<ID3D11Texture2D> nativeHudTex;
+    ComPtr<ID3D11ShaderResourceView> nativeHudSrv;
+    if (FAILED(device->CreateTexture2D(&nativeHudDesc, &nativeHudInit, &nativeHudTex)) ||
+        FAILED(device->CreateShaderResourceView(nativeHudTex.Get(), nullptr, &nativeHudSrv))) {
+        return 48;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), dlssSrv.Get(), dlssSrv.Get(),
+        nativeHudSrv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/true, /*preserveUi=*/true);
+    if (!ok) return 50;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 51;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t nhR0 = rows[0], nhG0 = rows[1], nhB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t nhR3 = lastRow[0], nhG3 = lastRow[1], nhB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0 must be DLSS green (no HUD)
+    if (nhG0 < 150 || nhR0 > 50 || nhB0 > 50) return 52;
+    // Row 3 must contain composited orange HUD from nativeHudTex (even though blackGameTex had 0!)
+    if (nhR3 < 100 || nhG3 < 50 || nhB3 > 50) return 53;
+
     return 0;
 }
 

@@ -14,7 +14,7 @@ cbuffer CompositeParams : register(b0) {
     float2 renderTexel;
     float2 outputSize;
     float2 outputTexel;
-    float4 flags; // x: isHdr (1.0 = HDR inputs, 0.0 = LDR inputs)
+    float4 flags; // x: isHdr (1.0 = HDR inputs, 0.0 = LDR inputs), y: isNativeRes, z: preserveUi, w: isNativeHud
 };
 
 float3 toLdr(float3 c) {
@@ -45,11 +45,11 @@ float4 ps_main(VSOutput pin) : SV_Target {
 
     // Sample Pass 35 HUD mask at exact pixel center without spatial dilation so
     // 3D background pixels surrounding HUD text/lines are never replaced with jittered tGame.
-    float4 hSample = tHudMask.SampleLevel(sLinear, pin.uv, 0);
+    float4 hSample = (flags.w > 0.5) ? tHudMask.Load(pixelPos) : tHudMask.SampleLevel(sLinear, pin.uv, 0);
     float hudRaw = max(hSample.r, max(hSample.g, hSample.b));
     float hudMask = smoothstep(0.005, 0.08, hudRaw);
 
-    if (hudMask > 0.0) {
+    if (flags.w < 0.5 && hudMask > 0.0) {
         // Distinguish sharp/opaque HUD elements (text, numbers, icons, reticle lines)
         // from flat translucent HUD panels where 3D geometry edges are visible behind the panel.
         float3 hC_ldr = toLdr(hSample.rgb);
@@ -158,7 +158,14 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 deltaUi = (cGame - cLow) - alphaUi * (cDlss - cLow);
     float3 finalColor = cDlss + uiMask * deltaUi;
 
-    finalColor = lerp(finalColor, cGame, saturate(hudMask));
+    if (flags.w > 0.5) {
+        float3 hudColor = (flags.x > 0.5) ? toLdr(hSample.rgb) : hSample.rgb;
+        float hudIntensity = max(hudColor.r, max(hudColor.g, hudColor.b));
+        float dim = saturate(hudIntensity * 0.5);
+        finalColor = saturate(finalColor * (1.0 - dim) + hudColor);
+    } else {
+        finalColor = lerp(finalColor, cGame, saturate(hudMask));
+    }
 
     return float4(saturate(finalColor), 1.0);
 }

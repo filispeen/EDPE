@@ -31,7 +31,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 9. NVIDIA DLSS Super Resolution | **Verified & working in-game** | `NgxContext` and `NvidiaUpscalerBackend` reconstruct low-res LDR scene target (`scene_ldr_source`) into native backbuffer with verified temporal inputs and presets (`Auto`, `J`, `K`, `L`, `M`). Reconstructed 3D world is composited under native-resolution HUD. |
 | 10. True render-scale control | **Verified & working in-game** | Cobra's native Supersampling (SSAA < 1.0x) delivers true rendering workload reduction. Automatically detected via scene depth dimensions with zero manual configuration. |
 | 11. AMD FSR upscaling | **Verified & working in-game** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated in `AmdUpscalerBackend`. Verified in-game: supports FSR Native AA (1.0x SSAA) and FSR Super Resolution (<1.0x SSAA) with auto-exposure, inverted reversed-Z, and fail-open lifecycle. |
-| 12. Native-resolution HUD | **In progress / Under investigation** | `UiCompositePass` composites native-resolution UI/cockpit elements from pre-upscale backbuffer copy over reconstructed DLSS/FSR frames. Verified in-game observation: Anti-aliasing works without issues in the Main Menu (where `colorSource == backbuffer`, bypassing `UiCompositePass` and directly copying pure `s_dlss_output_texture` to the swapchain), but degraded in gameplay when `UiCompositePass` substituted raw jittered `cGame` over HUD billboard quads. HDR composite path restored to differential composition (`cDlss + uiMask * deltaUi`), ensuring 100% reconstructed DLSS output across all 3D scene pixels. |
+| 12. Native-resolution HUD | **Implemented (Stage 2)** | Clean pre-HUD 3D scene color (`s_clean_hdr_scene_texture`) fed to upscaler. Cockpit HUD draws replayed at native swapchain resolution into `s_hud_mask_texture` (`R11G11B10_FLOAT`) with viewport subpixel projection unjittering. `UiCompositePass` composites razor-sharp emissive/additive HUD directly onto reconstructed DLSS/FSR frame without blurry `cGame` cutout blending (resolving Issue #7 motion aberrations). |
 | 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
@@ -67,9 +67,9 @@ Phase 11 (AMD FSR 3.1.2 Upscaling) is **Verified In-Game**:
 - Performance telemetry HUD tracks frame pacing, engine/upscaler times, and GPU/VRAM load.
 
 The immediate next steps are:
-1. **In-game verification of Phase 12 Stage 1 (Cockpit Holographic HUD Mask & UI Composition)**.
-2. Proceed to **Phase 12 Stage 2 (Native-res RT replay with scaled viewport for razor-sharp cockpit HUD)**.
-3. Proceed to **Phase 13 (D3D11/D3D12 presentation bridge research for Frame Generation)**.
+1. **In-game verification of Phase 12 Stage 2 (Native-res unjittered cockpit HUD layer & clean-world upscaling)**.
+
+2. Proceed to **Phase 13 (D3D11/D3D12 presentation bridge research for Frame Generation)**.
 
 ---
 
@@ -163,7 +163,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 ---
 
-## Cockpit Holographic HUD Mask & UI Composition — IMPLEMENTED (Phase 12, Stage 1)
+## Cockpit Holographic HUD Mask & UI Composition — IMPLEMENTED (Phase 12, Stage 1 & 2)
 
 - **Root Cause Solved:** Deriving `uiMask` solely from `|gameBackbuffer - lowResWorld|` failed for the cockpit holographic HUD because Pass 35 draws directly into HDR color before bloom and tonemapping. The difference was ~0, leaving `uiMask = 0`, causing the HUD to be reconstructed through DLSS/FSR without motion vectors (causing blur and ghosting).
 - **Verified Shader Pairs (Pass 35 / 50 in `gameplay.rdc`, 30 draws):**
@@ -177,11 +177,11 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
   - Hooks remain installed across frames without vtable thrashing or per-frame hooking overhead.
   - Hot-path gated by `s_hud_mask_active_pass` and `motion_pair_active` (single CPU branch for non-HUD draws).
 - **HUD Mask Generation:**
-  - Matched HUD draws are replayed into `s_hud_mask_rtv` (`R11G11B10_FLOAT`, render resolution) using the game's bound HUD shaders and an alpha/additive blend filter that skips subtractive/min-op dark backing quads.
+  - Matched HUD draws are replayed into `s_hud_mask_rtv` (`R11G11B10_FLOAT`, native output swapchain resolution) using the game's bound HUD shaders, an alpha/additive blend filter, and subpixel projection unjittering on the viewport (`TopLeftX = -jitterX`, `TopLeftY = +jitterY`).
   - Cleared once per frame on entry to RTV0 deferred lighting/HUD.
 - **UI Composite Pass Integration:**
   - Mask SRV bound as 4th SRV (`t3`).
-  - In `ui_composite_shader.h`, `uiMask = max(uiMask, hudMask)` and pixels where `hudMask > 0` directly output `cGame` (crisp backbuffer color without ghosting).
+  - In `ui_composite_shader.h`, clean pre-HUD scene color (`s_clean_hdr_scene_texture`) is fed to DLSS/FSR, and native-resolution unjittered HUD (`tHudMask`) is composited directly onto the reconstructed frame via emissive addition without blurry `cGame` cutout blending (resolving Issue #7).
   - Non-blocking staging readback every 300 frames logs `EDPE: HUD mask coverage=<percent>% frame=<n>`.
 
 ---

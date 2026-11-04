@@ -13,7 +13,7 @@ struct CompositeParams {
     float renderTexel[2];
     float outputSize[2];
     float outputTexel[2];
-    float flags[4]; // x: isHdr (1.0f = HDR, 0.0f = LDR)
+    float flags[4]; // x: isHdr (1.0f = HDR, 0.0f = LDR), y: isNativeRes, z: preserveUi, w: isNativeHud
 };
 
 } // namespace
@@ -108,6 +108,23 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
         return false;
     }
 
+    bool isNativeHud = false;
+    if (hudMask) {
+        Microsoft::WRL::ComPtr<ID3D11Resource> maskRes;
+        hudMask->GetResource(&maskRes);
+        if (maskRes) {
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> maskTex;
+            if (SUCCEEDED(maskRes.As(&maskTex))) {
+                D3D11_TEXTURE2D_DESC md{};
+                maskTex->GetDesc(&md);
+                if (md.Width == outputWidth && md.Height == outputHeight &&
+                    (md.Format == DXGI_FORMAT_R11G11B10_FLOAT || md.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+                    isNativeHud = true;
+                }
+            }
+        }
+    }
+
     CompositeParams params{};
     params.renderSize[0] = static_cast<float>(renderWidth);
     params.renderSize[1] = static_cast<float>(renderHeight);
@@ -120,6 +137,7 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     params.flags[0] = isHdr ? 1.0f : 0.0f;
     params.flags[1] = (renderWidth == outputWidth && renderHeight == outputHeight) ? 1.0f : 0.0f;
     params.flags[2] = preserveUi ? 1.0f : 0.0f;
+    params.flags[3] = isNativeHud ? 1.0f : 0.0f;
 
     context_->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &params, 0, 0);
 
