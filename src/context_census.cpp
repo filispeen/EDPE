@@ -662,6 +662,10 @@ static UINT s_clean_hdr_scene_height = 0;
 static unsigned long long s_clean_hdr_scene_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_early_color_snapshot;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_snapshot;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_hud_mask_snapshot;
+UINT s_hud_mask_snapshot_width = 0;
+UINT s_hud_mask_snapshot_height = 0;
+bool s_hud_mask_snapshot_queued = false;
 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> motion_clean_color_target;
 UINT motion_color_snapshot_width = 0;
 UINT motion_color_snapshot_height = 0;
@@ -6823,6 +6827,8 @@ bool ContextCensusRequestMotionPair(unsigned index) {
     camera_pair_context = sceneCtx->context;
     camera_pair_queued = static_cast<int>(index);
     motion_pair_queued = true;
+    s_hud_mask_snapshot.Reset();
+    s_hud_mask_snapshot_queued = true;
     return true;
 }
 
@@ -6853,6 +6859,39 @@ ID3D11ShaderResourceView* ContextCensusTakeMotionDepthSnapshot(UINT* width, UINT
     if (height) *height = motion_depth_snapshot_height;
     if (index) *index = motion_depth_snapshot_index;
     return motion_depth_snapshot.Detach();
+}
+
+ID3D11ShaderResourceView* ContextCensusTakeHudMaskSnapshot(UINT* width, UINT* height) {
+    if ((!s_hud_mask_snapshot || s_hud_mask_snapshot_queued) && s_hud_mask_texture && s_hud_mask_device) {
+        s_hud_mask_snapshot.Reset();
+        s_hud_mask_snapshot_queued = false;
+        D3D11_TEXTURE2D_DESC desc{};
+        s_hud_mask_texture->GetDesc(&desc);
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> copy;
+        if (SUCCEEDED(s_hud_mask_device->CreateTexture2D(&desc, nullptr, &copy)) && copy) {
+            Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+            s_hud_mask_device->GetImmediateContext(&ctx);
+            if (ctx) {
+                ctx->CopyResource(copy.Get(), s_hud_mask_texture.Get());
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+                srvDesc.Format = desc.Format;
+                srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvDesc.Texture2D.MostDetailedMip = 0;
+                srvDesc.Texture2D.MipLevels = 1;
+                s_hud_mask_device->CreateShaderResourceView(copy.Get(), &srvDesc, &s_hud_mask_snapshot);
+                s_hud_mask_snapshot_width = desc.Width;
+                s_hud_mask_snapshot_height = desc.Height;
+            }
+        }
+    }
+    if (!s_hud_mask_snapshot) return nullptr;
+    if (width) *width = s_hud_mask_snapshot_width;
+    if (height) *height = s_hud_mask_snapshot_height;
+    return s_hud_mask_snapshot.Detach();
 }
 
 int ContextCensusSceneDepthCandidate() {
@@ -7058,6 +7097,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_grid_readback.Reset();
         motion_grid_context = nullptr;
         motion_snapshot.Reset();
+        s_hud_mask_snapshot.Reset();
         motion_pass.reset();
         motion_camera_frames = {~0ull, ~0ull};
         camera_pair_sample_frames = {~0ull, ~0ull};

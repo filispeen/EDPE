@@ -51,7 +51,7 @@ int main() {
         // Keybinds with token-level wrapping
         const char* const binds[] = {
             "F5: menu", "F6: capture", "F7: perf HUD",
-            "F8: jitter view", "F9: record jitter", "F10: HUD debug"
+            "F8: debug views", "F9: record jitter"
         };
         const int bindCount = sizeof(binds) / sizeof(binds[0]);
         const float sepWidth = ImGui::CalcTextSize(" | ").x;

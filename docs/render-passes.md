@@ -287,9 +287,9 @@ The report summary calculates:
 
 ---
 
-## 7. Cockpit HUD & UI Mask Debug View (`F10`)
+## 7. Cockpit HUD & UI Mask Debug View (`F8` Debug Views)
 
-The Cockpit HUD & UI Mask Debug View (`F10`, [`edpe::HudDebugPass`](file:///F:/Code/%D0%A1++/EDPE/src/hud_debug_pass.h)) provides runtime visual inspection of the cockpit holographic HUD mask and menu 2D UI composition channels:
+The Cockpit HUD & UI Mask Debug View ([`edpe::HudDebugPass`](file:///F:/Code/%D0%A1++/EDPE/src/hud_debug_pass.h), inspected via `F8` Debug Views in Dev Mode) provides runtime visual inspection of the cockpit holographic HUD mask and menu 2D UI composition channels:
 
 ### Visual Modes:
 - **Mode 0 (Combined)**: Cockpit holographic HUD and 2D menu UI combined in Neon Amber (`float3(1.0, 0.55, 0.05)`) over dimmed grayscale game scene (`luma * 0.35`).
@@ -299,7 +299,7 @@ The Cockpit HUD & UI Mask Debug View (`F10`, [`edpe::HudDebugPass`](file:///F:/C
 - **Mode 4 (Binary Mask)**: Pure black background with full mask in Amber.
 
 ### Interactive Controls (Dear ImGui):
-- `Enable HUD & UI Debug View` toggle (hotkey `F10` in Dev Mode).
+- `Enable HUD & UI Debug View` toggle (inspected via `F8` Debug Views in Dev Mode).
 - `HUD Mask Opacity` slider (`0.10x` – `3.00x`, default `1.00x`).
 - `UI Diff Threshold` slider (`0.002` – `0.100`, default `0.020`).
 - `HUD Debug Mode` dropdown (Modes 0–4).
