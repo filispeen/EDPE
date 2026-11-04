@@ -23,6 +23,9 @@ Intel XeSS Super Resolution
 
 Native D3D11 TAA
 
+NVIDIA Reflex (Low Latency / Boost)
+AMD Anti-Lag / Anti-Lag 2
+
 Experimental later phases:
 NVIDIA DLSS Frame Generation
 AMD FSR Frame Generation
@@ -112,6 +115,9 @@ shared TemporalFrameInputs
                    |
                    v
              HUD/UI handling
+                   |
+                   v
+     Low Latency (Reflex / Anti-Lag)
                    |
                    v
         optional Frame Generation
@@ -466,6 +472,11 @@ Frame Generation:
 Off
 NVIDIA
 AMD
+
+Low Latency:
+Off
+NVIDIA Reflex (On / On+Boost)
+AMD Anti-Lag / Anti-Lag 2
 
 Render resolution
 Output resolution
@@ -1137,23 +1148,30 @@ pacing stability
 
 ---
 
-# Latency
+# Latency and Low-Latency Framework
 
-Frame Generation requires latency analysis.
+Both standard rendering/upscaling and Frame Generation benefit from active latency management.
 
 NVIDIA:
 
 ```text
-Reflex
+Reflex SDK / NvAPI / Streamline Reflex
+Low Latency (sleep marker alignment)
+Reflex Boost (GPU clock pinning)
 ```
 
 AMD:
 
 ```text
-current vendor-recommended latency solution
+AMD Anti-Lag (driver-level)
+AMD Anti-Lag 2 SDK (in-engine marker pacing)
 ```
 
-Do not claim FG lowers latency merely because presented FPS increases.
+Core principles:
+1. Low-latency technologies operate **both standalone** (with native rendering, DLAA, DLSS, FSR, XeSS, or native TAA) and **coupled with Frame Generation**.
+2. In GPU-bound scenarios (orbital starports, planetary settlements, fleet combat), Reflex and Anti-Lag 2 eliminate the 2-3 frame driver/D3D11 render queue, slashing input lag for flight sticks/HOTAS, mouse, and keyboard.
+3. For Frame Generation (Phases 14 & 15), Reflex or Anti-Lag 2 is mandatory to prevent interpolation presentation lag from degrading flight responsiveness.
+4. Do not claim FG lowers latency merely because presented FPS increases.
 
 ---
 

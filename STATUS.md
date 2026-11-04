@@ -35,9 +35,10 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
-| 16. NVIDIA DLSS-NR | **Not started** | Research phase for G-buffer normal/roughness extraction and NGX Ray Reconstruction / neural denoising integration. |
-| 17. Intel XeSS upscaling | **Planned / Research** | Intel XeSS 1.3+ temporal upscaling (XeSS Native AA and Super Resolution). Dual-model support: XMX matrix acceleration on Intel Arc GPUs and universal DP4a fallback on NVIDIA/AMD GPUs. Investigating D3D11-to-D3D12 interop bridge (via Phase 13) vs proxy wrapper execution. |
-| 18. Third-party mod compatibility (ReShade, EDHM, 3Dmigoto) | **Planned / Architecture defined** | Proxy DLL chaining architecture for transparent co-existence with ReShade and EDHM (3Dmigoto). Non-destructive HUD heuristics resilient to shader overrides, post-upscale ReShade injection order, and depth buffer alignment. |
+| 16. Intel XeSS upscaling | **Planned / Research** | Intel XeSS 1.3+ temporal upscaling (XeSS Native AA and Super Resolution). Dual-model support: XMX matrix acceleration on Intel Arc GPUs and universal DP4a fallback on NVIDIA/AMD GPUs. Investigating D3D11-to-D3D12 interop bridge (via Phase 13) vs proxy wrapper execution. |
+| 17. Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag) | **Planned / Architecture defined** | Standalone and FG-coupled input latency minimization. NVIDIA Reflex SDK (Low Latency / Boost, marker insertion, sleep pacing) and AMD Anti-Lag / Anti-Lag 2 SDK. Pacing controls in edpe.ini and telemetry HUD integration. |
+| 18. NVIDIA DLSS-NR | **Planned** | Research phase for G-buffer normal/roughness extraction and NGX Ray Reconstruction / neural denoising integration. |
+| 19. Third-party mod compatibility (ReShade, EDHM, 3Dmigoto) | **Planned / Architecture defined** | Proxy DLL chaining architecture for transparent co-existence with ReShade and EDHM (3Dmigoto). Non-destructive HUD heuristics resilient to shader overrides, post-upscale ReShade injection order, and depth buffer alignment. |
 
 ---
 
@@ -197,6 +198,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 1. **Phase 12 — Native-Resolution HUD Separation:** Fine reactive mask generation and refinement for cockpit holographic elements and emissive UI.
 2. **Phase 13–15 — D3D11/D3D12 Interop & Frame Generation:** Presentation bridge prototyping for AMD FSR & NVIDIA DLSS Frame Generation.
+3. **Phase 19 — Low-Latency Framework:** Prototyping standalone and FG-coupled input lag minimization via NVIDIA Reflex (Low Latency / Boost) and AMD Anti-Lag / Anti-Lag 2 SDK integration.
 
 ---
 

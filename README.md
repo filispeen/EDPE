@@ -71,11 +71,12 @@ As of **November 2026 (`v0.6.0`)**, EDPE has achieved:
 | **8** | **NVIDIA DLAA** | ✅ **Verified** | Official NGX DLAA evaluated at native resolution; ~0.3 ms GPU time, pristine anti-aliasing. |
 | **9–10** | **True Render Scale & NVIDIA DLSS SR** | ✅ **Verified** | Lower 3D scene render resolution via Cobra SSAA (< 1.0x) with full DLSS SR reconstruction and zero-configuration auto-scaling. |
 | **11** | **AMD FSR Super Resolution & Native AA** | ✅ **Verified** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated and verified in-game; supports FSR Native AA & FSR Super Resolution with fail-open fallback. |
-| **12** | **Native-Resolution HUD Separation** | 🟡 **Partial** (Works with menus; cockpit UI refined) | Native-res HUD composited over upscaled DLSS/FSR 3D scene (`UiCompositePass`), protecting cockpit/UI crispness. |
+| **12** | **Native-Resolution HUD Separation** | ✅ **Verified** (Works with menus; cockpit UI refined) | Native-res HUD composited over upscaled DLSS/FSR 3D scene (`UiCompositePass`), protecting cockpit/UI crispness. |
 | **13–15** | **D3D11/D3D12 Interop & Frame Generation** | 🔬 **Research** | NVIDIA DLSS Frame Generation (Streamline) & AMD FSR Frame Generation via interop bridge. |
-| **16** | **NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)** | 🔬 **Research** | AI-driven Ray Reconstruction / neural denoising replacing hand-tuned temporal filters for reflections and lighting via NGX Ray Reconstruction. |
-| **17** | **Intel XeSS Super Resolution & Native AA** | 🔬 **Planned / Research** | Intel XeSS 1.3+ AI temporal upscaler with dual-engine execution: Intel XMX hardware acceleration on Arc and universal DP4a fallback across all vendors via D3D11/D3D12 bridge. |
-| **18** | **Third-Party Mod Compatibility (ReShade, EDHM, 3Dmigoto)** | 📋 **Planned** | Proxy DLL chaining (`edpe.ini` `[Proxy]`), post-upscale ReShade injection, non-destructive HUD heuristics for EDHM custom colors, and cooperative input routing. |
+| **16** | **Intel XeSS Super Resolution & Native AA** | 📋 **Planned / Research** | Intel XeSS 1.3+ AI temporal upscaler with dual-engine execution: Intel XMX hardware acceleration on Arc and universal DP4a fallback across all vendors via D3D11/D3D12 bridge. |
+| **17** | **Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag)** | 📋 **Planned** | Standalone and FG-coupled input latency minimization via NVIDIA Reflex SDK (Low Latency / Boost) and AMD Anti-Lag / Anti-Lag 2 SDK, dynamic sleep pacing, marker injection, and latency telemetry. |
+| **18** | **NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)** | 📋 **Research** | AI-driven Ray Reconstruction / neural denoising replacing hand-tuned temporal filters for reflections and lighting via NGX Ray Reconstruction. |
+| **19** | **Third-Party Mod Compatibility (ReShade, EDHM, 3Dmigoto)** | 📋 **Planned** | Proxy DLL chaining (`edpe.ini` `[Proxy]`), post-upscale ReShade injection, non-destructive HUD heuristics for EDHM custom colors, and cooperative input routing. |
 
 See [STATUS.md](STATUS.md) for verified facts and [PLAN.md](PLAN.md) for the complete roadmap.
 
@@ -314,7 +315,7 @@ EDPE/
 ## Important Documentation References
 
 * [STATUS.md](STATUS.md): Up-to-date verified empirical facts, test results, and milestone logs.
-* [PLAN.md](PLAN.md): Detailed 18-phase architectural roadmap.
+* [PLAN.md](PLAN.md): Detailed 19-phase architectural roadmap.
 * [AGENTS.md](AGENTS.md): Project governance, architecture constraints, and contribution rules.
 * [render-pipeline-observations.md](docs/render-pipeline-observations.md): Reverse-engineering findings on Elite's MRT layout, depth buffers, and lighting passes.
 * [nvidia-dlaa-input-contract.md](docs/nvidia-dlaa-input-contract.md): Specifications for NVIDIA NGX DLAA integration.

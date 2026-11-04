@@ -12,6 +12,7 @@ The initial focus is temporal upscaling and anti-aliasing:
 * AMD FSR temporal upscaling / Native AA;
 * Intel XeSS Super Resolution / Native AA;
 * native D3D11 TAA;
+* low-latency technologies (NVIDIA Reflex & AMD Anti-Lag / Anti-Lag 2) for responsive flight controls and frame pacing;
 * vendor-neutral reconstruction infrastructure.
 
 The architecture must also leave a clean path for later experimental Frame Generation support:
@@ -35,6 +36,7 @@ The injector must eventually:
 * reconstruct a native-resolution image from a lower-resolution scene;
 * preserve HUD/UI at native resolution where feasible;
 * support seamless co-existence and proxy chaining with popular third-party tools and mods (ReShade post-processing, EDHM / 3Dmigoto cockpit HUD customization, Special K, RTSS);
+* reduce input latency and CPU-GPU desync via NVIDIA Reflex and AMD Anti-Lag / Anti-Lag 2;
 * expose configuration through **Dear ImGui**;
 * provide GPU timing and debug views;
 * support safe runtime switching;
@@ -1087,12 +1089,20 @@ Suggested architecture:
 │   │   │
 │   │   ├── nvidia/
 │   │   │   ├── streamline.cpp
-│   │   │   ├── dlss_fg.cpp
-│   │   │   └── reflex.cpp
+│   │   │   └── dlss_fg.cpp
 │   │   │
 │   │   └── amd/
-│   │       ├── fsr_fg.cpp
-│   │       └── anti_lag.cpp
+│   │       └── fsr_fg.cpp
+│   │
+│   ├── latency/
+│   │   ├── latency.h
+│   │   ├── latency_manager.cpp
+│   │   │
+│   │   ├── nvidia/
+│   │   │   └── reflex_backend.cpp
+│   │   │
+│   │   └── amd/
+│   │       └── anti_lag_backend.cpp
 │   │
 │   ├── interop/
 │   │   ├── d3d11_d3d12.cpp
@@ -1961,7 +1971,123 @@ IDXGISwapChain::Present
 
 ---
 
-# 42. Frame pacing
+# 42. Phase 19 — Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag / Anti-Lag 2)
+
+Implement a standalone, vendor-neutral low-latency framework integrating **NVIDIA Reflex** and **AMD Anti-Lag / Anti-Lag 2** into EDPE.
+
+In Elite Dangerous Odyssey, pilots frequently encounter severe GPU-bound conditions when docking inside densely populated starports, exploring high-complexity surface settlements, traversing dense asteroid belts with volumetric fog, or maneuvering in Conflict Zones with dozens of combatants. Under heavy GPU load (98–100% utilization), Direct3D 11 and GPU driver pipelines buffer 2 to 3 frames in the render queue. This queue introduces 30–80 ms of input latency, resulting in sluggish flight stick (HOTAS), mouse, and keyboard response during critical combat maneuvers, fixed-weapon tracking, and Flight Assist Off (FA-off) drift corrections.
+
+Furthermore, future Frame Generation (Phases 14 & 15) inserts interpolated frames into the presentation sequence, which compounds perceived input delay unless paired with aggressive frame-pacing and queue-flushing mechanisms.
+
+Therefore, the low-latency framework serves two critical operational roles in EDPE:
+1. **Standalone Latency Reduction:** Active during native rendering, DLAA, DLSS SR, FSR SR, XeSS, or native TAA, completely eliminating driver render queues and aligning CPU simulation with GPU execution without requiring Frame Generation;
+2. **Frame Generation Companion:** Mandatorily engaged when NVIDIA DLSS-G or AMD FSR FG is active, keeping perceived control lag crisp and immediate despite interpolation queue depth.
+
+### 1. NVIDIA Reflex Integration (`NvidiaReflexBackend`)
+- **Direct3D 11 Native Integration:**
+  Utilize the NVIDIA Reflex SDK and NvAPI Direct3D 11 entry points (`NvAPI_D3D_SetSleepMode`, `NvAPI_D3D_Sleep`, `NvAPI_D3D_SetLatencyMarker`). For Streamline-based DLSS Frame Generation (Phase 15), interface directly with the Streamline Reflex plugin (`sl.reflex`).
+- **Operational Modes:**
+  - `Off`: Standard D3D11 render queue depth (default driver buffering up to 3 frames);
+  - `On`: Reflex dynamically inserts microsecond-precision sleep delays immediately prior to input sampling, pacing CPU frame dispatch to match GPU consumption and constraining render queue depth to ~0–1 frame;
+  - `On + Boost`: Combines dynamic render queue reduction with an override of GPU power saving states, locking GPU core and memory clocks to maximum boost frequencies during transient CPU stalls or partial loads to minimize frame execution time.
+- **Latency Marker Instrumentation:**
+  Instrument the engine frame loop with explicit markers via `NvAPI_D3D_SetLatencyMarker`:
+  - `SIMULATION_START`: Placed at the beginning of frame processing or window message pump (`PeekMessageW` / `GetMessageW` hook);
+  - `INPUT_SAMPLE`: Latched immediately prior to Elite polling mouse, keyboard, DirectInput, or RawInput state;
+  - `SIMULATION_END`: Latched after engine game logic and camera constant buffer updates complete;
+  - `RENDER_SUBMIT_START`: Latched when the first draw call or constant buffer `Map` of the frame begins;
+  - `RENDER_SUBMIT_END`: Latched after all scene draw calls and post-processing finish;
+  - `PRESENT_START`: In `IDXGISwapChain::Present` immediately before handing off to the swapchain;
+  - `PRESENT_END`: In `IDXGISwapChain::Present` immediately after the frame flip.
+- **Precision Sleep Placement:**
+  Dispatch `NvAPI_D3D_Sleep` before `SIMULATION_START` / `INPUT_SAMPLE`. By holding the CPU until the GPU is nearly finished rendering the prior frame, the pilot's control inputs are sampled at the latest possible instant before rendering begins, slashing input-to-photon latency.
+- **Hardware Reflex Analyzer & Flash Indicator:**
+  Provide support for the NVIDIA Reflex Analyzer (LDAT / integrated gaming monitor analyzers) by supporting an optional 16×16 white flash box triggered on mouse click events.
+
+### 2. AMD Anti-Lag & Anti-Lag 2 Integration (`AmdAntiLagBackend`)
+- **Evolution & Architecture:**
+  - Support driver-level **AMD Anti-Lag** via AMD ADLX / Radeon driver integration;
+  - Integrate **AMD Anti-Lag 2 SDK** (`amd_anti_lag.h` / FidelityFX / AGS), providing true in-game sub-frame synchronization markers matching Reflex capabilities.
+- **Operational Modes:**
+  - `Off`: Standard driver presentation queue;
+  - `Anti-Lag`: Driver-level queue depth regulation;
+  - `Anti-Lag 2`: In-engine SDK-level pacing with explicit synchronization markers.
+- **Frame Alignment & Direct3D 11 Compatibility:**
+  Anti-Lag 2 operates natively in Direct3D 11 and Direct3D 12. Insert Anti-Lag 2 synchronization markers (`amdAntiLag2SetLatencyMarker`) between simulation completion and render submission to throttle CPU dispatch when GPU-bound, preventing the DXGI/driver command queue from buffering excess frames.
+
+### 3. Vendor-Neutral Latency Abstraction (`ILatencyBackend`)
+Architect behind an abstracted interface decoupling latency control from the engine hooks:
+
+```cpp
+enum class LatencyMode {
+    Off,
+    On,
+    OnBoost,       // Reflex On + Boost
+    AntiLag2       // AMD Anti-Lag 2
+};
+
+enum class LatencyMarker {
+    SimulationStart,
+    SimulationEnd,
+    InputSample,
+    RenderSubmitStart,
+    RenderSubmitEnd,
+    PresentStart,
+    PresentEnd
+};
+
+struct LatencyTelemetry {
+    float gameToRenderLatencyMs;
+    float simToPresentLatencyMs;
+    float renderSubmitLatencyMs;
+    float driverQueueLatencyMs;
+    bool  reflexAvailable;
+    bool  antiLagAvailable;
+    bool  antiLag2Available;
+};
+
+class ILatencyBackend {
+public:
+    virtual ~ILatencyBackend() = default;
+    virtual bool Initialize(ID3D11Device* device) = 0;
+    virtual void Shutdown() = 0;
+    virtual bool SetMode(LatencyMode mode) = 0;
+    virtual void SetMarker(LatencyMarker marker, uint64_t frameId) = 0;
+    virtual void Sleep() = 0;
+    virtual LatencyTelemetry GetTelemetry() = 0;
+};
+```
+
+- **Dynamic GPU Vendor Detection:**
+  Inspect adapter vendor ID (`0x10DE` for NVIDIA, `0x1002` for AMD, `0x8086` for Intel) via `IDXGIAdapter::GetDesc`. Automatically select and initialize the appropriate backend. Gracefully grey out unsupported vendor technologies with clear explanatory tooltips in Dear ImGui.
+- **Fail-Open Fallback:**
+  If Reflex SDK, NvAPI, or AMD Anti-Lag SDK initialization fails or if driver support is absent, log a diagnostic warning, disable low-latency pacing, and proceed with standard presentation without disrupting the game.
+
+### 4. Configuration & Runtime Telemetry (`edpe.ini`, ImGui & Telemetry HUD)
+- **Configuration in `edpe.ini`:**
+  ```ini
+  [Latency]
+  ; 0 = Off, 1 = On (Reflex / Anti-Lag), 2 = On+Boost (Reflex only)
+  Mode=1
+  ; 1 = Enable 16x16 white flash box on left click for Reflex Analyzer / LDAT
+  FlashIndicator=0
+  ```
+- **Dear ImGui Controls (`F5`):**
+  - Mode selector dynamically populated based on active GPU (`Off`, `On`, `On + Boost` on NVIDIA; `Off`, `Anti-Lag`, `Anti-Lag 2` on AMD);
+  - Real-time latency metrics display:
+    ```text
+    Low Latency:          NVIDIA Reflex (On + Boost)
+    Game-to-Render:       14.2 ms
+    Render Submit:         1.8 ms
+    Driver Queue Depth:   0.8 frames
+    Pacing Status:        Synchronized (Zero Queue Buildup)
+    ```
+- **Performance Telemetry HUD (`F7`):**
+  - Displays real-time low-latency indicator (`Reflex: BOOST` or `Anti-Lag 2`) and estimated input latency alongside FPS and frametimes.
+
+---
+
+# 43. Frame pacing
 
 Frame Generation requires its own diagnostics.
 
@@ -1984,36 +2110,39 @@ A generated frame is not a new simulation frame.
 
 ---
 
-# 43. Latency controls
+# 44. Latency controls
 
-FG must be paired with vendor-appropriate latency handling.
+Both standalone rendering/upscaling and Frame Generation must be paired with vendor-appropriate latency handling as defined in Phase 19:
 
-For NVIDIA investigate/integrate:
+For NVIDIA:
 
 ```text
-Reflex
+Reflex SDK / NvAPI / Streamline Reflex
+Low Latency (sleep marker alignment)
+Reflex Boost (GPU clock pinning)
 ```
 
-For AMD investigate:
+For AMD:
 
 ```text
-current recommended Anti-Lag / Anti-Lag 2 integration
+AMD Anti-Lag (driver-level)
+AMD Anti-Lag 2 SDK (in-engine marker pacing)
 ```
 
 Do not claim "lower latency" simply because presented FPS increased.
 
-Dear ImGui should eventually show separate:
+Dear ImGui and Performance HUD should expose dedicated:
 
 ```text
 Frame Generation
 Low Latency
 ```
 
-status fields.
+controls and status telemetry fields.
 
 ---
 
-# 44. Runtime compatibility matrix
+# 45. Runtime compatibility matrix
 
 EDPE should construct capability state dynamically.
 
@@ -2031,6 +2160,8 @@ NVIDIA Frame Gen     Unavailable: D3D12 bridge disabled
 AMD Frame Gen        Experimental
 Proxy DLL Chaining   Available / Configured (ReShade64.dll)
 EDHM Co-existence    Active (Heuristic HUD isolation)
+NVIDIA Reflex        Available (On / On+Boost)
+AMD Anti-Lag         Available (Anti-Lag / Anti-Lag 2)
 ```
 
 Use vendor API capability queries wherever possible.
@@ -2041,7 +2172,7 @@ Explain the reason in Dear ImGui.
 
 ---
 
-# 45. Diagnostics
+# 46. Diagnostics
 
 Log:
 
@@ -2067,6 +2198,10 @@ interop state
 fallback reason
 proxy chaining status
 detected third-party hooks
+latency backend (Reflex / Anti-Lag / Anti-Lag 2)
+latency mode (Off / On / Boost)
+game-to-render latency
+driver queue latency
 ```
 
 Measure separately:
@@ -2085,7 +2220,7 @@ Never block the render thread waiting for GPU queries.
 
 ---
 
-# 46. Failure behavior
+# 47. Failure behavior
 
 Every feature must fail open.
 
@@ -2111,7 +2246,7 @@ Do not black-screen the game because a vendor SDK rejects an input.
 
 ---
 
-# 47. Performance rules
+# 48. Performance rules
 
 Avoid:
 
@@ -2140,7 +2275,7 @@ stable backend contexts
 
 ---
 
-# 48. Scope exclusions for initial versions
+# 49. Scope exclusions for initial versions
 
 Not initial-release requirements:
 
@@ -2155,13 +2290,13 @@ network modifications
 anti-cheat bypassing
 ```
 
-Unlike earlier development revisions, **Frame Generation, DLSS-NR (Ray Reconstruction), Intel XeSS, and third-party mod compatibility (ReShade, EDHM, 3Dmigoto)** are part of the overall EDPE roadmap.
+Unlike earlier development revisions, **Frame Generation, DLSS-NR (Ray Reconstruction), Intel XeSS, third-party mod compatibility (ReShade, EDHM, 3Dmigoto), and Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag / Anti-Lag 2)** are part of the overall EDPE roadmap.
 
-They are explicitly planned later phases (Phases 13–18).
+They are explicitly planned later phases (Phases 13–19).
 
 ---
 
-# 49. Development philosophy
+# 50. Development philosophy
 
 Every significant graphics claim must be labelled:
 
@@ -2194,7 +2329,7 @@ guess
 
 ---
 
-# 50. Initial serious milestone
+# 51. Initial serious milestone
 
 First major temporal milestone:
 
@@ -2214,7 +2349,7 @@ Elite Dangerous 2D
 
 ---
 
-# 51. Multi-upscaler milestone
+# 52. Multi-upscaler milestone
 
 Next major target:
 
@@ -2243,7 +2378,7 @@ It is a **vendor-neutral Elite Dangerous temporal reconstruction framework**.
 
 ---
 
-# 52. Frame Generation milestone
+# 53. Frame Generation milestone
 
 Only after:
 
@@ -2277,7 +2412,7 @@ capability detection
 
 ---
 
-# 53. Final target
+# 54. Final target
 
 A mature EDPE UI may look approximately like:
 
