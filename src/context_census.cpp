@@ -4291,7 +4291,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.sharpness = s_sharpness.load(std::memory_order_relaxed);
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
-    const bool isHdrColor = hdrInput &&
+    const bool isHdrColor = (hdrInput || (preserveUi && rawColorChoice == s_clean_hdr_scene_texture.Get())) &&
                             (srcColorDesc.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
                              srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
                              srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);

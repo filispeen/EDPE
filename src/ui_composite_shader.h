@@ -18,7 +18,13 @@ cbuffer CompositeParams : register(b0) {
 };
 
 float3 toLdr(float3 c) {
-    float3 mapped = max(c, 0.0) / (1.0 + max(c, 0.0));
+    float3 x = max(c, 0.0);
+    float a = 2.51;
+    float b = 0.03;
+    float c_coeff = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    float3 mapped = saturate((x * (a * x + b)) / (x * (c_coeff * x + d) + e));
     return pow(mapped, 1.0 / 2.2);
 }
 
@@ -41,6 +47,21 @@ float4 ps_main(VSOutput pin) : SV_Target {
         float3 cOut = tDlss.Load(pixelPos).rgb;
         if (flags.x > 0.5) cOut = toLdr(cOut);
         return float4(saturate(cOut), 1.0);
+    }
+
+    // Direct door composite: pure reconstructed clean 3D world + native unjittered HUD overlay.
+    // The diff mask is completely bypassed so the reconstructed world is NEVER replaced with jittered tGame!
+    if (flags.w > 0.5) {
+        float3 cDlss = tDlss.Load(pixelPos).rgb;
+        if (flags.x > 0.5) {
+            cDlss = toLdr(cDlss);
+        }
+        float4 hSample = tHudMask.Load(pixelPos);
+        float3 hudColor = (flags.x > 0.5) ? toLdr(hSample.rgb) : hSample.rgb;
+        float hudIntensity = max(hudColor.r, max(hudColor.g, hudColor.b));
+        float dim = saturate(hudIntensity * 0.5);
+        float3 finalColor = saturate(cDlss * (1.0 - dim) + hudColor);
+        return float4(finalColor, 1.0);
     }
 
     // Sample Pass 35 HUD mask at exact pixel center without spatial dilation so

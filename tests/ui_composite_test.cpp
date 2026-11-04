@@ -373,6 +373,25 @@ int main() {
     // Row 3 must contain composited orange HUD from nativeHudTex (even though blackGameTex had 0!)
     if (nhR3 < 100 || nhG3 < 50 || nhB3 > 50) return 53;
 
+    // Test 12: Direct native HUD composite path with isHdr = false
+    ok = pass.composite(context.Get(), dlssSrv.Get(), dlssSrv.Get(), dlssSrv.Get(),
+        nativeHudSrv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true);
+    if (!ok) return 54;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 55;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t ldrR0 = rows[0], ldrG0 = rows[1], ldrB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t ldrR3 = lastRow[0], ldrG3 = lastRow[1], ldrB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0 must be DLSS green (no HUD)
+    if (ldrG0 < 150 || ldrR0 > 50 || ldrB0 > 50) return 56;
+    // Row 3 must contain composited orange HUD from nativeHudTex
+    if (ldrR3 < 100 || ldrG3 < 50 || ldrB3 > 50) return 57;
+
     return 0;
 }
 

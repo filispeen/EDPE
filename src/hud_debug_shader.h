@@ -36,7 +36,13 @@ VSOutput vs_main(uint id : SV_VertexID) {
 }
 
 float3 toLdr(float3 c) {
-    float3 mapped = max(c, 0.0) / (1.0 + max(c, 0.0));
+    float3 x = max(c, 0.0);
+    float a = 2.51;
+    float b = 0.03;
+    float c_coeff = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    float3 mapped = saturate((x * (a * x + b)) / (x * (c_coeff * x + d) + e));
     return pow(mapped, 1.0 / 2.2);
 }
 
@@ -73,8 +79,8 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 finalColor = grayBg;
 
     if (mode == 0) {
-        // Mode 0: Combined UI Mask (All UI in Amber)
-        float comb = max(hudVal, menuVal);
+        // Mode 0: Cockpit Holographic HUD Mask Only (Pass 35 in Amber, diff mask disabled)
+        float comb = hudVal;
         if (comb > 0.005) {
             float factor = saturate(comb * opacity);
             finalColor = lerp(grayBg, neonAmber, factor);
