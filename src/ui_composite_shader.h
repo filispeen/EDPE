@@ -62,8 +62,10 @@ float4 ps_main(VSOutput pin) : SV_Target {
             float3 combinedHdr = cDlss * hudTransmittance + hSample.rgb;
             return float4(toLdr(combinedHdr), 1.0);
         } else {
-            // SDR mode: already in LDR.
-            float3 finalColor = saturate(cDlss * hudTransmittance + hSample.rgb);
+            // SDR mode: cDlss already contains Cobra's full post-processing (bloom, exposure, 3D LUT tonemapping).
+            // hSample.rgb is linear HDR HUD radiance; map it to display LDR via toLdr() while backing dims cDlss.
+            float3 hudColor = toLdr(hSample.rgb);
+            float3 finalColor = saturate(cDlss * hudTransmittance + hudColor);
             return float4(finalColor, 1.0);
         }
     }
@@ -184,7 +186,8 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 finalColor = cDlss + uiMask * deltaUi;
 
     if (flags.w > 0.5) {
-        float3 combined = finalColor * saturate(hSample.a) + hSample.rgb;
+        float3 hudColor = (flags.x > 0.5) ? hSample.rgb : toLdr(hSample.rgb);
+        float3 combined = finalColor * saturate(hSample.a) + hudColor;
         finalColor = (flags.x > 0.5) ? toLdr(combined) : saturate(combined);
     } else {
         finalColor = lerp(finalColor, cGame, saturate(hudMask));
