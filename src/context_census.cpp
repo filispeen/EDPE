@@ -1129,14 +1129,7 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
         vs_hash == 0x2CECEC3065EF0D4Aull || // Holographic panels & radar
         vs_hash == 0xB7790CBFC6554097ull || // Flight HUD
         vs_hash == 0xE508648660A352B2ull || // Target sprite
-        vs_hash == 0x5559BD94B6852E83ull || // 3D ship hologram sphere
-        vs_hash == 0xA888D51024D9798Eull || // Menu and cockpit interface panel composite / backing
-        vs_hash == 0x4EF6DDB075A927FAull || // Cockpit curved screen interface
-        vs_hash == 0xB12F7A618E1BDE98ull || // Target / compass / orbit rings
-        vs_hash == 0xC7FA0C0F5DD49180ull || // Orbital HUD / flight path
-        vs_hash == 0x666EF0C4C616F67Eull || // GUI vector widgets
-        vs_hash == 0x1012E00B3CB44469ull || // GUI glyph-atlas text
-        vs_hash == 0xA3E5D3FCBC1165F8ull) { // GUI BC7 icons
+        vs_hash == 0x5559BD94B6852E83ull) { // 3D ship hologram sphere
         return true;
     }
     return (vs_hash == 0x81216C77F90DEDD6ull && ps_hash == 0xAB82734FE19EFB9Dull) ||
@@ -1349,7 +1342,7 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     ID3D11RenderTargetView* orig_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth;
     context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, orig_rtvs, depth.GetAddressOf());
-    if (!orig_rtvs[0]) {
+    if (!orig_rtvs[0] || !motion_color_source || !sameRenderTargetResource(orig_rtvs[0], motion_color_source.Get())) {
         for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
             if (orig_rtvs[i]) orig_rtvs[i]->Release();
         }
@@ -1519,7 +1512,7 @@ HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT insta
         }
     } drawTimer;
 
-    if (!s_hud_mask_active_pass) {
+    {
         ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
         context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, nullptr);
         bool target_matches = false;
@@ -5939,16 +5932,17 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
         auto* context = activeSceneContext();
         const auto cur_rendered = last_present_frame.load(std::memory_order_relaxed);
+        const float rotTrace = (s_camera_now.scaleX > 0.0f && s_camera_previous.scaleX > 0.0f)
+            ? edpe::cameraRotationTrace(s_camera_now, s_camera_previous)
+            : 3.0f;
+        const bool camera_is_moving = (rotTrace < 2.999f);
         const bool can_retain_prev_hud =
+            !camera_is_moving &&
             s_hud_mask_last_valid_frame != ~0ull &&
             cur_rendered >= s_hud_mask_last_valid_frame &&
             cur_rendered <= s_hud_mask_last_valid_frame + 2 &&
             s_hud_mask_last_valid_draws > 0;
         if (s_hud_mask_rtv && context) {
-            const bool single_frame_drop = (s_hud_mask_last_valid_draws >= 4 &&
-                                            s_hud_draws_replayed_frame > 0 &&
-                                            s_hud_draws_replayed_frame < s_hud_mask_last_valid_draws &&
-                                            cur_rendered - s_hud_mask_last_valid_frame == 1);
             if (!s_hud_mask_cleared_for_frame) {
                 if (can_retain_prev_hud) {
                     if (s_hud_mask_prev_texture && s_hud_mask_texture) {
@@ -5961,7 +5955,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     s_hud_draws_replayed_frame = 0;
                 }
             } else if (can_retain_prev_hud &&
-                       (s_hud_draws_replayed_frame < (s_hud_mask_last_valid_draws + 1) / 2 || single_frame_drop) &&
+                       s_hud_draws_replayed_frame < (s_hud_mask_last_valid_draws + 1) / 2 &&
                        s_hud_mask_prev_texture && s_hud_mask_texture) {
                 context->CopyResource(s_hud_mask_texture.Get(), s_hud_mask_prev_texture.Get());
                 s_hud_draws_replayed_frame = s_hud_mask_last_valid_draws;
