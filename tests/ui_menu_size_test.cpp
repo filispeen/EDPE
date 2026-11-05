@@ -50,7 +50,7 @@ int main() {
 
         // Keybinds with token-level wrapping
         const char* const binds[] = {
-            "F5: menu", "F6: capture", "F7: perf HUD",
+            "F5: menu", "F7: perf HUD",
             "F8: debug views", "F9: record jitter"
         };
         const int bindCount = sizeof(binds) / sizeof(binds[0]);

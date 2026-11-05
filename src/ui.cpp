@@ -90,7 +90,6 @@ struct UiState {
     std::vector<OverlayCaptureItem> overlay_items;
     unsigned capture_serial = 0;
     bool pending_backbuffer_capture = false;
-    bool pending_backbuffer_capture_on_motion = false;
     bool snapshot_ready = false;
     UINT motion_width = 0;
     UINT motion_height = 0;
@@ -136,8 +135,6 @@ struct UiState {
     wchar_t last_comparison_saved[128]{};
 } ui;
 std::atomic<bool> menu_visible{false};
-std::atomic<bool> all_captures_requested{false};
-std::atomic<bool> all_captures_save_to_disk{false};
 std::mutex input_mutex;
 std::vector<InputMessage> pending_input;
 std::vector<InputMessage> render_input;
@@ -182,17 +179,6 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
 
     auto& cfg = edpe::Config::instance();
 
-    if (cfg.devMode) {
-        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-            wparam == VK_F6 && !(lparam & (1LL << 30))) {
-            all_captures_save_to_disk.store(true, std::memory_order_release);
-            all_captures_requested.store(true, std::memory_order_release);
-            EdpeLog(L"EDPE: F6 pressed — One-Shot Capture requested for all buffers");
-            return true;
-        }
-        if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F6) return true;
-    }
-
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
         wparam == VK_F7 && !(lparam & (1LL << 30))) {
         cfg.showPerfOverlay = !cfg.showPerfOverlay;
@@ -203,26 +189,7 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F7) return true;
 
     if (cfg.devMode) {
-        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-            wparam == VK_F8 && !(lparam & (1LL << 30))) {
-            ui.debug_view_open = !ui.debug_view_open;
-            cfg.debugViewActive = ui.debug_view_open;
-            cfg.save();
-            if (ui.debug_view_open) {
-                ui.depth_window_open = true;
-                ui.color_window_open = true;
-                ui.early_color_window_open = true;
-                ui.motion_window_open = true;
-                ui.hud_window_open = true;
-                ui.snapshot_ready = true;
-                all_captures_save_to_disk.store(false, std::memory_order_release);
-                all_captures_requested.store(true, std::memory_order_release);
-            }
-            EdpeLog(ui.debug_view_open ? L"EDPE: F8 pressed — Debug Views enabled (all windows)"
-                                       : L"EDPE: F8 pressed — Debug Views disabled");
-            return true;
-        }
-        if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam == VK_F8) return true;
+        // F8 debug views removed.
 
         if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
             wparam == VK_F9 && !(lparam & (1LL << 30))) {
@@ -1568,46 +1535,14 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     }
     pollDepthSamples();
     pollFrameCapture();
-    static bool s_pending_save_disk = false;
-    if (all_captures_requested.exchange(false, std::memory_order_acq_rel)) {
-        const bool save_disk = all_captures_save_to_disk.exchange(false, std::memory_order_acq_rel);
-        s_pending_save_disk = save_disk;
-        int candidate = ContextCensusSceneDepthCandidate();
-        if (candidate < 0 && ui.depth_candidate >= 0 &&
-            ContextCensusDepthSnapshotAvailable(static_cast<unsigned>(ui.depth_candidate))) {
-            candidate = ui.depth_candidate;
-        }
-        if (candidate < 0 && ContextCensusDepthSnapshotAvailable(2)) {
-            candidate = 2;
-        }
-        if (candidate >= 0) {
-            ui.depth_candidate = candidate;
-            ContextCensusRequestMotionPair(static_cast<unsigned>(candidate));
-            ui.pending_backbuffer_capture_on_motion = save_disk;
-            releaseMotionSnapshot();
-            releaseHudSnapshot();
-            releaseColorSnapshot();
-            releaseEarlyColorSnapshot();
-            releaseDepthSnapshot();
-            wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: all-captures armed on DSV #%d", candidate);
-            EdpeLog(msg);
-        } else {
-            EdpeLog(L"EDPE: all-captures armed backbuffer only (no depth candidate yet)");
-            if (save_disk) ui.pending_backbuffer_capture = true;
-        }
-    }
-    bool motion_batch_ready = false;
     if (auto* motion = ContextCensusTakeMotionSnapshot(&ui.motion_width, &ui.motion_height)) {
         releaseMotionSnapshot();
         ui.motion_srv = motion;
         ui.motion_window_open = true;
         ui.snapshot_ready = true;
         ensureMotionPreviewShader();
-        if (s_pending_save_disk) queueTextureCaptureFromSrv(ui.motion_srv, UiState::CaptureKind::Motion);
         ui.motion_srv = cloneSrvToUiDevice(ui.motion_srv);
         EdpeLog(L"EDPE: motion snapshot handed to ImGui");
-        motion_batch_ready = true;
     }
     UINT motion_color_width = 0, motion_color_height = 0;
     if (auto* color = ContextCensusTakeMotionColorSnapshot(
@@ -1617,7 +1552,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.color_width = motion_color_width;
         ui.color_height = motion_color_height;
         ui.color_window_open = true;
-        if (s_pending_save_disk) queueTextureCaptureFromSrv(ui.color_srv, UiState::CaptureKind::SceneColor);
         ui.color_srv = cloneSrvToUiDevice(ui.color_srv);
         EdpeLog(L"EDPE: same-frame HDR color handed to ImGui");
     }
@@ -1626,7 +1560,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         releaseEarlyColorSnapshot();
         ui.early_color_srv = early;
         ui.early_color_window_open = true;
-        if (s_pending_save_disk) queueTextureCaptureFromSrv(ui.early_color_srv, UiState::CaptureKind::EarlyHdr);
         ui.early_color_srv = cloneSrvToUiDevice(ui.early_color_srv);
         EdpeLog(L"EDPE: early HDR color handed to ImGui");
     }
@@ -1642,7 +1575,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.depth_window_open = true;
         ui.snapshot_ready = true;
         ensureDepthContrastShader();
-        if (s_pending_save_disk) queueTextureCaptureFromSrv(ui.depth_srv, UiState::CaptureKind::Depth, static_cast<int>(motion_depth_idx));
         ui.depth_srv = cloneSrvToUiDevice(ui.depth_srv);
         EdpeLog(L"EDPE: same-frame depth handed to ImGui");
     }
@@ -1651,16 +1583,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ui.hud_srv = hud;
         ui.hud_window_open = true;
         ui.snapshot_ready = true;
-        if (s_pending_save_disk) queueTextureCaptureFromSrv(ui.hud_srv, UiState::CaptureKind::Hud);
         ui.hud_srv = cloneSrvToUiDevice(ui.hud_srv);
         EdpeLog(L"EDPE: same-frame HUD mask handed to ImGui");
-    }
-    if (motion_batch_ready) {
-        s_pending_save_disk = false;
-    }
-    if (motion_batch_ready && ui.pending_backbuffer_capture_on_motion) {
-        ui.pending_backbuffer_capture_on_motion = false;
-        ui.pending_backbuffer_capture = true;
     }
 
     // Manual single depth snapshot (if triggered separately via menu button)
@@ -1691,7 +1615,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     const bool show_menu = menu_visible.load();
     const bool overlay_capture_pending = !ui.overlay_items.empty();
     const bool show_perf = cfg.showPerfOverlay || overlay_capture_pending;
-    const bool show_debug_view = ui.debug_view_open;
+    const bool show_debug_view = false;
 
     if (!show_menu && !show_perf && !show_debug_view) {
         std::lock_guard lock(input_mutex);
@@ -2191,124 +2115,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ImGui::TextDisabled("(Settings auto-saved)");
             }
 
-            // Section 4: Debug Views & Diagnostics
-            if (ImGui::CollapsingHeader("Debug Views & Diagnostics")) {
-                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Subpixel Jitter Debug View");
-                bool debug_view = ContextCensusGetJitterDebugView();
-                if (ImGui::Checkbox("Enable Jitter Debug View", &debug_view)) {
-                    ContextCensusSetJitterDebugView(debug_view);
-                    auto& cfg = edpe::Config::instance();
-                    cfg.jitterDebugView = debug_view;
-                    cfg.save();
-                }
-                TextDisabledWrapped("Grayscale scene with green jitter-affected pixels");
-                if (debug_view) {
-                    float sens = ContextCensusGetJitterDebugSensitivity();
-                    if (ImGui::SliderFloat("Jitter Sensitivity", &sens, 0.1f, 5.0f, "%.2fx")) {
-                        ContextCensusSetJitterDebugSensitivity(sens);
-                        auto& cfg = edpe::Config::instance();
-                        cfg.jitterDebugSensitivity = sens;
-                    }
-                    if (ImGui::IsItemDeactivatedAfterEdit()) {
-                        edpe::Config::instance().save();
-                    }
-                    float thresh = ContextCensusGetJitterDebugThreshold();
-                    if (ImGui::SliderFloat("Jitter Threshold", &thresh, 0.002f, 0.1f, "%.3f")) {
-                        ContextCensusSetJitterDebugThreshold(thresh);
-                        auto& cfg = edpe::Config::instance();
-                        cfg.jitterDebugThreshold = thresh;
-                    }
-                    if (ImGui::IsItemDeactivatedAfterEdit()) {
-                        edpe::Config::instance().save();
-                    }
-                    int mode = ContextCensusGetJitterDebugMode();
-                    const char* const modes[] = {
-                        "Hybrid (Spatial Shift + Temporal Pulse)",
-                        "Spatial Jitter Shift Only",
-                        "Temporal Pulse Only",
-                        "Binary Mask Only"
-                    };
-                    if (ImGui::Combo("Debug Mode", &mode, modes, IM_ARRAYSIZE(modes))) {
-                        ContextCensusSetJitterDebugMode(mode);
-                        auto& cfg = edpe::Config::instance();
-                        cfg.jitterDebugMode = mode;
-                        cfg.save();
-                    }
-
-                    auto& recorder = edpe::JitterViewRecorder::instance();
-                    const bool can_record = recorder.isIdle();
-                    if (!can_record) ImGui::BeginDisabled();
-                    if (ImGui::Button("Record Jitter View (5s)")) {
-                        recorder.startRecording();
-                    }
-                    if (!can_record) ImGui::EndDisabled();
-
-                    if (recorder.isRecording()) {
-                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
-                            "Recording %.1f / 5.0 s", recorder.getRecordingElapsedSeconds());
-                    } else if (recorder.isDraining() || recorder.isWriting()) {
-                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Recording 5.0 / 5.0 s");
-                    } else if (recorder.hasSavedLog()) {
-                        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-                            "Saved jitter_view.log (%zu frames)", recorder.getLastSavedFrameCount());
-                    }
-
-                    ImGui::TextDisabled("Grayscale = game scene  |  Green pixels = subpixel jitter affected");
-                }
-
-                ImGui::Separator();
-                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Cockpit HUD & UI Mask Debug View");
-                bool hud_debug_view = ContextCensusGetHudDebugView();
-                if (ImGui::Checkbox("Enable HUD & UI Debug View (Grayscale Scene + Amber HUD / Cyan UI)", &hud_debug_view)) {
-                    ContextCensusSetHudDebugView(hud_debug_view);
-                    auto& cfg = edpe::Config::instance();
-                    cfg.save();
-                }
-                if (hud_debug_view) {
-                    float opacity = ContextCensusGetHudDebugOpacity();
-                    if (ImGui::SliderFloat("HUD Mask Opacity", &opacity, 0.1f, 3.0f, "%.2fx")) {
-                        ContextCensusSetHudDebugOpacity(opacity);
-                        auto& cfg = edpe::Config::instance();
-                        cfg.save();
-                    }
-                    float thresh = ContextCensusGetHudDebugThreshold();
-                    if (ImGui::SliderFloat("UI Diff Threshold", &thresh, 0.002f, 0.1f, "%.3f")) {
-                        ContextCensusSetHudDebugThreshold(thresh);
-                        auto& cfg = edpe::Config::instance();
-                        cfg.save();
-                    }
-                    int mode = ContextCensusGetHudDebugMode();
-                    const char* const hud_modes[] = {
-                        "Combined (Cockpit HUD + Menu UI)",
-                        "Cockpit Holographic HUD Only",
-                        "Menu 2D UI Diff Only",
-                        "Split Heatmap (Amber=HUD, Cyan=UI, Yellow=Both)",
-                        "Binary Mask Only"
-                    };
-                    if (ImGui::Combo("HUD Debug Mode", &mode, hud_modes, IM_ARRAYSIZE(hud_modes))) {
-                        ContextCensusSetHudDebugMode(mode);
-                        auto& cfg = edpe::Config::instance();
-                        cfg.save();
-                    }
-
-                    const float coverage = ContextCensusGetHudMaskCoverage();
-                    const unsigned draws = ContextCensusGetHudDrawsReplayed();
-                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                        "Cockpit HUD: %u replayed draws | Coverage: %.2f%%", draws, coverage);
-                    ImGui::TextDisabled("Amber = Cockpit Holographic HUD (Pass 35)  |  Cyan = Menu 2D UI Diff");
-                }
-
-                ImGui::Separator();
-                ImGui::TextUnformatted("Buffer Diagnostic Dumps:");
-                if (ImGui::Button("Capture ALL buffers (diagnostic dump)")) {
-                    all_captures_save_to_disk.store(true, std::memory_order_release);
-                    all_captures_requested.store(true, std::memory_order_release);
-                }
-                TextDisabledWrapped("(color, motion, depth, emission, frame)");
-                if (ImGui::Button("Capture clean game frame (backbuffer BMP)")) {
-                    ui.pending_backbuffer_capture = true;
-                }
-            }
+            // Debug Views & Diagnostics section removed.
         } // if (cfg.devMode)
 
         ImGui::Spacing();
@@ -2316,8 +2123,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         ImGui::Separator();
 
         static const char* const s_devBinds[] = {
-            "F5: menu", "F6: capture", "F7: perf HUD",
-            "F8: debug views", "F9: record jitter"
+            "F5: menu", "F7: perf HUD"
         };
         static const char* const s_userBinds[] = {
             "F5: menu", "F7: perf HUD"
@@ -2398,176 +2204,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
     } // if (draw_menu)
 
-    const bool show_snapshots = draw_menu || ui.debug_view_open;
 
-    if (show_snapshots && ui.debug_view_open && !ui.color_srv && !ui.depth_srv && !ui.motion_srv) {
-        ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_Appearing);
-        if (ImGui::Begin("EDPE Debug Views", &ui.debug_view_open)) {
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Capturing pipeline buffers (F8)...");
-            if (ImGui::Button("Retry Capture")) {
-                all_captures_save_to_disk.store(false, std::memory_order_release);
-                all_captures_requested.store(true, std::memory_order_release);
-            }
-        }
-        ImGui::End();
-    }
-
-    if (show_snapshots && ui.color_srv && ui.color_window_open) {
-        placeSnapshotWindow(0, 0);
-        if (ImGui::Begin("EDPE Scene Color Snapshot", &ui.color_window_open)) {
-            if (ui.color_snapshot_index >= 0)
-                ImGui::Text("DSV #%d / HDR RTV0 (%ux%u)",
-                    ui.color_snapshot_index, ui.color_width, ui.color_height);
-            else
-                ImGui::Text("Motion frame / HDR RTV3 (%ux%u)",
-                    ui.color_width, ui.color_height);
-            if (ui.color_snapshot_index < 0)
-                ImGui::TextUnformatted("Present-time HDR color; may include HUD");
-            if (ui.color_copy && ImGui::Button("Save scene color to BMP")) {
-                queueTextureCapture(ui.color_copy, UiState::CaptureKind::SceneColor, ui.color_snapshot_index);
-            } else if (ui.color_srv && ImGui::Button("Save scene color to BMP")) {
-                queueTextureCaptureFromSrv(ui.color_srv, UiState::CaptureKind::SceneColor, ui.color_snapshot_index);
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Refresh all")) {
-                all_captures_save_to_disk.store(false, std::memory_order_release);
-                all_captures_requested.store(true, std::memory_order_release);
-            }
-            float width = ImGui::GetContentRegionAvail().x;
-            if (width > 640.0f) width = 640.0f;
-            if (width < 1.0f) width = 1.0f;
-            float height = width * static_cast<float>(ui.color_height) / ui.color_width;
-            if (height > 200.0f) { width *= 200.0f / height; height = 200.0f; }
-            ImGui::Image(reinterpret_cast<ImTextureID>(ui.color_srv), ImVec2(width, height));
-            if (!ui.color_image_logged) {
-                EdpeLog(L"EDPE: scene color snapshot image submitted to ImGui");
-                ui.color_image_logged = true;
-            }
-        }
-        ImGui::End();
-    }
-
-    if (show_snapshots && ui.depth_srv && ui.depth_window_open) {
-        placeSnapshotWindow(1, 0);
-        if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
-            ImGui::Text("DSV #%d (%ux%u)",
-                ui.depth_snapshot_index, ui.depth_width, ui.depth_height);
-            if (ui.depth_range_valid) ImGui::Text("8x8 sample range: %.6g .. %.6g",
-                ui.depth_min, ui.depth_max);
-            if (ui.depth_center_valid) ImGui::Text("Center raw depth: %.9g", ui.depth_center);
-            if (ui.depth_contrast_shader) ImGui::Checkbox("Contrast preview", &ui.depth_contrast);
-            else ImGui::TextDisabled("Contrast preview unavailable; showing raw red depth");
-            if (ui.depth_copy && ImGui::Button("Save depth snapshot to BMP")) {
-                queueTextureCapture(ui.depth_copy, UiState::CaptureKind::Depth, ui.depth_snapshot_index);
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Refresh all")) {
-                all_captures_save_to_disk.store(false, std::memory_order_release);
-                all_captures_requested.store(true, std::memory_order_release);
-            }
-            float width = ImGui::GetContentRegionAvail().x;
-            if (width > 640.0f) width = 640.0f;
-            if (width < 1.0f) width = 1.0f;
-            float height = width * static_cast<float>(ui.depth_height) / ui.depth_width;
-            if (height > 200.0f) { width *= 200.0f / height; height = 200.0f; }
-            ImDrawList* draw_list = ImGui::GetWindowDrawList();
-            const bool contrast = ui.depth_contrast && ui.depth_contrast_shader;
-            if (contrast) draw_list->AddCallback(bindDepthContrastShader);
-            ImGui::Image(reinterpret_cast<ImTextureID>(ui.depth_srv), ImVec2(width, height));
-            if (contrast) draw_list->AddCallback(ImGui::GetPlatformIO().DrawCallback_ResetRenderState);
-            if (!ui.depth_image_logged) {
-                EdpeLog(L"EDPE: depth snapshot image submitted to ImGui");
-                ui.depth_image_logged = true;
-            }
-        }
-        ImGui::End();
-    }
-
-    if (show_snapshots && ui.motion_srv && ui.motion_window_open) {
-        placeSnapshotWindow(2, 0);
-        if (ImGui::Begin("EDPE Motion Snapshot", &ui.motion_window_open)) {
-            ImGui::Text("Motion (%ux%u)", ui.motion_width, ui.motion_height);
-            ImGui::TextUnformatted("Gray = 0; red = X, green = Y");
-            if (ui.motion_srv && ImGui::Button("Save motion to BMP")) {
-                queueTextureCaptureFromSrv(ui.motion_srv, UiState::CaptureKind::Motion);
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Refresh all")) {
-                all_captures_save_to_disk.store(false, std::memory_order_release);
-                all_captures_requested.store(true, std::memory_order_release);
-            }
-            float width = ImGui::GetContentRegionAvail().x;
-            if (width > 640.0f) width = 640.0f;
-            if (width < 1.0f) width = 1.0f;
-            float height = width * static_cast<float>(ui.motion_height) / ui.motion_width;
-            if (height > 200.0f) { width *= 200.0f / height; height = 200.0f; }
-            if (ui.motion_preview_shader) {
-                ImDrawList* draw_list = ImGui::GetWindowDrawList();
-                draw_list->AddCallback(bindMotionPreviewShader);
-                ImGui::Image(reinterpret_cast<ImTextureID>(ui.motion_srv), ImVec2(width, height));
-                draw_list->AddCallback(ImGui::GetPlatformIO().DrawCallback_ResetRenderState);
-            } else {
-                ImGui::TextDisabled("Motion preview unavailable");
-            }
-        }
-        ImGui::End();
-    }
-
-    if (show_snapshots && ui.early_color_srv && ui.early_color_window_open) {
-        placeSnapshotWindow(0, 1);
-        if (ImGui::Begin("EDPE Emissive / Glow (Early HDR) Snapshot", &ui.early_color_window_open)) {
-            ImGui::Text("Emissive / Glow (%ux%u)", ui.early_color_width, ui.early_color_height);
-            if (ui.early_color_srv && ImGui::Button("Save emissive to BMP")) {
-                queueTextureCaptureFromSrv(ui.early_color_srv, UiState::CaptureKind::EarlyHdr);
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Refresh all")) {
-                all_captures_save_to_disk.store(false, std::memory_order_release);
-                all_captures_requested.store(true, std::memory_order_release);
-            }
-            float width = ImGui::GetContentRegionAvail().x;
-            if (width > 640.0f) width = 640.0f;
-            if (width < 1.0f) width = 1.0f;
-            float height = width * static_cast<float>(ui.early_color_height) /
-                ui.early_color_width;
-            if (height > 200.0f) { width *= 200.0f / height; height = 200.0f; }
-            ImGui::Image(reinterpret_cast<ImTextureID>(ui.early_color_srv),
-                ImVec2(width, height));
-        }
-        ImGui::End();
-    }
-
-    if (show_snapshots && ui.hud_srv && ui.hud_window_open) {
-        placeSnapshotWindow(1, 1);
-        if (ImGui::Begin("EDPE Cockpit HUD & UI Mask Snapshot", &ui.hud_window_open)) {
-            ImGui::Text("Cockpit HUD & UI Mask (%ux%u)", ui.hud_width, ui.hud_height);
-            const float coverage = ContextCensusGetHudMaskCoverage();
-            const unsigned draws = ContextCensusGetHudDrawsReplayed();
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                "Replayed: %u draws | Coverage: %.2f%%", draws, coverage);
-            if (ui.hud_copy && ImGui::Button("Save HUD mask to BMP")) {
-                queueTextureCapture(ui.hud_copy, UiState::CaptureKind::Hud);
-            } else if (ui.hud_srv && ImGui::Button("Save HUD mask to BMP")) {
-                queueTextureCaptureFromSrv(ui.hud_srv, UiState::CaptureKind::Hud);
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Refresh all")) {
-                all_captures_save_to_disk.store(false, std::memory_order_release);
-                all_captures_requested.store(true, std::memory_order_release);
-            }
-            float width = ImGui::GetContentRegionAvail().x;
-            if (width > 640.0f) width = 640.0f;
-            if (width < 1.0f) width = 1.0f;
-            float height = width * static_cast<float>(ui.hud_height) / ui.hud_width;
-            if (height > 200.0f) { width *= 200.0f / height; height = 200.0f; }
-            ImGui::Image(reinterpret_cast<ImTextureID>(ui.hud_srv), ImVec2(width, height));
-            if (!ui.hud_image_logged) {
-                EdpeLog(L"EDPE: HUD mask snapshot image submitted to ImGui");
-                ui.hud_image_logged = true;
-            }
-        }
-        ImGui::End();
-    }
     ImGui::Render();
 
     ID3D11RenderTargetView* previous_rtv = nullptr;
