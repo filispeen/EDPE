@@ -31,6 +31,11 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Read tag message
         id: tagmsg
         shell: pwsh
@@ -92,16 +97,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build
-          key: edpe-build-${{ runner.os }}-v1-${{ github.ref_name }}-${{ hashFiles('CMakeLists.txt', '.gitmodules', 'src/**', 'external/imgui/**', 'tests/**', 'tools/**') }}
+          key: edpe-ninja-build-${{ runner.os }}-v1-${{ github.ref_name }}-${{ hashFiles('CMakeLists.txt', '.gitmodules', 'src/**', 'external/imgui/**', 'tests/**', 'tools/**') }}
           restore-keys: |
-            edpe-build-${{ runner.os }}-v1-${{ github.ref_name }}-
-            edpe-build-${{ runner.os }}-v1-
+            edpe-ninja-build-${{ runner.os }}-v1-${{ github.ref_name }}-
+            edpe-ninja-build-${{ runner.os }}-v1-
 
       - name: Configure CMake
         shell: pwsh
         run: |
           $ver = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
-          cmake -S . -B build -A x64 -DEDPE_VERSION="$ver"
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver"
 
       - name: Build EDPE (Release)
         shell: pwsh
