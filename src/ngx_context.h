@@ -113,7 +113,6 @@ public:
         ID3D11Resource* outputUav,
         ID3D11Resource* depthIn,
         ID3D11Resource* motionIn,
-        ID3D11Resource* reactiveMaskIn,
         uint32_t renderWidth,
         uint32_t renderHeight,
         uint32_t outputWidth,
@@ -127,7 +126,6 @@ public:
         ID3D11Resource* outputUav,
         ID3D11Resource* depthIn,
         ID3D11Resource* motionIn,
-        ID3D11Resource* reactiveMaskIn,
         uint32_t width,
         uint32_t height);
 

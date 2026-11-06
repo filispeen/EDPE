@@ -144,11 +144,10 @@ bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     ID3D11Resource* colorIn = inputs.color;
     ID3D11Resource* depthIn = inputs.depth;
     ID3D11Resource* motionIn = inputs.motionVectors;
-    ID3D11Resource* reactiveIn = inputs.reactiveMask;
 
     const UpscaleMode mode = UpscalerManager::instance().getMode();
     bool evalOk = NgxContext::evaluateDlss(context, params,
-        colorIn, outputTexture_.Get(), depthIn, motionIn, reactiveIn,
+        colorIn, outputTexture_.Get(), depthIn, motionIn,
         inputs.renderWidth, inputs.renderHeight,
         inputs.outputWidth, inputs.outputHeight,
         mode, NgxContext::get_preset());
@@ -454,10 +453,7 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.motionVectors = ffxGetResourceDX11_Fsr31(inputs.motionVectors,
         GetFfxResourceDescriptionDX11(inputs.motionVectors), L"FSR3_MotionVectors", FFX_RESOURCE_STATE_COMPUTE_READ);
 
-    if (inputs.reactiveMask) {
-        dispatchDesc.reactive = ffxGetResourceDX11_Fsr31(inputs.reactiveMask,
-            GetFfxResourceDescriptionDX11(inputs.reactiveMask), L"FSR3_Reactive", FFX_RESOURCE_STATE_COMPUTE_READ);
-    }
+    // Reactive mask removed: HUD and UI are composited via separate native layer.
 
     dispatchDesc.output = ffxGetResourceDX11_Fsr31(impl_->outputTexture.Get(),
         GetFfxResourceDescriptionDX11(impl_->outputTexture.Get()), L"FSR3_Output", FFX_RESOURCE_STATE_UNORDERED_ACCESS);

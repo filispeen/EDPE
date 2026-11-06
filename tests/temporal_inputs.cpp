@@ -256,13 +256,8 @@ int main() {
     if (!taaReason) return 79;
 
     // -------------------------------------------------------------------------
-    // Test 10: Reactive mask presence in TemporalFrameInputs and fail-open validation
+    // Test 10: TemporalFrameInputs fail-open validation
     // -------------------------------------------------------------------------
-    inputs.reactiveMask = dummyTexture();
-    inputs.reactiveMaskSrv = dummySrv();
-    if (!inputs.isValid(&reason)) return 81;
-    inputs.reactiveMask = nullptr;
-    inputs.reactiveMaskSrv = nullptr;
     if (!inputs.isValid(&reason)) return 82;
 
     // Test 11: evaluateBackend safety

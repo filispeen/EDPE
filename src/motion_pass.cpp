@@ -46,8 +46,7 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
 }
 
 bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection& now,
-    const CameraProjection& previous, UINT width, UINT height,
-    ID3D11ShaderResourceView* hudMask) {
+    const CameraProjection& previous, UINT width, UINT height) {
     if (!device_ || !depth || !width || !height ||
         !(now.scaleX > 0 && now.scaleY > 0 && now.depthB > 0 &&
           previous.scaleX > 0 && previous.scaleY > 0) ||
@@ -68,7 +67,7 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     values[28] = now.depthB;
     values[29] = static_cast<float>(width);
     values[30] = static_cast<float>(height);
-    return renderInternal(depth, values, nullptr, nullptr, width, height, hudMask);
+    return renderInternal(depth, values, nullptr, nullptr, width, height);
 }
 
 bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
@@ -86,12 +85,12 @@ bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
     float values[32]{};
     values[29] = static_cast<float>(width);
     values[30] = static_cast<float>(height);
-    return renderInternal(depth, values, now, previous, width, height, nullptr);
+    return renderInternal(depth, values, now, previous, width, height);
 }
 
 bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     const float (&values)[32], ID3D11Buffer* now, ID3D11Buffer* previous,
-    UINT width, UINT height, ID3D11ShaderResourceView* hudMask) {
+    UINT width, UINT height) {
     if (!device_ || !depth || !width || !height) return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     depth->GetDesc(&srv_desc);
@@ -141,7 +140,7 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
     context_->SwapDeviceContextState(state_.Get(), &prior);
     auto* rtv = output_rtv_.Get();
-    ID3D11ShaderResourceView* srvs[2] = {depth, hudMask};
+    ID3D11ShaderResourceView* srvs[1] = {depth};
     ID3D11Buffer* buffers[] = {constants_.Get(), now, previous};
     const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(width),
         static_cast<float>(height), 0, 1};
@@ -151,11 +150,11 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vertex_.Get(), nullptr, 0);
     context_->PSSetShader(now ? pixel_gpu_.Get() : pixel_.Get(), nullptr, 0);
-    context_->PSSetShaderResources(0, 2, srvs);
+    context_->PSSetShaderResources(0, 1, srvs);
     context_->PSSetConstantBuffers(0, now ? 3 : 1, buffers);
     context_->Draw(3, 0);
-    ID3D11ShaderResourceView* empty_srvs[2] = {nullptr, nullptr};
-    context_->PSSetShaderResources(0, 2, empty_srvs);
+    ID3D11ShaderResourceView* empty_srvs[1] = {nullptr};
+    context_->PSSetShaderResources(0, 1, empty_srvs);
     context_->OMSetRenderTargets(0, nullptr, nullptr);
     context_->SwapDeviceContextState(prior.Get(), nullptr);
     return true;
