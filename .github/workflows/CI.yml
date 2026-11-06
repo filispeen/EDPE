@@ -4,6 +4,9 @@ on:
   push:
     paths-ignore:
       - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - 'LICENSE'
   workflow_dispatch:
     inputs:
       rc:
@@ -14,6 +17,10 @@ on:
         description: 'Publish experimental release'
         type: boolean
         default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 permissions:
   contents: write
@@ -75,21 +82,20 @@ jobs:
         run: |
           python tools/fetch_ffx_dx11.py
 
-      - name: Cache EDPE Build
-        id: cache-build
-        uses: actions/cache@v4
+      - name: Set up sccache
+        uses: hendrikmuhs/ccache-action@v1
         with:
-          path: build
-          key: edpe-ninja-build-${{ runner.os }}-v1-${{ github.ref_name }}-${{ hashFiles('CMakeLists.txt', '.gitmodules', 'src/**', 'external/imgui/**', 'tests/**', 'tools/**') }}
+          variant: sccache
+          key: ${{ runner.os }}-sccache-${{ github.ref_name }}
           restore-keys: |
-            edpe-ninja-build-${{ runner.os }}-v1-${{ github.ref_name }}-
-            edpe-ninja-build-${{ runner.os }}-v1-
+            ${{ runner.os }}-sccache-
+          max-size: 2G
 
       - name: Configure CMake
         shell: pwsh
         run: |
           $ver = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
-          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver"
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build EDPE (Release)
         shell: pwsh
@@ -101,6 +107,13 @@ jobs:
         run: |
           ctest --test-dir build -C Release --output-on-failure
 
+      - name: Upload Staged Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: edpe-stage-binaries
+          path: build/stage/
+          retention-days: 1
+
   release:
     name: Publish Release
     needs: CI
@@ -108,6 +121,7 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       prerelease: ${{ inputs.rc == true || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+      has-artifact: true
     secrets: inherit
     permissions:
       contents: write
@@ -117,6 +131,8 @@ jobs:
     needs: CI
     if: (github.ref_type == 'tag' && (startsWith(github.ref_name, 'exp') || startsWith(github.ref_name, 'experimental'))) || inputs.experimental == true
     uses: ./.github/workflows/experimental.yml
+    with:
+      has-artifact: true
     secrets: inherit
     permissions:
       contents: write

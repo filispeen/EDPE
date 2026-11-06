@@ -2,7 +2,19 @@ name: Experimental Build
 
 on:
   workflow_call:
+    inputs:
+      has-artifact:
+        description: 'Whether staged binaries were pre-built by CI'
+        type: boolean
+        required: false
+        default: true
   workflow_dispatch:
+    inputs:
+      has-artifact:
+        description: 'Whether staged binaries were pre-built by CI'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -16,15 +28,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: ${{ inputs.has-artifact && 'false' || 'recursive' }}
           fetch-depth: 1
 
       - name: Set up MSVC environment
+        if: ${{ !inputs.has-artifact }}
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
       - name: Cache NVIDIA DLSS SDK
+        if: ${{ !inputs.has-artifact }}
         id: cache-dlss
         uses: actions/cache@v4
         with:
@@ -34,7 +48,7 @@ jobs:
             dlss-sdk-${{ runner.os }}-
 
       - name: Clone NVIDIA DLSS SDK
-        if: steps.cache-dlss.outputs.cache-hit != 'true'
+        if: ${{ !inputs.has-artifact && steps.cache-dlss.outputs.cache-hit != 'true' }}
         shell: pwsh
         run: |
           if (-not (Test-Path "external/DLSS/include/nvsdk_ngx.h")) {
@@ -50,6 +64,7 @@ jobs:
           }
 
       - name: Cache FidelityFX DX11 SDK
+        if: ${{ !inputs.has-artifact }}
         id: cache-ffx
         uses: actions/cache@v4
         with:
@@ -59,31 +74,40 @@ jobs:
             ffx-sdk-${{ runner.os }}-
 
       - name: Fetch FidelityFX DX11 SDK
-        if: steps.cache-ffx.outputs.cache-hit != 'true'
+        if: ${{ !inputs.has-artifact && steps.cache-ffx.outputs.cache-hit != 'true' }}
         shell: pwsh
         run: |
           python tools/fetch_ffx_dx11.py
 
-      - name: Cache EDPE Build
-        id: cache-build
-        uses: actions/cache@v4
+      - name: Set up sccache
+        if: ${{ !inputs.has-artifact }}
+        uses: hendrikmuhs/ccache-action@v1
         with:
-          path: build
-          key: edpe-ninja-build-${{ runner.os }}-v1-${{ github.ref_name }}-${{ hashFiles('CMakeLists.txt', '.gitmodules', 'src/**', 'external/imgui/**', 'tests/**', 'tools/**') }}
+          variant: sccache
+          key: ${{ runner.os }}-sccache-${{ github.ref_name }}
           restore-keys: |
-            edpe-ninja-build-${{ runner.os }}-v1-${{ github.ref_name }}-
-            edpe-ninja-build-${{ runner.os }}-v1-
+            ${{ runner.os }}-sccache-
+          max-size: 2G
 
       - name: Configure CMake
+        if: ${{ !inputs.has-artifact }}
         shell: pwsh
         run: |
           $ver = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
-          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver"
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build EDPE (Release)
+        if: ${{ !inputs.has-artifact }}
         shell: pwsh
         run: |
           cmake --build build --config Release --parallel
+
+      - name: Download Staged Binaries
+        if: ${{ inputs.has-artifact }}
+        uses: actions/download-artifact@v4
+        with:
+          name: edpe-stage-binaries
+          path: build/stage
 
       - name: Prepare Experimental Package
         id: package
