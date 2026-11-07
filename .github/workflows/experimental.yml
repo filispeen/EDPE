@@ -8,6 +8,11 @@ on:
         type: boolean
         required: false
         default: true
+      build-number:
+        description: 'Build number for experimental release (leave empty for auto-increment by tag)'
+        type: string
+        required: false
+        default: ''
   workflow_dispatch:
     inputs:
       has-artifact:
@@ -15,6 +20,11 @@ on:
         type: boolean
         required: false
         default: false
+      build-number:
+        description: 'Build number for experimental release (leave empty for auto-increment by tag)'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -30,6 +40,41 @@ jobs:
         with:
           submodules: ${{ inputs.has-artifact && 'false' || 'recursive' }}
           fetch-depth: 1
+
+      - name: Determine Experimental Build Info
+        id: build_info
+        shell: pwsh
+        run: |
+          git fetch --depth=1 -f origin '+refs/tags/*:refs/tags/*'
+          $customNum = "${{ inputs.build-number }}".Trim()
+
+          if ('${{ github.ref_type }}' -eq 'tag') {
+              $tag = '${{ github.ref_name }}'
+              if ($tag -match '^(?:exp|experimental)-build-(\d+)$') {
+                  $buildNum = $matches[1]
+              } else {
+                  $buildNum = $tag
+              }
+          } elseif (-not [string]::IsNullOrWhiteSpace($customNum)) {
+              $buildNum = $customNum
+              $tag = "exp-build-$buildNum"
+          } else {
+              $tags = git tag -l "exp-build-*" "experimental-build-*"
+              $maxNum = 0
+              foreach ($t in $tags) {
+                  if ($t -match '^(?:exp|experimental)-build-(\d+)$') {
+                      $n = [int]$matches[1]
+                      if ($n -gt $maxNum) { $maxNum = $n }
+                  }
+              }
+              $buildNum = $maxNum + 1
+              $tag = "exp-build-$buildNum"
+          }
+
+          Write-Host "Determined Build Number: $buildNum"
+          Write-Host "Determined Tag: $tag"
+          "build_number=$buildNum" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag_name=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Set up MSVC environment
         if: ${{ !inputs.has-artifact }}
@@ -93,7 +138,7 @@ jobs:
         if: ${{ !inputs.has-artifact }}
         shell: pwsh
         run: |
-          $ver = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
+          $ver = '${{ steps.build_info.outputs.tag_name }}'
           cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build EDPE (Release)
@@ -113,8 +158,7 @@ jobs:
         id: package
         shell: pwsh
         run: |
-          $buildNum = "${{ github.run_number }}"
-          $tag = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { "experimental-build-$buildNum" }
+          $tag = '${{ steps.build_info.outputs.tag_name }}'
           $pkgDir = "EDPE-package"
           New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
 
@@ -142,7 +186,7 @@ jobs:
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EDPE-experimental-build-${{ github.run_number }}-windows-x64
+          name: EDPE-experimental-build-${{ steps.build_info.outputs.build_number }}-windows-x64
           path: |
             ${{ steps.package.outputs.archive_name }}
 
@@ -151,9 +195,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ (startsWith(github.ref_name, 'exp') || startsWith(github.ref_name, 'experimental')) && github.ref_name || format('exp-build-{0}', github.run_number) }}
+          tag_name: ${{ steps.build_info.outputs.tag_name }}
           target_commitish: ${{ github.sha }}
-          name: EDPE Experimental Build #${{ github.run_number }}
+          name: EDPE Experimental Build #${{ steps.build_info.outputs.build_number }}
           files: |
             ${{ steps.package.outputs.archive_name }}
           generate_release_notes: true

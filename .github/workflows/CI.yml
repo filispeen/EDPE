@@ -17,6 +17,11 @@ on:
         description: 'Publish experimental release'
         type: boolean
         default: false
+      build_number:
+        description: 'Build number for experimental release (leave empty for auto-increment by tag)'
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -94,7 +99,27 @@ jobs:
       - name: Configure CMake
         shell: pwsh
         run: |
-          $ver = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
+          $ver = if ('${{ github.ref_type }}' -eq 'tag') {
+            '${{ github.ref_name }}'
+          } elseif ('${{ inputs.experimental }}' -eq 'true') {
+            git fetch --depth=1 -f origin '+refs/tags/*:refs/tags/*'
+            $customNum = "${{ inputs.build_number }}".Trim()
+            if (-not [string]::IsNullOrWhiteSpace($customNum)) {
+              "exp-build-$customNum"
+            } else {
+              $tags = git tag -l "exp-build-*" "experimental-build-*"
+              $maxNum = 0
+              foreach ($t in $tags) {
+                if ($t -match '^(?:exp|experimental)-build-(\d+)$') {
+                  $n = [int]$matches[1]
+                  if ($n -gt $maxNum) { $maxNum = $n }
+                }
+              }
+              "exp-build-$($maxNum + 1)"
+            }
+          } else {
+            'dev'
+          }
           cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build EDPE (Release)
@@ -133,6 +158,7 @@ jobs:
     uses: ./.github/workflows/experimental.yml
     with:
       has-artifact: true
+      build-number: ${{ inputs.build_number || '' }}
     secrets: inherit
     permissions:
       contents: write
