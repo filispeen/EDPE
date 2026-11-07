@@ -84,9 +84,12 @@ inline bool isRearOrAuxiliaryProbe(
     const Vec3 candPos = cameraPosition(candidate);
     const Vec3 prevPos = cameraPosition(baseline);
     const float rawDist = length(candPos - prevPos);
+    const float rotTrace = cameraRotationTrace(candidate, baseline);
 
-    // 1. IPD-гармоніки (1x 68.2 мм, 2x 136.4 мм, 4x 272.8 мм) незалежно від кута орієнтації:
-    if (rawDist >= 0.032f && rawDist <= 0.36f) {
+    // 1. IPD-гармоніки (1x 68.2 мм, 2x 136.4 мм, 4x 272.8 мм) при ідентичній орієнтації (rotTrace > 2.9995f):
+    // Під час кругового огляду головою (вліво->вправо->вліво) камера повертається (rotTrace < 2.9995f)
+    // і рухається по дузі шиї, тому реальний поворот голови ніколи не повинен відхилятися як IPD-зонд!
+    if (rotTrace > 2.9995f && rawDist >= 0.032f && rawDist <= 0.36f) {
         const float d68  = std::fabs(rawDist - 0.0682f);
         const float d136 = std::fabs(rawDist - 0.1364f);
         const float d273 = std::fabs(rawDist - 0.2728f);
@@ -106,9 +109,9 @@ inline bool isRearOrAuxiliaryProbe(
     }
 
     // 2. Дзеркальний зонд заднього огляду / ліхтаря кабіни:
-    // Розгортання ~180 град (rotTrace < 0.5f) біля положення пілота (rawDist < 1.5м)
-    const float rotTrace = cameraRotationTrace(candidate, baseline);
-    if (rotTrace < 0.5f && rawDist < 1.5f) {
+    // Розгортання ~180 град (rotTrace < 0.5f) зі зміщенням відносно пілота (0.05м <= rawDist < 1.5м).
+    // Чисте обертання голови/корабля на місці (rawDist < 0.05м) не є дзеркальним зондом.
+    if (rotTrace < 0.5f && rawDist >= 0.05f && rawDist < 1.5f) {
         return true;
     }
 
@@ -130,9 +133,10 @@ inline bool isStereoEyeOrIpdProbe(
         return true;
     }
 
-    // 1. Дозволяємо плавне обертання корабля між кадрами (rotTrace > 2.985f ≈ до 10 град/кадр)
+    // 1. Стерео-очний зонд у межах одного кадру має ідентичну орієнтацію (rotTrace > 2.9995f).
+    // Будь-яке активне обертання камери (rotTrace <= 2.9995f) — це реальний рух голови/корабля.
     const float rotTrace = cameraRotationTrace(candidate, baseline);
-    if (rotTrace < 2.985f) {
+    if (rotTrace <= 2.9995f) {
         return false;
     }
 
@@ -153,7 +157,7 @@ inline bool isStereoEyeOrIpdProbe(
     // Спрацьовує при стаціонарному кораблі або при внутрішньокадровому порівнянні пасів (last_velocity == 0).
     const Vec3 rawDelta = candPos - prevPos;
     const float rawDist = length(rawDelta);
-    if (rotTrace > 2.992f && rawDist >= 0.032f && rawDist <= 0.36f) {
+    if (rawDist >= 0.032f && rawDist <= 0.36f) {
         const float dRight = std::fabs(dot(rawDelta, right));
         const float dUp    = std::fabs(dot(rawDelta, up));
         const float dFwd   = std::fabs(dot(rawDelta, fwd));
