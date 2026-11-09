@@ -2202,6 +2202,77 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             io.ClearInputKeys();
             io.ClearInputMouse();
         }
+
+        if (ui.depth_srv && ui.depth_window_open) {
+            placeSnapshotWindow(0, 0);
+            if (ImGui::Begin("EDPE Depth Snapshot", &ui.depth_window_open)) {
+                const ImVec2 avail = ImGui::GetContentRegionAvail();
+                const ImVec2 imgSize(std::max(avail.x, 64.0f), std::max(avail.y - 28.0f, 64.0f));
+                if (ui.depth_contrast && ui.depth_contrast_shader) {
+                    ImGui::GetWindowDrawList()->AddCallback(bindDepthContrastShader, nullptr);
+                }
+                ImGui::Image(reinterpret_cast<ImTextureID>(ui.depth_srv), imgSize);
+                if (ui.depth_contrast && ui.depth_contrast_shader) {
+                    ImGui::GetWindowDrawList()->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+                }
+                if (!ui.depth_image_logged) {
+                    EdpeLog(L"EDPE: depth snapshot image submitted to ImGui");
+                    ui.depth_image_logged = true;
+                }
+                ImGui::Checkbox("Contrast preview", &ui.depth_contrast);
+            }
+            ImGui::End();
+        }
+        if (ui.color_srv && ui.color_window_open) {
+            placeSnapshotWindow(1, 0);
+            if (ImGui::Begin("EDPE Scene Color Snapshot", &ui.color_window_open)) {
+                const ImVec2 avail = ImGui::GetContentRegionAvail();
+                const ImVec2 imgSize(std::max(avail.x, 64.0f), std::max(avail.y, 64.0f));
+                ImGui::Image(reinterpret_cast<ImTextureID>(ui.color_srv), imgSize);
+                if (!ui.color_image_logged) {
+                    EdpeLog(L"EDPE: scene color snapshot image submitted to ImGui");
+                    ui.color_image_logged = true;
+                }
+            }
+            ImGui::End();
+        }
+        if (ui.early_color_srv && ui.early_color_window_open) {
+            placeSnapshotWindow(2, 0);
+            if (ImGui::Begin("EDPE Emissive Snapshot", &ui.early_color_window_open)) {
+                const ImVec2 avail = ImGui::GetContentRegionAvail();
+                const ImVec2 imgSize(std::max(avail.x, 64.0f), std::max(avail.y, 64.0f));
+                ImGui::Image(reinterpret_cast<ImTextureID>(ui.early_color_srv), imgSize);
+            }
+            ImGui::End();
+        }
+        if (ui.motion_srv && ui.motion_window_open) {
+            placeSnapshotWindow(0, 1);
+            if (ImGui::Begin("EDPE Motion Snapshot", &ui.motion_window_open)) {
+                const ImVec2 avail = ImGui::GetContentRegionAvail();
+                const ImVec2 imgSize(std::max(avail.x, 64.0f), std::max(avail.y, 64.0f));
+                if (ui.motion_preview_shader) {
+                    ImGui::GetWindowDrawList()->AddCallback(bindMotionPreviewShader, nullptr);
+                }
+                ImGui::Image(reinterpret_cast<ImTextureID>(ui.motion_srv), imgSize);
+                if (ui.motion_preview_shader) {
+                    ImGui::GetWindowDrawList()->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+                }
+            }
+            ImGui::End();
+        }
+        if (ui.hud_srv && ui.hud_window_open) {
+            placeSnapshotWindow(1, 1);
+            if (ImGui::Begin("EDPE HUD Snapshot", &ui.hud_window_open)) {
+                const ImVec2 avail = ImGui::GetContentRegionAvail();
+                const ImVec2 imgSize(std::max(avail.x, 64.0f), std::max(avail.y, 64.0f));
+                ImGui::Image(reinterpret_cast<ImTextureID>(ui.hud_srv), imgSize);
+                if (!ui.hud_image_logged) {
+                    EdpeLog(L"EDPE: HUD snapshot image submitted to ImGui");
+                    ui.hud_image_logged = true;
+                }
+            }
+            ImGui::End();
+        }
     } // if (draw_menu)
 
 

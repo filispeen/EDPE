@@ -36,26 +36,42 @@ float max3(float3 v) {
     return max(v.r, max(v.g, v.b));
 }
 
-// Safely sample the Pass 52 tonemapper's black floor (3D LUT toe lift at HDR = 0)
-// strictly from a corner pixel where tHudMask has zero HUD coverage (RGB == 0, A == 1).
-// When the cockpit camera rotates in a circle, HUD geometry or space dust can pass over
-// corner (0, 0); blindly reading tHudTonemapped(0, 0) on that frame would read bright
-// orange HUD radiance as hudBlack and subtract it from the entire screen, erasing the HUD!
-float3 sampleHudTonemapBlackFloor(bool isNativeSizedHud) {
+float3 sampleLowWorldLdrAtOutputPos(int2 outPos);
+
+// Safely inspect a corner pixel where tHudMask has zero HUD coverage (RGB == 0, A == 1)
+// to determine whether tHudTonemapped was tonemapped from the merged scene+HUD HDR
+// (H_scene * T + L_hud, where the HUD-free corner matches tLowWorld) or from HUD-only
+// over black (returning the 3D LUT black floor at HDR = 0).
+float3 sampleHudTonemapBlackFloor(bool isNativeSizedHud, out bool tonemapHasScene) {
+    tonemapHasScene = true;
     int2 dim = (int2)(isNativeSizedHud ? outputSize : renderSize);
     int maxX = max(dim.x - 1, 0);
     int maxY = max(dim.y - 1, 0);
+    int2 outMax = max((int2)outputSize - int2(1, 1), int2(0, 0));
     int3 corners[4] = {
         int3(0, 0, 0),
         int3(maxX, 0, 0),
         int3(0, maxY, 0),
         int3(maxX, maxY, 0)
     };
+    int2 outCorners[4] = {
+        int2(0, 0),
+        int2(outMax.x, 0),
+        int2(0, outMax.y),
+        int2(outMax.x, outMax.y)
+    };
     [unroll]
     for (int i = 0; i < 4; ++i) {
         float4 m = tHudMask.Load(corners[i]);
         if (all(m.rgb <= 1e-6) && m.a >= 0.999) {
-            return min(tHudTonemapped.Load(corners[i]).rgb, float3(0.04, 0.04, 0.04));
+            float3 cornerTone = tHudTonemapped.Load(corners[i]).rgb;
+            float3 cornerLow = sampleLowWorldLdrAtOutputPos(outCorners[i]);
+            if (max3(cornerTone) <= 0.04 && max3(cornerLow - cornerTone) > 0.05) {
+                tonemapHasScene = false;
+                return cornerTone;
+            }
+            tonemapHasScene = true;
+            return float3(0.0, 0.0, 0.0);
         }
     }
     return float3(0.0, 0.0, 0.0);
@@ -125,9 +141,32 @@ float4 ps_main(VSOutput pin) : SV_Target {
             float3 hudPost = isNativeSizedHud
                 ? tHudTonemapped.Load(pixelPos).rgb
                 : tHudTonemapped.SampleLevel(sLinear, pin.uv, 0).rgb;
-            float3 hudBlack = sampleHudTonemapBlackFloor(isNativeSizedHud);
-            float3 hudToned = max(hudPost - hudBlack, 0.0);
-            cScene = saturate(cDlss * hudTransmittance + hudToned);
+            bool tonemapHasScene = true;
+            float3 hudBlack = sampleHudTonemapBlackFloor(isNativeSizedHud, tonemapHasScene);
+            float3 dlssLin = pow(max(cDlss, 0.0), 2.2);
+            if (tonemapHasScene) {
+                // tHudTonemapped holds exact Pass 52 Tonemap(H_scene * T + L_hud, Bloom) at native resolution.
+                // Replace the pre-reconstruction background term (lowLin * T) with the DLSS/DLAA-reconstructed
+                // background term (dlssLin * T) in linear light so translucent HUD panels, orange headers,
+                // and 3D holograms preserve 1:1 stock tonemap/bloom/LUT brightness without 3D edge jitter.
+                float3 cLow = sampleLowWorldLdrAtOutputPos(outPos);
+                float3 lowLin = pow(max(cLow, 0.0), 2.2);
+                float3 postLin = pow(max(hudPost, 0.0), 2.2);
+                float3 bgLowLin = min(lowLin * hudTransmittance, postLin);
+                float3 bgScale = bgLowLin / max(lowLin, float3(1e-4, 1e-4, 1e-4));
+                float3 bgDlssLin = (lowLin > float3(1e-4, 1e-4, 1e-4))
+                    ? (dlssLin * bgScale)
+                    : (dlssLin * hudTransmittance);
+                float3 hudEmitLin = max(postLin - bgLowLin, 0.0);
+                float3 combinedLin = bgDlssLin + hudEmitLin;
+                cScene = pow(saturate(combinedLin), 1.0 / 2.2);
+            } else {
+                float3 hudToned = max(hudPost - hudBlack, 0.0);
+                float3 hudLin = pow(hudToned, 2.2);
+                float3 bgLin = dlssLin * hudTransmittance;
+                float3 combinedLin = bgLin + hudLin - bgLin * hudLin;
+                cScene = pow(saturate(combinedLin), 1.0 / 2.2);
+            }
         } else {
             float3 dlssLin = pow(max(cDlss, 0.0), 2.2);
             float3 hudLin = tonemapLinear(hSample.rgb * 120.0);
@@ -135,11 +174,13 @@ float4 ps_main(VSOutput pin) : SV_Target {
             float3 combinedLin = bgLin + hudLin - bgLin * hudLin;
             cScene = pow(saturate(combinedLin), 1.0 / 2.2);
         }
-        // During normal cockpit flight (flags.w > 0.5; no 2D modal/ESC menu active),
-        // tGame (presentBackbuffer) does not contain the separated Pass 35 Cockpit HUD.
-        // Return cScene directly so post-tonemap noise/motion-blur differences between
-        // tGame and tLowWorld during camera rotation never overwrite cScene and erase the HUD.
-        return float4(saturate(cScene), 1.0);
+        // On pixels with active Pass 35 Cockpit HUD coverage (hasHud), tGame (presentBackbuffer)
+        // does not contain the separated Pass 35 HUD. Return cScene directly on hasHud pixels so
+        // differences between tGame and tLowWorld never overwrite cScene and erase the HUD, while
+        // non-HUD pixels still flow through Step 2 to preserve Pass 53/54 2D overlays and cursor.
+        if (hasHud) {
+            return float4(saturate(cScene), 1.0);
+        }
     } else {
         cScene = (flags.x > 0.5) ? toLdr(cDlss) : cDlss;
         float hudRaw = (flags.y > 0.5)

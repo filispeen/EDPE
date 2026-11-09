@@ -518,5 +518,35 @@ int main() {
 
     if (m16B1 < 200 || m16G1 < 200) return 77; // Row 1 must reflect cyan from toneHudSrv
 
+    // Test 17: hasTonemappedHud (flags.w == 3.0) with translucent dark HUD backing (RGB = 0, T = 0.20)
+    // Verify that linear transmittance T = 0.20 dims the sRGB background in linear light
+    // (0.20^(1/2.2) * 255 ~ 123), NOT in gamma space (0.20 * 255 = 51).
+    std::array<uint32_t, 16> toneBackingPixels{};
+    for (int i = 0; i < 8; ++i) toneBackingPixels[i] = 0xFF00FF00;  // Clear rows 0-1: tonemapped green (0, 255, 0)
+    for (int i = 8; i < 16; ++i) toneBackingPixels[i] = 0xFF007B00; // Backing rows 2-3: tonemapped green * 0.20^(1/2.2) -> G = 123 (0x7B)
+    D3D11_SUBRESOURCE_DATA toneBackingInit{toneBackingPixels.data(), 4 * sizeof(uint32_t), 0};
+    ComPtr<ID3D11Texture2D> toneBackingTex;
+    ComPtr<ID3D11ShaderResourceView> toneBackingSrv;
+    if (FAILED(device->CreateTexture2D(&outDesc, &toneBackingInit, &toneBackingTex)) ||
+        FAILED(device->CreateShaderResourceView(toneBackingTex.Get(), nullptr, &toneBackingSrv))) {
+        return 78;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), dlssSrv.Get(), dlssSrv.Get(),
+        rgba16Srv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true,
+        toneBackingSrv.Get());
+    if (!ok) return 79;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 80;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t m17G3 = lastRow[1];
+    context->Unmap(staging.Get(), 0);
+
+    // Must match linear-light dimmed green (~123), never gamma-darkened (~51)
+    if (m17G3 < 110 || m17G3 > 135) return 81;
+
     return 0;
 }
