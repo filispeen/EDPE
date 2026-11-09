@@ -36,7 +36,13 @@ VSOutput vs_main(uint id : SV_VertexID) {
 }
 
 float3 toLdr(float3 c) {
-    float3 mapped = max(c, 0.0) / (1.0 + max(c, 0.0));
+    float3 x = max(c, 0.0);
+    float a = 2.51;
+    float b = 0.03;
+    float c_coeff = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    float3 mapped = saturate((x * (a * x + b)) / (x * (c_coeff * x + d) + e));
     return pow(mapped, 1.0 / 2.2);
 }
 
@@ -50,7 +56,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
 
     // 1. Cockpit Holographic HUD mask (Pass 35 replay mask)
     float4 hSample = hudMask.SampleLevel(linearSampler, uv, 0);
-    float hudRaw = max(hSample.r, max(hSample.g, hSample.b));
+    float hudTransmittance = saturate(hSample.a);
+    float hudBacking = saturate((1.0 - hudTransmittance) * 1.5);
+    float hudRaw = max(max(hSample.r, max(hSample.g, hSample.b)), hudBacking);
     float hudVal = smoothstep(0.005, 0.08, hudRaw);
 
     // 2. Menu 2D UI diff mask (|gameBackbuffer - lowResWorld|)
@@ -73,8 +81,8 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 finalColor = grayBg;
 
     if (mode == 0) {
-        // Mode 0: Combined UI Mask (All UI in Amber)
-        float comb = max(hudVal, menuVal);
+        // Mode 0: Cockpit Holographic HUD Mask Only (Pass 35 in Amber, diff mask disabled)
+        float comb = hudVal;
         if (comb > 0.005) {
             float factor = saturate(comb * opacity);
             finalColor = lerp(grayBg, neonAmber, factor);

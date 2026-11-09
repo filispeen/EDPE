@@ -335,6 +335,218 @@ int main() {
         return 47;
     }
 
+    // Test 11: isNativeHud path (flags.w == 1.0) with native R11G11B10_FLOAT HUD texture
+    // In this test, dlssReconstruction, gameBackbuffer, and lowResWorld are all pure DLSS green.
+    // gameBackbuffer has NO orange (diff == 0 everywhere).
+    // nativeHudTex has orange HUD in rows 2-3 (DXGI_FORMAT_R11G11B10_FLOAT).
+    // Under native HUD path, orange HUD must be composited cleanly without needing game orange!
+    D3D11_TEXTURE2D_DESC nativeHudDesc = outDesc;
+    nativeHudDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    const uint32_t orangeFloatPacked = (0x3C0u) | (0x380u << 11);
+    std::array<uint32_t, 16> nativeHudPixels{};
+    for (int i = 0; i < 8; ++i) nativeHudPixels[i] = 0;
+    for (int i = 8; i < 16; ++i) nativeHudPixels[i] = orangeFloatPacked;
+    D3D11_SUBRESOURCE_DATA nativeHudInit{nativeHudPixels.data(), 4 * sizeof(uint32_t), 0};
+
+    ComPtr<ID3D11Texture2D> nativeHudTex;
+    ComPtr<ID3D11ShaderResourceView> nativeHudSrv;
+    if (FAILED(device->CreateTexture2D(&nativeHudDesc, &nativeHudInit, &nativeHudTex)) ||
+        FAILED(device->CreateShaderResourceView(nativeHudTex.Get(), nullptr, &nativeHudSrv))) {
+        return 48;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), dlssSrv.Get(), dlssSrv.Get(),
+        nativeHudSrv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/true, /*preserveUi=*/true);
+    if (!ok) return 50;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 51;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t nhR0 = rows[0], nhG0 = rows[1], nhB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t nhR3 = lastRow[0], nhG3 = lastRow[1], nhB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0 must be DLSS green (no HUD)
+    if (nhG0 < 150 || nhR0 > 50 || nhB0 > 50) return 52;
+    // Row 3 must contain composited orange HUD from nativeHudTex (even though blackGameTex had 0!)
+    if (nhR3 < 100 || nhG3 < 50 || nhB3 > 50) return 53;
+
+    // Test 12: Direct native HUD composite path with isHdr = false
+    ok = pass.composite(context.Get(), dlssSrv.Get(), dlssSrv.Get(), dlssSrv.Get(),
+        nativeHudSrv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true);
+    if (!ok) return 54;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 55;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t ldrR0 = rows[0], ldrG0 = rows[1], ldrB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t ldrR3 = lastRow[0], ldrG3 = lastRow[1], ldrB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0 must be DLSS green (no HUD)
+    if (ldrG0 < 150 || ldrR0 > 50 || ldrB0 > 50) return 56;
+    // Row 3 must contain composited orange HUD from nativeHudTex
+    if (ldrR3 < 100 || ldrG3 < 50 || ldrB3 > 50) return 57;
+
+    // Test 13: R16G16B16A16_FLOAT HUD backing panel (transmittance = 0.20) dims background
+    D3D11_TEXTURE2D_DESC rgba16Desc = outDesc;
+    rgba16Desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    // Half-float: 0.0f = 0x0000, 1.0f = 0x3C00, 0.20f = 0x3266
+    struct Half4 { uint16_t r, g, b, a; };
+    std::array<Half4, 16> rgba16Pixels{};
+    for (int i = 0; i < 8; ++i) rgba16Pixels[i] = {0, 0, 0, 0x3C00};  // Clear: T = 1.0
+    for (int i = 8; i < 16; ++i) rgba16Pixels[i] = {0, 0, 0, 0x3266}; // Backing quad: T = 0.20
+    D3D11_SUBRESOURCE_DATA rgba16Init{rgba16Pixels.data(), 4 * sizeof(Half4), 0};
+
+    ComPtr<ID3D11Texture2D> rgba16Tex;
+    ComPtr<ID3D11ShaderResourceView> rgba16Srv;
+    if (FAILED(device->CreateTexture2D(&rgba16Desc, &rgba16Init, &rgba16Tex)) ||
+        FAILED(device->CreateShaderResourceView(rgba16Tex.Get(), nullptr, &rgba16Srv))) {
+        return 58;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), dlssSrv.Get(), dlssSrv.Get(),
+        rgba16Srv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true);
+    if (!ok) return 59;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 60;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t dimR0 = rows[0], dimG0 = rows[1], dimB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t dimR3 = lastRow[0], dimG3 = lastRow[1], dimB3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    // Row 0 must be full DLSS green (T = 1.0 -> G ~ 255)
+    if (dimG0 < 200 || dimR0 > 50 || dimB0 > 50) return 61;
+    // Row 3 must be dimmed by 20% linear transmittance in sRGB space (0.20^(1/2.2) * 255 ~ 123)
+    if (dimG3 > 140 || dimG3 < 95 || dimR3 > 20 || dimB3 > 20) return 62;
+
+    // Test 14: R16G16B16A16_FLOAT HUD panel with both HUD radiance (orange) and transmittance (T = 0.20)
+    std::array<Half4, 16> rgba16HudPixels{};
+    for (int i = 0; i < 8; ++i) rgba16HudPixels[i] = {0, 0, 0, 0x3C00};            // Clear: (0, 0, 0, 1.0)
+    for (int i = 8; i < 16; ++i) rgba16HudPixels[i] = {0x3C00, 0x3800, 0, 0x3266}; // Orange (1.0, 0.5, 0.0) + T = 0.20
+    D3D11_SUBRESOURCE_DATA rgba16HudInit{rgba16HudPixels.data(), 4 * sizeof(Half4), 0};
+
+    ComPtr<ID3D11Texture2D> rgba16HudTex;
+    ComPtr<ID3D11ShaderResourceView> rgba16HudSrv;
+    if (FAILED(device->CreateTexture2D(&rgba16Desc, &rgba16HudInit, &rgba16HudTex)) ||
+        FAILED(device->CreateShaderResourceView(rgba16HudTex.Get(), nullptr, &rgba16HudSrv))) {
+        return 63;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), dlssSrv.Get(), lowSrv.Get(),
+        rgba16HudSrv.Get(), targetRtv.Get(), 4, 4, 2, 2, /*isHdr=*/false, /*preserveUi=*/true);
+    if (!ok) return 64;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 65;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t combR0 = rows[0], combG0 = rows[1], combB0 = rows[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t combR3 = lastRow[0], combG3 = lastRow[1], combB3 = rows[3 * mapped.RowPitch + 2];
+    context->Unmap(staging.Get(), 0);
+
+    if (combG0 < 200 || combR0 > 50 || combB0 > 50) return 66;
+    if (combR3 < 150 || combG3 < 100 || combB3 > 50) return 67;
+
+    // Test 15: Combined Pass 35 float HUD (row 1) + Pass 54 2D ESC/Main Menu (rows 2-3)
+    // Verify that when validHudSrv is bound (flags.w > 0.5), 2D menus drawn in Pass 54 (gameSrv)
+    // are still extracted and composited over cScene!
+    std::array<Half4, 16> row1HudPixels{};
+    for (int i = 0; i < 16; ++i) row1HudPixels[i] = {0, 0, 0, 0x3C00};
+    for (int i = 4; i < 8; ++i) row1HudPixels[i] = {0x3C00, 0x3800, 0, 0x0000}; // Row 1: opaque orange HUD
+    D3D11_SUBRESOURCE_DATA row1HudInit{row1HudPixels.data(), 4 * sizeof(Half4), 0};
+    ComPtr<ID3D11Texture2D> row1HudTex;
+    ComPtr<ID3D11ShaderResourceView> row1HudSrv;
+    if (FAILED(device->CreateTexture2D(&rgba16Desc, &row1HudInit, &row1HudTex)) ||
+        FAILED(device->CreateShaderResourceView(row1HudTex.Get(), nullptr, &row1HudSrv))) {
+        return 68;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), dlssSrv.Get(),
+        row1HudSrv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true);
+    if (!ok) return 69;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 70;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t m15R0 = rows[0], m15G0 = rows[1], m15B0 = rows[2];
+    const auto* row1Ptr = rows + 1 * mapped.RowPitch;
+    const uint8_t m15R1 = row1Ptr[0], m15G1 = row1Ptr[1], m15B1 = row1Ptr[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t m15R3 = lastRow[0], m15G3 = lastRow[1], m15B3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    if (m15G0 < 200 || m15R0 > 50 || m15B0 > 50) return 71; // Row 0: pure DLSS green
+    if (m15R1 < 150 || m15G1 < 100 || m15B1 > 50) return 72; // Row 1: Pass 35 orange HUD
+    if (m15R3 < 200 || m15G3 < 200 || m15B3 < 200) return 73; // Row 3: Pass 54 white ESC menu
+
+    // Test 16: Pass 52 post-processed HUD SRV (hudTonemapped at t4, flags.w == 3.0)
+    // Verify that when hudTonemapped is supplied (e.g. cyan 3D-LUT-graded HUD in row 1),
+    // the composite pass uses the game-tonemapped color from hudTonemapped on HUD pixels.
+    std::array<uint32_t, 16> toneHudPixels{};
+    for (int i = 0; i < 16; ++i) toneHudPixels[i] = 0xFF000000; // Corner (0,0) black floor = 0
+    for (int i = 4; i < 8; ++i) toneHudPixels[i] = 0xFFFFFF00;  // Row 1: cyan (R=0, G=255, B=255)
+    D3D11_SUBRESOURCE_DATA toneHudInit{toneHudPixels.data(), 4 * sizeof(uint32_t), 0};
+    ComPtr<ID3D11Texture2D> toneHudTex;
+    ComPtr<ID3D11ShaderResourceView> toneHudSrv;
+    if (FAILED(device->CreateTexture2D(&outDesc, &toneHudInit, &toneHudTex)) ||
+        FAILED(device->CreateShaderResourceView(toneHudTex.Get(), nullptr, &toneHudSrv))) {
+        return 74;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), dlssSrv.Get(), dlssSrv.Get(),
+        row1HudSrv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true,
+        toneHudSrv.Get());
+    if (!ok) return 75;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 76;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    row1Ptr = rows + 1 * mapped.RowPitch;
+    const uint8_t m16R1 = row1Ptr[0], m16G1 = row1Ptr[1], m16B1 = row1Ptr[2];
+    context->Unmap(staging.Get(), 0);
+
+    if (m16B1 < 200 || m16G1 < 200) return 77; // Row 1 must reflect cyan from toneHudSrv
+
+    // Test 17: hasTonemappedHud (flags.w == 3.0) with translucent dark HUD backing (RGB = 0, T = 0.20)
+    // Verify that linear transmittance T = 0.20 dims the sRGB background in linear light
+    // (0.20^(1/2.2) * 255 ~ 123), NOT in gamma space (0.20 * 255 = 51).
+    std::array<uint32_t, 16> toneBackingPixels{};
+    for (int i = 0; i < 8; ++i) toneBackingPixels[i] = 0xFF00FF00;  // Clear rows 0-1: tonemapped green (0, 255, 0)
+    for (int i = 8; i < 16; ++i) toneBackingPixels[i] = 0xFF007B00; // Backing rows 2-3: tonemapped green * 0.20^(1/2.2) -> G = 123 (0x7B)
+    D3D11_SUBRESOURCE_DATA toneBackingInit{toneBackingPixels.data(), 4 * sizeof(uint32_t), 0};
+    ComPtr<ID3D11Texture2D> toneBackingTex;
+    ComPtr<ID3D11ShaderResourceView> toneBackingSrv;
+    if (FAILED(device->CreateTexture2D(&outDesc, &toneBackingInit, &toneBackingTex)) ||
+        FAILED(device->CreateShaderResourceView(toneBackingTex.Get(), nullptr, &toneBackingSrv))) {
+        return 78;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), dlssSrv.Get(), dlssSrv.Get(),
+        rgba16Srv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true,
+        toneBackingSrv.Get());
+    if (!ok) return 79;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 80;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t m17G3 = lastRow[1];
+    context->Unmap(staging.Get(), 0);
+
+    // Must match linear-light dimmed green (~123), never gamma-darkened (~51)
+    if (m17G3 < 110 || m17G3 > 135) return 81;
+
     return 0;
 }
-

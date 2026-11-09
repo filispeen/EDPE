@@ -390,7 +390,6 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ID3D11Resource* outputUav,
     ID3D11Resource* depthIn,
     ID3D11Resource* motionIn,
-    ID3D11Resource* reactiveMaskIn,
     uint32_t renderWidth,
     uint32_t renderHeight,
     uint32_t outputWidth,
@@ -417,7 +416,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ep.InReset = (params.inReset || g_ngx_state.reset_requested) ? 1 : 0;
     ep.InMVScaleX = params.motionScaleX;
     ep.InMVScaleY = params.motionScaleY;
-    ep.pInBiasCurrentColorMask = reactiveMaskIn;
+    ep.pInBiasCurrentColorMask = nullptr;
 
     ep.InExposureScale = 1.0f;
     ep.InFrameTimeDeltaInMsec = params.frameTimeMs;
@@ -449,7 +448,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     return true;
 #else
     (void)context; (void)params; (void)colorIn; (void)outputUav;
-    (void)depthIn; (void)motionIn; (void)reactiveMaskIn;
+    (void)depthIn; (void)motionIn;
     (void)renderWidth; (void)renderHeight; (void)outputWidth; (void)outputHeight;
     (void)mode; (void)preset;
     return false;
@@ -462,10 +461,9 @@ bool NgxContext::evaluateDlaa(ID3D11DeviceContext* context,
     ID3D11Resource* outputUav,
     ID3D11Resource* depthIn,
     ID3D11Resource* motionIn,
-    ID3D11Resource* reactiveMaskIn,
     uint32_t width,
     uint32_t height) {
-    return evaluateDlss(context, params, colorIn, outputUav, depthIn, motionIn, reactiveMaskIn,
+    return evaluateDlss(context, params, colorIn, outputUav, depthIn, motionIn,
         width, height, width, height, UpscaleMode::NativeAA, g_ngx_state.preset);
 }
 

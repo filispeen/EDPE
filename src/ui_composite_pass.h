@@ -17,7 +17,8 @@ public:
                    UINT outputWidth, UINT outputHeight,
                    UINT renderWidth, UINT renderHeight,
                    bool isHdr = false,
-                   bool preserveUi = true);
+                   bool preserveUi = true,
+                   ID3D11ShaderResourceView* hudTonemapped = nullptr);
 
 private:
     Microsoft::WRL::ComPtr<ID3D11Device> device_;

@@ -23,7 +23,7 @@ As of **November 2026 (`v0.6.0`)**, EDPE has achieved:
 * **Real-Time Frametime Graph in Performance HUD (`F7`):** Multi-curve 120-sample rolling history graph rendered directly in the HUD overlay, displaying Total Frametime (Orange), Game Frametime (White), and Upscaler/Reconstruction Frametime (Cyan) with 60 FPS (16.67 ms) and 30 FPS (33.33 ms) grid reference lines. Color-coded numerical metrics are padded with leading spaces for stable, non-jumping readouts.
 * **Multi-Backend Comparison Benchmark Tool:** Automated sequential capture across all upscaler backends (`Native / Bypass`, `NVIDIA DLSS / DLAA`, `AMD FSR Native AA / SR`, `Native D3D11 TAA`) with 5-second backend warmup. Saves uncompressed comparison frames with optional on-frame HUD telemetry and GPU reconstruction time stamps directly to `edpe-captures/comparison/`.
 * **Rate-Limited Telemetry & QPC Profiler:** Display telemetry and QPC profiler metrics are rate-limited to 66.66 ms (~15 Hz), preventing number flickering and reducing UI render overhead on the GPU and CPU at high frame rates.
-* **Developer Mode Toggle (`DEV=0` / `DEV=1`):** User-friendly menu simplification for regular players (`DEV=0` by default in `edpe.ini`). Hides developer capture/tuning controls and selectively gates developer hotkeys (`F6`, `F8`, `F9`), leaving a clean interface with `F5: menu | F7: perf HUD`.
+* **Developer Mode Toggle (`DEV=0` / `DEV=1`):** User-friendly menu simplification for regular players (`DEV=0` by default in `edpe.ini`). Hides developer capture/tuning controls and selectively gates developer hotkeys (`F8`, `F9`), leaving a clean interface with `F5: menu | F7: perf HUD`.
 * **Sticky Bottom Footer & UI Refinements:** Menu footer dynamically anchors to the bottom edge of the Dear ImGui window, featuring a clickable author link (`by FILISPEEN`) linking directly to GitHub.
 * **Cross-Device Scene Rendering & Multi-GPU Interop:** Native support for multi-device and cross-adapter rendering pipelines (such as RTX 4080 systems in Odyssey) using DXGI Keyed Mutex synchronization, completely resolving the issue where DLAA remained stuck in bypass mode (Issue #5).
 * **Native UI Composite Pass (`UiCompositePass`):** Dedicated graphics pass that isolates native-resolution HUD, cockpits, holograms, and menus from the pre-UI scene LDR buffer and composites them cleanly over the reconstructed DLAA/DLSS/FSR world.
@@ -53,7 +53,6 @@ As of **November 2026 (`v0.6.0`)**, EDPE has achieved:
 * **Subpixel Jitter Debug View & Log Recorder (`F8` / `F9`):** Real-time on-screen jitter visualization and frame-indexed logging to `jitter_view.log` for tracking subpixel jitter offsets, luma correlation, and frame stability.
 * **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA / FSR Native AA / TAA (at 1.0x) or DLSS / FSR Super Resolution (at < 1.0x).
 * **Native UI Protection & Composite:** Dedicated shader pass (`UiCompositePass`) preserves native-resolution HUD, text, cockpits, and menus, seamlessly compositing them over reconstructed DLSS/FSR frames.
-* **Synchronized 5-Buffer GPU Capture (`F6`):** One-shot capture of all 5 engine buffers (`color`, `motion`, `depth`, `early-color` emissive, `frame`) from the exact same frame using non-blocking asynchronous GPU readback (`D3D11_MAP_FLAG_DO_NOT_WAIT`), saved to `edpe-captures/`.
 * **Automated Test Suite:** 12 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy hooks, GPU motion passes, jitter reports, crash logger, and UI composition.
 
 ---
@@ -129,7 +128,6 @@ flowchart TD
 | Hotkey | Action | Description |
 |:---:|:---|:---|
 | **`F5`** | **Toggle EDPE Menu** | Opens/closes the Dear ImGui control panel. When closed, all mouse and keyboard inputs pass freely to the game. |
-| **`F6`** | **One-Shot Synchronized Capture** | *(DEV Mode)* Captures all 5 rendering buffers (`color`, `motion`, `depth`, `early-color`, `frame`) from the exact same frame to `edpe-captures/`. |
 | **`F7`** | **Toggle Performance HUD** | Toggles the real-time telemetry overlay (FPS, frametimes, frametime history graph, GPU adapter, GPU usage %, dedicated VRAM). |
 | **`F8`** | **Toggle Jitter Debug View** | *(DEV Mode)* Toggles the real-time visual overlay for subpixel jitter inspection. |
 | **`F9`** | **Record Jitter Diagnostics** | *(DEV Mode)* Starts recording subpixel jitter, luma, and camera motion telemetry to `jitter_view.log`. |
@@ -142,18 +140,6 @@ flowchart TD
 * **Motion Vector Tuning:** Motion scale slider, X/Y inversion toggles, zero-motion force mode, and skybox rotational motion toggle.
 * **Interactive Buffer Viewers:** Dedicated preview windows for Scene Depth, Scene Color, Emissive Glow (Early HDR), and Motion Vectors.
 * **Configuration Persistence:** Save runtime tuning adjustments directly to `edpe.ini` via the UI button.
-
-### Synchronized GPU Frame Capture (`F6`)
-Pressing **`F6`** saves five synchronized 32-bit BMP images in `edpe-captures/` beside `EliteDangerous64.exe`:
-* `color-*.bmp`: Tone-mapped scene color HDR (`DXGI_FORMAT_R11G11B10_FLOAT`).
-* `motion-*.bmp`: Visualized screen-space motion displacement (`DXGI_FORMAT_R16G16_FLOAT`).
-* `depth-dsv2-*.bmp`: Contrast-adjusted reversed-Z depth buffer (`DXGI_FORMAT_R32G8X24_TYPELESS`).
-* `early-color-*.bmp`: Emissive / illumination pass isolating glowing cockpit dials, indicators, and lamps (reactive mask candidate).
-* `frame-*.bmp`: Pristine native swapchain backbuffer captured immediately before ImGui overlay rendering.
-
-*Note: GPU readbacks are mapped with `D3D11_MAP_FLAG_DO_NOT_WAIT` and polled asynchronously, completely preventing game hitching or render thread stalls.*
-
----
 
 ## Configuration (`edpe.ini`)
 
@@ -200,7 +186,7 @@ Scale=1.50          ; HUD scale multiplier (0.5x - 2.0x)
 UiScale=1.00        ; Menu UI scale multiplier (0.5x - 2.5x)
 PosX=1900.0         ; Custom dragged X position (-1.0 = use corner default)
 PosY=496.0          ; Custom dragged Y position (-1.0 = use corner default)
-DEV=0               ; 0 = Standard gamer mode (hides dev tools, gates F6/F8/F9), 1 = Full developer mode
+DEV=0               ; 0 = Standard gamer mode (hides dev tools, gates F8/F9), 1 = Full developer mode
 ```
 
 Runtime diagnostics and initialization events are written to `edpe.log` beside the game executable.

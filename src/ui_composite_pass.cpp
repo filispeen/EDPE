@@ -13,7 +13,7 @@ struct CompositeParams {
     float renderTexel[2];
     float outputSize[2];
     float outputTexel[2];
-    float flags[4]; // x: isHdr (1.0f = HDR, 0.0f = LDR)
+    float flags[4]; // x: isHdr (1.0f = HDR, 0.0f = LDR), y: isNativeRes, z: preserveUi, w: isNativeHud
 };
 
 } // namespace
@@ -98,7 +98,8 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     UINT outputWidth, UINT outputHeight,
     UINT renderWidth, UINT renderHeight,
     bool isHdr,
-    bool preserveUi) {
+    bool preserveUi,
+    ID3D11ShaderResourceView* hudTonemapped) {
     if (!device_ || !context_ || !dlssReconstruction || !targetBackbufferRtv ||
         !outputWidth || !outputHeight || !renderWidth || !renderHeight) {
         return false;
@@ -106,6 +107,29 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     if (preserveUi && (!gameBackbufferWithUi ||
         !lowResWorld)) {
         return false;
+    }
+
+    float nativeHudFlag = 0.0f;
+    if (hudMask) {
+        Microsoft::WRL::ComPtr<ID3D11Resource> maskRes;
+        hudMask->GetResource(&maskRes);
+        if (maskRes) {
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> maskTex;
+            if (SUCCEEDED(maskRes.As(&maskTex))) {
+                D3D11_TEXTURE2D_DESC md{};
+                maskTex->GetDesc(&md);
+                if (md.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
+                    md.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                    md.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS) {
+                    const bool isOutputSized = (md.Width == outputWidth && md.Height == outputHeight);
+                    if (hudTonemapped) {
+                        nativeHudFlag = isOutputSized ? 3.0f : 4.0f;
+                    } else {
+                        nativeHudFlag = isOutputSized ? 1.0f : 2.0f;
+                    }
+                }
+            }
+        }
     }
 
     CompositeParams params{};
@@ -120,6 +144,7 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     params.flags[0] = isHdr ? 1.0f : 0.0f;
     params.flags[1] = (renderWidth == outputWidth && renderHeight == outputHeight) ? 1.0f : 0.0f;
     params.flags[2] = preserveUi ? 1.0f : 0.0f;
+    params.flags[3] = nativeHudFlag;
 
     context_->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &params, 0, 0);
 
@@ -128,9 +153,16 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
 
     auto* rtv = targetBackbufferRtv;
     auto* activeHudMask = hudMask ? hudMask : dummyMaskSrv_.Get();
+    auto* activeHudTonemapped = (hudMask && hudTonemapped) ? hudTonemapped : dummyMaskSrv_.Get();
     auto* activeGameBackbuffer = (!preserveUi || !gameBackbufferWithUi) ? dlssReconstruction : gameBackbufferWithUi;
     auto* activeLowResWorld = (!preserveUi || !lowResWorld) ? dlssReconstruction : lowResWorld;
-    ID3D11ShaderResourceView* srvs[4] = {dlssReconstruction, activeGameBackbuffer, activeLowResWorld, activeHudMask};
+    ID3D11ShaderResourceView* srvs[5] = {
+        dlssReconstruction,
+        activeGameBackbuffer,
+        activeLowResWorld,
+        activeHudMask,
+        activeHudTonemapped
+    };
     ID3D11Buffer* cb = constantBuffer_.Get();
     auto* sampler = linearSampler_.Get();
 
@@ -143,14 +175,14 @@ bool UiCompositePass::composite(ID3D11DeviceContext* /*context*/,
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
     context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
-    context_->PSSetShaderResources(0, 4, srvs);
+    context_->PSSetShaderResources(0, 5, srvs);
     context_->PSSetSamplers(0, 1, &sampler);
     context_->PSSetConstantBuffers(0, 1, &cb);
 
     context_->Draw(3, 0);
 
-    ID3D11ShaderResourceView* nullSrvs[4] = {nullptr, nullptr, nullptr, nullptr};
-    context_->PSSetShaderResources(0, 4, nullSrvs);
+    ID3D11ShaderResourceView* nullSrvs[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    context_->PSSetShaderResources(0, 5, nullSrvs);
     ID3D11RenderTargetView* nullRtv = nullptr;
     context_->OMSetRenderTargets(1, &nullRtv, nullptr);
 
