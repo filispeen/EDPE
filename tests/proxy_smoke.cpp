@@ -335,9 +335,9 @@ int wmain(int argc, wchar_t** argv) {
         UINT bytes = sizeof(hash);
         if (FAILED(vertex_shader->GetPrivateData(kEdpeShaderHashGuid, &bytes, &hash)) ||
             bytes != sizeof(hash) ||
-            hash != EdpeEdvrShaderHash(vertex_bytecode->GetBufferPointer(),
+            hash != EdpeShaderHash(vertex_bytecode->GetBufferPointer(),
                 vertex_bytecode->GetBufferSize()) ||
-            EdpeEdvrShaderHash("abc", 3) != 0xe16801510db89efdull) return 12;
+            EdpeShaderHash("abc", 3) != 0xe16801510db89efdull) return 12;
     }
     if (shader_probe && SUCCEEDED(vertex_result)) {
         unsigned char captured[8192]{};
@@ -372,7 +372,7 @@ int wmain(int argc, wchar_t** argv) {
         const bool hash_ok = SUCCEEDED(pixel_result) && pixel_shader &&
             SUCCEEDED(pixel_shader->GetPrivateData(kEdpeShaderHashGuid, &bytes, &hash)) &&
             bytes == sizeof(hash) &&
-            hash == EdpeEdvrShaderHash(pixel_bytecode->GetBufferPointer(),
+            hash == EdpeShaderHash(pixel_bytecode->GetBufferPointer(),
                 pixel_bytecode->GetBufferSize());
         UINT retained_size = 0;
         if (pixel_shader)
@@ -455,7 +455,7 @@ int wmain(int argc, wchar_t** argv) {
             ID3D11RenderTargetView* alias_mrt[4]{scene_mrt[0], scene_mrt[1],
                 scene_mrt[2], second_color_alias};
             context->OMSetRenderTargets(4, alias_mrt, depth_view);
-            // Synthetic EDVR HUD signature exercises the copy before the draw.
+            // Synthetic HUD signature exercises the copy before the draw.
             ID3DBlob* vs_code = nullptr;
             ID3DBlob* ps_code = nullptr;
             constexpr char ps_source[] =

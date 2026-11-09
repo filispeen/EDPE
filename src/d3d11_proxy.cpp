@@ -46,7 +46,7 @@ HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
         if (retain_vertex_bytecode.load(std::memory_order_relaxed))
             (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
-        const auto hash = EdpeEdvrShaderHash(bytecode, size);
+        const auto hash = EdpeShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
     }
     return result;
@@ -58,7 +58,7 @@ HRESULT STDMETHODCALLTYPE observedCreatePixelShader(ID3D11Device* device,
     const HRESULT result = original_create_pixel_shader.load(std::memory_order_acquire)(
         device, bytecode, size, linkage, shader);
     if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
-        const auto hash = EdpeEdvrShaderHash(bytecode, size);
+        const auto hash = EdpeShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
         (*shader)->SetPrivateData(kEdpePixelBytecodeGuid, static_cast<UINT>(size), bytecode);
     }

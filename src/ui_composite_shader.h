@@ -124,6 +124,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // tHudTonemapped: exact Pass 52 game-tonemapped, auto-exposed, 3D-LUT-graded HUD output).
     float3 cScene;
     float hudMask = 0.0;
+    bool hasHud = false;
     if (flags.w > 0.5) {
         bool isNativeSizedHud = (flags.w < 1.5) || (flags.w > 2.5 && flags.w < 3.5);
         bool hasTonemappedHud = (flags.w > 2.5);
@@ -131,7 +132,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
             ? tHudMask.Load(pixelPos)
             : tHudMask.SampleLevel(sLinear, pin.uv, 0);
         float hudTransmittance = saturate(hSample.a);
-        bool hasHud = any(hSample.rgb > 1e-5) || (hudTransmittance < 0.999);
+        hasHud = any(hSample.rgb > 1e-5) || (hudTransmittance < 0.999);
         if (!hasHud) {
             cScene = (flags.x > 0.5) ? toLdr(cDlss) : saturate(cDlss);
         } else if (flags.x > 0.5) {
@@ -174,13 +175,11 @@ float4 ps_main(VSOutput pin) : SV_Target {
             float3 combinedLin = bgLin + hudLin - bgLin * hudLin;
             cScene = pow(saturate(combinedLin), 1.0 / 2.2);
         }
-        // On pixels with active Pass 35 Cockpit HUD coverage (hasHud), tGame (presentBackbuffer)
-        // does not contain the separated Pass 35 HUD. Return cScene directly on hasHud pixels so
-        // differences between tGame and tLowWorld never overwrite cScene and erase the HUD, while
-        // non-HUD pixels still flow through Step 2 to preserve Pass 53/54 2D overlays and cursor.
-        if (hasHud) {
-            return float4(saturate(cScene), 1.0);
-        }
+        // Do not early-return on hasHud pixels: Pass 54 post-tonemap 2D menus (Starport Services,
+        // ESC Pause Menu, modal dialogs, mouse cursor) are drawn into tGame after Pass 52 Tonemapping
+        // and must composite ON TOP OF cScene (which already holds the reconstructed 3D world +
+        // Pass 35 Cockpit HUD). Where Pass 54 drew nothing (cGame == cLow),
+        // Step 2 produces darkWeight == 0 and uiMask == 0, preserving cScene 100% untouched.
     } else {
         cScene = (flags.x > 0.5) ? toLdr(cDlss) : cDlss;
         float hudRaw = (flags.y > 0.5)
@@ -242,7 +241,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // (a) Multiplicative vignette / shadow darkening applied directly to reconstructed cScene:
     // Because both cGame and cLow contain the exact same pre-AA 3D scene (cGame = T_vig * cLow),
     // the ratio tDark = cGame / cLow cancels out the jittered/low-res 3D edges of cLow identically!
-    float negDiff = max(0.0, max3(cLow - cGame));
+    float negDiff = max(0.0, max3(cLow - cGame) - (hasHud ? 0.15 * edgeRange : 0.0));
     float darkWeight = smoothstep(0.010, 0.030, negDiff);
     float3 tDark = clamp(cGame / max(cLow, float3(0.004, 0.004, 0.004)), 0.0, 1.0);
     float3 cBase = cScene * lerp(float3(1.0, 1.0, 1.0), tDark, darkWeight);
@@ -265,7 +264,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     //    that completely flatten a strong underlying 3D edge in cLow
     float gradGame = max(max3(abs(gR - gL)), max3(abs(gD - gU)));
     float gradLow  = max(max3(abs(lR - lL)), max3(abs(lD - lU)));
-    float extraUiEdge = max(0.0, gradGame - gradLow - 0.025);
+    float extraUiEdge = max(0.0, gradGame - gradLow - 0.025 - (hasHud ? 0.20 * edgeRange : 0.0));
     float opaqueDarkCard = (negDiff > 0.03 && max3(cGame) < 0.08 && gradLow > 0.04 && gradGame < 0.30 * gradLow)
         ? (gradLow - gradGame)
         : 0.0;

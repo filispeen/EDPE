@@ -798,6 +798,7 @@ static unsigned s_diag_ldr_updates = 0;      // number of scene_ldr_source updat
 static unsigned s_diag_hud_unhook_events = 0;// number of times d3d11.dll overwrote Draw* hooks this frame
 static unsigned s_diag_hud_declined_draws = 0;// number of HudReplay draws declined by replayHudDraw
 static unsigned long long s_pass53_blit_seen_frame = ~0ull;
+static bool s_upscale_evaluated_this_frame = false;
 static bool s_hud_merged_into_hdr_this_frame = false;
 static unsigned long long s_hud_merged_into_main_hdr_frame = ~0ull;
 static unsigned long long s_verified_ldr_tonemap_frame = ~0ull;
@@ -1072,7 +1073,7 @@ bool sameRenderTargetResource(ID3D11RenderTargetView* view,
         identity_a.Get() == identity_b.Get();
 }
 
-// Adapted from EDVR's exact glass-state gate. Only a one-shot diagnostic
+// Diagnostic glass-state gate. Only a one-shot diagnostic
 // replay can pass this; unsupported state leaves the game's draw untouched.
 const wchar_t* glassReplayRefusal(ID3D11DeviceContext* context, char kind,
     UINT instances) {
@@ -1237,8 +1238,7 @@ enum class HudDrawResult {
 };
 
 bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
-    // Verified EDVR Cockpit HUD & HDR UI shader families (cockpit-hud-layer-design-2026-09-27.md,
-    // ui-layer-2026-09-23.md, design-flat-ui-quality-2026-10-05.md, srv-turret-hud-2026-10-30.md).
+    // Verified Cockpit HUD & HDR UI shader families.
     // Explicitly excludes non-HUD Pass 35 world shaders:
     // - 0xD1281DF454A153AD / 0x97DBC87FCAA429C4 (sun corona & radar glow; taking it pulls the real sun over the cockpit)
     // - 0x5559BD94B6852E83 / 0xB12F7A618E1BDE98 (3D depth-sampling target & ship holograms)
@@ -1247,12 +1247,13 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
     // - 0x4EF6DDB075A927FA (main menu hangar / loading screen quad)
     // Note: VS 0x2CECEC3065EF0D4A (stencil setup A4D03619, frosted label backing 5F5FA64F behind INFO /
     // STARPORT SERVICES, and radar disc 1E87C9BF) is intentionally left in the HDR scene target (Tex#6888)
-    // per EDVR-docs (ui-layer-2026-09-23.md:412,619; dlss-blur-elements-2026-10-14.md:483) so it blends in
-    // pre-tonemap linear HDR with the game stencil buffer instead of darkening post-tonemap LDR lights.
+    // so it blends in pre-tonemap linear HDR with the game stencil buffer instead of darkening post-tonemap LDR lights.
     if (vs_hash == 0x81216C77F90DEDD6ull || // Cockpit holo panels (stock lit A2965EC2, EDHM 16F88966, unlit B4786E0A, text 41B9D7B2, backing 329ACCE7/925ACEDA, icons B357E4E5, radar sweep C610FB6F, AB82734F)
         vs_hash == 0x1989E6D3B405FDE0ull || // Cockpit holo panels (DisableGuiEffects variant PS EAB8A1C95A13FFBE)
-        vs_hash == 0xB7790CBFC6554097ull || // Flight HUD vector lines & pitch ladder (PS 8DEF46452FA459F5)
-        vs_hash == 0xE508648660A352B2ull || // Target reticle sprite (PS 499044B497EE6B2C / 63ABD86359B57D01)
+        vs_hash == 0x925ACEDA0153AA5Bull || // Planetary / Orbital Cruise shadowless holo panels (kUiVsHoloNoShadow)
+        vs_hash == 0xB7790CBFC6554097ull || // Flight HUD vector lines, altimeter ladder & pitch ladder (PS 8DEF46452FA459F5 / EDHM B1CA8D8EEF7C886D)
+        vs_hash == 0xE508648660A352B2ull || // HUD sprite & target/distance/planetary label composite (kHudSprite, PS 499044B497EE6B2C / 63ABD86359B57D01)
+        vs_hash == 0x5DA53D8B0133341Eull || // Target direction indicator quad (kTargetIndicator)
         vs_hash == 0xDF3503CD07F9B10Cull || // Radar disc & stalks hologram family (kHoloFamiliesTake)
         vs_hash == 0x5453D19B6D362364ull || // Radar stalks hologram family (kHoloFamiliesTake)
         vs_hash == 0x44DDCDEBAEA137D8ull || // Radar hologram family
@@ -1267,9 +1268,7 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
            (vs_hash == 0xB12F7A618E1BDE98ull &&                                      // Ship/target hologram shells
             (ps_hash == 0x203DF51758AADC4Dull || ps_hash == 0x42AC0CACC9CDF72Bull)) ||
            (vs_hash == 0xF8D8A92E96419901ull && ps_hash == 0x16196F69ADE35E77ull) || // Hologram icon core (kHoloFamiliesTake)
-           (vs_hash == 0x925ACEDA0153AA5Bull && ps_hash == 0x738A98ED038E58B7ull) || // Planetary / shadowless holo panel variant
            (vs_hash == 0x1989B75BF034ECC3ull && ps_hash == 0xDB79AE788E049DFDull) || // Radar contact triangles & elevation stalks
-           (vs_hash == 0x7B0DC42D383F694Cull && ps_hash == 0xC1D9B5D27AD4E656ull) || // Target reticle sub-elements
            (vs_hash == 0xC7FA0C0F5DD49180ull && ps_hash == 0x6EEF165A350DA30Full) || // Orbit / exclusion lines (kOrbitLines)
            (vs_hash == 0xA47A3315FFF5E2E4ull && ps_hash == 0x869FFF43E875906Eull) || // Supercruise speed/distance bars (kSupercruiseBars)
            (vs_hash == 0x9BFC7FD232328391ull && ps_hash == 0xDBF1725726018F52ull) || // Supercruise space dust particles (kSpaceDust)
@@ -1870,7 +1869,7 @@ ID3D11DepthStencilView* ensureSeededHudDepthStencil(
     }
 
     // Super Resolution path (renderSize < outputSize): resample depth and all 8 stencil bits (0x01..0x80)
-    // into the native-sized s_hud_depth_stencil_dsv per EDVR ui_layer_seed.h, caching the SRVs per texture.
+    // into the native-sized s_hud_depth_stencil_dsv, caching the SRVs per texture.
     if (!(dDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) ||
         !s_hud_hdr_merge_vs || !s_hud_depth_seed_ps || !s_hud_seed_ds_write_depth) {
         return nullptr;
@@ -1879,6 +1878,7 @@ ID3D11DepthStencilView* ensureSeededHudDepthStencil(
         s_seed_cached_depth_tex = nullptr;
         s_seed_cached_depth_srv.Reset();
         s_seed_cached_stencil_srv.Reset();
+        s_hud_depth_only_seeded = false;
 
         Microsoft::WRL::ComPtr<ID3D11Device> device;
         context->GetDevice(&device);
@@ -2004,8 +2004,8 @@ ID3D11DepthStencilView* ensureSeededHudDepthStencil(
 
     context->PSSetShaderResources(0, 2, nullSrvs);
     rawSet(context, 0, nullptr, nullptr);
-    rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, origDsv.Get());
     context->PSSetShaderResources(0, 2, origPsSrvs);
+    rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, origDsv.Get());
     context->VSSetShader(origVs.Get(), nullptr, 0);
     context->PSSetShader(origPs.Get(), nullptr, 0);
     context->GSSetShader(origGs.Get(), nullptr, 0);
@@ -2146,18 +2146,22 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         }
     }
 
-    // Per EDVR (ui-layer-2026-09-23.md:423-430, 1570-1584; cockpit-hud-layer-design-2026-09-27.md:300-313):
+    // Save PS t0 before ensureSeededHudDepthStencil so Flight HUD (B7790CBFC6554097 / 8DEF46452FA459F5,
+    // which samples scene depth at PS slot 0 for its manual depth test and cockpit fade)
+    // never loses its t0 SRV to an OM-DSV / PS-SRV hazard.
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> orig_ps_srv0;
+    context->PSGetShaderResources(0, 1, orig_ps_srv0.GetAddressOf());
+
     // Seed a dedicated native-sized depth-stencil target (s_hud_depth_stencil_dsv) from the game's scene DSV
-    // and bind it with the draw's depth/stencil test state (DepthWriteMask = ZERO) so space dust, orbit lines,
-    // and target indicators/reticles are properly occluded by the ship hull, nose, and canopy struts without
-    // creating any D3D11 OM-DSV / PS-SRV hazard when Flight HUD reads the scene depth SRV at PS t0.
+    // and bind it with the draw's exact depth/stencil test state (DepthWriteMask = ZERO).
+    // Do NOT force DepthEnable or MinDepth = MaxDepth = 0.0004f on kHudSprite (0xE508648660A352B2):
+    // kHudSprite draws in stock with DepthEnable = FALSE and hardware stencil testing (0x01 / 0x05) for
+    // ship-nose occlusion; forcing depth 0.0004f (62.5m) clips the Planetary Approach Indicator's DRP
+    // section, distance readout, and lat/long/G telemetry whenever positioned over the cockpit interior
+    // structure (z_view ~ 1.5-3m => z_raw ~ 0.008-0.016 > 0.0004f) or a nearby planet/station.
     const bool isHoloBillboardForDs = (s_current_hud_vs_hash == 0x5559BD94B6852E83ull);
-    const bool isTargetReticleVs =
-        (s_current_hud_vs_hash == 0xE508648660A352B2ull ||
-         s_current_hud_vs_hash == 0x7B0DC42D383F694Cull);
-    const bool forceTargetShipNoseDepthTest = isTargetReticleVs && !orig_depth_enable;
     ID3D11DepthStencilView* depth_to_bind = nullptr;
-    if ((orig_depth_enable || orig_stencil_enable || forceTargetShipNoseDepthTest) &&
+    if ((orig_depth_enable || orig_stencil_enable) &&
         !isHoloBillboardForDs && depth) {
         depth_to_bind = ensureSeededHudDepthStencil(context, depth.Get());
     }
@@ -2200,8 +2204,8 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
             hudViewports[i].TopLeftY = origViewports[i].TopLeftY * scaleY;
             hudViewports[i].Width = origViewports[i].Width * scaleX;
             hudViewports[i].Height = origViewports[i].Height * scaleY;
-            hudViewports[i].MinDepth = forceTargetShipNoseDepthTest ? 0.0004f : origViewports[i].MinDepth;
-            hudViewports[i].MaxDepth = forceTargetShipNoseDepthTest ? 0.0004f : origViewports[i].MaxDepth;
+            hudViewports[i].MinDepth = origViewports[i].MinDepth;
+            hudViewports[i].MaxDepth = origViewports[i].MaxDepth;
         }
         context->RSSetViewports(numViewports, hudViewports);
     } else {
@@ -2210,8 +2214,8 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         hudViewport.TopLeftY = 0.0f;
         hudViewport.Width = static_cast<float>(s_hud_mask_width);
         hudViewport.Height = static_cast<float>(s_hud_mask_height);
-        hudViewport.MinDepth = forceTargetShipNoseDepthTest ? 0.0004f : 0.0f;
-        hudViewport.MaxDepth = forceTargetShipNoseDepthTest ? 0.0004f : 1.0f;
+        hudViewport.MinDepth = 0.0f;
+        hudViewport.MaxDepth = 1.0f;
         context->RSSetViewports(1, &hudViewport);
     }
 
@@ -2308,16 +2312,17 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         ps_srv1_substituted = true;
     }
 
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> orig_ps_srv0;
-    context->PSGetShaderResources(0, 1, orig_ps_srv0.GetAddressOf());
-
     ID3D11RenderTargetView* mask = s_hud_mask_rtv.Get();
     set_targets(context, 1, &mask, depth_to_bind);
+    if (orig_ps_srv0) {
+        ID3D11ShaderResourceView* srv0 = orig_ps_srv0.Get();
+        context->PSSetShaderResources(0, 1, &srv0);
+    }
     const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     context->OMSetBlendState(blend_to_use, blend_factor, 0xFFFFFFFF);
     if (depth_to_bind) {
         ID3D11DepthStencilState* roDs = getHudReadOnlyDepthState(
-            context, original_ds.Get(), origDsDesc, forceTargetShipNoseDepthTest);
+            context, original_ds.Get(), origDsDesc, false);
         context->OMSetDepthStencilState(roDs, original_stencil_ref);
     } else if (s_hud_mask_ds_state_no_depth) {
         context->OMSetDepthStencilState(s_hud_mask_ds_state_no_depth.Get(), 0);
@@ -2664,7 +2669,6 @@ void mergeHudIntoHdrTarget(ID3D11DeviceContext* context, ID3D11RenderTargetView*
     rearmHudDrawProbe();
 }
 
-// Per EDVR (cockpit-hud-layer-design-2026-09-27.md:1111-1143, 1216-1224):
 // Build H' = H * T + HUD in a dedicated native-sized scratch HDR texture (s_hud_merged_hdr_texture,
 // never overwriting s_clean_hdr_scene_texture) and feed H' to Pass 36 Bloom level 0 and Pass 52
 // HUD+scene tonemapping without modifying the game's HUD-free HDR scene texture (H) in-place!
@@ -2785,18 +2789,29 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
     sz = sizeof(ps_hash);
     if (ps) ps->GetPrivateData(kEdpeShaderHashGuid, &sz, &ps_hash);
 
-    // Detect ESC Pause Menu or full-screen modal 2D composite (ui-layer-2026-09-23.md:825-856):
+    // Detect Station Services, ESC Pause Menu, or full-screen modal 2D composite:
     // - C4B4B334B26E81A9 / 0146ABCC53240479 (n=360): frosted base of Station Services & ESC Pause Menu
-    // - A888D51024D9798E / (9107E72CB016CC02 | F2F872B191F656D5): untinted ESC Pause Menu / Main Menu panel
-    // - 4EF6DDB075A927FA (n=360) on post-tonemap backbuffer: ESC menu darkening multiply wash
+    // - A888D51024D9798E / 015EF9349EC097E8 (n=360): tinted Station Services / in-cockpit pause menu panel
+    // - A888D51024D9798E / (9107E72CB016CC02 | F2F872B191F656D5 | BBA33147981BC99A): untinted / EDHM ESC & modal menu panel
+    // - 5DAD41AA66757CE3 / 25D5F73A4616093B (n=360): Station Services curved overlay mesh
+    // - 4EF6DDB075A927FA (n=360): ESC menu darkening multiply wash
     const bool isPostTonemapMenuStage =
-        (s_post_ldr_backbuffer_bound || s_ldr_tonemap_candidate_bound);
+        s_post_ldr_backbuffer_bound ||
+        s_ldr_tonemap_candidate_bound ||
+        ((s_verified_ldr_tonemap_frame == current_frame ||
+          scene_ldr_frame == current_frame ||
+          s_pass53_blit_seen_frame == current_frame) &&
+         !motion_color_bound && !s_upscale_evaluated_this_frame);
     const bool isModalOrEscMenuDraw =
         isPostTonemapMenuStage &&
         ((vs_hash == 0xC4B4B334B26E81A9ull && ps_hash == 0x0146ABCC53240479ull && count >= 300) ||
-         (vs_hash == 0xA888D51024D9798Eull && s_post_ldr_backbuffer_bound &&
-          (ps_hash == 0x9107E72CB016CC02ull || ps_hash == 0xF2F872B191F656D5ull)) ||
-         (vs_hash == 0x4EF6DDB075A927FAull && count >= 300 && s_post_ldr_backbuffer_bound));
+         (vs_hash == 0xA888D51024D9798Eull &&
+          ((ps_hash == 0x015EF9349EC097E8ull && count >= 300) ||
+           ps_hash == 0x9107E72CB016CC02ull ||
+           ps_hash == 0xF2F872B191F656D5ull ||
+           ps_hash == 0xBBA33147981BC99Aull)) ||
+         (vs_hash == 0x5DAD41AA66757CE3ull && ps_hash == 0x25D5F73A4616093Bull && count >= 300) ||
+         (vs_hash == 0x4EF6DDB075A927FAull && count >= 300));
     if (isModalOrEscMenuDraw) {
         s_pause_menu_seen_frame = current_frame;
     }
@@ -2988,7 +3003,33 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
     const bool pauseMenuActive =
         (s_pause_menu_seen_frame != ~0ull && current_frame <= s_pause_menu_seen_frame + 2);
     if (pauseMenuActive) {
+        // Merge HUD into scene_hdr_color_source and also feed mergedHudHdrSrv (built from hdrSlotRes,
+        // which in station hangars may be the DoF or DEF19B03 copy s_last_full_hdr_post_source)
+        // directly into the Pass 52 Tonemap draw so
+        // Pass 54 Station Services / ESC Menu draws over the tonemapped HUD in exact stock order.
         mergeHudIntoSceneHdr(context);
+        ID3D11ShaderResourceView* mergedHudHdrSrv =
+            buildHudMergedHdrScratchForBloom(context, hdrSlotRes.Get(), psSrvs[hdrSlot]);
+        if (mergedHudHdrSrv) {
+            ID3D11ShaderResourceView* hudSrvs[8]{};
+            for (int i = 0; i < 8; ++i) {
+                if (i == hdrSlot || (ps_hash == 0xDE65BFFF2F12ECC6ull && i == 1)) {
+                    hudSrvs[i] = mergedHudHdrSrv;
+                } else {
+                    hudSrvs[i] = psSrvs[i];
+                }
+            }
+            context->PSSetShaderResources(0, 8, hudSrvs);
+            issueDraw();
+            rearmHudDrawProbe();
+            context->PSSetShaderResources(0, 8, psSrvs);
+            s_hud_merged_into_main_hdr_frame = current_frame;
+            for (int i = 0; i < 8; ++i) {
+                if (psSrvs[i]) psSrvs[i]->Release();
+            }
+            abandonAmortizedAndRearmHudProbe(context);
+            return true;
+        }
         for (int i = 0; i < 8; ++i) {
             if (psSrvs[i]) psSrvs[i]->Release();
         }
@@ -5379,7 +5420,6 @@ void tryMotionPair(ID3D11DeviceContext* fallback_context, unsigned long long fra
     motion_hook_watch = 8;
 }
 
-static bool s_upscale_evaluated_this_frame = false;
 
 bool isLdrSceneColorFormat(DXGI_FORMAT fmt) {
     return fmt == DXGI_FORMAT_R8G8B8A8_UNORM ||
@@ -6609,6 +6649,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     EdpeLog(cmsg);
                 }
             }
+            ID3D11ShaderResourceView* validHudSrv = nullptr;
+            ID3D11ShaderResourceView* validHudTonemappedSrv = nullptr;
             if (canCompositeUi) {
                 if (!ui_composite_pass) {
                     auto comp = std::make_unique<edpe::UiCompositePass>();
@@ -6645,9 +6687,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     }
                     const bool hudSizeOk =
                         (s_hud_mask_width == backbufferDesc.Width || s_hud_mask_width == depthDesc.Width);
-                    ID3D11ShaderResourceView* validHudSrv =
+                    validHudSrv =
                         (hudSrvToUse && hudSizeOk) ? hudSrvToUse : nullptr;
-                    ID3D11ShaderResourceView* validHudTonemappedSrv =
+                    validHudTonemappedSrv =
                         (validHudSrv && hudTonemappedSrvToUse) ? hudTonemappedSrvToUse : nullptr;
 
                     compOk = ui_composite_pass->composite(context,
@@ -6718,9 +6760,51 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     SYSTEMTIME captureTime{};
                     GetLocalTime(&captureTime);
                     if (s_backbuffer_copy) {
+                        ID3D11Texture2D* beforeTex = s_backbuffer_copy.Get();
+                        // Because Pass 35 Cockpit HUD draws are redirected out of the game's HDR target into
+                        // s_hud_mask_srv, s_backbuffer_copy is missing the separated Pass 35 HUD. Composite
+                        // validHudSrv onto s_backbuffer_copy_srv into s_comp_final_tex so "Before-<Backend>"
+                        // screenshots show the complete pre-reconstruction frame with the Cockpit HUD intact.
+                        if (validHudSrv && ui_composite_pass && s_backbuffer_copy_srv && s_dlaa_input_srv) {
+                            if (s_comp_final_tex) {
+                                D3D11_TEXTURE2D_DESC cur{};
+                                s_comp_final_tex->GetDesc(&cur);
+                                if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height ||
+                                    cur.Format != bbFormat) {
+                                    s_comp_final_tex.Reset();
+                                    s_comp_final_rtv.Reset();
+                                }
+                            }
+                            if (!s_comp_final_tex) {
+                                D3D11_TEXTURE2D_DESC td = backbufferDesc;
+                                td.Format = bbFormat;
+                                td.Usage = D3D11_USAGE_DEFAULT;
+                                td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                                td.CPUAccessFlags = td.MiscFlags = 0;
+                                if (FAILED(device->CreateTexture2D(&td, nullptr, &s_comp_final_tex)) ||
+                                    FAILED(device->CreateRenderTargetView(s_comp_final_tex.Get(), nullptr, &s_comp_final_rtv))) {
+                                    s_comp_final_tex.Reset();
+                                    s_comp_final_rtv.Reset();
+                                }
+                            }
+                            if (s_comp_final_tex && s_comp_final_rtv &&
+                                ui_composite_pass->composite(context,
+                                    s_backbuffer_copy_srv.Get(),
+                                    s_backbuffer_copy_srv.Get(),
+                                    s_dlaa_input_srv.Get(),
+                                    validHudSrv,
+                                    s_comp_final_rtv.Get(),
+                                    backbufferDesc.Width, backbufferDesc.Height,
+                                    depthDesc.Width, depthDesc.Height,
+                                    /*isHdr=*/false,
+                                    /*preserveUi=*/true,
+                                    validHudTonemappedSrv)) {
+                                beforeTex = s_comp_final_tex.Get();
+                            }
+                        }
                         wchar_t beforeName[48];
                         swprintf_s(beforeName, L"Before-%ls", activeName);
-                        UiQueueComparisonItem(context, beforeName, s_backbuffer_copy.Get(), &captureTime, 0);
+                        UiQueueComparisonItem(context, beforeName, beforeTex, &captureTime, 0);
                     }
                     UiQueueComparisonItem(context, activeName, backbuffer, &captureTime, cmpBackendId(activeBackend));
                     const bool lastBackend = (s_cmp_seq.idx + 1 >= s_cmp_seq.list.size());
@@ -7393,6 +7477,23 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                             s_pass53_blit_seen_frame = current_frame;
                             s_post_ldr_backbuffer_bound = true;
                             s_post_ldr_backbuffer_no_dsv = (dsv == nullptr);
+                        }
+                    } else if (!isGbuffer && dsv != nullptr && !s_upscale_evaluated_this_frame &&
+                               scene_ldr_frame == current_frame && scene_ldr_source) {
+                        // Pass 54 Station Services & ESC Menu may bind an offscreen post-tonemap LDR screen
+                        // target with a dedicated UI depth-stencil buffer (D24_UNORM_S8_UINT) before the final
+                        // blit to the swapchain backbuffer.
+                        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex0;
+                        if (SUCCEEDED(res0->QueryInterface(__uuidof(ID3D11Texture2D),
+                                reinterpret_cast<void**>(tex0.GetAddressOf())))) {
+                            D3D11_TEXTURE2D_DESC td{};
+                            tex0->GetDesc(&td);
+                            if (td.SampleDesc.Count == 1 && isLdrSceneColorFormat(td.Format)) {
+                                s_hud_mask_active_pass = false;
+                                hud_first_match_seen = false;
+                                s_post_ldr_backbuffer_bound = true;
+                                s_post_ldr_backbuffer_no_dsv = false;
+                            }
                         }
                     }
                     res0->Release();

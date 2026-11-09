@@ -37,7 +37,7 @@ struct NgxFeatureState {
 };
 
 // EDPE's own NGX project ID, for NVSDK_NGX_D3D11_Init_with_ProjectID.
-// Generated for EDPE with PowerShell New-Guid on 2026-10-05; it is not EDVR's ID
+// Generated for EDPE with PowerShell New-Guid on 2026-10-05; it is an EDPE-owned ID
 // and not the example GUID from the SDK header.
 constexpr char kNgxProjectId[] = "48d353f3-d07b-4048-876b-09f8622f5a27";
 constexpr char kNgxEngineVersion[] = "EDPE-unreleased";

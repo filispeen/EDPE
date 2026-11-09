@@ -12,8 +12,8 @@ constexpr GUID kEdpeVertexBytecodeGuid =
 constexpr GUID kEdpePixelBytecodeGuid =
     {0x8b7c68fa, 0x223f, 0x49e9, {0xb1, 0x0c, 0x7c, 0xd5, 0x2e, 0x86, 0x09, 0xa4}};
 
-// EDVR uses this FNV offset for its game shader signatures (MIT, revision 96df075).
-inline std::uint64_t EdpeEdvrShaderHash(const void* bytes, std::size_t size) {
+// 64-bit FNV-1a hash used for game shader signatures.
+inline std::uint64_t EdpeShaderHash(const void* bytes, std::size_t size) {
     auto hash = std::uint64_t{1469598103934665603};
     const auto* data = static_cast<const unsigned char*>(bytes);
     for (std::size_t i = 0; i < size; ++i)

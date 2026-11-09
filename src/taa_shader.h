@@ -112,8 +112,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 currentY = RGBToYCoCg(current);
 
     // 2. 3x3 Neighborhood Statistics in YCoCg
-    // Plain 3x3 neighborhood (as proven in EDVR temporal_shader_source.h:1126)
-    // prevents artificial AABB box narrowing and specular clipping shimmer.
+    // Plain 3x3 neighborhood prevents artificial AABB box narrowing and specular clipping shimmer.
     float3 m1 = 0;
     float3 m2 = 0;
     float3 boxMin = float3(1e9, 1e9, 1e9);

@@ -548,5 +548,39 @@ int main() {
     // Must match linear-light dimmed green (~123), never gamma-darkened (~51)
     if (m17G3 < 110 || m17G3 > 135) return 81;
 
+    // Test 18: Pass 54 Starport Services / modal 2D menu overlapping Pass 35 Cockpit HUD on the same pixels
+    // Row 1 has Pass 35 orange HUD only (tGame == tLowWorld == green).
+    // Rows 2-3 have BOTH Pass 35 orange HUD in tHudMask AND Pass 54 white Starport Services menu in tGame (gameSrv).
+    // Verify that Row 1 outputs Pass 35 orange HUD, while Row 3 outputs Pass 54 white Starport Services ON TOP OF the HUD!
+    std::array<Half4, 16> overlapHudPixels{};
+    for (int i = 0; i < 4; ++i) overlapHudPixels[i] = {0, 0, 0, 0x3C00};             // Row 0: clear
+    for (int i = 4; i < 16; ++i) overlapHudPixels[i] = {0x3C00, 0x3800, 0, 0x0000};  // Rows 1-3: opaque orange HUD
+    D3D11_SUBRESOURCE_DATA overlapHudInit{overlapHudPixels.data(), 4 * sizeof(Half4), 0};
+    ComPtr<ID3D11Texture2D> overlapHudTex;
+    ComPtr<ID3D11ShaderResourceView> overlapHudSrv;
+    if (FAILED(device->CreateTexture2D(&rgba16Desc, &overlapHudInit, &overlapHudTex)) ||
+        FAILED(device->CreateShaderResourceView(overlapHudTex.Get(), nullptr, &overlapHudSrv))) {
+        return 82;
+    }
+
+    ok = pass.composite(context.Get(), dlssSrv.Get(), gameSrv.Get(), dlssSrv.Get(),
+        overlapHudSrv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true);
+    if (!ok) return 83;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 84;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t m18R0 = rows[0], m18G0 = rows[1], m18B0 = rows[2];
+    row1Ptr = rows + 1 * mapped.RowPitch;
+    const uint8_t m18R1 = row1Ptr[0], m18G1 = row1Ptr[1], m18B1 = row1Ptr[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t m18R3 = lastRow[0], m18G3 = lastRow[1], m18B3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    if (m18G0 < 200 || m18R0 > 50 || m18B0 > 50) return 85;   // Row 0: pure DLSS green
+    if (m18R1 < 150 || m18G1 < 100 || m18B1 > 50) return 86;  // Row 1: non-overlapped Pass 35 orange HUD preserved
+    if (m18R3 < 200 || m18G3 < 200 || m18B3 < 200) return 87; // Row 3: Pass 54 Starport Services white menu covers Pass 35 HUD
+
     return 0;
 }

@@ -1,5 +1,4 @@
 #pragma once
-// Adapted from EDVR revision 96df0757 (MIT; see docs/third-party/EDVR-LICENSE.txt).
 // Restricted SM5 colour-output fanout. Original arithmetic and texture reads
 // are retained; the final colour is exported to the game, clean colour and
 // scalar UI-influence targets. Unsupported programs decline without mutation.
