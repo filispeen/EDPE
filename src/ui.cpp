@@ -2115,8 +2115,22 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ImGui::TextDisabled("(Settings auto-saved)");
             }
 
-            // Debug Views & Diagnostics section removed.
         } // if (cfg.devMode)
+
+        if (ImGui::CollapsingHeader("Debug View")) {
+            const char* debug_view_items[] = {
+                "None",
+                "Subpixel Jitter",
+                "Feet pictures" // will not be implemented, you can check thoose in google
+            };
+            int current_debug_view = ContextCensusGetJitterDebugView() ? 1 : 0;
+            if (ImGui::Combo("Debug view", &current_debug_view, debug_view_items, IM_ARRAYSIZE(debug_view_items))) {
+                const bool enable_jitter_debug = (current_debug_view == 1);
+                ContextCensusSetHudDebugView(false);
+                ContextCensusSetJitterDebugView(enable_jitter_debug);
+            }
+            TextDisabledWrapped("Dims and desaturates the game view while highlighting subpixel jitter pixels in green.");
+        }
 
         ImGui::Spacing();
 

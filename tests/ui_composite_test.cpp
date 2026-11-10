@@ -582,5 +582,102 @@ int main() {
     if (m18R1 < 150 || m18G1 < 100 || m18B1 > 50) return 86;  // Row 1: non-overlapped Pass 35 orange HUD preserved
     if (m18R3 < 200 || m18G3 < 200 || m18B3 < 200) return 87; // Row 3: Pass 54 Starport Services white menu covers Pass 35 HUD
 
+    // Test 19: Pass 54 dark card / frosted vignette shadow over an equally dark 3D background (cGame == cLow == dark)
+    // where Pass 35 HUD is present in rows 1-3, but Pass 54 attenuated tHudTonemapped.a to 0 in rows 2-3.
+    // Row 1 (tHudTonemapped.a == 255) must preserve the orange Pass 35 HUD;
+    // Row 3 (tHudTonemapped.a == 0) must be occluded by Pass 54 even though cGame == cLow!
+    std::array<uint32_t, 16> darkBgPixels{};
+    darkBgPixels.fill(0xFF050505); // Dark 3D background and dark Pass 54 card (R=5, G=5, B=5)
+    D3D11_SUBRESOURCE_DATA darkBgInit{darkBgPixels.data(), 4 * sizeof(uint32_t), 0};
+    std::array<uint32_t, 16> toneOccPixels{};
+    for (int i = 0; i < 4; ++i) toneOccPixels[i] = 0xFF050505;  // Row 0: HUD-free dark corner, T_54 = 1.0
+    for (int i = 4; i < 8; ++i) toneOccPixels[i] = 0xFF0080FF;  // Row 1: orange HUD (R=255, G=128, B=0), T_54 = 1.0 (0xFF)
+    for (int i = 8; i < 16; ++i) toneOccPixels[i] = 0x000080FF; // Rows 2-3: orange HUD, occluded by Pass 54 -> T_54 = 0.0 (0x00)
+    D3D11_SUBRESOURCE_DATA toneOccInit{toneOccPixels.data(), 4 * sizeof(uint32_t), 0};
+    ComPtr<ID3D11Texture2D> darkBgTex, toneOccTex;
+    ComPtr<ID3D11ShaderResourceView> darkBgSrv, toneOccSrv;
+    if (FAILED(device->CreateTexture2D(&outDesc, &darkBgInit, &darkBgTex)) ||
+        FAILED(device->CreateShaderResourceView(darkBgTex.Get(), nullptr, &darkBgSrv)) ||
+        FAILED(device->CreateTexture2D(&outDesc, &toneOccInit, &toneOccTex)) ||
+        FAILED(device->CreateShaderResourceView(toneOccTex.Get(), nullptr, &toneOccSrv))) {
+        return 88;
+    }
+
+    ok = pass.composite(context.Get(), darkBgSrv.Get(), darkBgSrv.Get(), darkBgSrv.Get(),
+        overlapHudSrv.Get(), targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true,
+        toneOccSrv.Get());
+    if (!ok) return 89;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 90;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    row1Ptr = rows + 1 * mapped.RowPitch;
+    const uint8_t m19R1 = row1Ptr[0], m19G1 = row1Ptr[1], m19B1 = row1Ptr[2];
+    lastRow = rows + 3 * mapped.RowPitch;
+    const uint8_t m19R3 = lastRow[0], m19G3 = lastRow[1], m19B3 = lastRow[2];
+    context->Unmap(staging.Get(), 0);
+
+    if (m19R1 < 200 || m19G1 < 100 || m19B1 > 50) return 91; // Row 1: unoccluded orange HUD preserved
+    if (m19R3 > 20 || m19G3 > 20 || m19B3 > 20) return 92;   // Row 3: dark Pass 54 card occludes HUD despite cGame == cLow
+
+    // Test 20: Main Menu dark brown UI cards (Options / Continue cards, R=40, G=21, B=7, flags.w == 0)
+    // over a subpixel-jittered 3D hangar background (where tLowWorld and tDlss differ due to jitter/AA,
+    // and tLowWorld has both brighter hangar girders > card and darker beams < card).
+    // Row 0 (untouched 3D hangar, cGame == cLow) must output anti-aliased tDlss;
+    // Row 3 (inside the dark brown Main Menu card) must output clean (40, 21, 7) with zero 3D bleed-through.
+    auto packRgba = [](uint8_t r, uint8_t g, uint8_t b) -> uint32_t {
+        return 0xFF000000u | (static_cast<uint32_t>(b) << 16) | (static_cast<uint32_t>(g) << 8) | r;
+    };
+    const uint32_t cardBrown = packRgba(40, 21, 7);
+    std::array<uint32_t, 16> mmLowPixels = {
+        packRgba(36, 20, 10), packRgba(71, 46, 26), packRgba(46, 36, 26), packRgba(31, 15, 5),
+        packRgba(36, 20, 10), packRgba(71, 46, 26), packRgba(46, 36, 26), packRgba(31, 15, 5),
+        packRgba(64, 46, 31), packRgba(38, 20, 8),  packRgba(41, 22, 8),  packRgba(71, 46, 26),
+        packRgba(64, 46, 31), packRgba(36, 18, 5),  packRgba(41, 22, 8),  packRgba(71, 46, 26)
+    };
+    std::array<uint32_t, 16> mmDlssPixels = {
+        packRgba(56, 36, 20), packRgba(48, 31, 18), packRgba(48, 31, 18), packRgba(48, 31, 18),
+        packRgba(56, 36, 20), packRgba(48, 31, 18), packRgba(48, 31, 18), packRgba(48, 31, 18),
+        packRgba(38, 25, 15), packRgba(56, 36, 23), packRgba(54, 36, 24), packRgba(38, 25, 15),
+        packRgba(38, 25, 15), packRgba(56, 36, 23), packRgba(54, 36, 24), packRgba(38, 25, 15)
+    };
+    std::array<uint32_t, 16> mmGamePixels = mmLowPixels;
+    for (int i = 8; i < 16; ++i) mmGamePixels[i] = cardBrown;
+
+    D3D11_SUBRESOURCE_DATA mmLowInit{mmLowPixels.data(), 4 * sizeof(uint32_t), 0};
+    D3D11_SUBRESOURCE_DATA mmDlssInit{mmDlssPixels.data(), 4 * sizeof(uint32_t), 0};
+    D3D11_SUBRESOURCE_DATA mmGameInit{mmGamePixels.data(), 4 * sizeof(uint32_t), 0};
+    ComPtr<ID3D11Texture2D> mmLowTex, mmDlssTex, mmGameTex;
+    ComPtr<ID3D11ShaderResourceView> mmLowSrv, mmDlssSrv, mmGameSrv;
+    if (FAILED(device->CreateTexture2D(&outDesc, &mmLowInit, &mmLowTex)) ||
+        FAILED(device->CreateShaderResourceView(mmLowTex.Get(), nullptr, &mmLowSrv)) ||
+        FAILED(device->CreateTexture2D(&outDesc, &mmDlssInit, &mmDlssTex)) ||
+        FAILED(device->CreateShaderResourceView(mmDlssTex.Get(), nullptr, &mmDlssSrv)) ||
+        FAILED(device->CreateTexture2D(&outDesc, &mmGameInit, &mmGameTex)) ||
+        FAILED(device->CreateShaderResourceView(mmGameTex.Get(), nullptr, &mmGameSrv))) {
+        return 93;
+    }
+
+    ok = pass.composite(context.Get(), mmDlssSrv.Get(), mmGameSrv.Get(), mmLowSrv.Get(),
+        nullptr, targetRtv.Get(), 4, 4, 4, 4, /*isHdr=*/false, /*preserveUi=*/true);
+    if (!ok) return 94;
+
+    context->CopyResource(staging.Get(), targetTex.Get());
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 95;
+
+    rows = static_cast<const uint8_t*>(mapped.pData);
+    lastRow = rows + 3 * mapped.RowPitch;
+    for (int col = 0; col < 4; ++col) {
+        const int cr = lastRow[col * 4 + 0];
+        const int cg = lastRow[col * 4 + 1];
+        const int cb = lastRow[col * 4 + 2];
+        if (std::abs(cr - 40) > 2 || std::abs(cg - 21) > 2 || std::abs(cb - 7) > 2) {
+            context->Unmap(staging.Get(), 0);
+            return 96 + col;
+        }
+    }
+    context->Unmap(staging.Get(), 0);
+
     return 0;
 }

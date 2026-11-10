@@ -125,6 +125,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 cScene;
     float hudMask = 0.0;
     bool hasHud = false;
+    float pass54Transmittance = 1.0;
     if (flags.w > 0.5) {
         bool isNativeSizedHud = (flags.w < 1.5) || (flags.w > 2.5 && flags.w < 3.5);
         bool hasTonemappedHud = (flags.w > 2.5);
@@ -139,9 +140,11 @@ float4 ps_main(VSOutput pin) : SV_Target {
             float3 combinedHdr = cDlss * hudTransmittance + hSample.rgb;
             cScene = toLdr(combinedHdr);
         } else if (hasTonemappedHud) {
-            float3 hudPost = isNativeSizedHud
-                ? tHudTonemapped.Load(pixelPos).rgb
-                : tHudTonemapped.SampleLevel(sLinear, pin.uv, 0).rgb;
+            float4 hudPostSample = isNativeSizedHud
+                ? tHudTonemapped.Load(pixelPos)
+                : tHudTonemapped.SampleLevel(sLinear, pin.uv, 0);
+            pass54Transmittance = saturate(hudPostSample.a);
+            float3 hudPost = hudPostSample.rgb;
             bool tonemapHasScene = true;
             float3 hudBlack = sampleHudTonemapBlackFloor(isNativeSizedHud, tonemapHasScene);
             float3 dlssLin = pow(max(cDlss, 0.0), 2.2);
@@ -198,6 +201,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
     //      news cards, mouse cursor).
     float3 cGame = sampleGameLdr(outPos);
     float3 cLow = sampleLowWorldLdrAtOutputPos(outPos);
+    if (flags.w > 0.5 && pass54Transmittance > 0.995 && max3(abs(cGame - cLow)) <= 0.015) {
+        return float4(saturate(cScene), 1.0);
+    }
 
     // 4-neighbor cross at +/-2 output pixels to measure local 2D UI gradients vs 3D world gradients
     // and detect dark glyphs (e.g. black "CONTINUE" letters) inside bright emissive buttons.
@@ -237,40 +243,68 @@ float4 ps_main(VSOutput pin) : SV_Target {
         wMax = max(wMax, max(max(w00, w10), max(w01, w11)));
     }
     float edgeRange = max3(wMax - wMin);
+    float gameFlatH = min(max3(abs(cGame - gL)), max3(abs(cGame - gR)));
+    float gameFlatV = min(max3(abs(cGame - gU)), max3(abs(cGame - gD)));
+    float gameRange = max(gameFlatH, gameFlatV);
+    float edgeTol = min(edgeRange, gameRange);
 
-    // (a) Multiplicative vignette / shadow darkening applied directly to reconstructed cScene:
-    // Because both cGame and cLow contain the exact same pre-AA 3D scene (cGame = T_vig * cLow),
-    // the ratio tDark = cGame / cLow cancels out the jittered/low-res 3D edges of cLow identically!
-    float negDiff = max(0.0, max3(cLow - cGame) - (hasHud ? 0.15 * edgeRange : 0.0));
+    // (a) Multiplicative vignette / shadow darkening applied to reconstructed cScene ONLY
+    // where tGame preserves the 3D spatial gradient (vigPreserve). On flat opaque/semi-opaque
+    // UI cards (Main Menu Options / Continue cards, Starport Services cards) where gameRange is
+    // flat while the 3D hangar has girders/lights or subpixel jitter, vigPreserve = 0 prevents
+    // (cScene - cLow) subpixel jitter from ever bleeding through the card.
+    float negDiff = max(0.0, max3(cLow - cGame) - 0.15 * edgeTol);
     float darkWeight = smoothstep(0.010, 0.030, negDiff);
     float3 tDark = clamp(cGame / max(cLow, float3(0.004, 0.004, 0.004)), 0.0, 1.0);
-    float3 cBase = cScene * lerp(float3(1.0, 1.0, 1.0), tDark, darkWeight);
+    float kVig = clamp(max3(cGame) / max(max3(cLow), 0.01), 0.0, 1.0);
+    float worldVar = max(edgeRange, max3(abs(cScene - cLow)));
+    float expectedGameRange = kVig * worldVar;
+    float vigPreserve = (worldVar > 0.008)
+        ? saturate((gameRange - 0.012) / max(expectedGameRange, 0.012))
+        : 0.0;
+    float3 cDarkened = clamp(cGame + (tDark * vigPreserve) * (cScene - cLow), 0.0, 1.0);
+    float3 cBase = lerp(cScene, cDarkened, darkWeight);
 
     // (b) Detect genuine emissive, chromatic, or opaque 2D UI elements (excluding neutral vignette darkening):
     // 1. Positive brightening above cLow / wMax
-    float posCenter = max(0.0, max3(cGame - cLow) - 0.15 * edgeRange);
+    float posCenter = max(0.0, max3(cGame - cLow) - 0.15 * edgeTol);
     float posBox = max(0.0, max3(cGame - wMax));
     float posNeigh = max(
         max(max3(gL - lL), max3(gR - lR)),
         max(max3(gU - lU), max3(gD - lD))
     );
-    float posUi = max(max(posCenter, posBox * 2.0), 0.65 * max(0.0, posNeigh - 0.15 * edgeRange));
+    float posUi = max(max(posCenter, posBox * 2.0), 0.65 * max(0.0, posNeigh - 0.15 * edgeTol));
 
     // 2. Chromaticity shift (color change orthogonal to neutral scalar darkening cGame = k * cLow)
     float kScale = clamp(dot(cGame, cLow) / max(dot(cLow, cLow), 1e-4), 0.0, 1.5);
-    float chromaDiff = max(0.0, max3(abs(cGame - cLow * kScale)) - 0.15 * edgeRange);
+    float chromaDiff = max(0.0, max3(abs(cGame - cLow * kScale)) - 0.15 * edgeTol);
 
-    // 3. Sharp 2D UI edges in cGame that do not exist in cLow, OR opaque dark UI cards
-    //    that completely flatten a strong underlying 3D edge in cLow
+    // 3. Sharp 2D UI edges in cGame that do not exist in cLow, OR opaque/flat UI cards
+    //    that flatten underlying 3D hangar edges or subpixel jitter in cLow/cScene
     float gradGame = max(max3(abs(gR - gL)), max3(abs(gD - gU)));
     float gradLow  = max(max3(abs(lR - lL)), max3(abs(lD - lU)));
-    float extraUiEdge = max(0.0, gradGame - gradLow - 0.025 - (hasHud ? 0.20 * edgeRange : 0.0));
-    float opaqueDarkCard = (negDiff > 0.03 && max3(cGame) < 0.08 && gradLow > 0.04 && gradGame < 0.30 * gradLow)
-        ? (gradLow - gradGame)
+    float extraUiEdge = max(0.0, gradGame - gradLow - 0.025 - 0.20 * edgeTol);
+    bool inUiCard = (max3(abs(cGame - cLow)) > 0.010) ||
+                    (max3(abs(gL - lL)) > 0.012 && max3(abs(gR - lR)) > 0.012) ||
+                    (max3(abs(gU - lU)) > 0.012 && max3(abs(gD - lD)) > 0.012);
+    float flatCardMainMenu = (!hasHud && inUiCard && (
+        (expectedGameRange > 0.015 && gameRange < 0.45 * expectedGameRange) ||
+        (gameRange < 0.018 && worldVar > 0.006)
+    )) ? max(worldVar - gameRange, 0.045) : 0.0;
+    float flatOverlayHud = (hasHud && max3(abs(cGame - cLow)) > 0.025 && edgeRange > 0.04 &&
+                            gradGame < 0.35 * edgeRange && max3(wMax - cGame) > 0.03)
+        ? (edgeRange - gradGame)
         : 0.0;
+    float opaqueDarkCard = max(
+        (negDiff > 0.03 && max3(cGame) < 0.08 && gradLow > 0.04 && gradGame < 0.30 * gradLow)
+            ? (gradLow - gradGame)
+            : 0.0,
+        max(flatCardMainMenu, flatOverlayHud)
+    );
 
     float dUi = max(max(posUi, chromaDiff * 1.5), max(extraUiEdge, opaqueDarkCard));
-    float uiMask = max(smoothstep(0.012, 0.038, dUi), hudMask);
+    float pass54Mask = 1.0 - pass54Transmittance;
+    float uiMask = max(max(smoothstep(0.012, 0.038, dUi), hudMask), pass54Mask);
 
     float3 finalColor = lerp(cBase, cGame, uiMask);
     return float4(saturate(finalColor), 1.0);
