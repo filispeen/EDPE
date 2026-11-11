@@ -27,7 +27,11 @@ public:
         float jitterY,
         bool reset,
         uint32_t renderWidth = 0,
-        uint32_t renderHeight = 0);
+        uint32_t renderHeight = 0,
+        float prevJitterX = 0.0f,
+        float prevJitterY = 0.0f,
+        float depthB = 0.025f,
+        ID3D11ShaderResourceView* prevDepthSrv = nullptr);
 
     void resetHistory() { resetRequested_ = true; }
     bool isInitialized() const { return device_ != nullptr; }
@@ -50,6 +54,9 @@ private:
     uint32_t historyWidth_ = 0;
     uint32_t historyHeight_ = 0;
     DXGI_FORMAT historyFormat_ = DXGI_FORMAT_UNKNOWN;
+
+    ID3D11Texture2D* cachedDestTexture_ = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> cachedDestRtv_;
 
     bool resetRequested_ = true;
 };

@@ -2080,6 +2080,63 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                     edpe::Config::instance().save();
                 }
                 ImGui::SetItemTooltip("default: 8, standard Halton");
+
+                ImGui::Separator();
+                ImGui::Text("Jitter Telemetry (jitter.log)");
+                auto& jlogger = edpe::JitterLogger::instance();
+                bool jlog_enabled = jlogger.isLoggingEnabled();
+                if (ImGui::Checkbox("Enable jitter.log Recording", &jlog_enabled)) {
+                    cfg.jitterLogEnabled = jlog_enabled;
+                    jlogger.setLoggingEnabled(jlog_enabled);
+                    cfg.save();
+                }
+                ImGui::SetItemTooltip("Records subpixel jitter and camera telemetry to jitter.log in the game directory.");
+
+                int jlog_interval = static_cast<int>(jlogger.getSampleInterval());
+                if (ImGui::SliderInt("Log Every N Frames", &jlog_interval, 1, 120, "%d frames")) {
+                    const uint32_t clamped_interval = static_cast<uint32_t>(std::clamp(jlog_interval, 1, 600));
+                    cfg.jitterLogInterval = clamped_interval;
+                    jlogger.setSampleInterval(clamped_interval);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    cfg.save();
+                }
+                ImGui::SetItemTooltip("Higher values reduce telemetry overhead (e.g. 10 = log every 10th frame; scene cuts are always logged).");
+
+                ImGui::TextDisabled("Presets:");
+                ImGui::SameLine();
+                const int presets[] = { 1, 5, 10, 30, 60 };
+                for (int i = 0; i < 5; ++i) {
+                    if (i > 0) ImGui::SameLine();
+                    char label[16];
+                    std::snprintf(label, sizeof(label), "%df", presets[i]);
+                    if (ImGui::SmallButton(label)) {
+                        cfg.jitterLogInterval = static_cast<unsigned>(presets[i]);
+                        jlogger.setSampleInterval(cfg.jitterLogInterval);
+                        cfg.save();
+                    }
+                }
+
+                int jlog_flush_ms = static_cast<int>(jlogger.getFlushIntervalMs());
+                if (ImGui::SliderInt("Disk Flush Interval", &jlog_flush_ms, 250, 5000, "%d ms")) {
+                    const uint32_t clamped_flush = static_cast<uint32_t>(std::clamp(jlog_flush_ms, 100, 10000));
+                    cfg.jitterLogFlushMs = clamped_flush;
+                    jlogger.setFlushIntervalMs(clamped_flush);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    cfg.save();
+                }
+                ImGui::SetItemTooltip("How often the background writer flushes buffered telemetry rows to disk.");
+
+                ImGui::TextDisabled("Rows written: %u", jlogger.getWrittenRowCount());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Flush Now")) {
+                    jlogger.flush();
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear jitter.log")) {
+                    jlogger.clearFile();
+                }
             }
 
             // Section 3: Motion Vectors Tuning

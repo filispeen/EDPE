@@ -114,6 +114,7 @@ struct TemporalFrameInputs {
 
     ID3D11Texture2D* depth = nullptr;
     ID3D11ShaderResourceView* depthSrv = nullptr;
+    ID3D11ShaderResourceView* prevDepthSrv = nullptr;
 
     ID3D11Texture2D* motionVectors = nullptr;
     ID3D11ShaderResourceView* motionSrv = nullptr;
@@ -135,6 +136,8 @@ struct TemporalFrameInputs {
     // Subpixel jitter in render pixels (EDPE Halton sequence convention).
     float jitterX = 0.0f;
     float jitterY = 0.0f;
+    float prevJitterX = 0.0f;
+    float prevJitterY = 0.0f;
 
     // Elapsed frame delta time in milliseconds.
     float frameTimeMs = 0.0f;

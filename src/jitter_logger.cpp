@@ -1,6 +1,7 @@
 #include "jitter_logger.h"
 #include "temporal_math.h"
 #include "context_census.h"
+#include "config.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -19,16 +20,28 @@ JitterLogger& JitterLogger::instance() {
 }
 
 JitterLogger::JitterLogger() {
-    workerThread_ = std::thread(&JitterLogger::workerThreadLoop, this);
+    // Worker thread and jitter.log file creation are deferred until DEV=1 and logging is enabled.
 }
 
 JitterLogger::~JitterLogger() {
     shutdown();
 }
 
+void JitterLogger::ensureWorkerStarted() {
+    if (!Config::instance().devMode || !running_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(workerStartMutex_);
+    if (!workerStarted_ && running_.load(std::memory_order_relaxed)) {
+        workerStarted_ = true;
+        workerThread_ = std::thread(&JitterLogger::workerThreadLoop, this);
+    }
+}
+
 void JitterLogger::shutdown() {
     if (running_.exchange(false)) {
         cv_.notify_all();
+        std::lock_guard<std::mutex> lock(workerStartMutex_);
         if (workerThread_.joinable()) {
             workerThread_.join();
         }
@@ -37,13 +50,51 @@ void JitterLogger::shutdown() {
 
 void JitterLogger::setLoggingEnabled(bool enabled) {
     enabled_.store(enabled, std::memory_order_relaxed);
+    if (enabled && Config::instance().devMode) {
+        ensureWorkerStarted();
+    } else if (!enabled) {
+        flushRequested_.store(true, std::memory_order_release);
+        cv_.notify_one();
+    }
 }
 
 bool JitterLogger::isLoggingEnabled() const {
-    return enabled_.load(std::memory_order_relaxed);
+    return Config::instance().devMode && enabled_.load(std::memory_order_relaxed);
+}
+
+void JitterLogger::setSampleInterval(uint32_t everyNFrames) {
+    sampleInterval_.store(std::clamp(everyNFrames, 1u, 600u), std::memory_order_relaxed);
+}
+
+uint32_t JitterLogger::getSampleInterval() const {
+    return sampleInterval_.load(std::memory_order_relaxed);
+}
+
+void JitterLogger::setFlushIntervalMs(uint32_t intervalMs) {
+    flushIntervalMs_.store(std::clamp(intervalMs, 100u, 10000u), std::memory_order_relaxed);
+    cv_.notify_one();
+}
+
+uint32_t JitterLogger::getFlushIntervalMs() const {
+    return flushIntervalMs_.load(std::memory_order_relaxed);
+}
+
+bool JitterLogger::shouldSampleFrame(unsigned long long frame, bool forceOnAnomaly) const {
+    if (!Config::instance().devMode || !enabled_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    if (forceOnAnomaly) {
+        return true;
+    }
+    const uint32_t interval = std::max(1u, sampleInterval_.load(std::memory_order_relaxed));
+    return (frame % interval) == 0;
 }
 
 void JitterLogger::pushFrame(const JitterFrameLog& log) {
+    if (!shouldSampleFrame(log.frame, log.sceneCut)) {
+        return;
+    }
+
     // 1. Update UI rolling history (< 10ns)
     {
         std::lock_guard lock(historyMutex_);
@@ -61,24 +112,30 @@ void JitterLogger::pushFrame(const JitterFrameLog& log) {
     }
 
     // 2. Push to circular buffer for background logging (< 10ns)
-    if (enabled_.load(std::memory_order_relaxed)) {
-        const uint32_t w = writeIdx_.load(std::memory_order_relaxed);
-        ring_[w % kRingSize] = log;
-        writeIdx_.store(w + 1, std::memory_order_release);
+    ensureWorkerStarted();
+    const uint32_t w = writeIdx_.load(std::memory_order_relaxed);
+    ring_[w % kRingSize] = log;
+    writeIdx_.store(w + 1, std::memory_order_release);
 
-        // Wake background thread if a batch accumulated
-        if ((w % 256) == 0) {
-            cv_.notify_one();
-        }
+    // Wake background thread only when a full batch accumulated
+    if (((w + 1) % 512) == 0) {
+        cv_.notify_one();
     }
 }
 
 void JitterLogger::flush() {
+    if (!Config::instance().devMode) {
+        return;
+    }
+    ensureWorkerStarted();
     flushRequested_.store(true, std::memory_order_release);
     cv_.notify_one();
 }
 
 void JitterLogger::clearFile() {
+    if (!Config::instance().devMode) {
+        return;
+    }
     const std::wstring path = getLogFilePath();
     if (path.empty()) return;
 
@@ -130,6 +187,9 @@ std::wstring JitterLogger::getLogFilePath() const {
 }
 
 void JitterLogger::workerThreadLoop() {
+    if (!Config::instance().devMode) {
+        return;
+    }
     const std::wstring path = getLogFilePath();
     if (path.empty()) return;
 
@@ -151,15 +211,20 @@ void JitterLogger::workerThreadLoop() {
 
     while (running_.load(std::memory_order_relaxed)) {
         {
+            const uint32_t waitMs = std::clamp(flushIntervalMs_.load(std::memory_order_relaxed), 100u, 10000u);
             std::unique_lock<std::mutex> lock(cvMutex_);
-            cv_.wait_for(lock, std::chrono::milliseconds(250), [this] {
+            cv_.wait_for(lock, std::chrono::milliseconds(waitMs), [this] {
                 return !running_.load(std::memory_order_relaxed) ||
                        flushRequested_.load(std::memory_order_relaxed) ||
-                       (writeIdx_.load(std::memory_order_relaxed) - readIdx_.load(std::memory_order_relaxed) >= 256);
+                       (writeIdx_.load(std::memory_order_relaxed) - readIdx_.load(std::memory_order_relaxed) >= 512);
             });
         }
 
         flushRequested_.store(false, std::memory_order_relaxed);
+        if (!Config::instance().devMode) {
+            readIdx_.store(writeIdx_.load(std::memory_order_relaxed), std::memory_order_release);
+            continue;
+        }
 
         const uint32_t w = writeIdx_.load(std::memory_order_acquire);
         uint32_t r = readIdx_.load(std::memory_order_relaxed);
@@ -214,6 +279,9 @@ void JitterLogger::workerThreadLoop() {
     }
 
     // Flush remainder before thread exits
+    if (!Config::instance().devMode) {
+        return;
+    }
     const uint32_t w = writeIdx_.load(std::memory_order_acquire);
     uint32_t r = readIdx_.load(std::memory_order_relaxed);
     if (r != w) {

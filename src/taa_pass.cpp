@@ -13,6 +13,7 @@ struct TaaConstantBufferData {
     float resolution[4];       // outputWidth, outputHeight, 1/outputWidth, 1/outputHeight
     float renderResolution[4]; // renderWidth, renderHeight, 1/renderWidth, 1/renderHeight
     float params[4];           // jitterX, jitterY, blendWeight, resetFlag
+    float jitterHistory[4];    // prevJitterX, prevJitterY, depthB, hasPrevDepth
 };
 
 } // namespace
@@ -95,6 +96,8 @@ void TaaPass::shutdown() {
     constantBuffer_.Reset();
     historyTexture_.Reset();
     historySrv_.Reset();
+    cachedDestRtv_.Reset();
+    cachedDestTexture_ = nullptr;
     context_.Reset();
     device_ = nullptr;
     historyWidth_ = 0;
@@ -157,10 +160,17 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     float jitterY,
     bool reset,
     uint32_t renderWidth,
-    uint32_t renderHeight) {
+    uint32_t renderHeight,
+    float prevJitterX,
+    float prevJitterY,
+    float depthB,
+    ID3D11ShaderResourceView* prevDepthSrv) {
     if (!device_ || !context || !currentFrameSrv || !destinationTexture || width == 0 || height == 0) {
         return false;
     }
+
+    const uint32_t rW = (renderWidth > 0) ? renderWidth : width;
+    const uint32_t rH = (renderHeight > 0) ? renderHeight : height;
 
     D3D11_TEXTURE2D_DESC destDesc{};
     destinationTexture->GetDesc(&destDesc);
@@ -169,20 +179,21 @@ bool TaaPass::render(ID3D11DeviceContext* context,
         return false;
     }
 
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> localRtv;
     ID3D11RenderTargetView* targetRtv = destinationRtv;
     if (!targetRtv) {
-        if (FAILED(device_->CreateRenderTargetView(destinationTexture, nullptr, &localRtv))) {
-            return false;
+        if (cachedDestTexture_ != destinationTexture || !cachedDestRtv_) {
+            cachedDestRtv_.Reset();
+            cachedDestTexture_ = nullptr;
+            if (FAILED(device_->CreateRenderTargetView(destinationTexture, nullptr, &cachedDestRtv_))) {
+                return false;
+            }
+            cachedDestTexture_ = destinationTexture;
         }
-        targetRtv = localRtv.Get();
+        targetRtv = cachedDestRtv_.Get();
     }
 
     const bool performReset = reset || resetRequested_;
     resetRequested_ = false;
-
-    const uint32_t rW = (renderWidth > 0) ? renderWidth : width;
-    const uint32_t rH = (renderHeight > 0) ? renderHeight : height;
 
     TaaConstantBufferData cb{};
     cb.resolution[0] = static_cast<float>(width);
@@ -197,6 +208,10 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     cb.params[1] = jitterY;
     cb.params[2] = 0.90f; // 90% history weight
     cb.params[3] = performReset ? 1.0f : 0.0f;
+    cb.jitterHistory[0] = prevJitterX;
+    cb.jitterHistory[1] = prevJitterY;
+    cb.jitterHistory[2] = (depthB > 0.0f) ? depthB : 0.025f;
+    cb.jitterHistory[3] = (!performReset && prevDepthSrv && depthSrv) ? 1.0f : 0.0f;
 
     context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cb, 0, 0);
 
@@ -213,8 +228,14 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     context->VSSetShader(vertexShader_.Get(), nullptr, 0);
     context->PSSetShader(pixelShader_.Get(), nullptr, 0);
 
-    ID3D11ShaderResourceView* srvs[4] = { currentFrameSrv, historySrv_.Get(), motionVectorsSrv, depthSrv };
-    context->PSSetShaderResources(0, 4, srvs);
+    ID3D11ShaderResourceView* srvs[5] = {
+        currentFrameSrv,
+        historySrv_.Get(),
+        motionVectorsSrv,
+        depthSrv,
+        (!performReset) ? prevDepthSrv : nullptr
+    };
+    context->PSSetShaderResources(0, 5, srvs);
 
     ID3D11SamplerState* samplers[2] = { linearSampler_.Get(), pointSampler_.Get() };
     context->PSSetSamplers(0, 2, samplers);
@@ -225,8 +246,8 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     context->Draw(3, 0);
 
     // Unbind resources before copy to prevent pipeline hazards
-    ID3D11ShaderResourceView* nullSrvs[4] = { nullptr, nullptr, nullptr, nullptr };
-    context->PSSetShaderResources(0, 4, nullSrvs);
+    ID3D11ShaderResourceView* nullSrvs[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
+    context->PSSetShaderResources(0, 5, nullSrvs);
     ID3D11RenderTargetView* nullRtv = nullptr;
     context->OMSetRenderTargets(1, &nullRtv, nullptr);
 
@@ -236,6 +257,7 @@ bool TaaPass::render(ID3D11DeviceContext* context,
 
     // Save the resolved output as the new history
     context->CopyResource(historyTexture_.Get(), destinationTexture);
+
     return true;
 }
 

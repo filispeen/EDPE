@@ -182,6 +182,10 @@ struct AmdUpscalerBackend::Impl {
     uint32_t outputHeight = 0;
     DXGI_FORMAT outputFormat = DXGI_FORMAT_UNKNOWN;
 
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> dilatedDepthTexture;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> dilatedMotionVectorsTexture;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> reconstructedPrevNearestDepthTexture;
+
     uint32_t maxRenderWidth = 0;
     uint32_t maxRenderHeight = 0;
     uint32_t maxOutputWidth = 0;
@@ -193,6 +197,62 @@ struct AmdUpscalerBackend::Impl {
     std::vector<uint8_t> scratchBuffer;
     FfxInterface ffxInterface{};
     FfxFsr3UpscalerContext fsrContext{};
+
+    static DXGI_FORMAT ffxFormatToDxgi(FfxSurfaceFormat fmt) {
+        switch (fmt) {
+        case FFX_SURFACE_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_TYPELESS;
+        case FFX_SURFACE_FORMAT_R32G32B32A32_UINT: return DXGI_FORMAT_R32G32B32A32_UINT;
+        case FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case FFX_SURFACE_FORMAT_R32G32_FLOAT: return DXGI_FORMAT_R32G32_FLOAT;
+        case FFX_SURFACE_FORMAT_R32_UINT: return DXGI_FORMAT_R32_UINT;
+        case FFX_SURFACE_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        case FFX_SURFACE_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case FFX_SURFACE_FORMAT_R8G8B8A8_SNORM: return DXGI_FORMAT_R8G8B8A8_SNORM;
+        case FFX_SURFACE_FORMAT_R8G8B8A8_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        case FFX_SURFACE_FORMAT_R11G11B10_FLOAT: return DXGI_FORMAT_R11G11B10_FLOAT;
+        case FFX_SURFACE_FORMAT_R16G16_FLOAT: return DXGI_FORMAT_R16G16_FLOAT;
+        case FFX_SURFACE_FORMAT_R16G16_UINT: return DXGI_FORMAT_R16G16_UINT;
+        case FFX_SURFACE_FORMAT_R16G16_SINT: return DXGI_FORMAT_R16G16_SINT;
+        case FFX_SURFACE_FORMAT_R16_FLOAT: return DXGI_FORMAT_R16_FLOAT;
+        case FFX_SURFACE_FORMAT_R16_UINT: return DXGI_FORMAT_R16_UINT;
+        case FFX_SURFACE_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+        case FFX_SURFACE_FORMAT_R16_SNORM: return DXGI_FORMAT_R16_SNORM;
+        case FFX_SURFACE_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
+        case FFX_SURFACE_FORMAT_R8_UINT: return DXGI_FORMAT_R8_UINT;
+        case FFX_SURFACE_FORMAT_R8G8_UNORM: return DXGI_FORMAT_R8G8_UNORM;
+        case FFX_SURFACE_FORMAT_R8G8_UINT: return DXGI_FORMAT_R8G8_UINT;
+        case FFX_SURFACE_FORMAT_R32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+        default: return DXGI_FORMAT_UNKNOWN;
+        }
+    }
+
+    static bool createSharedTexture(ID3D11Device* device,
+        const FfxCreateResourceDescription& createDesc,
+        DXGI_FORMAT fallbackFormat,
+        uint32_t fallbackW,
+        uint32_t fallbackH,
+        Microsoft::WRL::ComPtr<ID3D11Texture2D>* outTex) {
+        if (!device || !outTex) return false;
+        outTex->Reset();
+
+        const FfxResourceDescription& resDesc = createDesc.resourceDescription;
+        DXGI_FORMAT fmt = ffxFormatToDxgi(resDesc.format);
+        if (fmt == DXGI_FORMAT_UNKNOWN) fmt = fallbackFormat;
+
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = (resDesc.width > 0) ? resDesc.width : fallbackW;
+        td.Height = (resDesc.height > 0) ? resDesc.height : fallbackH;
+        td.MipLevels = (resDesc.mipCount > 0) ? resDesc.mipCount : 1;
+        td.ArraySize = 1;
+        td.Format = fmt;
+        td.SampleDesc.Count = 1;
+        td.SampleDesc.Quality = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+        return SUCCEEDED(device->CreateTexture2D(&td, nullptr, outTex->GetAddressOf()));
+    }
 
     static const wchar_t* getFfxErrorString(FfxErrorCode err) {
         switch (err) {
@@ -265,6 +325,9 @@ struct AmdUpscalerBackend::Impl {
 
     void destroyFsrContext() {
 #if defined(EDPE_ENABLE_FSR)
+        dilatedDepthTexture.Reset();
+        dilatedMotionVectorsTexture.Reset();
+        reconstructedPrevNearestDepthTexture.Reset();
         if (contextCreated) {
             ffxFsr3UpscalerContextDestroy(&fsrContext);
             contextCreated = false;
@@ -272,12 +335,14 @@ struct AmdUpscalerBackend::Impl {
 #endif
     }
 
-    bool ensureFsrContext(ID3D11Device* /*device*/, uint32_t renderW, uint32_t renderH,
+    bool ensureFsrContext(ID3D11Device* device, uint32_t renderW, uint32_t renderH,
                           uint32_t outputW, uint32_t outputH, bool isHdr) {
 #if defined(EDPE_ENABLE_FSR)
+        if (!device) return false;
         if (contextCreated && renderW <= maxRenderWidth && renderH <= maxRenderHeight &&
             outputW == maxOutputWidth && outputH == maxOutputHeight &&
-            currentIsHdr == isHdr) {
+            currentIsHdr == isHdr &&
+            dilatedDepthTexture && dilatedMotionVectorsTexture && reconstructedPrevNearestDepthTexture) {
             return true;
         }
 
@@ -291,10 +356,10 @@ struct AmdUpscalerBackend::Impl {
 
         FfxFsr3UpscalerContextDescription desc{};
         desc.flags = FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED |
-                     FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE |
-                     FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE;
+                     FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE;
         if (isHdr) {
-            desc.flags |= FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE;
+            desc.flags |= FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE |
+                          FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE;
         }
         desc.maxRenderSize.width = maxRenderWidth;
         desc.maxRenderSize.height = maxRenderHeight;
@@ -318,6 +383,28 @@ struct AmdUpscalerBackend::Impl {
             return false;
         }
         contextCreated = true;
+
+        // Allocate the three shared working surfaces required by FSR 3.1.2's dilate and reprojection passes.
+        // Without these textures, RegisterResourceDX11 maps null pointers to NULL resources and the dilate
+        // pass discards all motion vectors, causing reprojection to read (0, 0) every frame.
+        FfxFsr3UpscalerSharedResourceDescriptions sharedDescs{};
+        err = ffxFsr3UpscalerGetSharedResourceDescriptions(&fsrContext, &sharedDescs);
+        if (err != FFX_OK) {
+            swprintf_s(lastErrorReason, L"ffxFsr3UpscalerGetSharedResourceDescriptions failed (0x%08X: %ls)", static_cast<unsigned>(err), getFfxErrorString(err));
+            destroyFsrContext();
+            return false;
+        }
+
+        if (!createSharedTexture(device, sharedDescs.dilatedDepth, DXGI_FORMAT_R32_FLOAT, maxRenderWidth, maxRenderHeight, &dilatedDepthTexture) ||
+            !createSharedTexture(device, sharedDescs.dilatedMotionVectors, DXGI_FORMAT_R16G16_FLOAT, maxRenderWidth, maxRenderHeight, &dilatedMotionVectorsTexture) ||
+            !createSharedTexture(device, sharedDescs.reconstructedPrevNearestDepth, DXGI_FORMAT_R32_UINT, maxRenderWidth, maxRenderHeight, &reconstructedPrevNearestDepthTexture)) {
+            swprintf_s(lastErrorReason, L"Failed to create FSR 3.1 shared working textures");
+            EdpeLog(L"EDPE: Failed to create FSR 3.1 shared working textures");
+            destroyFsrContext();
+            return false;
+        }
+
+        resetRequested = true;
         return true;
 #else
         return false;
@@ -453,6 +540,14 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.motionVectors = ffxGetResourceDX11_Fsr31(inputs.motionVectors,
         GetFfxResourceDescriptionDX11(inputs.motionVectors), L"FSR3_MotionVectors", FFX_RESOURCE_STATE_COMPUTE_READ);
 
+    // Shared working surfaces required by FSR 3.1.2 dilate and reprojection passes
+    dispatchDesc.dilatedDepth = ffxGetResourceDX11_Fsr31(impl_->dilatedDepthTexture.Get(),
+        GetFfxResourceDescriptionDX11(impl_->dilatedDepthTexture.Get()), L"FSR3_DilatedDepth", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatchDesc.dilatedMotionVectors = ffxGetResourceDX11_Fsr31(impl_->dilatedMotionVectorsTexture.Get(),
+        GetFfxResourceDescriptionDX11(impl_->dilatedMotionVectorsTexture.Get()), L"FSR3_DilatedMotionVectors", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatchDesc.reconstructedPrevNearestDepth = ffxGetResourceDX11_Fsr31(impl_->reconstructedPrevNearestDepthTexture.Get(),
+        GetFfxResourceDescriptionDX11(impl_->reconstructedPrevNearestDepthTexture.Get()), L"FSR3_ReconstructedPrevNearestDepth", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+
     // Reactive mask removed: HUD and UI are composited via separate native layer.
 
     dispatchDesc.output = ffxGetResourceDX11_Fsr31(impl_->outputTexture.Get(),
@@ -478,10 +573,16 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.cameraFovAngleVertical = (inputs.cameraNow.scaleY > 0.0f)
         ? (2.0f * std::atan(1.0f / inputs.cameraNow.scaleY))
         : 1.0f;
-    dispatchDesc.cameraNear = (inputs.cameraNow.depthB > 0.0f)
+    const float nearPlane = (inputs.cameraNow.depthB > 0.0f)
         ? inputs.cameraNow.depthB
-        : 0.1f;
-    dispatchDesc.cameraFar = FLT_MAX;
+        : 0.025f;
+    if (params.depthInverted) {
+        dispatchDesc.cameraNear = FLT_MAX;
+        dispatchDesc.cameraFar = nearPlane;
+    } else {
+        dispatchDesc.cameraNear = nearPlane;
+        dispatchDesc.cameraFar = FLT_MAX;
+    }
     dispatchDesc.viewSpaceToMetersFactor = 1.0f;
 
     FfxErrorCode err;
@@ -587,7 +688,11 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.jitterY,
         inputs.reset,
         inputs.renderWidth,
-        inputs.renderHeight);
+        inputs.renderHeight,
+        inputs.prevJitterX,
+        inputs.prevJitterY,
+        inputs.cameraNow.depthB,
+        inputs.prevDepthSrv);
 }
 
 void TaaUpscalerBackend::resetHistory() {

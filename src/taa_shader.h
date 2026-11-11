@@ -3,20 +3,22 @@
 namespace edpe {
 
 // Temporal Anti-Aliasing (TAA) HLSL shader.
-// Implements subpixel Halton (2,3) de-jittering, cross-weighted 3x3 neighborhood
-// statistics in YCoCg, Brian Karis Ray-to-AABB color clipping, 5-tap Catmull-Rom
-// history reconstruction, cockpit interior stabilization, and velocity/UI confidence protection.
+// Implements subpixel Halton (2,3) de-jittering, 5-tap cross nearest-depth motion vector dilation,
+// 3x3 neighborhood statistics in YCoCg around the de-jittered sample, Brian Karis Ray-to-AABB
+// color clipping, 5-tap Catmull-Rom history reconstruction, and depth-based disocclusion rejection.
 inline constexpr char kTaaShader[] = R"(
 cbuffer TaaConstants : register(b0) {
     float4 resolution;       // x: outputWidth, y: outputHeight, z: 1/outputWidth, w: 1/outputHeight
     float4 renderResolution; // x: renderWidth, y: renderHeight, z: 1/renderWidth, w: 1/renderHeight
     float4 params;           // x: jitterX, y: jitterY, z: blendWeight, w: resetFlag
+    float4 jitterHistory;    // x: prevJitterX, y: prevJitterY, z: depthB, w: hasPrevDepth
 };
 
 Texture2D<float4> currentFrame  : register(t0);
 Texture2D<float4> historyFrame  : register(t1);
 Texture2D<float2> motionVectors : register(t2);
 Texture2D<float>  sceneDepth    : register(t3);
+Texture2D<float>  prevSceneDepth: register(t4);
 
 SamplerState linearSampler : register(s0);
 SamplerState pointSampler  : register(s1);
@@ -104,15 +106,14 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // The projection shifted geometry by +jitter in screen pixels.
     // To sample the feature that corresponds to the nominal unjittered pixel center, we sample at uv + jitterUv.
     float2 jitterUv = float2(params.x * renderResolution.z, params.y * renderResolution.w);
-    float2 centerUv = uv + jitterUv;
+    float2 centerUv = clamp(uv + jitterUv, 0.0, 1.0);
 
-    // Center sample evaluated with high-quality Catmull-Rom reconstruction at render resolution
-    float4 centerSample = SampleCatmullRom5(currentFrame, linearSampler, centerUv, renderResolution.xy, renderResolution.zw);
+    // Hardware bilinear sample at de-jittered center (clamped to 3x3 neighborhood box below)
+    float4 centerSample = currentFrame.SampleLevel(linearSampler, centerUv, 0);
     float3 current = max(centerSample.rgb, 0.0);
     float3 currentY = RGBToYCoCg(current);
 
-    // 2. 3x3 Neighborhood Statistics in YCoCg
-    // Plain 3x3 neighborhood prevents artificial AABB box narrowing and specular clipping shimmer.
+    // 2. 3x3 Neighborhood Statistics in YCoCg around centerUv
     float3 m1 = 0;
     float3 m2 = 0;
     float3 boxMin = float3(1e9, 1e9, 1e9);
@@ -122,7 +123,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     for (int y = -1; y <= 1; ++y) {
         [unroll]
         for (int x = -1; x <= 1; ++x) {
-            float2 sampleUv = uv + float2(x, y) * renderResolution.zw;
+            float2 sampleUv = centerUv + float2(x, y) * renderResolution.zw;
             float3 c = currentFrame.SampleLevel(pointSampler, sampleUv, 0).rgb;
             float3 cY = RGBToYCoCg(c);
 
@@ -134,39 +135,45 @@ float4 ps_main(VSOutput pin) : SV_Target {
         }
     }
 
+    // 5-tap cross/corner nearest-depth dilation (Reversed-Z: larger depth = closer to camera)
+    float centerDepth = sceneDepth.SampleLevel(pointSampler, uv, 0).r;
+    float nearestDepth = centerDepth;
+    float2 nearestUv = uv;
+
+    float2 d00 = uv + float2(-1.0, -1.0) * renderResolution.zw;
+    float2 d10 = uv + float2( 1.0, -1.0) * renderResolution.zw;
+    float2 d01 = uv + float2(-1.0,  1.0) * renderResolution.zw;
+    float2 d11 = uv + float2( 1.0,  1.0) * renderResolution.zw;
+
+    float z00 = sceneDepth.SampleLevel(pointSampler, d00, 0).r;
+    if (z00 > nearestDepth) { nearestDepth = z00; nearestUv = d00; }
+    float z10 = sceneDepth.SampleLevel(pointSampler, d10, 0).r;
+    if (z10 > nearestDepth) { nearestDepth = z10; nearestUv = d10; }
+    float z01 = sceneDepth.SampleLevel(pointSampler, d01, 0).r;
+    if (z01 > nearestDepth) { nearestDepth = z01; nearestUv = d01; }
+    float z11 = sceneDepth.SampleLevel(pointSampler, d11, 0).r;
+    if (z11 > nearestDepth) { nearestDepth = z11; nearestUv = d11; }
+
     currentY = clamp(currentY, boxMin, boxMax);
     current = YCoCgToRGB(currentY);
 
-    float3 mean = m1 / 9.0;
-    float3 sigma = sqrt(max(0.0, m2 / 9.0 - mean * mean));
+    float3 mean = m1 * (1.0 / 9.0);
+    float3 sigma = sqrt(max(0.0, m2 * (1.0 / 9.0) - mean * mean));
 
-    // 3. Motion vector and depth evaluation
-    float rawDepth = sceneDepth.SampleLevel(pointSampler, uv, 0).r;
-    float2 mvPixels = motionVectors.SampleLevel(pointSampler, uv, 0).xy;
-
-    // In Elite Dangerous reversed-Z depth:
-    // depth = depthB / viewZ, where depthB is ~0.025.
-    // If rawDepth >= 0.00714 (viewZ <= 3.5 meters), the pixel belongs to the ship cockpit interior!
-    // The cockpit and ship HUD are rigidly mounted around the camera: they do not rotate on screen.
-    // Forcing mvPixels = 0 for the cockpit completely prevents cockpit and ship UI smearing!
-    bool isCockpit = (rawDepth >= 0.00714);
-    if (isCockpit) {
-        mvPixels = float2(0.0, 0.0);
-    }
+    // 3. Dilated motion vector evaluation (motionVectors already exclude jitter and handle cockpit depth validation)
+    float2 mvPixels = motionVectors.SampleLevel(pointSampler, nearestUv, 0).xy;
     float speed = length(mvPixels);
 
     // Dynamic variance box scale:
-    // When stationary (speed near 0), gamma = 2.25 allows subpixel Halton jitter phases
-    // to accumulate cleanly into temporal history without clipping fine station geometry or stars.
-    // When moving, gamma smoothly tightens to 1.5 to aggressively prevent ghosting.
-    float gamma = lerp(2.25, 1.5, saturate(speed * 0.25));
+    // Tightens under camera rotation/movement so stale foreground colors at geometry silhouettes
+    // cannot linger inside a wide neighborhood box and stretch geometry along the motion direction.
+    float gamma = lerp(1.75, 0.85, saturate(speed * 0.35));
     float3 varMin = mean - gamma * sigma;
     float3 varMax = mean + gamma * sigma;
 
     float3 finalMin = max(boxMin, varMin);
-    // For high-luminance specular highlights/lamps, widen varMax towards boxMax when stationary
-    // to prevent subpixel Karis clipping shimmer across frame phases:
-    float3 finalMax = min(boxMax, max(varMax, boxMax * (1.0 - saturate(speed * 0.5))));
+    float stationaryBoost = saturate(1.0 - speed * 2.0);
+    float3 finalMax = min(boxMax, lerp(varMax, boxMax, stationaryBoost * 0.5));
 
     float2 priorUv = uv + mvPixels * renderResolution.zw;
     bool isOffscreen = (priorUv.x < 0.0 || priorUv.x > 1.0 || priorUv.y < 0.0 || priorUv.y > 1.0);
@@ -180,29 +187,37 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float4 histSample = SampleCatmullRom5(historyFrame, linearSampler, priorUv, resolution.xy, resolution.zw);
     float3 histY = RGBToYCoCg(histSample.rgb);
 
-    // 5. Brian Karis Ray-to-AABB Clipping
-    // Clips along the ray from history towards currentY, preserving chromaticity and eliminating pulsing!
+    // 5. Fast disocclusion check against previous frame depth buffer
+    float depthConfidence = 1.0;
+    if (jitterHistory.w > 0.5 && speed > 0.5 && centerDepth > 0.0) {
+        float2 prevJitterUv = jitterHistory.xy * renderResolution.zw;
+        float pd = prevSceneDepth.SampleLevel(pointSampler, priorUv + prevJitterUv, 0).r;
+        if (pd > max(centerDepth * 1.06, centerDepth + 0.0003)) {
+            depthConfidence = 0.0;
+        } else {
+            float relDiff = abs(pd - centerDepth) / max(centerDepth, 1e-6);
+            if (relDiff > 0.06) {
+                depthConfidence = saturate(1.0 - (relDiff - 0.06) * 8.0);
+            }
+        }
+    }
+
+    // 6. Brian Karis Ray-to-AABB Clipping
     float3 clampedHistY = ClipToAABB(histY, currentY, finalMin, finalMax);
 
-    // 6. Velocity / Disocclusion / UI Confidence
-    // If the reprojected history differed drastically from the current neighborhood
-    // (e.g. holographic UI drawn over moving space, or an occluded edge),
-    // clampDistance is large. Scale history confidence smoothly when moving.
-    // When stationary (speed near 0), preserve full history confidence so subpixel
-    // jitter integrates specular highlights, stars and lamps without flickering!
+    // 7. Velocity / Disocclusion / UI Confidence
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
-    float speedFactor = saturate(speed * 0.25);
-    float historyConfidence = lerp(1.0, 1.0 / (1.0 + clampDistance * 4.0), speedFactor);
+    float speedFactor = saturate(speed * 0.35);
+    float historyConfidence = lerp(1.0, 1.0 / (1.0 + clampDistance * 6.0), speedFactor) * depthConfidence;
 
     // Base blend weight: 0.90 for static/smooth, lower when high speed
     float blendWeight = clamp(params.z, 0.0, 0.95);
-    blendWeight = lerp(blendWeight, 0.70, saturate(speed * 0.05));
+    blendWeight = lerp(blendWeight, 0.65, saturate(speed * 0.08));
 
     // Dynamic blend weight
     float dynamicBlend = blendWeight * historyConfidence;
 
-    // 7. Karis luma weighting during accumulation
-    // Suppresses high-contrast specular pulsing on stars and glowing lights
+    // 8. Karis luma weighting during accumulation
     float lumaCurrent = currentY.x;
     float lumaHistory = clampedHistY.x;
     float wCurrent = 1.0 / (1.0 + max(0.0, lumaCurrent));

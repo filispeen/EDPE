@@ -12,14 +12,24 @@ class MotionPass {
 public:
     bool initialize(ID3D11Device* device, ID3D11DeviceContext* context);
     bool render(ID3D11ShaderResourceView* depth, const CameraProjection& now,
-        const CameraProjection& previous, UINT width, UINT height);
+        const CameraProjection& previous, UINT width, UINT height,
+        float jitterX = 0.0f, float jitterY = 0.0f,
+        float prevJitterX = 0.0f, float prevJitterY = 0.0f,
+        bool reset = false,
+        ID3D11ShaderResourceView* prevDepth = nullptr);
     bool renderGpuCameras(ID3D11ShaderResourceView* depth, ID3D11Buffer* now,
-        ID3D11Buffer* previous, UINT width, UINT height);
+        ID3D11Buffer* previous, UINT width, UINT height,
+        float jitterX = 0.0f, float jitterY = 0.0f,
+        float prevJitterX = 0.0f, float prevJitterY = 0.0f,
+        bool reset = false,
+        ID3D11ShaderResourceView* prevDepth = nullptr);
     ID3D11ShaderResourceView* output() const { return output_srv_.Get(); }
     void clear(ID3D11DeviceContext* context);
 
 private:
-    bool renderInternal(ID3D11ShaderResourceView* depth, const float (&values)[32],
+    bool renderInternal(ID3D11ShaderResourceView* depth,
+        ID3D11ShaderResourceView* prevDepth,
+        const float (&values)[36],
         ID3D11Buffer* now, ID3D11Buffer* previous, UINT width, UINT height);
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context_;

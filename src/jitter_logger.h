@@ -40,6 +40,17 @@ public:
     void setLoggingEnabled(bool enabled);
     bool isLoggingEnabled() const;
 
+    // Controls how often frames are sampled into jitter.log (1 = every frame, N = every Nth frame)
+    void setSampleInterval(uint32_t everyNFrames);
+    uint32_t getSampleInterval() const;
+
+    // Controls how often the background thread flushes buffered entries to disk (ms)
+    void setFlushIntervalMs(uint32_t intervalMs);
+    uint32_t getFlushIntervalMs() const;
+
+    // Fast lock-free check before building JitterFrameLog on the Present thread
+    bool shouldSampleFrame(unsigned long long frame, bool forceOnAnomaly = false) const;
+
     // Fast push called on Present thread (< 20ns, never blocks on disk I/O)
     void pushFrame(const JitterFrameLog& log);
 
@@ -64,6 +75,7 @@ private:
     JitterLogger();
     ~JitterLogger();
 
+    void ensureWorkerStarted();
     void workerThreadLoop();
     std::wstring getLogFilePath() const;
 
@@ -72,7 +84,9 @@ private:
     std::atomic<uint32_t> writeIdx_{0};
     std::atomic<uint32_t> readIdx_{0};
     std::atomic<uint32_t> writtenRows_{0};
-    std::atomic<bool> enabled_{true};
+    std::atomic<bool> enabled_{false};
+    std::atomic<uint32_t> sampleInterval_{10};
+    std::atomic<uint32_t> flushIntervalMs_{1000};
     std::atomic<bool> running_{true};
     std::atomic<bool> flushRequested_{false};
 
@@ -89,7 +103,9 @@ private:
     std::mutex latestMutex_;
     JitterFrameLog latest_{};
 
-    // Asynchronous background writer
+    // Asynchronous background writer (started lazily only when DEV=1 and logging is enabled)
+    std::mutex workerStartMutex_;
+    bool workerStarted_{false};
     std::thread workerThread_;
     std::mutex cvMutex_;
     std::condition_variable cv_;

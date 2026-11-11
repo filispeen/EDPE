@@ -219,6 +219,11 @@ static std::atomic<ID3D11DeviceContext*> s_last_warned_scene_ctx{nullptr};
 
 PerContextData* getOrCreateContextData(ID3D11DeviceContext* context) {
     if (!context) return nullptr;
+    const size_t fastCount = s_tracked_context_count.load(std::memory_order_acquire);
+    if (fastCount == 1 && context == observed_context.load(std::memory_order_relaxed) &&
+        s_tracked_contexts[0] && s_tracked_contexts[0]->context == context) {
+        return s_tracked_contexts[0].get();
+    }
     ID3D11Device* curDevice = nullptr;
     context->GetDevice(&curDevice);
     if (curDevice) curDevice->Release();
@@ -446,6 +451,8 @@ static unsigned long long s_jitter_injected_frame = ~0ull;
 static std::atomic<unsigned long long> s_jitter_standdown_until{0};
 static unsigned long long s_jitter_standdown_len = 60;
 static edpe::ProjectionJitter s_last_rendered_jitter{};
+static float s_prev_eval_jitter_x = 0.0f;
+static float s_prev_eval_jitter_y = 0.0f;
 
 inline bool isSceneCameraAspect(float scaleX, float scaleY, UINT width, UINT height) {
     if (scaleX <= 0.0f || scaleY <= 0.0f) return false;
@@ -655,6 +662,9 @@ std::atomic<ID3D11Resource*> s_swapchain_backbuffer{nullptr};
 unsigned long long motion_depth_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_depth;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_view;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> s_motion_prev_depth;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_motion_prev_depth_view;
+bool s_has_motion_prev_depth = false;
 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> motion_color_source;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_view;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_color_snapshot;
@@ -1074,18 +1084,91 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
 void renderHudDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void rearmContextHooks();
 
+static ID3D11RenderTargetView* s_cached_hdr_rtv0 = nullptr;
+
+struct CachedShaderHashEntry {
+    const void* shader = nullptr;
+    std::uint64_t hash = 0;
+};
+static constexpr size_t kShaderHashCacheSize = 512;
+static CachedShaderHashEntry s_vs_hash_cache[kShaderHashCacheSize]{};
+static CachedShaderHashEntry s_ps_hash_cache[kShaderHashCacheSize]{};
+static inline std::uint64_t lookupOrFetchShaderHash(ID3D11DeviceChild* shader,
+    CachedShaderHashEntry (&cache)[kShaderHashCacheSize]) {
+    if (!shader) return 0;
+    const size_t slot = (reinterpret_cast<uintptr_t>(shader) >> 4) & (kShaderHashCacheSize - 1);
+    if (cache[slot].shader == shader && cache[slot].hash != 0) {
+        return cache[slot].hash;
+    }
+    std::uint64_t hash = 0;
+    UINT sz = sizeof(hash);
+    if (SUCCEEDED(shader->GetPrivateData(kEdpeShaderHashGuid, &sz, &hash)) && sz == sizeof(hash) && hash != 0) {
+        cache[slot].shader = shader;
+        cache[slot].hash = hash;
+        return hash;
+    }
+    return 0;
+}
+
+static inline bool getFastBoundShaderHashes(ID3D11DeviceContext* context,
+    std::uint64_t& outVsHash, std::uint64_t& outPsHash) {
+    if (motion_pair_active) {
+        Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
+        Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
+        context->VSGetShader(&vs, nullptr, nullptr);
+        context->PSGetShader(&ps, nullptr, nullptr);
+        outVsHash = 0;
+        outPsHash = 0;
+        if (!vs || !ps) return false;
+        UINT sz = sizeof(outVsHash);
+        if (FAILED(vs->GetPrivateData(kEdpeShaderHashGuid, &sz, &outVsHash)) || sz != sizeof(outVsHash)) return false;
+        sz = sizeof(outPsHash);
+        if (FAILED(ps->GetPrivateData(kEdpeShaderHashGuid, &sz, &outPsHash)) || sz != sizeof(outPsHash)) return false;
+        return true;
+    }
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+    context->VSGetShader(&vs, nullptr, nullptr);
+    context->PSGetShader(&ps, nullptr, nullptr);
+    outVsHash = lookupOrFetchShaderHash(vs, s_vs_hash_cache);
+    outPsHash = lookupOrFetchShaderHash(ps, s_ps_hash_cache);
+    if (vs) vs->Release();
+    if (ps) ps->Release();
+    return outVsHash != 0 && outPsHash != 0;
+}
+
 bool sameRenderTargetResource(ID3D11RenderTargetView* view,
     ID3D11RenderTargetView* source) {
     if (!view || !source) return false;
     if (view == source) return true;
-    Microsoft::WRL::ComPtr<ID3D11Resource> a, b;
+    if (source == motion_color_source.Get() && view == s_cached_hdr_rtv0) return true;
+    ID3D11Resource* a = nullptr;
     view->GetResource(&a);
+    if (!a) return false;
+    if (source == motion_color_source.Get() && scene_hdr_color_source) {
+        const bool match = (a == static_cast<ID3D11Resource*>(scene_hdr_color_source.Get()));
+        a->Release();
+        if (match) s_cached_hdr_rtv0 = view;
+        return match;
+    }
+    ID3D11Resource* b = nullptr;
     source->GetResource(&b);
-    if (!a || !b) return false;
-    if (a.Get() == b.Get()) return true;
+    if (!b) {
+        a->Release();
+        return false;
+    }
+    if (a == b) {
+        b->Release();
+        a->Release();
+        return true;
+    }
     Microsoft::WRL::ComPtr<IUnknown> identity_a, identity_b;
-    return SUCCEEDED(a.As(&identity_a)) && SUCCEEDED(b.As(&identity_b)) &&
-        identity_a.Get() == identity_b.Get();
+    const bool match = SUCCEEDED(a->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void**>(identity_a.GetAddressOf()))) &&
+                       SUCCEEDED(b->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void**>(identity_b.GetAddressOf()))) &&
+                       identity_a.Get() == identity_b.Get();
+    b->Release();
+    a->Release();
+    return match;
 }
 
 // Diagnostic glass-state gate. Only a one-shot diagnostic
@@ -1260,10 +1343,8 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
     // - 0x71DD8B8B09060A81 / 0x2D037A047171BF3B (world-space brackets)
     // - 0xB018D143700AB803 / 0x258B95AC99520C1F (null-output depth/stencil quad)
     // - 0x4EF6DDB075A927FA (main menu hangar / loading screen quad)
-    // Note: VS 0x2CECEC3065EF0D4A (stencil setup A4D03619, frosted label backing 5F5FA64F behind INFO /
-    // STARPORT SERVICES, and radar disc 1E87C9BF) is intentionally left in the HDR scene target (Tex#6888)
-    // so it blends in pre-tonemap linear HDR with the game stencil buffer instead of darkening post-tonemap LDR lights.
     if (vs_hash == 0x81216C77F90DEDD6ull || // Cockpit holo panels (stock lit A2965EC2, EDHM 16F88966, unlit B4786E0A, text 41B9D7B2, backing 329ACCE7/925ACEDA, icons B357E4E5, radar sweep C610FB6F, AB82734F)
+        vs_hash == 0x2CECEC3065EF0D4Aull || // Cockpit HUD stencil setup (A4D03619), frosted HUD panel backing (5F5FA64F), and radar disc backing (1E87C9BF)
         vs_hash == 0x1989E6D3B405FDE0ull || // Cockpit holo panels (DisableGuiEffects variant PS EAB8A1C95A13FFBE)
         vs_hash == 0x925ACEDA0153AA5Bull || // Planetary / Orbital Cruise shadowless holo panels (kUiVsHoloNoShadow)
         vs_hash == 0xB7790CBFC6554097ull || // Flight HUD vector lines, altimeter ladder & pitch ladder (PS 8DEF46452FA459F5 / EDHM B1CA8D8EEF7C886D)
@@ -1953,10 +2034,8 @@ ID3D11DepthStencilView* ensureSeededHudDepthStencil(
         return nullptr;
     }
 
-    // Fast path (Native Resolution / DLAA): direct 1:1 hardware copy of depth + stencil planes.
-    if (dDesc.Width == s_hud_mask_width && dDesc.Height == s_hud_mask_height &&
-        (dDesc.Format == s_hud_depth_stencil_tex_fmt ||
-         dDesc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) {
+    // Fast path (Native Resolution / DLAA / TAA): 1:1 GPU copy of depth and all 8 stencil bits once per frame.
+    if (dDesc.Width == s_hud_mask_width && dDesc.Height == s_hud_mask_height) {
         context->CopyResource(s_hud_depth_stencil_texture.Get(), depthTex.Get());
         s_hud_depth_stencil_seeded = true;
         s_hud_depth_only_seeded = true;
@@ -2156,91 +2235,6 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     UINT original_stencil_ref = 0;
     context->OMGetDepthStencilState(original_ds.GetAddressOf(), &original_stencil_ref);
 
-    ID3D11BlendState* blend_to_use = s_hud_mask_blend_add.Get();
-    if (!original_blend) {
-        blend_to_use = s_hud_mask_blend_opaque.Get();
-    } else {
-        D3D11_BLEND_DESC origBlendDesc{};
-        original_blend->GetDesc(&origBlendDesc);
-        const auto& rt0 = origBlendDesc.RenderTarget[0];
-        if (rt0.RenderTargetWriteMask == 0) {
-            // Stencil-only setup draw: execute on game's depth-stencil target, then force
-            // CContext::AbandonAmortized via set_targets + rearmHudDrawProbe so d3d11.dll
-            // never overwrites our Draw* vtable hooks on the next state change.
-            switch (kind) {
-            case 'X':
-                if (auto* fn = original_draw_indexed_instanced.load(std::memory_order_acquire))
-                    fn(context, count, instance_count, start_index_or_vertex, base_vertex, start_instance);
-                break;
-            case 'I':
-                if (auto* fn = original_draw_indexed.load(std::memory_order_acquire))
-                    fn(context, count, start_index_or_vertex, base_vertex);
-                break;
-            case 'N':
-                if (auto* fn = original_draw_instanced.load(std::memory_order_acquire))
-                    fn(context, count, instance_count, start_index_or_vertex, start_instance);
-                break;
-            case 'D':
-                if (auto* fn = original_draw.load(std::memory_order_acquire))
-                    fn(context, count, start_index_or_vertex);
-                break;
-            }
-            if (s_hud_depth_stencil_seeded && s_hud_depth_stencil_dsv &&
-                s_observed_scene_width.load(std::memory_order_relaxed) == s_hud_mask_width &&
-                s_observed_scene_height.load(std::memory_order_relaxed) == s_hud_mask_height) {
-                set_targets(context, 0, nullptr, s_hud_depth_stencil_dsv.Get());
-                switch (kind) {
-                case 'X':
-                    if (auto* fn = original_draw_indexed_instanced.load(std::memory_order_acquire))
-                        fn(context, count, instance_count, start_index_or_vertex, base_vertex, start_instance);
-                    break;
-                case 'I':
-                    if (auto* fn = original_draw_indexed.load(std::memory_order_acquire))
-                        fn(context, count, start_index_or_vertex, base_vertex);
-                    break;
-                case 'N':
-                    if (auto* fn = original_draw_instanced.load(std::memory_order_acquire))
-                        fn(context, count, instance_count, start_index_or_vertex, start_instance);
-                    break;
-                case 'D':
-                    if (auto* fn = original_draw.load(std::memory_order_acquire))
-                        fn(context, count, start_index_or_vertex);
-                    break;
-                }
-            } else {
-                s_hud_depth_stencil_seeded = false;
-            }
-            set_targets(context, 1, orig_rtvs, depth.Get());
-            if (orig_rtvs[0]) orig_rtvs[0]->Release();
-            if (auto* stat = findOrAddHudPairStat(s_current_hud_vs_hash, s_current_hud_ps_hash)) {
-                ++stat->stencil_only;
-            }
-            abandonAmortizedAndRearmHudProbe(context);
-            return true;
-        }
-
-        if (!rt0.BlendEnable) {
-            blend_to_use = s_hud_mask_blend_opaque.Get();
-        } else if (rt0.SrcBlend == D3D11_BLEND_ZERO) {
-            // Multiplicative darkening / backing quad
-            blend_to_use = s_hud_mask_blend_darken.Get();
-        } else if (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA) {
-            blend_to_use = s_hud_mask_blend_premul.Get();
-        } else if ((rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA || rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA_SAT) &&
-                   (rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA || rt0.DestBlend == D3D11_BLEND_INV_SRC_COLOR)) {
-            blend_to_use = s_hud_mask_blend_alpha.Get();
-        } else if ((rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA || rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA_SAT) &&
-                   rt0.DestBlend == D3D11_BLEND_ONE) {
-            // Scaled additive (Flight HUD B7790CBF/8DEF4645, HUD text 81216C77/41B9D7B2, sweep lines C610FB6F):
-            // S.a carries glyph/line coverage while S.rgb is solid color. Must use SRC_ALPHA, ONE!
-            blend_to_use = s_hud_mask_blend_scaled_add ? s_hud_mask_blend_scaled_add.Get() : s_hud_mask_blend_add.Get();
-        } else if (rt0.DestBlend == D3D11_BLEND_ONE) {
-            blend_to_use = s_hud_mask_blend_add.Get();
-        } else {
-            blend_to_use = s_hud_mask_blend_alpha.Get();
-        }
-    }
-
     bool orig_depth_enable = true;
     bool orig_stencil_enable = false;
     bool orig_depth_readonly = false;
@@ -2294,21 +2288,13 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
 
     UINT numViewports = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     D3D11_VIEWPORT origViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    D3D11_VIEWPORT hudViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
     UINT numScissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     D3D11_RECT origScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-    if (needVpScale) {
-        context->RSGetViewports(&numViewports, origViewports);
-        context->RSGetScissorRects(&numScissors, origScissors);
+    D3D11_RECT hudScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    auto applyScaledVpAndScissor = [&]() {
+        if (!needVpScale) return;
         if (numViewports > 0) {
-            D3D11_VIEWPORT hudViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-            for (UINT i = 0; i < numViewports; ++i) {
-                hudViewports[i].TopLeftX = origViewports[i].TopLeftX * scaleX;
-                hudViewports[i].TopLeftY = origViewports[i].TopLeftY * scaleY;
-                hudViewports[i].Width = origViewports[i].Width * scaleX;
-                hudViewports[i].Height = origViewports[i].Height * scaleY;
-                hudViewports[i].MinDepth = origViewports[i].MinDepth;
-                hudViewports[i].MaxDepth = origViewports[i].MaxDepth;
-            }
             context->RSSetViewports(numViewports, hudViewports);
         } else {
             D3D11_VIEWPORT hudViewport{};
@@ -2321,16 +2307,34 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
             context->RSSetViewports(1, &hudViewport);
         }
         if (numScissors > 0) {
-            D3D11_RECT hudScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-            const LONG maxW = static_cast<LONG>(s_hud_mask_width);
-            const LONG maxH = static_cast<LONG>(s_hud_mask_height);
-            for (UINT i = 0; i < numScissors; ++i) {
-                hudScissors[i].left = std::clamp(static_cast<LONG>(std::lround(origScissors[i].left * scaleX)), 0L, maxW);
-                hudScissors[i].top = std::clamp(static_cast<LONG>(std::lround(origScissors[i].top * scaleY)), 0L, maxH);
-                hudScissors[i].right = std::clamp(static_cast<LONG>(std::lround(origScissors[i].right * scaleX)), 0L, maxW);
-                hudScissors[i].bottom = std::clamp(static_cast<LONG>(std::lround(origScissors[i].bottom * scaleY)), 0L, maxH);
-            }
             context->RSSetScissorRects(numScissors, hudScissors);
+        }
+    };
+    auto restoreOrigVpAndScissor = [&]() {
+        if (!needVpScale) return;
+        context->RSSetViewports(numViewports, origViewports);
+        if (numScissors > 0) {
+            context->RSSetScissorRects(numScissors, origScissors);
+        }
+    };
+    if (needVpScale) {
+        context->RSGetViewports(&numViewports, origViewports);
+        context->RSGetScissorRects(&numScissors, origScissors);
+        for (UINT i = 0; i < numViewports; ++i) {
+            hudViewports[i].TopLeftX = origViewports[i].TopLeftX * scaleX;
+            hudViewports[i].TopLeftY = origViewports[i].TopLeftY * scaleY;
+            hudViewports[i].Width = origViewports[i].Width * scaleX;
+            hudViewports[i].Height = origViewports[i].Height * scaleY;
+            hudViewports[i].MinDepth = origViewports[i].MinDepth;
+            hudViewports[i].MaxDepth = origViewports[i].MaxDepth;
+        }
+        const LONG maxW = static_cast<LONG>(s_hud_mask_width);
+        const LONG maxH = static_cast<LONG>(s_hud_mask_height);
+        for (UINT i = 0; i < numScissors; ++i) {
+            hudScissors[i].left = std::clamp(static_cast<LONG>(std::lround(origScissors[i].left * scaleX)), 0L, maxW);
+            hudScissors[i].top = std::clamp(static_cast<LONG>(std::lround(origScissors[i].top * scaleY)), 0L, maxH);
+            hudScissors[i].right = std::clamp(static_cast<LONG>(std::lround(origScissors[i].right * scaleX)), 0L, maxW);
+            hudScissors[i].bottom = std::clamp(static_cast<LONG>(std::lround(origScissors[i].bottom * scaleY)), 0L, maxH);
         }
     }
 
@@ -2345,7 +2349,7 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     bool cb1_substituted = false;
     bool ps_cb1_substituted = false;
     bool ps_srv1_substituted = false;
-    if (s_preserve_native_ui.load(std::memory_order_relaxed) &&
+    if (s_hud_mask_active_pass &&
         s_has_clean_cb1_data && s_clean_camera_frame == motion_color_frame) {
         context->VSGetConstantBuffers(1, 1, orig_cb1.GetAddressOf());
         if (orig_cb1) {
@@ -2400,30 +2404,6 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
             }
         }
     }
-    if (isHoloBillboard && s_far_linear_depth_srv) {
-        if (s_far_linear_depth_rtv && !s_far_linear_depth_cleared) {
-            const float farDepth[4] = {10000.0f, 10000.0f, 10000.0f, 10000.0f};
-            context->ClearRenderTargetView(s_far_linear_depth_rtv.Get(), farDepth);
-            s_far_linear_depth_cleared = true;
-        }
-        context->PSGetShaderResources(1, 1, orig_ps_srv1.GetAddressOf());
-        ID3D11ShaderResourceView* farSrv = s_far_linear_depth_srv.Get();
-        context->PSSetShaderResources(1, 1, &farSrv);
-        ps_srv1_substituted = true;
-    }
-
-    ID3D11RenderTargetView* mask = s_hud_mask_rtv.Get();
-    set_targets(context, 1, &mask, depth_to_bind);
-    const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    context->OMSetBlendState(blend_to_use, blend_factor, 0xFFFFFFFF);
-    if (depth_to_bind) {
-        ID3D11DepthStencilState* roDs = getHudReadOnlyDepthState(
-            context, original_ds.Get(), origDsDesc, false);
-        context->OMSetDepthStencilState(roDs, original_stencil_ref);
-    } else if (s_hud_mask_ds_state_no_depth) {
-        context->OMSetDepthStencilState(s_hud_mask_ds_state_no_depth.Get(), 0);
-    }
-    rearmHudDrawProbe(context);
 
     auto issueDraw = [&]() {
         switch (kind) {
@@ -2450,6 +2430,103 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         }
     };
 
+    auto restoreSubstitutedBindings = [&]() {
+        if (ps_srv1_substituted) {
+            ID3D11ShaderResourceView* restore_srv1 = orig_ps_srv1.Get();
+            context->PSSetShaderResources(1, 1, &restore_srv1);
+        }
+        if (ps_cb1_substituted) {
+            ID3D11Buffer* restore_ps_buf = orig_ps_cb1.Get();
+            context->PSSetConstantBuffers(1, 1, &restore_ps_buf);
+        }
+        if (cb1_substituted) {
+            ID3D11Buffer* restore_buf = orig_cb1.Get();
+            if (auto* vs_set = original_vs_set_buffers.load(std::memory_order_acquire)) {
+                vs_set(context, 1, 1, &restore_buf);
+            } else {
+                context->VSSetConstantBuffers(1, 1, &restore_buf);
+            }
+        }
+    };
+
+    ID3D11BlendState* blend_to_use = s_hud_mask_blend_add.Get();
+    if (!original_blend) {
+        blend_to_use = s_hud_mask_blend_opaque.Get();
+    } else {
+        D3D11_BLEND_DESC origBlendDesc{};
+        original_blend->GetDesc(&origBlendDesc);
+        const auto& rt0 = origBlendDesc.RenderTarget[0];
+        if (rt0.RenderTargetWriteMask == 0) {
+            // Stencil-only setup draw (e.g. VS 2CECEC3065EF0D4A / PS A4D03619D631B186):
+            // execute with unjittered camera CB1 on both the game's depth-stencil target and
+            // s_hud_depth_stencil_dsv so stencil mask 0x04 aligns with unjittered HUD panels.
+            issueDraw();
+            if (s_hud_depth_stencil_seeded && s_hud_depth_stencil_dsv) {
+                applyScaledVpAndScissor();
+                set_targets(context, 0, nullptr, s_hud_depth_stencil_dsv.Get());
+                issueDraw();
+                restoreOrigVpAndScissor();
+            }
+            restoreSubstitutedBindings();
+            set_targets(context, 1, orig_rtvs, depth.Get());
+            if (orig_rtvs[0]) orig_rtvs[0]->Release();
+            if (auto* stat = findOrAddHudPairStat(s_current_hud_vs_hash, s_current_hud_ps_hash)) {
+                ++stat->stencil_only;
+                if (cb1_substituted) ++stat->cb1_substituted;
+            }
+            abandonAmortizedAndRearmHudProbe(context);
+            return true;
+        }
+
+        if (!rt0.BlendEnable) {
+            blend_to_use = s_hud_mask_blend_opaque.Get();
+        } else if (rt0.SrcBlend == D3D11_BLEND_ZERO) {
+            // Multiplicative darkening / backing quad
+            blend_to_use = s_hud_mask_blend_darken.Get();
+        } else if (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA) {
+            blend_to_use = s_hud_mask_blend_premul.Get();
+        } else if ((rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA || rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA_SAT) &&
+                   (rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA || rt0.DestBlend == D3D11_BLEND_INV_SRC_COLOR)) {
+            blend_to_use = s_hud_mask_blend_alpha.Get();
+        } else if ((rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA || rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA_SAT) &&
+                   rt0.DestBlend == D3D11_BLEND_ONE) {
+            // Scaled additive (Flight HUD B7790CBF/8DEF4645, HUD text 81216C77/41B9D7B2, sweep lines C610FB6F):
+            // S.a carries glyph/line coverage while S.rgb is solid color. Must use SRC_ALPHA, ONE!
+            blend_to_use = s_hud_mask_blend_scaled_add ? s_hud_mask_blend_scaled_add.Get() : s_hud_mask_blend_add.Get();
+        } else if (rt0.DestBlend == D3D11_BLEND_ONE) {
+            blend_to_use = s_hud_mask_blend_add.Get();
+        } else {
+            blend_to_use = s_hud_mask_blend_alpha.Get();
+        }
+    }
+
+    applyScaledVpAndScissor();
+
+    if (isHoloBillboard && s_far_linear_depth_srv) {
+        if (s_far_linear_depth_rtv && !s_far_linear_depth_cleared) {
+            const float farDepth[4] = {10000.0f, 10000.0f, 10000.0f, 10000.0f};
+            context->ClearRenderTargetView(s_far_linear_depth_rtv.Get(), farDepth);
+            s_far_linear_depth_cleared = true;
+        }
+        context->PSGetShaderResources(1, 1, orig_ps_srv1.GetAddressOf());
+        ID3D11ShaderResourceView* farSrv = s_far_linear_depth_srv.Get();
+        context->PSSetShaderResources(1, 1, &farSrv);
+        ps_srv1_substituted = true;
+    }
+
+    ID3D11RenderTargetView* mask = s_hud_mask_rtv.Get();
+    set_targets(context, 1, &mask, depth_to_bind);
+    const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    context->OMSetBlendState(blend_to_use, blend_factor, 0xFFFFFFFF);
+    if (depth_to_bind) {
+        ID3D11DepthStencilState* roDs = getHudReadOnlyDepthState(
+            context, original_ds.Get(), origDsDesc, false);
+        context->OMSetDepthStencilState(roDs, original_stencil_ref);
+    } else if (s_hud_mask_ds_state_no_depth) {
+        context->OMSetDepthStencilState(s_hud_mask_ds_state_no_depth.Get(), 0);
+    }
+    rearmHudDrawProbe(context);
+
     issueDraw();
     rearmHudDrawProbe(context);
     ++s_hud_draws_replayed_frame;
@@ -2459,39 +2536,18 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         if (cb1_substituted) ++stat->cb1_substituted;
     }
 
-    if (ps_srv1_substituted) {
-        ID3D11ShaderResourceView* restore_srv1 = orig_ps_srv1.Get();
-        context->PSSetShaderResources(1, 1, &restore_srv1);
-    }
-    if (ps_cb1_substituted) {
-        ID3D11Buffer* restore_ps_buf = orig_ps_cb1.Get();
-        context->PSSetConstantBuffers(1, 1, &restore_ps_buf);
-    }
-    if (cb1_substituted) {
-        ID3D11Buffer* restore_buf = orig_cb1.Get();
-        if (auto* vs_set = original_vs_set_buffers.load(std::memory_order_acquire)) {
-            vs_set(context, 1, 1, &restore_buf);
-        } else {
-            context->VSSetConstantBuffers(1, 1, &restore_buf);
-        }
-    }
-
-    if (needVpScale) {
-        context->RSSetViewports(numViewports, origViewports);
-        if (numScissors > 0) {
-            context->RSSetScissorRects(numScissors, origScissors);
-        }
-    }
+    restoreOrigVpAndScissor();
     context->OMSetDepthStencilState(original_ds.Get(), original_stencil_ref);
     set_targets(context, 1, orig_rtvs, depth.Get());
     // When a redirected HUD panel draw also writes stencil (e.g., 0x04 stencil mask),
-    // replay a colourless stencil write-back onto the game's scene DSV.
-    if (orig_writes_stencil && depth && s_hud_mask_blend_colorless) {
+    // replay a colourless stencil write-back onto the game's scene DSV while unjittered CB1 is still bound.
+    if (orig_writes_stencil && depth && depth_to_bind != depth.Get() && s_hud_mask_blend_colorless) {
         context->OMSetBlendState(s_hud_mask_blend_colorless.Get(), blend_factor, 0xFFFFFFFF);
         issueDraw();
         rearmHudDrawProbe(context);
         set_targets(context, 1, orig_rtvs, depth.Get());
     }
+    restoreSubstitutedBindings();
     context->OMSetBlendState(original_blend.Get(), original_blend_factor, original_sample_mask);
     if (orig_rtvs[0]) orig_rtvs[0]->Release();
     abandonAmortizedAndRearmHudProbe(context);
@@ -2541,24 +2597,8 @@ HudDrawResult observeHudDrawImpl(ID3D11DeviceContext* context, char kind, UINT i
         ++hud_target_draws;
         if (hud_first_match_seen) ++hud_after_copy_draws;
     }
-    Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
-    context->VSGetShader(&vs, nullptr, nullptr);
-    context->PSGetShader(&ps, nullptr, nullptr);
-    if (!vs || !ps) {
-        if (motion_pair_active) ++hud_shader_missing_hash;
-        return HudDrawResult::None;
-    }
     std::uint64_t vs_hash = 0, ps_hash = 0;
-    UINT size = sizeof(vs_hash);
-    if (FAILED(vs->GetPrivateData(kEdpeShaderHashGuid, &size, &vs_hash)) ||
-        size != sizeof(vs_hash)) {
-        if (motion_pair_active) ++hud_shader_missing_hash;
-        return HudDrawResult::None;
-    }
-    size = sizeof(ps_hash);
-    if (FAILED(ps->GetPrivateData(kEdpeShaderHashGuid, &size, &ps_hash)) ||
-        size != sizeof(ps_hash)) {
+    if (!getFastBoundShaderHashes(context, vs_hash, ps_hash)) {
         if (motion_pair_active) ++hud_shader_missing_hash;
         return HudDrawResult::None;
     }
@@ -2585,13 +2625,15 @@ HudDrawResult observeHudDrawImpl(ID3D11DeviceContext* context, char kind, UINT i
             if (world_candidate && sample != hud_shader_samples.begin() + hud_shader_sample_count &&
                 !sample->fanout_checked) {
                 sample->fanout_checked = true;
-                probeWorldShaderFanout(context, ps.Get(), vs_hash, ps_hash);
+                Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
+                context->PSGetShader(&ps, nullptr, nullptr);
+                if (ps) probeWorldShaderFanout(context, ps.Get(), vs_hash, ps_hash);
             }
         }
     }
 
-    if (s_hud_depth_stencil_seeded && vs_hash == 0x2CECEC3065EF0D4Aull) {
-        // Stencil writer (2CECEC30, stencil 0x04) modifies scene stencil mid-pass.
+    if (s_hud_depth_stencil_seeded && vs_hash == 0x2CECEC3065EF0D4Aull && !s_hud_mask_active_pass) {
+        // Stencil writer (2CECEC30, stencil 0x04) modifies scene stencil mid-pass when HUD replay is inactive.
         s_hud_depth_stencil_seeded = false;
     }
 
@@ -2895,15 +2937,8 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
         return false;
     }
 
-    Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
-    context->VSGetShader(&vs, nullptr, nullptr);
-    context->PSGetShader(&ps, nullptr, nullptr);
     std::uint64_t vs_hash = 0, ps_hash = 0;
-    UINT sz = sizeof(vs_hash);
-    if (vs) vs->GetPrivateData(kEdpeShaderHashGuid, &sz, &vs_hash);
-    sz = sizeof(ps_hash);
-    if (ps) ps->GetPrivateData(kEdpeShaderHashGuid, &sz, &ps_hash);
+    getFastBoundShaderHashes(context, vs_hash, ps_hash);
 
     auto issueDraw = [&]() {
         switch (kind) {
@@ -3570,11 +3605,24 @@ static inline bool isHudDrawInterceptWindowActive() {
     return true;
 }
 
+static inline bool shouldInspectHudOrTonemapDraw() {
+    return (s_hud_mask_active_pass && motion_color_bound) ||
+           s_ldr_tonemap_candidate_bound ||
+           s_post_ldr_backbuffer_bound ||
+           motion_pair_active ||
+           draw_probe_active.load(std::memory_order_relaxed);
+}
+
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
     UINT start, INT base) {
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
         original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
+        return;
+    }
+    if (!shouldInspectHudOrTonemapDraw()) {
+        original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
+        abandonAmortizedAndRearmHudProbe(context);
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
@@ -3606,6 +3654,11 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
         original_draw.load(std::memory_order_acquire)(context, count, start);
+        return;
+    }
+    if (!shouldInspectHudOrTonemapDraw()) {
+        original_draw.load(std::memory_order_acquire)(context, count, start);
+        abandonAmortizedAndRearmHudProbe(context);
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
@@ -3640,6 +3693,12 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
     if (!immediate || !isHudDrawInterceptWindowActive()) {
         original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
             index_count, instance_count, start_index, base_vertex, start_instance);
+        return;
+    }
+    if (!shouldInspectHudOrTonemapDraw()) {
+        original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
+            index_count, instance_count, start_index, base_vertex, start_instance);
+        abandonAmortizedAndRearmHudProbe(context);
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
@@ -3681,6 +3740,12 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     if (!immediate || !isHudDrawInterceptWindowActive()) {
         original_draw_instanced.load(std::memory_order_acquire)(context,
             vertex_count, instance_count, start_vertex, start_instance);
+        return;
+    }
+    if (!shouldInspectHudOrTonemapDraw()) {
+        original_draw_instanced.load(std::memory_order_acquire)(context,
+            vertex_count, instance_count, start_vertex, start_instance);
+        abandonAmortizedAndRearmHudProbe(context);
         return;
     }
     std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
@@ -4027,7 +4092,33 @@ void beginHudDrawProbe() {
     EdpeLog(L"  VS=0xE508648660A352B2 PS=0x63ABD86359B57D01 (target reticle sprite)");
 }
 
+static inline bool areDrawAndOmHooksIntact(void** tbl) {
+    if (!tbl) return false;
+    if (tbl[kOMSetRenderTargets] != reinterpret_cast<void*>(&observedOMSetRenderTargets) ||
+        tbl[kOMSetRenderTargetsAndUnorderedAccessViews] !=
+            reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews) ||
+        tbl[kVSSetConstantBuffers] != reinterpret_cast<void*>(&observedVSSetConstantBuffers)) {
+        return false;
+    }
+    if (hud_draw_probe_active.load(std::memory_order_relaxed)) {
+        const unsigned mask = hud_draw_hook_mask;
+        if (((mask & 1u) && tbl[kDrawIndexed] != reinterpret_cast<void*>(&observedDrawIndexed)) ||
+            ((mask & 2u) && tbl[kDraw] != reinterpret_cast<void*>(&observedDraw)) ||
+            ((mask & 4u) && tbl[kDrawIndexedInstanced] != reinterpret_cast<void*>(&observedDrawIndexedInstanced)) ||
+            ((mask & 8u) && tbl[kDrawInstanced] != reinterpret_cast<void*>(&observedDrawInstanced))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
+    if (activeCtx && activeCtx == observed_context.load(std::memory_order_relaxed) &&
+        patched_table && *reinterpret_cast<void***>(activeCtx) == patched_table &&
+        s_hooked_table_count.load(std::memory_order_relaxed) <= 1 &&
+        areDrawAndOmHooksIntact(patched_table)) {
+        return;
+    }
     const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
     void** activeTable = nullptr;
     if (activeCtx && activeCtx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) {
@@ -4350,7 +4441,19 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             const bool in_main_scene = s_inside_main_scene.load(std::memory_order_acquire);
             if (motion_color_frame == cur_frame && s_ustat.gbufStartIdx == 0) s_ustat.gbufStartIdx = s_ustat.total;
             bool is_main_camera = false;
-            const float* words = static_cast<const float*>(mapped_ptr);
+            float* mutable_unmap_words = static_cast<float*>(mapped_ptr);
+            edpe::NdcOffset existing_ndc_offset{};
+            if (edpe::estimateEliteBlockNdcOffset(&mutable_unmap_words[1080], &existing_ndc_offset) &&
+                std::isfinite(existing_ndc_offset.x) && std::isfinite(existing_ndc_offset.y) &&
+                (std::fabs(existing_ndc_offset.x) > 1e-6f || std::fabs(existing_ndc_offset.y) > 1e-6f) &&
+                std::fabs(existing_ndc_offset.x) <= 0.05f && std::fabs(existing_ndc_offset.y) <= 0.05f) {
+                float unjittered_block[16]{};
+                const edpe::ProjectionJitter unjitter{0.0f, 0.0f, -existing_ndc_offset.x, -existing_ndc_offset.y};
+                if (edpe::jitterEliteProjectionBlock(&mutable_unmap_words[1080], unjittered_block, unjitter)) {
+                    std::memcpy(&mutable_unmap_words[1080], unjittered_block, sizeof(unjittered_block));
+                }
+            }
+            const float* words = mutable_unmap_words;
             int parse_fail_reason = 0;
             const bool parse_ok = edpe::parseEliteCamera(words, 5376 / sizeof(float), &parsed_camera, &parse_fail_reason);
             if (parse_ok && !s_ustat.haveFirstOk) {
@@ -4560,13 +4663,27 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 std::fabs(parsed_camera.scaleX - s_staged_camera.scaleX) <= 0.02f * s_staged_camera.scaleX &&
                                 std::fabs(parsed_camera.scaleY - s_staged_camera.scaleY) <= 0.02f * s_staged_camera.scaleY &&
                                 std::fabs(parsed_camera.depthB - s_staged_camera.depthB) <= 1e-3f;
-                            if (intraDist <= 0.04f && intraTrace > 2.99f && sameStagedFov &&
+                            if (intraDist <= 0.04f && intraTrace > 2.95f && sameStagedFov &&
                                 cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                                 parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
                                 !isReflectionOrAuxiliaryCamera(parsed_camera, s_staged_camera, {0.0f, 0.0f, 0.0f}, 1.0f) &&
                                 !isRearOrAuxiliaryProbe(parsed_camera, s_staged_camera)) {
                                 is_main_camera = true;
                             }
+                        }
+                    } else if (!is_probe && s_has_staged_camera && s_staged_camera_frame == cur_frame) {
+                        // Coherent phase-group jitter for same-pose scene sub-passes whose near plane
+                        // was adjusted per-item (e.g. 0.0675 vs 0.025) while sharing the main scene grid.
+                        const float intraDist = edpe::length(
+                            edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
+                        const float intraTrace = edpe::cameraRotationTrace(parsed_camera, s_staged_camera);
+                        if (intraDist <= 0.04f && intraTrace > 2.98f &&
+                            isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH) &&
+                            cameraRotationDeterminant(parsed_camera) >= 0.85f &&
+                            cameraRotationDeterminant(parsed_camera) <= 1.15f &&
+                            parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
+                            !isRearOrAuxiliaryProbe(parsed_camera, s_staged_camera)) {
+                            is_main_camera = true;
                         }
                     }
 
@@ -5206,7 +5323,7 @@ void logCameraDelta(unsigned long long frame, bool parsed, const edpe::CameraPro
 
 // Called at the first scene-MRT bind of a frame: retain the VS slot-1 buffer.
 void takeCameraDeltaSource(ID3D11DeviceContext* context, unsigned long long frame) {
-    if (edpe::UpscalerManager::instance().isReconstructionActive()) return;
+    if (!edpe::Config::instance().devMode || edpe::UpscalerManager::instance().isReconstructionActive()) return;
     if (camera_delta_disabled || camera_delta_source || camera_delta_taken_frame == frame) return;
     camera_delta_taken_frame = frame;
     ID3D11Buffer* buffer = nullptr;
@@ -5916,6 +6033,9 @@ static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_comp_final_tex;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_comp_final_rtv;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlaa_input;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlaa_input_srv;
+static ID3D11Texture2D* s_direct_color_tex = nullptr;
+static DXGI_FORMAT s_direct_color_fmt = DXGI_FORMAT_UNKNOWN;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_direct_color_srv;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlss_output_texture;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlss_output_srv;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_backbuffer_rtv;
@@ -6166,25 +6286,6 @@ bool tryInPipelineDlaa(ID3D11DeviceContext* context) {
         }
     } restoreGuard{context, rawSet, savedRtvs, savedDsv};
 
-    // Render motion vectors
-    context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
-    if (!motion_pass) {
-        auto candidate = std::make_unique<edpe::MotionPass>();
-        if (candidate->initialize(device.Get(), context)) {
-            motion_pass = std::move(candidate);
-        }
-    }
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
-    if (motion_pass) {
-        motion_pass->render(motion_depth_view.Get(), s_camera_now, s_camera_previous, width, height);
-        if (motion_pass->output()) {
-            Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
-            motion_pass->output()->GetResource(&motionRes);
-            if (motionRes) motionRes.As(&motionTexture);
-        }
-    }
-    if (!motionTexture) return false;
-
     const unsigned scene_writes_this_eval = s_scene_writes_since_eval.exchange(0, std::memory_order_acq_rel);
     const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0);
     s_scene_jitter_consumed.store(true, std::memory_order_release);
@@ -6200,9 +6301,30 @@ bool tryInPipelineDlaa(ID3D11DeviceContext* context) {
     if (s_jitter_swap_xy.load(std::memory_order_relaxed)) std::swap(jx, jy);
     if (s_jitter_invert_x.load(std::memory_order_relaxed)) jx = -jx;
     if (s_jitter_invert_y.load(std::memory_order_relaxed)) jy = -jy;
-    const float jScale = s_jitter_scale.load(std::memory_order_relaxed);
-    jx *= jScale;
-    jy *= jScale;
+
+    const bool eval_reset = s_camera_reset || scene_cut;
+    const float prev_jx = eval_reset ? 0.0f : s_prev_eval_jitter_x;
+    const float prev_jy = eval_reset ? 0.0f : s_prev_eval_jitter_y;
+
+    // Render motion vectors with current and previous subpixel jitter phases
+    context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
+    if (!motion_pass) {
+        auto candidate = std::make_unique<edpe::MotionPass>();
+        if (candidate->initialize(device.Get(), context)) {
+            motion_pass = std::move(candidate);
+        }
+    }
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
+    if (motion_pass) {
+        motion_pass->render(motion_depth_view.Get(), s_camera_now, s_camera_previous,
+            width, height, jx, jy, prev_jx, prev_jy, eval_reset);
+        if (motion_pass->output()) {
+            Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
+            motion_pass->output()->GetResource(&motionRes);
+            if (motionRes) motionRes.As(&motionTexture);
+        }
+    }
+    if (!motionTexture) return false;
 
     const float mScale = s_motion_scale.load(std::memory_order_relaxed);
     const float mScaleX = (s_motion_invert_x.load(std::memory_order_relaxed) ? -1.0f : 1.0f) * mScale;
@@ -6236,10 +6358,12 @@ bool tryInPipelineDlaa(ID3D11DeviceContext* context) {
     inputs.outputHeight = height;
     inputs.jitterX = jx;
     inputs.jitterY = jy;
+    inputs.prevJitterX = prev_jx;
+    inputs.prevJitterY = prev_jy;
     inputs.motionScaleX = mScaleX;
     inputs.motionScaleY = mScaleY;
     inputs.frameTimeMs = dt_ms;
-    inputs.reset = s_camera_reset || scene_cut;
+    inputs.reset = eval_reset;
     inputs.cameraNow = s_camera_now;
     inputs.cameraPrevious = s_camera_previous;
     inputs.sharpness = s_sharpness.load(std::memory_order_relaxed);
@@ -6261,6 +6385,8 @@ bool tryInPipelineDlaa(ID3D11DeviceContext* context) {
 
     if (evalOk) {
         s_camera_reset = false;
+        s_prev_eval_jitter_x = jx;
+        s_prev_eval_jitter_y = jy;
         s_in_pipeline_dlaa_evaluated = true;
         s_in_pipeline_dlaa_frame = motion_color_frame;
         static unsigned s_dlaa_in_pipe_count = 0;
@@ -6443,7 +6569,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             const bool ldrAvailable = (ldrCandidate != nullptr);
             rawColorChoice = ldrAvailable ? ldrCandidate : presentBackbuffer;
             static unsigned long long s_native_src_log = ~0ull;
-            if (s_native_src_log == ~0ull || frame >= s_native_src_log + 300) {
+            if (edpe::Config::instance().devMode && (s_native_src_log == ~0ull || frame >= s_native_src_log + 300)) {
                 s_native_src_log = frame;
                 wchar_t msg[224];
                 swprintf_s(msg,
@@ -6587,8 +6713,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_clean_hdr_scene_frame = ~0ull;
         s_dlaa_input.Reset();
         s_dlaa_input_srv.Reset();
+        s_direct_color_srv.Reset();
+        s_direct_color_tex = nullptr;
+        s_direct_color_fmt = DXGI_FORMAT_UNKNOWN;
         motion_depth.Reset();
         motion_depth_view.Reset();
+        s_motion_prev_depth.Reset();
+        s_motion_prev_depth_view.Reset();
+        s_has_motion_prev_depth = false;
+        s_cached_hdr_rtv0 = nullptr;
         motion_pass.reset();
         s_dlss_output_texture.Reset();
         s_dlss_output_srv.Reset();
@@ -6636,27 +6769,52 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_dlaa_input_srv.Reset();
         }
     }
-    if (!s_dlaa_input) {
-        D3D11_TEXTURE2D_DESC inDesc{};
-        inDesc.Width = depthDesc.Width;
-        inDesc.Height = depthDesc.Height;
-        inDesc.MipLevels = inDesc.ArraySize = 1;
-        inDesc.Format = inputFormat;
-        inDesc.SampleDesc.Count = 1;
-        inDesc.Usage = D3D11_USAGE_DEFAULT;
-        inDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input))) return;
-        device->CreateShaderResourceView(s_dlaa_input.Get(), nullptr, &s_dlaa_input_srv);
-        s_camera_reset = true;
-        wchar_t msg[160];
-        swprintf_s(msg, L"EDPE: temporal color input created %ux%u format=%u (%ls)",
-            depthDesc.Width, depthDesc.Height, static_cast<unsigned>(inputFormat),
-            colorSource == scene_hdr_color_source.Get() ? L"HDR scene color (no UI)" :
-            (isSubNative ? L"low-res LDR scene target" :
-            (colorSource != backbuffer ? L"offscreen LDR scene target (no UI)" : L"native backbuffer")));
-        EdpeLog(msg);
+    bool useDirectColorSrv = false;
+    if (colorSource != backbuffer &&
+        upscaler.getBackend() == edpe::UpscalerBackend::Taa &&
+        !debug_view_active && !s_cmp_seq.active &&
+        (srcColorDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+        if (s_direct_color_tex != colorSource || s_direct_color_fmt != inputFormat || !s_direct_color_srv) {
+            s_direct_color_srv.Reset();
+            s_direct_color_tex = nullptr;
+            s_direct_color_fmt = DXGI_FORMAT_UNKNOWN;
+            D3D11_SHADER_RESOURCE_VIEW_DESC cSrvDesc{};
+            cSrvDesc.Format = inputFormat;
+            cSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            cSrvDesc.Texture2D.MostDetailedMip = 0;
+            cSrvDesc.Texture2D.MipLevels = 1;
+            if (SUCCEEDED(device->CreateShaderResourceView(colorSource, &cSrvDesc, &s_direct_color_srv))) {
+                s_direct_color_tex = colorSource;
+                s_direct_color_fmt = inputFormat;
+            }
+        }
+        useDirectColorSrv = (s_direct_color_srv != nullptr);
     }
-    context->CopyResource(s_dlaa_input.Get(), colorSource);
+    if (!useDirectColorSrv) {
+        if (!s_dlaa_input) {
+            D3D11_TEXTURE2D_DESC inDesc{};
+            inDesc.Width = depthDesc.Width;
+            inDesc.Height = depthDesc.Height;
+            inDesc.MipLevels = inDesc.ArraySize = 1;
+            inDesc.Format = inputFormat;
+            inDesc.SampleDesc.Count = 1;
+            inDesc.Usage = D3D11_USAGE_DEFAULT;
+            inDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input))) return;
+            device->CreateShaderResourceView(s_dlaa_input.Get(), nullptr, &s_dlaa_input_srv);
+            s_camera_reset = true;
+            wchar_t msg[160];
+            swprintf_s(msg, L"EDPE: temporal color input created %ux%u format=%u (%ls)",
+                depthDesc.Width, depthDesc.Height, static_cast<unsigned>(inputFormat),
+                colorSource == scene_hdr_color_source.Get() ? L"HDR scene color (no UI)" :
+                (isSubNative ? L"low-res LDR scene target" :
+                (colorSource != backbuffer ? L"offscreen LDR scene target (no UI)" : L"native backbuffer")));
+            EdpeLog(msg);
+        }
+        context->CopyResource(s_dlaa_input.Get(), colorSource);
+    }
+    ID3D11Texture2D* activeColorInputTex = useDirectColorSrv ? colorSource : s_dlaa_input.Get();
+    ID3D11ShaderResourceView* activeColorInputSrv = useDirectColorSrv ? s_direct_color_srv.Get() : s_dlaa_input_srv.Get();
 
     if (motion_depth) {
         D3D11_TEXTURE2D_DESC curDesc{};
@@ -6664,21 +6822,36 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (curDesc.Width != depthDesc.Width || curDesc.Height != depthDesc.Height) {
             motion_depth.Reset();
             motion_depth_view.Reset();
+            s_motion_prev_depth.Reset();
+            s_motion_prev_depth_view.Reset();
+            s_has_motion_prev_depth = false;
         }
     }
 
-    if (!motion_depth) {
+    if (!motion_depth || !s_motion_prev_depth) {
         D3D11_TEXTURE2D_DESC copyDesc = depthDesc;
         copyDesc.Usage = D3D11_USAGE_DEFAULT;
         copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         copyDesc.CPUAccessFlags = copyDesc.MiscFlags = 0;
-        if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &motion_depth))) return;
 
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
         srvDesc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
         srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = 1;
-        if (FAILED(device->CreateShaderResourceView(motion_depth.Get(), &srvDesc, &motion_depth_view))) return;
+
+        if (!motion_depth) {
+            if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &motion_depth))) return;
+            if (FAILED(device->CreateShaderResourceView(motion_depth.Get(), &srvDesc, &motion_depth_view))) return;
+        }
+        if (!s_motion_prev_depth) {
+            if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &s_motion_prev_depth)) ||
+                FAILED(device->CreateShaderResourceView(s_motion_prev_depth.Get(), &srvDesc, &s_motion_prev_depth_view))) {
+                s_motion_prev_depth.Reset();
+                s_motion_prev_depth_view.Reset();
+                s_has_motion_prev_depth = false;
+            }
+        }
+        s_has_motion_prev_depth = false;
     }
 
     static Microsoft::WRL::ComPtr<ID3DDeviceContextState> s_upscale_ctx_state;
@@ -6733,32 +6906,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             abandonAmortizedAndRearmHudProbe(ctx);
         }
     } restoreTargets{context, ctx1.Get(), priorGameState.Get(), rawSet, savedRtvs, savedDsv};
-
-    const bool need_motion = upscale_active || s_jitter_debug_view.load(std::memory_order_relaxed);
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
-    if (need_motion) {
-        context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
-
-        if (!motion_pass) {
-            auto candidate = std::make_unique<edpe::MotionPass>();
-            if (!candidate->initialize(device.Get(), context)) return;
-            motion_pass = std::move(candidate);
-        }
-
-        if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
-            motion_pass->clear(context);
-        } else {
-            // Render motion vectors at render resolution using current and previous camera projections
-            motion_pass->render(motion_depth_view.Get(),
-                s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height);
-        }
-
-        if (!motion_pass->output()) return;
-
-        Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
-        motion_pass->output()->GetResource(&motionRes);
-        if (!motionRes || FAILED(motionRes.As(&motionTexture))) return;
-    }
 
     const unsigned scene_writes_this_eval = s_scene_writes_since_eval.exchange(0, std::memory_order_acq_rel);
     const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0);
@@ -6876,11 +7023,52 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const bool teleport_cut = (moveDist > 5000.0f);
     scene_cut = scene_cut || (s_camera_previous_frame == ~0ull) || teleport_cut;
 
+    const bool eval_reset = s_camera_reset || scene_cut;
+    const float prev_jx = eval_reset ? 0.0f : s_prev_eval_jitter_x;
+    const float prev_jy = eval_reset ? 0.0f : s_prev_eval_jitter_y;
+
+    const bool need_motion = upscale_active || s_jitter_debug_view.load(std::memory_order_relaxed);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
+    ID3D11ShaderResourceView* prevDepthSrv = nullptr;
+    if (need_motion) {
+        if (s_motion_prev_depth && s_motion_prev_depth_view) {
+            std::swap(motion_depth, s_motion_prev_depth);
+            std::swap(motion_depth_view, s_motion_prev_depth_view);
+            if (s_has_motion_prev_depth && !eval_reset) {
+                prevDepthSrv = s_motion_prev_depth_view.Get();
+            }
+        }
+        context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
+        s_has_motion_prev_depth = (s_motion_prev_depth && s_motion_prev_depth_view);
+
+        if (!motion_pass) {
+            auto candidate = std::make_unique<edpe::MotionPass>();
+            if (!candidate->initialize(device.Get(), context)) return;
+            motion_pass = std::move(candidate);
+        }
+
+        if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
+            motion_pass->clear(context);
+        } else {
+            // Render motion vectors at render resolution using current and previous camera projections and jitter phases
+            motion_pass->render(motion_depth_view.Get(),
+                s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
+                jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv);
+        }
+
+        if (!motion_pass->output()) return;
+
+        Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
+        motion_pass->output()->GetResource(&motionRes);
+        if (!motionRes || FAILED(motionRes.As(&motionTexture))) return;
+    }
+
     edpe::TemporalFrameInputs inputs{};
-    inputs.color = s_dlaa_input.Get();
-    inputs.colorSrv = s_dlaa_input_srv.Get();
+    inputs.color = activeColorInputTex;
+    inputs.colorSrv = activeColorInputSrv;
     inputs.depth = motion_depth.Get();
     inputs.depthSrv = motion_depth_view.Get();
+    inputs.prevDepthSrv = prevDepthSrv;
     inputs.motionVectors = motionTexture ? motionTexture.Get() : nullptr;
     inputs.motionSrv = (motion_pass && need_motion) ? motion_pass->output() : nullptr;
     inputs.renderWidth = depthDesc.Width;
@@ -6889,10 +7077,12 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.outputHeight = backbufferDesc.Height;
     inputs.jitterX = jx;
     inputs.jitterY = jy;
+    inputs.prevJitterX = prev_jx;
+    inputs.prevJitterY = prev_jy;
     inputs.motionScaleX = mScaleX;
     inputs.motionScaleY = mScaleY;
     inputs.frameTimeMs = dt_ms;
-    inputs.reset = s_camera_reset || scene_cut;
+    inputs.reset = eval_reset;
     inputs.cameraNow = s_camera_now;
     inputs.cameraPrevious = s_camera_previous;
     inputs.sharpness = s_sharpness.load(std::memory_order_relaxed);
@@ -6911,6 +7101,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
     if (!upscale_active) {
         s_camera_reset = false;
+        s_prev_eval_jitter_x = jx;
+        s_prev_eval_jitter_y = jy;
     } else {
         const DXGI_FORMAT bbFormat = concreteLdrColorFormat(backbufferDesc.Format);
         const DXGI_FORMAT outFormat = isHdrColor ? srcColorDesc.Format : bbFormat;
@@ -6991,6 +7183,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             last_present_frame.load(std::memory_order_relaxed));
         if (upscalerEvalOk) {
             s_camera_reset = false;
+            s_prev_eval_jitter_x = jx;
+            s_prev_eval_jitter_y = jy;
             s_upscale_evaluated_this_frame = true;
             s_diag_eval_stage = 2;
 
@@ -7000,7 +7194,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             // never overwritten by s_dlss_output_texture.
             const bool canCompositeUi = (evalDestination == s_dlss_output_texture.Get() &&
                                          s_dlss_output_srv && s_backbuffer_copy_srv &&
-                                         s_dlaa_input_srv && s_backbuffer_rtv &&
+                                         activeColorInputSrv && s_backbuffer_rtv &&
                                          colorSource != backbuffer);
             s_diag_composite_path = canCompositeUi ? 1 : 2;
             if (!canCompositeUi) {
@@ -7033,7 +7227,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                         (s_pause_menu_seen_frame != ~0ull && rendered <= s_pause_menu_seen_frame + 1 &&
                          s_hud_draws_replayed_frame == 0);
                     const bool preserveHudActive =
-                        s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                        (s_preserve_native_ui.load(std::memory_order_relaxed) ||
+                         s_hud_debug_view.load(std::memory_order_relaxed) ||
+                         s_jitter_debug_view.load(std::memory_order_relaxed)) &&
                         !hudMergedIntoSceneThisFrame;
                     ID3D11ShaderResourceView* hudSrvToUse = nullptr;
                     ID3D11ShaderResourceView* hudTonemappedSrvToUse = nullptr;
@@ -7063,7 +7259,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     compOk = ui_composite_pass->composite(context,
                         s_dlss_output_srv.Get(),
                         s_backbuffer_copy_srv.Get(),
-                        s_dlaa_input_srv.Get(),
+                        activeColorInputSrv,
                         validHudSrv,
                         s_backbuffer_rtv.Get(),
                         backbufferDesc.Width, backbufferDesc.Height,
@@ -7074,7 +7270,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 }
                 if (compOk) {
                     static unsigned long long s_comp_log = ~0ull;
-                    if (s_comp_log != frame && (s_comp_log == ~0ull || frame % 300 == 0)) {
+                    if (edpe::Config::instance().devMode && s_comp_log != frame && (s_comp_log == ~0ull || frame % 300 == 0)) {
                         s_comp_log = frame;
                         wchar_t cmsg[192];
                         swprintf_s(cmsg, L"EDPE: UI composited frame=%llu render=%ux%u output=%ux%u (%ls, %ls)",
@@ -7265,13 +7461,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
     }
 
-    // Push frame jitter diagnostics and log entry to asynchronous JitterLogger
-    {
-        static unsigned s_last_writes = 0;
-        const unsigned cur_writes = jittered_writes_count.load(std::memory_order_relaxed);
-        const unsigned writes_this_frame = cur_writes - s_last_writes;
-        s_last_writes = cur_writes;
-
+    // Push frame jitter diagnostics and log entry to asynchronous JitterLogger (only when DEV=1 and enabled)
+    if (edpe::JitterLogger::instance().shouldSampleFrame(rendered, scene_cut || s_camera_reset)) {
         const unsigned phases = s_active_jitter_phases.load(std::memory_order_relaxed);
         const unsigned long long scene_seq = jitter_frame_index.load(std::memory_order_relaxed);
 
@@ -8581,6 +8772,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_motion_invert_y.store(cfg.motionInvertY, std::memory_order_relaxed);
         s_motion_scale.store(cfg.motionScale, std::memory_order_relaxed);
         edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
+        edpe::JitterLogger::instance().setSampleInterval(cfg.jitterLogInterval);
+        edpe::JitterLogger::instance().setFlushIntervalMs(cfg.jitterLogFlushMs);
+        edpe::JitterLogger::instance().setLoggingEnabled(cfg.devMode && cfg.jitterLogEnabled);
 
         if (cfg.upscalerBackend >= 1 && cfg.upscalerBackend <= 3) {
             auto& upscaler = edpe::UpscalerManager::instance();
@@ -8856,7 +9050,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 commitMainCamera(rendered_frame, dummy_cut);
             }
         }
-        if (edpe::UpscalerManager::instance().isReconstructionActive()) {
+        if (edpe::Config::instance().devMode && edpe::UpscalerManager::instance().isReconstructionActive()) {
             // HUD diagnostics: one summary line per 60 frames, plus detailed per-shader-pair
             // blink diagnostics ("HUD BLINK DIAG") on any frame where total or per-pair HUD draws
             // change, a draw is declined, hooks are overwritten, or evaluation stage changes.
@@ -9035,7 +9229,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             active_projection_jitter = jitter;
         }
 
-        if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
+        if (edpe::JitterLogger::instance().shouldSampleFrame(frame, false) &&
+            !edpe::UpscalerManager::instance().isReconstructionActive() &&
             !s_jitter_debug_view.load(std::memory_order_relaxed) &&
             !s_hud_debug_view.load(std::memory_order_relaxed)) {
             static LARGE_INTEGER s_last_present_qpc{};
@@ -9077,7 +9272,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             edpe::JitterLogger::instance().pushFrame(jlog);
         }
     }
-    if (frame % 1024 == 0 && observed_swap_chain == swap_chain) {
+    if ((edpe::Config::instance().devMode || !edpe::UpscalerManager::instance().isReconstructionActive()) &&
+        frame % 1024 == 0 && observed_swap_chain == swap_chain) {
         wchar_t callMsg[256];
         swprintf_s(callMsg,
             L"EDPE: context calls frame=%llu OMSetRenderTargets=%llu OMSetRenderTargetsAndUnorderedAccessViews=%llu FinishCommandList=%llu ExecuteCommandList=%llu",
@@ -9497,6 +9693,10 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_hook_watch = 0;
         motion_depth.Reset();
         motion_depth_view.Reset();
+        s_motion_prev_depth.Reset();
+        s_motion_prev_depth_view.Reset();
+        s_has_motion_prev_depth = false;
+        s_cached_hdr_rtv0 = nullptr;
         scene_depth_source.Reset();
         scene_ldr_source.Reset();
         scene_ldr_frame = ~0ull;
@@ -9512,6 +9712,9 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_clean_hdr_scene_frame = ~0ull;
         s_dlaa_input.Reset();
         s_dlaa_input_srv.Reset();
+        s_direct_color_srv.Reset();
+        s_direct_color_tex = nullptr;
+        s_direct_color_fmt = DXGI_FORMAT_UNKNOWN;
         s_dlss_output_texture.Reset();
         s_dlss_output_srv.Reset();
         s_backbuffer_copy.Reset();

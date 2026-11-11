@@ -62,6 +62,11 @@ public:
         if (jitterScale < 0.0f || jitterScale > 2.0f) jitterScale = 1.0f;
 
         jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 32, path.c_str());
+        jitterLogEnabled = GetPrivateProfileIntW(L"Jitter", L"LogEnabled", 0, path.c_str()) != 0;
+        int logIntVal = GetPrivateProfileIntW(L"Jitter", L"LogInterval", 10, path.c_str());
+        jitterLogInterval = (logIntVal < 1) ? 1u : (logIntVal > 600 ? 600u : static_cast<unsigned>(logIntVal));
+        int logFlushVal = GetPrivateProfileIntW(L"Jitter", L"LogFlushMs", 1000, path.c_str());
+        jitterLogFlushMs = (logFlushVal < 100) ? 100u : (logFlushVal > 10000 ? 10000u : static_cast<unsigned>(logFlushVal));
 
         jitterDebugView = GetPrivateProfileIntW(L"Jitter", L"DebugView", 0, path.c_str()) != 0;
         GetPrivateProfileStringW(L"Jitter", L"DebugSensitivity", L"1.5", buf, 64, path.c_str());
@@ -153,6 +158,9 @@ public:
         swprintf_s(buf, L"%.2f", jitterScale);
         WritePrivateProfileStringW(L"Jitter", L"Scale", buf, path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"PhaseCount", std::to_wstring(jitterPhaseCount).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"Jitter", L"LogEnabled", jitterLogEnabled ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"Jitter", L"LogInterval", std::to_wstring(jitterLogInterval).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"Jitter", L"LogFlushMs", std::to_wstring(jitterLogFlushMs).c_str(), path.c_str());
 
         WritePrivateProfileStringW(L"Jitter", L"DebugView", jitterDebugView ? L"1" : L"0", path.c_str());
         swprintf_s(buf, L"%.2f", jitterDebugSensitivity);
@@ -294,6 +302,9 @@ public:
     bool jitterSwapXY = false;
     float jitterScale = 1.0f;
     unsigned jitterPhaseCount = 32;
+    bool jitterLogEnabled = false;
+    unsigned jitterLogInterval = 10;
+    unsigned jitterLogFlushMs = 1000;
 
     bool jitterDebugView = false;
     float jitterDebugSensitivity = 1.5f;
