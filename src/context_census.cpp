@@ -1342,8 +1342,7 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
     // - 0x71DD8B8B09060A81 / 0x2D037A047171BF3B (world-space brackets)
     // - 0xB018D143700AB803 / 0x258B95AC99520C1F (null-output depth/stencil quad)
     // - 0x4EF6DDB075A927FA (main menu hangar / loading screen quad)
-    if (vs_hash == 0x81216C77F90DEDD6ull || // Cockpit holo panels (stock lit A2965EC2, EDHM 16F88966, unlit B4786E0A, text 41B9D7B2, backing 329ACCE7/925ACEDA, icons B357E4E5, radar sweep C610FB6F, AB82734F)
-        vs_hash == 0x2CECEC3065EF0D4Aull || // Cockpit HUD stencil setup (A4D03619), frosted HUD panel backing (5F5FA64F), and radar disc backing (1E87C9BF)
+    if (vs_hash == 0x81216C77F90DEDD6ull || // Cockpit holo panels (stock lit A2965EC2, EDHM 16F88966, unlit B4786E0A, text 41B9D7B2, icons B357E4E5, radar sweep C610FB6F, AB82734F)
         vs_hash == 0x1989E6D3B405FDE0ull || // Cockpit holo panels (DisableGuiEffects variant PS EAB8A1C95A13FFBE)
         vs_hash == 0x925ACEDA0153AA5Bull || // Planetary / Orbital Cruise shadowless holo panels (kUiVsHoloNoShadow)
         vs_hash == 0xB7790CBFC6554097ull || // Flight HUD vector lines, altimeter ladder & pitch ladder (PS 8DEF46452FA459F5 / EDHM B1CA8D8EEF7C886D)
@@ -1358,7 +1357,8 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
         vs_hash == 0xB932058F26B76691ull) { // Radar contact hologram family 4 (kHoloFamiliesTake)
         return true;
     }
-    return (vs_hash == 0x5559BD94B6852E83ull &&                                      // Target & Own-Ship 3D schematic hologram billboards (kHoloTargetSphere)
+    return (vs_hash == 0x2CECEC3065EF0D4Aull && ps_hash == 0xA4D03619D631B186ull) || // Cockpit HUD stencil setup (A4D03619, 0x04)
+           (vs_hash == 0x5559BD94B6852E83ull &&                                      // Target & Own-Ship 3D schematic hologram billboards (kHoloTargetSphere)
             (ps_hash == 0xEA02FAC2BD6C643Cull || ps_hash == 0xE95634B0F61D218Full)) ||
            (vs_hash == 0xB12F7A618E1BDE98ull &&                                      // Ship/target hologram shells
             (ps_hash == 0x203DF51758AADC4Dull || ps_hash == 0x42AC0CACC9CDF72Bull)) ||
@@ -2493,8 +2493,12 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         if (!rt0.BlendEnable) {
             blend_to_use = s_hud_mask_blend_opaque.Get();
         } else if (rt0.SrcBlend == D3D11_BLEND_ZERO) {
-            // Multiplicative darkening / backing quad
-            blend_to_use = s_hud_mask_blend_darken.Get();
+            // Multiplicative darkening / backing quad: do NOT redirect out of the game's HDR target!
+            // Let Cobra render it directly into the 3D scene so the world is naturally tinted without crushing DLSS output.
+            restoreSubstitutedBindings();
+            if (orig_rtvs[0]) orig_rtvs[0]->Release();
+            abandonAmortizedAndRearmHudProbe(context);
+            return false;
         } else if (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA) {
             blend_to_use = s_hud_mask_blend_premul.Get();
         } else if ((rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA || rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA_SAT) &&
@@ -2999,48 +3003,6 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
          (vs_hash == 0x4EF6DDB075A927FAull));
     if (isModalOrEscMenuDraw) {
         s_pause_menu_seen_frame = current_frame;
-    }
-
-    // Pass 54 (2D UI / Menu): redirect post-tonemap 2D UI draws directly into LdrLayer (or MultLayer)
-    // on top of the tonemapped Cockpit HUD result using beginIntercept(..., isHdr = false).
-    if ((s_verified_ldr_tonemap_frame == current_frame || s_post_ldr_backbuffer_bound) &&
-        edpe::UiLayer::instance().shouldInterceptDraw(vs_hash, ps_hash, /*isHdrTarget=*/false)) {
-        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
-        context->OMGetRenderTargets(1, curRtv.GetAddressOf(), nullptr);
-        UINT rtvW = s_swapchain_width.load(std::memory_order_relaxed);
-        UINT rtvH = s_swapchain_height.load(std::memory_order_relaxed);
-        bool isPostToneTarget = false;
-        if (curRtv) {
-            Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
-            curRtv->GetResource(&rtvRes);
-            Microsoft::WRL::ComPtr<ID3D11Texture2D> postTex;
-            if (rtvRes && SUCCEEDED(rtvRes.As(&postTex)) && postTex) {
-                D3D11_TEXTURE2D_DESC postDesc{};
-                postTex->GetDesc(&postDesc);
-                rtvW = postDesc.Width;
-                rtvH = postDesc.Height;
-                const UINT swapW = s_swapchain_width.load(std::memory_order_relaxed);
-                const UINT swapH = s_swapchain_height.load(std::memory_order_relaxed);
-                const UINT scW = s_observed_scene_width.load(std::memory_order_relaxed);
-                const UINT scH = s_observed_scene_height.load(std::memory_order_relaxed);
-                const bool isBackbufferRes =
-                    (rtvRes.Get() == s_swapchain_backbuffer.load(std::memory_order_relaxed));
-                const bool isFullLdrScreen =
-                    (postDesc.SampleDesc.Count == 1 &&
-                     isLdrSceneColorFormat(postDesc.Format) &&
-                     postTex.Get() != scene_ldr_source.Get() &&
-                     ((swapW > 0 && rtvW == swapW && rtvH == swapH) ||
-                      (scW > 0 && rtvW == scW && rtvH == scH)));
-                isPostToneTarget = isBackbufferRes || isFullLdrScreen;
-            }
-        }
-        if (isPostToneTarget && rtvW > 0 && rtvH > 0) {
-            edpe::UiLayer::instance().beginIntercept(context, 0.0f, 0.0f, rtvW, rtvH, /*isHdr=*/false);
-            issueDraw();
-            edpe::UiLayer::instance().endIntercept(context);
-            abandonAmortizedAndRearmHudProbe(context);
-            return true;
-        }
     }
 
     if (s_hdr_slot0_seen_frame != current_frame || s_verified_ldr_tonemap_frame == current_frame) {
@@ -6260,10 +6222,7 @@ void finalizeHudMaskForFrame(ID3D11DeviceContext* context, unsigned long long cu
     s_hud_mask_finalized_frame = cur_rendered;
 
     if (!s_hud_mask_cleared_for_frame || s_hud_draws_replayed_frame == 0) {
-        if (!s_hud_mask_cleared_for_frame) {
-            const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            context->ClearRenderTargetView(s_hud_mask_rtv.Get(), clearColor);
-        }
+        edpe::UiLayer::instance().beginFrame(context);
         s_hud_draws_replayed_frame = 0;
         hud_first_match_seen = false;
         s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
@@ -7069,7 +7028,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_diag_eval_stage = 2;
 
             ID3D11UnorderedAccessView* targetUav = s_backbuffer_uav ? s_backbuffer_uav.Get() : s_comp_final_uav.Get();
-            const bool canCompositeUi = (evalDestination == s_dlss_output_texture.Get() &&
+            const bool canCompositeUi = (s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                                         evalDestination == s_dlss_output_texture.Get() &&
                                          s_dlss_output_srv && targetUav &&
                                          colorSource != backbuffer);
             s_diag_composite_path = canCompositeUi ? 1 : 2;
@@ -7084,14 +7044,20 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     backbufferDesc.Height,
                     s_hud_debug_view.load(std::memory_order_relaxed));
                 if (compOk && targetUav == s_comp_final_uav.Get() && s_comp_final_tex) {
-                    context->CopyResource(backbuffer, s_comp_final_tex.Get());
+                    if (s_pause_menu_seen_frame != rendered) {
+                        context->CopyResource(backbuffer, s_comp_final_tex.Get());
+                    }
                 }
                 if (!compOk && !isHdrColor) {
-                    context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                    if (s_pause_menu_seen_frame != rendered) {
+                        context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                    }
                     compOk = true;
                 }
             } else if (evalDestination == s_dlss_output_texture.Get()) {
-                context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                if (colorSource != backbuffer && s_pause_menu_seen_frame != rendered) {
+                    context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                }
                 compOk = true;
             } else {
                 compOk = true;
@@ -7716,6 +7682,11 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                     s_hud_depth_stencil_seeded = false;
                     s_hud_depth_only_seeded = false;
                 }
+            } else if (!s_hud_mask_cleared_for_frame) {
+                edpe::UiLayer::instance().beginFrame(context);
+                s_hud_mask_cleared_for_frame = true;
+                s_hud_depth_stencil_seeded = false;
+                s_hud_depth_only_seeded = false;
             }
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
@@ -9739,6 +9710,9 @@ unsigned ContextCensusGetJitterPhaseCount() {
 void ContextCensusSetPreserveNativeUi(bool preserve) {
     s_preserve_native_ui.store(preserve, std::memory_order_relaxed);
     edpe::Config::instance().preserveNativeUi = preserve;
+    if (!preserve) {
+        s_hud_mask_cleared_for_frame = false;
+    }
 }
 bool ContextCensusGetPreserveNativeUi() {
     return s_preserve_native_ui.load(std::memory_order_relaxed);

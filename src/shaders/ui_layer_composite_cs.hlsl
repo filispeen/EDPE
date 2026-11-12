@@ -17,8 +17,8 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     float4 ui = tUi.Load(p);
     float3 mult = (hasMultiply != 0) ? tMult.Load(p).rgb : float3(1.0, 1.0, 1.0);
 
-    // Якщо піксель не містить інтерфейсу, зберігаємо світ без змін:
-    if (debugView == 0 && all(ui.rgb <= 1e-5) && ui.a >= 0.999 && all(mult >= 0.999)) {
+    // Якщо піксель не містить емісійного UI, зберігаємо світ без змін:
+    if (debugView == 0 && all(ui.rgb <= 1e-4) && all(mult >= 0.999)) {
         uOut[id.xy] = tWorld.Load(p);
         return;
     }
@@ -36,6 +36,8 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     // ui.rgb - це premultiplied емісійне світло інтерфейсу
     // ui.a   - це коефіцієнт пропускання фону T = prod(1 - alpha)
     // mult   - це мультиплікативне затемнення меню/тіней
-    float3 finalRgb = ui.rgb + world.rgb * ui.a * mult;
+    // Захист від затемнення фону підкладками без емісії:
+    float effectiveTransmittance = all(ui.rgb <= 1e-4) ? 1.0 : ui.a;
+    float3 finalRgb = ui.rgb + world.rgb * effectiveTransmittance * mult;
     uOut[id.xy] = float4(saturate(finalRgb), world.a);
 }

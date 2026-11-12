@@ -27,8 +27,8 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     float4 ui = tUi.Load(p);
     float3 mult = (hasMultiply != 0) ? tMult.Load(p).rgb : float3(1.0, 1.0, 1.0);
 
-    // Якщо піксель не містить інтерфейсу, зберігаємо світ без змін:
-    if (debugView == 0 && all(ui.rgb <= 1e-5) && ui.a >= 0.999 && all(mult >= 0.999)) {
+    // Якщо піксель не містить емісійного UI, зберігаємо світ без змін:
+    if (debugView == 0 && all(ui.rgb <= 1e-4) && all(mult >= 0.999)) {
         uOut[id.xy] = tWorld.Load(p);
         return;
     }
@@ -46,7 +46,9 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     // ui.rgb - це premultiplied емісійне світло інтерфейсу
     // ui.a   - це коефіцієнт пропускання фону T = prod(1 - alpha)
     // mult   - це мультиплікативне затемнення меню/тіней
-    float3 finalRgb = ui.rgb + world.rgb * ui.a * mult;
+    // Захист від затемнення фону підкладками без емісії:
+    float effectiveTransmittance = all(ui.rgb <= 1e-4) ? 1.0 : ui.a;
+    float3 finalRgb = ui.rgb + world.rgb * effectiveTransmittance * mult;
     uOut[id.xy] = float4(saturate(finalRgb), world.a);
 }
 )hlsl";
@@ -341,49 +343,44 @@ void UiLayer::beginFrame(ID3D11DeviceContext* context) {
 }
 
 bool UiLayer::shouldInterceptDraw(uint64_t vsHash, uint64_t psHash, bool isHdrTarget) {
-    if (isHdrTarget) {
-        if (vsHash == 0x81216C77F90DEDD6ull ||
-            vsHash == 0x2CECEC3065EF0D4Aull ||
-            vsHash == 0x1989E6D3B405FDE0ull ||
-            vsHash == 0x925ACEDA0153AA5Bull ||
-            vsHash == 0xB7790CBFC6554097ull ||
-            vsHash == 0xE508648660A352B2ull ||
-            vsHash == 0x5DA53D8B0133341Eull ||
-            vsHash == 0xDF3503CD07F9B10Cull ||
-            vsHash == 0x5453D19B6D362364ull ||
-            vsHash == 0x44DDCDEBAEA137D8ull ||
-            vsHash == 0xA2C2D5510BF1926Dull ||
-            vsHash == 0x9B34C331902DC1EDull ||
-            vsHash == 0x9611A454527F7FEBull ||
-            vsHash == 0xB932058F26B76691ull) {
-            return true;
-        }
-        return (vsHash == 0x5559BD94B6852E83ull &&
-                (psHash == 0xEA02FAC2BD6C643Cull || psHash == 0xE95634B0F61D218Full)) ||
-               (vsHash == 0xB12F7A618E1BDE98ull &&
-                (psHash == 0x203DF51758AADC4Dull || psHash == 0x42AC0CACC9CDF72Bull)) ||
-               (vsHash == 0xF8D8A92E96419901ull && psHash == 0x16196F69ADE35E77ull) ||
-               (vsHash == 0x1989B75BF034ECC3ull && psHash == 0xDB79AE788E049DFDull) ||
-               (vsHash == 0xC7FA0C0F5DD49180ull && psHash == 0x6EEF165A350DA30Full) ||
-               (vsHash == 0xA47A3315FFF5E2E4ull && psHash == 0x869FFF43E875906Eull) ||
-               (vsHash == 0x9BFC7FD232328391ull && psHash == 0xDBF1725726018F52ull) ||
-               (vsHash == 0xE904D334BC8B11EAull && psHash == 0x095030F27D2C362Aull) ||
-               (vsHash == 0x1012E00B3CB44469ull && psHash == 0x666EF0C4C616F67Eull) ||
-               (vsHash == 0xA3E5D3FCBC1165F8ull && psHash == 0x019E81F4EECFB371ull) ||
-               (vsHash == 0x1E8D013722FE71B8ull && psHash == 0x3D62E1CE0B0ECDF6ull) ||
-               (vsHash == 0x12382D2EA45E9632ull && psHash == 0x855C469156AB997Full) ||
-               (vsHash == 0xC31238331D8AC3D4ull &&
-                (psHash == 0xBD0FEB3276C8B2D7ull || psHash == 0x539A4858CE3A3477ull || psHash == 0x964221955A9E77E7ull));
+    if (!isHdrTarget) {
+        // Pass 54 2D UI (Main Menu, ESC Menu, cursor) draws to backbuffer at native resolution.
+        // Never intercept LDR draws; let Cobra render them straight to backbuffer.
+        return false;
     }
 
-    return vsHash == 0xC4B4B334B26E81A9ull ||
-           vsHash == 0xA888D51024D9798Eull ||
-           vsHash == 0x5DAD41AA66757CE3ull ||
-           vsHash == 0x4EF6DDB075A927FAull ||
-           vsHash == 0x1E8D013722FE71B8ull ||
-           vsHash == 0x1012E00B3CB44469ull ||
-           vsHash == 0xA3E5D3FCBC1165F8ull ||
-           vsHash == 0x81216C77F90DEDD6ull;
+    if (vsHash == 0x81216C77F90DEDD6ull ||
+        vsHash == 0x1989E6D3B405FDE0ull ||
+        vsHash == 0x925ACEDA0153AA5Bull ||
+        vsHash == 0xB7790CBFC6554097ull ||
+        vsHash == 0xE508648660A352B2ull ||
+        vsHash == 0x5DA53D8B0133341Eull ||
+        vsHash == 0xDF3503CD07F9B10Cull ||
+        vsHash == 0x5453D19B6D362364ull ||
+        vsHash == 0x44DDCDEBAEA137D8ull ||
+        vsHash == 0xA2C2D5510BF1926Dull ||
+        vsHash == 0x9B34C331902DC1EDull ||
+        vsHash == 0x9611A454527F7FEBull ||
+        vsHash == 0xB932058F26B76691ull) {
+        return true;
+    }
+    return (vsHash == 0x2CECEC3065EF0D4Aull && psHash == 0xA4D03619D631B186ull) || // Stencil setup only (0x04)
+           (vsHash == 0x5559BD94B6852E83ull &&
+            (psHash == 0xEA02FAC2BD6C643Cull || psHash == 0xE95634B0F61D218Full)) ||
+           (vsHash == 0xB12F7A618E1BDE98ull &&
+            (psHash == 0x203DF51758AADC4Dull || psHash == 0x42AC0CACC9CDF72Bull)) ||
+           (vsHash == 0xF8D8A92E96419901ull && psHash == 0x16196F69ADE35E77ull) ||
+           (vsHash == 0x1989B75BF034ECC3ull && psHash == 0xDB79AE788E049DFDull) ||
+           (vsHash == 0xC7FA0C0F5DD49180ull && psHash == 0x6EEF165A350DA30Full) ||
+           (vsHash == 0xA47A3315FFF5E2E4ull && psHash == 0x869FFF43E875906Eull) ||
+           (vsHash == 0x9BFC7FD232328391ull && psHash == 0xDBF1725726018F52ull) ||
+           (vsHash == 0xE904D334BC8B11EAull && psHash == 0x095030F27D2C362Aull) ||
+           (vsHash == 0x1012E00B3CB44469ull && psHash == 0x666EF0C4C616F67Eull) ||
+           (vsHash == 0xA3E5D3FCBC1165F8ull && psHash == 0x019E81F4EECFB371ull) ||
+           (vsHash == 0x1E8D013722FE71B8ull && psHash == 0x3D62E1CE0B0ECDF6ull) ||
+           (vsHash == 0x12382D2EA45E9632ull && psHash == 0x855C469156AB997Full) ||
+           (vsHash == 0xC31238331D8AC3D4ull &&
+            (psHash == 0xBD0FEB3276C8B2D7ull || psHash == 0x539A4858CE3A3477ull || psHash == 0x964221955A9E77E7ull));
 }
 
 void UiLayer::beginIntercept(ID3D11DeviceContext* context, float jitterX, float jitterY,
