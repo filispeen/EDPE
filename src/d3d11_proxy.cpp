@@ -6,12 +6,14 @@
 #include "log.h"
 #include "shader_probe.h"
 #include "system_dll.h"
+#include "vtable_hook.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cwchar>
 #include <d3d11.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <string>
 #include <mutex>
@@ -20,8 +22,6 @@
 #include <windows.h>
 #include <dxgi.h>
 #include <vector>
-
-void ObserveDxgiSwapChain(IDXGISwapChain* swap_chain);
 
 namespace {
 using CreateVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*,
@@ -117,11 +117,30 @@ HRESULT STDMETHODCALLTYPE observedCreateDeferredContext(ID3D11Device* device,
 }
 
 std::mutex s_device_track_mutex;
-Microsoft::WRL::ComPtr<ID3D11Device> s_primary_device;
-Microsoft::WRL::ComPtr<ID3D11DeviceContext> s_primary_context;
+// Non-owning identity pointers (never AddRef/Release during DLL_PROCESS_DETACH).
+ID3D11Device* s_primary_device = nullptr;
+ID3D11DeviceContext* s_primary_context = nullptr;
 LUID s_primary_luid{};
 bool s_has_primary_device = false;
 std::atomic<unsigned> s_device_create_call_count{0};
+
+HMODULE resolveRealSystemD3D11() {
+    static HMODULE s_system_d3d11 = nullptr;
+    if (s_system_d3d11) return s_system_d3d11;
+    HMODULE raw = LoadSystemDll(L"d3d11.dll");
+    HMODULE chosen = chooseSystemD3D11(raw);
+    if (chosen && chosen != raw) {
+        wchar_t rawPath[MAX_PATH]{};
+        wchar_t chosenPath[MAX_PATH]{};
+        GetModuleFileNameW(raw, rawPath, MAX_PATH);
+        GetModuleFileNameW(chosen, chosenPath, MAX_PATH);
+        wchar_t msg[512];
+        swprintf_s(msg, L"EDPE: bypassed redirected d3d11 module (%ls -> %ls)", rawPath, chosenPath);
+        EdpeLog(msg);
+    }
+    s_system_d3d11 = chosen ? chosen : raw;
+    return s_system_d3d11;
+}
 
 void logDeviceCreationCall(const wchar_t* apiName, IDXGIAdapter* adapter, D3D_DRIVER_TYPE driverType,
     UINT flags, const D3D_FEATURE_LEVEL* featureLevels, UINT featureLevelCount, UINT sdkVersion) {
@@ -176,6 +195,19 @@ bool armShaderProbe() {
     wcscpy_s(name + 1, MAX_PATH - prefix, L"edpe_shader_probe.once");
     return DeleteFileW(path) != 0;
 }
+}
+
+ID3D11Device* GetPrimaryD3D11Device() {
+    std::lock_guard lock(s_device_track_mutex);
+    return s_primary_device;
+}
+
+void ResetPrimaryD3D11Device() {
+    std::lock_guard lock(s_device_track_mutex);
+    s_primary_device = nullptr;
+    s_primary_context = nullptr;
+    s_primary_luid = {};
+    s_has_primary_device = false;
 }
 
 void hookShaderCreation(ID3D11Device* device) {
@@ -280,17 +312,54 @@ void hookShaderCreation(ID3D11Device* device) {
 
 void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UINT flags, D3D_FEATURE_LEVEL featureLevel) {
     if (!device) return;
-    if (ContextCensusIsDeviceRegistered(device)) {
-        hookShaderCreation(device);
-        if (context) ContextCensusHookContext(context);
-        return;
-    }
 
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> immContext;
     if (context) {
         immContext = context;
     } else {
         device->GetImmediateContext(&immContext);
+    }
+
+    // First-Device Authority: the first D3D11 device created by the engine is the
+    // authoritative scene & swapchain device. Auxiliary devices created later are
+    // logged at most 4 times and never overwrite the primary render device.
+    bool isPrimary = false;
+    ID3D11Device* primaryPtr = nullptr;
+    {
+        std::lock_guard lock(s_device_track_mutex);
+        if (!s_has_primary_device) {
+            s_primary_device = device;
+            s_primary_context = immContext.Get();
+            s_has_primary_device = true;
+            isPrimary = true;
+            primaryPtr = device;
+        } else {
+            primaryPtr = s_primary_device;
+            isPrimary = (device == primaryPtr);
+        }
+    }
+
+    if (!isPrimary) {
+        static std::atomic<uint32_t> s_extra_device_logs{0};
+        const uint32_t extra = s_extra_device_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (extra <= 4) {
+            wchar_t extraMsg[256];
+            swprintf_s(extraMsg,
+                L"EDPE: secondary D3D11 device #%u ignored for primary authority (device=%p, primary=%p)",
+                extra, device, primaryPtr);
+            EdpeLog(extraMsg);
+        }
+        if (!edpe::isRunningInEliteProcess()) {
+            ContextCensusRegisterDevice(device, immContext.Get());
+            if (immContext) ContextCensusHookContext(immContext.Get());
+        }
+        return;
+    }
+
+    if (ContextCensusIsDeviceRegistered(device)) {
+        hookShaderCreation(device);
+        if (immContext) ContextCensusHookContext(immContext.Get());
+        return;
     }
 
     std::wstring adapterName = L"Unknown";
@@ -307,6 +376,11 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
         }
     }
 
+    {
+        std::lock_guard lock(s_device_track_mutex);
+        s_primary_luid = adapterLuid;
+    }
+
     D3D_FEATURE_LEVEL fl = (featureLevel != 0) ? featureLevel : device->GetFeatureLevel();
 
     wchar_t message[384];
@@ -316,17 +390,7 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
         adapterLuid.HighPart, adapterLuid.LowPart,
         static_cast<unsigned>(fl), flags, GetCurrentThreadId());
     EdpeLog(message);
-
-    {
-        std::lock_guard lock(s_device_track_mutex);
-        if (!s_has_primary_device) {
-            s_primary_device = device;
-            s_primary_context = immContext.Get();
-            s_primary_luid = adapterLuid;
-            s_has_primary_device = true;
-            EdpeLog(L"EDPE: registered primary D3D11 device");
-        }
-    }
+    EdpeLog(L"EDPE: registered primary D3D11 device");
 
     hookShaderCreation(device);
     ContextCensusRegisterDevice(device, immContext.Get());
@@ -337,6 +401,7 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
 
 namespace edpe {
 void installD3D11Hooks() {
+    if (!edpe::isRunningInEliteProcess()) return;
     static std::atomic<bool> s_installed{false};
     if (s_installed.exchange(true)) return;
 
@@ -368,7 +433,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
     D3D_FEATURE_LEVEL* feature_level,
     ID3D11DeviceContext** context) {
     syncConfigOnce();
-    static const HMODULE system_d3d11 = LoadSystemDll(L"d3d11.dll");
+    const HMODULE system_d3d11 = resolveRealSystemD3D11();
     if (!system_d3d11) return HRESULT_FROM_WIN32(GetLastError());
 
     static const auto create_device = reinterpret_cast<decltype(&D3D11CreateDevice)>(
@@ -377,41 +442,6 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
 
     logDeviceCreationCall(L"D3D11CreateDevice", adapter, driver_type, flags,
         feature_levels, feature_level_count, sdk_version);
-
-    if (edpe::Config::instance().reusePrimaryDevice) {
-        flags &= ~D3D11_CREATE_DEVICE_SINGLETHREADED;
-        if (driver_type == D3D_DRIVER_TYPE_HARDWARE || driver_type == D3D_DRIVER_TYPE_UNKNOWN) {
-            std::lock_guard lock(s_device_track_mutex);
-            if (s_has_primary_device && s_primary_device &&
-                SUCCEEDED(s_primary_device->GetDeviceRemovedReason())) {
-                LUID reqLuid{};
-                if (adapter) {
-                    DXGI_ADAPTER_DESC aDesc{};
-                    if (SUCCEEDED(adapter->GetDesc(&aDesc))) reqLuid = aDesc.AdapterLuid;
-                }
-                if (!adapter || (reqLuid.LowPart == s_primary_luid.LowPart && reqLuid.HighPart == s_primary_luid.HighPart)) {
-                    if (device || context) {
-                        wchar_t rMsg[256];
-                        swprintf_s(rMsg, L"EDPE: D3D11CreateDevice REUSING primary device %p (ctx=%p) for thread=%u",
-                            s_primary_device.Get(), s_primary_context.Get(), GetCurrentThreadId());
-                        EdpeLog(rMsg);
-                    }
-                    if (device) {
-                        *device = s_primary_device.Get();
-                        s_primary_device->AddRef();
-                    }
-                    if (context) {
-                        *context = s_primary_context.Get();
-                        if (s_primary_context) s_primary_context->AddRef();
-                    }
-                    if (feature_level) {
-                        *feature_level = s_primary_device->GetFeatureLevel();
-                    }
-                    return S_OK;
-                }
-            }
-        }
-    }
 
     const HRESULT result = create_device(adapter, driver_type, software, flags,
         feature_levels, feature_level_count, sdk_version, device, feature_level, context);
@@ -448,7 +478,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDeviceAndSwapChain(
     D3D_FEATURE_LEVEL* pFeatureLevel,
     ID3D11DeviceContext** ppImmediateContext) {
     syncConfigOnce();
-    static const HMODULE system_d3d11 = LoadSystemDll(L"d3d11.dll");
+    const HMODULE system_d3d11 = resolveRealSystemD3D11();
     if (!system_d3d11) return HRESULT_FROM_WIN32(GetLastError());
 
     static const auto create_device_and_swap_chain = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(
@@ -458,70 +488,11 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDeviceAndSwapChain(
     logDeviceCreationCall(L"D3D11CreateDeviceAndSwapChain", pAdapter, DriverType, Flags,
         pFeatureLevels, FeatureLevels, SDKVersion);
 
-    if (edpe::Config::instance().reusePrimaryDevice) {
-        Flags &= ~D3D11_CREATE_DEVICE_SINGLETHREADED;
-        if (DriverType == D3D_DRIVER_TYPE_HARDWARE || DriverType == D3D_DRIVER_TYPE_UNKNOWN) {
-            std::lock_guard lock(s_device_track_mutex);
-            if (s_has_primary_device && s_primary_device &&
-                SUCCEEDED(s_primary_device->GetDeviceRemovedReason())) {
-                LUID reqLuid{};
-                if (pAdapter) {
-                    DXGI_ADAPTER_DESC aDesc{};
-                    if (SUCCEEDED(pAdapter->GetDesc(&aDesc))) reqLuid = aDesc.AdapterLuid;
-                }
-                if (!pAdapter || (reqLuid.LowPart == s_primary_luid.LowPart && reqLuid.HighPart == s_primary_luid.HighPart)) {
-                    if (ppSwapChain && pSwapChainDesc) {
-                        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDev;
-                        Microsoft::WRL::ComPtr<IDXGIAdapter> dxgiAdp;
-                        Microsoft::WRL::ComPtr<IDXGIFactory> dxgiFac;
-                        if (SUCCEEDED(s_primary_device.As(&dxgiDev)) &&
-                            SUCCEEDED(dxgiDev->GetAdapter(&dxgiAdp)) &&
-                            SUCCEEDED(dxgiAdp->GetParent(IID_PPV_ARGS(&dxgiFac)))) {
-                            DXGI_SWAP_CHAIN_DESC scDesc = *pSwapChainDesc;
-                            HRESULT hr = dxgiFac->CreateSwapChain(s_primary_device.Get(), &scDesc, ppSwapChain);
-                            if (SUCCEEDED(hr) && *ppSwapChain) {
-                                ObserveDxgiSwapChain(*ppSwapChain);
-                                wchar_t rMsg[256];
-                                swprintf_s(rMsg, L"EDPE: D3D11CreateDeviceAndSwapChain REUSING primary device %p for swapchain %p",
-                                    s_primary_device.Get(), static_cast<void*>(*ppSwapChain));
-                                EdpeLog(rMsg);
-                                if (ppDevice) {
-                                    *ppDevice = s_primary_device.Get();
-                                    s_primary_device->AddRef();
-                                }
-                                if (ppImmediateContext) {
-                                    *ppImmediateContext = s_primary_context.Get();
-                                    if (s_primary_context) s_primary_context->AddRef();
-                                }
-                                if (pFeatureLevel) {
-                                    *pFeatureLevel = s_primary_device->GetFeatureLevel();
-                                }
-                                return S_OK;
-                            }
-                        }
-                    } else if (!ppSwapChain && !pSwapChainDesc) {
-                        if (ppDevice) {
-                            *ppDevice = s_primary_device.Get();
-                            s_primary_device->AddRef();
-                        }
-                        if (ppImmediateContext) {
-                            *ppImmediateContext = s_primary_context.Get();
-                            if (s_primary_context) s_primary_context->AddRef();
-                        }
-                        if (pFeatureLevel) {
-                            *pFeatureLevel = s_primary_device->GetFeatureLevel();
-                        }
-                        return S_OK;
-                    }
-                }
-            }
-        }
-    }
-
     const HRESULT result = create_device_and_swap_chain(pAdapter, DriverType, Software, Flags,
         pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
     if (SUCCEEDED(result)) {
         if (ppDevice && *ppDevice) {
+            hookShaderCreation(*ppDevice);
             processDeviceCreated(*ppDevice, (ppImmediateContext && *ppImmediateContext) ? *ppImmediateContext : nullptr,
                 Flags, (pFeatureLevel && *pFeatureLevel) ? *pFeatureLevel : static_cast<D3D_FEATURE_LEVEL>(0));
         }

@@ -7,7 +7,7 @@
 
 namespace edpe {
 
-// GPU-only camera/depth motion. The caller owns depth/frame association.
+// GPU-only camera/depth + MRT6 per-object velocity motion pass.
 class MotionPass {
 public:
     bool initialize(ID3D11Device* device, ID3D11DeviceContext* context);
@@ -16,19 +16,22 @@ public:
         float jitterX = 0.0f, float jitterY = 0.0f,
         float prevJitterX = 0.0f, float prevJitterY = 0.0f,
         bool reset = false,
-        ID3D11ShaderResourceView* prevDepth = nullptr);
+        ID3D11ShaderResourceView* prevDepth = nullptr,
+        ID3D11ShaderResourceView* engineVelocity = nullptr);
     bool renderGpuCameras(ID3D11ShaderResourceView* depth, ID3D11Buffer* now,
         ID3D11Buffer* previous, UINT width, UINT height,
         float jitterX = 0.0f, float jitterY = 0.0f,
         float prevJitterX = 0.0f, float prevJitterY = 0.0f,
         bool reset = false,
-        ID3D11ShaderResourceView* prevDepth = nullptr);
+        ID3D11ShaderResourceView* prevDepth = nullptr,
+        ID3D11ShaderResourceView* engineVelocity = nullptr);
     ID3D11ShaderResourceView* output() const { return output_srv_.Get(); }
     void clear(ID3D11DeviceContext* context);
 
 private:
     bool renderInternal(ID3D11ShaderResourceView* depth,
         ID3D11ShaderResourceView* prevDepth,
+        ID3D11ShaderResourceView* engineVelocity,
         const float (&values)[36],
         ID3D11Buffer* now, ID3D11Buffer* previous, UINT width, UINT height);
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
