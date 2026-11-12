@@ -11,7 +11,7 @@
 #include "upscaler_backend.h"
 #include "ngx_context.h"
 #include "config.h"
-#include "ui_composite_pass.h"
+#include "ui_layer.h"
 #include "ui.h"
 #include "jitter_logger.h"
 #include "jitter_debug_pass.h"
@@ -727,7 +727,6 @@ unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 ID3D11DeviceContext* motion_grid_context = nullptr;
 std::unique_ptr<edpe::MotionPass> motion_pass;
-std::unique_ptr<edpe::UiCompositePass> ui_composite_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
 UINT motion_snapshot_width = 0;
 UINT motion_snapshot_height = 0;
@@ -1565,6 +1564,7 @@ static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
     s_hud_mask_last_valid_frame = ~0ull;
     s_hud_mask_last_valid_draws = 0;
     s_hud_mask_coverage_pending_frame = ~0ull;
+    edpe::UiLayer::instance().shutdown();
     s_hud_mask_device = newDevice;
 }
 
@@ -1771,6 +1771,18 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
         device->CreateBlendState(&mbd, &s_hud_hdr_merge_blend);
     }
 
+    edpe::UiLayer::instance().initialize(device);
+    edpe::UiLayer::instance().resize(device, width, height);
+    if (edpe::UiLayer::instance().hdrLayerTexture()) {
+        s_hud_mask_texture = edpe::UiLayer::instance().hdrLayerTexture();
+        s_hud_mask_rtv = edpe::UiLayer::instance().hdrLayerRtv();
+        s_hud_mask_srv = edpe::UiLayer::instance().hdrLayerSrv();
+    }
+    if (edpe::UiLayer::instance().ldrLayerTexture()) {
+        s_hud_tonemapped_texture = edpe::UiLayer::instance().ldrLayerTexture();
+        s_hud_tonemapped_rtv = edpe::UiLayer::instance().ldrLayerRtv();
+        s_hud_tonemapped_srv = edpe::UiLayer::instance().ldrLayerSrv();
+    }
     s_hud_mask_width = width;
     s_hud_mask_height = height;
 
@@ -2514,20 +2526,25 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         ps_srv1_substituted = true;
     }
 
-    ID3D11RenderTargetView* mask = s_hud_mask_rtv.Get();
-    set_targets(context, 1, &mask, depth_to_bind);
-    const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    context->OMSetBlendState(blend_to_use, blend_factor, 0xFFFFFFFF);
+    restoreOrigVpAndScissor();
+    const float jitterX = (!cb1_substituted && s_jitter_injected_frame == motion_color_frame && ContextCensusIsJitterActive())
+        ? s_injected_jitter.pixelX : 0.0f;
+    const float jitterY = (!cb1_substituted && s_jitter_injected_frame == motion_color_frame && ContextCensusIsJitterActive())
+        ? s_injected_jitter.pixelY : 0.0f;
+    edpe::UiLayer::instance().beginIntercept(context, jitterX, jitterY, srcW, srcH, /*isHdr=*/true);
     if (depth_to_bind) {
+        ID3D11RenderTargetView* hdrRtv = edpe::UiLayer::instance().hdrLayerRtv();
+        set_targets(context, 1, &hdrRtv, depth_to_bind);
         ID3D11DepthStencilState* roDs = getHudReadOnlyDepthState(
             context, original_ds.Get(), origDsDesc, false);
         context->OMSetDepthStencilState(roDs, original_stencil_ref);
-    } else if (s_hud_mask_ds_state_no_depth) {
-        context->OMSetDepthStencilState(s_hud_mask_ds_state_no_depth.Get(), 0);
     }
+    const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    context->OMSetBlendState(blend_to_use, blend_factor, 0xFFFFFFFF);
     rearmHudDrawProbe(context);
 
     issueDraw();
+    edpe::UiLayer::instance().endIntercept(context);
     rearmHudDrawProbe(context);
     ++s_hud_draws_replayed_frame;
     ++s_diag_hud_replayed;
@@ -2536,7 +2553,6 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         if (cb1_substituted) ++stat->cb1_substituted;
     }
 
-    restoreOrigVpAndScissor();
     context->OMSetDepthStencilState(original_ds.Get(), original_stencil_ref);
     set_targets(context, 1, orig_rtvs, depth.Get());
     // When a redirected HUD panel draw also writes stencil (e.g., 0x04 stencil mask),
@@ -2985,142 +3001,45 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
         s_pause_menu_seen_frame = current_frame;
     }
 
-    // Pass 54 Post-Tonemap UI Occlusion (active ONLY when an in-cockpit modal/pause menu is open):
-    // Replay the alpha attenuation of modal menu backdrop/panel/card draws (C4B4B334 frosted shadow,
-    // A888D510 Starport Services / ESC Menu panels, 5DAD41AA curved mesh, 4EF6DDB0 multiply wash,
-    // 1E8D0137 widget cards) into s_hud_tonemapped_rtv.a (T_54 = prod(1 - alpha_54)) so
-    // UiCompositePass knows the exact hardware transmittance of Pass 54 even where both the 3D
-    // background (cLow) and the Pass 54 card/shadow (cGame) are dark, with zero overhead during gameplay.
-    const bool isPass54ModalBackdropOrCard =
-        (vs_hash == 0xC4B4B334B26E81A9ull ||
-         vs_hash == 0xA888D51024D9798Eull ||
-         vs_hash == 0x5DAD41AA66757CE3ull ||
-         vs_hash == 0x4EF6DDB075A927FAull ||
-         vs_hash == 0x1E8D013722FE71B8ull);
-    if (isPauseOrModalMenuActive(current_frame) && isPass54ModalBackdropOrCard &&
-        (s_verified_ldr_tonemap_frame == current_frame || s_post_ldr_backbuffer_bound) &&
-        s_hud_tonemapped_valid_frame == current_frame && s_hud_tonemapped_rtv &&
-        (s_hud_pass54_tone_atten_blend || s_hud_pass54_mul_wash_blend)) {
-        Microsoft::WRL::ComPtr<ID3D11BlendState> origBlend;
-        FLOAT origBlendFactor[4]{};
-        UINT origSampleMask = 0xFFFFFFFF;
-        context->OMGetBlendState(origBlend.GetAddressOf(), origBlendFactor, &origSampleMask);
-        D3D11_BLEND_DESC bd{};
-        if (origBlend) origBlend->GetDesc(&bd);
-        const D3D11_BLEND destBlend = bd.RenderTarget[0].DestBlend;
-        const bool isOverOrMulBlend =
-            origBlend && bd.RenderTarget[0].BlendEnable &&
-            (destBlend == D3D11_BLEND_INV_SRC_ALPHA || destBlend == D3D11_BLEND_SRC_COLOR);
-        if (isOverOrMulBlend) {
-            ID3D11RenderTargetView* origRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-            Microsoft::WRL::ComPtr<ID3D11DepthStencilView> origDsv;
-            context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, origDsv.GetAddressOf());
-            bool isPostToneTarget = false;
-            UINT rtvW = 0, rtvH = 0;
-            if (origRtvs[0]) {
-                Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
-                origRtvs[0]->GetResource(&rtvRes);
-                Microsoft::WRL::ComPtr<ID3D11Texture2D> postTex;
-                if (rtvRes && SUCCEEDED(rtvRes.As(&postTex)) && postTex) {
-                    D3D11_TEXTURE2D_DESC postDesc{};
-                    postTex->GetDesc(&postDesc);
-                    rtvW = postDesc.Width;
-                    rtvH = postDesc.Height;
-                    const UINT swapW = s_swapchain_width.load(std::memory_order_relaxed);
-                    const UINT swapH = s_swapchain_height.load(std::memory_order_relaxed);
-                    const UINT scW = s_observed_scene_width.load(std::memory_order_relaxed);
-                    const UINT scH = s_observed_scene_height.load(std::memory_order_relaxed);
-                    const bool isBackbufferRes =
-                        (rtvRes.Get() == s_swapchain_backbuffer.load(std::memory_order_relaxed));
-                    const bool isFullLdrScreen =
-                        (postDesc.SampleDesc.Count == 1 &&
-                         isLdrSceneColorFormat(postDesc.Format) &&
-                         postTex.Get() != scene_ldr_source.Get() &&
-                         ((swapW > 0 && rtvW == swapW && rtvH == swapH) ||
-                          (scW > 0 && rtvW == scW && rtvH == scH)));
-                    isPostToneTarget = isBackbufferRes || isFullLdrScreen;
-                }
+    // Pass 54 (2D UI / Menu): redirect post-tonemap 2D UI draws directly into LdrLayer (or MultLayer)
+    // on top of the tonemapped Cockpit HUD result using beginIntercept(..., isHdr = false).
+    if ((s_verified_ldr_tonemap_frame == current_frame || s_post_ldr_backbuffer_bound) &&
+        edpe::UiLayer::instance().shouldInterceptDraw(vs_hash, ps_hash, /*isHdrTarget=*/false)) {
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
+        context->OMGetRenderTargets(1, curRtv.GetAddressOf(), nullptr);
+        UINT rtvW = s_swapchain_width.load(std::memory_order_relaxed);
+        UINT rtvH = s_swapchain_height.load(std::memory_order_relaxed);
+        bool isPostToneTarget = false;
+        if (curRtv) {
+            Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
+            curRtv->GetResource(&rtvRes);
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> postTex;
+            if (rtvRes && SUCCEEDED(rtvRes.As(&postTex)) && postTex) {
+                D3D11_TEXTURE2D_DESC postDesc{};
+                postTex->GetDesc(&postDesc);
+                rtvW = postDesc.Width;
+                rtvH = postDesc.Height;
+                const UINT swapW = s_swapchain_width.load(std::memory_order_relaxed);
+                const UINT swapH = s_swapchain_height.load(std::memory_order_relaxed);
+                const UINT scW = s_observed_scene_width.load(std::memory_order_relaxed);
+                const UINT scH = s_observed_scene_height.load(std::memory_order_relaxed);
+                const bool isBackbufferRes =
+                    (rtvRes.Get() == s_swapchain_backbuffer.load(std::memory_order_relaxed));
+                const bool isFullLdrScreen =
+                    (postDesc.SampleDesc.Count == 1 &&
+                     isLdrSceneColorFormat(postDesc.Format) &&
+                     postTex.Get() != scene_ldr_source.Get() &&
+                     ((swapW > 0 && rtvW == swapW && rtvH == swapH) ||
+                      (scW > 0 && rtvW == scW && rtvH == scH)));
+                isPostToneTarget = isBackbufferRes || isFullLdrScreen;
             }
-            if (isPostToneTarget) {
-                const OMSetRenderTargetsFn rawSet = resolveOriginalOM(context);
-                ID3D11BlendState* attenBlend =
-                    (destBlend == D3D11_BLEND_SRC_COLOR)
-                        ? s_hud_pass54_mul_wash_blend.Get()
-                        : s_hud_pass54_tone_atten_blend.Get();
-                if (rawSet && attenBlend && rtvW > 0 && rtvH > 0 &&
-                    s_hud_mask_width > 0 && s_hud_mask_height > 0) {
-                    issueDraw();
-                    rearmHudDrawProbe(context);
-
-                    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> origDs;
-                    UINT origStencilRef = 0;
-                    context->OMGetDepthStencilState(origDs.GetAddressOf(), &origStencilRef);
-
-                    UINT numVps = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-                    D3D11_VIEWPORT origVps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-                    context->RSGetViewports(&numVps, origVps);
-                    UINT numScissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-                    D3D11_RECT origScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-                    context->RSGetScissorRects(&numScissors, origScissors);
-
-                    const float scaleX = static_cast<float>(s_hud_mask_width) / static_cast<float>(rtvW);
-                    const float scaleY = static_cast<float>(s_hud_mask_height) / static_cast<float>(rtvH);
-                    const bool needScale = (rtvW != s_hud_mask_width || rtvH != s_hud_mask_height);
-                    if (needScale && numVps > 0) {
-                        D3D11_VIEWPORT scaledVps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-                        for (UINT i = 0; i < numVps; ++i) {
-                            scaledVps[i] = origVps[i];
-                            scaledVps[i].TopLeftX *= scaleX;
-                            scaledVps[i].TopLeftY *= scaleY;
-                            scaledVps[i].Width *= scaleX;
-                            scaledVps[i].Height *= scaleY;
-                        }
-                        context->RSSetViewports(numVps, scaledVps);
-                    }
-                    if (needScale && numScissors > 0) {
-                        D3D11_RECT scaledScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-                        const LONG maxW = static_cast<LONG>(s_hud_mask_width);
-                        const LONG maxH = static_cast<LONG>(s_hud_mask_height);
-                        for (UINT i = 0; i < numScissors; ++i) {
-                            scaledScissors[i].left = std::clamp(static_cast<LONG>(std::lround(origScissors[i].left * scaleX)), 0L, maxW);
-                            scaledScissors[i].top = std::clamp(static_cast<LONG>(std::lround(origScissors[i].top * scaleY)), 0L, maxH);
-                            scaledScissors[i].right = std::clamp(static_cast<LONG>(std::lround(origScissors[i].right * scaleX)), 0L, maxW);
-                            scaledScissors[i].bottom = std::clamp(static_cast<LONG>(std::lround(origScissors[i].bottom * scaleY)), 0L, maxH);
-                        }
-                        context->RSSetScissorRects(numScissors, scaledScissors);
-                    }
-
-                    ID3D11RenderTargetView* toneRtv = s_hud_tonemapped_rtv.Get();
-                    rawSet(context, 1, &toneRtv, nullptr);
-                    if (s_hud_mask_ds_state_no_depth) {
-                        context->OMSetDepthStencilState(s_hud_mask_ds_state_no_depth.Get(), 0);
-                    }
-                    const FLOAT oneFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-                    context->OMSetBlendState(attenBlend, oneFactor, origSampleMask);
-
-                    issueDraw();
-                    rearmHudDrawProbe(context);
-                    s_hud_tonemapped_alpha_dirty = true;
-
-                    if (needScale) {
-                        context->RSSetViewports(numVps, origVps);
-                        if (numScissors > 0) {
-                            context->RSSetScissorRects(numScissors, origScissors);
-                        }
-                    }
-                    context->OMSetDepthStencilState(origDs.Get(), origStencilRef);
-                    context->OMSetBlendState(origBlend.Get(), origBlendFactor, origSampleMask);
-                    rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, origDsv.Get());
-                    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
-                        if (origRtvs[i]) origRtvs[i]->Release();
-                    }
-                    abandonAmortizedAndRearmHudProbe(context);
-                    return true;
-                }
-            }
-            for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
-                if (origRtvs[i]) origRtvs[i]->Release();
-            }
+        }
+        if (isPostToneTarget && rtvW > 0 && rtvH > 0) {
+            edpe::UiLayer::instance().beginIntercept(context, 0.0f, 0.0f, rtvW, rtvH, /*isHdr=*/false);
+            issueDraw();
+            edpe::UiLayer::instance().endIntercept(context);
+            abandonAmortizedAndRearmHudProbe(context);
+            return true;
         }
     }
 
@@ -3300,90 +3219,16 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
     issueDraw();
     rearmHudDrawProbe(context);
 
-    // 2. Re-issue the exact same Pass 52 Tonemap draw (with Auto-Exposure VS t0, 3D LUT PS t0,
-    //    Bloom pyramid PS t2, and cb2) for the native-resolution merged HDR (H_scene * T + L_hud)
-    //    into s_hud_tonemapped_rtv. Evaluating Pass 52 Tonemap on (H_scene * T + L_hud) with the
-    //    game's Bloom SRV intact avoids the E8948389 rational filmic curve's <0.0013 black-toe
-    //    crush on translucent HUD fills/holograms and preserves in-HUD bloom and 3D LUT grading.
-    const OMSetRenderTargetsFn rawSet = resolveOriginalOM(context);
-    if (rawSet && s_hud_tonemapped_rtv && s_hud_mask_srv && s_zero_hdr_srv &&
-        s_hud_mask_width > 0 && s_hud_mask_height > 0 &&
-        s_hud_tonemapped_valid_frame != current_frame) {
-        ID3D11ShaderResourceView* mergedHudHdrSrv =
-            buildHudMergedHdrScratchForBloom(context, hdrSlotRes.Get(), psSrvs[hdrSlot]);
-        ID3D11ShaderResourceView* hudToneSrcSrv =
-            mergedHudHdrSrv ? mergedHudHdrSrv : s_hud_mask_srv.Get();
-
-        ID3D11RenderTargetView* origRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-        Microsoft::WRL::ComPtr<ID3D11DepthStencilView> origDsv;
-        context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, origDsv.GetAddressOf());
-
-        Microsoft::WRL::ComPtr<ID3D11BlendState> origBlend;
-        FLOAT origBlendFactor[4]{};
-        UINT origSampleMask = 0xFFFFFFFF;
-        context->OMGetBlendState(origBlend.GetAddressOf(), origBlendFactor, &origSampleMask);
-
-        UINT numVps = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-        D3D11_VIEWPORT origVps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-        context->RSGetViewports(&numVps, origVps);
-        UINT numScissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-        D3D11_RECT origScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-        context->RSGetScissorRects(&numScissors, origScissors);
-
-        ID3D11ShaderResourceView* hudSrvs[8]{};
-        for (int i = 0; i < 8; ++i) {
-            if (i == hdrSlot) {
-                hudSrvs[i] = hudToneSrcSrv;
-            } else if (ps_hash == 0xDE65BFFF2F12ECC6ull && i == 1) {
-                // DoF 2 composite (DE65): replace DoF blur slot t1 with merged HUD+scene SRV so (1-f)*H + f*H = H
-                hudSrvs[i] = hudToneSrcSrv;
-            } else {
-                hudSrvs[i] = psSrvs[i];
-            }
-        }
-
-        Microsoft::WRL::ComPtr<ID3D11DepthStencilState> origToneDs;
-        UINT origToneStencilRef = 0;
-        context->OMGetDepthStencilState(origToneDs.GetAddressOf(), &origToneStencilRef);
-
-        ID3D11RenderTargetView* toneRtv = s_hud_tonemapped_rtv.Get();
-        if (s_hud_tonemapped_alpha_dirty || isPauseOrModalMenuActive(current_frame)) {
-            const float oneAlphaClear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            context->ClearRenderTargetView(toneRtv, oneAlphaClear);
-            s_hud_tonemapped_alpha_dirty = false;
-        }
-        const bool useEarlyZ =
-            (s_hud_earlyz_valid_frame == current_frame && s_hud_earlyz_dsv && s_hud_earlyz_test_ds);
-        rawSet(context, 1, &toneRtv, useEarlyZ ? s_hud_earlyz_dsv.Get() : nullptr);
-        if (useEarlyZ) {
-            context->OMSetDepthStencilState(s_hud_earlyz_test_ds.Get(), 0);
-        }
-        const D3D11_VIEWPORT hudVp{0.0f, 0.0f, static_cast<float>(s_hud_mask_width),
-                                   static_cast<float>(s_hud_mask_height),
-                                   useEarlyZ ? 0.5f : 0.0f, useEarlyZ ? 0.5f : 1.0f};
-        context->RSSetViewports(1, &hudVp);
-        const D3D11_RECT hudScissor{0, 0, static_cast<LONG>(s_hud_mask_width), static_cast<LONG>(s_hud_mask_height)};
-        context->RSSetScissorRects(1, &hudScissor);
-        const FLOAT oneFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-        context->OMSetBlendState(s_hud_tone_rgb_only_blend.Get(), oneFactor, 0xFFFFFFFF);
-        context->PSSetShaderResources(0, 8, hudSrvs);
-
-        issueDraw();
-        rearmHudDrawProbe(context);
-        s_hud_tonemapped_valid_frame = current_frame;
-
-        context->PSSetShaderResources(0, 8, psSrvs);
-        context->RSSetViewports(numVps, origVps);
-        if (numScissors > 0) {
-            context->RSSetScissorRects(numScissors, origScissors);
-        }
-        if (useEarlyZ) {
-            context->OMSetDepthStencilState(origToneDs.Get(), origToneStencilRef);
-        }
-        context->OMSetBlendState(origBlend.Get(), origBlendFactor, origSampleMask);
-        rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, origDsv.Get());
-        for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
-            if (origRtvs[i]) origRtvs[i]->Release();
+    // 2. Tonemap Re-issue: save game shader resources, re-issue tonemap with HdrLayer on slot t1
+    //    and output to LdrLayer (RGB channels), then transfer alpha from HdrLayer.a to LdrLayer.a.
+    if (s_hud_tonemapped_valid_frame != current_frame) {
+        Microsoft::WRL::ComPtr<ID3D11Buffer> gameExposureCb;
+        context->PSGetConstantBuffers(2, 1, gameExposureCb.GetAddressOf());
+        if (edpe::UiLayer::instance().beginTonemapReissue(context, psSrvs[0], gameExposureCb.Get())) {
+            issueDraw();
+            rearmHudDrawProbe(context);
+            edpe::UiLayer::instance().endTonemapReissue(context);
+            s_hud_tonemapped_valid_frame = current_frame;
         }
     }
 
@@ -3597,11 +3442,11 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
 }
 
 static inline bool isHudDrawInterceptWindowActive() {
+    if (g_is_evaluating_upscaler.load(std::memory_order_relaxed)) return false;
     if (motion_pair_active || draw_probe_active.load(std::memory_order_relaxed)) return true;
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) || s_upscale_evaluated_this_frame) return false;
     const auto cur = last_present_frame.load(std::memory_order_relaxed);
     if (s_hdr_slot0_seen_frame != cur) return false;
-    if (s_verified_ldr_tonemap_frame == cur && s_hud_draws_replayed_frame == 0) return false;
     return true;
 }
 
@@ -6031,6 +5876,8 @@ static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_comp_eval_srv;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_comp_eval_rtv;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_comp_final_tex;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_comp_final_rtv;
+static Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> s_comp_final_uav;
+static Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> s_backbuffer_uav;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dlaa_input;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dlaa_input_srv;
 static ID3D11Texture2D* s_direct_color_tex = nullptr;
@@ -6733,10 +6580,12 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_comp_eval_rtv.Reset();
         s_comp_final_tex.Reset();
         s_comp_final_rtv.Reset();
+        s_comp_final_uav.Reset();
         s_backbuffer_rtv.Reset();
+        s_backbuffer_uav.Reset();
         s_cached_backbuffer_ptr = nullptr;
         resetTemporalPathDebounce();
-        ui_composite_pass.reset();
+        edpe::UiLayer::instance().shutdown();
         resetHudMaskResources(nullptr);
         s_temporal_resources_device = device.Get();
     }
@@ -7157,15 +7006,46 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (s_cached_backbuffer_ptr != backbuffer || !s_backbuffer_rtv) {
             s_cached_backbuffer_ptr = backbuffer;
             s_backbuffer_rtv.Reset();
+            s_backbuffer_uav.Reset();
             device->CreateRenderTargetView(backbuffer, nullptr, &s_backbuffer_rtv);
+            if (backbufferDesc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
+                D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+                uavDesc.Format = bbFormat;
+                uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+                device->CreateUnorderedAccessView(backbuffer, &uavDesc, &s_backbuffer_uav);
+            }
+        }
+        if (!s_backbuffer_uav) {
+            if (s_comp_final_tex) {
+                D3D11_TEXTURE2D_DESC cur{};
+                s_comp_final_tex->GetDesc(&cur);
+                if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height ||
+                    cur.Format != bbFormat || !(cur.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) {
+                    s_comp_final_tex.Reset();
+                    s_comp_final_rtv.Reset();
+                    s_comp_final_uav.Reset();
+                }
+            }
+            if (!s_comp_final_tex) {
+                D3D11_TEXTURE2D_DESC td = backbufferDesc;
+                td.Format = bbFormat;
+                td.Usage = D3D11_USAGE_DEFAULT;
+                td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+                td.CPUAccessFlags = td.MiscFlags = 0;
+                if (SUCCEEDED(device->CreateTexture2D(&td, nullptr, &s_comp_final_tex))) {
+                    device->CreateRenderTargetView(s_comp_final_tex.Get(), nullptr, &s_comp_final_rtv);
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+                    uavDesc.Format = bbFormat;
+                    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+                    device->CreateUnorderedAccessView(s_comp_final_tex.Get(), &uavDesc, &s_comp_final_uav);
+                }
+            }
         }
 
         ID3D11Texture2D* evalDestination = s_dlss_output_texture ? s_dlss_output_texture.Get() : backbuffer;
 
         finalizeHudMaskForFrame(context, rendered);
 
-        // Copy backbuffer (containing post-tonemap 2D menus, ESC menu, Main Menu, and cursor drawn in Pass 53/54)
-        // to s_backbuffer_copy BEFORE any modification so UiCompositePass can extract 2D UI against s_dlaa_input.
         if (s_backbuffer_copy) {
             context->CopyResource(s_backbuffer_copy.Get(), backbuffer);
         }
@@ -7188,125 +7068,31 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_upscale_evaluated_this_frame = true;
             s_diag_eval_stage = 2;
 
-            // Always run UiCompositePass when colorSource != backbuffer (even if Preserve Native HUD is OFF)
-            // so Pass 53/54 2D menus (ESC Pause Menu, Main Menu, mouse cursor) drawn onto backbuffer after
-            // Pass 52 (scene_ldr_source) are extracted from s_backbuffer_copy_srv vs s_dlaa_input_srv and
-            // never overwritten by s_dlss_output_texture.
+            ID3D11UnorderedAccessView* targetUav = s_backbuffer_uav ? s_backbuffer_uav.Get() : s_comp_final_uav.Get();
             const bool canCompositeUi = (evalDestination == s_dlss_output_texture.Get() &&
-                                         s_dlss_output_srv && s_backbuffer_copy_srv &&
-                                         activeColorInputSrv && s_backbuffer_rtv &&
+                                         s_dlss_output_srv && targetUav &&
                                          colorSource != backbuffer);
             s_diag_composite_path = canCompositeUi ? 1 : 2;
-            if (!canCompositeUi) {
-                static unsigned long long s_nocomp_log = ~0ull;
-                if (s_nocomp_log == ~0ull || frame >= s_nocomp_log + 300) {
-                    s_nocomp_log = frame;
-                    wchar_t cmsg[256];
-                    swprintf_s(cmsg,
-                        L"EDPE: UI composite disabled frame=%llu preserveUi=%d evalToIntermediate=%d dlssSrv=%d bbCopySrv=%d inputSrv=%d bbRtv=%d srcIsBackbuffer=%d",
-                        frame, s_preserve_native_ui.load(std::memory_order_relaxed) ? 1 : 0,
-                        evalDestination == s_dlss_output_texture.Get() ? 1 : 0,
-                        s_dlss_output_srv ? 1 : 0, s_backbuffer_copy_srv ? 1 : 0,
-                        s_dlaa_input_srv ? 1 : 0, s_backbuffer_rtv ? 1 : 0,
-                        colorSource == backbuffer ? 1 : 0);
-                    EdpeLog(cmsg);
-                }
-            }
-            ID3D11ShaderResourceView* validHudSrv = nullptr;
-            ID3D11ShaderResourceView* validHudTonemappedSrv = nullptr;
             if (canCompositeUi) {
-                if (!ui_composite_pass) {
-                    auto comp = std::make_unique<edpe::UiCompositePass>();
-                    if (comp->initialize(device.Get(), context)) {
-                        ui_composite_pass = std::move(comp);
-                    }
+                edpe::UiLayer::instance().initialize(device.Get());
+                edpe::UiLayer::instance().resize(device.Get(), backbufferDesc.Width, backbufferDesc.Height);
+                compOk = edpe::UiLayer::instance().composite(
+                    context,
+                    s_dlss_output_srv.Get(),
+                    targetUav,
+                    backbufferDesc.Width,
+                    backbufferDesc.Height,
+                    s_hud_debug_view.load(std::memory_order_relaxed));
+                if (compOk && targetUav == s_comp_final_uav.Get() && s_comp_final_tex) {
+                    context->CopyResource(backbuffer, s_comp_final_tex.Get());
                 }
-                if (ui_composite_pass) {
-                    const bool hudMergedIntoSceneThisFrame =
-                        (s_hud_merged_into_main_hdr_frame == rendered) ||
-                        (s_pause_menu_seen_frame != ~0ull && rendered <= s_pause_menu_seen_frame + 1 &&
-                         s_hud_draws_replayed_frame == 0);
-                    const bool preserveHudActive =
-                        (s_preserve_native_ui.load(std::memory_order_relaxed) ||
-                         s_hud_debug_view.load(std::memory_order_relaxed) ||
-                         s_jitter_debug_view.load(std::memory_order_relaxed)) &&
-                        !hudMergedIntoSceneThisFrame;
-                    ID3D11ShaderResourceView* hudSrvToUse = nullptr;
-                    ID3D11ShaderResourceView* hudTonemappedSrvToUse = nullptr;
-                    s_diag_hud_mask_w = s_hud_mask_width;
-                    if (preserveHudActive) {
-                        s_diag_hud_src = (s_hud_draws_replayed_frame > 0 && s_hud_mask_srv) ? 1 : 0;
-                        if (s_hud_draws_replayed_frame > 0 && s_hud_mask_srv) {
-                            hudSrvToUse = s_hud_mask_srv.Get();
-                            if (s_hud_tonemapped_srv &&
-                                (s_hud_tonemapped_valid_frame == rendered ||
-                                 (s_hud_tonemapped_last_valid_frame != ~0ull &&
-                                  rendered >= s_hud_tonemapped_last_valid_frame &&
-                                  rendered - s_hud_tonemapped_last_valid_frame <= 2))) {
-                                hudTonemappedSrvToUse = s_hud_tonemapped_srv.Get();
-                            }
-                        }
-                    } else {
-                        s_diag_hud_src = (s_pause_menu_seen_frame != ~0ull && rendered <= s_pause_menu_seen_frame + 1) ? 3 : 0;
-                    }
-                    const bool hudSizeOk =
-                        (s_hud_mask_width == backbufferDesc.Width || s_hud_mask_width == depthDesc.Width);
-                    validHudSrv =
-                        (hudSrvToUse && hudSizeOk) ? hudSrvToUse : nullptr;
-                    validHudTonemappedSrv =
-                        (validHudSrv && hudTonemappedSrvToUse) ? hudTonemappedSrvToUse : nullptr;
-
-                    compOk = ui_composite_pass->composite(context,
-                        s_dlss_output_srv.Get(),
-                        s_backbuffer_copy_srv.Get(),
-                        activeColorInputSrv,
-                        validHudSrv,
-                        s_backbuffer_rtv.Get(),
-                        backbufferDesc.Width, backbufferDesc.Height,
-                        depthDesc.Width, depthDesc.Height,
-                        isHdrColor,
-                        /*preserveUi=*/true,
-                        validHudTonemappedSrv);
-                }
-                if (compOk) {
-                    static unsigned long long s_comp_log = ~0ull;
-                    if (edpe::Config::instance().devMode && s_comp_log != frame && (s_comp_log == ~0ull || frame % 300 == 0)) {
-                        s_comp_log = frame;
-                        wchar_t cmsg[192];
-                        swprintf_s(cmsg, L"EDPE: UI composited frame=%llu render=%ux%u output=%ux%u (%ls, %ls)",
-                            frame, depthDesc.Width, depthDesc.Height, backbufferDesc.Width, backbufferDesc.Height,
-                            isSubNative ? L"Super Resolution" : L"Native Resolution",
-                            isHdrColor ? L"HDR" : L"LDR");
-                        EdpeLog(cmsg);
-                    }
-                    } else if (!isHdrColor) {
+                if (!compOk && !isHdrColor) {
                     context->CopyResource(backbuffer, s_dlss_output_texture.Get());
                     compOk = true;
                 }
             } else if (evalDestination == s_dlss_output_texture.Get()) {
-                if (!isHdrColor) {
-                    context->CopyResource(backbuffer, s_dlss_output_texture.Get());
-                    compOk = true;
-                } else {
-                    if (!ui_composite_pass) {
-                        auto comp = std::make_unique<edpe::UiCompositePass>();
-                        if (comp->initialize(device.Get(), context)) {
-                            ui_composite_pass = std::move(comp);
-                        }
-                    }
-                    if (ui_composite_pass) {
-                        compOk = ui_composite_pass->composite(context,
-                            s_dlss_output_srv.Get(),
-                            nullptr,
-                            nullptr,
-                            nullptr,
-                            s_backbuffer_rtv.Get(),
-                            backbufferDesc.Width, backbufferDesc.Height,
-                            depthDesc.Width, depthDesc.Height,
-                            /*isHdr=*/true,
-                            /*preserveUi=*/false);
-                    }
-                }
+                context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                compOk = true;
             } else {
                 compOk = true;
             }
@@ -7317,54 +7103,21 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 if (s_cmp_seq.warmFrames > 0) {
                     --s_cmp_seq.warmFrames;
                 } else {
-                    // Capture "Before" (scene before reconstruction) and the reconstructed frame
-                    // (already in `backbuffer`, with native UI composited when active).
                     const auto activeBackend = upscaler.getBackend();
                     const wchar_t* activeName = cmpBackendName(activeBackend);
                     SYSTEMTIME captureTime{};
                     GetLocalTime(&captureTime);
                     if (s_backbuffer_copy) {
                         ID3D11Texture2D* beforeTex = s_backbuffer_copy.Get();
-                        // Because Pass 35 Cockpit HUD draws are redirected out of the game's HDR target into
-                        // s_hud_mask_srv, s_backbuffer_copy is missing the separated Pass 35 HUD. Composite
-                        // validHudSrv onto s_backbuffer_copy_srv into s_comp_final_tex so "Before-<Backend>"
-                        // screenshots show the complete pre-reconstruction frame with the Cockpit HUD intact.
-                        if (validHudSrv && ui_composite_pass && s_backbuffer_copy_srv && s_dlaa_input_srv) {
-                            if (s_comp_final_tex) {
-                                D3D11_TEXTURE2D_DESC cur{};
-                                s_comp_final_tex->GetDesc(&cur);
-                                if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height ||
-                                    cur.Format != bbFormat) {
-                                    s_comp_final_tex.Reset();
-                                    s_comp_final_rtv.Reset();
-                                }
-                            }
-                            if (!s_comp_final_tex) {
-                                D3D11_TEXTURE2D_DESC td = backbufferDesc;
-                                td.Format = bbFormat;
-                                td.Usage = D3D11_USAGE_DEFAULT;
-                                td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-                                td.CPUAccessFlags = td.MiscFlags = 0;
-                                if (FAILED(device->CreateTexture2D(&td, nullptr, &s_comp_final_tex)) ||
-                                    FAILED(device->CreateRenderTargetView(s_comp_final_tex.Get(), nullptr, &s_comp_final_rtv))) {
-                                    s_comp_final_tex.Reset();
-                                    s_comp_final_rtv.Reset();
-                                }
-                            }
-                            if (s_comp_final_tex && s_comp_final_rtv &&
-                                ui_composite_pass->composite(context,
-                                    s_backbuffer_copy_srv.Get(),
-                                    s_backbuffer_copy_srv.Get(),
-                                    s_dlaa_input_srv.Get(),
-                                    validHudSrv,
-                                    s_comp_final_rtv.Get(),
-                                    backbufferDesc.Width, backbufferDesc.Height,
-                                    depthDesc.Width, depthDesc.Height,
-                                    /*isHdr=*/false,
-                                    /*preserveUi=*/true,
-                                    validHudTonemappedSrv)) {
-                                beforeTex = s_comp_final_tex.Get();
-                            }
+                        if (s_backbuffer_copy_srv && s_comp_final_tex && s_comp_final_uav &&
+                            edpe::UiLayer::instance().composite(
+                                context,
+                                s_backbuffer_copy_srv.Get(),
+                                s_comp_final_uav.Get(),
+                                backbufferDesc.Width,
+                                backbufferDesc.Height,
+                                false)) {
+                            beforeTex = s_comp_final_tex.Get();
                         }
                         wchar_t beforeName[48];
                         swprintf_s(beforeName, L"Before-%ls", activeName);
@@ -7958,8 +7711,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                     }
                 }
                 if (s_hud_mask_rtv && !s_hud_mask_cleared_for_frame) {
-                    const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-                    context->ClearRenderTargetView(s_hud_mask_rtv.Get(), clearColor);
+                    edpe::UiLayer::instance().beginFrame(context);
                     s_hud_mask_cleared_for_frame = true;
                     s_hud_depth_stencil_seeded = false;
                     s_hud_depth_only_seeded = false;
@@ -9660,6 +9412,8 @@ void ContextCensusOnResize(IDXGISwapChain* swap_chain) {
     std::lock_guard<std::recursive_mutex> sceneLock(g_scene_ctx_mutex);
     std::lock_guard lock(seen_mutex);
     s_backbuffer_rtv.Reset();
+    s_backbuffer_uav.Reset();
+    s_comp_final_uav.Reset();
     s_cached_backbuffer_ptr = nullptr;
     s_debug_backbuffer_rtv.Reset();
     s_debug_cached_backbuffer = nullptr;
@@ -9733,7 +9487,8 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_hud_debug_cached_backbuffer = nullptr;
         s_first_hud_draw_logged = false;
         resetHudMaskResources(nullptr);
-        ui_composite_pass.reset();
+        s_backbuffer_uav.Reset();
+        s_comp_final_uav.Reset();
         resetSharedBackbufferBridge();
         s_last_final_output_present.Reset();
         s_last_reconstructed_output.Reset();
