@@ -96,52 +96,47 @@ as four mostly duplicated systems.
 
 Instead use shared EDPE-produced temporal inputs:
 
-```text
-                       Elite Dangerous
-                              |
-                              v
-                       EDPE renderer hooks
-                              |
-             +----------------+----------------+
-             |                |                |
-             v                v                v
-           Color            Depth        Camera/Projection
-                                              |
-                                              v
-                                      Projection jitter
-                                              |
-                                              v
-                                      Motion generation
-                                              |
-                       +----------------------+
-                       |
-                       v
-                        TemporalFrameInputs
-                                 |
-              +---------+--------+--------+---------+
-              |                  |                  |
-              v                  v                  v
-         NVIDIA DLSS          AMD FSR           Intel XeSS
-         (DLAA / SR)       (NativeAA / SR)    (NativeAA / SR)
-              |                  |                  |
-              +---------+--------+--------+---------+
-                       |
-                       v
-              Native-res scene
-                       |
-                       v
-                  UI/HUD stage
-                       |
-                       v
-             Frame Generation layer
-             |                   |
-             v                   v
-       NVIDIA DLSS-G         AMD FSR FG
-             |                   |
-             +---------+---------+
-                       |
-                       v
-                    Present
+```mermaid
+flowchart TD
+    ED["Elite Dangerous"] --> Hooks["EDPE renderer hooks"]
+    Hooks --> Color["Scene Color"]
+    Hooks --> Depth["Scene Depth"]
+    Hooks --> Cam["Camera / Projection"]
+
+    Cam --> Jitter["Projection jitter"]
+    Jitter --> Motion["Motion generation"]
+    Color --> Inputs["TemporalFrameInputs"]
+    Depth --> Inputs
+    Motion --> Inputs
+
+    subgraph Upscalers ["Temporal Reconstruction Backends"]
+        DLSS["NVIDIA DLSS<br/>(DLAA / SR)"]
+        FSR["AMD FSR<br/>(Native AA / SR)"]
+        XeSS["Intel XeSS<br/>(Native AA / SR)"]
+    end
+
+    Inputs --> DLSS
+    Inputs --> FSR
+    Inputs --> XeSS
+
+    DLSS --> NativeScene["Native-res scene"]
+    FSR --> NativeScene
+    XeSS --> NativeScene
+
+    NativeScene --> UI["UI / HUD stage"]
+    UI --> FGLayer{"Frame Generation layer"}
+
+    subgraph FG ["Frame Generation Backends"]
+        DLSSG["NVIDIA DLSS-G"]
+        FSRFG["AMD FSR FG"]
+    end
+
+    FGLayer --> DLSSG
+    FGLayer --> FSRFG
+
+    DLSSG --> Present["Present"]
+    FSRFG --> Present
+    FGLayer -- "FG Off" --> Present
 ```
 
 Depth, motion, jitter and camera reconstruction belong to **EDPE**, not to an individual vendor backend.
@@ -306,22 +301,14 @@ Frame Generation is a later research phase.
 
 Likely architecture:
 
-```text
-Elite D3D11
-     |
-     v
-EDPE D3D11 interception
-     |
-     +--> temporal reconstruction
-     |
-     v
-D3D11 / D3D12 shared resources
-     |
-     v
-D3D12 presentation / FG bridge
-     |
-     v
-FG swapchain / presentation path
+```mermaid
+flowchart TD
+    ED["Elite D3D11"] --> Hook["EDPE D3D11 interception"]
+    Hook --> SR["Temporal Reconstruction<br/>(DLAA / DLSS / FSR / TAA)"]
+    SR --> Shared["D3D11 / D3D12 shared resources<br/>(Keyed Mutex / Shared NT Handles)"]
+    Hook -.-> Shared
+    Shared --> Bridge["D3D12 presentation / FG bridge"]
+    Bridge --> Swapchain["FG swapchain / presentation path"]
 ```
 
 Possible technologies to investigate:
@@ -643,18 +630,13 @@ Investigate a D3D11 -> D3D12 interoperability layer that permits use of the curr
 
 Possible architecture:
 
-```text
-Elite D3D11 resources
-        |
-shared resources
-        |
-D3D12 EDPE device
-        |
-FidelityFX API
-        |
-D3D12 output
-        |
-shared back to D3D11
+```mermaid
+flowchart TD
+    D11["Elite D3D11 resources"] --> Shared["Shared resources<br/>(Keyed Mutex)"]
+    Shared --> D12Device["D3D12 EDPE device"]
+    D12Device --> FFX["FidelityFX API<br/>(FSR 3.1.x)"]
+    FFX --> D12Out["D3D12 output"]
+    D12Out --> BackD11["Shared back to D3D11"]
 ```
 
 Advantages:
@@ -754,16 +736,12 @@ Evaluate two primary implementation routes:
 
 Leverage the Phase 13 shared resource infrastructure:
 
-```text
-Elite D3D11 render targets (Color, Depth, Motion)
-         |
-shared NT handles / key-mutex synchronization
-         |
-EDPE D3D12 device & command queue
-         |
-libxess execution (xessD3D12Execute)
-         |
-shared back to D3D11 swapchain backbuffer
+```mermaid
+flowchart TD
+    Targets["Elite D3D11 render targets<br/>(Color, Depth, Motion)"] --> Sync["Shared NT handles / Keyed Mutex synchronization"]
+    Sync --> D12Queue["EDPE D3D12 device & command queue"]
+    D12Queue --> XeSS["libxess execution<br/>(xessD3D12Execute)"]
+    XeSS --> Backbuffer["Shared back to D3D11 swapchain backbuffer"]
 ```
 
 Advantages:
@@ -892,28 +870,16 @@ For Frame Generation it becomes a much more important requirement.
 
 Target pipeline:
 
-```text
-LOW-RES WORLD
-      |
-      v
-TEMPORAL UPSCALER
-      |
-      v
-NATIVE-RES HUD-LESS WORLD
-      |
-      +---------------------+
-      |                     |
-      v                     v
-    FG INPUT             UI LAYER
-      |
-      v
-GENERATED / REAL FRAME
-      |
-      v
-UI COMPOSITION
-      |
-      v
-PRESENT
+```mermaid
+flowchart TD
+    LowRes["LOW-RES WORLD"] --> Upscaler["TEMPORAL UPSCALER"]
+    Upscaler --> HudLess["NATIVE-RES HUD-LESS WORLD"]
+    HudLess --> FGInput["FG INPUT"]
+    HudLess --> UILayer["UI LAYER"]
+    FGInput --> GenFrame["GENERATED / REAL FRAME"]
+    GenFrame --> UIComp["UI COMPOSITION"]
+    UILayer --> UIComp
+    UIComp --> Present["PRESENT"]
 ```
 
 Do not enable production FG until EDPE can correctly distinguish world content from the HUD or otherwise provide the vendor API's supported UI handling mode.
@@ -1618,16 +1584,13 @@ before deciding which is the production EDPE AMD path.
 
 Target architecture:
 
-```text
-low-res world
-     |
-  upscale
-     |
-native-res world
-     |
-native-res HUD (`UiCompositePass`)
-     |
-  Present
+```mermaid
+flowchart TD
+    LowRes["Low-res 3D World"] --> Upscale["Upscale<br/>(DLAA / DLSS / FSR / TAA)"]
+    Upscale --> NativeWorld["Native-res 3D World"]
+    NativeWorld --> Composite["Native-res HUD Composite<br/>(`UiCompositePass`)"]
+    HUDMask["Cockpit HUD Mask<br/>(`s_hud_mask_texture`)"] --> Composite
+    Composite --> Present["Present"]
 ```
 
 Elite's cockpit HUD, text, holograms, and menus are isolated from the scene LDR buffer and composited at native presentation resolution:
@@ -1967,29 +1930,15 @@ Key architectural requirements and technical execution:
 ### 2. Render Pipeline & Hook Execution Ordering
 The execution order between EDPE and third-party tools is mathematically critical to image quality:
 
-```text
-Game Scene Draw Calls (Low-Res 3D World)
-                 │
-                 ▼
-EDPE Latches Scene Color, Depth (DSV #2), Camera Constants & Jitter
-                 │
-                 ▼
-EDHM / 3Dmigoto Shaders Modify Cockpit & HUD Elements
-                 │
-                 ▼
-EDPE Temporal Reconstruction (DLSS / FSR / XeSS) Evaluates 3D World
-                 │
-                 ▼
-EDPE UiCompositePass Composites Native-Res Cockpit/UI over Reconstructed World
-                 │
-                 ▼
-ReShade Post-Processing Pass (Color Grading, Bloom, CRT, Sharpening)
-                 │
-                 ▼
-EDPE Dear ImGui & ReShade Overlays
-                 │
-                 ▼
-IDXGISwapChain::Present
+```mermaid
+flowchart TD
+    Scene["Game Scene Draw Calls<br/>(Low-Res 3D World)"] --> Latch["EDPE Latches Scene Color, Depth (DSV #2),<br/>Camera Constants & Jitter"]
+    Latch --> EDHM["EDHM / 3Dmigoto Shaders Modify Cockpit & HUD Elements"]
+    EDHM --> Reconstruct["EDPE Temporal Reconstruction (DLSS / FSR / XeSS)<br/>Evaluates 3D World"]
+    Reconstruct --> UIComp["EDPE UiCompositePass Composites Native-Res Cockpit/UI<br/>over Reconstructed World"]
+    UIComp --> ReShade["ReShade Post-Processing Pass<br/>(Color Grading, Bloom, CRT, Sharpening)"]
+    ReShade --> Overlay["EDPE Dear ImGui & ReShade Overlays"]
+    Overlay --> Present["IDXGISwapChain::Present"]
 ```
 
 - **Post-Upscale ReShade Execution:**
