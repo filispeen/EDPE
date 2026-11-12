@@ -11,7 +11,6 @@
 #include "upscaler_backend.h"
 #include "ngx_context.h"
 #include "config.h"
-#include "ui_composite_pass.h"
 #include "ui_layer.h"
 #include "ui.h"
 #include "jitter_logger.h"
@@ -728,7 +727,6 @@ unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 ID3D11DeviceContext* motion_grid_context = nullptr;
 std::unique_ptr<edpe::MotionPass> motion_pass;
-std::unique_ptr<edpe::UiCompositePass> ui_composite_pass;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
 UINT motion_snapshot_width = 0;
 UINT motion_snapshot_height = 0;
@@ -1567,7 +1565,6 @@ static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
     s_hud_mask_last_valid_draws = 0;
     s_hud_mask_coverage_pending_frame = ~0ull;
     edpe::UiLayer::instance().shutdown();
-    ui_composite_pass.reset();
     s_hud_mask_device = newDevice;
 }
 
@@ -3002,6 +2999,48 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
          (vs_hash == 0x4EF6DDB075A927FAull));
     if (isModalOrEscMenuDraw) {
         s_pause_menu_seen_frame = current_frame;
+    }
+
+    // Pass 54 (2D UI / Menu): redirect post-tonemap 2D UI draws directly into LdrLayer (or MultLayer)
+    // on top of the tonemapped Cockpit HUD result using beginIntercept(..., isHdr = false).
+    if ((s_verified_ldr_tonemap_frame == current_frame || s_post_ldr_backbuffer_bound) &&
+        edpe::UiLayer::instance().shouldInterceptDraw(vs_hash, ps_hash, /*isHdrTarget=*/false)) {
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
+        context->OMGetRenderTargets(1, curRtv.GetAddressOf(), nullptr);
+        UINT rtvW = s_swapchain_width.load(std::memory_order_relaxed);
+        UINT rtvH = s_swapchain_height.load(std::memory_order_relaxed);
+        bool isPostToneTarget = false;
+        if (curRtv) {
+            Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
+            curRtv->GetResource(&rtvRes);
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> postTex;
+            if (rtvRes && SUCCEEDED(rtvRes.As(&postTex)) && postTex) {
+                D3D11_TEXTURE2D_DESC postDesc{};
+                postTex->GetDesc(&postDesc);
+                rtvW = postDesc.Width;
+                rtvH = postDesc.Height;
+                const UINT swapW = s_swapchain_width.load(std::memory_order_relaxed);
+                const UINT swapH = s_swapchain_height.load(std::memory_order_relaxed);
+                const UINT scW = s_observed_scene_width.load(std::memory_order_relaxed);
+                const UINT scH = s_observed_scene_height.load(std::memory_order_relaxed);
+                const bool isBackbufferRes =
+                    (rtvRes.Get() == s_swapchain_backbuffer.load(std::memory_order_relaxed));
+                const bool isFullLdrScreen =
+                    (postDesc.SampleDesc.Count == 1 &&
+                     isLdrSceneColorFormat(postDesc.Format) &&
+                     postTex.Get() != scene_ldr_source.Get() &&
+                     ((swapW > 0 && rtvW == swapW && rtvH == swapH) ||
+                      (scW > 0 && rtvW == scW && rtvH == scH)));
+                isPostToneTarget = isBackbufferRes || isFullLdrScreen;
+            }
+        }
+        if (isPostToneTarget && rtvW > 0 && rtvH > 0) {
+            edpe::UiLayer::instance().beginIntercept(context, 0.0f, 0.0f, rtvW, rtvH, /*isHdr=*/false);
+            issueDraw();
+            edpe::UiLayer::instance().endIntercept(context);
+            abandonAmortizedAndRearmHudProbe(context);
+            return true;
+        }
     }
 
     if (s_hdr_slot0_seen_frame != current_frame || s_verified_ldr_tonemap_frame == current_frame) {
@@ -6221,7 +6260,10 @@ void finalizeHudMaskForFrame(ID3D11DeviceContext* context, unsigned long long cu
     s_hud_mask_finalized_frame = cur_rendered;
 
     if (!s_hud_mask_cleared_for_frame || s_hud_draws_replayed_frame == 0) {
-        edpe::UiLayer::instance().beginFrame(context);
+        if (!s_hud_mask_cleared_for_frame) {
+            const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            context->ClearRenderTargetView(s_hud_mask_rtv.Get(), clearColor);
+        }
         s_hud_draws_replayed_frame = 0;
         hud_first_match_seen = false;
         s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
@@ -7026,81 +7068,30 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_upscale_evaluated_this_frame = true;
             s_diag_eval_stage = 2;
 
-            ID3D11RenderTargetView* targetRtv = s_backbuffer_rtv ? s_backbuffer_rtv.Get() : s_comp_final_rtv.Get();
+            ID3D11UnorderedAccessView* targetUav = s_backbuffer_uav ? s_backbuffer_uav.Get() : s_comp_final_uav.Get();
             const bool canCompositeUi = (evalDestination == s_dlss_output_texture.Get() &&
-                                         s_dlss_output_srv && s_backbuffer_copy_srv &&
-                                         activeColorInputSrv && targetRtv &&
+                                         s_dlss_output_srv && targetUav &&
                                          colorSource != backbuffer);
             s_diag_composite_path = canCompositeUi ? 1 : 2;
-            ID3D11ShaderResourceView* validHudSrv = nullptr;
-            ID3D11ShaderResourceView* validHudTonemappedSrv = nullptr;
             if (canCompositeUi) {
-                if (!ui_composite_pass) {
-                    auto comp = std::make_unique<edpe::UiCompositePass>();
-                    if (comp->initialize(device.Get(), context)) {
-                        ui_composite_pass = std::move(comp);
-                    }
-                }
-                if (ui_composite_pass) {
-                    const bool hudMergedIntoSceneThisFrame =
-                        (s_hud_merged_into_main_hdr_frame == rendered) ||
-                        (s_pause_menu_seen_frame != ~0ull && rendered <= s_pause_menu_seen_frame + 1 &&
-                         s_hud_draws_replayed_frame == 0);
-                    const bool preserveHudActive =
-                        (s_preserve_native_ui.load(std::memory_order_relaxed) ||
-                         s_hud_debug_view.load(std::memory_order_relaxed) ||
-                         s_jitter_debug_view.load(std::memory_order_relaxed)) &&
-                        !hudMergedIntoSceneThisFrame;
-                    ID3D11ShaderResourceView* hudSrvToUse = nullptr;
-                    ID3D11ShaderResourceView* hudTonemappedSrvToUse = nullptr;
-                    s_diag_hud_mask_w = s_hud_mask_width;
-                    if (preserveHudActive) {
-                        s_diag_hud_src = (s_hud_draws_replayed_frame > 0 && s_hud_mask_srv) ? 1 : 0;
-                        if (s_hud_draws_replayed_frame > 0 && s_hud_mask_srv) {
-                            hudSrvToUse = s_hud_mask_srv.Get();
-                            if (s_hud_tonemapped_srv &&
-                                (s_hud_tonemapped_valid_frame == rendered ||
-                                 (s_hud_tonemapped_last_valid_frame != ~0ull &&
-                                  rendered >= s_hud_tonemapped_last_valid_frame &&
-                                  rendered - s_hud_tonemapped_last_valid_frame <= 2))) {
-                                hudTonemappedSrvToUse = s_hud_tonemapped_srv.Get();
-                            }
-                        }
-                    } else {
-                        s_diag_hud_src = (s_pause_menu_seen_frame != ~0ull && rendered <= s_pause_menu_seen_frame + 1) ? 3 : 0;
-                    }
-                    const bool hudSizeOk =
-                        (s_hud_mask_width == backbufferDesc.Width || s_hud_mask_width == depthDesc.Width);
-                    validHudSrv =
-                        (hudSrvToUse && hudSizeOk) ? hudSrvToUse : nullptr;
-                    validHudTonemappedSrv =
-                        (validHudSrv && hudTonemappedSrvToUse) ? hudTonemappedSrvToUse : nullptr;
-
-                    compOk = ui_composite_pass->composite(context,
-                        s_dlss_output_srv.Get(),
-                        s_backbuffer_copy_srv.Get(),
-                        activeColorInputSrv,
-                        validHudSrv,
-                        targetRtv,
-                        backbufferDesc.Width, backbufferDesc.Height,
-                        depthDesc.Width, depthDesc.Height,
-                        isHdrColor,
-                        /*preserveUi=*/true,
-                        validHudTonemappedSrv);
-                    if (compOk && targetRtv == s_comp_final_rtv.Get() && s_comp_final_tex) {
-                        context->CopyResource(backbuffer, s_comp_final_tex.Get());
-                    }
+                edpe::UiLayer::instance().initialize(device.Get());
+                edpe::UiLayer::instance().resize(device.Get(), backbufferDesc.Width, backbufferDesc.Height);
+                compOk = edpe::UiLayer::instance().composite(
+                    context,
+                    s_dlss_output_srv.Get(),
+                    targetUav,
+                    backbufferDesc.Width,
+                    backbufferDesc.Height,
+                    s_hud_debug_view.load(std::memory_order_relaxed));
+                if (compOk && targetUav == s_comp_final_uav.Get() && s_comp_final_tex) {
+                    context->CopyResource(backbuffer, s_comp_final_tex.Get());
                 }
                 if (!compOk && !isHdrColor) {
-                    if (colorSource != backbuffer && s_pause_menu_seen_frame != rendered) {
-                        context->CopyResource(backbuffer, s_dlss_output_texture.Get());
-                    }
+                    context->CopyResource(backbuffer, s_dlss_output_texture.Get());
                     compOk = true;
                 }
             } else if (evalDestination == s_dlss_output_texture.Get()) {
-                if (colorSource != backbuffer && s_pause_menu_seen_frame != rendered) {
-                    context->CopyResource(backbuffer, s_dlss_output_texture.Get());
-                }
+                context->CopyResource(backbuffer, s_dlss_output_texture.Get());
                 compOk = true;
             } else {
                 compOk = true;
@@ -7118,42 +7109,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     GetLocalTime(&captureTime);
                     if (s_backbuffer_copy) {
                         ID3D11Texture2D* beforeTex = s_backbuffer_copy.Get();
-                        if (validHudSrv && ui_composite_pass && s_backbuffer_copy_srv && s_dlaa_input_srv) {
-                            if (s_comp_final_tex) {
-                                D3D11_TEXTURE2D_DESC cur{};
-                                s_comp_final_tex->GetDesc(&cur);
-                                if (cur.Width != backbufferDesc.Width || cur.Height != backbufferDesc.Height ||
-                                    cur.Format != bbFormat) {
-                                    s_comp_final_tex.Reset();
-                                    s_comp_final_rtv.Reset();
-                                }
-                            }
-                            if (!s_comp_final_tex) {
-                                D3D11_TEXTURE2D_DESC td = backbufferDesc;
-                                td.Format = bbFormat;
-                                td.Usage = D3D11_USAGE_DEFAULT;
-                                td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-                                td.CPUAccessFlags = td.MiscFlags = 0;
-                                if (FAILED(device->CreateTexture2D(&td, nullptr, &s_comp_final_tex)) ||
-                                    FAILED(device->CreateRenderTargetView(s_comp_final_tex.Get(), nullptr, &s_comp_final_rtv))) {
-                                    s_comp_final_tex.Reset();
-                                    s_comp_final_rtv.Reset();
-                                }
-                            }
-                            if (s_comp_final_tex && s_comp_final_rtv &&
-                                ui_composite_pass->composite(context,
-                                    s_backbuffer_copy_srv.Get(),
-                                    s_backbuffer_copy_srv.Get(),
-                                    s_dlaa_input_srv.Get(),
-                                    validHudSrv,
-                                    s_comp_final_rtv.Get(),
-                                    backbufferDesc.Width, backbufferDesc.Height,
-                                    depthDesc.Width, depthDesc.Height,
-                                    /*isHdr=*/false,
-                                    /*preserveUi=*/true,
-                                    validHudTonemappedSrv)) {
-                                beforeTex = s_comp_final_tex.Get();
-                            }
+                        if (s_backbuffer_copy_srv && s_comp_final_tex && s_comp_final_uav &&
+                            edpe::UiLayer::instance().composite(
+                                context,
+                                s_backbuffer_copy_srv.Get(),
+                                s_comp_final_uav.Get(),
+                                backbufferDesc.Width,
+                                backbufferDesc.Height,
+                                false)) {
+                            beforeTex = s_comp_final_tex.Get();
                         }
                         wchar_t beforeName[48];
                         swprintf_s(beforeName, L"Before-%ls", activeName);
@@ -7752,11 +7716,6 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                     s_hud_depth_stencil_seeded = false;
                     s_hud_depth_only_seeded = false;
                 }
-            } else if (!s_hud_mask_cleared_for_frame) {
-                edpe::UiLayer::instance().beginFrame(context);
-                s_hud_mask_cleared_for_frame = true;
-                s_hud_depth_stencil_seeded = false;
-                s_hud_depth_only_seeded = false;
             }
         }
         if (!motion_color_bound && bound) motion_color_rebound = true;
@@ -9780,9 +9739,6 @@ unsigned ContextCensusGetJitterPhaseCount() {
 void ContextCensusSetPreserveNativeUi(bool preserve) {
     s_preserve_native_ui.store(preserve, std::memory_order_relaxed);
     edpe::Config::instance().preserveNativeUi = preserve;
-    if (!preserve) {
-        s_hud_mask_cleared_for_frame = false;
-    }
 }
 bool ContextCensusGetPreserveNativeUi() {
     return s_preserve_native_ui.load(std::memory_order_relaxed);
