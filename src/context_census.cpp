@@ -18,6 +18,8 @@
 #include "hud_debug_pass.h"
 #include "jitter_view_recorder.h"
 #include "profiler.h"
+#include "d3d11_proxy.h"
+#include "vtable_hook.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -94,6 +96,11 @@ std::atomic<OMSetRenderTargetsFn> original_deferred_om{nullptr};
 OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context);
 MapFn resolveOriginalMap(ID3D11DeviceContext* context);
 UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context);
+VSSetConstantBuffersFn resolveOriginalVSSetConstantBuffers(ID3D11DeviceContext* context);
+DrawIndexedFn resolveOriginalDrawIndexed(ID3D11DeviceContext* context);
+DrawFn resolveOriginalDraw(ID3D11DeviceContext* context);
+DrawIndexedInstancedFn resolveOriginalDrawIndexedInstanced(ID3D11DeviceContext* context);
+DrawInstancedFn resolveOriginalDrawInstanced(ID3D11DeviceContext* context);
 std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_om_uav{nullptr};
 std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_deferred_om_uav{nullptr};
 std::atomic<ExecuteCommandListFn> original_execute_command_list{nullptr};
@@ -148,6 +155,8 @@ static std::atomic<bool> s_present_device_logged{false};
 
 struct HookedTableEntry {
     void** table = nullptr;
+    void** original_table = nullptr;
+    ID3D11DeviceContext* context = nullptr;
     bool is_immediate = false;
     OMSetRenderTargetsFn orig_om = nullptr;
     OMSetRenderTargetsAndUnorderedAccessViewsFn orig_om_uav = nullptr;
@@ -155,11 +164,33 @@ struct HookedTableEntry {
     FinishCommandListFn orig_finish = nullptr;
     MapFn orig_map = nullptr;
     UnmapFn orig_unmap = nullptr;
+    VSSetConstantBuffersFn orig_vs_cb = nullptr;
+    DrawIndexedFn orig_draw_indexed = nullptr;
+    DrawFn orig_draw = nullptr;
+    DrawIndexedInstancedFn orig_draw_indexed_instanced = nullptr;
+    DrawInstancedFn orig_draw_instanced = nullptr;
 };
 static constexpr size_t kMaxHookedTables = 16;
 static std::atomic<size_t> s_hooked_table_count{0};
 static HookedTableEntry s_hooked_tables[kMaxHookedTables]{};
+static std::array<std::unique_ptr<edpe::VTableHook>, kMaxHookedTables> s_context_vtable_hooks{};
 static std::mutex s_hooked_tables_mutex;
+
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_engine_velocity_texture;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_engine_velocity_srv;
+static unsigned long long s_engine_velocity_frame = ~0ull;
+static unsigned long long s_map_shader_seen_frame = ~0ull;
+static float s_last_jittered_forward_block[16]{};
+static float s_last_unjittered_forward_block[16]{};
+static float s_last_unjittered_inv_rays[12]{};
+static bool s_has_reference_cb0_blocks = false;
+static Microsoft::WRL::ComPtr<ID3D11Buffer> s_deferred_cb2_staging;
+static Microsoft::WRL::ComPtr<ID3D11Buffer> s_deferred_cb2_override;
+static constexpr size_t kDofRingSize = 8;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dof_ring_tex[kDofRingSize]{};
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dof_ring_srv[kDofRingSize]{};
+static UINT s_dof_ring_w = 0, s_dof_ring_h = 0;
+static size_t s_dof_ring_idx = 0;
 
 struct SeenDepthView {
     ID3D11DepthStencilView* view = nullptr; // Identity only; never dereferenced later.
@@ -2162,7 +2193,7 @@ ID3D11DepthStencilView* ensureSeededHudDepthStencil(
         context->PSSetShaderResources(0, 1, &dSrv);
         context->PSSetShader(s_hud_depth_seed_ps.Get(), nullptr, 0);
         context->OMSetDepthStencilState(s_hud_seed_ds_write_depth.Get(), 0);
-        if (auto* drawFn = original_draw.load(std::memory_order_acquire)) {
+        if (auto* drawFn = resolveOriginalDraw(context)) {
             drawFn(context, 3, 0);
         } else {
             context->Draw(3, 0);
@@ -2179,7 +2210,7 @@ ID3D11DepthStencilView* ensureSeededHudDepthStencil(
             if (!s_hud_seed_ds_write_stencil[i] || !s_hud_stencil_seed_ps[i]) continue;
             context->PSSetShader(s_hud_stencil_seed_ps[i].Get(), nullptr, 0);
             context->OMSetDepthStencilState(s_hud_seed_ds_write_stencil[i].Get(), 0xFFu);
-            if (auto* drawFn = original_draw.load(std::memory_order_acquire)) {
+            if (auto* drawFn = resolveOriginalDraw(context)) {
                 drawFn(context, 3, 0);
             } else {
                 context->Draw(3, 0);
@@ -2400,7 +2431,7 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
                 }
                 if (s_clean_camera_cb && orig_cb1.Get() != s_clean_camera_cb.Get()) {
                     ID3D11Buffer* clean_buf = s_clean_camera_cb.Get();
-                    if (auto* vs_set = original_vs_set_buffers.load(std::memory_order_acquire)) {
+                    if (auto* vs_set = resolveOriginalVSSetConstantBuffers(context)) {
                         vs_set(context, 1, 1, &clean_buf);
                     } else {
                         context->VSSetConstantBuffers(1, 1, &clean_buf);
@@ -2420,22 +2451,22 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     auto issueDraw = [&]() {
         switch (kind) {
         case 'X': // DrawIndexedInstanced
-            if (auto* fn = original_draw_indexed_instanced.load(std::memory_order_acquire)) {
+            if (auto* fn = resolveOriginalDrawIndexedInstanced(context)) {
                 fn(context, count, instance_count, start_index_or_vertex, base_vertex, start_instance);
             }
             break;
         case 'I': // DrawIndexed
-            if (auto* fn = original_draw_indexed.load(std::memory_order_acquire)) {
+            if (auto* fn = resolveOriginalDrawIndexed(context)) {
                 fn(context, count, start_index_or_vertex, base_vertex);
             }
             break;
         case 'N': // DrawInstanced
-            if (auto* fn = original_draw_instanced.load(std::memory_order_acquire)) {
+            if (auto* fn = resolveOriginalDrawInstanced(context)) {
                 fn(context, count, instance_count, start_index_or_vertex, start_instance);
             }
             break;
         case 'D': // Draw
-            if (auto* fn = original_draw.load(std::memory_order_acquire)) {
+            if (auto* fn = resolveOriginalDraw(context)) {
                 fn(context, count, start_index_or_vertex);
             }
             break;
@@ -2453,7 +2484,7 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         }
         if (cb1_substituted) {
             ID3D11Buffer* restore_buf = orig_cb1.Get();
-            if (auto* vs_set = original_vs_set_buffers.load(std::memory_order_acquire)) {
+            if (auto* vs_set = resolveOriginalVSSetConstantBuffers(context)) {
                 vs_set(context, 1, 1, &restore_buf);
             } else {
                 context->VSSetConstantBuffers(1, 1, &restore_buf);
@@ -2796,7 +2827,7 @@ void mergeHudIntoHdrTarget(ID3D11DeviceContext* context, ID3D11RenderTargetView*
     const FLOAT blendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     context->OMSetBlendState(baseSceneSrv ? nullptr : s_hud_hdr_merge_blend.Get(), blendFactor, 0xFFFFFFFF);
 
-    if (auto* drawFn = original_draw.load(std::memory_order_acquire)) {
+    if (auto* drawFn = resolveOriginalDraw(context)) {
         drawFn(context, 3, 0);
     } else {
         context->Draw(3, 0);
@@ -2963,19 +2994,19 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
     auto issueDraw = [&]() {
         switch (kind) {
         case 'X':
-            if (auto* fn = original_draw_indexed_instanced.load(std::memory_order_acquire))
+            if (auto* fn = resolveOriginalDrawIndexedInstanced(context))
                 fn(context, count, instance_count, start_index_or_vertex, base_vertex, start_instance);
             break;
         case 'I':
-            if (auto* fn = original_draw_indexed.load(std::memory_order_acquire))
+            if (auto* fn = resolveOriginalDrawIndexed(context))
                 fn(context, count, start_index_or_vertex, base_vertex);
             break;
         case 'N':
-            if (auto* fn = original_draw_instanced.load(std::memory_order_acquire))
+            if (auto* fn = resolveOriginalDrawInstanced(context))
                 fn(context, count, instance_count, start_index_or_vertex, start_instance);
             break;
         case 'D':
-            if (auto* fn = original_draw.load(std::memory_order_acquire))
+            if (auto* fn = resolveOriginalDraw(context))
                 fn(context, count, start_index_or_vertex);
             break;
         }
@@ -3371,7 +3402,7 @@ void dumpSceneShaders() {
 
 void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context,
     UINT start, UINT count, ID3D11Buffer* const* buffers) {
-    const auto forward = original_vs_set_buffers.load(std::memory_order_acquire);
+    const auto forward = resolveOriginalVSSetConstantBuffers(context);
     if (!forward) return;
 
     const bool immediate = isObservedImmediateContext(context);
@@ -3424,11 +3455,11 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
     UINT start, INT base) {
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
-        original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
+        if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         return;
     }
     if (!shouldInspectHudOrTonemapDraw()) {
-        original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
+        if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         abandonAmortizedAndRearmHudProbe(context);
         return;
     }
@@ -3452,7 +3483,7 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
         redirected = observePostHudDrawAndTonemap(context, 'I', count, 1, start, base, 0);
     }
     if (!redirected) {
-        original_draw_indexed.load(std::memory_order_acquire)(context, count, start, base);
+        if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         abandonAmortizedAndRearmHudProbe(context);
     }
 }
@@ -3460,11 +3491,11 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
 void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start) {
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
-        original_draw.load(std::memory_order_acquire)(context, count, start);
+        if (const auto forward = resolveOriginalDraw(context)) forward(context, count, start);
         return;
     }
     if (!shouldInspectHudOrTonemapDraw()) {
-        original_draw.load(std::memory_order_acquire)(context, count, start);
+        if (const auto forward = resolveOriginalDraw(context)) forward(context, count, start);
         abandonAmortizedAndRearmHudProbe(context);
         return;
     }
@@ -3488,7 +3519,7 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
         redirected = observePostHudDrawAndTonemap(context, 'D', count, 1, start, 0, 0);
     }
     if (!redirected) {
-        original_draw.load(std::memory_order_acquire)(context, count, start);
+        if (const auto forward = resolveOriginalDraw(context)) forward(context, count, start);
         abandonAmortizedAndRearmHudProbe(context);
     }
 }
@@ -3498,13 +3529,15 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
     UINT start_instance) {
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
-        original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
-            index_count, instance_count, start_index, base_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
+            forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        }
         return;
     }
     if (!shouldInspectHudOrTonemapDraw()) {
-        original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
-            index_count, instance_count, start_index, base_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
+            forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        }
         abandonAmortizedAndRearmHudProbe(context);
         return;
     }
@@ -3530,8 +3563,9 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
             start_index, base_vertex, start_instance);
     }
     if (!redirected) {
-        original_draw_indexed_instanced.load(std::memory_order_acquire)(context,
-            index_count, instance_count, start_index, base_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
+            forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        }
         abandonAmortizedAndRearmHudProbe(context);
         if (hudResult == HudDrawResult::GlassReplay) {
             replayGlassDraw(context, index_count, instance_count,
@@ -3545,13 +3579,15 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
-        original_draw_instanced.load(std::memory_order_acquire)(context,
-            vertex_count, instance_count, start_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawInstanced(context)) {
+            forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        }
         return;
     }
     if (!shouldInspectHudOrTonemapDraw()) {
-        original_draw_instanced.load(std::memory_order_acquire)(context,
-            vertex_count, instance_count, start_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawInstanced(context)) {
+            forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        }
         abandonAmortizedAndRearmHudProbe(context);
         return;
     }
@@ -3576,8 +3612,9 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
             start_vertex, 0, start_instance);
     }
     if (!redirected) {
-        original_draw_instanced.load(std::memory_order_acquire)(context,
-            vertex_count, instance_count, start_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawInstanced(context)) {
+            forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        }
         abandonAmortizedAndRearmHudProbe(context);
     }
 }
@@ -3599,244 +3636,13 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
     ID3D11DepthStencilView* dsv, UINT uavStartSlot, UINT numUAVs,
     ID3D11UnorderedAccessView* const* uavs, const UINT* initialCounts);
 
-#define EDPE_DEFINE_STATE_REARM_HOOK(Name, Slot, Ret, Params, Args) \
-    using Name##Fn = Ret(STDMETHODCALLTYPE*) Params; \
-    static std::atomic<Name##Fn> original_##Name{nullptr}; \
-    static Ret STDMETHODCALLTYPE observed_##Name Params { \
-        if (auto* fn = original_##Name.load(std::memory_order_acquire)) { \
-            fn Args; \
-        } \
-        if (isHudDrawInterceptWindowActive() && \
-            !g_is_evaluating_upscaler.load(std::memory_order_relaxed) && \
-            !s_in_edpe_present.load(std::memory_order_relaxed) && \
-            isObservedImmediateContext(context)) { \
-            rearmHudDrawProbe(context); \
-        } \
-    }
-
-EDPE_DEFINE_STATE_REARM_HOOK(PSSetShaderResources, 8, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11ShaderResourceView* const* v),
-    (context, s, c, v))
-EDPE_DEFINE_STATE_REARM_HOOK(PSSetShader, 9, void,
-    (ID3D11DeviceContext* context, ID3D11PixelShader* p, ID3D11ClassInstance* const* i, UINT c),
-    (context, p, i, c))
-EDPE_DEFINE_STATE_REARM_HOOK(PSSetSamplers, 10, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11SamplerState* const* v),
-    (context, s, c, v))
-EDPE_DEFINE_STATE_REARM_HOOK(VSSetShader, 11, void,
-    (ID3D11DeviceContext* context, ID3D11VertexShader* p, ID3D11ClassInstance* const* i, UINT c),
-    (context, p, i, c))
-EDPE_DEFINE_STATE_REARM_HOOK(PSSetConstantBuffers, 16, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11Buffer* const* b),
-    (context, s, c, b))
-EDPE_DEFINE_STATE_REARM_HOOK(IASetInputLayout, 17, void,
-    (ID3D11DeviceContext* context, ID3D11InputLayout* l),
-    (context, l))
-EDPE_DEFINE_STATE_REARM_HOOK(IASetVertexBuffers, 18, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11Buffer* const* b, const UINT* st, const UINT* of),
-    (context, s, c, b, st, of))
-EDPE_DEFINE_STATE_REARM_HOOK(IASetIndexBuffer, 19, void,
-    (ID3D11DeviceContext* context, ID3D11Buffer* b, DXGI_FORMAT f, UINT of),
-    (context, b, f, of))
-EDPE_DEFINE_STATE_REARM_HOOK(GSSetConstantBuffers, 22, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11Buffer* const* b),
-    (context, s, c, b))
-EDPE_DEFINE_STATE_REARM_HOOK(GSSetShader, 23, void,
-    (ID3D11DeviceContext* context, ID3D11GeometryShader* g, ID3D11ClassInstance* const* i, UINT c),
-    (context, g, i, c))
-EDPE_DEFINE_STATE_REARM_HOOK(IASetPrimitiveTopology, 24, void,
-    (ID3D11DeviceContext* context, D3D11_PRIMITIVE_TOPOLOGY t),
-    (context, t))
-EDPE_DEFINE_STATE_REARM_HOOK(VSSetShaderResources, 25, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11ShaderResourceView* const* v),
-    (context, s, c, v))
-EDPE_DEFINE_STATE_REARM_HOOK(VSSetSamplers, 26, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11SamplerState* const* v),
-    (context, s, c, v))
-EDPE_DEFINE_STATE_REARM_HOOK(OMSetBlendState, 35, void,
-    (ID3D11DeviceContext* context, ID3D11BlendState* b, const FLOAT f[4], UINT m),
-    (context, b, f, m))
-EDPE_DEFINE_STATE_REARM_HOOK(OMSetDepthStencilState, 36, void,
-    (ID3D11DeviceContext* context, ID3D11DepthStencilState* d, UINT r),
-    (context, d, r))
-EDPE_DEFINE_STATE_REARM_HOOK(Dispatch, 41, void,
-    (ID3D11DeviceContext* context, UINT x, UINT y, UINT z),
-    (context, x, y, z))
-EDPE_DEFINE_STATE_REARM_HOOK(DispatchIndirect, 42, void,
-    (ID3D11DeviceContext* context, ID3D11Buffer* b, UINT of),
-    (context, b, of))
-EDPE_DEFINE_STATE_REARM_HOOK(RSSetState, 43, void,
-    (ID3D11DeviceContext* context, ID3D11RasterizerState* r),
-    (context, r))
-EDPE_DEFINE_STATE_REARM_HOOK(RSSetViewports, 44, void,
-    (ID3D11DeviceContext* context, UINT c, const D3D11_VIEWPORT* v),
-    (context, c, v))
-EDPE_DEFINE_STATE_REARM_HOOK(RSSetScissorRects, 45, void,
-    (ID3D11DeviceContext* context, UINT c, const D3D11_RECT* r),
-    (context, c, r))
-EDPE_DEFINE_STATE_REARM_HOOK(CopySubresourceRegion, 46, void,
-    (ID3D11DeviceContext* context, ID3D11Resource* d, UINT ds, UINT dx, UINT dy, UINT dz, ID3D11Resource* s, UINT ss, const D3D11_BOX* b),
-    (context, d, ds, dx, dy, dz, s, ss, b))
-EDPE_DEFINE_STATE_REARM_HOOK(CopyResource, 47, void,
-    (ID3D11DeviceContext* context, ID3D11Resource* d, ID3D11Resource* s),
-    (context, d, s))
-EDPE_DEFINE_STATE_REARM_HOOK(UpdateSubresource, 48, void,
-    (ID3D11DeviceContext* context, ID3D11Resource* d, UINT ds, const D3D11_BOX* b, const void* p, UINT rp, UINT dp),
-    (context, d, ds, b, p, rp, dp))
-EDPE_DEFINE_STATE_REARM_HOOK(ClearRenderTargetView, 50, void,
-    (ID3D11DeviceContext* context, ID3D11RenderTargetView* r, const FLOAT c[4]),
-    (context, r, c))
-EDPE_DEFINE_STATE_REARM_HOOK(ClearUnorderedAccessViewUint, 51, void,
-    (ID3D11DeviceContext* context, ID3D11UnorderedAccessView* u, const UINT v[4]),
-    (context, u, v))
-EDPE_DEFINE_STATE_REARM_HOOK(ClearUnorderedAccessViewFloat, 52, void,
-    (ID3D11DeviceContext* context, ID3D11UnorderedAccessView* u, const FLOAT v[4]),
-    (context, u, v))
-EDPE_DEFINE_STATE_REARM_HOOK(ClearDepthStencilView, 53, void,
-    (ID3D11DeviceContext* context, ID3D11DepthStencilView* d, UINT cf, FLOAT dp, UINT8 st),
-    (context, d, cf, dp, st))
-EDPE_DEFINE_STATE_REARM_HOOK(CSSetShaderResources, 67, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11ShaderResourceView* const* v),
-    (context, s, c, v))
-EDPE_DEFINE_STATE_REARM_HOOK(CSSetUnorderedAccessViews, 68, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11UnorderedAccessView* const* u, const UINT* ic),
-    (context, s, c, u, ic))
-EDPE_DEFINE_STATE_REARM_HOOK(CSSetShader, 69, void,
-    (ID3D11DeviceContext* context, ID3D11ComputeShader* cs, ID3D11ClassInstance* const* i, UINT c),
-    (context, cs, i, c))
-EDPE_DEFINE_STATE_REARM_HOOK(CSSetSamplers, 70, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11SamplerState* const* v),
-    (context, s, c, v))
-EDPE_DEFINE_STATE_REARM_HOOK(CSSetConstantBuffers, 71, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11Buffer* const* b),
-    (context, s, c, b))
-EDPE_DEFINE_STATE_REARM_HOOK(VSSetConstantBuffers1, 119, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11Buffer* const* b, const UINT* fc, const UINT* nc),
-    (context, s, c, b, fc, nc))
-EDPE_DEFINE_STATE_REARM_HOOK(PSSetConstantBuffers1, 123, void,
-    (ID3D11DeviceContext* context, UINT s, UINT c, ID3D11Buffer* const* b, const UINT* fc, const UINT* nc),
-    (context, s, c, b, fc, nc))
-#undef EDPE_DEFINE_STATE_REARM_HOOK
-
 void installHudStateRearmHooks() {
-    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
-    if (!patched_table && tblCount == 0) return;
-    auto installOneOnTable = [&](void** tbl, size_t slot, auto& orig_fn, auto obs_fn) {
-        if (!tbl) return;
-        auto cur = reinterpret_cast<decltype(obs_fn)>(tbl[slot]);
-        if (!cur || cur == obs_fn) return;
-        if (!orig_fn.load(std::memory_order_acquire)) {
-            orig_fn.store(cur, std::memory_order_release);
-        }
-        auto* obs_ptr = reinterpret_cast<void*>(obs_fn);
-        auto* cur_ptr = reinterpret_cast<void*>(cur);
-        if (InterlockedCompareExchangePointer(
-                reinterpret_cast<PVOID volatile*>(tbl + slot), obs_ptr, cur_ptr) != cur_ptr) {
-            patchSlot(tbl, slot, cur_ptr, obs_ptr);
-        }
-    };
-    auto installOne = [&](size_t slot, auto& orig_fn, auto obs_fn) {
-        if (patched_table) {
-            installOneOnTable(patched_table, slot, orig_fn, obs_fn);
-        }
-        for (size_t i = 0; i < tblCount; ++i) {
-            if (s_hooked_tables[i].is_immediate && s_hooked_tables[i].table &&
-                s_hooked_tables[i].table != patched_table) {
-                installOneOnTable(s_hooked_tables[i].table, slot, orig_fn, obs_fn);
-            }
-        }
-    };
-    installOne(kVSSetConstantBuffers, original_vs_set_buffers, &observedVSSetConstantBuffers);
-    installOne(8, original_PSSetShaderResources, &observed_PSSetShaderResources);
-    installOne(9, original_PSSetShader, &observed_PSSetShader);
-    installOne(10, original_PSSetSamplers, &observed_PSSetSamplers);
-    installOne(11, original_VSSetShader, &observed_VSSetShader);
-    installOne(16, original_PSSetConstantBuffers, &observed_PSSetConstantBuffers);
-    installOne(17, original_IASetInputLayout, &observed_IASetInputLayout);
-    installOne(18, original_IASetVertexBuffers, &observed_IASetVertexBuffers);
-    installOne(19, original_IASetIndexBuffer, &observed_IASetIndexBuffer);
-    installOne(22, original_GSSetConstantBuffers, &observed_GSSetConstantBuffers);
-    installOne(23, original_GSSetShader, &observed_GSSetShader);
-    installOne(24, original_IASetPrimitiveTopology, &observed_IASetPrimitiveTopology);
-    installOne(25, original_VSSetShaderResources, &observed_VSSetShaderResources);
-    installOne(26, original_VSSetSamplers, &observed_VSSetSamplers);
-    installOne(35, original_OMSetBlendState, &observed_OMSetBlendState);
-    installOne(36, original_OMSetDepthStencilState, &observed_OMSetDepthStencilState);
-    installOne(41, original_Dispatch, &observed_Dispatch);
-    installOne(42, original_DispatchIndirect, &observed_DispatchIndirect);
-    installOne(43, original_RSSetState, &observed_RSSetState);
-    installOne(44, original_RSSetViewports, &observed_RSSetViewports);
-    installOne(45, original_RSSetScissorRects, &observed_RSSetScissorRects);
-    installOne(46, original_CopySubresourceRegion, &observed_CopySubresourceRegion);
-    installOne(47, original_CopyResource, &observed_CopyResource);
-    installOne(48, original_UpdateSubresource, &observed_UpdateSubresource);
-    installOne(50, original_ClearRenderTargetView, &observed_ClearRenderTargetView);
-    installOne(51, original_ClearUnorderedAccessViewUint, &observed_ClearUnorderedAccessViewUint);
-    installOne(52, original_ClearUnorderedAccessViewFloat, &observed_ClearUnorderedAccessViewFloat);
-    installOne(53, original_ClearDepthStencilView, &observed_ClearDepthStencilView);
-    installOne(67, original_CSSetShaderResources, &observed_CSSetShaderResources);
-    installOne(68, original_CSSetUnorderedAccessViews, &observed_CSSetUnorderedAccessViews);
-    installOne(69, original_CSSetShader, &observed_CSSetShader);
-    installOne(70, original_CSSetSamplers, &observed_CSSetSamplers);
-    installOne(71, original_CSSetConstantBuffers, &observed_CSSetConstantBuffers);
-    installOne(119, original_VSSetConstantBuffers1, &observed_VSSetConstantBuffers1);
-    installOne(123, original_PSSetConstantBuffers1, &observed_PSSetConstantBuffers1);
+    // No-op: HookMode::LiveCopy maintains a private vtable with 16-byte live trampolines,
+    // so d3d11.dll's CContext::AbandonAmortized() never unhooks Draw or OM slots.
 }
 
 void restoreHudStateRearmHooks() {
-    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
-    if (!patched_table && tblCount == 0) return;
-    auto restoreOne = [&](size_t slot, auto& orig_fn, auto obs_fn) {
-        auto* fwd = orig_fn.load(std::memory_order_acquire);
-        if (!fwd) return;
-        if (patched_table) {
-            patchSlot(patched_table, slot, reinterpret_cast<void*>(obs_fn), reinterpret_cast<void*>(fwd));
-        }
-        for (size_t i = 0; i < tblCount; ++i) {
-            if (s_hooked_tables[i].is_immediate && s_hooked_tables[i].table &&
-                s_hooked_tables[i].table != patched_table) {
-                patchSlot(s_hooked_tables[i].table, slot,
-                    reinterpret_cast<void*>(obs_fn), reinterpret_cast<void*>(fwd));
-            }
-        }
-    };
-    if (!vs_buffer_probe_active.load(std::memory_order_acquire)) {
-        restoreOne(kVSSetConstantBuffers, original_vs_set_buffers, &observedVSSetConstantBuffers);
-    }
-    restoreOne(8, original_PSSetShaderResources, &observed_PSSetShaderResources);
-    restoreOne(9, original_PSSetShader, &observed_PSSetShader);
-    restoreOne(10, original_PSSetSamplers, &observed_PSSetSamplers);
-    restoreOne(11, original_VSSetShader, &observed_VSSetShader);
-    restoreOne(16, original_PSSetConstantBuffers, &observed_PSSetConstantBuffers);
-    restoreOne(17, original_IASetInputLayout, &observed_IASetInputLayout);
-    restoreOne(18, original_IASetVertexBuffers, &observed_IASetVertexBuffers);
-    restoreOne(19, original_IASetIndexBuffer, &observed_IASetIndexBuffer);
-    restoreOne(22, original_GSSetConstantBuffers, &observed_GSSetConstantBuffers);
-    restoreOne(23, original_GSSetShader, &observed_GSSetShader);
-    restoreOne(24, original_IASetPrimitiveTopology, &observed_IASetPrimitiveTopology);
-    restoreOne(25, original_VSSetShaderResources, &observed_VSSetShaderResources);
-    restoreOne(26, original_VSSetSamplers, &observed_VSSetSamplers);
-    restoreOne(35, original_OMSetBlendState, &observed_OMSetBlendState);
-    restoreOne(36, original_OMSetDepthStencilState, &observed_OMSetDepthStencilState);
-    restoreOne(41, original_Dispatch, &observed_Dispatch);
-    restoreOne(42, original_DispatchIndirect, &observed_DispatchIndirect);
-    restoreOne(43, original_RSSetState, &observed_RSSetState);
-    restoreOne(44, original_RSSetViewports, &observed_RSSetViewports);
-    restoreOne(45, original_RSSetScissorRects, &observed_RSSetScissorRects);
-    restoreOne(46, original_CopySubresourceRegion, &observed_CopySubresourceRegion);
-    restoreOne(47, original_CopyResource, &observed_CopyResource);
-    restoreOne(48, original_UpdateSubresource, &observed_UpdateSubresource);
-    restoreOne(50, original_ClearRenderTargetView, &observed_ClearRenderTargetView);
-    restoreOne(51, original_ClearUnorderedAccessViewUint, &observed_ClearUnorderedAccessViewUint);
-    restoreOne(52, original_ClearUnorderedAccessViewFloat, &observed_ClearUnorderedAccessViewFloat);
-    restoreOne(53, original_ClearDepthStencilView, &observed_ClearDepthStencilView);
-    restoreOne(67, original_CSSetShaderResources, &observed_CSSetShaderResources);
-    restoreOne(68, original_CSSetUnorderedAccessViews, &observed_CSSetUnorderedAccessViews);
-    restoreOne(69, original_CSSetShader, &observed_CSSetShader);
-    restoreOne(70, original_CSSetSamplers, &observed_CSSetSamplers);
-    restoreOne(71, original_CSSetConstantBuffers, &observed_CSSetConstantBuffers);
-    restoreOne(119, original_VSSetConstantBuffers1, &observed_VSSetConstantBuffers1);
-    restoreOne(123, original_PSSetConstantBuffers1, &observed_PSSetConstantBuffers1);
+    // No-op: state-setting methods are no longer hooked in-place.
 }
 
 void abandonAmortizedAndRearmHudProbe(ID3D11DeviceContext* context) {
@@ -3848,35 +3654,42 @@ void beginHudDrawProbe() {
     const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
     if ((!patched_table && tblCount == 0) || hud_draw_hook_mask ||
         draw_probe_active.load(std::memory_order_acquire)) return;
-    auto installOnTable = [&](void** tbl, size_t slot, auto& original_fn, auto observer) -> bool {
-        if (!tbl) return false;
-        auto forward = reinterpret_cast<decltype(observer)>(tbl[slot]);
+    auto installOnEntry = [&](size_t idx, size_t slot, auto& entry_field, auto& original_fn, auto observer) -> bool {
+        auto& entry = s_hooked_tables[idx];
+        if (!entry.is_immediate || !entry.table) return false;
+        if (s_context_vtable_hooks[idx] && s_context_vtable_hooks[idx]->isInitialized()) {
+            void* fwd = nullptr;
+            if (s_context_vtable_hooks[idx]->hook(entry.context, slot,
+                    reinterpret_cast<void*>(observer), &fwd, s_context_vtable_hooks[idx]->mode())) {
+                entry_field = reinterpret_cast<decltype(observer)>(fwd);
+                if (!original_fn.load(std::memory_order_acquire)) {
+                    original_fn.store(entry_field, std::memory_order_release);
+                }
+                return true;
+            }
+        }
+        auto forward = reinterpret_cast<decltype(observer)>(entry.table[slot]);
         if (!forward) return false;
         if (forward == observer) return true;
+        entry_field = forward;
         if (!original_fn.load(std::memory_order_acquire)) {
             original_fn.store(forward, std::memory_order_release);
         }
-        return patchSlot(tbl, slot, reinterpret_cast<void*>(forward),
+        return patchSlot(entry.table, slot, reinterpret_cast<void*>(forward),
             reinterpret_cast<void*>(observer));
     };
-    auto install = [&](size_t slot, auto& original_fn, auto observer, unsigned bit) {
-        bool hooked = false;
-        if (patched_table) {
-            hooked |= installOnTable(patched_table, slot, original_fn, observer);
-        }
-        for (size_t i = 0; i < tblCount; ++i) {
-            if (s_hooked_tables[i].is_immediate && s_hooked_tables[i].table &&
-                s_hooked_tables[i].table != patched_table) {
-                hooked |= installOnTable(s_hooked_tables[i].table, slot, original_fn, observer);
-            }
-        }
-        if (hooked) hud_draw_hook_mask |= bit;
-    };
-    install(kDrawIndexed, original_draw_indexed, &observedDrawIndexed, 1);
-    install(kDraw, original_draw, &observedDraw, 2);
-    install(kDrawIndexedInstanced, original_draw_indexed_instanced,
-        &observedDrawIndexedInstanced, 4);
-    install(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (!s_hooked_tables[i].is_immediate) continue;
+        installOnEntry(i, kVSSetConstantBuffers, s_hooked_tables[i].orig_vs_cb, original_vs_set_buffers, &observedVSSetConstantBuffers);
+        if (installOnEntry(i, kDrawIndexed, s_hooked_tables[i].orig_draw_indexed, original_draw_indexed, &observedDrawIndexed))
+            hud_draw_hook_mask |= 1u;
+        if (installOnEntry(i, kDraw, s_hooked_tables[i].orig_draw, original_draw, &observedDraw))
+            hud_draw_hook_mask |= 2u;
+        if (installOnEntry(i, kDrawIndexedInstanced, s_hooked_tables[i].orig_draw_indexed_instanced, original_draw_indexed_instanced, &observedDrawIndexedInstanced))
+            hud_draw_hook_mask |= 4u;
+        if (installOnEntry(i, kDrawInstanced, s_hooked_tables[i].orig_draw_instanced, original_draw_instanced, &observedDrawInstanced))
+            hud_draw_hook_mask |= 8u;
+    }
     installHudStateRearmHooks();
     hud_target_draws = 0;
     hud_draw_rearmed_mask = 0;
@@ -3920,100 +3733,65 @@ static inline bool areDrawAndOmHooksIntact(void** tbl) {
 }
 
 void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
-    if (activeCtx && activeCtx == observed_context.load(std::memory_order_relaxed) &&
-        patched_table && *reinterpret_cast<void***>(activeCtx) == patched_table &&
-        s_hooked_table_count.load(std::memory_order_relaxed) <= 1 &&
-        areDrawAndOmHooksIntact(patched_table)) {
-        return;
-    }
     const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
-    void** activeTable = nullptr;
-    if (activeCtx && activeCtx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) {
-        activeTable = *reinterpret_cast<void***>(activeCtx);
-        const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
-        for (size_t i = 0; i < cloneCount; ++i) {
-            if (s_cloned_contexts[i] && s_cloned_contexts[i]->methods == activeTable) {
-                activeTable = s_cloned_contexts[i]->original_table;
+    if (activeCtx) {
+        for (size_t i = 0; i < tblCount; ++i) {
+            if (s_hooked_tables[i].context == activeCtx &&
+                s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
+                s_context_vtable_hooks[i]->reclaim();
+                if (s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy &&
+                    areDrawAndOmHooksIntact(s_hooked_tables[i].table)) {
+                    return;
+                }
                 break;
             }
         }
     }
-    if (!patched_table && !activeTable && tblCount == 0) return;
 
-    // Always keep OMSetRenderTargets (slot 33), OMSetRenderTargetsAndUAVs (slot 34), and
-    // VSSetConstantBuffers (slot 7) armed across all immediate-context vtables, because
-    // d3d11.dll amortizes slots in each CContext's embedded vtable during state transitions.
-    auto rearmAlwaysOnTable = [&](void** tbl, size_t slot, auto& original_fn, auto observer) {
-        if (!tbl || !original_fn.load(std::memory_order_acquire)) return;
-        void* current = tbl[slot];
-        auto* obs_ptr = reinterpret_cast<void*>(observer);
-        if (current && current != obs_ptr) {
+    auto rearmSlotOnEntry = [&](size_t idx, size_t slot, void* observer, unsigned bit) {
+        auto& entry = s_hooked_tables[idx];
+        if (!entry.is_immediate || !entry.table) return;
+        void* current = entry.table[slot];
+        if (current && current != observer) {
             if (InterlockedCompareExchangePointer(
-                    reinterpret_cast<PVOID volatile*>(tbl + slot), obs_ptr, current) != current) {
-                patchSlot(tbl, slot, current, obs_ptr);
+                    reinterpret_cast<PVOID volatile*>(entry.table + slot), observer, current) == current ||
+                patchSlot(entry.table, slot, current, observer)) {
+                if (bit) {
+                    hud_draw_rearmed_mask |= bit;
+                    ++s_diag_hud_unhook_events;
+                }
             }
         }
     };
-    auto rearmAlways = [&](size_t slot, auto& original_fn, auto observer) {
-        if (patched_table) {
-            rearmAlwaysOnTable(patched_table, slot, original_fn, observer);
-        }
-        if (activeTable && activeTable != patched_table) {
-            rearmAlwaysOnTable(activeTable, slot, original_fn, observer);
-        }
-        for (size_t i = 0; i < tblCount; ++i) {
-            void** tbl = s_hooked_tables[i].table;
-            if (s_hooked_tables[i].is_immediate && tbl && tbl != patched_table && tbl != activeTable) {
-                rearmAlwaysOnTable(tbl, slot, original_fn, observer);
-            }
-        }
-    };
-    rearmAlways(kOMSetRenderTargets, original, &observedOMSetRenderTargets);
-    rearmAlways(kOMSetRenderTargetsAndUnorderedAccessViews, original_om_uav,
-        &observedOMSetRenderTargetsAndUnorderedAccessViews);
-    rearmAlways(kVSSetConstantBuffers, original_vs_set_buffers, &observedVSSetConstantBuffers);
 
-    if (!hud_draw_probe_active.load(std::memory_order_acquire)) return;
-    if (!isHudDrawInterceptWindowActive()) return;
+    const bool needVsCb = vs_buffer_probe_active.load(std::memory_order_relaxed) ||
+                          hud_draw_probe_active.load(std::memory_order_relaxed);
+    const bool needDraws = hud_draw_probe_active.load(std::memory_order_acquire) &&
+                           isHudDrawInterceptWindowActive();
 
-    // d3d11.dll dynamically swaps draw and state slots in each CContext's embedded vtable (context + 8)
-    // between *_<0> and *_Amortized<0> during state changes and draw calls.
-    auto rearmOnTable = [&](void** tbl, size_t slot, auto& original_fn, auto observer, unsigned bit) {
-        if (!tbl) return;
-        void* current = tbl[slot];
-        auto* obs_ptr = reinterpret_cast<void*>(observer);
-        if (current && current != obs_ptr) {
-            if (!original_fn.load(std::memory_order_acquire)) {
-                original_fn.store(reinterpret_cast<decltype(observer)>(current), std::memory_order_release);
-            }
-            if (InterlockedCompareExchangePointer(
-                    reinterpret_cast<PVOID volatile*>(tbl + slot), obs_ptr, current) == current ||
-                patchSlot(tbl, slot, current, obs_ptr)) {
-                hud_draw_rearmed_mask |= bit;
-                ++s_diag_hud_unhook_events;
-            }
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (!s_hooked_tables[i].is_immediate) continue;
+        if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
+            s_context_vtable_hooks[i]->reclaim();
         }
-    };
-    auto rearm = [&](size_t slot, auto& original_fn, auto observer, unsigned bit) {
-        if (!(hud_draw_hook_mask & bit)) return;
-        if (patched_table) {
-            rearmOnTable(patched_table, slot, original_fn, observer, bit);
+        rearmSlotOnEntry(i, kOMSetRenderTargets, reinterpret_cast<void*>(&observedOMSetRenderTargets), 0);
+        rearmSlotOnEntry(i, kOMSetRenderTargetsAndUnorderedAccessViews,
+            reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews), 0);
+        if (needVsCb) {
+            rearmSlotOnEntry(i, kVSSetConstantBuffers,
+                reinterpret_cast<void*>(&observedVSSetConstantBuffers), 0);
         }
-        if (activeTable && activeTable != patched_table) {
-            rearmOnTable(activeTable, slot, original_fn, observer, bit);
+        if (needDraws) {
+            if (hud_draw_hook_mask & 1u)
+                rearmSlotOnEntry(i, kDrawIndexed, reinterpret_cast<void*>(&observedDrawIndexed), 1u);
+            if (hud_draw_hook_mask & 2u)
+                rearmSlotOnEntry(i, kDraw, reinterpret_cast<void*>(&observedDraw), 2u);
+            if (hud_draw_hook_mask & 4u)
+                rearmSlotOnEntry(i, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), 4u);
+            if (hud_draw_hook_mask & 8u)
+                rearmSlotOnEntry(i, kDrawInstanced, reinterpret_cast<void*>(&observedDrawInstanced), 8u);
         }
-        for (size_t i = 0; i < tblCount; ++i) {
-            void** tbl = s_hooked_tables[i].table;
-            if (s_hooked_tables[i].is_immediate && tbl && tbl != patched_table && tbl != activeTable) {
-                rearmOnTable(tbl, slot, original_fn, observer, bit);
-            }
-        }
-    };
-    rearm(kDrawIndexed, original_draw_indexed, &observedDrawIndexed, 1);
-    rearm(kDraw, original_draw, &observedDraw, 2);
-    rearm(kDrawIndexedInstanced, original_draw_indexed_instanced,
-        &observedDrawIndexedInstanced, 4);
-    rearm(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
+    }
 }
 
 void endHudDrawProbe() {
@@ -4023,34 +3801,29 @@ void endHudDrawProbe() {
     const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
     unsigned restored = 0;
     unsigned reverted = 0;
-    auto restore = [&](size_t slot, auto& original_fn, auto observer, unsigned bit) {
+    auto restore = [&](size_t slot, auto observer, unsigned bit) {
         if (!(hud_draw_hook_mask & bit)) return;
-        auto* forward = reinterpret_cast<void*>(original_fn.load(std::memory_order_acquire));
         bool anyRestored = false;
         bool anyReverted = false;
-        if (patched_table) {
-            if (patchSlot(patched_table, slot, reinterpret_cast<void*>(observer), forward))
-                anyRestored = true;
-            else if (patched_table[slot] == forward)
-                anyReverted = true;
-        }
         for (size_t i = 0; i < tblCount; ++i) {
             void** tbl = s_hooked_tables[i].table;
-            if (s_hooked_tables[i].is_immediate && tbl && tbl != patched_table) {
-                if (patchSlot(tbl, slot, reinterpret_cast<void*>(observer), forward))
-                    anyRestored = true;
-                else if (tbl[slot] == forward)
-                    anyReverted = true;
-            }
+            if (!s_hooked_tables[i].is_immediate || !tbl) continue;
+            void* forward = (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized())
+                ? s_context_vtable_hooks[i]->liveStubForSlot(slot)
+                : nullptr;
+            if (!forward) continue;
+            if (patchSlot(tbl, slot, reinterpret_cast<void*>(observer), forward))
+                anyRestored = true;
+            else if (tbl[slot] == forward)
+                anyReverted = true;
         }
         if (anyRestored) restored |= bit;
         else if (anyReverted) reverted |= bit;
     };
-    restore(kDrawIndexed, original_draw_indexed, &observedDrawIndexed, 1);
-    restore(kDraw, original_draw, &observedDraw, 2);
-    restore(kDrawIndexedInstanced, original_draw_indexed_instanced,
-        &observedDrawIndexedInstanced, 4);
-    restore(kDrawInstanced, original_draw_instanced, &observedDrawInstanced, 8);
+    restore(kDrawIndexed, &observedDrawIndexed, 1);
+    restore(kDraw, &observedDraw, 2);
+    restore(kDrawIndexedInstanced, &observedDrawIndexedInstanced, 4);
+    restore(kDrawInstanced, &observedDrawInstanced, 8);
     wchar_t message[320];
     swprintf_s(message,
         L"EDPE: HUD draw probe frame=%llu mask=0x%X rearmed=0x%X restored=0x%X reverted=0x%X draws=%u hudCopy=%u afterHud=%u glassAfterHud=%u glassReplay=%u glassDeclined=%u missingHash=%u overflow=%u",
@@ -4076,50 +3849,62 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
 void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource);
 
+template <typename Fn>
+inline Fn resolveContextOriginalSlot(ID3D11DeviceContext* context, size_t slot, void* observer,
+                                     const std::atomic<Fn>& fallback) {
+    if (context) {
+        void** table = *reinterpret_cast<void***>(context);
+        const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+        for (size_t i = 0; i < tblCount; ++i) {
+            if (s_hooked_tables[i].context == context ||
+                s_hooked_tables[i].table == table ||
+                s_hooked_tables[i].original_table == table) {
+                if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
+                    void* stub = s_context_vtable_hooks[i]->liveStubForSlot(slot);
+                    if (stub && stub != observer) {
+                        return reinterpret_cast<Fn>(stub);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    return fallback.load(std::memory_order_acquire);
+}
+
+VSSetConstantBuffersFn resolveOriginalVSSetConstantBuffers(ID3D11DeviceContext* context) {
+    return resolveContextOriginalSlot(context, kVSSetConstantBuffers,
+        reinterpret_cast<void*>(&observedVSSetConstantBuffers), original_vs_set_buffers);
+}
+
+DrawIndexedFn resolveOriginalDrawIndexed(ID3D11DeviceContext* context) {
+    return resolveContextOriginalSlot(context, kDrawIndexed,
+        reinterpret_cast<void*>(&observedDrawIndexed), original_draw_indexed);
+}
+
+DrawFn resolveOriginalDraw(ID3D11DeviceContext* context) {
+    return resolveContextOriginalSlot(context, kDraw,
+        reinterpret_cast<void*>(&observedDraw), original_draw);
+}
+
+DrawIndexedInstancedFn resolveOriginalDrawIndexedInstanced(ID3D11DeviceContext* context) {
+    return resolveContextOriginalSlot(context, kDrawIndexedInstanced,
+        reinterpret_cast<void*>(&observedDrawIndexedInstanced), original_draw_indexed_instanced);
+}
+
+DrawInstancedFn resolveOriginalDrawInstanced(ID3D11DeviceContext* context) {
+    return resolveContextOriginalSlot(context, kDrawInstanced,
+        reinterpret_cast<void*>(&observedDrawInstanced), original_draw_instanced);
+}
+
 MapFn resolveOriginalMap(ID3D11DeviceContext* context) {
-    if (!context) return original_map.load(std::memory_order_acquire);
-    void** table = *reinterpret_cast<void***>(context);
-    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
-    for (size_t i = 0; i < cloneCount; ++i) {
-        if (s_cloned_contexts[i] &&
-            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
-            if (s_cloned_contexts[i]->orig_map && s_cloned_contexts[i]->orig_map != &observedMap)
-                return s_cloned_contexts[i]->orig_map;
-            table = s_cloned_contexts[i]->original_table;
-            break;
-        }
-    }
-    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
-    for (size_t i = 0; i < tblCount; ++i) {
-        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_map &&
-            s_hooked_tables[i].orig_map != &observedMap) {
-            return s_hooked_tables[i].orig_map;
-        }
-    }
-    return original_map.load(std::memory_order_acquire);
+    return resolveContextOriginalSlot(context, kMap,
+        reinterpret_cast<void*>(&observedMap), original_map);
 }
 
 UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context) {
-    if (!context) return original_unmap.load(std::memory_order_acquire);
-    void** table = *reinterpret_cast<void***>(context);
-    const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
-    for (size_t i = 0; i < cloneCount; ++i) {
-        if (s_cloned_contexts[i] &&
-            (s_cloned_contexts[i]->context == context || s_cloned_contexts[i]->methods == table)) {
-            if (s_cloned_contexts[i]->orig_unmap && s_cloned_contexts[i]->orig_unmap != &observedUnmap)
-                return s_cloned_contexts[i]->orig_unmap;
-            table = s_cloned_contexts[i]->original_table;
-            break;
-        }
-    }
-    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
-    for (size_t i = 0; i < tblCount; ++i) {
-        if (s_hooked_tables[i].table == table && s_hooked_tables[i].orig_unmap &&
-            s_hooked_tables[i].orig_unmap != &observedUnmap) {
-            return s_hooked_tables[i].orig_unmap;
-        }
-    }
-    return original_unmap.load(std::memory_order_acquire);
+    return resolveContextOriginalSlot(context, kUnmap,
+        reinterpret_cast<void*>(&observedUnmap), original_unmap);
 }
 
 static constexpr size_t kRejectedCacheSize = 256;
@@ -5357,7 +5142,8 @@ void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
 }
 
 void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
-    if ((motion_early_color_view && !from_hud) || !motion_color_source) return;
+    if (!motion_color_source) return;
+    if (s_clean_hdr_scene_texture && s_clean_hdr_scene_frame == motion_color_frame && !from_hud) return;
     D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
     motion_color_source->GetDesc(&rtv_desc);
     Microsoft::WRL::ComPtr<ID3D11Resource> resource;
@@ -5855,11 +5641,6 @@ static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_hud_debug_backbuffer_rtv
 static ID3D11Texture2D* s_hud_debug_cached_backbuffer = nullptr;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_present;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_shared_bb_scene;
-// Keyed mutex protocol for the cross-device bridge (GPU-side synchronisation;
-// uses single key 0 on both devices to avoid alternating-key deadlocks on timeout):
-//   present: Acquire(0, 500) -> copy in (if needed) -> Release(0)
-//   scene:   Acquire(0, 500) -> reconstruct         -> Release(0)
-//   present: Acquire(0, 500) -> copy result out     -> Release(0)
 static Microsoft::WRL::ComPtr<IDXGIKeyedMutex> s_shared_mutex_present;
 static Microsoft::WRL::ComPtr<IDXGIKeyedMutex> s_shared_mutex_scene;
 static ID3D11Device* s_shared_present_dev = nullptr;
@@ -6002,6 +5783,131 @@ bool ensureSharedBackbufferBridge(ID3D11Device* presentDevice, ID3D11Device* sce
 OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context);
 MapFn resolveOriginalMap(ID3D11DeviceContext* context);
 UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context);
+
+struct ScopedD3D11PipelineState {
+    ID3D11DeviceContext* ctx = nullptr;
+    OMSetRenderTargetsFn rawSetOm = nullptr;
+    VSSetConstantBuffersFn rawSetVsCb = nullptr;
+    ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+    ID3D11GeometryShader* gs = nullptr;
+    ID3D11ComputeShader* cs = nullptr;
+    ID3D11Buffer* vsCbs[4]{};
+    ID3D11Buffer* psCbs[4]{};
+    ID3D11Buffer* csCbs[4]{};
+    ID3D11ShaderResourceView* psSrvs[8]{};
+    ID3D11ShaderResourceView* csSrvs[8]{};
+    ID3D11UnorderedAccessView* csUavs[2]{};
+    ID3D11SamplerState* psSamps[4]{};
+    ID3D11SamplerState* csSamps[4]{};
+    ID3D11InputLayout* inputLayout = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11RasterizerState* rs = nullptr;
+    UINT numVps = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT numScissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    ID3D11BlendState* blend = nullptr;
+    FLOAT blendFactor[4]{};
+    UINT sampleMask = 0xFFFFFFFF;
+    ID3D11DepthStencilState* ds = nullptr;
+    UINT stencilRef = 0;
+
+    explicit ScopedD3D11PipelineState(ID3D11DeviceContext* c) : ctx(c) {
+        if (!ctx) return;
+        rawSetOm = resolveOriginalOM(ctx);
+        rawSetVsCb = resolveOriginalVSSetConstantBuffers(ctx);
+        ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+        ctx->VSGetShader(&vs, nullptr, nullptr);
+        ctx->PSGetShader(&ps, nullptr, nullptr);
+        ctx->GSGetShader(&gs, nullptr, nullptr);
+        ctx->CSGetShader(&cs, nullptr, nullptr);
+        ctx->VSGetConstantBuffers(0, 4, vsCbs);
+        ctx->PSGetConstantBuffers(0, 4, psCbs);
+        ctx->CSGetConstantBuffers(0, 4, csCbs);
+        ctx->PSGetShaderResources(0, 8, psSrvs);
+        ctx->CSGetShaderResources(0, 8, csSrvs);
+        ctx->CSGetUnorderedAccessViews(0, 2, csUavs);
+        ctx->PSGetSamplers(0, 4, psSamps);
+        ctx->CSGetSamplers(0, 4, csSamps);
+        ctx->IAGetInputLayout(&inputLayout);
+        ctx->IAGetPrimitiveTopology(&topo);
+        ctx->RSGetState(&rs);
+        ctx->RSGetViewports(&numVps, vps);
+        ctx->RSGetScissorRects(&numScissors, scissors);
+        ctx->OMGetBlendState(&blend, blendFactor, &sampleMask);
+        ctx->OMGetDepthStencilState(&ds, &stencilRef);
+
+        if (rawSetOm) {
+            ID3D11RenderTargetView* nullRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+            rawSetOm(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullRtvs, nullptr);
+        }
+    }
+
+    ~ScopedD3D11PipelineState() {
+        if (!ctx) return;
+        rearmContextHooks();
+        ID3D11ShaderResourceView* nullSrvs[8]{};
+        ID3D11UnorderedAccessView* nullUavs[2]{};
+        ctx->PSSetShaderResources(0, 8, nullSrvs);
+        ctx->CSSetShaderResources(0, 8, nullSrvs);
+        ctx->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+        if (rawSetOm) {
+            ID3D11RenderTargetView* nullRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+            rawSetOm(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullRtvs, nullptr);
+            rawSetOm(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
+        }
+        ctx->VSSetShader(vs, nullptr, 0);
+        ctx->PSSetShader(ps, nullptr, 0);
+        ctx->GSSetShader(gs, nullptr, 0);
+        ctx->CSSetShader(cs, nullptr, 0);
+        if (rawSetVsCb) {
+            rawSetVsCb(ctx, 0, 4, vsCbs);
+        } else {
+            ctx->VSSetConstantBuffers(0, 4, vsCbs);
+        }
+        ctx->PSSetConstantBuffers(0, 4, psCbs);
+        ctx->CSSetConstantBuffers(0, 4, csCbs);
+        ctx->PSSetShaderResources(0, 8, psSrvs);
+        ctx->CSSetShaderResources(0, 8, csSrvs);
+        ctx->CSSetUnorderedAccessViews(0, 2, csUavs, nullptr);
+        ctx->PSSetSamplers(0, 4, psSamps);
+        ctx->CSSetSamplers(0, 4, csSamps);
+        ctx->IASetInputLayout(inputLayout);
+        ctx->IASetPrimitiveTopology(topo);
+        ctx->RSSetState(rs);
+        ctx->RSSetViewports(numVps, vps);
+        if (numScissors > 0) ctx->RSSetScissorRects(numScissors, scissors);
+        ctx->OMSetBlendState(blend, blendFactor, sampleMask);
+        ctx->OMSetDepthStencilState(ds, stencilRef);
+
+        for (auto* p : rtvs) if (p) p->Release();
+        if (dsv) dsv->Release();
+        if (vs) vs->Release();
+        if (ps) ps->Release();
+        if (gs) gs->Release();
+        if (cs) cs->Release();
+        for (auto* p : vsCbs) if (p) p->Release();
+        for (auto* p : psCbs) if (p) p->Release();
+        for (auto* p : csCbs) if (p) p->Release();
+        for (auto* p : psSrvs) if (p) p->Release();
+        for (auto* p : csSrvs) if (p) p->Release();
+        for (auto* p : csUavs) if (p) p->Release();
+        for (auto* p : psSamps) if (p) p->Release();
+        for (auto* p : csSamps) if (p) p->Release();
+        if (inputLayout) inputLayout->Release();
+        if (rs) rs->Release();
+        if (blend) blend->Release();
+        if (ds) ds->Release();
+        rearmContextHooks();
+        abandonAmortizedAndRearmHudProbe(ctx);
+    }
+
+    ScopedD3D11PipelineState(const ScopedD3D11PipelineState&) = delete;
+    ScopedD3D11PipelineState& operator=(const ScopedD3D11PipelineState&) = delete;
+};
 
 static bool s_in_pipeline_dlaa_evaluated = false;
 static unsigned long long s_in_pipeline_dlaa_frame = ~0ull;
@@ -6662,58 +6568,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_has_motion_prev_depth = false;
     }
 
-    static Microsoft::WRL::ComPtr<ID3DDeviceContextState> s_upscale_ctx_state;
-    static ID3D11Device* s_upscale_ctx_state_device = nullptr;
-    if (s_upscale_ctx_state_device != device.Get()) {
-        s_upscale_ctx_state.Reset();
-        s_upscale_ctx_state_device = device.Get();
-        Microsoft::WRL::ComPtr<ID3D11Device1> dev1;
-        if (SUCCEEDED(device.As(&dev1))) {
-            const auto fl = device->GetFeatureLevel();
-            const UINT stFlags = (device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED)
-                ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED : 0;
-            dev1->CreateDeviceContextState(stFlags, &fl, 1, D3D11_SDK_VERSION,
-                __uuidof(ID3D11Device1), nullptr, &s_upscale_ctx_state);
-        }
-    }
-
-    ID3D11RenderTargetView* savedRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-    ID3D11DepthStencilView* savedDsv = nullptr;
-    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, &savedDsv);
-    const OMSetRenderTargetsFn rawSet = resolveOriginalOM(context);
-    if (rawSet) {
-        ID3D11RenderTargetView* nullRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-        rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullRtvs, nullptr);
-    }
-
-    Microsoft::WRL::ComPtr<ID3D11DeviceContext1> ctx1;
-    Microsoft::WRL::ComPtr<ID3DDeviceContextState> priorGameState;
-    if (s_upscale_ctx_state && SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&ctx1)))) {
-        ctx1->SwapDeviceContextState(s_upscale_ctx_state.Get(), &priorGameState);
-    }
-
-    struct RestoreTargetsGuard {
-        ID3D11DeviceContext* ctx;
-        ID3D11DeviceContext1* ctx1Ptr;
-        ID3DDeviceContextState* priorStatePtr;
-        OMSetRenderTargetsFn setFn;
-        ID3D11RenderTargetView** rtvs;
-        ID3D11DepthStencilView* dsv;
-        ~RestoreTargetsGuard() {
-            if (ctx1Ptr && priorStatePtr) {
-                ctx1Ptr->SwapDeviceContextState(priorStatePtr, nullptr);
-            }
-            if (setFn) {
-                setFn(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
-            }
-            for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
-                if (rtvs[i]) rtvs[i]->Release();
-            }
-            if (dsv) dsv->Release();
-            rearmContextHooks();
-            abandonAmortizedAndRearmHudProbe(ctx);
-        }
-    } restoreTargets{context, ctx1.Get(), priorGameState.Get(), rawSet, savedRtvs, savedDsv};
+    ScopedD3D11PipelineState stateGuard(context);
 
     const unsigned scene_writes_this_eval = s_scene_writes_since_eval.exchange(0, std::memory_order_acq_rel);
     const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0);
@@ -6862,6 +6717,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             motion_pass->render(motion_depth_view.Get(),
                 s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
                 jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv);
+            rearmContextHooks();
         }
 
         if (!motion_pass->output()) return;
@@ -7011,6 +6867,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
         bool compOk = false;
         const bool upscalerEvalOk = upscaler.evaluate(context, inputs, nullptr, evalDestination);
+        rearmContextHooks();
         edpe::updateCrashUpscalerState(
             static_cast<int>(upscaler.getBackend()),
             static_cast<int>(upscaler.getMode()),
@@ -7356,6 +7213,7 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         renderW, renderH,
         reset,
         isHdr);
+    rearmContextHooks();
 
     if (crossDevice) {
         context->Flush();
@@ -7503,6 +7361,7 @@ void renderHudDebugView(ID3D11DeviceContext* context, unsigned long long rendere
         bbDesc.Width, bbDesc.Height,
         renderW, renderH,
         opacity, threshold, mode, isHdr);
+    rearmContextHooks();
 
     if (crossDevice) {
         context->Flush();
@@ -8352,17 +8211,48 @@ HRESULT STDMETHODCALLTYPE observedFinishCommandList(
 
 
 bool patchSlot(void** table, size_t slot, void* expected, void* replacement) {
+    if (!table) return false;
     DWORD old_protection = 0;
-    if (!VirtualProtect(table + slot, sizeof(void*), PAGE_READWRITE,
-            &old_protection)) return false;
+    if (!VirtualProtect(table + slot, sizeof(void*), PAGE_READWRITE, &old_protection)) {
+        if (!VirtualProtect(table + slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protection)) {
+            return false;
+        }
+    }
     void* replaced = InterlockedCompareExchangePointer(
         reinterpret_cast<PVOID volatile*>(table + slot), replacement, expected);
     DWORD ignored = 0;
     VirtualProtect(table + slot, sizeof(void*), old_protection, &ignored);
-    return replaced == expected;
+    if (replaced == expected) {
+        const size_t count = s_hooked_table_count.load(std::memory_order_acquire);
+        for (size_t i = 0; i < count; ++i) {
+            if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
+                if (s_context_vtable_hooks[i]->activeTable() == table ||
+                    s_context_vtable_hooks[i]->originalTable() == table) {
+                    s_context_vtable_hooks[i]->notifySlotPatched(slot, replacement);
+                }
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 void rearmContextHooks() {
+    if (g_is_evaluating_upscaler.load(std::memory_order_acquire)) return;
+    const size_t hookCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < hookCount; ++i) {
+        if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
+            s_context_vtable_hooks[i]->reclaim();
+        }
+    }
+    static bool s_swap_logged = false;
+    if (!s_swap_logged && motion_hook_watch > 0 && patched_table) {
+        s_swap_logged = true;
+        EdpeLog(L"EDPE: DSV observer restored after context-state swap");
+        EdpeLog(L"EDPE: vtable slot 33 (OMSetRenderTargets) match");
+        EdpeLog(L"EDPE: vtable slot 34 (OMSetRenderTargetsAndUAVs) match");
+    }
+
     if (g_is_evaluating_upscaler.load(std::memory_order_acquire)) return;
     if (!patched_table && s_hooked_table_count.load(std::memory_order_acquire) == 0) return;
     if (patched_table) {
@@ -8371,7 +8261,6 @@ void rearmContextHooks() {
         const bool restored = patchSlot(patched_table, kOMSetRenderTargets,
             patched_table[kOMSetRenderTargets],
             reinterpret_cast<void*>(&observedOMSetRenderTargets));
-        static bool s_swap_logged = false;
         if (restored && !s_swap_logged) {
             s_swap_logged = true;
             EdpeLog(L"EDPE: DSV observer restored after context-state swap");
@@ -8628,6 +8517,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
 
         ContextCensusHookContext(context);
+        table = *reinterpret_cast<void***>(context);
         observed_context.store(context, std::memory_order_release);
         patched_table = table;
         observed_swap_chain = swap_chain;
@@ -9528,6 +9418,9 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     }
     endVSBufferProbe();
     resetCameraDelta();
+    endHudDrawProbe();
+    hud_draw_hook_mask = 0;
+    hud_draw_probe_active.store(false, std::memory_order_release);
     for (size_t i = 0; i < s_cloned_context_count.load(std::memory_order_acquire); ++i) {
         if (s_cloned_contexts[i] && s_cloned_contexts[i]->context && s_cloned_contexts[i]->original_table) {
             *reinterpret_cast<void***>(s_cloned_contexts[i]->context) = s_cloned_contexts[i]->original_table;
@@ -9546,7 +9439,6 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
                     reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews),
                     reinterpret_cast<void*>(entry.orig_om_uav));
             }
-
             if (entry.orig_exec) {
                 patchSlot(entry.table, kExecuteCommandList,
                     reinterpret_cast<void*>(&observedExecuteCommandList),
@@ -9569,9 +9461,6 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
             }
         }
     }
-    endHudDrawProbe();
-    hud_draw_hook_mask = 0;
-    hud_draw_probe_active.store(false, std::memory_order_release);
     if (patched_table) {
         if (map_hook_active.exchange(false, std::memory_order_acq_rel)) {
             patchSlot(patched_table, kMap,
@@ -9584,14 +9473,24 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
                 reinterpret_cast<void*>(original_unmap.load(std::memory_order_acquire)));
         }
     }
+    for (size_t i = 0; i < s_hooked_table_count.load(std::memory_order_acquire); ++i) {
+        if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
+            s_context_vtable_hooks[i]->unhookAll();
+        }
+        s_hooked_tables[i] = {};
+    }
+    s_hooked_table_count.store(0, std::memory_order_release);
     scene_map_target.store(nullptr, std::memory_order_release);
     scene_mapped_data.store(nullptr, std::memory_order_release);
     s_hud_probe_armed_once.store(false, std::memory_order_release);
     clearTrackedMappedBuffers();
-    observed_context.exchange(nullptr, std::memory_order_acq_rel)->Release();
+    if (auto* prevCtx = observed_context.exchange(nullptr, std::memory_order_acq_rel)) {
+        prevCtx->Release();
+    }
     patched_table = nullptr;
     observed_swap_chain = nullptr;
     last_present_frame.store(0, std::memory_order_relaxed);
+    ResetPrimaryD3D11Device();
 }
 
 void ContextCensusSetJitterEnabled(bool enabled) {
@@ -9884,168 +9783,124 @@ unsigned ContextCensusGetHudDrawsReplayed() {
 
 void ContextCensusHookContext(ID3D11DeviceContext* context) {
     if (!context) return;
-    void** table = *reinterpret_cast<void***>(context);
-    if (!table) return;
-
-    {
-        const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
-        for (size_t i = 0; i < cloneCount; ++i) {
-            if (s_cloned_contexts[i] && s_cloned_contexts[i]->methods == table) {
-                table = s_cloned_contexts[i]->original_table;
-                break;
-            }
-        }
-    }
+    void** rawTable = *reinterpret_cast<void***>(context);
+    if (!rawTable) return;
 
     getOrCreateContextData(context);
-
-    bool alreadyHooked = false;
-    {
-        std::lock_guard lock(s_hooked_tables_mutex);
-        const size_t count = s_hooked_table_count.load(std::memory_order_relaxed);
-        for (size_t i = 0; i < count; ++i) {
-            if (s_hooked_tables[i].table == table &&
-                table[kOMSetRenderTargets] == reinterpret_cast<void*>(&observedOMSetRenderTargets) &&
-                table[kOMSetRenderTargetsAndUnorderedAccessViews] ==
-                    reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews)) {
-                alreadyHooked = true;
-                break;
-            }
-        }
-    }
-
     const bool is_immediate = (context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE);
 
-    bool sharedPatchOk = alreadyHooked;
-    if (!alreadyHooked) {
-        HookedTableEntry entry{};
-        entry.table = table;
-        entry.is_immediate = is_immediate;
-        entry.orig_om = reinterpret_cast<OMSetRenderTargetsFn>(table[kOMSetRenderTargets]);
-        entry.orig_om_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(
-            table[kOMSetRenderTargetsAndUnorderedAccessViews]);
-        entry.orig_exec = reinterpret_cast<ExecuteCommandListFn>(table[kExecuteCommandList]);
-        entry.orig_finish = reinterpret_cast<FinishCommandListFn>(table[kFinishCommandList]);
-
-        if (is_immediate) {
-            entry.orig_map = reinterpret_cast<MapFn>(table[kMap]);
-            entry.orig_unmap = reinterpret_cast<UnmapFn>(table[kUnmap]);
-        }
-
-        bool om_ok = (entry.orig_om == &observedOMSetRenderTargets);
-        if (entry.orig_om && entry.orig_om != &observedOMSetRenderTargets) {
-            original.store(entry.orig_om, std::memory_order_release);
-            om_ok = patchSlot(table, kOMSetRenderTargets, reinterpret_cast<void*>(entry.orig_om),
-                reinterpret_cast<void*>(&observedOMSetRenderTargets));
-        }
-        bool uav_ok = (entry.orig_om_uav == &observedOMSetRenderTargetsAndUnorderedAccessViews);
-        if (entry.orig_om_uav && entry.orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews) {
-            original_om_uav.store(entry.orig_om_uav, std::memory_order_release);
-            uav_ok = patchSlot(table, kOMSetRenderTargetsAndUnorderedAccessViews,
-                reinterpret_cast<void*>(entry.orig_om_uav),
-                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
-        }
-        if (entry.orig_exec && entry.orig_exec != &observedExecuteCommandList) {
-            original_execute_command_list.store(entry.orig_exec, std::memory_order_release);
-            patchSlot(table, kExecuteCommandList, reinterpret_cast<void*>(entry.orig_exec),
-                reinterpret_cast<void*>(&observedExecuteCommandList));
-        }
-
-        if (entry.orig_finish && entry.orig_finish != &observedFinishCommandList) {
-            original_finish_command_list.store(entry.orig_finish, std::memory_order_release);
-            patchSlot(table, kFinishCommandList, reinterpret_cast<void*>(entry.orig_finish),
-                reinterpret_cast<void*>(&observedFinishCommandList));
-        }
-        if (is_immediate) {
-            if (entry.orig_map && entry.orig_map != &observedMap) {
-                if (!original_map.load(std::memory_order_relaxed)) {
-                    original_map.store(entry.orig_map, std::memory_order_release);
-                }
-                if (map_hook_active.load(std::memory_order_acquire)) {
-                    patchSlot(table, kMap, reinterpret_cast<void*>(entry.orig_map),
-                        reinterpret_cast<void*>(&observedMap));
-                }
-            }
-            if (entry.orig_unmap && entry.orig_unmap != &observedUnmap) {
-                if (!original_unmap.load(std::memory_order_relaxed)) {
-                    original_unmap.store(entry.orig_unmap, std::memory_order_release);
-                }
-                if (unmap_hook_active.load(std::memory_order_acquire)) {
-                    patchSlot(table, kUnmap, reinterpret_cast<void*>(entry.orig_unmap),
-                        reinterpret_cast<void*>(&observedUnmap));
-                }
-            }
-        }
-        sharedPatchOk = om_ok && uav_ok;
-
-        std::lock_guard lock(s_hooked_tables_mutex);
-        const size_t count = s_hooked_table_count.load(std::memory_order_relaxed);
-        bool found = false;
-        for (size_t i = 0; i < count; ++i) {
-            if (s_hooked_tables[i].table == table) {
-                if (entry.orig_om != &observedOMSetRenderTargets) s_hooked_tables[i].orig_om = entry.orig_om;
-                if (entry.orig_om_uav != &observedOMSetRenderTargetsAndUnorderedAccessViews)
-                    s_hooked_tables[i].orig_om_uav = entry.orig_om_uav;
-                if (entry.orig_exec != &observedExecuteCommandList) s_hooked_tables[i].orig_exec = entry.orig_exec;
-                if (entry.orig_finish != &observedFinishCommandList) s_hooked_tables[i].orig_finish = entry.orig_finish;
-
-                if (is_immediate) {
-                    s_hooked_tables[i].is_immediate = true;
-                    if (entry.orig_map && entry.orig_map != &observedMap)
-                        s_hooked_tables[i].orig_map = entry.orig_map;
-                    if (entry.orig_unmap && entry.orig_unmap != &observedUnmap)
-                        s_hooked_tables[i].orig_unmap = entry.orig_unmap;
-                }
-                found = true;
-                break;
-            }
-        }
-        if (!found && count < kMaxHookedTables) {
-            s_hooked_tables[count] = entry;
-            s_hooked_table_count.store(count + 1, std::memory_order_release);
+    std::lock_guard lock(s_hooked_tables_mutex);
+    const size_t count = s_hooked_table_count.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i) {
+        if (s_hooked_tables[i].context == context &&
+            s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
+            s_context_vtable_hooks[i]->reclaim();
+            return;
         }
     }
 
-    if (is_immediate && hud_draw_probe_active.load(std::memory_order_acquire)) {
-        installHudStateRearmHooks();
-        rearmHudDrawProbe(context);
+    if (count >= kMaxHookedTables) return;
+
+    const edpe::HookMode mode = edpe::contextHookModeFor(context);
+    auto vtHook = std::make_unique<edpe::VTableHook>();
+    if (!vtHook->initialize(context, mode)) return;
+
+    HookedTableEntry entry{};
+    entry.context = context;
+    entry.original_table = vtHook->originalTable();
+    entry.table = vtHook->activeTable();
+    entry.is_immediate = is_immediate;
+
+    void* fwdOm = nullptr;
+    vtHook->hook(context, kOMSetRenderTargets,
+        reinterpret_cast<void*>(&observedOMSetRenderTargets), &fwdOm, mode);
+    entry.orig_om = reinterpret_cast<OMSetRenderTargetsFn>(fwdOm);
+    if (is_immediate || !original.load(std::memory_order_relaxed)) {
+        original.store(entry.orig_om, std::memory_order_release);
+    } else {
+        original_deferred_om.store(entry.orig_om, std::memory_order_release);
     }
 
-    if (!sharedPatchOk) {
-        std::lock_guard lock(s_cloned_contexts_mutex);
-        const size_t cloneCount = s_cloned_context_count.load(std::memory_order_relaxed);
-        for (size_t i = 0; i < cloneCount; ++i) {
-            if (s_cloned_contexts[i] && s_cloned_contexts[i]->context == context) return;
+    void* fwdOmUav = nullptr;
+    vtHook->hook(context, kOMSetRenderTargetsAndUnorderedAccessViews,
+        reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews), &fwdOmUav, mode);
+    entry.orig_om_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(fwdOmUav);
+    if (is_immediate || !original_om_uav.load(std::memory_order_relaxed)) {
+        original_om_uav.store(entry.orig_om_uav, std::memory_order_release);
+    } else {
+        original_deferred_om_uav.store(entry.orig_om_uav, std::memory_order_release);
+    }
+
+    void* fwdExec = nullptr;
+    vtHook->hook(context, kExecuteCommandList,
+        reinterpret_cast<void*>(&observedExecuteCommandList), &fwdExec, mode);
+    entry.orig_exec = reinterpret_cast<ExecuteCommandListFn>(fwdExec);
+    if (is_immediate || !original_execute_command_list.load(std::memory_order_relaxed)) {
+        original_execute_command_list.store(entry.orig_exec, std::memory_order_release);
+    } else {
+        original_deferred_execute_command_list.store(entry.orig_exec, std::memory_order_release);
+    }
+
+    void* fwdFinish = nullptr;
+    vtHook->hook(context, kFinishCommandList,
+        reinterpret_cast<void*>(&observedFinishCommandList), &fwdFinish, mode);
+    entry.orig_finish = reinterpret_cast<FinishCommandListFn>(fwdFinish);
+    if (is_immediate || !original_finish_command_list.load(std::memory_order_relaxed)) {
+        original_finish_command_list.store(entry.orig_finish, std::memory_order_release);
+    } else {
+        original_deferred_finish_command_list.store(entry.orig_finish, std::memory_order_release);
+    }
+
+    if (is_immediate) {
+        entry.orig_map = reinterpret_cast<MapFn>(vtHook->liveStubForSlot(kMap));
+        entry.orig_unmap = reinterpret_cast<UnmapFn>(vtHook->liveStubForSlot(kUnmap));
+        entry.orig_vs_cb = reinterpret_cast<VSSetConstantBuffersFn>(vtHook->liveStubForSlot(kVSSetConstantBuffers));
+        entry.orig_draw_indexed = reinterpret_cast<DrawIndexedFn>(vtHook->liveStubForSlot(kDrawIndexed));
+        entry.orig_draw = reinterpret_cast<DrawFn>(vtHook->liveStubForSlot(kDraw));
+        entry.orig_draw_indexed_instanced = reinterpret_cast<DrawIndexedInstancedFn>(vtHook->liveStubForSlot(kDrawIndexedInstanced));
+        entry.orig_draw_instanced = reinterpret_cast<DrawInstancedFn>(vtHook->liveStubForSlot(kDrawInstanced));
+        if (!original_map.load(std::memory_order_relaxed)) {
+            original_map.store(entry.orig_map, std::memory_order_release);
         }
-        if (cloneCount < kMaxClonedContexts) {
-            auto clone = std::make_unique<ClonedContextVtable>();
-            clone->context = context;
-            clone->original_table = table;
-            clone->orig_om = reinterpret_cast<OMSetRenderTargetsFn>(table[kOMSetRenderTargets]);
-            clone->orig_om_uav = reinterpret_cast<OMSetRenderTargetsAndUnorderedAccessViewsFn>(
-                table[kOMSetRenderTargetsAndUnorderedAccessViews]);
-
-            if (is_immediate) {
-                clone->orig_map = reinterpret_cast<MapFn>(table[kMap]);
-                clone->orig_unmap = reinterpret_cast<UnmapFn>(table[kUnmap]);
-            }
-            std::memcpy(clone->methods, table, sizeof(clone->methods));
-            clone->methods[kOMSetRenderTargets] = reinterpret_cast<void*>(&observedOMSetRenderTargets);
-            clone->methods[kOMSetRenderTargetsAndUnorderedAccessViews] =
-                reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews);
-
-            if (is_immediate && map_hook_active.load(std::memory_order_acquire)) {
-                clone->methods[kMap] = reinterpret_cast<void*>(&observedMap);
-            }
-            if (is_immediate && unmap_hook_active.load(std::memory_order_acquire)) {
-                clone->methods[kUnmap] = reinterpret_cast<void*>(&observedUnmap);
-            }
-            *reinterpret_cast<void***>(context) = clone->methods;
-            s_cloned_contexts[cloneCount] = std::move(clone);
-            s_cloned_context_count.store(cloneCount + 1, std::memory_order_release);
-            EdpeLog(L"EDPE: shared context vtable patch failed; installed per-context clone hook fallback");
+        if (!original_unmap.load(std::memory_order_relaxed)) {
+            original_unmap.store(entry.orig_unmap, std::memory_order_release);
+        }
+        if (!original_vs_set_buffers.load(std::memory_order_relaxed)) {
+            original_vs_set_buffers.store(entry.orig_vs_cb, std::memory_order_release);
+        }
+        if (!original_draw_indexed.load(std::memory_order_relaxed)) {
+            original_draw_indexed.store(entry.orig_draw_indexed, std::memory_order_release);
+        }
+        if (!original_draw.load(std::memory_order_relaxed)) {
+            original_draw.store(entry.orig_draw, std::memory_order_release);
+        }
+        if (!original_draw_indexed_instanced.load(std::memory_order_relaxed)) {
+            original_draw_indexed_instanced.store(entry.orig_draw_indexed_instanced, std::memory_order_release);
+        }
+        if (!original_draw_instanced.load(std::memory_order_relaxed)) {
+            original_draw_instanced.store(entry.orig_draw_instanced, std::memory_order_release);
+        }
+        if (map_hook_active.load(std::memory_order_acquire)) {
+            void* ignoredOut = nullptr;
+            vtHook->hook(context, kMap, reinterpret_cast<void*>(&observedMap), &ignoredOut, mode);
+        }
+        if (unmap_hook_active.load(std::memory_order_acquire)) {
+            void* ignoredOut = nullptr;
+            vtHook->hook(context, kUnmap, reinterpret_cast<void*>(&observedUnmap), &ignoredOut, mode);
+        }
+        if (hud_draw_probe_active.load(std::memory_order_acquire)) {
+            void* ignoredOut = nullptr;
+            vtHook->hook(context, kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers), &ignoredOut, mode);
+            vtHook->hook(context, kDrawIndexed, reinterpret_cast<void*>(&observedDrawIndexed), &ignoredOut, mode);
+            vtHook->hook(context, kDraw, reinterpret_cast<void*>(&observedDraw), &ignoredOut, mode);
+            vtHook->hook(context, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), &ignoredOut, mode);
+            vtHook->hook(context, kDrawInstanced, reinterpret_cast<void*>(&observedDrawInstanced), &ignoredOut, mode);
         }
     }
+
+    s_hooked_tables[count] = entry;
+    s_context_vtable_hooks[count] = std::move(vtHook);
+    s_hooked_table_count.store(count + 1, std::memory_order_release);
 }
 
 void ContextCensusHookDeferredContext(ID3D11DeviceContext* context) {

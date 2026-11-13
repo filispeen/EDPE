@@ -48,7 +48,8 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
 bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection& now,
     const CameraProjection& previous, UINT width, UINT height,
     float jitterX, float jitterY, float prevJitterX, float prevJitterY, bool reset,
-    ID3D11ShaderResourceView* prevDepth) {
+    ID3D11ShaderResourceView* prevDepth,
+    ID3D11ShaderResourceView* engineVelocity) {
     if (!device_ || !depth || !width || !height ||
         !(now.scaleX > 0 && now.scaleY > 0 && now.depthB > 0 &&
           previous.scaleX > 0 && previous.scaleY > 0) ||
@@ -59,6 +60,9 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
         !std::isfinite(prevJitterX) || !std::isfinite(prevJitterY)) return false;
     for (float value : now.worldFromView) if (!std::isfinite(value)) return false;
     for (float value : previous.worldFromView) if (!std::isfinite(value)) return false;
+    const int modeFlags =
+        ((prevDepth && !reset) ? 1 : 0) |
+        ((engineVelocity && !reset) ? 2 : 0);
     float values[36]{};
     for (unsigned i = 0; i < 12; ++i) {
         values[i] = now.worldFromView[i];
@@ -71,19 +75,22 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     values[28] = now.depthB;
     values[29] = static_cast<float>(width);
     values[30] = static_cast<float>(height);
-    values[31] = (prevDepth && !reset) ? 1.0f : 0.0f;
+    values[31] = static_cast<float>(modeFlags);
     values[32] = jitterX;
     values[33] = jitterY;
     values[34] = prevJitterX;
     values[35] = prevJitterY;
-    return renderInternal(depth, (prevDepth && !reset) ? prevDepth : nullptr,
+    return renderInternal(depth,
+        (prevDepth && !reset) ? prevDepth : nullptr,
+        (engineVelocity && !reset) ? engineVelocity : nullptr,
         values, nullptr, nullptr, width, height);
 }
 
 bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
     ID3D11Buffer* now, ID3D11Buffer* previous, UINT width, UINT height,
     float jitterX, float jitterY, float prevJitterX, float prevJitterY, bool reset,
-    ID3D11ShaderResourceView* prevDepth) {
+    ID3D11ShaderResourceView* prevDepth,
+    ID3D11ShaderResourceView* engineVelocity) {
     if (!device_ || !now || !previous || !width || !height ||
         !std::isfinite(jitterX) || !std::isfinite(jitterY) ||
         !std::isfinite(prevJitterX) || !std::isfinite(prevJitterY)) return false;
@@ -96,20 +103,26 @@ bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
         if (owner.Get() != device_.Get() || desc.ByteWidth != 5376 ||
             !(desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) return false;
     }
+    const int modeFlags =
+        ((prevDepth && !reset) ? 1 : 0) |
+        ((engineVelocity && !reset) ? 2 : 0);
     float values[36]{};
     values[29] = static_cast<float>(width);
     values[30] = static_cast<float>(height);
-    values[31] = (prevDepth && !reset) ? 1.0f : 0.0f;
+    values[31] = static_cast<float>(modeFlags);
     values[32] = jitterX;
     values[33] = jitterY;
     values[34] = prevJitterX;
     values[35] = prevJitterY;
-    return renderInternal(depth, (prevDepth && !reset) ? prevDepth : nullptr,
+    return renderInternal(depth,
+        (prevDepth && !reset) ? prevDepth : nullptr,
+        (engineVelocity && !reset) ? engineVelocity : nullptr,
         values, now, previous, width, height);
 }
 
 bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     ID3D11ShaderResourceView* prevDepth,
+    ID3D11ShaderResourceView* engineVelocity,
     const float (&values)[36], ID3D11Buffer* now, ID3D11Buffer* previous,
     UINT width, UINT height) {
     if (!device_ || !depth || !width || !height) return false;
@@ -162,7 +175,7 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
     context_->SwapDeviceContextState(state_.Get(), &prior);
     auto* rtv = output_rtv_.Get();
-    ID3D11ShaderResourceView* srvs[2] = {depth, prevDepth};
+    ID3D11ShaderResourceView* srvs[3] = {depth, prevDepth, engineVelocity};
     ID3D11Buffer* buffers[] = {constants_.Get(), now, previous};
     const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(width),
         static_cast<float>(height), 0, 1};
@@ -172,11 +185,11 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vertex_.Get(), nullptr, 0);
     context_->PSSetShader(now ? pixel_gpu_.Get() : pixel_.Get(), nullptr, 0);
-    context_->PSSetShaderResources(0, 2, srvs);
+    context_->PSSetShaderResources(0, 3, srvs);
     context_->PSSetConstantBuffers(0, now ? 3 : 1, buffers);
     context_->Draw(3, 0);
-    ID3D11ShaderResourceView* empty_srvs[2] = {nullptr, nullptr};
-    context_->PSSetShaderResources(0, 2, empty_srvs);
+    ID3D11ShaderResourceView* empty_srvs[3] = {nullptr, nullptr, nullptr};
+    context_->PSSetShaderResources(0, 3, empty_srvs);
     context_->OMSetRenderTargets(0, nullptr, nullptr);
     context_->SwapDeviceContextState(prior.Get(), nullptr);
 

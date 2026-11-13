@@ -4,9 +4,9 @@
 
 [![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version)](https://github.com/filispeen/EDPE/releases/latest)
 [![CI](https://github.com/filispeen/EDPE/actions/workflows/CI.yml/badge.svg)](https://github.com/filispeen/EDPE/actions/workflows/CI.yml)
-[![Status](https://img.shields.io/badge/status-v0.6.0%20Verified%20In--Game-success.svg)](STATUS.md)
+[![Status](https://img.shields.io/badge/status-v0.7.0%20Verified%20In--Game-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-12%2F12%20Passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-14%2F14%20Passing-brightgreen.svg)]()
 
 </div>
 
@@ -16,10 +16,14 @@ Elite Dangerous natively lacks modern temporal reconstruction technologies in it
 
 ---
 
-## Current Status: Milestone `v0.6.0` (Frametime Graph, Multi-Backend Benchmark & Developer Mode)
+## Current Status: Milestone `v0.7.0` (Cockpit Holographic HUD Mask & Composite Pass, Vector Font Overlay, Keyed Mutex Synchronization)
 
-As of **November 2026 (`v0.6.0`)**, EDPE has achieved:
+As of **November 2026 (`v0.7.0`)**, EDPE has achieved:
 
+* **Cockpit Holographic HUD Mask & Composite Pass:** Dedicated holographic UI extraction and subpixel projection unjittering pass (`s_hud_mask_texture` in `R11G11B10_FLOAT`) composited via `UiCompositePass`, eliminating motion blur, ghosting, and cutout artifacts on cockpit holographic panels and target displays.
+* **HUD Debug Visualizer:** Dedicated real-time visual inspection pass for cockpit HUD geometry and isolated UI mask elements.
+* **Vector Font Dear ImGui Overlay:** ImGui overlay refactored with ProggyForever vector font, delivering crisp, non-blurry menu rendering across 1080p, 1440p, and 4K displays.
+* **Color Source Debounce & Stability:** Cross-device Keyed Mutex synchronization and swapchain color debounce resolving transient flickering during camera transitions and scene re-renders.
 * **Real-Time Frametime Graph in Performance HUD (`F7`):** Multi-curve 120-sample rolling history graph rendered directly in the HUD overlay, displaying Total Frametime (Orange), Game Frametime (White), and Upscaler/Reconstruction Frametime (Cyan) with 60 FPS (16.67 ms) and 30 FPS (33.33 ms) grid reference lines. Color-coded numerical metrics are padded with leading spaces for stable, non-jumping readouts.
 * **Multi-Backend Comparison Benchmark Tool:** Automated sequential capture across all upscaler backends (`Native / Bypass`, `NVIDIA DLSS / DLAA`, `AMD FSR Native AA / SR`, `Native D3D11 TAA`) with 5-second backend warmup. Saves uncompressed comparison frames with optional on-frame HUD telemetry and GPU reconstruction time stamps directly to `edpe-captures/comparison/`.
 * **Rate-Limited Telemetry & QPC Profiler:** Display telemetry and QPC profiler metrics are rate-limited to 66.66 ms (~15 Hz), preventing number flickering and reducing UI render overhead on the GPU and CPU at high frame rates.
@@ -53,7 +57,7 @@ As of **November 2026 (`v0.6.0`)**, EDPE has achieved:
 * **Subpixel Jitter Debug View & Log Recorder (`F8` / `F9`):** Real-time on-screen jitter visualization and frame-indexed logging to `jitter_view.log` for tracking subpixel jitter offsets, luma correlation, and frame stability.
 * **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA / FSR Native AA / TAA (at 1.0x) or DLSS / FSR Super Resolution (at < 1.0x).
 * **Native UI Protection & Composite:** Dedicated shader pass (`UiCompositePass`) preserves native-resolution HUD, text, cockpits, and menus, seamlessly compositing them over reconstructed DLSS/FSR frames.
-* **Automated Test Suite:** 12 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy hooks, GPU motion passes, jitter reports, crash logger, and UI composition.
+* **Automated Test Suite:** 14 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy hooks, GPU motion passes, jitter reports, crash logger, HUD debug, and UI composition.
 
 ---
 
@@ -157,7 +161,7 @@ EDPE automatically reads and writes configuration parameters from `edpe.ini` loc
 ```ini
 [Upscaler]
 ; Upscaler backend: 0 = Native (Bypass), 1 = NVIDIA DLSS/DLAA, 2 = AMD FSR, 3 = Native D3D11 TAA
-Backend=1
+Backend=0
 ; DLSS Preset: 0 = Auto, 1 = J, 2 = K, 3 = L, 4 = M
 Preset=0
 AutoSyncEliteConfig=1
@@ -234,16 +238,18 @@ The build produces:
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
 ```
-All 12 automated unit and integration tests should pass:
+All 14 automated unit and integration tests should pass:
 * `temporal_math`: Halton sequence generation, projection math, matrix rejection bounds.
 * `camera_delta`: Camera displacement and scene reset detection.
 * `capture_format`: Half-float, float11/10 unpackers, depth contrast, Reinhard tone mapping.
 * `temporal_inputs`: Temporal input validation, vendor translation conventions, fail-open logic.
 * `motion_gpu`: Direct3D 11 GPU motion vector compute/pixel pass.
 * `ui_composite`: Native-resolution UI preservation and alpha blending pass.
+* `hud_debug`: Cockpit holographic HUD mask geometry and UI extraction test.
 * `dxbc_fanout`: Shader bytecode interception and hash validation.
 * `jitter_view_report`: Subpixel jitter diagnostics and luma correlation verification.
 * `crash_logger`: Minidump generation and fault-injection safety verification.
+* `ui_menu_size`: Dear ImGui menu dimensions, layout bounds, and DPI scaling test.
 * `proxy_smoke`: DLL proxy loading and swapchain hook smoke checks.
 * `proxy_shader_probe`: Shader bytecode interception verification.
 * `proxy_alias_smoke`: Consolidated `dxgi.dll` staged loading smoke checks.
@@ -273,20 +279,29 @@ To remove EDPE, simply delete or rename `dxgi.dll` and `nvngx_dlss.dll` from the
 EDPE/
 ├── external/                # Third-party dependencies (imgui, DLSS SDK, FidelityFX SDK)
 ├── src/
-│   ├── config.h             # Central configuration (kVersion, edpe.ini management)
-│   ├── context_census.cpp   # Direct3D 11 pipeline observation, CB0 parsing, jitter injection
-│   ├── d3d11_proxy.cpp      # D3D11CreateDevice hook & system DLL forwarding
-│   ├── dxgi_proxy.cpp       # DXGI factory hooks
+│   ├── config.c / .h        # Central configuration (kVersion, edpe.ini serialization)
+│   ├── context_census.cpp/.h# Direct3D 11 pipeline observation, CB0 parsing, jitter injection
+│   ├── d3d11_proxy.cpp / .h # D3D11CreateDevice hook & system DLL forwarding
+│   ├── dxgi_proxy.cpp / .def# DXGI factory hooks and export forwarding (dxgi.dll)
 │   ├── dxgi_observer.cpp    # Swapchain creation & Present hooks
-│   ├── motion_pass.cpp      # GPU camera-depth motion vector generation
-│   ├── ngx_context.cpp      # NVIDIA NGX DLAA/DLSS evaluation wrapper
-│   ├── amd_upscaler_backend.cpp # AMD FidelityFX FSR 3.1.2 backend
-│   ├── taa_backend.cpp      # Native Direct3D 11 TAA reconstruction pass
-│   ├── upscaler_backend.cpp # Vendor-neutral upscaler manager & backend abstraction
+│   ├── motion_pass.cpp / .h # GPU camera-depth motion vector generation pass
+│   ├── ngx_context.cpp / .h # NVIDIA NGX DLAA/DLSS evaluation wrapper
+│   ├── upscaler_backend.cpp/.h # Multi-upscaler manager & backends (DLSS, FSR 3.1.2, TAA)
+│   ├── taa_pass.cpp / .h    # Native Direct3D 11 TAA reconstruction pass
+│   ├── ui_composite_pass.cpp/.h # Native UI composite pass (HUD preservation)
+│   ├── hud_debug_pass.cpp/.h# Cockpit holographic HUD mask geometry and debug pass
+│   ├── jitter_debug_pass.cpp/.h # Subpixel jitter real-time visualization pass
+│   ├── jitter_logger.cpp/.h # Jitter diagnostics logger
+│   ├── jitter_view_recorder.cpp/.h # Subpixel jitter telemetry recorder (F9)
+│   ├── crash_logger.cpp/.h  # Minidump generation and crash diagnostics
+│   ├── input_hook.cpp / .h  # Window procedure (WndProc) filtering and DirectInput hook
+│   ├── perf_overlay.cpp/.h  # Real-time performance telemetry HUD & frametime graph (F7)
+│   ├── profiler.h           # High-precision QPC per-pass execution profiler
 │   ├── temporal_inputs.h    # Shared TemporalFrameInputs data contract
-│   ├── profiler.h / .cpp    # High-precision QPC per-pass execution profiler
-│   └── ui.cpp               # Dear ImGui overlay, telemetry HUD, F5-F9 hotkeys, snapshot visualizers
-├── tests/                   # Automated unit & integration test suites
+│   ├── temporal_math.h      # Halton sequences, camera delta projection math
+│   ├── log.cpp / .h         # Thread-safe diagnostic logging (edpe.log)
+│   └── ui.cpp / .h          # Dear ImGui overlay, telemetry HUD, F5-F9 hotkeys, snapshot visualizers
+├── tests/                   # Automated unit & integration test suites (14 tests)
 ├── tools/
 │   ├── fetch_ffx_dx11.py    # Automation script for fetching and building FidelityFX DX11 SDK
 │   └── ngx_probe/           # Standalone diagnostic probe for hardware NGX verification

@@ -74,7 +74,7 @@ Git tags
 Recommended names:
 
 ```text
-EDPE.dll
+dxgi.dll
 edpe.ini
 edpe.log
 ```
@@ -96,52 +96,47 @@ as four mostly duplicated systems.
 
 Instead use shared EDPE-produced temporal inputs:
 
-```text
-                       Elite Dangerous
-                              |
-                              v
-                       EDPE renderer hooks
-                              |
-             +----------------+----------------+
-             |                |                |
-             v                v                v
-           Color            Depth        Camera/Projection
-                                              |
-                                              v
-                                      Projection jitter
-                                              |
-                                              v
-                                      Motion generation
-                                              |
-                       +----------------------+
-                       |
-                       v
-                        TemporalFrameInputs
-                                 |
-              +---------+--------+--------+---------+
-              |                  |                  |
-              v                  v                  v
-         NVIDIA DLSS          AMD FSR           Intel XeSS
-         (DLAA / SR)       (NativeAA / SR)    (NativeAA / SR)
-              |                  |                  |
-              +---------+--------+--------+---------+
-                       |
-                       v
-              Native-res scene
-                       |
-                       v
-                  UI/HUD stage
-                       |
-                       v
-             Frame Generation layer
-             |                   |
-             v                   v
-       NVIDIA DLSS-G         AMD FSR FG
-             |                   |
-             +---------+---------+
-                       |
-                       v
-                    Present
+```mermaid
+flowchart TD
+    ED["Elite Dangerous"] --> Hooks["EDPE renderer hooks"]
+    Hooks --> Color["Scene Color"]
+    Hooks --> Depth["Scene Depth"]
+    Hooks --> Cam["Camera / Projection"]
+
+    Cam --> Jitter["Projection jitter"]
+    Jitter --> Motion["Motion generation"]
+    Color --> Inputs["TemporalFrameInputs"]
+    Depth --> Inputs
+    Motion --> Inputs
+
+    subgraph Upscalers ["Temporal Reconstruction Backends"]
+        DLSS["NVIDIA DLSS<br/>(DLAA / SR)"]
+        FSR["AMD FSR<br/>(Native AA / SR)"]
+        XeSS["Intel XeSS<br/>(Native AA / SR)"]
+    end
+
+    Inputs --> DLSS
+    Inputs --> FSR
+    Inputs --> XeSS
+
+    DLSS --> NativeScene["Native-res scene"]
+    FSR --> NativeScene
+    XeSS --> NativeScene
+
+    NativeScene --> UI["UI / HUD stage"]
+    UI --> FGLayer{"Frame Generation layer"}
+
+    subgraph FG ["Frame Generation Backends"]
+        DLSSG["NVIDIA DLSS-G"]
+        FSRFG["AMD FSR FG"]
+    end
+
+    FGLayer --> DLSSG
+    FGLayer --> FSRFG
+
+    DLSSG --> Present["Present"]
+    FSRFG --> Present
+    FGLayer -- "FG Off" --> Present
 ```
 
 Depth, motion, jitter and camera reconstruction belong to **EDPE**, not to an individual vendor backend.
@@ -155,43 +150,66 @@ Design around a vendor-neutral interface.
 Conceptually:
 
 ```cpp
-enum class UpscalerBackend {
-    None,
-    NvidiaDlss,
-    AmdFsr,
-    IntelXess,
-    Taa
+enum class UpscalerBackend : uint32_t {
+    None = 0,
+    NvidiaDlss = 1,
+    AmdFsr = 2,
+    Taa = 3
+    // IntelXess planned (Phase 16)
 };
 
-enum class UpscaleMode {
-    Native,
-    NativeAA,
-    UltraQualityPlus,
-    UltraQuality,
-    Quality,
-    Balanced,
-    Performance,
-    UltraPerformance
+enum class UpscaleMode : uint32_t {
+    Native = 0,           // 1:1 bypass / original game presentation
+    NativeAA = 1,         // 1:1 native-resolution temporal AA (DLAA / FSR Native AA / TAA)
+    Quality = 2,          // ~1.5x scaling per dimension (66.7% resolution)
+    Balanced = 3,         // ~1.7x scaling per dimension (58.8% resolution)
+    Performance = 4,      // 2.0x scaling per dimension (50.0% resolution)
+    UltraPerformance = 5  // 3.0x scaling per dimension (33.3% resolution)
 };
 
 struct TemporalFrameInputs {
-    ID3D11Texture2D* color;
-    ID3D11Texture2D* depth;
-    ID3D11Texture2D* motionVectors;
-    ID3D11Texture2D* reactiveMask;
+    ID3D11Texture2D* color = nullptr;
+    ID3D11ShaderResourceView* colorSrv = nullptr;
 
-    uint32_t renderWidth;
-    uint32_t renderHeight;
+    ID3D11Texture2D* depth = nullptr;
+    ID3D11ShaderResourceView* depthSrv = nullptr;
+    ID3D11ShaderResourceView* prevDepthSrv = nullptr;
 
-    uint32_t outputWidth;
-    uint32_t outputHeight;
+    ID3D11Texture2D* motionVectors = nullptr;
+    ID3D11ShaderResourceView* motionSrv = nullptr;
 
-    float jitterX;
-    float jitterY;
+    // Reactive mask superseded in EDPE by UiCompositePass (native HUD isolation & composite)
+    ID3D11Texture2D* transparencyMask = nullptr;
+    ID3D11ShaderResourceView* transparencyMaskSrv = nullptr;
 
-    float frameTimeMs;
+    ID3D11Texture2D* exposure = nullptr;
+    ID3D11ShaderResourceView* exposureSrv = nullptr;
 
-    bool reset;
+    uint32_t renderWidth = 0;
+    uint32_t renderHeight = 0;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
+
+    float jitterX = 0.0f;
+    float jitterY = 0.0f;
+    float prevJitterX = 0.0f;
+    float prevJitterY = 0.0f;
+
+    float frameTimeMs = 0.0f;
+    float sharpness = 0.0f;
+    bool reset = false;
+
+    CameraProjection cameraNow{};
+    CameraProjection cameraPrevious{};
+
+    bool depthInverted = true;
+    bool depthInfinite = true;
+
+    bool motionJittered = false;
+    bool motionIsLowRes = true;
+    bool colorIsHdr = true;
+    float motionScaleX = 1.0f;
+    float motionScaleY = 1.0f;
 };
 ```
 
@@ -283,22 +301,14 @@ Frame Generation is a later research phase.
 
 Likely architecture:
 
-```text
-Elite D3D11
-     |
-     v
-EDPE D3D11 interception
-     |
-     +--> temporal reconstruction
-     |
-     v
-D3D11 / D3D12 shared resources
-     |
-     v
-D3D12 presentation / FG bridge
-     |
-     v
-FG swapchain / presentation path
+```mermaid
+flowchart TD
+    ED["Elite D3D11"] --> Hook["EDPE D3D11 interception"]
+    Hook --> SR["Temporal Reconstruction<br/>(DLAA / DLSS / FSR / TAA)"]
+    SR --> Shared["D3D11 / D3D12 shared resources<br/>(Keyed Mutex / Shared NT Handles)"]
+    Hook -.-> Shared
+    Shared --> Bridge["D3D12 presentation / FG bridge"]
+    Bridge --> Swapchain["FG swapchain / presentation path"]
 ```
 
 Possible technologies to investigate:
@@ -620,18 +630,13 @@ Investigate a D3D11 -> D3D12 interoperability layer that permits use of the curr
 
 Possible architecture:
 
-```text
-Elite D3D11 resources
-        |
-shared resources
-        |
-D3D12 EDPE device
-        |
-FidelityFX API
-        |
-D3D12 output
-        |
-shared back to D3D11
+```mermaid
+flowchart TD
+    D11["Elite D3D11 resources"] --> Shared["Shared resources<br/>(Keyed Mutex)"]
+    Shared --> D12Device["D3D12 EDPE device"]
+    D12Device --> FFX["FidelityFX API<br/>(FSR 3.1.x)"]
+    FFX --> D12Out["D3D12 output"]
+    D12Out --> BackD11["Shared back to D3D11"]
 ```
 
 Advantages:
@@ -731,16 +736,12 @@ Evaluate two primary implementation routes:
 
 Leverage the Phase 13 shared resource infrastructure:
 
-```text
-Elite D3D11 render targets (Color, Depth, Motion)
-         |
-shared NT handles / key-mutex synchronization
-         |
-EDPE D3D12 device & command queue
-         |
-libxess execution (xessD3D12Execute)
-         |
-shared back to D3D11 swapchain backbuffer
+```mermaid
+flowchart TD
+    Targets["Elite D3D11 render targets<br/>(Color, Depth, Motion)"] --> Sync["Shared NT handles / Keyed Mutex synchronization"]
+    Sync --> D12Queue["EDPE D3D12 device & command queue"]
+    D12Queue --> XeSS["libxess execution<br/>(xessD3D12Execute)"]
+    XeSS --> Backbuffer["Shared back to D3D11 swapchain backbuffer"]
 ```
 
 Advantages:
@@ -869,28 +870,16 @@ For Frame Generation it becomes a much more important requirement.
 
 Target pipeline:
 
-```text
-LOW-RES WORLD
-      |
-      v
-TEMPORAL UPSCALER
-      |
-      v
-NATIVE-RES HUD-LESS WORLD
-      |
-      +---------------------+
-      |                     |
-      v                     v
-    FG INPUT             UI LAYER
-      |
-      v
-GENERATED / REAL FRAME
-      |
-      v
-UI COMPOSITION
-      |
-      v
-PRESENT
+```mermaid
+flowchart TD
+    LowRes["LOW-RES WORLD"] --> Upscaler["TEMPORAL UPSCALER"]
+    Upscaler --> HudLess["NATIVE-RES HUD-LESS WORLD"]
+    HudLess --> FGInput["FG INPUT"]
+    HudLess --> UILayer["UI LAYER"]
+    FGInput --> GenFrame["GENERATED / REAL FRAME"]
+    GenFrame --> UIComp["UI COMPOSITION"]
+    UILayer --> UIComp
+    UIComp --> Present["PRESENT"]
 ```
 
 Do not enable production FG until EDPE can correctly distinguish world content from the HUD or otherwise provide the vendor API's supported UI handling mode.
@@ -927,6 +916,11 @@ imgui_impl_dx11
 ```
 
 If EDPE later replaces/proxies the presentation path through D3D12 for FG, preserve the ImGui abstraction so its renderer backend can be changed without rewriting settings logic.
+
+Controls & Hotkeys:
+
+* `F5`: Toggle EDPE Dear ImGui control panel (all input passes through to the game when closed)
+* `F7`: Toggle real-time Performance Telemetry HUD (FPS, frametimes, frametime history graph, GPU stats)
 
 Suggested UI:
 
@@ -1019,123 +1013,52 @@ Never mislabel generated frames as additional game simulation frames.
 
 # 20. Project layout
 
-Suggested architecture:
+Project architecture:
 
 ```text
 /
 ├── AGENTS.md
 ├── PLAN.md
-├── CMakeLists.txt
+├── STATUS.md
 ├── README.md
+├── CMakeLists.txt
+├── edpe.ini
 │
-├── external/
+├── external/                # Third-party dependencies (imgui, DLSS SDK, FidelityFX SDK)
 │   ├── imgui/
-│   ├── nvidia/
-│   ├── amd/
-│   └── intel/
+│   ├── DLSS/
+│   └── ffx-dx11/
 │
 ├── src/
-│   ├── dllmain.cpp
-│   │
-│   ├── hook/
-│   │   ├── d3d11_proxy.cpp
-│   │   ├── dxgi_hook.cpp
-│   │   ├── present_hook.cpp
-│   │   ├── device_hook.cpp
-│   │   ├── proxy_chain.cpp
-│   │   └── wndproc_hook.cpp
-│   │
-│   ├── renderer/
-│   │   ├── frame_context.cpp
-│   │   ├── render_target_tracker.cpp
-│   │   ├── depth_tracker.cpp
-│   │   ├── camera_tracker.cpp
-│   │   ├── projection_jitter.cpp
-│   │   └── resolution_controller.cpp
-│   │
-│   ├── temporal/
-│   │   ├── temporal_inputs.cpp
-│   │   ├── motion_vectors.cpp
-│   │   ├── reactive_mask.cpp
-│   │   ├── history_state.cpp
-│   │   └── temporal_math.cpp
-│   │
-│   ├── upscaler/
-│   │   ├── upscaler.h
-│   │   ├── upscaler_manager.cpp
-│   │   │
-│   │   ├── nvidia/
-│   │   │   ├── ngx_context.cpp
-│   │   │   ├── dlss.cpp
-│   │   │   └── dlss_resources.cpp
-│   │   │
-│   │   ├── amd/
-│   │   │   ├── fsr.cpp
-│   │   │   ├── fsr_context.cpp
-│   │   │   └── fsr_resources.cpp
-│   │   │
-│   │   ├── intel/
-│   │   │   ├── xess.cpp
-│   │   │   ├── xess_context.cpp
-│   │   │   └── xess_resources.cpp
-│   │   │
-│   │   └── taa/
-│   │       ├── taa.cpp
-│   │       └── taa_resources.cpp
-│   │
-│   ├── framegen/
-│   │   ├── framegen.h
-│   │   ├── framegen_manager.cpp
-│   │   │
-│   │   ├── nvidia/
-│   │   │   ├── streamline.cpp
-│   │   │   └── dlss_fg.cpp
-│   │   │
-│   │   └── amd/
-│   │       └── fsr_fg.cpp
-│   │
-│   ├── latency/
-│   │   ├── latency.h
-│   │   ├── latency_manager.cpp
-│   │   │
-│   │   ├── nvidia/
-│   │   │   └── reflex_backend.cpp
-│   │   │
-│   │   └── amd/
-│   │       └── anti_lag_backend.cpp
-│   │
-│   ├── interop/
-│   │   ├── d3d11_d3d12.cpp
-│   │   ├── shared_texture.cpp
-│   │   └── shared_fence.cpp
-│   │
-│   ├── ui/
-│   │   ├── imgui_layer.cpp
-│   │   ├── settings_window.cpp
-│   │   └── debug_views.cpp
-│   │
-│   ├── diagnostics/
-│   │   ├── logger.cpp
-│   │   ├── gpu_timer.cpp
-│   │   ├── texture_dump.cpp
-│   │   └── frame_debug.cpp
-│   │
-│   └── config/
-│       ├── config.cpp
-│       └── config.h
+│   ├── dllmain.cpp          # DllMain entry point and initialization
+│   ├── dxgi_proxy.cpp / .def# DXGI factory export forwarding and hook injection (dxgi.dll)
+│   ├── d3d11_proxy.cpp / .h # D3D11CreateDevice hook & system DLL forwarding
+│   ├── dxgi_observer.cpp    # Swapchain creation & Present hooks, backbuffer tracking
+│   ├── context_census.cpp/.h# Direct3D 11 pipeline observation, CB0 parsing, jitter injection
+│   ├── temporal_inputs.h    # Shared TemporalFrameInputs data contract
+│   ├── temporal_math.h      # Halton sequences, camera delta projection math
+│   ├── motion_pass.cpp / .h # GPU camera-depth motion vector generation pass
+│   ├── ngx_context.cpp / .h # NVIDIA NGX DLAA/DLSS evaluation wrapper
+│   ├── upscaler_backend.cpp/.h # Multi-upscaler manager & backends (DLSS, FSR 3.1.2, TAA)
+│   ├── taa_pass.cpp / .h    # Native Direct3D 11 TAA reconstruction pass
+│   ├── ui_composite_pass.cpp/.h # Native UI composite pass (HUD preservation)
+│   ├── hud_debug_pass.cpp/.h# Cockpit holographic HUD mask geometry and debug pass
+│   ├── jitter_debug_pass.cpp/.h # Subpixel jitter real-time visualization pass
+│   ├── jitter_logger.cpp/.h # Jitter diagnostics logger
+│   ├── jitter_view_recorder.cpp/.h # Subpixel jitter telemetry recorder (F9)
+│   ├── crash_logger.cpp/.h  # Minidump generation and crash diagnostics
+│   ├── input_hook.cpp / .h  # Window procedure (WndProc) filtering and DirectInput hook
+│   ├── perf_overlay.cpp/.h  # Real-time performance telemetry HUD & frametime graph (F7)
+│   ├── profiler.h           # High-precision QPC per-pass execution profiler
+│   ├── ui.cpp / .h          # Dear ImGui overlay (F5), hotkey handling, settings UI
+│   ├── config.c / .h        # Central configuration (kVersion, edpe.ini serialization)
+│   ├── log.cpp / .h         # Thread-safe diagnostic logging (edpe.log)
+│   └── *_shader.h           # Compiled HLSL bytecode headers embedded in C/C++
 │
-└── shaders/
-    ├── motion_vectors.hlsl
-    ├── depth_prepare.hlsl
-    ├── reactive_mask.hlsl
-    └── debug_visualize.hlsl
+├── tests/                   # Automated unit & integration test suites (14 tests)
+├── tools/                   # Standalone diagnostic probes & SDK fetch scripts
+└── docs/                    # Technical research, reverse-engineering notes & input contracts
 ```
-
-Do not create this whole hierarchy immediately.
-
-Create modules only when the implementation reaches them.
-
----
 
 # 21. Git workflow
 
@@ -1657,34 +1580,24 @@ before deciding which is the production EDPE AMD path.
 
 # 35. Phase 12 — native-resolution HUD
 
-Investigate HUD separation.
+**Status: Implemented & Verified in-game (Stage 2)**
 
-Possible detection mechanisms:
+Target architecture:
 
-```text
-shader hashes
-blend states
-textures
-render targets
-constant buffers
-draw ordering
+```mermaid
+flowchart TD
+    LowRes["Low-res 3D World"] --> Upscale["Upscale<br/>(DLAA / DLSS / FSR / TAA)"]
+    Upscale --> NativeWorld["Native-res 3D World"]
+    NativeWorld --> Composite["Native-res HUD Composite<br/>(`UiCompositePass`)"]
+    HUDMask["Cockpit HUD Mask<br/>(`s_hud_mask_texture`)"] --> Composite
+    Composite --> Present["Present"]
 ```
 
-Target:
-
-```text
-low-res world
-     |
-upscale
-     |
-native-res world
-     |
-native-res HUD
-     |
-Present
-```
-
-This phase significantly improves SR quality and is a prerequisite for production-quality Frame Generation.
+Elite's cockpit HUD, text, holograms, and menus are isolated from the scene LDR buffer and composited at native presentation resolution:
+1. **Scene Color Isolation:** Clean pre-HUD 3D scene color (`s_clean_hdr_scene_texture`) is latched and fed directly to the active upscaler (DLAA / DLSS / FSR / TAA).
+2. **Cockpit Holographic HUD Mask:** Cockpit HUD draws are replayed at native resolution into `s_hud_mask_texture` (`R11G11B10_FLOAT`) with viewport subpixel projection unjittering.
+3. **UI Composition Pass:** `UiCompositePass` composites native-res emissive and additive HUD elements cleanly over the reconstructed world without blurry cutout blending.
+4. **Validation:** Cockpit text, navigation compass, target reticles, and system holographic panels remain razor-sharp and free of temporal motion smearing.
 
 ---
 
@@ -1804,38 +1717,7 @@ MFG multiplier
 
 ---
 
-# 39. Phase 16 — NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)
-
-Investigate and prototype NVIDIA DLSS Ray Reconstruction / Neural Radiance Denoiser (DLSS-NR / DLSS-RR) support via NVIDIA NGX (`NVSDK_NGX_Feature_RayReconstruction`) or Streamline (`SL_FEATURE_DLSS_RR`).
-
-DLSS-NR replaces traditional handcrafted temporal/spatial denoisers by feeding noisy diffuse/specular signals into an AI neural model that reconstructs higher-quality lighting, specular reflections, and ambient occlusion while simultaneously performing temporal super-resolution.
-
-Required investigation and inputs:
-
-```text
-Cobra G-Buffer surface normals (world or view space)
-Cobra G-Buffer roughness / specular material parameters
-Noisy radiance render targets (SSR reflections / ambient lighting)
-Scene depth (DSV #2 reversed-Z)
-Screen-space motion vectors
-Subpixel projection jitter
-Camera matrices and exposure
-```
-
-Goals:
-
-1. **G-Buffer Discovery in Cobra:**
-   Identify and isolate render-target binds containing view/world normals and surface roughness during the deferred G-Buffer lighting pass.
-2. **NGX Ray Reconstruction Dispatch:**
-   Initialize and dispatch `NVSDK_NGX_D3D11_CreateFeature` with `NVSDK_NGX_Feature_RayReconstruction` (or through the D3D12/Streamline bridge).
-3. **Fail-Open Fallback:**
-   If normal/roughness buffers are unavailable or if the active GPU lacks required Tensor Core capabilities, safely fall back to standard DLSS Super Resolution or DLAA.
-4. **Validation:**
-   Verify elimination of reflection smearing, ghosting, and noise on cockpit canopies, planetary ice/water surfaces, and station interior metallic structures.
-
----
-
-# 40. Phase 17 — Intel XeSS (Xe Super Sampling) temporal upscaling & Native AA
+# 39. Phase 16 — Intel XeSS (Xe Super Sampling) temporal upscaling & Native AA
 
 Implement Intel XeSS (Xe Super Sampling) temporal upscaling and XeSS Native AA as a first-class reconstruction backend within the EDPE multi-upscaler architecture.
 
@@ -1871,107 +1753,7 @@ Requirements and execution:
 
 ---
 
-# 41. Phase 18 — Third-party mod & ecosystem compatibility (ReShade, EDHM, 3Dmigoto, overlays)
-
-Ensure robust, out-of-the-box compatibility and co-existence with essential Elite Dangerous visual mods and community graphics tools, specifically **ReShade**, **EDHM (Elite Dangerous HUD Mod)**, **3Dmigoto**, and standard overlays (**RTSS**, **Special K**, **Steam/Discord**).
-
-Many pilots rely on EDHM to customize cockpits/menus and ReShade for stylized post-processing or color grading. EDPE must not force players into an either/or choice: temporal reconstruction must co-exist cleanly with these tools.
-
-Key architectural requirements and technical execution:
-
-### 1. Proxy DLL Chaining Architecture (`edpe.ini` `[Proxy]`)
-- **DLL Name Collision Resolution:**
-  Elite Dangerous loads proxy DLLs placed in the game directory (`elite-dangerous-odyssey-64/`). Since EDPE, ReShade, and EDHM/3Dmigoto all commonly masquerade as `dxgi.dll` or `d3d11.dll`, EDPE provides a configurable DLL proxy chaining loader.
-- **Configuration & Auto-Discovery:**
-  In `edpe.ini`:
-  ```ini
-  [Proxy]
-  EnableProxyChain=1
-  ; Target DLL to chain into (relative filename or absolute path).
-  ; Examples: ReShade64.dll, d3d11_edhm.dll, dxgi_chain.dll
-  ProxyDll=ReShade64.dll
-  ```
-  If `ProxyDll` is not explicitly set but known third-party binaries are present in the directory (e.g. `ReShade64.dll`, `dxgi_reshade.dll`, `d3d11_edhm.dll`), EDPE can auto-detect and chain into them automatically.
-- **Export Forwarding & Transparent VTable Delegation:**
-  `EDPE.dll` exports all necessary DXGI / D3D11 factory and device entry points (`CreateDXGIFactory`, `CreateDXGIFactory1`, `CreateDXGIFactory2`, `DXGIDeclareAdapterRemovalSupport`, `D3D11CreateDevice`, `D3D11CreateDeviceAndSwapChain`).
-  When chaining is active, EDPE forwards the creation call down to the chained proxy DLL, intercepts the resulting interface pointers (wrapping or observing them), and retains its own lightweight hooks.
-- **Fail-Open Fallback:**
-  If the chained proxy DLL fails to load, is corrupt, or is missing exports, EDPE logs the diagnostic error and transparently falls back to the genuine Windows system DLL (`system32\dxgi.dll` / `system32\d3d11.dll`) without crashing.
-
-### 2. Render Pipeline & Hook Execution Ordering
-The execution order between EDPE and third-party tools is mathematically critical to image quality:
-
-```text
-Game Scene Draw Calls (Low-Res 3D World)
-                 │
-                 ▼
-EDPE Latches Scene Color, Depth (DSV #2), Camera Constants & Jitter
-                 │
-                 ▼
-EDHM / 3Dmigoto Shaders Modify Cockpit & HUD Elements
-                 │
-                 ▼
-EDPE Temporal Reconstruction (DLSS / FSR / XeSS) Evaluates 3D World
-                 │
-                 ▼
-EDPE UiCompositePass Composites Native-Res Cockpit/UI over Reconstructed World
-                 │
-                 ▼
-ReShade Post-Processing Pass (Color Grading, Bloom, CRT, Sharpening)
-                 │
-                 ▼
-EDPE Dear ImGui & ReShade Overlays
-                 │
-                 ▼
-IDXGISwapChain::Present
-```
-
-- **Post-Upscale ReShade Execution:**
-  ReShade shader passes **must execute after EDPE temporal reconstruction and UI composition**.
-  Running temporal upscaling on top of an image already altered by ReShade post-processing (film grain, bloom, chromatic aberration, color grading) severely corrupts temporal history, generates smear artifacts, and breaks motion vectors.
-  Conversely, executing ReShade on the high-resolution reconstructed frame guarantees pristine post-processing fidelity.
-- **ReShade Depth Buffer Alignment:**
-  ReShade effects utilizing scene depth (e.g., MXAO, RTGI, Depth of Field) need access to the authoritative depth buffer.
-  EDPE identifies DSV #2 (`DXGI_FORMAT_R32G8X24_TYPELESS`, reversed-Z) and provides documentation/configuration guidance for ReShade's generic depth add-on, eliminating depth-buffer hunting conflicts.
-
-### 3. EDHM (Elite Dangerous HUD Mod) / 3Dmigoto Interoperability
-- **Dynamic Shader Override Resiliency:**
-  EDHM uses 3Dmigoto to intercept and replace pixel/vertex shaders for cockpit panels, HUD holograms, and cabin lighting.
-  EDPE's Phase 12 (native-resolution HUD extraction and reactive mask pass) must **not** rely on brittle single pixel shader hashes that change when EDHM modifies shaders.
-  Instead, HUD classification must combine multi-criteria heuristics:
-  - Render target formats and binding order;
-  - Depth-stencil states (e.g. depth write disabled, depth test configurations typical of UI passes);
-  - Alpha / additive blend states;
-  - Constant buffer size and layout (e.g. cockpit UI projection transforms);
-  - Optional configurable EDHM shader hash wildcards/ranges.
-- **Preservation of Custom Cockpit Themes:**
-  EDPE isolates the native-resolution UI elements and composites them cleanly over the upscaled 3D exterior scene, preserving custom EDHM color palettes and cabin glow while rendering the space background with temporal clarity.
-
-### 4. Cooperative Window & Input Routing (WndProc Chain)
-- Hook `WndProc` cleanly using standard message procedure subclassing (`SetWindowLongPtrW` / `CallWindowProcW`).
-- When the EDPE menu is inactive, immediately forward all mouse, keyboard, and joystick events down the chain without delay, preventing input lag or dropped keystrokes in ReShade (`Home` key), EDHM (`F11`), or Elite flight controls.
-- When EDPE's Dear ImGui menu is open, handle mouse interaction within the ImGui window and cleanly pass through non-conflicting inputs.
-
-### 5. Runtime Diagnostics & Third-Party Tool Detection
-- During initialization, inspect loaded modules in the process memory space.
-- Detect and log the presence of:
-  - `ReShade64.dll` / `ReShade.ini`
-  - `d3d11.dll` / `3Dmigoto` / `EDHM_UI.exe`
-  - `RTSSHooks64.dll` (RivaTuner Statistics Server)
-  - `SpecialK64.dll`
-  - `gameoverlayrenderer64.dll` (Steam)
-  - `DiscordHook64.dll`
-- Expose third-party mod status in Dear ImGui and `edpe.log`:
-  ```text
-  Proxy Chaining:       Enabled (ReShade64.dll)
-  Detected Hooks:       EDHM (3Dmigoto), RTSS
-  Hook Order:           OK (Scene -> EDHM -> EDPE SR -> ReShade -> Present)
-  ```
-- If an incompatible hook ordering or conflicting DLL override is detected, display a helpful suggestion in the Dear ImGui status panel.
-
----
-
-# 42. Phase 19 — Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag / Anti-Lag 2)
+# 40. Phase 17 — Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag / Anti-Lag 2)
 
 Implement a standalone, vendor-neutral low-latency framework integrating **NVIDIA Reflex** and **AMD Anti-Lag / Anti-Lag 2** into EDPE.
 
@@ -2087,6 +1869,123 @@ public:
 
 ---
 
+# 41. Phase 18 — NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)
+
+Investigate and prototype NVIDIA DLSS Ray Reconstruction / Neural Radiance Denoiser (DLSS-NR / DLSS-RR) support via NVIDIA NGX (`NVSDK_NGX_Feature_RayReconstruction`) or Streamline (`SL_FEATURE_DLSS_RR`).
+
+DLSS-NR replaces traditional handcrafted temporal/spatial denoisers by feeding noisy diffuse/specular signals into an AI neural model that reconstructs higher-quality lighting, specular reflections, and ambient occlusion while simultaneously performing temporal super-resolution.
+
+Required investigation and inputs:
+
+```text
+Cobra G-Buffer surface normals (world or view space)
+Cobra G-Buffer roughness / specular material parameters
+Noisy radiance render targets (SSR reflections / ambient lighting)
+Scene depth (DSV #2 reversed-Z)
+Screen-space motion vectors
+Subpixel projection jitter
+Camera matrices and exposure
+```
+
+Goals:
+
+1. **G-Buffer Discovery in Cobra:**
+   Identify and isolate render-target binds containing view/world normals and surface roughness during the deferred G-Buffer lighting pass.
+2. **NGX Ray Reconstruction Dispatch:**
+   Initialize and dispatch `NVSDK_NGX_D3D11_CreateFeature` with `NVSDK_NGX_Feature_RayReconstruction` (or through the D3D12/Streamline bridge).
+3. **Fail-Open Fallback:**
+   If normal/roughness buffers are unavailable or if the active GPU lacks required Tensor Core capabilities, safely fall back to standard DLSS Super Resolution or DLAA.
+4. **Validation:**
+   Verify elimination of reflection smearing, ghosting, and noise on cockpit canopies, planetary ice/water surfaces, and station interior metallic structures.
+
+---
+
+# 42. Phase 19 — Third-party mod & ecosystem compatibility (ReShade, EDHM, 3Dmigoto, overlays)
+
+Ensure robust, out-of-the-box compatibility and co-existence with essential Elite Dangerous visual mods and community graphics tools, specifically **ReShade**, **EDHM (Elite Dangerous HUD Mod)**, **3Dmigoto**, and standard overlays (**RTSS**, **Special K**, **Steam/Discord**).
+
+Many pilots rely on EDHM to customize cockpits/menus and ReShade for stylized post-processing or color grading. EDPE must not force players into an either/or choice: temporal reconstruction must co-exist cleanly with these tools.
+
+Key architectural requirements and technical execution:
+
+### 1. Proxy DLL Chaining Architecture (`edpe.ini` `[Proxy]`)
+- **DLL Name Collision Resolution:**
+  Elite Dangerous loads proxy DLLs placed in the game directory (`elite-dangerous-odyssey-64/`). Since EDPE, ReShade, and EDHM/3Dmigoto all commonly masquerade as `dxgi.dll` or `d3d11.dll`, EDPE provides a configurable DLL proxy chaining loader.
+- **Configuration & Auto-Discovery:**
+  In `edpe.ini`:
+  ```ini
+  [Proxy]
+  EnableProxyChain=1
+  ; Target DLL to chain into (relative filename or absolute path).
+  ; Examples: ReShade64.dll, d3d11_edhm.dll, dxgi_chain.dll
+  ProxyDll=ReShade64.dll
+  ```
+  If `ProxyDll` is not explicitly set but known third-party binaries are present in the directory (e.g. `ReShade64.dll`, `dxgi_reshade.dll`, `d3d11_edhm.dll`), EDPE can auto-detect and chain into them automatically.
+- **Export Forwarding & Transparent VTable Delegation:**
+  `dxgi.dll` exports all necessary DXGI / D3D11 factory and device entry points (`CreateDXGIFactory`, `CreateDXGIFactory1`, `CreateDXGIFactory2`, `DXGIDeclareAdapterRemovalSupport`, `D3D11CreateDevice`, `D3D11CreateDeviceAndSwapChain`).
+  When chaining is active, EDPE forwards the creation call down to the chained proxy DLL, intercepts the resulting interface pointers (wrapping or observing them), and retains its own lightweight hooks.
+- **Fail-Open Fallback:**
+  If the chained proxy DLL fails to load, is corrupt, or is missing exports, EDPE logs the diagnostic error and transparently falls back to the genuine Windows system DLL (`system32\dxgi.dll` / `system32\d3d11.dll`) without crashing.
+
+### 2. Render Pipeline & Hook Execution Ordering
+The execution order between EDPE and third-party tools is mathematically critical to image quality:
+
+```mermaid
+flowchart TD
+    Scene["Game Scene Draw Calls<br/>(Low-Res 3D World)"] --> Latch["EDPE Latches Scene Color, Depth (DSV #2),<br/>Camera Constants & Jitter"]
+    Latch --> EDHM["EDHM / 3Dmigoto Shaders Modify Cockpit & HUD Elements"]
+    EDHM --> Reconstruct["EDPE Temporal Reconstruction (DLSS / FSR / XeSS)<br/>Evaluates 3D World"]
+    Reconstruct --> UIComp["EDPE UiCompositePass Composites Native-Res Cockpit/UI<br/>over Reconstructed World"]
+    UIComp --> ReShade["ReShade Post-Processing Pass<br/>(Color Grading, Bloom, CRT, Sharpening)"]
+    ReShade --> Overlay["EDPE Dear ImGui & ReShade Overlays"]
+    Overlay --> Present["IDXGISwapChain::Present"]
+```
+
+- **Post-Upscale ReShade Execution:**
+  ReShade shader passes **must execute after EDPE temporal reconstruction and UI composition**.
+  Running temporal upscaling on top of an image already altered by ReShade post-processing (film grain, bloom, chromatic aberration, color grading) severely corrupts temporal history, generates smear artifacts, and breaks motion vectors.
+  Conversely, executing ReShade on the high-resolution reconstructed frame guarantees pristine post-processing fidelity.
+- **ReShade Depth Buffer Alignment:**
+  ReShade effects utilizing scene depth (e.g., MXAO, RTGI, Depth of Field) need access to the authoritative depth buffer.
+  EDPE identifies DSV #2 (`DXGI_FORMAT_R32G8X24_TYPELESS`, reversed-Z) and provides documentation/configuration guidance for ReShade's generic depth add-on, eliminating depth-buffer hunting conflicts.
+
+### 3. EDHM (Elite Dangerous HUD Mod) / 3Dmigoto Interoperability
+- **Dynamic Shader Override Resiliency:**
+  EDHM uses 3Dmigoto to intercept and replace pixel/vertex shaders for cockpit panels, HUD holograms, and cabin lighting.
+  EDPE's Phase 12 (native-resolution HUD extraction and reactive mask pass) must **not** rely on brittle single pixel shader hashes that change when EDHM modifies shaders.
+  Instead, HUD classification must combine multi-criteria heuristics:
+  - Render target formats and binding order;
+  - Depth-stencil states (e.g. depth write disabled, depth test configurations typical of UI passes);
+  - Alpha / additive blend states;
+  - Constant buffer size and layout (e.g. cockpit UI projection transforms);
+  - Optional configurable EDHM shader hash wildcards/ranges.
+- **Preservation of Custom Cockpit Themes:**
+  EDPE isolates the native-resolution UI elements and composites them cleanly over the upscaled 3D exterior scene, preserving custom EDHM color palettes and cabin glow while rendering the space background with temporal clarity.
+
+### 4. Cooperative Window & Input Routing (WndProc Chain)
+- Hook `WndProc` cleanly using standard message procedure subclassing (`SetWindowLongPtrW` / `CallWindowProcW`).
+- When the EDPE menu is inactive, immediately forward all mouse, keyboard, and joystick events down the chain without delay, preventing input lag or dropped keystrokes in ReShade (`Home` key), EDHM (`F11`), or Elite flight controls.
+- When EDPE's Dear ImGui menu is open, handle mouse interaction within the ImGui window and cleanly pass through non-conflicting inputs.
+
+### 5. Runtime Diagnostics & Third-Party Tool Detection
+- During initialization, inspect loaded modules in the process memory space.
+- Detect and log the presence of:
+  - `ReShade64.dll` / `ReShade.ini`
+  - `d3d11.dll` / `3Dmigoto` / `EDHM_UI.exe`
+  - `RTSSHooks64.dll` (RivaTuner Statistics Server)
+  - `SpecialK64.dll`
+  - `gameoverlayrenderer64.dll` (Steam)
+  - `DiscordHook64.dll`
+- Expose third-party mod status in Dear ImGui and `edpe.log`:
+  ```text
+  Proxy Chaining:       Enabled (ReShade64.dll)
+  Detected Hooks:       EDHM (3Dmigoto), RTSS
+  Hook Order:           OK (Scene -> EDHM -> EDPE SR -> ReShade -> Present)
+  ```
+- If an incompatible hook ordering or conflicting DLL override is detected, display a helpful suggestion in the Dear ImGui status panel.
+
+---
+
 # 43. Frame pacing
 
 Frame Generation requires its own diagnostics.
@@ -2112,7 +2011,7 @@ A generated frame is not a new simulation frame.
 
 # 44. Latency controls
 
-Both standalone rendering/upscaling and Frame Generation must be paired with vendor-appropriate latency handling as defined in Phase 19:
+Both standalone rendering/upscaling and Frame Generation must be paired with vendor-appropriate latency handling as defined in Phase 17:
 
 For NVIDIA:
 
@@ -2329,7 +2228,22 @@ guess
 
 ---
 
-# 51. Initial serious milestone
+# 51. Achieved milestone progression
+
+The project has achieved the following verified milestones:
+
+* **`v0.0.1`**: Initial framework, D3D11 device/swapchain hooks, Dear ImGui overlay integration.
+* **`v0.1.0`**: Verified in-game NVIDIA DLAA evaluation (~0.3 ms GPU overhead).
+* **`v0.2.1`**: Verified in-game DLSS Super Resolution, true sub-native render scaling, native UI protection.
+* **`v0.3.5`**: Verified in-game AMD FSR 3.1.2 Native AA & Super Resolution, real-time performance HUD.
+* **`v0.4.0` – `v0.4.10`**: Native D3D11 TAA reconstruction pass, subpixel de-jittering, star rotational motion vectors at infinity, canopy reflection filtering, HOTAS/input isolation, CPU overhead reduction, crash logger.
+* **`v0.5.0`**: DXGI Keyed Mutex cross-device rendering, native UI composite pass, auxiliary camera rejection, runtime sharpening.
+* **`v0.6.0`**: Real-time frametime graph in performance HUD, multi-backend automated benchmark, 66.66 ms telemetry rate limiting, DEV mode toggle.
+* **`v0.7.0`**: Cockpit holographic HUD mask & composite pass, HUD debug visualizer, ProggyForever vector font overlay, cross-device Keyed Mutex synchronization, color source debounce.
+
+---
+
+# 52. Initial serious milestone
 
 First major temporal milestone:
 
@@ -2349,7 +2263,7 @@ Elite Dangerous 2D
 
 ---
 
-# 52. Multi-upscaler milestone
+# 53. Multi-upscaler milestone
 
 Next major target:
 
@@ -2378,7 +2292,7 @@ It is a **vendor-neutral Elite Dangerous temporal reconstruction framework**.
 
 ---
 
-# 53. Frame Generation milestone
+# 54. Frame Generation milestone
 
 Only after:
 
@@ -2412,7 +2326,7 @@ capability detection
 
 ---
 
-# 54. Final target
+# 55. Final target
 
 A mature EDPE UI may look approximately like:
 

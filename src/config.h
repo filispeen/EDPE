@@ -131,7 +131,6 @@ public:
         }
         devMode = (devVal > 0);
 
-        reusePrimaryDevice = GetPrivateProfileIntW(L"Experimental", L"ReusePrimaryDevice", 0, path.c_str()) != 0;
         debugViewActive = GetPrivateProfileIntW(L"Pipeline", L"DebugView", 0, path.c_str()) != 0;
     }
 
@@ -205,7 +204,6 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"MenuHeight", buf, path.c_str());
         WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
 
-        WritePrivateProfileStringW(L"Experimental", L"ReusePrimaryDevice", reusePrimaryDevice ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Pipeline", L"DebugView", debugViewActive ? L"1" : L"0", path.c_str());
     }
 
@@ -335,7 +333,6 @@ public:
     float menuHeight = -1.0f;
     bool devMode = false;
 
-    bool reusePrimaryDevice = false;
     bool debugViewActive = false;
 };
 

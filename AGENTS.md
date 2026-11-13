@@ -63,7 +63,7 @@ diagnostics
 Preferred project-owned filenames:
 
 ```text
-EDPE.dll
+dxgi.dll
 edpe.ini
 edpe.log
 ```

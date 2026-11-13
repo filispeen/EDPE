@@ -51,6 +51,42 @@ static std::atomic<bool> s_ngx_has_evaluated{false};
 static NVSDK_NGX_Parameter* g_ngx_params = nullptr;
 static NVSDK_NGX_Handle* g_dlaa_feature = nullptr;
 static ID3D11Device* g_ngx_device = nullptr;
+static ID3D11Texture2D* g_exposure_one = nullptr;
+
+// Presets L (12) and M (13) are calibrated for Ultra-Performance / Performance ratios;
+// clamp DLAA, UltraQuality, and MaxQuality to Preset K (11) to prevent high-contrast ringing.
+static uint32_t dlaaSafePreset(uint32_t preset, NVSDK_NGX_PerfQuality_Value quality) {
+    const uint32_t base = (preset >= 10u && preset <= 13u) ? preset : 11u;
+    if ((quality == NVSDK_NGX_PerfQuality_Value_DLAA ||
+         quality == NVSDK_NGX_PerfQuality_Value_UltraQuality ||
+         quality == NVSDK_NGX_PerfQuality_Value_MaxQuality) &&
+        (base == 12u || base == 13u)) {
+        return 11u;
+    }
+    return base;
+}
+
+static ID3D11Texture2D* ensureExposureOneTexture() {
+    if (g_exposure_one) return g_exposure_one;
+    if (!g_ngx_device) return nullptr;
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = 1;
+    desc.Height = 1;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    const float one = 1.0f;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = &one;
+    init.SysMemPitch = sizeof(float);
+    if (FAILED(g_ngx_device->CreateTexture2D(&desc, &init, &g_exposure_one))) {
+        g_exposure_one = nullptr;
+    }
+    return g_exposure_one;
+}
 
 static std::wstring getModuleDir() {
     wchar_t path[MAX_PATH]{};
@@ -172,6 +208,10 @@ void NgxContext::shutdown() {
     s_ngx_has_evaluated.store(false, std::memory_order_release);
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     releaseFeature();
+    if (g_exposure_one) {
+        g_exposure_one->Release();
+        g_exposure_one = nullptr;
+    }
     if (g_ngx_params) {
         NVSDK_NGX_D3D11_DestroyParameters(g_ngx_params);
         g_ngx_params = nullptr;
@@ -294,7 +334,7 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
         }
     }
 
-    const uint32_t effectivePreset = (preset >= 10u && preset <= 13u) ? preset : 11u;
+    const uint32_t effectivePreset = dlaaSafePreset(preset, perfQuality);
     const uint32_t perfQualityInt = static_cast<uint32_t>(perfQuality);
 
     if (g_dlaa_feature &&
@@ -311,11 +351,12 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     releaseFeature();
 
     // Apply selected DLSS Transformer/CNN preset (defaulting to Preset K = 11).
+    const uint32_t srPreset = (preset >= 10u && preset <= 13u) ? preset : 11u;
     NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, effectivePreset);
     NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, effectivePreset);
-    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, effectivePreset);
-    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, effectivePreset);
-    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, effectivePreset);
+    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, srPreset);
+    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, srPreset);
+    NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, srPreset);
 
     NVSDK_NGX_DLSS_Create_Params cp{};
     cp.Feature.InWidth = renderWidth;
@@ -324,10 +365,13 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     cp.Feature.InTargetHeight = outputHeight;
     cp.Feature.InPerfQualityValue = perfQuality;
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
-                              NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (isHdr) {
+        // On the linear HDR route H is pre-tonemap radiance that the game's own tone pass exposes
+        // after the resolve. Do NOT enable AutoExposure when supplying fixed 1.0f HDR exposure.
         cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+    } else {
+        cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     }
 
     NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &g_dlaa_feature, g_ngx_params, &cp);
@@ -418,7 +462,11 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ep.InMVScaleY = params.motionScaleY;
     ep.pInBiasCurrentColorMask = nullptr;
 
+    ep.InPreExposure = 1.0f;
     ep.InExposureScale = 1.0f;
+    if (params.isHdr) {
+        ep.pInExposureTexture = ensureExposureOneTexture();
+    }
     ep.InFrameTimeDeltaInMsec = params.frameTimeMs;
 
     NVSDK_NGX_Result r;
