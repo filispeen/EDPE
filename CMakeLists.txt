@@ -53,6 +53,9 @@ add_library(EDPE_DXGI SHARED
     src/perf_overlay.cpp
     src/input_hook.cpp
     src/motion_pass.cpp
+    src/ui_layer.cpp
+    src/ui_layer.h
+    src/shaders/ui_layer_composite_cs.hlsl
     src/ui_composite_pass.cpp
     src/ngx_context.cpp
     src/upscaler_backend.cpp
@@ -66,6 +69,7 @@ add_library(EDPE_DXGI SHARED
 )
 target_compile_features(EDPE_DXGI PRIVATE cxx_std_20)
 target_compile_definitions(EDPE_DXGI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+set_source_files_properties(src/shaders/ui_layer_composite_cs.hlsl PROPERTIES HEADER_FILE_ONLY TRUE)
 set_target_properties(EDPE_DXGI PROPERTIES OUTPUT_NAME dxgi)
 add_library(EDPE ALIAS EDPE_DXGI)
 

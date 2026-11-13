@@ -215,18 +215,17 @@ bool TaaPass::render(ID3D11DeviceContext* context,
 
     context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cb, 0, 0);
 
-    Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
-    if (state_ && context_) {
-        context_->SwapDeviceContextState(state_.Get(), &prior);
-    }
-
     const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
     context->RSSetViewports(1, &vp);
+    context->RSSetState(nullptr);
+    context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    context->OMSetDepthStencilState(nullptr, 0);
     context->OMSetRenderTargets(1, &targetRtv, nullptr);
     context->IASetInputLayout(nullptr);
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context->VSSetShader(vertexShader_.Get(), nullptr, 0);
     context->PSSetShader(pixelShader_.Get(), nullptr, 0);
+    context->GSSetShader(nullptr, nullptr, 0);
 
     ID3D11ShaderResourceView* srvs[5] = {
         currentFrameSrv,
@@ -250,10 +249,6 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     context->PSSetShaderResources(0, 5, nullSrvs);
     ID3D11RenderTargetView* nullRtv = nullptr;
     context->OMSetRenderTargets(1, &nullRtv, nullptr);
-
-    if (state_ && prior && context_) {
-        context_->SwapDeviceContextState(prior.Get(), nullptr);
-    }
 
     // Save the resolved output as the new history
     context->CopyResource(historyTexture_.Get(), destinationTexture);

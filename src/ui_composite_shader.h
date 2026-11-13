@@ -167,7 +167,8 @@ float4 ps_main(VSOutput pin) : SV_Target {
             } else {
                 float3 hudToned = max(hudPost - hudBlack, 0.0);
                 float3 hudLin = pow(hudToned, 2.2);
-                float3 bgLin = dlssLin * hudTransmittance;
+                float effectiveTransmittance = all(hudToned <= 1e-4) ? 1.0 : hudTransmittance;
+                float3 bgLin = dlssLin * effectiveTransmittance;
                 float3 combinedLin = bgLin + hudLin - bgLin * hudLin;
                 cScene = pow(saturate(combinedLin), 1.0 / 2.2);
             }

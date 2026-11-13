@@ -1,13 +1,16 @@
 #pragma once
-// Restricted SM5 colour-output fanout. Original arithmetic and texture reads
-// are retained; the final colour is exported to the game, clean colour and
-// scalar UI-influence targets. Unsupported programs decline without mutation.
+// Restricted SM5 colour-output fanout and pixel-position remap utilities.
+// Original arithmetic and texture reads are retained; unsupported programs
+// decline without mutation.
 // Token definitions: Microsoft DirectXShaderCompiler d3d12TokenizedProgramFormat.hpp.
 #include <windows.h>
-#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
-#include <string>
 #include <stdexcept>
+#include <string>
+#include <vector>
 void ComputeHashRetail(const BYTE*,UINT,BYTE*);
 namespace edpe { namespace dxbc_fanout_detail {
 static UINT word(const std::vector<BYTE>& b,size_t off){if(off>b.size()||b.size()-off<4)throw std::runtime_error("bounds");UINT n;memcpy(&n,b.data()+off,4);return n;}
@@ -118,6 +121,133 @@ static std::vector<BYTE> patch(const std::vector<BYTE>& in){
  for(auto& c:chunks){UINT off=UINT(out.size());memcpy(out.data()+32+4*i++,&off,4);put(out,c.first);put(out,UINT(c.second.size()));out.insert(out.end(),c.second.begin(),c.second.end());}
  UINT sz=UINT(out.size());memcpy(out.data()+24,&sz,4);ComputeHashRetail(out.data()+20,sz-20,out.data()+4);return out;
 }
+
+enum class HoloRemapKind : uint8_t { kHologramDepth = 0, kFrostedBase = 1 };
+struct HoloProgram { uint64_t ps; uint32_t bytes; HoloRemapKind kind; };
+inline constexpr HoloProgram kHoloPrograms[] = {
+    {0xEA02FAC2BD6C643Cull, 7092,  HoloRemapKind::kHologramDepth},
+    {0xE95634B0F61D218Full, 11428, HoloRemapKind::kHologramDepth},
+    {0x0146ABCC53240479ull, 2292,  HoloRemapKind::kFrostedBase},
+};
+struct HoloRecipe {
+    uint32_t target[8]; size_t targetLength;
+    uint32_t follow[17]; size_t followLength;
+    uint32_t operand;
+};
+inline constexpr HoloRecipe kHoloRecipes[] = {
+    // ftoi r1.xy, v2.xyxx  followed by  mov r1.zw, l(0,0,0,0); ld_aoffimmi(0,0,0) r1.x, r1.xyzw, t1.xyzw
+    {{0x0500001b, 0x00100032, 1, 0x00101046, 2}, 5,
+     {0x08000036, 0x001000c2, 1, 0x00004002, 0, 0, 0, 0,
+      0x8900002d, 0x800000c2, 0x00155543, 0x00100012, 1, 0x00100e46, 1, 0x00107e46, 1}, 17,
+     0x00100046},
+    // mul r0.zw, v2.xxxy, cb1[332].zzzw  followed by  sample_indexable r1.xyz, r0.zwzz, t0.xyzw, s1
+    {{0x08000038, 0x001000c2, 0, 0x00101406, 2, 0x00208ea6, 1, 332}, 8,
+     {0x8b000045, 0x800000c2, 0x00155543, 0x00100072, 1, 0x00100ae6, 0, 0x00107e46, 0, 0x00106000, 1}, 11,
+     0x00100406},
+};
+inline constexpr size_t kHoloReliefLen = 16;
+inline constexpr uint32_t kHoloReliefStock[2][kHoloReliefLen] = {
+    {0x08000034,0x00100012,1,0x0020802a,1,120,0x00004001,0x3f800000, 0x08000038,0x00100012,1,0x0010000a,1,0x0020801a,2,21},
+    {0x08000034,0x00100082,1,0x0020802a,1,120,0x00004001,0x3f800000, 0x08000038,0x00100082,1,0x0010003a,1,0x0020801a,2,21},
+};
+
+static std::vector<UINT> patchHoloTokens(const std::vector<UINT>& t, HoloRemapKind kind) {
+    const HoloRecipe& r = kHoloRecipes[static_cast<size_t>(kind)];
+    const bool relief = (kind == HoloRemapKind::kHologramDepth);
+    size_t target = 0, tempAt = 0, reliefAt = 0;
+    UINT temp = 0, found = 0, reliefFound = 0;
+    if (t.size() <= 2 || t[0] != 0x50 || t[1] != t.size()) throw std::runtime_error("pixel SM5 program");
+    for (size_t a = 2; a < t.size(); a += instructionLength(t, a)) {
+        const UINT op = t[a] & 2047, n = instructionLength(t, a);
+        if (op == 89 && (n != 4 || t[a + 2] == 13)) throw std::runtime_error("b13 occupied");
+        if (op == 104) {
+            if (n != 2 || tempAt != 0) throw std::runtime_error("temps declaration");
+            tempAt = a;
+            temp = t[a + 1];
+        }
+        if (n == r.targetLength && std::equal(r.target, r.target + n, t.begin() + a)) {
+            target = a;
+            ++found;
+        }
+        if (relief && a + kHoloReliefLen <= t.size()) {
+            for (const auto& v : kHoloReliefStock) {
+                if (std::equal(v, v + kHoloReliefLen, t.begin() + a)) {
+                    reliefAt = a;
+                    ++reliefFound;
+                }
+            }
+        }
+    }
+    if (found != 1 || !tempAt || temp >= 4096 || tempAt >= target) throw std::runtime_error("SV_Position target not found");
+    if (target + r.targetLength + r.followLength > t.size() ||
+        !std::equal(r.follow, r.follow + r.followLength, t.begin() + target + r.targetLength)) {
+        throw std::runtime_error("SV_Position follow mismatch");
+    }
+    if (relief && (reliefFound != 1 || reliefAt <= target)) throw std::runtime_error("relief target not found");
+
+    const UINT cbDecl[] = {0x04000059, 0x00208e46, 13, relief ? 2u : 1u};
+    const UINT madInst[] = {0x0b000032, 0x00100032, temp, 0x00101046, 2, 0x00208046, 13, 0, 0x00208ae6, 13, 0};
+    std::vector<UINT> out(t.begin(), t.begin() + tempAt);
+    out.insert(out.end(), cbDecl, cbDecl + 4);
+    out.insert(out.end(), t.begin() + tempAt, t.begin() + target);
+    out[tempAt + 5] = temp + 1;
+    out.insert(out.end(), madInst, madInst + 11);
+    out.insert(out.end(), t.begin() + target, t.end());
+    out[target + 18] = r.operand;
+    out[target + 19] = temp;
+    out[1] = static_cast<UINT>(out.size());
+    if (relief) {
+        const size_t at = reliefAt + 15;
+        const UINT reliefOp[3] = {0x0020800a, 13, 1}; // cb13[1].x
+        for (size_t k = 0; k < 3; ++k) out[at + 3 + k] = reliefOp[k];
+        out[at + 7] = 0; // l(0.0)
+    }
+    return out;
+}
+
+static std::vector<BYTE> patchHoloContainer(const std::vector<BYTE>& in, HoloRemapKind kind) {
+    if (in.size() > 1024 * 1024 || in.size() < 32 || word(in, 28) > 128 ||
+        memcmp(in.data(), "DXBC", 4) || word(in, 24) != in.size()) {
+        throw std::runtime_error("container");
+    }
+    BYTE digest[16];
+    ComputeHashRetail(in.data() + 20, UINT(in.size() - 20), digest);
+    if (memcmp(digest, in.data() + 4, 16)) throw std::runtime_error("input checksum");
+
+    std::vector<std::pair<UINT, std::vector<BYTE>>> chunks;
+    bool program = false;
+    for (UINT i = 0, n = word(in, 28); i < n; ++i) {
+        UINT off = word(in, 32 + 4 * i), tag = word(in, off), size = word(in, off + 4);
+        if (off + 8 > in.size() || size > in.size() - (off + 8)) throw std::runtime_error("chunk bounds");
+        std::vector<BYTE> b(in.begin() + off + 8, in.begin() + off + 8 + size);
+        if (tag == 0x58454853 || tag == 0x52444853) {
+            if (program || b.size() % 4 || word(b, 0) != 0x50 || word(b, 4) != b.size() / 4)
+                throw std::runtime_error("program header");
+            std::vector<UINT> t(b.size() / 4);
+            memcpy(t.data(), b.data(), b.size());
+            const auto outTokens = patchHoloTokens(t, kind);
+            b.resize(outTokens.size() * 4);
+            memcpy(b.data(), outTokens.data(), b.size());
+            program = true;
+        }
+        chunks.push_back({tag, std::move(b)});
+    }
+    if (!program) throw std::runtime_error("missing program chunk");
+    std::vector<BYTE> out(in.begin(), in.begin() + 32);
+    out.resize(32 + chunks.size() * 4);
+    UINT i = 0;
+    for (auto& c : chunks) {
+        UINT off = UINT(out.size());
+        memcpy(out.data() + 32 + 4 * i++, &off, 4);
+        put(out, c.first);
+        put(out, UINT(c.second.size()));
+        out.insert(out.end(), c.second.begin(), c.second.end());
+    }
+    UINT sz = UINT(out.size());
+    memcpy(out.data() + 24, &sz, 4);
+    ComputeHashRetail(out.data() + 20, sz - 20, out.data() + 4);
+    return out;
+}
 } // namespace dxbc_fanout_detail
 inline bool colourFanout(const void* data,size_t bytes,std::vector<BYTE>& output,std::string& reason) {
     output.clear();reason.clear();
@@ -126,5 +256,45 @@ inline bool colourFanout(const void* data,size_t bytes,std::vector<BYTE>& output
         const auto* p=static_cast<const BYTE*>(data);
         output=dxbc_fanout_detail::patch(std::vector<BYTE>(p,p+bytes));return true;
     } catch(const std::exception& e){reason=e.what();return false;}
+}
+
+struct HoloRemapParams {
+    float scaleX = 1.0f;
+    float scaleY = 1.0f;
+    float biasX = 0.0f;
+    float biasY = 0.0f;
+    float relief = 1.0f;
+    float pad0 = 0.0f;
+    float pad1 = 0.0f;
+    float pad2 = 0.0f;
+};
+static_assert(sizeof(HoloRemapParams) == 32, "HoloRemapParams must be two float4 registers");
+
+inline int findHoloProgramSlot(uint64_t psHash) {
+    for (size_t i = 0; i < sizeof(dxbc_fanout_detail::kHoloPrograms) / sizeof(dxbc_fanout_detail::kHoloPrograms[0]); ++i) {
+        if (dxbc_fanout_detail::kHoloPrograms[i].ps == psHash) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+inline bool patchHoloPixelShader(const void* data, size_t bytes, uint64_t psHash,
+                                 std::vector<BYTE>& output, std::string& reason) {
+    output.clear();
+    reason.clear();
+    const int slot = findHoloProgramSlot(psHash);
+    if (slot < 0 || !data || bytes != dxbc_fanout_detail::kHoloPrograms[slot].bytes) {
+        reason = "unsupported hologram pixel shader";
+        return false;
+    }
+    try {
+        const auto* p = static_cast<const BYTE*>(data);
+        output = dxbc_fanout_detail::patchHoloContainer(
+            std::vector<BYTE>(p, p + bytes),
+            dxbc_fanout_detail::kHoloPrograms[slot].kind);
+        return true;
+    } catch (const std::exception& e) {
+        reason = e.what();
+        return false;
+    }
 }
 } // namespace edpe
