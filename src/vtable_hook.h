@@ -98,6 +98,8 @@ inline HMODULE probeSystemD3D11Module() {
 
 namespace edpe {
 
+inline thread_local bool g_inSafeMemProbe = false;
+
 enum class HookMode {
     InPlace,  // Patch entries directly inside the object's existing vtable
     LiveCopy, // Redirect object's vptr to a 512-slot private table backed by 16-byte live trampolines
@@ -122,23 +124,33 @@ inline bool safeReadPtr(const void* addr, void** outVal) {
         *outVal = nullptr;
         return false;
     }
+    g_inSafeMemProbe = true;
+    bool ok = false;
+    void* val = nullptr;
     __try {
-        *outVal = *reinterpret_cast<void* const*>(addr);
-        return true;
+        val = *reinterpret_cast<void* const*>(addr);
+        ok = true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        *outVal = nullptr;
-        return false;
+        val = nullptr;
+        ok = false;
     }
+    g_inSafeMemProbe = false;
+    *outVal = val;
+    return ok;
 }
 
 inline bool safeWritePtr(void* addr, void* val) {
     if (!addr) return false;
+    g_inSafeMemProbe = true;
+    bool ok = false;
     __try {
         *reinterpret_cast<void**>(addr) = val;
-        return true;
+        ok = true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+        ok = false;
     }
+    g_inSafeMemProbe = false;
+    return ok;
 }
 
 inline bool isExecutableCodePtr(const void* p) {
@@ -186,9 +198,9 @@ inline HookMode contextHookModeFor(ID3D11DeviceContext* ctx) {
 
 class VTableHook {
 public:
-    // 512 slots covers the entire ID3D11DeviceContext4 + internal d3d11.dll vtable (~302 methods)
-    // and places m_privateTable on a dedicated 4096-byte PAGE_READWRITE page followed by
-    // 2 pages (8192 bytes) of PAGE_EXECUTE_READ 16-byte live trampolines.
+    // Reserve 2 prefix slots before m_privateTable (m_privateTable[-2], m_privateTable[-1])
+    // to preserve Itanium (MinGW/DXVK) and MSVC RTTI pointers, keeping m_liveStubs page-aligned.
+    static constexpr size_t kRttiPrefixSlots = 2;
     static constexpr size_t kTableSlots = 512;
     static constexpr size_t kStubSize = 16;
     static constexpr size_t kMaxSlotOwners = 256;
@@ -230,8 +242,8 @@ public:
         m_mode = mode;
 
         if (m_mode == HookMode::LiveCopy) {
-            constexpr size_t kTableBytes = kTableSlots * sizeof(void*); // 4096 bytes (1 page)
-            constexpr size_t kStubBytes = kTableSlots * kStubSize;      // 8192 bytes (2 pages)
+            constexpr size_t kTableBytes = 2 * 4096;               // 2 READWRITE pages (RTTI prefix + 512 slots)
+            constexpr size_t kStubBytes = kTableSlots * kStubSize; // 8192 bytes (2 pages)
             constexpr size_t kAllocBytes = kTableBytes + kStubBytes;
             auto* mem = static_cast<uint8_t*>(
                 VirtualAlloc(nullptr, kAllocBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -240,8 +252,11 @@ public:
             } else {
                 m_liveAlloc = mem;
                 m_liveAllocBytes = kAllocBytes;
-                m_privateTable = reinterpret_cast<void**>(mem);
+                m_privateTable = reinterpret_cast<void**>(mem) + kRttiPrefixSlots;
                 m_liveStubs = mem + kTableBytes;
+
+                safeReadPtr(&m_vtable[-2], &m_privateTable[-2]);
+                safeReadPtr(&m_vtable[-1], &m_privateTable[-1]);
 
                 bool readingValid = true;
                 for (size_t i = 0; i < kTableSlots; ++i) {
@@ -263,7 +278,7 @@ public:
                     }
                 }
 
-                // Seal only the stub pages as PAGE_EXECUTE_READ; m_privateTable (first 4096B page)
+                // Seal only the stub pages as PAGE_EXECUTE_READ; m_privateTable (first two 4096B pages)
                 // remains PAGE_READWRITE data so atomic slot updates never fault on a read-only page.
                 DWORD oldProt = 0;
                 if (!VirtualProtect(m_liveStubs, kStubBytes, PAGE_EXECUTE_READ, &oldProt)) {

@@ -7,8 +7,6 @@
 #include <array>
 #include <thread>
 #include <atomic>
-#include <condition_variable>
-#include <mutex>
 #include <chrono>
 #include <imgui.h>
 
@@ -154,8 +152,8 @@ private:
     std::thread nvmlWorkerThread_;
     std::atomic<bool> nvmlRunning_{false};
     std::atomic<uint32_t> cachedGpuUsage_{0};
-    std::condition_variable nvmlCv_;
-    std::mutex nvmlMutex_;
+    CONDITION_VARIABLE nvmlCv_ = CONDITION_VARIABLE_INIT;
+    SRWLOCK nvmlLock_ = SRWLOCK_INIT;
 };
 
 } // namespace edpe

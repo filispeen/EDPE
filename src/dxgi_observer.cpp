@@ -5,6 +5,7 @@
 #include "ui.h"
 #include "context_census.h"
 #include "perf_overlay.h"
+#include "vtable_hook.h"
 
 #include <atomic>
 #include <cstddef>
@@ -26,6 +27,7 @@ constexpr size_t kMaxMethods = 41;
 
 struct HookTable {
     void** original;
+    void* rtti[2];
     void* methods[kMaxMethods];
 };
 
@@ -96,6 +98,8 @@ bool hookObject(IUnknown* object, size_t count, size_t method, void* replacement
     auto* table = new (std::nothrow) HookTable{};
     if (!table) return false;
     table->original = *reinterpret_cast<void***>(object);
+    edpe::safeReadPtr(table->original - 2, &table->rtti[0]);
+    edpe::safeReadPtr(table->original - 1, &table->rtti[1]);
     std::memcpy(table->methods, table->original, count * sizeof(void*));
     table->methods[kRelease] = reinterpret_cast<void*>(&observedRelease);
     table->methods[method] = replacement;

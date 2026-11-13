@@ -32,11 +32,10 @@ PerfTracker::~PerfTracker() {
 }
 
 void PerfTracker::shutdown() {
-    {
-        std::lock_guard<std::mutex> lock(nvmlMutex_);
-        nvmlRunning_.store(false, std::memory_order_release);
-    }
-    nvmlCv_.notify_all();
+    AcquireSRWLockExclusive(&nvmlLock_);
+    nvmlRunning_.store(false, std::memory_order_release);
+    ReleaseSRWLockExclusive(&nvmlLock_);
+    WakeAllConditionVariable(&nvmlCv_);
     if (nvmlWorkerThread_.joinable()) {
         nvmlWorkerThread_.join();
     }
@@ -70,13 +69,13 @@ void PerfTracker::initNvml() {
             nvmlRunning_.store(true, std::memory_order_relaxed);
             nvmlWorkerThread_ = std::thread([this]() {
                 while (true) {
-                    {
-                        std::unique_lock<std::mutex> lock(nvmlMutex_);
-                        nvmlCv_.wait_for(lock, std::chrono::milliseconds(500), [this]() {
-                            return !nvmlRunning_.load(std::memory_order_acquire);
-                        });
-                        if (!nvmlRunning_.load(std::memory_order_acquire)) break;
+                    AcquireSRWLockExclusive(&nvmlLock_);
+                    if (nvmlRunning_.load(std::memory_order_acquire)) {
+                        SleepConditionVariableSRW(&nvmlCv_, &nvmlLock_, 500, 0);
                     }
+                    const bool keepRunning = nvmlRunning_.load(std::memory_order_acquire);
+                    ReleaseSRWLockExclusive(&nvmlLock_);
+                    if (!keepRunning) break;
                     NvmlUtil_t util{};
                     if (nvmlGetUtil_ && nvmlDevice_ && nvmlGetUtil_(nvmlDevice_, &util) == 0) {
                         cachedGpuUsage_.store(util.gpu, std::memory_order_relaxed);

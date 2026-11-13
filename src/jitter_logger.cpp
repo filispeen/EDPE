@@ -39,8 +39,11 @@ void JitterLogger::ensureWorkerStarted() {
 }
 
 void JitterLogger::shutdown() {
-    if (running_.exchange(false)) {
-        cv_.notify_all();
+    AcquireSRWLockExclusive(&cvLock_);
+    const bool wasRunning = running_.exchange(false);
+    ReleaseSRWLockExclusive(&cvLock_);
+    if (wasRunning) {
+        WakeAllConditionVariable(&cv_);
         std::lock_guard<std::mutex> lock(workerStartMutex_);
         if (workerThread_.joinable()) {
             workerThread_.join();
@@ -53,8 +56,10 @@ void JitterLogger::setLoggingEnabled(bool enabled) {
     if (enabled && Config::instance().devMode) {
         ensureWorkerStarted();
     } else if (!enabled) {
+        AcquireSRWLockExclusive(&cvLock_);
         flushRequested_.store(true, std::memory_order_release);
-        cv_.notify_one();
+        ReleaseSRWLockExclusive(&cvLock_);
+        WakeConditionVariable(&cv_);
     }
 }
 
@@ -71,8 +76,10 @@ uint32_t JitterLogger::getSampleInterval() const {
 }
 
 void JitterLogger::setFlushIntervalMs(uint32_t intervalMs) {
+    AcquireSRWLockExclusive(&cvLock_);
     flushIntervalMs_.store(std::clamp(intervalMs, 100u, 10000u), std::memory_order_relaxed);
-    cv_.notify_one();
+    ReleaseSRWLockExclusive(&cvLock_);
+    WakeConditionVariable(&cv_);
 }
 
 uint32_t JitterLogger::getFlushIntervalMs() const {
@@ -119,7 +126,9 @@ void JitterLogger::pushFrame(const JitterFrameLog& log) {
 
     // Wake background thread only when a full batch accumulated
     if (((w + 1) % 512) == 0) {
-        cv_.notify_one();
+        AcquireSRWLockExclusive(&cvLock_);
+        ReleaseSRWLockExclusive(&cvLock_);
+        WakeConditionVariable(&cv_);
     }
 }
 
@@ -128,8 +137,10 @@ void JitterLogger::flush() {
         return;
     }
     ensureWorkerStarted();
+    AcquireSRWLockExclusive(&cvLock_);
     flushRequested_.store(true, std::memory_order_release);
-    cv_.notify_one();
+    ReleaseSRWLockExclusive(&cvLock_);
+    WakeConditionVariable(&cv_);
 }
 
 void JitterLogger::clearFile() {
@@ -211,13 +222,15 @@ void JitterLogger::workerThreadLoop() {
 
     while (running_.load(std::memory_order_relaxed)) {
         {
-            const uint32_t waitMs = std::clamp(flushIntervalMs_.load(std::memory_order_relaxed), 100u, 10000u);
-            std::unique_lock<std::mutex> lock(cvMutex_);
-            cv_.wait_for(lock, std::chrono::milliseconds(waitMs), [this] {
-                return !running_.load(std::memory_order_relaxed) ||
-                       flushRequested_.load(std::memory_order_relaxed) ||
-                       (writeIdx_.load(std::memory_order_relaxed) - readIdx_.load(std::memory_order_relaxed) >= 512);
-            });
+            const DWORD waitMs = static_cast<DWORD>(std::clamp(flushIntervalMs_.load(std::memory_order_relaxed), 100u, 10000u));
+            AcquireSRWLockExclusive(&cvLock_);
+            const bool shouldWake = !running_.load(std::memory_order_relaxed) ||
+                                    flushRequested_.load(std::memory_order_relaxed) ||
+                                    (writeIdx_.load(std::memory_order_relaxed) - readIdx_.load(std::memory_order_relaxed) >= 512);
+            if (!shouldWake) {
+                SleepConditionVariableSRW(&cv_, &cvLock_, waitMs, 0);
+            }
+            ReleaseSRWLockExclusive(&cvLock_);
         }
 
         flushRequested_.store(false, std::memory_order_relaxed);

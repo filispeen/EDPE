@@ -7,7 +7,7 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
-#include <condition_variable>
+#include <windows.h>
 
 namespace edpe {
 
@@ -107,8 +107,8 @@ private:
     std::mutex workerStartMutex_;
     bool workerStarted_{false};
     std::thread workerThread_;
-    std::mutex cvMutex_;
-    std::condition_variable cv_;
+    SRWLOCK cvLock_ = SRWLOCK_INIT;
+    CONDITION_VARIABLE cv_ = CONDITION_VARIABLE_INIT;
 };
 
 } // namespace edpe

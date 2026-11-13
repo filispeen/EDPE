@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.25)
 project(EDPE LANGUAGES CXX)
 
+# Ensure compatibility with Wine/Proton builtin MSVCP140.dll and pre-14.40 VC++ runtimes
+add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+
 if(DEFINED CACHE{EDPE_VERSION} AND NOT "$CACHE{EDPE_VERSION}" STREQUAL "")
     set(EDPE_BUILD_VERSION "$CACHE{EDPE_VERSION}")
 else()

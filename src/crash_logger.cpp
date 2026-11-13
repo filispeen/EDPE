@@ -2,6 +2,7 @@
 #include "log.h"
 #include "config.h"
 #include "system_dll.h"
+#include "vtable_hook.h"
 
 #include <windows.h>
 #include <dbghelp.h>
@@ -213,6 +214,18 @@ static void cacheSystemInformation() {
     }
     if (s_cachedWindowsVersion[0] == L'\0') {
         wcscpy_s(s_cachedWindowsVersion, L"Windows (Unknown)");
+    }
+    if (hNtdll) {
+        typedef const char* (CDECL* PFN_wine_get_version)(void);
+        auto pfnWine = reinterpret_cast<PFN_wine_get_version>(GetProcAddress(hNtdll, "wine_get_version"));
+        if (pfnWine) {
+            const char* wineVer = pfnWine();
+            if (wineVer && wineVer[0] != '\0') {
+                wchar_t wineBuf[64]{};
+                swprintf_s(wineBuf, L" [Wine %.48hs]", wineVer);
+                wcscat_s(s_cachedWindowsVersion, wineBuf);
+            }
+        }
     }
     // Do NOT call LoadSystemDll(L"dxgi.dll") / CreateDXGIFactory1 / FreeLibrary inside DllMain:
     // GPU and driver details are populated safely outside the loader lock by
@@ -520,7 +533,7 @@ static LONG WINAPI edpeUnhandledExceptionFilter(EXCEPTION_POINTERS* ep) {
 }
 
 static LONG WINAPI edpeVectoredExceptionHandler(PEXCEPTION_POINTERS ep) {
-    if (!ep || !ep->ExceptionRecord) {
+    if (!ep || !ep->ExceptionRecord || edpe::g_inSafeMemProbe) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
