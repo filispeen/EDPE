@@ -145,9 +145,12 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
         swprintf_s(g_status_msg, L"NGX init failed: device or context is null");
         return false;
     }
-    if (g_ngx_state.initialized) return true;
 
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
+    if (g_ngx_state.initialized) {
+        if (g_ngx_device == device) return true;
+        shutdown();
+    }
     g_ngx_device = device;
 
     std::wstring dll_dir = getModuleDir();

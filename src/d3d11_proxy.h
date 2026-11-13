@@ -13,6 +13,7 @@ void syncConfigOnce();
 
 namespace edpe {
 void installD3D11Hooks();
+bool isSmoothMotionDetected();
 }
 
 extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(

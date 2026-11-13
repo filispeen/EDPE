@@ -38,6 +38,7 @@ std::atomic<CreateSamplerStateFn> original_create_sampler_state{nullptr};
 std::atomic<CreateDeferredContextFn> original_create_deferred_context{nullptr};
 std::atomic<void**> hooked_device_table{nullptr};
 std::atomic<bool> retain_vertex_bytecode{false};
+std::atomic<bool> s_smooth_motion_detected{false};
 
 HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     const void* bytecode, SIZE_T size, ID3D11ClassLinkage* linkage,
@@ -425,6 +426,15 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
                 adapterLuid.HighPart, adapterLuid.LowPart,
                 static_cast<unsigned>(fl), devFlags, callerMod.c_str(), stackStr.c_str());
             EdpeLog(extraMsg);
+            if (_wcsicmp(callerMod.c_str(), L"NvPresent64.dll") == 0) {
+                if (!s_smooth_motion_detected.exchange(true, std::memory_order_acq_rel)) {
+                    EdpeLog(L"EDPE: WARNING: NVIDIA Smooth Motion (NvPresent64.dll) secondary device detected; anchoring temporal pass on scene device and bypassing cross-device KeyedMutex bridge");
+                }
+            }
+        } else if (GetModuleHandleW(L"NvPresent64.dll") != nullptr) {
+            if (!s_smooth_motion_detected.exchange(true, std::memory_order_acq_rel)) {
+                EdpeLog(L"EDPE: WARNING: NVIDIA Smooth Motion (NvPresent64.dll) secondary device detected; anchoring temporal pass on scene device and bypassing cross-device KeyedMutex bridge");
+            }
         }
     }
 
@@ -436,6 +446,10 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
 }
 
 namespace edpe {
+bool isSmoothMotionDetected() {
+    return s_smooth_motion_detected.load(std::memory_order_relaxed) ||
+           GetModuleHandleW(L"NvPresent64.dll") != nullptr;
+}
 void installD3D11Hooks() {
     if (!edpe::isRunningInEliteProcess()) return;
     static std::atomic<bool> s_installed{false};

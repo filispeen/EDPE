@@ -985,12 +985,28 @@ void UiLayer::endTonemapReissue(ID3D11DeviceContext* context) {
     savedToneBlend_.Reset();
 }
 
+namespace {
+
+bool matchesDevice(ID3D11DeviceChild* child, ID3D11Device* expectedDevice) {
+    if (!child || !expectedDevice) return false;
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    child->GetDevice(&dev);
+    return dev && dev.Get() == expectedDevice;
+}
+
+} // namespace
+
 bool UiLayer::composite(ID3D11DeviceContext* context,
                         ID3D11ShaderResourceView* worldReconstruction,
                         ID3D11UnorderedAccessView* backbufferUav,
                         UINT outputWidth, UINT outputHeight,
                         bool debugView) {
-    if (!context || !worldReconstruction || !backbufferUav || !compositeCs_ || !hdrLayerSrv_) return false;
+    if (!context || !worldReconstruction || !backbufferUav || !compositeCs_ || !hdrLayerSrv_ || !device_) return false;
+    if (!matchesDevice(context, device_.Get()) ||
+        !matchesDevice(worldReconstruction, device_.Get()) ||
+        !matchesDevice(backbufferUav, device_.Get())) {
+        return false;
+    }
     EvaluatingUpscalerGuard guard;
 
     // Усуваємо D3D11 RTV/UAV hazard: якщо цільова текстура прив'язана як OM RTV,
@@ -1050,7 +1066,12 @@ bool UiLayer::compositeToRtv(ID3D11DeviceContext* context,
                              bool debugView,
                              bool callerRestoresState) {
     if (!context || !worldReconstruction || !targetRtv ||
-        !coverageVs_ || !compositePs_ || !hdrLayerSrv_) {
+        !coverageVs_ || !compositePs_ || !hdrLayerSrv_ || !device_) {
+        return false;
+    }
+    if (!matchesDevice(context, device_.Get()) ||
+        !matchesDevice(worldReconstruction, device_.Get()) ||
+        !matchesDevice(targetRtv, device_.Get())) {
         return false;
     }
     EvaluatingUpscalerGuard guard;

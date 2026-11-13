@@ -83,6 +83,7 @@ public:
 
     UINT width() const { return width_; }
     UINT height() const { return height_; }
+    ID3D11Device* device() const { return device_.Get(); }
 
 private:
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
