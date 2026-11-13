@@ -20,7 +20,6 @@
 #include "profiler.h"
 #include "d3d11_proxy.h"
 #include "vtable_hook.h"
-#include "cobra_camera_inject.h"
 
 #include <DirectXPackedVector.h>
 #include <algorithm>
@@ -1110,8 +1109,6 @@ static bool s_config_loaded = false;
 void queueConstantBufferSample(ID3D11DeviceContext* context, ID3D11Buffer* source,
     const D3D11_BUFFER_DESC& source_desc, unsigned bind_ordinal);
 void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud);
-static bool s_in_pipeline_dlaa_evaluated = false;
-static unsigned long long s_in_pipeline_dlaa_frame = ~0ull;
 bool tryInPipelineDlaa(ID3D11DeviceContext* context);
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
@@ -1366,8 +1363,7 @@ void probeWorldShaderFanout(ID3D11DeviceContext* context,
 enum class HudDrawResult {
     None,
     GlassReplay,
-    HudReplay,
-    HudInPlaceCleanCb
+    HudReplay
 };
 
 bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
@@ -2590,9 +2586,8 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
 }
 
 HudDrawResult observeHudDrawImpl(ID3D11DeviceContext* context, char kind, UINT instances) {
-    const bool in_pipe_active = (s_in_pipeline_dlaa_evaluated && s_in_pipeline_dlaa_frame == motion_color_frame);
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) ||
-        (!s_hud_mask_active_pass && !in_pipe_active && !motion_pair_active) ||
+        (!s_hud_mask_active_pass && !motion_pair_active) ||
         !motion_color_source ||
         (!motion_color_bound && !motion_pair_active)) return HudDrawResult::None;
 
@@ -2668,77 +2663,6 @@ HudDrawResult observeHudDrawImpl(ID3D11DeviceContext* context, char kind, UINT i
         }
     }
 
-    if ((vs_hash == edpe::cobra_camera::kMapCanvasVsHash && ps_hash == edpe::cobra_camera::kMapCanvasPsHash) ||
-        vs_hash == edpe::cobra_camera::kMapSpriteVsHash) {
-        s_map_shader_seen_frame = last_present_frame.load(std::memory_order_relaxed);
-        edpe::cobra_camera::frameWindow().mapModeActive.store(true, std::memory_order_relaxed);
-    }
-
-    // Verify and repair deferred lighting CB2 (slot 2) subpixel jitter phase when needed
-    if (vs_hash == edpe::cobra_camera::kDeferredLightingVsHash &&
-        ps_hash == edpe::cobra_camera::kDeferredLightingPsHash &&
-        s_has_reference_cb0_blocks && ContextCensusIsJitterActive()) {
-        Microsoft::WRL::ComPtr<ID3D11Buffer> psCb2;
-        context->PSGetConstantBuffers(2, 1, psCb2.GetAddressOf());
-        if (psCb2) {
-            D3D11_BUFFER_DESC cb2Desc{};
-            psCb2->GetDesc(&cb2Desc);
-            if (cb2Desc.ByteWidth >= 17 * 16 && cb2Desc.ByteWidth <= 4096) {
-                Microsoft::WRL::ComPtr<ID3D11Device> dev;
-                context->GetDevice(&dev);
-                if (dev) {
-                    D3D11_BUFFER_DESC stDesc = cb2Desc;
-                    stDesc.Usage = D3D11_USAGE_STAGING;
-                    stDesc.BindFlags = 0;
-                    stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                    stDesc.MiscFlags = 0;
-                    if (!s_deferred_cb2_staging) {
-                        dev->CreateBuffer(&stDesc, nullptr, &s_deferred_cb2_staging);
-                    }
-                    D3D11_BUFFER_DESC ovDesc = cb2Desc;
-                    ovDesc.Usage = D3D11_USAGE_DEFAULT;
-                    ovDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-                    ovDesc.CPUAccessFlags = 0;
-                    ovDesc.MiscFlags = 0;
-                    if (!s_deferred_cb2_override) {
-                        dev->CreateBuffer(&ovDesc, nullptr, &s_deferred_cb2_override);
-                    }
-                    if (s_deferred_cb2_staging && s_deferred_cb2_override) {
-                        context->CopyResource(s_deferred_cb2_staging.Get(), psCb2.Get());
-                        const auto mapFn = resolveOriginalMap(context);
-                        const auto unmapFn = resolveOriginalUnmap(context);
-                        D3D11_MAPPED_SUBRESOURCE mapped{};
-                        if (mapFn && unmapFn &&
-                            SUCCEEDED(mapFn(context, s_deferred_cb2_staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) &&
-                            mapped.pData) {
-                            float localCb2[1024]{};
-                            const size_t floatsToCopy = std::min<size_t>(cb2Desc.ByteWidth / sizeof(float), 1024);
-                            std::memcpy(localCb2, mapped.pData, floatsToCopy * sizeof(float));
-                            unmapFn(context, s_deferred_cb2_staging.Get(), 0);
-                            const UINT rw = s_observed_scene_width.load(std::memory_order_relaxed);
-                            const UINT rh = s_observed_scene_height.load(std::memory_order_relaxed);
-                            const float dxUv = (rw > 0) ? (s_injected_jitter.pixelX / static_cast<float>(rw)) : 0.0f;
-                            const float dyUv = (rh > 0) ? (s_injected_jitter.pixelY / static_cast<float>(rh)) : 0.0f;
-                            const bool repaired =
-                                edpe::cobra_camera::repairDeferredMissingPhase(
-                                    localCb2, floatsToCopy, s_last_jittered_forward_block,
-                                    s_last_unjittered_inv_rays, dxUv, dyUv) ||
-                                edpe::cobra_camera::repairDeferredWholeOmission(
-                                    localCb2, floatsToCopy, s_last_unjittered_forward_block,
-                                    s_injected_jitter, dxUv, dyUv);
-                            if (repaired) {
-                                context->UpdateSubresource(s_deferred_cb2_override.Get(), 0, nullptr, localCb2, 0, 0);
-                                ID3D11Buffer* repBuf = s_deferred_cb2_override.Get();
-                                context->PSSetConstantBuffers(2, 1, &repBuf);
-                                context->VSSetConstantBuffers(2, 1, &repBuf);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     if (s_hud_depth_stencil_seeded && vs_hash == 0x2CECEC3065EF0D4Aull && !s_hud_mask_active_pass) {
         // Stencil writer (2CECEC30, stencil 0x04) modifies scene stencil mid-pass when HUD replay is inactive.
         s_hud_depth_stencil_seeded = false;
@@ -2766,26 +2690,9 @@ HudDrawResult observeHudDrawImpl(ID3D11DeviceContext* context, char kind, UINT i
             }
             hud_first_match_seen = true;
 
-            if (motion_pair_active || edpe::Config::instance().hdrInput ||
-                edpe::UpscalerManager::instance().isReconstructionActive()) {
+            if (motion_pair_active || edpe::Config::instance().hdrInput) {
                 captureEarlyMotionColor(context, true);
-                if (!motion_pair_active &&
-                    (!s_in_pipeline_dlaa_evaluated || s_in_pipeline_dlaa_frame != motion_color_frame)) {
-                    if (tryInPipelineDlaa(context)) {
-                        // In-pipeline linear HDR DLAA resolved directly into H before HUD;
-                        // let subsequent Pass 35 HUD draws render natively onto H without redirection.
-                        s_hud_mask_active_pass = false;
-                    }
-                }
             }
-        }
-        if (s_in_pipeline_dlaa_evaluated && s_in_pipeline_dlaa_frame == motion_color_frame) {
-            if (auto* stat = findOrAddHudPairStat(vs_hash, ps_hash)) {
-                ++stat->candidates;
-                ++stat->replayed;
-                ++stat->cb1_substituted;
-            }
-            return HudDrawResult::HudInPlaceCleanCb;
         }
         if (auto* stat = findOrAddHudPairStat(vs_hash, ps_hash)) {
             ++stat->candidates;
@@ -2806,86 +2713,6 @@ HudDrawResult observeHudDraw(ID3D11DeviceContext* context, char kind, UINT insta
 }
 
 bool isLdrSceneColorFormat(DXGI_FORMAT fmt);
-
-void drawHudInPlaceWithCleanCamera(ID3D11DeviceContext* context, char kind, UINT count,
-                                   UINT instance_count, UINT start_index_or_vertex,
-                                   INT base_vertex, UINT start_instance) {
-    Microsoft::WRL::ComPtr<ID3D11Buffer> orig_cb1;
-    bool cb1_substituted = false;
-    if (s_has_clean_cb1_data && s_clean_camera_frame == motion_color_frame) {
-        context->VSGetConstantBuffers(1, 1, orig_cb1.GetAddressOf());
-        if (orig_cb1) {
-            D3D11_BUFFER_DESC bd{};
-            orig_cb1->GetDesc(&bd);
-            if (bd.ByteWidth == 5376) {
-                if (!s_clean_camera_cb) {
-                    Microsoft::WRL::ComPtr<ID3D11Device> dev;
-                    context->GetDevice(&dev);
-                    if (dev) {
-                        D3D11_BUFFER_DESC cbd{};
-                        cbd.ByteWidth = 5376;
-                        cbd.Usage = D3D11_USAGE_DYNAMIC;
-                        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-                        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-                        dev->CreateBuffer(&cbd, nullptr, &s_clean_camera_cb);
-                        s_clean_camera_cb_dirty = true;
-                    }
-                }
-                if (s_clean_camera_cb && s_clean_camera_cb_dirty) {
-                    const auto map_fn = resolveOriginalMap(context);
-                    const auto unmap_fn = resolveOriginalUnmap(context);
-                    if (map_fn && unmap_fn) {
-                        D3D11_MAPPED_SUBRESOURCE mapped{};
-                        if (SUCCEEDED(map_fn(context, s_clean_camera_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-                            std::memcpy(mapped.pData, s_last_clean_cb1_data, 5376);
-                            unmap_fn(context, s_clean_camera_cb.Get(), 0);
-                            s_clean_camera_cb_dirty = false;
-                        }
-                    }
-                }
-                if (s_clean_camera_cb && orig_cb1.Get() != s_clean_camera_cb.Get()) {
-                    ID3D11Buffer* clean_buf = s_clean_camera_cb.Get();
-                    if (auto* vs_set = resolveOriginalVSSetConstantBuffers(context)) {
-                        vs_set(context, 1, 1, &clean_buf);
-                    } else {
-                        context->VSSetConstantBuffers(1, 1, &clean_buf);
-                    }
-                    cb1_substituted = true;
-                    s_clean_camera_substitutions.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        }
-    }
-
-    switch (kind) {
-    case 'X':
-        if (auto* fn = resolveOriginalDrawIndexedInstanced(context))
-            fn(context, count, instance_count, start_index_or_vertex, base_vertex, start_instance);
-        break;
-    case 'I':
-        if (auto* fn = resolveOriginalDrawIndexed(context))
-            fn(context, count, start_index_or_vertex, base_vertex);
-        break;
-    case 'N':
-        if (auto* fn = resolveOriginalDrawInstanced(context))
-            fn(context, count, instance_count, start_index_or_vertex, start_instance);
-        break;
-    case 'D':
-        if (auto* fn = resolveOriginalDraw(context))
-            fn(context, count, start_index_or_vertex);
-        break;
-    }
-
-    if (cb1_substituted) {
-        ID3D11Buffer* restore_buf = orig_cb1.Get();
-        if (auto* vs_set = resolveOriginalVSSetConstantBuffers(context)) {
-            vs_set(context, 1, 1, &restore_buf);
-        } else {
-            context->VSSetConstantBuffers(1, 1, &restore_buf);
-        }
-    }
-    abandonAmortizedAndRearmHudProbe(context);
-}
 
 void mergeHudIntoHdrTarget(ID3D11DeviceContext* context, ID3D11RenderTargetView* targetRtv,
                            UINT targetW, UINT targetH,
@@ -3123,11 +2950,7 @@ void mergeHudIntoSceneHdr(ID3D11DeviceContext* context) {
 bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT count,
                                   UINT instance_count, UINT start_index_or_vertex,
                                   INT base_vertex, UINT start_instance) {
-    const auto raw_present_frame = last_present_frame.load(std::memory_order_relaxed);
-    const auto current_frame =
-        (motion_color_source && raw_present_frame >= motion_color_frame && raw_present_frame <= motion_color_frame + 1)
-            ? motion_color_frame
-            : raw_present_frame;
+    const auto current_frame = last_present_frame.load(std::memory_order_relaxed);
     if (s_hdr_slot0_seen_frame != current_frame || motion_color_bound || s_upscale_evaluated_this_frame) {
         return false;
     }
@@ -3806,21 +3629,15 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
 
 static inline bool isHudDrawInterceptWindowActive() {
     if (motion_pair_active || draw_probe_active.load(std::memory_order_relaxed)) return true;
-    if (!hud_draw_probe_active.load(std::memory_order_relaxed)) return false;
-    const bool in_pipe_pass35 = (s_in_pipeline_dlaa_evaluated && s_in_pipeline_dlaa_frame == motion_color_frame && motion_color_bound);
-    if (s_upscale_evaluated_this_frame && !in_pipe_pass35) return false;
+    if (!hud_draw_probe_active.load(std::memory_order_relaxed) || s_upscale_evaluated_this_frame) return false;
     const auto cur = last_present_frame.load(std::memory_order_relaxed);
-    if (s_hdr_slot0_seen_frame == ~0ull ||
-        (s_hdr_slot0_seen_frame != cur && s_hdr_slot0_seen_frame != motion_color_frame)) {
-        return false;
-    }
-    if (s_verified_ldr_tonemap_frame == s_hdr_slot0_seen_frame && s_hud_draws_replayed_frame == 0 && !in_pipe_pass35) return false;
+    if (s_hdr_slot0_seen_frame != cur) return false;
+    if (s_verified_ldr_tonemap_frame == cur && s_hud_draws_replayed_frame == 0) return false;
     return true;
 }
 
 static inline bool shouldInspectHudOrTonemapDraw() {
-    const bool in_pipe_pass35 = (s_in_pipeline_dlaa_evaluated && s_in_pipeline_dlaa_frame == motion_color_frame);
-    return ((s_hud_mask_active_pass || in_pipe_pass35) && motion_color_bound) ||
+    return (s_hud_mask_active_pass && motion_color_bound) ||
            s_ldr_tonemap_candidate_bound ||
            s_post_ldr_backbuffer_bound ||
            motion_pair_active ||
@@ -3829,14 +3646,13 @@ static inline bool shouldInspectHudOrTonemapDraw() {
 
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
     UINT start, INT base) {
-    const auto forward = resolveOriginalDrawIndexed(context);
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
-        if (forward) forward(context, count, start, base);
+        if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         return;
     }
     if (!shouldInspectHudOrTonemapDraw()) {
-        if (forward) forward(context, count, start, base);
+        if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         abandonAmortizedAndRearmHudProbe(context);
         return;
     }
@@ -3847,10 +3663,6 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
             draw_indexed_scene_calls.fetch_add(1, std::memory_order_relaxed);
         observeFirstSceneDraw(context);
-    }
-    if (hudResult == HudDrawResult::HudInPlaceCleanCb) {
-        drawHudInPlaceWithCleanCamera(context, 'I', count, 1, start, base, 0);
-        return;
     }
     bool redirected = false;
     if (hudResult == HudDrawResult::HudReplay) {
@@ -3864,20 +3676,19 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
         redirected = observePostHudDrawAndTonemap(context, 'I', count, 1, start, base, 0);
     }
     if (!redirected) {
-        if (forward) forward(context, count, start, base);
+        if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         abandonAmortizedAndRearmHudProbe(context);
     }
 }
 
 void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UINT start) {
-    const auto forward = resolveOriginalDraw(context);
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
-        if (forward) forward(context, count, start);
+        if (const auto forward = resolveOriginalDraw(context)) forward(context, count, start);
         return;
     }
     if (!shouldInspectHudOrTonemapDraw()) {
-        if (forward) forward(context, count, start);
+        if (const auto forward = resolveOriginalDraw(context)) forward(context, count, start);
         abandonAmortizedAndRearmHudProbe(context);
         return;
     }
@@ -3888,10 +3699,6 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
             draw_scene_calls.fetch_add(1, std::memory_order_relaxed);
         observeFirstSceneDraw(context);
-    }
-    if (hudResult == HudDrawResult::HudInPlaceCleanCb) {
-        drawHudInPlaceWithCleanCamera(context, 'D', count, 1, start, 0, 0);
-        return;
     }
     bool redirected = false;
     if (hudResult == HudDrawResult::HudReplay) {
@@ -3905,7 +3712,7 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
         redirected = observePostHudDrawAndTonemap(context, 'D', count, 1, start, 0, 0);
     }
     if (!redirected) {
-        if (forward) forward(context, count, start);
+        if (const auto forward = resolveOriginalDraw(context)) forward(context, count, start);
         abandonAmortizedAndRearmHudProbe(context);
     }
 }
@@ -3913,14 +3720,17 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
     UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
     UINT start_instance) {
-    const auto forward = resolveOriginalDrawIndexedInstanced(context);
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
-        if (forward) forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
+            forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        }
         return;
     }
     if (!shouldInspectHudOrTonemapDraw()) {
-        if (forward) forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
+            forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        }
         abandonAmortizedAndRearmHudProbe(context);
         return;
     }
@@ -3931,10 +3741,6 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
             draw_indexed_instanced_scene_calls.fetch_add(1, std::memory_order_relaxed);
         observeFirstSceneDraw(context);
-    }
-    if (hudResult == HudDrawResult::HudInPlaceCleanCb) {
-        drawHudInPlaceWithCleanCamera(context, 'X', index_count, instance_count, start_index, base_vertex, start_instance);
-        return;
     }
     bool redirected = false;
     if (hudResult == HudDrawResult::HudReplay) {
@@ -3950,7 +3756,9 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
             start_index, base_vertex, start_instance);
     }
     if (!redirected) {
-        if (forward) forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
+            forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
+        }
         abandonAmortizedAndRearmHudProbe(context);
         if (hudResult == HudDrawResult::GlassReplay) {
             replayGlassDraw(context, index_count, instance_count,
@@ -3962,14 +3770,17 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
 
 void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
-    const auto forward = resolveOriginalDrawInstanced(context);
     const bool immediate = isObservedImmediateContext(context);
     if (!immediate || !isHudDrawInterceptWindowActive()) {
-        if (forward) forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawInstanced(context)) {
+            forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        }
         return;
     }
     if (!shouldInspectHudOrTonemapDraw()) {
-        if (forward) forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawInstanced(context)) {
+            forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        }
         abandonAmortizedAndRearmHudProbe(context);
         return;
     }
@@ -3980,10 +3791,6 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         if (vs_scene_buffer_bound.load(std::memory_order_relaxed))
             draw_instanced_scene_calls.fetch_add(1, std::memory_order_relaxed);
         observeFirstSceneDraw(context);
-    }
-    if (hudResult == HudDrawResult::HudInPlaceCleanCb) {
-        drawHudInPlaceWithCleanCamera(context, 'N', vertex_count, instance_count, start_vertex, 0, start_instance);
-        return;
     }
     bool redirected = false;
     if (hudResult == HudDrawResult::HudReplay) {
@@ -3998,7 +3805,9 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
             start_vertex, 0, start_instance);
     }
     if (!redirected) {
-        if (forward) forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        if (const auto forward = resolveOriginalDrawInstanced(context)) {
+            forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        }
         abandonAmortizedAndRearmHudProbe(context);
     }
 }
@@ -4427,8 +4236,6 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 const edpe::ProjectionJitter unjitter{0.0f, 0.0f, -existing_ndc_offset.x, -existing_ndc_offset.y};
                 if (edpe::jitterEliteProjectionBlock(&mutable_unmap_words[1080], unjittered_block, unjitter)) {
                     std::memcpy(&mutable_unmap_words[1080], unjittered_block, sizeof(unjittered_block));
-                    edpe::cobra_camera::jitterInverseUvRay(
-                        &mutable_unmap_words[98 * 4], -existing_ndc_offset.x * 0.5f, existing_ndc_offset.y * 0.5f);
                 }
             }
             const float* words = mutable_unmap_words;
@@ -4770,23 +4577,11 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     float jittered_block[16]{};
                     if (edpe::jitterEliteProjectionBlock(&mutable_words[1080], jittered_block, jitter)) {
                         std::memcpy(s_last_clean_cb1_data, mutable_words, 5376);
-                        std::memcpy(s_last_unjittered_forward_block, &mutable_words[1080], 16 * sizeof(float));
-                        std::memcpy(s_last_jittered_forward_block, jittered_block, 16 * sizeof(float));
-                        std::memcpy(s_last_unjittered_inv_rays, &mutable_words[98 * 4], 12 * sizeof(float));
-                        s_has_reference_cb0_blocks = true;
                         s_has_clean_cb1_data = true;
                         s_clean_camera_cb_dirty = true;
                         s_clean_camera_frame = cur_frame;
 
-                        // Apply both the forward projection block jitter (words 1080..1095) and the inverse
-                        // frustum ray jitter (rows 98..101) on the unjittered baseline so G-buffer, deferred
-                        // lighting, and skybox rays are always phase-aligned.
                         std::memcpy(&mutable_words[1080], jittered_block, sizeof(jittered_block));
-                        const UINT rw = s_observed_scene_width.load(std::memory_order_relaxed);
-                        const UINT rh = s_observed_scene_height.load(std::memory_order_relaxed);
-                        const float dxUv = (rw > 0) ? (jitter.pixelX / static_cast<float>(rw)) : (jitter.ndcX * 0.5f);
-                        const float dyUv = (rh > 0) ? (jitter.pixelY / static_cast<float>(rh)) : (-jitter.ndcY * 0.5f);
-                        edpe::cobra_camera::jitterInverseUvRay(&mutable_words[98 * 4], dxUv, dyUv);
                         s_jittered_cb1_buffer.store(resource, std::memory_order_release);
                         jitter_applied_this_unmap = true;
                         s_injected_jitter = jitter;
@@ -6048,7 +5843,21 @@ static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_reconstructed_output;
 static edpe::TemporalFrameInputs s_last_temporal_inputs{};
 static unsigned long long s_last_temporal_inputs_frame = ~0ull;
 
-void resetTemporalPathDebounce() {}
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_debounced_offscreen_color;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_pending_offscreen_color;
+static bool s_has_debounced_source = false;
+static bool s_debounced_is_backbuffer = false;
+static bool s_pending_is_backbuffer = false;
+static unsigned s_pending_source_streak = 0;
+
+void resetTemporalPathDebounce() {
+    s_debounced_offscreen_color.Reset();
+    s_pending_offscreen_color.Reset();
+    s_has_debounced_source = false;
+    s_debounced_is_backbuffer = false;
+    s_pending_is_backbuffer = false;
+    s_pending_source_streak = 0;
+}
 
 constexpr DWORD kBridgeTimeoutMs = 500;
 
@@ -6061,6 +5870,7 @@ void resetSharedBackbufferBridge() {
     s_shared_scene_dev = nullptr;
 }
 
+// Present device -> shared texture, then releases key 0.
 bool bridgeCopyBackbufferIn(ID3D11DeviceContext* presentCtx, ID3D11Resource* presentBackbuffer) {
     if (!s_shared_mutex_present || !s_shared_bb_present) return false;
     if (s_shared_mutex_present->AcquireSync(0, kBridgeTimeoutMs) != S_OK) {
@@ -6074,6 +5884,8 @@ bool bridgeCopyBackbufferIn(ID3D11DeviceContext* presentCtx, ID3D11Resource* pre
     return true;
 }
 
+// Scene-device ownership of the shared texture for the duration of one pass.
+// Always uses key 0 on acquire and release so the present device can never deadlock.
 struct SceneBridgeLock {
     bool held = false;
     bool acquire() {
@@ -6093,6 +5905,7 @@ struct SceneBridgeLock {
     ~SceneBridgeLock() { release(); }
 };
 
+// Shared texture -> present backbuffer. Caller must have released SceneBridgeLock.
 bool bridgeCopyResultOut(ID3D11DeviceContext* presentCtx, ID3D11Resource* presentBackbuffer) {
     if (!s_shared_mutex_present || !s_shared_bb_present) return false;
     if (s_shared_mutex_present->AcquireSync(0, kBridgeTimeoutMs) != S_OK) {
@@ -6162,11 +5975,6 @@ OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context);
 MapFn resolveOriginalMap(ID3D11DeviceContext* context);
 UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context);
 
-static Microsoft::WRL::ComPtr<ID3DDeviceContextState> s_upscale_ctx_state;
-static ID3D11Device* s_upscale_ctx_state_device = nullptr;
-
-// Saves and restores the D3D11 pipeline state directly on `ctx` without calling
-// SwapDeviceContextState (which swaps CContext's embedded vtable and breaks VTableHook LiveCopy).
 struct ScopedD3D11PipelineState {
     ID3D11DeviceContext* ctx = nullptr;
     OMSetRenderTargetsFn rawSetOm = nullptr;
@@ -6231,6 +6039,7 @@ struct ScopedD3D11PipelineState {
 
     ~ScopedD3D11PipelineState() {
         if (!ctx) return;
+        rearmContextHooks();
         ID3D11ShaderResourceView* nullSrvs[8]{};
         ID3D11UnorderedAccessView* nullUavs[2]{};
         ctx->PSSetShaderResources(0, 8, nullSrvs);
@@ -6283,11 +6092,16 @@ struct ScopedD3D11PipelineState {
         if (rs) rs->Release();
         if (blend) blend->Release();
         if (ds) ds->Release();
+        rearmContextHooks();
+        abandonAmortizedAndRearmHudProbe(ctx);
     }
 
     ScopedD3D11PipelineState(const ScopedD3D11PipelineState&) = delete;
     ScopedD3D11PipelineState& operator=(const ScopedD3D11PipelineState&) = delete;
 };
+
+static bool s_in_pipeline_dlaa_evaluated = false;
+static unsigned long long s_in_pipeline_dlaa_frame = ~0ull;
 
 bool tryInPipelineDlaa(ID3D11DeviceContext* context) {
     if (!context || !motion_color_source || !scene_depth_source) return false;
@@ -6308,19 +6122,12 @@ bool tryInPipelineDlaa(ID3D11DeviceContext* context) {
         return false;
     }
 
-    if (edpe::cobra_camera::frameWindow().mapModeActive.load(std::memory_order_relaxed)) {
+    if (!s_clean_hdr_scene_texture || s_clean_hdr_scene_frame != motion_color_frame) {
         return false;
     }
 
     if (!s_has_staged_camera && s_camera_now.scaleX <= 0.0f) {
         return false;
-    }
-
-    if (!s_clean_hdr_scene_texture || s_clean_hdr_scene_frame != motion_color_frame) {
-        captureEarlyMotionColor(context, false);
-        if (!s_clean_hdr_scene_texture || s_clean_hdr_scene_frame != motion_color_frame) {
-            return false;
-        }
     }
 
     Microsoft::WRL::ComPtr<ID3D11Resource> gameHdrRes;
@@ -6345,40 +6152,48 @@ bool tryInPipelineDlaa(ID3D11DeviceContext* context) {
         if (curDesc.Width != width || curDesc.Height != height) {
             motion_depth.Reset();
             motion_depth_view.Reset();
-            s_motion_prev_depth.Reset();
-            s_motion_prev_depth_view.Reset();
-            s_has_motion_prev_depth = false;
         }
     }
-    if (!motion_depth || !s_motion_prev_depth) {
+    if (!motion_depth) {
         D3D11_TEXTURE2D_DESC copyDesc = depthDesc;
         copyDesc.Usage = D3D11_USAGE_DEFAULT;
         copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         copyDesc.CPUAccessFlags = copyDesc.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &motion_depth))) return false;
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
         srvDesc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
         srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = 1;
-        if (!motion_depth) {
-            if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &motion_depth))) return false;
-            if (FAILED(device->CreateShaderResourceView(motion_depth.Get(), &srvDesc, &motion_depth_view))) return false;
-        }
-        if (!s_motion_prev_depth) {
-            if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &s_motion_prev_depth)) ||
-                FAILED(device->CreateShaderResourceView(s_motion_prev_depth.Get(), &srvDesc, &s_motion_prev_depth_view))) {
-                s_motion_prev_depth.Reset();
-                s_motion_prev_depth_view.Reset();
-                s_has_motion_prev_depth = false;
-            }
-        }
+        if (FAILED(device->CreateShaderResourceView(motion_depth.Get(), &srvDesc, &motion_depth_view))) return false;
     }
 
-    ScopedD3D11PipelineState stateGuard(context);
+    // Save and temporarily unbind OM targets to eliminate resource hazards for depth and HDR color
+    ID3D11RenderTargetView* savedRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    ID3D11DepthStencilView* savedDsv = nullptr;
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtvs, &savedDsv);
+    const OMSetRenderTargetsFn rawSet = resolveOriginalOM(context);
+    if (rawSet) {
+        ID3D11RenderTargetView* nullRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+        rawSet(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullRtvs, nullptr);
+    }
+    struct RestoreTargetsGuard {
+        ID3D11DeviceContext* ctx;
+        OMSetRenderTargetsFn setFn;
+        ID3D11RenderTargetView** rtvs;
+        ID3D11DepthStencilView* dsv;
+        ~RestoreTargetsGuard() {
+            if (setFn) {
+                setFn(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
+            }
+            for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+                if (rtvs[i]) rtvs[i]->Release();
+            }
+            if (dsv) dsv->Release();
+        }
+    } restoreGuard{context, rawSet, savedRtvs, savedDsv};
 
     const unsigned scene_writes_this_eval = s_scene_writes_since_eval.exchange(0, std::memory_order_acq_rel);
-    const uint32_t engine_refresh_writes =
-        edpe::cobra_camera::frameWindow().injectedDrawsThisFrame.exchange(0, std::memory_order_acq_rel);
-    const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0 || engine_refresh_writes > 0);
+    const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0);
     s_scene_jitter_consumed.store(true, std::memory_order_release);
     float jx = 0.0f, jy = 0.0f;
     if ((has_fresh_scene_jitter || s_clean_camera_frame == motion_color_frame) && ContextCensusIsJitterActive()) {
@@ -6397,31 +6212,18 @@ bool tryInPipelineDlaa(ID3D11DeviceContext* context) {
     const float prev_jx = eval_reset ? 0.0f : s_prev_eval_jitter_x;
     const float prev_jy = eval_reset ? 0.0f : s_prev_eval_jitter_y;
 
-    ID3D11ShaderResourceView* prevDepthSrv = nullptr;
-    if (s_motion_prev_depth && s_motion_prev_depth_view) {
-        std::swap(motion_depth, s_motion_prev_depth);
-        std::swap(motion_depth_view, s_motion_prev_depth_view);
-        if (s_has_motion_prev_depth && !eval_reset) {
-            prevDepthSrv = s_motion_prev_depth_view.Get();
-        }
-    }
+    // Render motion vectors with current and previous subpixel jitter phases
     context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
-    s_has_motion_prev_depth = (s_motion_prev_depth && s_motion_prev_depth_view);
-
     if (!motion_pass) {
         auto candidate = std::make_unique<edpe::MotionPass>();
         if (candidate->initialize(device.Get(), context)) {
             motion_pass = std::move(candidate);
         }
     }
-    ID3D11ShaderResourceView* engVelSrv =
-        (s_engine_velocity_frame == motion_color_frame && s_engine_velocity_srv)
-            ? s_engine_velocity_srv.Get()
-            : nullptr;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
     if (motion_pass) {
         motion_pass->render(motion_depth_view.Get(), s_camera_now, s_camera_previous,
-            width, height, jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv, engVelSrv);
+            width, height, jx, jy, prev_jx, prev_jy, eval_reset);
         if (motion_pass->output()) {
             Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
             motion_pass->output()->GetResource(&motionRes);
@@ -6493,11 +6295,6 @@ bool tryInPipelineDlaa(ID3D11DeviceContext* context) {
         s_prev_eval_jitter_y = jy;
         s_in_pipeline_dlaa_evaluated = true;
         s_in_pipeline_dlaa_frame = motion_color_frame;
-        s_upscale_evaluated_this_frame = true;
-        s_last_reconstructed_frame = last_present_frame.load(std::memory_order_relaxed);
-        s_diag_eval_stage = 1;
-        s_last_temporal_inputs = inputs;
-        s_last_temporal_inputs_frame = s_last_reconstructed_frame;
         static unsigned s_dlaa_in_pipe_count = 0;
         if (++s_dlaa_in_pipe_count <= 5 || s_dlaa_in_pipe_count % 300 == 0) {
             wchar_t msg[192];
@@ -6556,10 +6353,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     if (s_upscale_evaluated_this_frame) {
         return;
     }
-    if (s_in_pipeline_dlaa_evaluated &&
-        (s_in_pipeline_dlaa_frame == rendered || s_in_pipeline_dlaa_frame == motion_color_frame)) {
+    if (s_in_pipeline_dlaa_evaluated && s_in_pipeline_dlaa_frame == rendered) {
         s_upscale_evaluated_this_frame = true;
-        s_last_reconstructed_frame = rendered;
         return;
     }
 
@@ -6569,7 +6364,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
     const wchar_t* skip = nullptr;
     if (!motion_color_source || !scene_depth_source) skip = L"scene color/depth not observed";
-    else if (motion_color_frame != rendered && motion_color_frame + 1 != rendered) skip = L"no scene MRT pass this frame";
+    else if (motion_color_frame != rendered) skip = L"no scene MRT pass this frame";
     else if (!s_has_staged_camera && s_camera_now.scaleX <= 0.0f) skip = L"no main camera latched this frame";
 
     bool scene_cut = false;
@@ -6707,7 +6502,66 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     }
     s_consecutive_skipped_frames = 0;
 
-    ID3D11Texture2D* chosenColor = rawColorChoice ? rawColorChoice : presentBackbuffer;
+    // Apply debounce hysteresis filter to prevent flapping between scene target and backbuffer
+    const bool rawIsBackbuffer = (rawColorChoice == presentBackbuffer);
+    if (s_has_debounced_source && !s_debounced_is_backbuffer) {
+        bool validDebounced = false;
+        if (s_debounced_offscreen_color) {
+            Microsoft::WRL::ComPtr<ID3D11Device> debDev;
+            s_debounced_offscreen_color->GetDevice(&debDev);
+            D3D11_TEXTURE2D_DESC debDesc{};
+            s_debounced_offscreen_color->GetDesc(&debDesc);
+            validDebounced = (debDev.Get() == sceneDevice.Get() &&
+                              debDesc.Width == depthDesc.Width &&
+                              debDesc.Height == depthDesc.Height);
+        }
+        if (!validDebounced || isSubNative != (depthDesc.Width < backbufferDesc.Width || depthDesc.Height < backbufferDesc.Height)) {
+            resetTemporalPathDebounce();
+        }
+    } else if (s_has_debounced_source && s_debounced_is_backbuffer && isSubNative) {
+        resetTemporalPathDebounce();
+    }
+
+    ID3D11Texture2D* chosenColor = nullptr;
+    if (!s_has_debounced_source) {
+        s_has_debounced_source = true;
+        s_debounced_is_backbuffer = rawIsBackbuffer;
+        s_debounced_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+        s_pending_is_backbuffer = rawIsBackbuffer;
+        s_pending_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+        s_pending_source_streak = 0;
+        chosenColor = rawColorChoice;
+    } else if (rawIsBackbuffer == s_debounced_is_backbuffer) {
+        s_debounced_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+        s_pending_is_backbuffer = rawIsBackbuffer;
+        s_pending_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+        s_pending_source_streak = 0;
+        chosenColor = rawColorChoice;
+    } else {
+        if (rawIsBackbuffer == s_pending_is_backbuffer &&
+            (rawIsBackbuffer || rawColorChoice == s_pending_offscreen_color.Get())) {
+            ++s_pending_source_streak;
+        } else {
+            s_pending_is_backbuffer = rawIsBackbuffer;
+            s_pending_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+            s_pending_source_streak = 1;
+        }
+
+        if (s_pending_source_streak >= 3) {
+            s_debounced_is_backbuffer = rawIsBackbuffer;
+            s_debounced_offscreen_color = rawIsBackbuffer ? nullptr : rawColorChoice;
+            s_pending_source_streak = 0;
+            s_camera_reset = true;
+            chosenColor = rawColorChoice;
+            EdpeLog(L"EDPE: debounced color source switched, DLSS history reset triggered");
+        } else {
+            chosenColor = s_debounced_is_backbuffer ? presentBackbuffer : s_debounced_offscreen_color.Get();
+        }
+    }
+
+    if (!chosenColor) {
+        chosenColor = presentBackbuffer;
+    }
     D3D11_TEXTURE2D_DESC srcColorDesc{};
     if (chosenColor != presentBackbuffer) {
         Microsoft::WRL::ComPtr<ID3D11Device> colorDev;
@@ -6715,15 +6569,28 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         chosenColor->GetDesc(&srcColorDesc);
         if (!colorDev || colorDev.Get() != sceneDevice.Get() ||
             srcColorDesc.Width != depthDesc.Width || srcColorDesc.Height != depthDesc.Height) {
+            resetTemporalPathDebounce();
             if (!isSubNative) {
                 chosenColor = presentBackbuffer;
             } else {
+                static unsigned long long s_last_dim_log = ~0ull;
+                if (s_last_dim_log == ~0ull || frame >= s_last_dim_log + 300) {
+                    s_last_dim_log = frame;
+                    wchar_t msg[192];
+                    swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu (color %ux%u != depth %ux%u)",
+                        frame, srcColorDesc.Width, srcColorDesc.Height, depthDesc.Width, depthDesc.Height);
+                    EdpeLog(msg);
+                }
                 return;
             }
         }
     }
 
     const bool chosenIsBackbuffer = (chosenColor == presentBackbuffer);
+    // Always copy presentBackbuffer when using an offscreen scene target so Pass 53/54 2D menus
+    // (ESC menu, Main Menu, cursor) are preserved regardless of s_preserve_native_ui.
+    const bool needBackbufferIn = true;
+
     const bool crossDevice = (sceneDevice.Get() != presentDevice.Get());
     SceneBridgeLock sceneBridgeLock;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> sceneCtxHolder;
@@ -6733,7 +6600,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (!ensureSharedBackbufferBridge(presentDevice.Get(), sceneDevice.Get(), backbufferDesc)) {
             return;
         }
-        if (!bridgeCopyBackbufferIn(presentCtx, presentBackbuffer)) return;
+        if (needBackbufferIn) {
+            if (!bridgeCopyBackbufferIn(presentCtx, presentBackbuffer)) return;
+        }
         if (!sceneBridgeLock.acquire()) return;
         context = sceneCtxHolder.Get();
         backbuffer = s_shared_bb_scene.Get();
@@ -7036,14 +6905,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
             motion_pass->clear(context);
         } else {
-            ID3D11ShaderResourceView* engVelSrv =
-                (s_engine_velocity_frame == rendered && s_engine_velocity_srv)
-                    ? s_engine_velocity_srv.Get()
-                    : nullptr;
-            // Render motion vectors at render resolution using current and previous camera projections, jitter phases, and MRT6 velocity
+            // Render motion vectors at render resolution using current and previous camera projections and jitter phases
             motion_pass->render(motion_depth_view.Get(),
                 s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
-                jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv, engVelSrv);
+                jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv);
+            rearmContextHooks();
         }
 
         if (!motion_pass->output()) return;
@@ -7162,6 +7028,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
         bool compOk = false;
         const bool upscalerEvalOk = upscaler.evaluate(context, inputs, nullptr, evalDestination);
+        rearmContextHooks();
         edpe::updateCrashUpscalerState(
             static_cast<int>(upscaler.getBackend()),
             static_cast<int>(upscaler.getMode()),
@@ -7182,8 +7049,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             // so Pass 53/54 2D menus (ESC Pause Menu, Main Menu, mouse cursor) drawn onto backbuffer after
             // Pass 52 (scene_ldr_source) are extracted from s_backbuffer_copy_srv vs s_dlaa_input_srv and
             // never overwritten by s_dlss_output_texture.
-            const bool canCompositeUi = (!isHdrColor && isSubNative &&
-                                         evalDestination == s_dlss_output_texture.Get() &&
+            const bool canCompositeUi = (evalDestination == s_dlss_output_texture.Get() &&
                                          s_dlss_output_srv && s_backbuffer_copy_srv &&
                                          activeColorInputSrv && s_backbuffer_rtv &&
                                          colorSource != backbuffer);
@@ -7628,6 +7494,7 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         renderW, renderH,
         reset,
         isHdr);
+    rearmContextHooks();
 
     if (crossDevice) {
         context->Flush();
@@ -7775,6 +7642,7 @@ void renderHudDebugView(ID3D11DeviceContext* context, unsigned long long rendere
         bbDesc.Width, bbDesc.Height,
         renderW, renderH,
         opacity, threshold, mode, isHdr);
+    rearmContextHooks();
 
     if (crossDevice) {
         context->Flush();
@@ -7832,309 +7700,6 @@ bool isMainSceneMrtDepth(const D3D11_TEXTURE2D_DESC& dd, UINT outW, UINT outH, b
     return true;
 }
 
-struct RefreshSite592300Tls {
-    uint64_t realRet = 0;
-    uintptr_t camera = 0;
-    float entryX = 0.0f;
-    float entryY = 0.0f;
-    uint32_t flags = 0;
-    uint32_t haveFlags = 0;
-    uint32_t armed = 0;
-};
-
-__declspec(thread) RefreshSite592300Tls t_refresh592300Tls{};
-uintptr_t s_refresh592300StubB = 0;
-uintptr_t s_refresh592300LastR11 = 0;
-std::atomic<bool> s_refresh592300Attempted{false};
-std::atomic<bool> s_refresh592300Hooked{false};
-
-bool sehReadBytes592300(uintptr_t at, uint8_t* got, size_t bytes) noexcept {
-    __try {
-        std::memcpy(got, reinterpret_cast<const void*>(at), bytes);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool sehReadU32_592300(uintptr_t at, uint32_t* out) noexcept {
-    __try {
-        *out = *reinterpret_cast<const uint32_t*>(at);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool sehReadF32_592300(uintptr_t at, float* out) noexcept {
-    __try {
-        *out = *reinterpret_cast<const float*>(at);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool sehReadU64_592300(uintptr_t at, uint64_t* out) noexcept {
-    __try {
-        *out = *reinterpret_cast<const uint64_t*>(at);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool sehWriteF32_592300(uintptr_t at, float value) noexcept {
-    __try {
-        *reinterpret_cast<float*>(at) = value;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool sehWriteU32_592300(uintptr_t at, uint32_t value) noexcept {
-    __try {
-        *reinterpret_cast<uint32_t*>(at) = value;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool sehWriteU64_592300(uintptr_t at, uint64_t value) noexcept {
-    __try {
-        *reinterpret_cast<uint64_t*>(at) = value;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-void __fastcall refresh592300Pre(uintptr_t r0, uintptr_t /*ctx*/, uintptr_t /*p2*/, uintptr_t camera) noexcept {
-    constexpr uint32_t kCamFlags  = 0x250;
-    constexpr uint32_t kCamKind   = 0x264;
-    constexpr uint32_t kCamBoundX = 0x28C;
-    constexpr uint32_t kCamBoundY = 0x290;
-    constexpr uint32_t kFlagProj  = 0x4u;
-    constexpr uint32_t kFlagVP    = 0x8u;
-
-    RefreshSite592300Tls& tls = t_refresh592300Tls;
-    tls.armed = 0;
-    if (!camera || !r0 || !s_refresh592300StubB) return;
-
-    auto& win = edpe::cobra_camera::frameWindow();
-    const DWORD tid = win.renderThreadId.load(std::memory_order_relaxed);
-    if (tid != 0 && GetCurrentThreadId() != tid) return;
-
-    uint32_t kind = 0;
-    if (!sehReadU32_592300(camera + kCamKind, &kind) || kind != 3) {
-        return;
-    }
-
-    const bool canInject =
-        win.windowOpen.load(std::memory_order_acquire) &&
-        !win.mapModeActive.load(std::memory_order_relaxed);
-    const uint32_t rw = win.renderWidth.load(std::memory_order_relaxed);
-    const uint32_t rh = win.renderHeight.load(std::memory_order_relaxed);
-    const float jx = win.jitterPxX.load(std::memory_order_relaxed);
-    const float jy = win.jitterPxY.load(std::memory_order_relaxed);
-    const bool phaseNonZero = (rw > 0 && rh > 0 && (std::fabs(jx) > 1e-6f || std::fabs(jy) > 1e-6f));
-
-    if (!canInject || !phaseNonZero) {
-        return;
-    }
-
-    float entryX = 0.0f, entryY = 0.0f;
-    if (!sehReadF32_592300(camera + kCamBoundX, &entryX) || !sehReadF32_592300(camera + kCamBoundY, &entryY)) {
-        return;
-    }
-    if (!std::isfinite(entryX) || !std::isfinite(entryY) ||
-        std::fabs(entryX) < 0.05f || std::fabs(entryX) > 5.0f ||
-        std::fabs(entryY) < 0.05f || std::fabs(entryY) > 5.0f) {
-        return;
-    }
-
-    const float jitX = entryX + jx / static_cast<float>(rw);
-    const float jitY = entryY - jy / static_cast<float>(rh);
-    uint32_t flags = 0;
-    const bool haveFlags = sehReadU32_592300(camera + kCamFlags, &flags);
-    const bool wroteX = sehWriteF32_592300(camera + kCamBoundX, jitX);
-    const bool wroteY = wroteX && sehWriteF32_592300(camera + kCamBoundY, jitY);
-    const bool wroteAll = wroteY && (!haveFlags || sehWriteU32_592300(camera + kCamFlags, flags | kFlagProj | kFlagVP));
-    if (!wroteAll) {
-        if (wroteX) sehWriteF32_592300(camera + kCamBoundX, entryX);
-        if (wroteY) sehWriteF32_592300(camera + kCamBoundY, entryY);
-        return;
-    }
-
-    uint64_t realRet = 0;
-    if (!sehReadU64_592300(r0, &realRet) || !sehWriteU64_592300(r0, static_cast<uint64_t>(s_refresh592300StubB))) {
-        sehWriteF32_592300(camera + kCamBoundX, entryX);
-        sehWriteF32_592300(camera + kCamBoundY, entryY);
-        if (haveFlags) sehWriteU32_592300(camera + kCamFlags, flags);
-        return;
-    }
-
-    tls.realRet = realRet;
-    tls.camera = camera;
-    tls.entryX = entryX;
-    tls.entryY = entryY;
-    tls.flags = flags;
-    tls.haveFlags = haveFlags ? 1u : 0u;
-    tls.armed = 1u;
-    win.injectedDrawsThisFrame.fetch_add(1, std::memory_order_relaxed);
-    win.injectedFrameCount.fetch_add(1, std::memory_order_relaxed);
-}
-
-uint64_t __fastcall refresh592300Post() noexcept {
-    constexpr uint32_t kCamFlags  = 0x250;
-    constexpr uint32_t kCamBoundX = 0x28C;
-    constexpr uint32_t kCamBoundY = 0x290;
-
-    RefreshSite592300Tls& tls = t_refresh592300Tls;
-    const uint64_t ret = tls.realRet;
-    if (tls.armed && tls.camera) {
-        tls.armed = 0;
-        sehWriteF32_592300(tls.camera + kCamBoundX, tls.entryX);
-        sehWriteF32_592300(tls.camera + kCamBoundY, tls.entryY);
-        if (tls.haveFlags) {
-            sehWriteU32_592300(tls.camera + kCamFlags, tls.flags);
-        }
-        tls.camera = 0;
-    }
-    return ret;
-}
-
-void ensureRefreshSite592300HookInstalled() noexcept {
-    if (s_refresh592300Attempted.exchange(true, std::memory_order_acq_rel)) return;
-    if (!edpe::isRunningInEliteProcess()) return;
-    if (edpe::cobra_camera::EngineHookManager::instance().isViewRefreshHooked()) return;
-
-    HMODULE exeMod = GetModuleHandleW(nullptr);
-    if (!exeMod) return;
-    const auto baseAddr = reinterpret_cast<uintptr_t>(exeMod);
-    constexpr uintptr_t kSiteRva = 0x0592300;
-    constexpr uint8_t kExpectedPrologue[16] = {
-        0x41, 0x57, 0x48, 0x81, 0xEC, 0xE0, 0x00, 0x00,
-        0x00, 0x4D, 0x8B, 0xF8, 0x4C, 0x8B, 0xEA, 0x4C
-    };
-    auto* target = reinterpret_cast<uint8_t*>(baseAddr + kSiteRva);
-    uint8_t got[16]{};
-    if (!sehReadBytes592300(reinterpret_cast<uintptr_t>(target), got, sizeof(got)) ||
-        std::memcmp(got, kExpectedPrologue, sizeof(kExpectedPrologue)) != 0) {
-        return;
-    }
-
-    auto* page = static_cast<uint8_t*>(edpe::CodeHook::allocateNear(target, 4096));
-    if (!page) return;
-
-    uint8_t* stubA = page;
-    uint8_t* stubB = page + 160;
-    uint8_t* tramp = page + 256;
-
-    constexpr size_t kStolen = 9;
-    std::memcpy(tramp, target, kStolen);
-    const uintptr_t resumeAddr = reinterpret_cast<uintptr_t>(target + kStolen);
-    tramp[kStolen + 0] = 0xFF;
-    tramp[kStolen + 1] = 0x25;
-    tramp[kStolen + 2] = 0x00;
-    tramp[kStolen + 3] = 0x00;
-    tramp[kStolen + 4] = 0x00;
-    tramp[kStolen + 5] = 0x00;
-    std::memcpy(tramp + kStolen + 6, &resumeAddr, sizeof(resumeAddr));
-
-    auto emitBytes = [](uint8_t*& p, std::initializer_list<uint8_t> bs) {
-        for (uint8_t b : bs) *p++ = b;
-    };
-    auto emitU32 = [](uint8_t*& p, uint32_t v) {
-        std::memcpy(p, &v, 4);
-        p += 4;
-    };
-    auto emitU64 = [](uint8_t*& p, uint64_t v) {
-        std::memcpy(p, &v, 8);
-        p += 8;
-    };
-
-    uint8_t* pa = stubA;
-    emitBytes(pa, {0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55});
-    emitBytes(pa, {0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
-                   0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57});
-    emitBytes(pa, {0x48, 0x8B, 0x44, 0x24, 0x20});
-    emitBytes(pa, {0x48, 0xA3}); emitU64(pa, reinterpret_cast<uint64_t>(&s_refresh592300LastR11));
-    emitBytes(pa, {0x48, 0x8D, 0x8C, 0x24}); emitU32(pa, 0x88);
-    emitBytes(pa, {0x48, 0x8B, 0x54, 0x24, 0x60});
-    emitBytes(pa, {0x4C, 0x8B, 0x44, 0x24, 0x58});
-    emitBytes(pa, {0x4C, 0x8B, 0x4C, 0x24, 0x38});
-    emitBytes(pa, {0x49, 0xBB}); emitU64(pa, reinterpret_cast<uint64_t>(&refresh592300Pre));
-    emitBytes(pa, {0x48, 0x83, 0xEC, 0x20});
-    emitBytes(pa, {0x41, 0xFF, 0xD3});
-    emitBytes(pa, {0x48, 0x83, 0xC4, 0x20});
-    emitBytes(pa, {0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C,
-                   0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58});
-    emitBytes(pa, {0x5D, 0x5F, 0x5E, 0x5A, 0x59, 0x5B, 0x58});
-    emitBytes(pa, {0xFF, 0x25}); emitU32(pa, 0);
-    emitU64(pa, reinterpret_cast<uint64_t>(tramp));
-
-    uint8_t* pb = stubB;
-    emitBytes(pb, {0x50, 0x51, 0x52});
-    emitBytes(pb, {0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53});
-    emitBytes(pb, {0x48, 0x83, 0xEC, 0x30});
-    emitBytes(pb, {0x0F, 0x29, 0x44, 0x24, 0x20});
-    emitBytes(pb, {0x49, 0xBB}); emitU64(pb, reinterpret_cast<uint64_t>(&refresh592300Post));
-    emitBytes(pb, {0x41, 0xFF, 0xD3});
-    emitBytes(pb, {0x48, 0x89, 0x44, 0x24, 0x30});
-    emitBytes(pb, {0x0F, 0x28, 0x44, 0x24, 0x20});
-    emitBytes(pb, {0x48, 0x83, 0xC4, 0x30});
-    emitBytes(pb, {0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58});
-    emitBytes(pb, {0x5A, 0x59, 0x58});
-    emitBytes(pb, {0x41, 0xFF, 0xE3});
-
-    s_refresh592300StubB = reinterpret_cast<uintptr_t>(stubB);
-
-    DWORD oldPageProt = 0;
-    VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &oldPageProt);
-    FlushInstructionCache(GetCurrentProcess(), page, 4096);
-
-    const intptr_t jmpDelta =
-        reinterpret_cast<intptr_t>(stubA) - reinterpret_cast<intptr_t>(target + 5);
-    if (jmpDelta < INT32_MIN || jmpDelta > INT32_MAX) {
-        VirtualFree(page, 0, MEM_RELEASE);
-        return;
-    }
-
-    DWORD oldProt = 0;
-    if (!VirtualProtect(target, 8, PAGE_EXECUTE_READWRITE, &oldProt)) {
-        VirtualFree(page, 0, MEM_RELEASE);
-        return;
-    }
-
-    uint64_t saved8 = 0;
-    std::memcpy(&saved8, target, sizeof(saved8));
-    uint8_t patched8[8]{};
-    patched8[0] = 0xE9;
-    const int32_t rel32 = static_cast<int32_t>(jmpDelta);
-    std::memcpy(patched8 + 1, &rel32, sizeof(rel32));
-    patched8[5] = 0x90;
-    patched8[6] = 0x90;
-    patched8[7] = 0x90;
-
-    int64_t expected64 = 0, desired64 = 0;
-    std::memcpy(&expected64, &saved8, sizeof(expected64));
-    std::memcpy(&desired64, patched8, sizeof(desired64));
-    const int64_t prev = InterlockedCompareExchange64(
-        reinterpret_cast<volatile LONG64*>(target), desired64, expected64);
-    DWORD ignored = 0;
-    VirtualProtect(target, 8, oldProt, &ignored);
-    if (prev == expected64) {
-        FlushInstructionCache(GetCurrentProcess(), target, 8);
-        s_refresh592300Hooked.store(true, std::memory_order_release);
-        EdpeLog(L"EDPE: Cobra view-constant refresh hook installed (RVA 0x592300)");
-    } else {
-        VirtualFree(page, 0, MEM_RELEASE);
-    }
-}
-
 void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     ID3D11RenderTargetView* const* targets, ID3D11DepthStencilView* dsv) {
     if (g_is_evaluating_upscaler.load(std::memory_order_acquire)) return;
@@ -8149,22 +7714,16 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         upscale_active ||
         s_jitter_debug_view.load(std::memory_order_relaxed) ||
         s_hud_debug_view.load(std::memory_order_relaxed);
-    const auto raw_present_frame = last_present_frame.load(std::memory_order_relaxed);
+    const auto current_frame = last_present_frame.load(std::memory_order_relaxed);
     bool is_scene_device_ctx = true;
-    if (scene_depth_source || motion_color_source) {
+    if (motion_color_source && motion_color_frame == current_frame) {
         Microsoft::WRL::ComPtr<ID3D11Device> ctxDev, sceneDev;
         context->GetDevice(&ctxDev);
-        if (scene_depth_source) scene_depth_source->GetDevice(&sceneDev);
-        else if (motion_color_source) motion_color_source->GetDevice(&sceneDev);
+        motion_color_source->GetDevice(&sceneDev);
         if (ctxDev && sceneDev && ctxDev.Get() != sceneDev.Get()) {
             is_scene_device_ctx = false;
         }
     }
-    const auto current_frame =
-        (is_scene_device_ctx && motion_color_source &&
-         raw_present_frame >= motion_color_frame && raw_present_frame <= motion_color_frame + 1)
-            ? motion_color_frame
-            : raw_present_frame;
     if (isObservedImmediateContext(context) && is_scene_device_ctx) {
         if (s_hud_mask_active_frame != current_frame) {
             s_hud_mask_active_frame = current_frame;
@@ -8196,43 +7755,13 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             }
             // Cobra transitions the HDR color target from MRT RTV3 (Binds 1-3) to RTV0 (Binds 4-7).
             // In Cobra Odyssey, OMSetRenderTargets is called with NumViews=8 and null in unused slots.
-            bool is_hdr_slot0 = count >= 1 && targets && targets[0] &&
+            const bool is_hdr_slot0 = count >= 1 && targets && targets[0] &&
                 sameRenderTargetResource(targets[0], motion_color_source.Get()) &&
                 (non_null_count < 4 || (count > 3 && targets[3] == nullptr));
-            if (!is_hdr_slot0 && dsv != nullptr && count >= 1 && targets && targets[0] &&
-                (non_null_count < 4 || (count > 3 && targets[3] == nullptr))) {
-                D3D11_RENDER_TARGET_VIEW_DESC rtv0Desc{};
-                targets[0]->GetDesc(&rtv0Desc);
-                if (rtv0Desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
-                    const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
-                    const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
-                    ID3D11Resource* r0 = nullptr;
-                    targets[0]->GetResource(&r0);
-                    if (r0) {
-                        Microsoft::WRL::ComPtr<ID3D11Texture2D> t0;
-                        if (SUCCEEDED(r0->QueryInterface(__uuidof(ID3D11Texture2D),
-                                reinterpret_cast<void**>(t0.GetAddressOf())))) {
-                            D3D11_TEXTURE2D_DESC td0{};
-                            t0->GetDesc(&td0);
-                            if (sceneW > 0 && sceneH > 0 &&
-                                td0.Width == sceneW && td0.Height == sceneH && td0.SampleDesc.Count == 1) {
-                                motion_color_source = targets[0];
-                                scene_hdr_color_source = t0;
-                                scene_hdr_color_frame = current_frame;
-                                s_cached_hdr_rtv0 = targets[0];
-                                bound = true;
-                                is_hdr_slot0 = true;
-                            }
-                        }
-                        r0->Release();
-                    }
-                }
-            }
 
         if (motion_color_bound && !bound) {
             // Main scene G-buffer or Pass 35 HDR pass has completed and unbound!
             s_inside_main_scene.store(false, std::memory_order_release);
-            edpe::cobra_camera::frameWindow().windowOpen.store(false, std::memory_order_release);
             s_hud_mask_active_pass = false;
             if (motion_pair_active && !motion_color_first_exit_logged) {
                 motion_color_first_exit_logged = true;
@@ -8243,10 +7772,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                 EdpeLog(message);
                 captureEarlyMotionColor(context, false);
             }
-            if (upscale_active && s_hdr_slot0_seen_frame == current_frame &&
-                (!s_in_pipeline_dlaa_evaluated || s_in_pipeline_dlaa_frame != motion_color_frame)) {
-                tryInPipelineDlaa(context);
-            }
+
         } else if (is_hdr_slot0) {
             // Transitioned from 4-MRT G-buffer (Binds 1-3) to RTV0 deferred lighting/HUD (Binds 4-7)
             s_inside_main_scene.store(false, std::memory_order_release);
@@ -8450,60 +7976,6 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         }
 
         if (is_main_scene) {
-            edpe::cobra_camera::EngineHookManager::instance().ensureInstalled();
-            ensureRefreshSite592300HookInstalled();
-            const bool mapFocus = edpe::cobra_camera::MapFocusPoller::isMapGuiFocusActive() ||
-                                  (s_map_shader_seen_frame != ~0ull && current_frame <= s_map_shader_seen_frame + 2);
-            auto& fwin = edpe::cobra_camera::frameWindow();
-            fwin.renderThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
-            fwin.mapModeActive.store(mapFocus, std::memory_order_relaxed);
-            fwin.renderWidth.store(s_observed_scene_width.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            fwin.renderHeight.store(s_observed_scene_height.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            if (ContextCensusIsJitterActive() && !mapFocus) {
-                const edpe::ProjectionJitter frameJitter = getOrUpdateSceneProjectionJitter();
-                fwin.jitterPxX.store(frameJitter.pixelX, std::memory_order_relaxed);
-                fwin.jitterPxY.store(frameJitter.pixelY, std::memory_order_relaxed);
-                s_injected_jitter = frameJitter;
-                fwin.windowOpen.store(true, std::memory_order_release);
-            } else {
-                fwin.jitterPxX.store(0.0f, std::memory_order_relaxed);
-                fwin.jitterPxY.store(0.0f, std::memory_order_relaxed);
-                fwin.windowOpen.store(false, std::memory_order_release);
-            }
-
-            // Capture MRT6 per-object velocity G-buffer (slot 6, R16G16B16A16_FLOAT) when bound
-            if (count >= 7 && targets && targets[6]) {
-                ID3D11Resource* velRes = nullptr;
-                targets[6]->GetResource(&velRes);
-                if (velRes) {
-                    Microsoft::WRL::ComPtr<ID3D11Texture2D> velTex;
-                    if (SUCCEEDED(velRes->QueryInterface(__uuidof(ID3D11Texture2D),
-                            reinterpret_cast<void**>(velTex.GetAddressOf())))) {
-                        D3D11_TEXTURE2D_DESC vd{};
-                        velTex->GetDesc(&vd);
-                        if ((vd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-                             vd.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS) &&
-                            (vd.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
-                            if (s_engine_velocity_texture.Get() != velTex.Get() || !s_engine_velocity_srv) {
-                                s_engine_velocity_srv.Reset();
-                                s_engine_velocity_texture = velTex;
-                                Microsoft::WRL::ComPtr<ID3D11Device> dev;
-                                context->GetDevice(&dev);
-                                if (dev) {
-                                    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-                                    sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-                                    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                                    sd.Texture2D.MipLevels = 1;
-                                    dev->CreateShaderResourceView(velTex.Get(), &sd, &s_engine_velocity_srv);
-                                }
-                            }
-                            s_engine_velocity_frame = current_frame;
-                        }
-                    }
-                    velRes->Release();
-                }
-            }
-
             ID3D11Device* sceneDevice = nullptr;
             context->GetDevice(&sceneDevice);
             ID3D11Device* presentDev = s_present_device.load(std::memory_order_acquire);
@@ -8528,19 +8000,8 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             scene_ldr_frame = ~0ull;
 
             if (reconstruction_active) {
-                if (motion_color_frame != raw_present_frame) {
-                    s_hdr_slot0_seen_frame = ~0ull;
-                    s_in_pipeline_dlaa_evaluated = false;
-                    s_upscale_evaluated_this_frame = false;
-                    hud_first_match_seen = false;
-                    s_hud_mask_active_frame = raw_present_frame;
-                    s_hud_mask_active_pass = false;
-                    s_hud_mask_cleared_for_frame = false;
-                    s_hud_draws_replayed_frame = 0;
-                    s_hud_merged_into_hdr_this_frame = false;
-                }
                 motion_color_source = targets[3];
-                motion_color_frame = raw_present_frame;
+                motion_color_frame = current_frame;
                 motion_color_bound = true;
                 ID3D11Resource* hdrRes = nullptr;
                 targets[3]->GetResource(&hdrRes);
@@ -9436,9 +8897,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 }
                 if (edpe::UpscalerManager::instance().isReconstructionActive() &&
                     jittered_writes_count.load(std::memory_order_relaxed) == 0 &&
-                    motion_color_frame == rendered_frame &&
-                    !s_inside_main_scene.load(std::memory_order_relaxed) &&
-                    !motion_color_bound) {
+                    motion_color_frame == rendered_frame) {
                     static unsigned long long s_last_zero_write_warn = 0;
                     if (rendered_frame > s_last_zero_write_warn + 60) {
                         s_last_zero_write_warn = rendered_frame;
@@ -9590,24 +9049,20 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_diag_composite_path = 0;
         s_diag_hud_src = 0;
         s_diag_hud_mask_w = 0;
-        const bool scene_active_async =
-            s_inside_main_scene.load(std::memory_order_acquire) || motion_color_bound;
-        if (!scene_active_async) {
-            s_upscale_evaluated_this_frame = false;
-            motion_color_first_exit_logged = false;
-            s_has_staged_camera = false;
-            s_staged_from_in_scene = false;
-            s_hdr_slot0_seen_frame = ~0ull;
-            s_pass53_blit_seen_frame = ~0ull;
-            s_jitter_injected_frame = ~0ull;
-            s_hud_mask_cleared_for_frame = false;
-            s_hud_mask_active_pass = false;
-            hud_first_match_seen = false;
-            s_in_pipeline_dlaa_evaluated = false;
-            s_hud_draws_replayed_frame = 0;
-            s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
-            s_jittered_cb1_buffer.store(nullptr, std::memory_order_relaxed);
-        }
+        s_upscale_evaluated_this_frame = false;
+        motion_color_first_exit_logged = false;
+        s_has_staged_camera = false;
+        s_staged_from_in_scene = false;
+        s_hdr_slot0_seen_frame = ~0ull;
+        s_pass53_blit_seen_frame = ~0ull;
+        s_jitter_injected_frame = ~0ull;
+        s_hud_mask_cleared_for_frame = false;
+        s_hud_mask_active_pass = false;
+        hud_first_match_seen = false;
+        s_in_pipeline_dlaa_evaluated = false;
+        s_hud_draws_replayed_frame = 0;
+    s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
+    s_jittered_cb1_buffer.store(nullptr, std::memory_order_relaxed);
         clearTrackedMappedBuffers();
         clearRejectedResourceCache();
         static uint64_t s_watchdog_last_camera_seen = 0;
@@ -10237,16 +9692,6 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     }
     endVSBufferProbe();
     resetCameraDelta();
-    s_engine_velocity_texture.Reset();
-    s_engine_velocity_srv.Reset();
-    s_deferred_cb2_staging.Reset();
-    s_deferred_cb2_override.Reset();
-    s_upscale_ctx_state.Reset();
-    s_upscale_ctx_state_device = nullptr;
-    for (size_t i = 0; i < kDofRingSize; ++i) {
-        s_dof_ring_tex[i].Reset();
-        s_dof_ring_srv[i].Reset();
-    }
     endHudDrawProbe();
     hud_draw_hook_mask = 0;
     hud_draw_probe_active.store(false, std::memory_order_release);
@@ -10351,7 +9796,6 @@ bool ContextCensusGetJitterTestOverride() {
 bool ContextCensusIsJitterActive() {
     if (!jitter_enabled.load(std::memory_order_relaxed)) return false;
     if (jitter_test_override.load(std::memory_order_relaxed)) return true;
-    if (edpe::cobra_camera::frameWindow().mapModeActive.load(std::memory_order_relaxed)) return false;
     if (s_jitter_debug_view.load(std::memory_order_relaxed)) return true;
     if (last_present_frame.load(std::memory_order_relaxed) < s_jitter_standdown_until.load(std::memory_order_relaxed)) return false;
     return edpe::UpscalerManager::instance().isReconstructionActive();
