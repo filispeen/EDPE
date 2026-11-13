@@ -24,6 +24,8 @@ struct EvaluatingUpscalerGuard {
     EvaluatingUpscalerGuard& operator=(const EvaluatingUpscalerGuard&) = delete;
 };
 
+bool ContextCensusSelectSwapChain(IDXGISwapChain* swap_chain, UINT flags);
+bool ContextCensusIsObservedSwapChain(IDXGISwapChain* swap_chain);
 void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame, UINT flags);
 void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags);
 void ContextCensusAfterOverlay(IDXGISwapChain* swap_chain, UINT flags);

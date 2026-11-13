@@ -105,6 +105,23 @@ enum class HookMode {
 
 inline bool safeReadPtr(const void* addr, void** outVal) {
     if (!addr || !outVal) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT) {
+        *outVal = nullptr;
+        return false;
+    }
+    constexpr DWORD kReadMask =
+        PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & kReadMask) == 0 || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        *outVal = nullptr;
+        return false;
+    }
+    const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    if (reinterpret_cast<uintptr_t>(addr) + sizeof(void*) > regionEnd) {
+        *outVal = nullptr;
+        return false;
+    }
     __try {
         *outVal = *reinterpret_cast<void* const*>(addr);
         return true;

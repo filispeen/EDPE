@@ -1525,7 +1525,12 @@ bool createBackbufferView(IDXGISwapChain* swap_chain) {
 
 void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
     if (flags & DXGI_PRESENT_TEST) return;
-    if (ui.swap_chain && ui.swap_chain != swap_chain) return;
+    if (!ContextCensusIsObservedSwapChain(swap_chain)) return;
+    if (ui.swap_chain && ui.swap_chain != swap_chain) {
+        EdpeLog(L"EDPE: active swapchain switched; rebinding Dear ImGui overlay");
+        shutdownUi();
+        ui.failed = false;
+    }
     if (ui.failed) return;
     if (!ui.imgui && !initializeUi(swap_chain)) {
         shutdownUi();

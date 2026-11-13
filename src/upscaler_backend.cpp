@@ -53,9 +53,33 @@ bool NvidiaUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext
     return initialized_;
 }
 
+namespace {
+DXGI_FORMAT sanitizeNvidiaUavFormat(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default:
+        return format;
+    }
+}
+} // namespace
+
 void NvidiaUpscalerBackend::shutdown() {
     outputTexture_.Reset();
     outputUav_.Reset();
+    outputDevice_ = nullptr;
     outputWidth_ = 0;
     outputHeight_ = 0;
     outputFormat_ = DXGI_FORMAT_UNKNOWN;
@@ -66,11 +90,14 @@ void NvidiaUpscalerBackend::shutdown() {
 }
 
 bool NvidiaUpscalerBackend::ensureOutputTexture(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format) {
-    if (outputTexture_ && outputWidth_ == width && outputHeight_ == height && outputFormat_ == format) {
+    const DXGI_FORMAT uavFormat = sanitizeNvidiaUavFormat(format);
+    if (outputTexture_ && outputUav_ && outputDevice_ == device &&
+        outputWidth_ == width && outputHeight_ == height && outputFormat_ == uavFormat) {
         return true;
     }
     outputTexture_.Reset();
     outputUav_.Reset();
+    outputDevice_ = nullptr;
     outputWidth_ = 0;
     outputHeight_ = 0;
     outputFormat_ = DXGI_FORMAT_UNKNOWN;
@@ -82,7 +109,7 @@ bool NvidiaUpscalerBackend::ensureOutputTexture(ID3D11Device* device, uint32_t w
     desc.Height = height;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = format;
+    desc.Format = uavFormat;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
@@ -93,7 +120,7 @@ bool NvidiaUpscalerBackend::ensureOutputTexture(ID3D11Device* device, uint32_t w
     }
 
     D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-    uavDesc.Format = format;
+    uavDesc.Format = uavFormat;
     uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
     uavDesc.Texture2D.MipSlice = 0;
 
@@ -103,9 +130,10 @@ bool NvidiaUpscalerBackend::ensureOutputTexture(ID3D11Device* device, uint32_t w
         return false;
     }
 
+    outputDevice_ = device;
     outputWidth_ = width;
     outputHeight_ = height;
-    outputFormat_ = format;
+    outputFormat_ = uavFormat;
     return true;
 }
 

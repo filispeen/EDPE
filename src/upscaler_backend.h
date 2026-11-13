@@ -108,6 +108,7 @@ private:
     bool initialized_ = false;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> outputTexture_;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> outputUav_;
+    ID3D11Device* outputDevice_ = nullptr;
     uint32_t outputWidth_ = 0;
     uint32_t outputHeight_ = 0;
     DXGI_FORMAT outputFormat_ = DXGI_FORMAT_UNKNOWN;

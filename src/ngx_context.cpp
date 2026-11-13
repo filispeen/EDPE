@@ -48,8 +48,19 @@ static wchar_t g_status_msg[256] = L"NGX uninitialized";
 static std::atomic<bool> s_ngx_has_evaluated{false};
 
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
+struct NgxFeatureSlot {
+    NVSDK_NGX_Handle* handle = nullptr;
+    uint32_t render_width = 0;
+    uint32_t render_height = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    uint32_t active_perf_quality = 0;
+    uint32_t active_preset = 0;
+    bool reset_requested = false;
+};
+
 static NVSDK_NGX_Parameter* g_ngx_params = nullptr;
-static NVSDK_NGX_Handle* g_dlaa_feature = nullptr;
+static NgxFeatureSlot g_feature_slots[2]{}; // [0] = LDR, [1] = HDR
 static ID3D11Device* g_ngx_device = nullptr;
 static ID3D11Texture2D* g_exposure_one = nullptr;
 
@@ -336,19 +347,29 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
 
     const uint32_t effectivePreset = dlaaSafePreset(preset, perfQuality);
     const uint32_t perfQualityInt = static_cast<uint32_t>(perfQuality);
+    NgxFeatureSlot& slot = g_feature_slots[isHdr ? 1 : 0];
 
-    if (g_dlaa_feature &&
-        g_ngx_state.render_width == renderWidth &&
-        g_ngx_state.render_height == renderHeight &&
-        g_ngx_state.output_width == outputWidth &&
-        g_ngx_state.output_height == outputHeight &&
-        g_ngx_state.active_perf_quality == perfQualityInt &&
-        g_ngx_state.active_preset == effectivePreset &&
-        g_ngx_state.is_hdr == isHdr) {
+    if (slot.handle &&
+        slot.render_width == renderWidth &&
+        slot.render_height == renderHeight &&
+        slot.output_width == outputWidth &&
+        slot.output_height == outputHeight &&
+        slot.active_perf_quality == perfQualityInt &&
+        slot.active_preset == effectivePreset) {
+        g_ngx_state.render_width = renderWidth;
+        g_ngx_state.render_height = renderHeight;
+        g_ngx_state.output_width = outputWidth;
+        g_ngx_state.output_height = outputHeight;
+        g_ngx_state.active_perf_quality = perfQualityInt;
+        g_ngx_state.active_preset = effectivePreset;
+        g_ngx_state.is_hdr = isHdr;
         return true;
     }
 
-    releaseFeature();
+    if (slot.handle) {
+        NVSDK_NGX_D3D11_ReleaseFeature(slot.handle);
+        slot = {};
+    }
 
     // Apply selected DLSS Transformer/CNN preset (defaulting to Preset K = 11).
     const uint32_t srPreset = (preset >= 10u && preset <= 13u) ? preset : 11u;
@@ -374,13 +395,22 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
         cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     }
 
-    NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &g_dlaa_feature, g_ngx_params, &cp);
-    if (r != NVSDK_NGX_Result_Success || !g_dlaa_feature) {
+    NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &slot.handle, g_ngx_params, &cp);
+    if (r != NVSDK_NGX_Result_Success || !slot.handle) {
+        slot.handle = nullptr;
         swprintf_s(g_status_msg, L"NGX_D3D11_CREATE_DLSS_EXT (%ux%u -> %ux%u) failed: 0x%08X",
             renderWidth, renderHeight, outputWidth, outputHeight, static_cast<unsigned>(r));
         EdpeLog(g_status_msg);
         return false;
     }
+
+    slot.render_width = renderWidth;
+    slot.render_height = renderHeight;
+    slot.output_width = outputWidth;
+    slot.output_height = outputHeight;
+    slot.active_perf_quality = perfQualityInt;
+    slot.active_preset = effectivePreset;
+    slot.reset_requested = true;
 
     g_ngx_state.render_width = renderWidth;
     g_ngx_state.render_height = renderHeight;
@@ -415,9 +445,11 @@ bool NgxContext::ensureDlaaFeature(ID3D11DeviceContext* context, uint32_t width,
 
 void NgxContext::releaseFeature() {
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
-    if (g_dlaa_feature) {
-        NVSDK_NGX_D3D11_ReleaseFeature(g_dlaa_feature);
-        g_dlaa_feature = nullptr;
+    for (auto& slot : g_feature_slots) {
+        if (slot.handle) {
+            NVSDK_NGX_D3D11_ReleaseFeature(slot.handle);
+        }
+        slot = {};
     }
 #endif
     g_ngx_state.render_width = 0;
@@ -446,6 +478,8 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     if (!ensureDlssFeature(context, renderWidth, renderHeight, outputWidth, outputHeight, mode, params.isHdr, usePreset)) {
         return false;
     }
+    NgxFeatureSlot& slot = g_feature_slots[params.isHdr ? 1 : 0];
+    if (!slot.handle) return false;
 
     NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};
     ep.Feature.pInColor = colorIn;
@@ -457,7 +491,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     ep.InJitterOffsetY = params.jitterY;
     ep.InRenderSubrectDimensions.Width = renderWidth;
     ep.InRenderSubrectDimensions.Height = renderHeight;
-    ep.InReset = (params.inReset || g_ngx_state.reset_requested) ? 1 : 0;
+    ep.InReset = (params.inReset || g_ngx_state.reset_requested || slot.reset_requested) ? 1 : 0;
     ep.InMVScaleX = params.motionScaleX;
     ep.InMVScaleY = params.motionScaleY;
     ep.pInBiasCurrentColorMask = nullptr;
@@ -472,7 +506,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     NVSDK_NGX_Result r;
     {
         EvaluatingUpscalerGuard evalGuard;
-        r = NGX_D3D11_EVALUATE_DLSS_EXT(context, g_dlaa_feature, g_ngx_params, &ep);
+        r = NGX_D3D11_EVALUATE_DLSS_EXT(context, slot.handle, g_ngx_params, &ep);
     }
     if (r != NVSDK_NGX_Result_Success) {
         swprintf_s(g_status_msg, L"NGX_D3D11_EVALUATE_DLSS_EXT failed: 0x%08X", static_cast<unsigned>(r));
@@ -491,6 +525,7 @@ bool NgxContext::evaluateDlss(ID3D11DeviceContext* context,
     }
 
     if (ep.InReset) {
+        slot.reset_requested = false;
         g_ngx_state.reset_requested = false;
     }
     return true;

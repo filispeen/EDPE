@@ -20,6 +20,7 @@
 #include <set>
 #include <tuple>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <dxgi.h>
 #include <vector>
 
@@ -202,6 +203,22 @@ ID3D11Device* GetPrimaryD3D11Device() {
     return s_primary_device;
 }
 
+void SetPrimaryD3D11Device(ID3D11Device* device, ID3D11DeviceContext* context) {
+    if (!device) return;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> immContext;
+    if (context) {
+        immContext = context;
+    } else {
+        device->GetImmediateContext(&immContext);
+    }
+    std::lock_guard lock(s_device_track_mutex);
+    s_primary_device = device;
+    if (immContext) {
+        s_primary_context = immContext.Get();
+    }
+    s_has_primary_device = true;
+}
+
 void ResetPrimaryD3D11Device() {
     std::lock_guard lock(s_device_track_mutex);
     s_primary_device = nullptr;
@@ -320,9 +337,12 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
         device->GetImmediateContext(&immContext);
     }
 
-    // First-Device Authority: the first D3D11 device created by the engine is the
-    // authoritative scene & swapchain device. Auxiliary devices created later are
-    // logged at most 4 times and never overwrite the primary render device.
+    if (ContextCensusIsDeviceRegistered(device)) {
+        hookShaderCreation(device);
+        if (immContext) ContextCensusHookContext(immContext.Get());
+        return;
+    }
+
     bool isPrimary = false;
     ID3D11Device* primaryPtr = nullptr;
     {
@@ -339,29 +359,6 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
         }
     }
 
-    if (!isPrimary) {
-        static std::atomic<uint32_t> s_extra_device_logs{0};
-        const uint32_t extra = s_extra_device_logs.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (extra <= 4) {
-            wchar_t extraMsg[256];
-            swprintf_s(extraMsg,
-                L"EDPE: secondary D3D11 device #%u ignored for primary authority (device=%p, primary=%p)",
-                extra, device, primaryPtr);
-            EdpeLog(extraMsg);
-        }
-        if (!edpe::isRunningInEliteProcess()) {
-            ContextCensusRegisterDevice(device, immContext.Get());
-            if (immContext) ContextCensusHookContext(immContext.Get());
-        }
-        return;
-    }
-
-    if (ContextCensusIsDeviceRegistered(device)) {
-        hookShaderCreation(device);
-        if (immContext) ContextCensusHookContext(immContext.Get());
-        return;
-    }
-
     std::wstring adapterName = L"Unknown";
     LUID adapterLuid{};
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
@@ -376,21 +373,60 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
         }
     }
 
-    {
-        std::lock_guard lock(s_device_track_mutex);
-        s_primary_luid = adapterLuid;
+    const D3D_FEATURE_LEVEL fl = (featureLevel != 0) ? featureLevel : device->GetFeatureLevel();
+    const UINT devFlags = (flags != 0) ? flags : device->GetCreationFlags();
+
+    if (isPrimary) {
+        {
+            std::lock_guard lock(s_device_track_mutex);
+            s_primary_luid = adapterLuid;
+        }
+        wchar_t message[384];
+        swprintf_s(message,
+            L"EDPE: D3D11 device created device=%p context=%p adapter=\"%ls\" luid=%08x:%08x featureLevel=0x%04X flags=0x%X thread=%u",
+            device, immContext.Get(), adapterName.c_str(),
+            adapterLuid.HighPart, adapterLuid.LowPart,
+            static_cast<unsigned>(fl), devFlags, GetCurrentThreadId());
+        EdpeLog(message);
+        EdpeLog(L"EDPE: registered primary D3D11 device");
+    } else {
+        static std::atomic<uint32_t> s_extra_device_logs{0};
+        const uint32_t extra = s_extra_device_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (extra <= 4) {
+            HMODULE selfMod = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&processDeviceCreated), &selfMod);
+            void* stack[8]{};
+            const USHORT frames = CaptureStackBackTrace(1, 8, stack, nullptr);
+            std::wstring stackStr;
+            std::wstring callerMod = L"unknown";
+            for (USHORT i = 0; i < frames; ++i) {
+                wchar_t frameHex[24];
+                swprintf_s(frameHex, L"%p ", stack[i]);
+                stackStr += frameHex;
+                if (callerMod == L"unknown" && stack[i]) {
+                    HMODULE mod = nullptr;
+                    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(stack[i]), &mod) && mod && mod != selfMod) {
+                        wchar_t modPath[MAX_PATH]{};
+                        if (GetModuleFileNameW(mod, modPath, MAX_PATH) > 0) {
+                            const wchar_t* base = wcsrchr(modPath, L'\\');
+                            callerMod = base ? (base + 1) : modPath;
+                        }
+                    }
+                }
+            }
+            wchar_t extraMsg[512];
+            swprintf_s(extraMsg,
+                L"EDPE: secondary D3D11 device #%u registered (device=%p, context=%p, primary=%p, adapter=\"%ls\" luid=%08x:%08x, featureLevel=0x%04X, flags=0x%X, caller=%ls, stack=[%ls])",
+                extra, device, immContext.Get(), primaryPtr, adapterName.c_str(),
+                adapterLuid.HighPart, adapterLuid.LowPart,
+                static_cast<unsigned>(fl), devFlags, callerMod.c_str(), stackStr.c_str());
+            EdpeLog(extraMsg);
+        }
     }
-
-    D3D_FEATURE_LEVEL fl = (featureLevel != 0) ? featureLevel : device->GetFeatureLevel();
-
-    wchar_t message[384];
-    swprintf_s(message,
-        L"EDPE: D3D11 device created device=%p context=%p adapter=\"%ls\" luid=%08x:%08x featureLevel=0x%04X flags=0x%X thread=%u",
-        device, immContext.Get(), adapterName.c_str(),
-        adapterLuid.HighPart, adapterLuid.LowPart,
-        static_cast<unsigned>(fl), flags, GetCurrentThreadId());
-    EdpeLog(message);
-    EdpeLog(L"EDPE: registered primary D3D11 device");
 
     hookShaderCreation(device);
     ContextCensusRegisterDevice(device, immContext.Get());
@@ -408,6 +444,11 @@ void installD3D11Hooks() {
     HMODULE gameExe = GetModuleHandleW(nullptr);
     if (!gameExe) return;
 
+    HMODULE selfMod = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&installD3D11Hooks), &selfMod);
+
     static void* s_orig_d3d11 = nullptr;
     if (patchIatEntry(gameExe, "d3d11.dll", "D3D11CreateDevice",
             reinterpret_cast<void*>(&EdpeD3D11CreateDevice), &s_orig_d3d11)) {
@@ -417,6 +458,39 @@ void installD3D11Hooks() {
     if (patchIatEntry(gameExe, "d3d11.dll", "D3D11CreateDeviceAndSwapChain",
             reinterpret_cast<void*>(&EdpeD3D11CreateDeviceAndSwapChain), &s_orig_d3d11_sc)) {
         EdpeLog(L"EDPE: D3D11CreateDeviceAndSwapChain IAT hook installed in main executable");
+    }
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snap != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32W me{};
+        me.dwSize = sizeof(me);
+        if (Module32FirstW(snap, &me)) {
+            do {
+                if (!me.hModule || me.hModule == gameExe || me.hModule == selfMod) continue;
+                if (_wcsicmp(me.szModule, L"d3d11.dll") == 0 ||
+                    _wcsicmp(me.szModule, L"dxgi.dll") == 0 ||
+                    _wcsicmp(me.szModule, L"ntdll.dll") == 0 ||
+                    _wcsicmp(me.szModule, L"kernel32.dll") == 0 ||
+                    _wcsicmp(me.szModule, L"kernelbase.dll") == 0) {
+                    continue;
+                }
+                void* origDev = nullptr;
+                if (patchIatEntry(me.hModule, "d3d11.dll", "D3D11CreateDevice",
+                        reinterpret_cast<void*>(&EdpeD3D11CreateDevice), &origDev)) {
+                    wchar_t msg[256];
+                    swprintf_s(msg, L"EDPE: D3D11CreateDevice IAT hook installed in module %ls", me.szModule);
+                    EdpeLog(msg);
+                }
+                void* origSc = nullptr;
+                if (patchIatEntry(me.hModule, "d3d11.dll", "D3D11CreateDeviceAndSwapChain",
+                        reinterpret_cast<void*>(&EdpeD3D11CreateDeviceAndSwapChain), &origSc)) {
+                    wchar_t msg[256];
+                    swprintf_s(msg, L"EDPE: D3D11CreateDeviceAndSwapChain IAT hook installed in module %ls", me.szModule);
+                    EdpeLog(msg);
+                }
+            } while (Module32NextW(snap, &me));
+        }
+        CloseHandle(snap);
     }
 }
 }

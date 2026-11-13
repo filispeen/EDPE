@@ -195,6 +195,8 @@ void pruneCrashLogs() {
     }
 }
 
+static std::atomic<bool> s_symInitialized{false};
+
 static void cacheSystemInformation() {
     typedef LONG(NTAPI* PFN_RtlGetVersion)(PRTL_OSVERSIONINFOW);
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
@@ -212,35 +214,9 @@ static void cacheSystemInformation() {
     if (s_cachedWindowsVersion[0] == L'\0') {
         wcscpy_s(s_cachedWindowsVersion, L"Windows (Unknown)");
     }
-
-    HMODULE hDxgi = LoadSystemDll(L"dxgi.dll");
-    if (hDxgi) {
-        auto pfnCreateDXGIFactory1 = reinterpret_cast<HRESULT(WINAPI*)(REFIID, void**)>(
-            GetProcAddress(hDxgi, "CreateDXGIFactory1"));
-        if (pfnCreateDXGIFactory1) {
-            IDXGIFactory1* factory = nullptr;
-            if (SUCCEEDED(pfnCreateDXGIFactory1(IID_PPV_ARGS(&factory))) && factory) {
-                IDXGIAdapter* adapter = nullptr;
-                if (SUCCEEDED(factory->EnumAdapters(0, &adapter)) && adapter) {
-                    DXGI_ADAPTER_DESC desc{};
-                    if (SUCCEEDED(adapter->GetDesc(&desc))) {
-                        wcscpy_s(s_cachedGpuName, desc.Description);
-                    }
-                    LARGE_INTEGER drvVer{};
-                    if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &drvVer))) {
-                        swprintf_s(s_cachedDriverVersion, L"%u.%u.%u.%u",
-                                   HIWORD(drvVer.HighPart),
-                                   LOWORD(drvVer.HighPart),
-                                   HIWORD(drvVer.LowPart),
-                                   LOWORD(drvVer.LowPart));
-                    }
-                    adapter->Release();
-                }
-                factory->Release();
-            }
-        }
-        FreeLibrary(hDxgi);
-    }
+    // Do NOT call LoadSystemDll(L"dxgi.dll") / CreateDXGIFactory1 / FreeLibrary inside DllMain:
+    // GPU and driver details are populated safely outside the loader lock by
+    // updateCrashGpuInfoFromDevice() and updateCrashGpuInfo().
     if (s_cachedGpuName[0] == L'\0') {
         wcscpy_s(s_cachedGpuName, L"Unknown GPU");
     }
@@ -390,6 +366,11 @@ static void writeCrashDump(EXCEPTION_POINTERS* ep) {
     writeRaw(file, "--- Stack Trace ---\r\n");
     HANDLE hProcess = GetCurrentProcess();
     HANDLE hThread = GetCurrentThread();
+    bool symExpected = false;
+    if (s_symInitialized.compare_exchange_strong(symExpected, true)) {
+        SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+        SymInitialize(hProcess, nullptr, TRUE);
+    }
 
     CONTEXT ctxCopy{};
     if (ctx) {
@@ -632,9 +613,6 @@ void installCrashLogger() {
     initLogsDirectory();
     cacheSystemInformation();
 
-    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
-    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
-
     s_prevUnhandledFilter = SetUnhandledExceptionFilter(edpeUnhandledExceptionFilter);
     s_vehHandle = AddVectoredExceptionHandler(1, edpeVectoredExceptionHandler);
     s_prevTerminate = std::set_terminate(edpeTerminateHandler);
@@ -668,7 +646,9 @@ void uninstallCrashLogger() {
         _set_purecall_handler(s_prevPurecall);
         s_prevPurecall = nullptr;
     }
-    SymCleanup(GetCurrentProcess());
+    if (s_symInitialized.exchange(false)) {
+        SymCleanup(GetCurrentProcess());
+    }
 }
 
 void setLastD3D11HResult(HRESULT hr) {

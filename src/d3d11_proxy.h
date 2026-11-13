@@ -5,6 +5,7 @@
 void hookShaderCreation(ID3D11Device* device);
 void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UINT flags, D3D_FEATURE_LEVEL featureLevel);
 ID3D11Device* GetPrimaryD3D11Device();
+void SetPrimaryD3D11Device(ID3D11Device* device, ID3D11DeviceContext* context = nullptr);
 void ResetPrimaryD3D11Device();
 void ObserveDxgiFactory(REFIID iid, void* factory);
 void ObserveDxgiSwapChain(IDXGISwapChain* swap_chain);
