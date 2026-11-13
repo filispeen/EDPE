@@ -454,6 +454,9 @@ public:
         if (m_mode == HookMode::LiveCopy && m_liveStubs && slotIndex < kTableSlots) {
             return m_liveStubs + slotIndex * kStubSize;
         }
+        if (slotIndex < kTableSlots && m_originals[slotIndex]) {
+            return m_originals[slotIndex];
+        }
         return (m_vtable && slotIndex < kTableSlots) ? m_vtable[slotIndex] : nullptr;
     }
 
