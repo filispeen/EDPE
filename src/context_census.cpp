@@ -6912,7 +6912,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     compOk = true;
                 }
             } else if (evalDestination == s_dlss_output_texture.Get()) {
-                if (colorSource != backbuffer && allowBackbufferWrite) {
+                if (allowBackbufferWrite) {
                     context->CopyResource(backbuffer, s_dlss_output_texture.Get());
                 }
                 compOk = true;
@@ -6993,13 +6993,17 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             static bool s_prev_is_hdr = false;
             static bool s_prev_eval_intermediate = false;
             static bool s_prev_comp_ok = false;
+            static int s_prev_eval_stage = 0;
+            static int s_prev_comp_path = 0;
             static unsigned s_path_log_count = 0;
             if (!s_path_state_valid ||
                 s_prev_color_source != colorSource ||
                 s_prev_color_format != srcColorDesc.Format ||
                 s_prev_is_hdr != isHdrColor ||
                 s_prev_eval_intermediate != evalToIntermediate ||
-                s_prev_comp_ok != compOk) {
+                s_prev_comp_ok != compOk ||
+                s_prev_eval_stage != s_diag_eval_stage ||
+                s_prev_comp_path != s_diag_composite_path) {
                 wchar_t diffBuf[256] = L"";
                 if (!s_path_state_valid) {
                     wcscpy_s(diffBuf, L"init");
@@ -7025,6 +7029,14 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                         pos += swprintf_s(diffBuf + pos, sizeof(diffBuf)/sizeof(diffBuf[0]) - pos,
                             L"comp(%d->%d) ", s_prev_comp_ok ? 1 : 0, compOk ? 1 : 0);
                     }
+                    if (s_prev_eval_stage != s_diag_eval_stage) {
+                        pos += swprintf_s(diffBuf + pos, sizeof(diffBuf)/sizeof(diffBuf[0]) - pos,
+                            L"stage(%d->%d) ", s_prev_eval_stage, s_diag_eval_stage);
+                    }
+                    if (s_prev_comp_path != s_diag_composite_path) {
+                        pos += swprintf_s(diffBuf + pos, sizeof(diffBuf)/sizeof(diffBuf[0]) - pos,
+                            L"compPath(%d->%d) ", s_prev_comp_path, s_diag_composite_path);
+                    }
                 }
                 s_path_state_valid = true;
                 s_prev_color_source = colorSource;
@@ -7032,16 +7044,21 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 s_prev_is_hdr = isHdrColor;
                 s_prev_eval_intermediate = evalToIntermediate;
                 s_prev_comp_ok = compOk;
+                s_prev_eval_stage = s_diag_eval_stage;
+                s_prev_comp_path = s_diag_composite_path;
                 if (s_path_log_count < 200) {
                     ++s_path_log_count;
                     wchar_t pmsg[384];
                     swprintf_s(pmsg,
-                        L"EDPE: temporal path change frame=%llu src=%p fmt=%u hdr=%d eval=%d comp=%d [reason: %ls]",
+                        L"EDPE: temporal path change frame=%llu src=%p fmt=%u hdr=%d eval=%d comp=%d stage=%d compPath=%d hudDraws=%u [reason: %ls]",
                         frame, static_cast<const void*>(colorSource),
                         static_cast<unsigned>(srcColorDesc.Format),
                         isHdrColor ? 1 : 0,
                         evalToIntermediate ? 1 : 0,
                         compOk ? 1 : 0,
+                        s_diag_eval_stage,
+                        s_diag_composite_path,
+                        s_hud_draws_replayed_frame,
                         diffBuf);
                     EdpeLog(pmsg);
                 }
