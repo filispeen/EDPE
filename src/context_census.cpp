@@ -440,8 +440,9 @@ static unsigned s_consecutive_skipped_frames = 0;
 static edpe::CameraProjection s_anchor_camera{};
 static bool s_anchor_valid = false;
 static unsigned long long s_anchor_frame = ~0ull;
+static edpe::CameraProjection s_last_true_camera{};
+static unsigned long long s_last_true_camera_frame = ~0ull;
 static bool s_probe_seen_this_frame = false;
-static unsigned s_spike_reject_streak = 0;
 static unsigned s_consecutive_fallback_frames = 0;
 static unsigned s_unreconstructed_jitter_streak = 0;
 
@@ -585,60 +586,54 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
 
     out_scene_cut = false;
     if (s_has_staged_camera && s_staged_camera_frame == rendered_frame) {
-        float dtRatio = 1.0f;
-        if (s_last_frame_dt > 1e-5f && s_current_frame_dt > 1e-5f) {
-            dtRatio = s_current_frame_dt / s_last_frame_dt;
-        }
-
         if (s_camera_now.scaleX > 0.0f) {
-            const float rotTrace = edpe::cameraRotationTrace(s_staged_camera, s_camera_now);
+            const edpe::CameraProjection& prevRef =
+                (s_consecutive_fallback_frames > 0 && s_last_true_camera.scaleX > 0.0f)
+                    ? s_last_true_camera
+                    : s_camera_now;
+            const float rotTrace = edpe::cameraRotationTrace(s_staged_camera, prevRef);
             const bool fovChanged =
-                std::fabs(s_camera_now.scaleX - s_staged_camera.scaleX) > 0.01f * s_camera_now.scaleX;
+                std::fabs(prevRef.scaleX - s_staged_camera.scaleX) > 0.01f * prevRef.scaleX;
 
             s_prev_valid_velocity = s_last_valid_velocity;
             if (rotTrace < 2.414f || fovChanged) {
                 out_scene_cut = true;
                 s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                s_camera_previous = s_camera_now;
+                s_camera_previous_frame = s_camera_frame;
+            } else if (s_consecutive_fallback_frames > 0 && s_last_true_camera.scaleX > 0.0f) {
+                s_camera_previous = s_last_true_camera;
+                s_camera_previous_frame = s_last_true_camera_frame;
+                const edpe::Vec3 trueDelta =
+                    edpe::cameraPosition(s_staged_camera) - edpe::cameraPosition(s_last_true_camera);
+                const float trueDist = edpe::length(trueDelta);
+                const unsigned long long gap =
+                    (rendered_frame > s_last_true_camera_frame)
+                        ? (rendered_frame - s_last_true_camera_frame)
+                        : 1ull;
+                if (trueDist > 50.0f) {
+                    out_scene_cut = true;
+                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                } else {
+                    out_scene_cut = false;
+                    s_last_valid_velocity = (s_consecutive_fallback_frames == 1 && trueDist <= 2.0f)
+                        ? (trueDelta * (1.0f / static_cast<float>(gap)))
+                        : edpe::Vec3{0.0f, 0.0f, 0.0f};
+                }
             } else {
-                out_scene_cut = false;
+                s_camera_previous = s_camera_now;
+                s_camera_previous_frame = s_camera_frame;
                 const edpe::Vec3 newDelta =
                     edpe::cameraPosition(s_staged_camera) - edpe::cameraPosition(s_camera_now);
-                const edpe::Vec3 right = edpe::cameraRight(s_staged_camera);
-                const edpe::Vec3 up    = edpe::cameraUp(s_staged_camera);
-                const edpe::Vec3 fwd   = edpe::cameraForward(s_staged_camera);
-
-                const float dLen   = edpe::length(newDelta);
-                const float dRight = std::fabs(edpe::dot(newDelta, right));
-                const float dUp    = std::fabs(edpe::dot(newDelta, up));
-                const float dFwd   = std::fabs(edpe::dot(newDelta, fwd));
-
-                const bool isLateralSpike = (dRight >= 0.80f * dLen && dUp < 0.045f && dFwd < 0.045f);
-                const bool isCockpitHeadSpike = (dRight < 0.025f && dUp >= 0.65f * dLen && dFwd >= 0.45f * dLen);
-
-                const bool looksLikeSuddenSpike =
-                    (rotTrace > 2.992f && dLen >= 0.032f && dLen <= 0.36f &&
-                     (isLateralSpike || isCockpitHeadSpike));
-
-                if (looksLikeSuddenSpike && s_anchor_valid && (rendered_frame <= s_anchor_frame + 2) &&
-                    !edpe::matchesAnchorPrediction(s_staged_camera, s_anchor_camera, s_last_valid_velocity, dtRatio)) {
-                    if (++s_spike_reject_streak < 6) {
-                        // Відхиляємо staged камеру - утримуємо попередню валідну камеру з екстраполяцією:
-                        s_has_staged_camera = false;
-                        s_camera_previous = s_camera_now;
-                        s_camera_previous_frame = s_camera_frame;
-                        const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
-                        edpe::cameraSetPosition(s_camera_now, extPos);
-                        s_camera_frame = rendered_frame;
-                        out_scene_cut = false;
-                        s_last_committed_scene_cut = out_scene_cut;
-                        return;
-                    }
+                const float newDist = edpe::length(newDelta);
+                if (newDist > 50.0f) {
+                    out_scene_cut = true;
+                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                } else {
+                    out_scene_cut = false;
+                    s_last_valid_velocity = newDelta;
                 }
-
-                s_last_valid_velocity = newDelta;
             }
-            s_camera_previous = s_camera_now;
-            s_camera_previous_frame = s_camera_frame;
         } else {
             s_camera_previous = s_staged_camera;
             s_camera_previous_frame = rendered_frame;
@@ -648,29 +643,34 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         }
 
         s_consecutive_fallback_frames = 0;
-        s_spike_reject_streak = 0;
         s_cut_rejection_streak = 0;
         s_teleport_rejection_streak = 0;
         s_anchor_camera = s_staged_camera;
         s_anchor_valid = true;
         s_anchor_frame = rendered_frame;
 
+        s_last_true_camera = s_staged_camera;
+        s_last_true_camera_frame = rendered_frame;
         s_camera_now = s_staged_camera;
         s_camera_frame = rendered_frame;
         s_has_staged_camera = false;
         s_staged_from_in_scene = false;
     } else if (s_camera_now.scaleX > 0.0f) {
-        // Fallback: жоден пас не оновив камеру — плавна екстраполяція без скидання TAA/DLAA
-        if (++s_consecutive_fallback_frames > 2) {
-            s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+        // Fallback: жоден пас не оновив камеру — обмежена екстраполяція щонайбільше на 1 кадр
+        ++s_consecutive_fallback_frames;
+        if (s_consecutive_fallback_frames > 2) {
             s_anchor_valid = false;
             s_camera_reset = true;
         }
         s_prev_valid_velocity = s_last_valid_velocity;
         s_camera_previous = s_camera_now;
         s_camera_previous_frame = s_camera_frame;
-        const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
-        edpe::cameraSetPosition(s_camera_now, extPos);
+        if (s_consecutive_fallback_frames == 1 && edpe::length(s_last_valid_velocity) <= 1.0f) {
+            const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
+            edpe::cameraSetPosition(s_camera_now, extPos);
+        } else {
+            s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+        }
         s_camera_frame = rendered_frame;
         out_scene_cut = false;
     }
@@ -4170,9 +4170,10 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             // and rotation. The strict parser rejects those writes (codes 7, 8, 10). Build the
             // camera from the block orientation so the pilot pose keeps updating every frame.
             bool block_cam_ok = false;
+            const edpe::CameraProjection& blockRef =
+                (s_has_staged_camera && s_staged_camera_frame == cur_frame) ? s_staged_camera : s_camera_now;
             if (!parse_ok && (parse_fail_reason == 7 || parse_fail_reason == 8 || parse_fail_reason == 10) &&
-                s_camera_now.scaleX > 0.0f &&
-                !(s_hdr_slot0_seen_frame == cur_frame && motion_color_frame == cur_frame)) {
+                blockRef.scaleX > 0.0f) {
                 bool finite_block = true;
                 for (size_t i = 1080; i < 1096; ++i)
                     if (!std::isfinite(words[i])) { finite_block = false; break; }
@@ -4184,9 +4185,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                     const double bsx = std::sqrt(xl), bsy = std::sqrt(yl);
                     bool ok =
-                        std::fabs(bsx - s_camera_now.scaleX) < 2e-3 &&
-                        std::fabs(bsy - s_camera_now.scaleY) < 2e-3 &&
-                        std::fabs(words[1094] - s_camera_now.depthB) < 1e-4f &&
+                        std::fabs(bsx - blockRef.scaleX) < 2e-3 &&
+                        std::fabs(bsy - blockRef.scaleY) < 2e-3 &&
+                        words[1094] >= 0.01f && words[1094] <= 0.25f &&
                         std::fabs(words[1082]) <= 0.002f && std::fabs(words[1086]) <= 0.002f &&
                         std::fabs(words[1090]) <= 0.002f && std::fabs(words[1092]) <= 0.002f &&
                         std::fabs(words[1093]) <= 0.002f && std::fabs(words[1095]) <= 0.002f;
@@ -4207,7 +4208,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         }
                     }
                     if (ok) {
-                        edpe::CameraProjection bc = s_camera_now;
+                        edpe::CameraProjection bc = blockRef;
                         for (size_t row = 0; row < 3; ++row) {
                             bc.worldFromView[row * 4] = static_cast<float>(words[1080 + row * 4] / bsx);
                             bc.worldFromView[row * 4 + 1] = static_cast<float>(words[1081 + row * 4] / bsy);
@@ -4216,9 +4217,29 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         bc.scaleX = static_cast<float>(bsx);
                         bc.scaleY = static_cast<float>(bsy);
                         bc.depthB = words[1094];
-                        edpe::cameraSetPosition(bc, edpe::cameraPosition(s_camera_now) + s_last_valid_velocity);
-                        if (s_consecutive_fallback_frames <= 2 &&
-                            edpe::cameraRotationTrace(bc, s_camera_now) > 2.40f) {
+
+                        bool row932ValidPos = std::isfinite(words[935]) && std::isfinite(words[939]) && std::isfinite(words[943]);
+                        if (row932ValidPos) {
+                            double rowTrace = 0.0;
+                            for (size_t row = 0; row < 3; ++row) {
+                                for (size_t axis = 0; axis < 3; ++axis) {
+                                    rowTrace += static_cast<double>(words[932 + row * 4 + axis]) *
+                                                static_cast<double>(bc.worldFromView[row * 4 + axis]);
+                                }
+                            }
+                            row932ValidPos = (rowTrace > 2.85);
+                        }
+                        const bool hasStagedPos = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
+                        if (row932ValidPos) {
+                            edpe::cameraSetPosition(bc, {words[935], words[939], words[943]});
+                        } else if (hasStagedPos) {
+                            edpe::cameraSetPosition(bc, edpe::cameraPosition(s_staged_camera));
+                        } else {
+                            edpe::cameraSetPosition(bc, edpe::cameraPosition(s_camera_now) + s_last_valid_velocity);
+                        }
+
+                        if ((row932ValidPos || hasStagedPos || s_consecutive_fallback_frames <= 2) &&
+                            edpe::cameraRotationTrace(bc, blockRef) > 2.40f) {
                             parsed_camera = bc;
                             block_cam_ok = true;
                             ++s_ustat.blockOnly;
@@ -4251,7 +4272,10 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const bool probe_vs_committed = (s_camera_now.scaleX > 0.0f) && !matches_anchor &&
                         isStereoEyeOrIpdProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio);
 
-                    const bool is_probe = probe_vs_anchor || probe_vs_committed;
+                    const bool allow_fallback_recovery =
+                        (s_consecutive_fallback_frames >= 1) &&
+                        !(s_has_staged_camera && s_staged_camera_frame == cur_frame);
+                    const bool is_probe = !allow_fallback_recovery && (probe_vs_anchor || probe_vs_committed);
 
                     if (is_probe) {
                         s_probe_seen_this_frame = true;
@@ -4435,7 +4459,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         if (lateDist < 0.1f && lateTrace > 2.95f) {
                             ++s_ustat.nearLate;
                             if (s_ustat.firstNearLateIdx == 0) s_ustat.firstNearLateIdx = s_ustat.total;
-                            if (parse_ok) {
+                            if ((parse_ok || block_cam_ok) &&
+                                std::fabs(parsed_camera.depthB - refCam.depthB) <= 1e-3f) {
                                 std::memcpy(s_last_clean_cb1_data, words, 5376);
                                 s_has_clean_cb1_data = true;
                                 s_clean_camera_cb_dirty = true;
@@ -4448,7 +4473,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             const bool sameRefFov =
                                 std::fabs(parsed_camera.scaleX - refCam.scaleX) <= 0.02f * refCam.scaleX &&
                                 std::fabs(parsed_camera.scaleY - refCam.scaleY) <= 0.02f * refCam.scaleY &&
-                                std::fabs(parsed_camera.depthB - refCam.depthB) <= 1e-3f;
+                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f;
                             if (preTonemapScenePass && lateDist <= 0.04f && lateTrace > 2.99f && sameRefFov &&
                                 cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                                 parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
@@ -6164,6 +6189,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_camera_reset = true;
             if (s_consecutive_skipped_frames > 15) {
                 s_camera_now = {};
+                s_last_true_camera = {};
+                s_last_true_camera_frame = ~0ull;
+                s_consecutive_fallback_frames = 0;
+                s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                 s_anchor_valid = false;
                 s_cut_rejection_streak = 0;
                 s_teleport_rejection_streak = 0;
@@ -9519,6 +9548,10 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_has_staged_camera = false;
         s_staged_from_in_scene = false;
         s_staged_camera_frame = ~0ull;
+        s_camera_now = {};
+        s_last_true_camera = {};
+        s_last_true_camera_frame = ~0ull;
+        s_consecutive_fallback_frames = 0;
         s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
         s_prev_valid_velocity = {0.0f, 0.0f, 0.0f};
         s_teleport_rejection_streak = 0;

@@ -201,5 +201,36 @@ int main() {
     shipTurnaround.worldFromView[11] = 50.0f;
     if (edpe::isRearOrAuxiliaryProbe(shipTurnaround, identity())) return 45;
 
+    // 21. On-foot hangar forward & diagonal run at IPD-matching speeds (0.0682m and 0.1364m/frame, rotTrace=3.0)
+    // MUST NOT be rejected as rear/aux or stereo probes:
+    for (float step : {0.0682f, 0.1364f}) {
+        auto runForward = identity();
+        runForward.worldFromView[11] = step;
+        if (edpe::isRearOrAuxiliaryProbe(runForward, identity())) return 46;
+        if (edpe::isStereoEyeOrIpdProbe(runForward, identity())) return 47;
+        if (edpe::isReflectionOrAuxiliaryCamera(runForward, identity())) return 48;
+
+        const float diagComponent = step * 0.70710678f;
+        auto runDiagonal = identity();
+        runDiagonal.worldFromView[3] = diagComponent;
+        runDiagonal.worldFromView[11] = diagComponent;
+        if (edpe::isRearOrAuxiliaryProbe(runDiagonal, identity())) return 49;
+        if (edpe::isStereoEyeOrIpdProbe(runDiagonal, identity())) return 50;
+        if (edpe::isReflectionOrAuxiliaryCamera(runDiagonal, identity())) return 51;
+    }
+
+    // 22. On-foot hangar strafe start (0.088m/frame from rest) and direction reversal (+0.088 -> -0.088)
+    // MUST NOT be rejected as stereo/auxiliary probes:
+    auto strafeStart = identity();
+    strafeStart.worldFromView[3] = 0.088f;
+    if (edpe::isStereoEyeOrIpdProbe(strafeStart, identity())) return 52;
+    if (edpe::isReflectionOrAuxiliaryCamera(strafeStart, identity())) return 53;
+
+    const edpe::Vec3 prevStrafeRight{0.088f, 0.0f, 0.0f};
+    auto strafeReverse = identity();
+    strafeReverse.worldFromView[3] = -0.088f;
+    if (edpe::isStereoEyeOrIpdProbe(strafeReverse, identity(), prevStrafeRight)) return 54;
+    if (edpe::isReflectionOrAuxiliaryCamera(strafeReverse, identity(), prevStrafeRight)) return 55;
+
     return 0;
 }
