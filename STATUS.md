@@ -1,6 +1,6 @@
 # EDPE Status — Elite Dangerous Performance Enhanced
 
-**Last updated:** 2026-11-02
+**Last updated:** 2026-11-15
 
 This file documents **verified facts only**. Unverified claims, hypotheses, or speculative results are not recorded here. See `AGENTS.md` and `PLAN.md` for project governance and roadmap.
 
@@ -8,10 +8,10 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Repository
 
-- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling), `v0.3.5` (verified in-game AMD FSR 3.1.2 Native AA & SR, Performance HUD, input leak isolation), `v0.4.0` (verified in-game native D3D11 TAA reconstruction backend, HUD scaling and mouse dragging), `v0.4.1` (verified in-game native TAA stabilization, subpixel de-jittering, Karis clipping, cockpit depth stabilization), `v0.4.4` (verified in-game analytical skybox/star rotational motion vectors at infinity, elimination of star erasure during ship maneuvers, star bloom/corona motion coherence and artifact resolution across all reconstruction backends), `v0.4.6` (verified in-game canopy reflection sub-camera filtering, elimination of TAA docked station pulsing, adaptive stationary variance scaling, Performance HUD mouse cursor isolation when overlay is closed), `v0.4.7` (HOTAS/DirectInput isolation), `v0.4.8` (hot-path CPU overhead elimination), `v0.4.9` (crash logger and diagnostics subsystem), `v0.4.10` (AMD driver 26.10.1 FSR fix & UI scale slider), `v0.5.0` (cross-device scene rendering & DXGI Keyed Mutex, native UI composite pass, auxiliary camera/eye probe filtering, 2nd-order kinematic probe filter, pilot camera projection fallback, sharpening control), `v0.6.0` (real-time frametime graph in Performance HUD, multi-backend automated comparison benchmark with warmup & HUD stamp, 66.66ms telemetry & profiler rate limiting, DEV mode toggle in edpe.ini gating F8/F9 binds, sticky window footer with interactive author link), `v0.7.0-rc1` (cockpit holographic HUD mask & composite pass, HUD debug visualizer F10, ImGui overlay refactor with ProggyForever vector font, cross-device Keyed Mutex synchronization, color source debounce)
+- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling), `v0.3.5` (verified in-game AMD FSR 3.1.2 Native AA & SR, Performance HUD, input leak isolation), `v0.4.0` (verified in-game native D3D11 TAA reconstruction backend, HUD scaling and mouse dragging), `v0.4.1` (verified in-game native TAA stabilization, subpixel de-jittering, Karis clipping, cockpit depth stabilization), `v0.4.4` (verified in-game analytical skybox/star rotational motion vectors at infinity, elimination of star erasure during ship maneuvers, star bloom/corona motion coherence and artifact resolution across all reconstruction backends), `v0.4.6` (verified in-game canopy reflection sub-camera filtering, elimination of TAA docked station pulsing, adaptive stationary variance scaling, Performance HUD mouse cursor isolation when overlay is closed), `v0.4.7` (HOTAS/DirectInput isolation), `v0.4.8` (hot-path CPU overhead elimination), `v0.4.9` (crash logger and diagnostics subsystem), `v0.4.10` (AMD driver 26.10.1 FSR fix & UI scale slider), `v0.5.0` (cross-device scene rendering & DXGI Keyed Mutex, native UI composite pass, auxiliary camera/eye probe filtering, 2nd-order kinematic probe filter, pilot camera projection fallback, sharpening control), `v0.6.0` (real-time frametime graph in Performance HUD, multi-backend automated comparison benchmark with warmup & HUD stamp, 66.66ms telemetry & profiler rate limiting, DEV mode toggle in edpe.ini gating F8/F9 binds, sticky window footer with interactive author link), `v0.7.0-rc1`–`v0.7.0-rc3` / `v0.7.0` (cockpit holographic HUD live draw redirection & compute composite `UiLayer`, HUD debug view in F8 debug window, ImGui overlay refactor with ProggyForever vector font, cross-device Keyed Mutex synchronization, color source debounce, `CodeHook`/`VTableHook` D3D11 hook hot-path CPU optimization, EDO row-major deferred lighting/shadow/clustered CB2 jitter fixes, distant decal & on-foot hangar camera/HUD fixes)
 - **Build artifacts:** Consolidated `dxgi.dll` deployed beside `EliteDangerous64.exe`; staged in `build/stage/`
-- **Source:** `src/` contains modular C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, `ui_composite_pass.cpp`, `crash_logger.cpp`, etc.); `tools/` contains standalone probes
-- **Test suite:** 14 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `hud_debug`, `dxbc_fanout`, `jitter_view_report`, `crash_logger`, `ui_menu_size`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
+- **Source:** `src/` contains modular C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, `ui_layer.cpp`, `ui_composite_pass.cpp`, `vtable_hook.h`, `code_hook.h`, `crash_logger.cpp`, `version.cpp`, etc.); `tools/` contains standalone probes
+- **Test suite:** 15 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `hud_debug`, `dxbc_fanout`, `jitter_view_report`, `crash_logger`, `ui_menu_size`, `vtable_hook`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
 
 ---
 
@@ -31,7 +31,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 9. NVIDIA DLSS Super Resolution | **Verified & working in-game** | `NgxContext` and `NvidiaUpscalerBackend` reconstruct low-res LDR scene target (`scene_ldr_source`) into native backbuffer with verified temporal inputs and presets (`Auto`, `J`, `K`, `L`, `M`). Reconstructed 3D world is composited under native-resolution HUD. |
 | 10. True render-scale control | **Verified & working in-game** | Cobra's native Supersampling (SSAA < 1.0x) delivers true rendering workload reduction. Automatically detected via scene depth dimensions with zero manual configuration. |
 | 11. AMD FSR upscaling | **Verified & working in-game** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated in `AmdUpscalerBackend`. Verified in-game: supports FSR Native AA (1.0x SSAA) and FSR Super Resolution (<1.0x SSAA) with auto-exposure, inverted reversed-Z, and fail-open lifecycle. |
-| 12. Native-resolution HUD | **Implemented (Stage 2)** | Clean pre-HUD 3D scene color (`s_clean_hdr_scene_texture`) fed to upscaler. Cockpit HUD draws replayed at native swapchain resolution into `s_hud_mask_texture` (`R11G11B10_FLOAT`) with viewport subpixel projection unjittering. `UiCompositePass` composites razor-sharp emissive/additive HUD directly onto reconstructed DLSS/FSR frame without blurry `cGame` cutout blending (resolving Issue #7 motion aberrations). |
+| 12. Native-resolution HUD | **Verified in-game (Stage 2)** | Clean pre-HUD 3D scene color (`s_clean_hdr_scene_texture`) fed to upscaler. Cockpit HUD draws redirected live at native swapchain resolution (`UiLayer` / `ui_layer_composite_cs.hlsl`) with viewport subpixel projection unjittering and composited cleanly onto the reconstructed world (`evalStage=1`, `composite=2` verified in-game). |
 | 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
 | 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
@@ -61,7 +61,7 @@ Phase 11 (AMD FSR 3.1.2 Upscaling) is **Verified In-Game**:
 - Performance telemetry HUD tracks frame pacing, engine/upscaler times, and GPU/VRAM load.
 
 The immediate next steps are:
-1. **In-game verification of Phase 12 Stage 2 (Native-res unjittered cockpit HUD layer & clean-world upscaling)**.
+1. **Validate `9-Add-Linux-Support` on real Linux/Proton distributions** for a follow-up `v0.7.1` release.
 
 2. Proceed to **Phase 13 (D3D11/D3D12 presentation bridge research for Frame Generation)**.
 
@@ -202,6 +202,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 | `ui_composite_test` | ✅ Unit test | Menu UI difference isolation and cockpit holographic HUD mask blending |
 | `hud_debug_test` | ✅ Unit test | Cockpit HUD & UI Debug View modes (0–4) and null fallback safety |
 | `ui_menu_size_test` | ✅ Unit test | ImGui menu window size, auto-fit, and position persistence |
+| `vtable_hook_test` | ✅ Unit test | `LiveCopy` vtable hook initialization, drift detection (`reclaimLive`), and unhook restoration |
 | `motion_gpu_test` | ✅ Requires D3D11 | GPU motion pass test (WARP / hardware) |
 | `dxbc_fanout_test` | ✅ DXBC fanout probe | Shader hash analysis |
 | `proxy_smoke` | ✅ Integration test | Verifies DLL load, Present hook, and input pass-through |

@@ -6,7 +6,7 @@
 [![CI](https://github.com/filispeen/EDPE/actions/workflows/CI.yml/badge.svg)](https://github.com/filispeen/EDPE/actions/workflows/CI.yml)
 [![Status](https://img.shields.io/badge/status-v0.7.0%20Verified%20In--Game-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-14%2F14%20Passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-15%2F15%20Passing-brightgreen.svg)]()
 
 </div>
 
@@ -57,7 +57,7 @@ As of **November 2026 (`v0.7.0`)**, EDPE has achieved:
 * **Subpixel Jitter Debug View & Log Recorder (`F8` / `F9`):** Real-time on-screen jitter visualization and frame-indexed logging to `jitter_view.log` for tracking subpixel jitter offsets, luma correlation, and frame stability.
 * **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA / FSR Native AA / TAA (at 1.0x) or DLSS / FSR Super Resolution (at < 1.0x).
 * **Native UI Protection & Composite:** Dedicated shader pass (`UiCompositePass`) preserves native-resolution HUD, text, cockpits, and menus, seamlessly compositing them over reconstructed DLSS/FSR frames.
-* **Automated Test Suite:** 14 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy hooks, GPU motion passes, jitter reports, crash logger, HUD debug, and UI composition.
+* **Automated Test Suite:** 15 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy and vtable hooks, GPU motion passes, jitter reports, crash logger, HUD debug, and UI composition.
 
 ---
 
@@ -238,7 +238,7 @@ The build produces:
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
 ```
-All 14 automated unit and integration tests should pass:
+All 15 automated unit and integration tests should pass:
 * `temporal_math`: Halton sequence generation, projection math, matrix rejection bounds.
 * `camera_delta`: Camera displacement and scene reset detection.
 * `capture_format`: Half-float, float11/10 unpackers, depth contrast, Reinhard tone mapping.
@@ -250,6 +250,7 @@ All 14 automated unit and integration tests should pass:
 * `jitter_view_report`: Subpixel jitter diagnostics and luma correlation verification.
 * `crash_logger`: Minidump generation and fault-injection safety verification.
 * `ui_menu_size`: Dear ImGui menu dimensions, layout bounds, and DPI scaling test.
+* `vtable_hook`: LiveCopy vtable hook initialization, drift detection, and unhook restoration test.
 * `proxy_smoke`: DLL proxy loading and swapchain hook smoke checks.
 * `proxy_shader_probe`: Shader bytecode interception verification.
 * `proxy_alias_smoke`: Consolidated `dxgi.dll` staged loading smoke checks.
@@ -301,7 +302,7 @@ EDPE/
 │   ├── temporal_math.h      # Halton sequences, camera delta projection math
 │   ├── log.cpp / .h         # Thread-safe diagnostic logging (edpe.log)
 │   └── ui.cpp / .h          # Dear ImGui overlay, telemetry HUD, F5-F9 hotkeys, snapshot visualizers
-├── tests/                   # Automated unit & integration test suites (14 tests)
+├── tests/                   # Automated unit & integration test suites (15 tests)
 ├── tools/
 │   ├── fetch_ffx_dx11.py    # Automation script for fetching and building FidelityFX DX11 SDK
 │   └── ngx_probe/           # Standalone diagnostic probe for hardware NGX verification
