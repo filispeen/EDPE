@@ -19,7 +19,7 @@ option(EDPE_ENABLE_ASAN "Enable MSVC AddressSanitizer (/fsanitize=address)" OFF)
 if(EDPE_ENABLE_ASAN AND MSVC)
     add_compile_options(/fsanitize=address)
     # Prebuilt SDK static libraries (FidelityFX DX11) are compiled without ASan STL annotations.
-    add_compile_definitions(_DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
+    add_compile_definitions(_DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION _DISABLE_OPTIONAL_ANNOTATION)
     add_link_options(/INCREMENTAL:NO)
 endif()
 
