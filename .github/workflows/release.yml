@@ -265,9 +265,9 @@ jobs:
           mod_id: ${{ vars.NEXUSMODS_MOD_ID }}
           filename: ${{ steps.package.outputs.archive_name }}
           version: ${{ steps.package.outputs.clean_version }}
-          display_name: EDPE ${{ steps.package.outputs.tag }}
+          display_name: EDPE(V${{ steps.package.outputs.clean_version }})
           description: Automated release from GitHub (${{ steps.release.outputs.url }})
           category: main
-          archive_existing_version: 'true'
+          archive_existing_version: 'false'
           update_mod_version: 'true'
           changelog: ${{ vars.NEXUSMODS_MOD_ID != '' && steps.package.outputs.changelog || '' }}
