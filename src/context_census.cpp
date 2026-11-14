@@ -182,6 +182,9 @@ static std::atomic<size_t> s_hooked_table_count{0};
 static HookedTableEntry s_hooked_tables[kMaxHookedTables]{};
 static std::array<std::unique_ptr<edpe::VTableHook>, kMaxHookedTables> s_context_vtable_hooks{};
 static std::mutex s_hooked_tables_mutex;
+static std::atomic<ID3D11DeviceContext*> s_primary_hook_ctx{nullptr};
+static std::atomic<void**> s_primary_live_table{nullptr};
+static std::atomic<edpe::VTableHook*> s_primary_vtable_hook{nullptr};
 
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_engine_velocity_texture;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_engine_velocity_srv;
@@ -994,12 +997,16 @@ struct MappedBufferEntry {
 static constexpr size_t kMaxTrackedMappedBuffers = 32;
 static MappedBufferEntry s_tracked_mapped_buffers[kMaxTrackedMappedBuffers]{};
 static std::mutex s_tracked_mapped_buffers_mutex;
+static std::atomic<int> s_tracked_mapped_count{0};
 
 inline void trackMappedBuffer(ID3D11Resource* resource, void* ptr, UINT byteWidth = 5376) {
     if (!resource) return;
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         if (s_tracked_mapped_buffers[i].resource == resource || s_tracked_mapped_buffers[i].resource == nullptr) {
+            if (s_tracked_mapped_buffers[i].resource == nullptr) {
+                s_tracked_mapped_count.fetch_add(1, std::memory_order_release);
+            }
             s_tracked_mapped_buffers[i].resource = resource;
             s_tracked_mapped_buffers[i].mapped_ptr = ptr;
             s_tracked_mapped_buffers[i].byte_width = byteWidth;
@@ -1010,7 +1017,7 @@ inline void trackMappedBuffer(ID3D11Resource* resource, void* ptr, UINT byteWidt
 
 inline void* popMappedBuffer(ID3D11Resource* resource, UINT* outByteWidth = nullptr) {
     if (outByteWidth) *outByteWidth = 0;
-    if (!resource) return nullptr;
+    if (!resource || s_tracked_mapped_count.load(std::memory_order_acquire) <= 0) return nullptr;
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         if (s_tracked_mapped_buffers[i].resource == resource) {
@@ -1019,6 +1026,7 @@ inline void* popMappedBuffer(ID3D11Resource* resource, UINT* outByteWidth = null
             s_tracked_mapped_buffers[i].resource = nullptr;
             s_tracked_mapped_buffers[i].mapped_ptr = nullptr;
             s_tracked_mapped_buffers[i].byte_width = 0;
+            s_tracked_mapped_count.fetch_sub(1, std::memory_order_release);
             return ptr;
         }
     }
@@ -1026,23 +1034,29 @@ inline void* popMappedBuffer(ID3D11Resource* resource, UINT* outByteWidth = null
 }
 
 inline void clearTrackedMappedBuffers() {
+    if (s_tracked_mapped_count.load(std::memory_order_acquire) == 0) return;
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         s_tracked_mapped_buffers[i].resource = nullptr;
         s_tracked_mapped_buffers[i].mapped_ptr = nullptr;
         s_tracked_mapped_buffers[i].byte_width = 0;
     }
+    s_tracked_mapped_count.store(0, std::memory_order_release);
 }
 
 inline void clearTrackedMappedBuffersExcept(ID3D11Resource* keep) {
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
+    int remaining = 0;
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         if (s_tracked_mapped_buffers[i].resource != keep) {
             s_tracked_mapped_buffers[i].resource = nullptr;
             s_tracked_mapped_buffers[i].mapped_ptr = nullptr;
             s_tracked_mapped_buffers[i].byte_width = 0;
+        } else if (s_tracked_mapped_buffers[i].resource != nullptr) {
+            ++remaining;
         }
     }
+    s_tracked_mapped_count.store(remaining, std::memory_order_release);
 }
 
 static std::atomic<bool> s_hud_probe_armed_once{false};
@@ -1151,6 +1165,7 @@ static ID3D11RenderTargetView* s_cached_hdr_rtv0 = nullptr;
 struct CachedShaderHashEntry {
     const void* shader = nullptr;
     std::uint64_t hash = 0;
+    bool known = false;
 };
 static constexpr size_t kShaderHashCacheSize = 512;
 static CachedShaderHashEntry s_vs_hash_cache[kShaderHashCacheSize]{};
@@ -1159,17 +1174,17 @@ static inline std::uint64_t lookupOrFetchShaderHash(ID3D11DeviceChild* shader,
     CachedShaderHashEntry (&cache)[kShaderHashCacheSize]) {
     if (!shader) return 0;
     const size_t slot = (reinterpret_cast<uintptr_t>(shader) >> 4) & (kShaderHashCacheSize - 1);
-    if (cache[slot].shader == shader && cache[slot].hash != 0) {
+    if (cache[slot].shader == shader && cache[slot].known) {
         return cache[slot].hash;
     }
     std::uint64_t hash = 0;
     UINT sz = sizeof(hash);
-    if (SUCCEEDED(shader->GetPrivateData(kEdpeShaderHashGuid, &sz, &hash)) && sz == sizeof(hash) && hash != 0) {
-        cache[slot].shader = shader;
-        cache[slot].hash = hash;
-        return hash;
-    }
-    return 0;
+    const bool ok = SUCCEEDED(shader->GetPrivateData(kEdpeShaderHashGuid, &sz, &hash)) &&
+                    sz == sizeof(hash) && hash != 0;
+    cache[slot].shader = shader;
+    cache[slot].hash = ok ? hash : 0;
+    cache[slot].known = true;
+    return cache[slot].hash;
 }
 
 static inline bool getFastBoundShaderHashes(ID3D11DeviceContext* context,
@@ -3816,7 +3831,12 @@ void beginHudDrawProbe() {
     };
     for (size_t i = 0; i < tblCount; ++i) {
         if (!s_hooked_tables[i].is_immediate) continue;
-        installOnEntry(i, kVSSetConstantBuffers, s_hooked_tables[i].orig_vs_cb, original_vs_set_buffers, &observedVSSetConstantBuffers);
+        const bool isLiveCopy = s_context_vtable_hooks[i] &&
+            s_context_vtable_hooks[i]->isInitialized() &&
+            s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy;
+        if (!isLiveCopy || vs_buffer_probe_active.load(std::memory_order_relaxed)) {
+            installOnEntry(i, kVSSetConstantBuffers, s_hooked_tables[i].orig_vs_cb, original_vs_set_buffers, &observedVSSetConstantBuffers);
+        }
         if (installOnEntry(i, kDrawIndexed, s_hooked_tables[i].orig_draw_indexed, original_draw_indexed, &observedDrawIndexed))
             hud_draw_hook_mask |= 1u;
         if (installOnEntry(i, kDraw, s_hooked_tables[i].orig_draw, original_draw, &observedDraw))
@@ -3848,12 +3868,14 @@ void beginHudDrawProbe() {
     EdpeLog(L"  VS=0xE508648660A352B2 PS=0x63ABD86359B57D01 (target reticle sprite)");
 }
 
-static inline bool areDrawAndOmHooksIntact(void** tbl) {
+static inline bool areDrawAndOmHooksIntact(void** tbl, bool checkVsCb) {
     if (!tbl) return false;
     if (tbl[kOMSetRenderTargets] != reinterpret_cast<void*>(&observedOMSetRenderTargets) ||
         tbl[kOMSetRenderTargetsAndUnorderedAccessViews] !=
-            reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews) ||
-        tbl[kVSSetConstantBuffers] != reinterpret_cast<void*>(&observedVSSetConstantBuffers)) {
+            reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews)) {
+        return false;
+    }
+    if (checkVsCb && tbl[kVSSetConstantBuffers] != reinterpret_cast<void*>(&observedVSSetConstantBuffers)) {
         return false;
     }
     if (hud_draw_probe_active.load(std::memory_order_relaxed)) {
@@ -3869,14 +3891,25 @@ static inline bool areDrawAndOmHooksIntact(void** tbl) {
 }
 
 void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
+    const bool vsProbeActive = vs_buffer_probe_active.load(std::memory_order_relaxed);
+    if (activeCtx && activeCtx == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+        edpe::VTableHook* primaryHook = s_primary_vtable_hook.load(std::memory_order_acquire);
+        void** primaryTbl = s_primary_live_table.load(std::memory_order_acquire);
+        if (primaryHook && primaryTbl &&
+            primaryHook->isLiveCopyVptrValid(activeCtx) &&
+            areDrawAndOmHooksIntact(primaryTbl, vsProbeActive)) {
+            return;
+        }
+    }
+
     const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
     if (activeCtx) {
         for (size_t i = 0; i < tblCount; ++i) {
             if (s_hooked_tables[i].context == activeCtx &&
                 s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
-                s_context_vtable_hooks[i]->reclaim();
+                s_context_vtable_hooks[i]->reclaimLive(activeCtx);
                 if (s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy &&
-                    areDrawAndOmHooksIntact(s_hooked_tables[i].table)) {
+                    areDrawAndOmHooksIntact(s_hooked_tables[i].table, vsProbeActive)) {
                     return;
                 }
                 break;
@@ -3900,20 +3933,20 @@ void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
         }
     };
 
-    const bool needVsCb = vs_buffer_probe_active.load(std::memory_order_relaxed) ||
-                          hud_draw_probe_active.load(std::memory_order_relaxed);
-    const bool needDraws = hud_draw_probe_active.load(std::memory_order_acquire) &&
-                           isHudDrawInterceptWindowActive();
+    const bool hudProbeActive = hud_draw_probe_active.load(std::memory_order_acquire);
+    const bool needDraws = hudProbeActive && isHudDrawInterceptWindowActive();
 
     for (size_t i = 0; i < tblCount; ++i) {
         if (!s_hooked_tables[i].is_immediate) continue;
+        bool isLiveCopy = false;
         if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
-            s_context_vtable_hooks[i]->reclaim();
+            s_context_vtable_hooks[i]->reclaimLive(s_hooked_tables[i].context);
+            isLiveCopy = (s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy);
         }
         rearmSlotOnEntry(i, kOMSetRenderTargets, reinterpret_cast<void*>(&observedOMSetRenderTargets), 0);
         rearmSlotOnEntry(i, kOMSetRenderTargetsAndUnorderedAccessViews,
             reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews), 0);
-        if (needVsCb) {
+        if (vsProbeActive || (!isLiveCopy && hudProbeActive)) {
             rearmSlotOnEntry(i, kVSSetConstantBuffers,
                 reinterpret_cast<void*>(&observedVSSetConstantBuffers), 0);
         }
@@ -3989,6 +4022,12 @@ template <typename Fn>
 inline Fn resolveContextOriginalSlot(ID3D11DeviceContext* context, size_t slot, void* observer,
                                      const std::atomic<Fn>& fallback) {
     if (context) {
+        if (s_hooked_table_count.load(std::memory_order_acquire) == 1 &&
+            context == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+            if (const Fn fast = fallback.load(std::memory_order_acquire)) {
+                return fast;
+            }
+        }
         void** table = *reinterpret_cast<void***>(context);
         const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
         for (size_t i = 0; i < tblCount; ++i) {
@@ -4052,7 +4091,7 @@ UpdateSubresourceFn resolveOriginalUpdateSubresource(ID3D11DeviceContext* contex
         reinterpret_cast<void*>(&observedUpdateSubresource), original_update_subresource);
 }
 
-static constexpr size_t kRejectedCacheSize = 256;
+static constexpr size_t kRejectedCacheSize = 2048;
 static std::atomic<ID3D11Resource*> s_rejected_map_resources[kRejectedCacheSize]{};
 static std::atomic<ID3D11Resource*> s_accepted_dot_cb_resources[kRejectedCacheSize]{};
 static std::atomic<UINT> s_accepted_dot_cb_bytes[kRejectedCacheSize]{};
@@ -4103,14 +4142,16 @@ inline void computeUvJitterDelta(const edpe::ProjectionJitter& jitter, float& dx
     dyUv = (rh > 0) ? (jitter.pixelY / static_cast<float>(rh)) : (-jitter.ndcY * 0.5f);
 }
 
+inline bool isInSceneWindowLocked(unsigned long long cur_frame) {
+    return (s_hdr_slot0_seen_frame != cur_frame) ||
+           (s_verified_ldr_tonemap_frame != cur_frame &&
+            !s_ldr_tonemap_candidate_bound &&
+            !s_post_ldr_backbuffer_bound);
+}
+
 inline bool repairAuxiliarySceneConstantBuffer(float* words, size_t floatCount, unsigned long long cur_frame) {
     if (!words || floatCount < 20) return false;
-    const bool in_scene_window =
-        (s_hdr_slot0_seen_frame != cur_frame) ||
-        (s_verified_ldr_tonemap_frame != cur_frame &&
-         !s_ldr_tonemap_candidate_bound &&
-         !s_post_ldr_backbuffer_bound);
-    if (!in_scene_window || !ContextCensusIsJitterActive()) return false;
+    if (!isInSceneWindowLocked(cur_frame) || !ContextCensusIsJitterActive()) return false;
 
     const edpe::CameraProjection& refCam =
         (s_has_staged_camera && s_staged_camera_frame == cur_frame)
@@ -4216,91 +4257,104 @@ inline bool repairAuxiliarySceneConstantBuffer(float* words, size_t floatCount, 
 
 HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
-    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
     const MapFn forward = resolveOriginalMap(context);
     const HRESULT result = forward ? forward(
         context, resource, subresource, type, flags, mapped) : E_FAIL;
-    if (s_in_edpe_present.load(std::memory_order_acquire)) return result;
-    if (SUCCEEDED(result) && isObservedImmediateContext(context) &&
-        resource && map_hook_active.load(std::memory_order_acquire)) {
-        ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
-        bool is_scene_cb = (resource == target);
-        UINT dot_cb_bytes = is_scene_cb ? 0u : getCachedDotCbByteWidth(resource);
+    if (FAILED(result) || !resource ||
+        s_in_edpe_present.load(std::memory_order_acquire) ||
+        !map_hook_active.load(std::memory_order_acquire) ||
+        !isObservedImmediateContext(context)) {
+        return result;
+    }
+    ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
+    bool is_scene_cb = (resource == target);
+    UINT dot_cb_bytes = is_scene_cb ? 0u : getCachedDotCbByteWidth(resource);
+    if (!is_scene_cb && dot_cb_bytes == 0) {
+        if (isResourceCachedRejected(resource)) {
+            return result;
+        }
         const bool probe_active = vs_buffer_probe_active.load(std::memory_order_relaxed);
-        if (!is_scene_cb && dot_cb_bytes == 0) {
-            if (!isResourceCachedRejected(resource)) {
-                edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
-                D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-                resource->GetType(&dimension);
-                if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
-                    ID3D11Buffer* buffer = nullptr;
-                    if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Buffer),
-                            reinterpret_cast<void**>(&buffer)))) {
-                        D3D11_BUFFER_DESC desc{};
-                        buffer->GetDesc(&desc);
-                        if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
-                            (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
-                            const bool had_target = (target != nullptr);
-                            scene_map_target.store(buffer, std::memory_order_release);
-                            if (probe_active) clearTrackedMappedBuffersExcept(buffer);
-                            target = buffer;
-                            is_scene_cb = true;
-                            if (!had_target && !scene_maps_before_bind.load(std::memory_order_relaxed)) {
-                                scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
-                                EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
-                            }
-                        } else if ((desc.ByteWidth == 208 || (desc.ByteWidth >= 272 && desc.ByteWidth <= 4096)) &&
-                                   desc.Usage == D3D11_USAGE_DYNAMIC &&
-                                   (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
-                            cacheDotCbResource(resource, desc.ByteWidth);
-                            dot_cb_bytes = desc.ByteWidth;
-                        } else {
-                            cacheRejectedResource(resource);
-                        }
-                        buffer->Release();
+        edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
+        D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+        resource->GetType(&dimension);
+        if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            ID3D11Buffer* buffer = nullptr;
+            if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Buffer),
+                    reinterpret_cast<void**>(&buffer)))) {
+                D3D11_BUFFER_DESC desc{};
+                buffer->GetDesc(&desc);
+                if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
+                    (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+                    const bool had_target = (target != nullptr);
+                    scene_map_target.store(buffer, std::memory_order_release);
+                    if (probe_active) clearTrackedMappedBuffersExcept(buffer);
+                    target = buffer;
+                    is_scene_cb = true;
+                    if (!had_target && !scene_maps_before_bind.load(std::memory_order_relaxed)) {
+                        scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
+                        EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
                     }
+                } else if ((desc.ByteWidth == 208 || (desc.ByteWidth >= 272 && desc.ByteWidth <= 4096)) &&
+                           desc.Usage == D3D11_USAGE_DYNAMIC &&
+                           (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+                    cacheDotCbResource(resource, desc.ByteWidth);
+                    dot_cb_bytes = desc.ByteWidth;
                 } else {
                     cacheRejectedResource(resource);
                 }
+                buffer->Release();
             }
+        } else {
+            cacheRejectedResource(resource);
         }
-        if (is_scene_cb) {
-            trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, 5376);
-            scene_maps.fetch_add(1, std::memory_order_relaxed);
-            scene_mapped_data.store(mapped ? mapped->pData : nullptr, std::memory_order_release);
-            if (draw_indexed_calls.load(std::memory_order_relaxed) ||
-                draw_calls.load(std::memory_order_relaxed) ||
-                draw_indexed_instanced_calls.load(std::memory_order_relaxed) ||
-                draw_instanced_calls.load(std::memory_order_relaxed))
-                scene_maps_after_draw.fetch_add(1, std::memory_order_relaxed);
-        } else if (dot_cb_bytes > 0) {
-            trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, dot_cb_bytes);
-        }
+    }
+    if (is_scene_cb) {
+        trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, 5376);
+        scene_maps.fetch_add(1, std::memory_order_relaxed);
+        scene_mapped_data.store(mapped ? mapped->pData : nullptr, std::memory_order_release);
+        if (draw_indexed_calls.load(std::memory_order_relaxed) ||
+            draw_calls.load(std::memory_order_relaxed) ||
+            draw_indexed_instanced_calls.load(std::memory_order_relaxed) ||
+            draw_instanced_calls.load(std::memory_order_relaxed))
+            scene_maps_after_draw.fetch_add(1, std::memory_order_relaxed);
+    } else if (dot_cb_bytes > 0) {
+        trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, dot_cb_bytes);
     }
     return result;
 }
 
 void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource) {
-    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
     const UnmapFn forward = resolveOriginalUnmap(context);
     if (!s_in_edpe_present.load(std::memory_order_acquire) &&
-        isObservedImmediateContext(context) &&
+        unmap_hook_active.load(std::memory_order_acquire) &&
         resource &&
-        unmap_hook_active.load(std::memory_order_acquire)) {
+        isObservedImmediateContext(context)) {
+        ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
+        if (resource != target &&
+            ((s_tracked_mapped_count.load(std::memory_order_acquire) <= 0 &&
+              scene_mapped_data.load(std::memory_order_relaxed) == nullptr) ||
+             isResourceCachedRejected(resource))) {
+            if (forward) forward(context, resource, subresource);
+            rearmHudDrawProbe(context);
+            return;
+        }
         UINT mapped_byte_width = 0;
         void* mapped_ptr = popMappedBuffer(resource, &mapped_byte_width);
-        ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
         if (!mapped_ptr && resource == target) {
             mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
             mapped_byte_width = 5376;
         }
         if (!mapped_ptr) {
-            if (resource == target) ++s_ustat.noMapped;
+            if (resource == target) {
+                std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+                ++s_ustat.noMapped;
+            }
             if (forward) forward(context, resource, subresource);
             rearmHudDrawProbe(context);
             return;
         }
+        std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
         edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
         if (mapped_ptr && mapped_byte_width == 208) {
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
@@ -4322,12 +4376,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         std::memcpy(&mutable_unmap_words[16], unjittered_block, sizeof(unjittered_block));
                     }
                 }
-                const bool in_scene_window =
-                    (s_hdr_slot0_seen_frame != cur_frame) ||
-                    (s_verified_ldr_tonemap_frame != cur_frame &&
-                     !s_ldr_tonemap_candidate_bound &&
-                     !s_post_ldr_backbuffer_bound);
-                if (in_scene_window && ContextCensusIsJitterActive()) {
+                if (isInSceneWindowLocked(cur_frame) && ContextCensusIsJitterActive()) {
                     const edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
                     float jittered_block[16]{};
                     if (edpe::jitterEliteDotProjectionBlock(&mutable_unmap_words[16], jittered_block, jitter)) {
@@ -4908,16 +4957,18 @@ void STDMETHODCALLTYPE observedUpdateSubresource(ID3D11DeviceContext* context,
         if (cbBytes >= 272 && cbBytes <= 4096) {
             std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
-            alignas(16) uint8_t patchedBuf[4096];
-            std::memcpy(patchedBuf, pSrcData, cbBytes);
-            if (repairAuxiliarySceneConstantBuffer(
-                    reinterpret_cast<float*>(patchedBuf),
-                    static_cast<size_t>(cbBytes) / sizeof(float),
-                    cur_frame)) {
-                if (forward) {
-                    forward(context, pDstResource, DstSubresource, pDstBox, patchedBuf, SrcRowPitch, SrcDepthPitch);
+            if (isInSceneWindowLocked(cur_frame)) {
+                alignas(16) uint8_t patchedBuf[4096];
+                std::memcpy(patchedBuf, pSrcData, cbBytes);
+                if (repairAuxiliarySceneConstantBuffer(
+                        reinterpret_cast<float*>(patchedBuf),
+                        static_cast<size_t>(cbBytes) / sizeof(float),
+                        cur_frame)) {
+                    if (forward) {
+                        forward(context, pDstResource, DstSubresource, pDstBox, patchedBuf, SrcRowPitch, SrcDepthPitch);
+                    }
+                    return;
                 }
-                return;
             }
         }
     }
@@ -5075,7 +5126,10 @@ void beginDrawProbe() {
 void endVSBufferProbe() {
     endDrawProbe();
     if (!vs_buffer_probe_active.exchange(false, std::memory_order_acq_rel)) return;
-    const bool restored = !hud_draw_probe_active.load(std::memory_order_acquire) &&
+    edpe::VTableHook* primaryHook = s_primary_vtable_hook.load(std::memory_order_acquire);
+    const bool liveCopyPrimary = primaryHook && primaryHook->isInitialized() &&
+        primaryHook->mode() == edpe::HookMode::LiveCopy;
+    const bool restored = (liveCopyPrimary || !hud_draw_probe_active.load(std::memory_order_acquire)) &&
         patched_table && patchSlot(patched_table,
         kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers),
         reinterpret_cast<void*>(original_vs_set_buffers.load(std::memory_order_acquire)));
@@ -7869,11 +7923,16 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     const auto current_frame = last_present_frame.load(std::memory_order_relaxed);
     bool is_scene_device_ctx = true;
     if (motion_color_source && motion_color_frame == current_frame) {
-        Microsoft::WRL::ComPtr<ID3D11Device> ctxDev, sceneDev;
-        context->GetDevice(&ctxDev);
-        motion_color_source->GetDevice(&sceneDev);
-        if (ctxDev && sceneDev && ctxDev.Get() != sceneDev.Get()) {
-            is_scene_device_ctx = false;
+        ID3D11Device* sceneDevPtr = s_scene_device.load(std::memory_order_acquire);
+        ID3D11Device* presentDevPtr = s_present_device.load(std::memory_order_acquire);
+        if (!(context == s_primary_hook_ctx.load(std::memory_order_acquire) &&
+              sceneDevPtr != nullptr && sceneDevPtr == presentDevPtr)) {
+            Microsoft::WRL::ComPtr<ID3D11Device> ctxDev, sceneDev;
+            context->GetDevice(&ctxDev);
+            motion_color_source->GetDevice(&sceneDev);
+            if (ctxDev && sceneDev && ctxDev.Get() != sceneDev.Get()) {
+                is_scene_device_ctx = false;
+            }
         }
     }
     if (isObservedImmediateContext(context) && is_scene_device_ctx) {
@@ -9356,7 +9415,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
     s_jittered_cb1_buffer.store(nullptr, std::memory_order_relaxed);
         clearTrackedMappedBuffers();
-        clearRejectedResourceCache();
+        if ((last_present_frame.load(std::memory_order_relaxed) % 300ull) == 0ull) {
+            clearRejectedResourceCache();
+        }
         static uint64_t s_watchdog_last_camera_seen = 0;
         static unsigned s_watchdog_no_camera_frames = 0;
         const uint64_t cur_camera_seen = s_valid_camera_seen_counter.load(std::memory_order_relaxed);
@@ -10066,6 +10127,9 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_hooked_tables[i] = {};
     }
     s_hooked_table_count.store(0, std::memory_order_release);
+    s_primary_hook_ctx.store(nullptr, std::memory_order_release);
+    s_primary_live_table.store(nullptr, std::memory_order_release);
+    s_primary_vtable_hook.store(nullptr, std::memory_order_release);
     scene_map_target.store(nullptr, std::memory_order_release);
     scene_mapped_data.store(nullptr, std::memory_order_release);
     s_hud_probe_armed_once.store(false, std::memory_order_release);
@@ -10487,7 +10551,9 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
         }
         if (hud_draw_probe_active.load(std::memory_order_acquire)) {
             void* ignoredOut = nullptr;
-            vtHook->hook(context, kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers), &ignoredOut, mode);
+            if (mode != edpe::HookMode::LiveCopy || vs_buffer_probe_active.load(std::memory_order_acquire)) {
+                vtHook->hook(context, kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers), &ignoredOut, mode);
+            }
             vtHook->hook(context, kDrawIndexed, reinterpret_cast<void*>(&observedDrawIndexed), &ignoredOut, mode);
             vtHook->hook(context, kDraw, reinterpret_cast<void*>(&observedDraw), &ignoredOut, mode);
             vtHook->hook(context, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), &ignoredOut, mode);
@@ -10497,6 +10563,11 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
 
     s_hooked_tables[count] = entry;
     s_context_vtable_hooks[count] = std::move(vtHook);
+    if (is_immediate && s_primary_hook_ctx.load(std::memory_order_acquire) == nullptr) {
+        s_primary_live_table.store(entry.table, std::memory_order_release);
+        s_primary_vtable_hook.store(s_context_vtable_hooks[count].get(), std::memory_order_release);
+        s_primary_hook_ctx.store(context, std::memory_order_release);
+    }
     s_hooked_table_count.store(count + 1, std::memory_order_release);
 }
 

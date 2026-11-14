@@ -183,6 +183,12 @@ target_include_directories(ui_menu_size_test PRIVATE external/imgui)
 target_link_libraries(ui_menu_size_test PRIVATE EDPE_IMGUI)
 add_test(NAME ui_menu_size COMMAND ui_menu_size_test)
 
+add_executable(vtable_hook_test tests/vtable_hook_test.cpp)
+target_compile_features(vtable_hook_test PRIVATE cxx_std_20)
+target_compile_definitions(vtable_hook_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(vtable_hook_test PRIVATE src)
+add_test(NAME vtable_hook COMMAND vtable_hook_test)
+
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)
 target_link_libraries(proxy_smoke PRIVATE d3dcompiler)
