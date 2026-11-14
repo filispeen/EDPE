@@ -190,6 +190,28 @@ jobs:
           prerelease: ${{ inputs.prerelease || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
           make_latest: ${{ (inputs.prerelease || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha')) && 'false' || 'true' }}
 
+      - name: Upload Release to Nexus Mods
+        id: nexus
+        if: >-
+          env.HAS_NEXUSMODS_API_KEY == 'true' &&
+          vars.NEXUSMODS_FILE_ID != '' &&
+          github.ref_type == 'tag' &&
+          !(inputs.prerelease || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha'))
+        continue-on-error: true
+        uses: Nexus-Mods/upload-action@v1
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          file_id: ${{ vars.NEXUSMODS_FILE_ID }}
+          mod_id: ${{ vars.NEXUSMODS_MOD_ID }}
+          filename: ${{ steps.package.outputs.archive_name }}
+          version: ${{ steps.package.outputs.clean_version }}
+          display_name: EDPE(V${{ steps.package.outputs.clean_version }})
+          description: Automated release from GitHub (${{ steps.release.outputs.url }})
+          category: main
+          archive_existing_version: 'false'
+          update_mod_version: 'true'
+          changelog: ${{ vars.NEXUSMODS_MOD_ID != '' && steps.package.outputs.changelog || '' }}
+
       - name: Notify Discord (#releases-and-roadmap)
         shell: pwsh
         env:
@@ -200,6 +222,8 @@ jobs:
           ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
           ARCHIVE_SHA256: ${{ steps.package.outputs.sha256 }}
           IS_PRERELEASE: ${{ inputs.prerelease || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          NEXUS_MOD_ID: ${{ vars.NEXUSMODS_MOD_ID }}
+          NEXUS_OUTCOME: ${{ steps.nexus.outcome }}
         run: |
           if (-not $env:DISCORD_BOT_TOKEN -or -not $env:DISCORD_CHANNEL_ID) {
             Write-Host "DISCORD_BOT_TOKEN or DISCORD_RELEASE_CHANNEL_ID not set; skipping Discord post."
@@ -218,6 +242,12 @@ jobs:
           $title = if ($isPre) { "EDPE $($env:RELEASE_TAG) (Pre-release)" } else { "EDPE $($env:RELEASE_TAG)" }
           $color = if ($isPre) { 0xF39C12 } else { 0x2ECC71 }
 
+          $downloadValue = "[GitHub Release]($($env:RELEASE_URL))"
+          if ($env:NEXUS_OUTCOME -eq "success" -and $env:NEXUS_MOD_ID) {
+            $nexusUrl = "https://www.nexusmods.com/elitedangerous/mods/$($env:NEXUS_MOD_ID)?tab=files"
+            $downloadValue += " | [Nexus Mods]($nexusUrl)"
+          }
+
           $payload = @{
             embeds = @(
               @{
@@ -227,7 +257,7 @@ jobs:
                 color = $color
                 fields = @(
                   @{ name = "Archive"; value = "``$($env:ARCHIVE_NAME)``"; inline = $true }
-                  @{ name = "Download"; value = "[GitHub Release]($($env:RELEASE_URL))"; inline = $true }
+                  @{ name = "Download"; value = $downloadValue; inline = $true }
                   @{ name = "SHA-256"; value = "``$($env:ARCHIVE_SHA256)``"; inline = $false }
                 )
                 footer = @{ text = "EDPE Automated Release" }
@@ -250,24 +280,3 @@ jobs:
           } catch {
             Write-Warning "Failed to notify Discord: $_"
           }
-
-      - name: Upload Release to Nexus Mods
-        if: >-
-          env.HAS_NEXUSMODS_API_KEY == 'true' &&
-          vars.NEXUSMODS_FILE_ID != '' &&
-          github.ref_type == 'tag' &&
-          !(inputs.prerelease || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha'))
-        continue-on-error: true
-        uses: Nexus-Mods/upload-action@v1
-        with:
-          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
-          file_id: ${{ vars.NEXUSMODS_FILE_ID }}
-          mod_id: ${{ vars.NEXUSMODS_MOD_ID }}
-          filename: ${{ steps.package.outputs.archive_name }}
-          version: ${{ steps.package.outputs.clean_version }}
-          display_name: EDPE(V${{ steps.package.outputs.clean_version }})
-          description: Automated release from GitHub (${{ steps.release.outputs.url }})
-          category: main
-          archive_existing_version: 'false'
-          update_mod_version: 'true'
-          changelog: ${{ vars.NEXUSMODS_MOD_ID != '' && steps.package.outputs.changelog || '' }}
