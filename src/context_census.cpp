@@ -4152,6 +4152,33 @@ inline bool repairAuxiliarySceneConstantBuffer(float* words, size_t floatCount, 
                 }
                 return true;
             }
+            static std::atomic<unsigned> s_row_cb2_miss_logs{0};
+            if (s_row_cb2_miss_logs.load(std::memory_order_relaxed) < 12) {
+                float expUnjit[16]{}, expJit[16]{};
+                edpe::cobra_camera::transposeBlock4x4(s_last_unjittered_forward_block, expUnjit);
+                edpe::cobra_camera::transposeBlock4x4(s_last_jittered_forward_block, expJit);
+                const float* rows10to16 = words + 40;
+                const bool colsUnjit = edpe::cobra_camera::matchRowMajorCols0to2(rows10to16, expUnjit);
+                const bool colsJitNeedsRays =
+                    !colsUnjit &&
+                    edpe::cobra_camera::matchRowMajorCols0to2(rows10to16, expJit) &&
+                    edpe::cobra_camera::rowMajorInverseRaysNeedJitter(rows10to16, dxUv, dyUv);
+                if (colsUnjit || colsJitNeedsRays) {
+                    if (s_row_cb2_miss_logs.fetch_add(1, std::memory_order_relaxed) < 12) {
+                        edpe::Vec3 cb2Pos{};
+                        const bool hasCb2Pos = edpe::cobra_camera::extractWorldCamPosFromDeferredCb2(
+                            words, floatCount, &cb2Pos);
+                        wchar_t msg[256];
+                        swprintf_s(msg,
+                            L"EDPE DIAG: row CB2 3x3 matched (%s) frame=%llu floats=%zu staged=%llu ref=(%.3f,%.3f,%.3f) cb2PosOk=%d cb2=(%.3f,%.3f,%.3f)",
+                            colsUnjit ? L"unjit" : L"jit+rays",
+                            cur_frame, floatCount, s_staged_camera_frame,
+                            refCamPos.x, refCamPos.y, refCamPos.z,
+                            hasCb2Pos ? 1 : 0, cb2Pos.x, cb2Pos.y, cb2Pos.z);
+                        EdpeLog(msg);
+                    }
+                }
+            }
         }
         if (refDepthB >= 0.01f &&
             std::isfinite(words[54]) &&

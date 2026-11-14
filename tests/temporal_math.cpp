@@ -459,5 +459,47 @@ int main() {
     if (edpe::cobra_camera::repairRowMajorDeferredMissingPhase(
             ws_cb2_missing.data(), ws_cb2_missing.size(), ws_cb1_jit_cm, dxUv, dyUv, &ws_cam_pos)) return 73;
 
+    // Self-contained WorldView (b2[2..5]) + InvView (b2[6..9]) inside deferred CB2:
+    // even when the staged CB1 camera position is stale during translation, CB2's own
+    // validated world position repairs both whole-omission and missing-phase blocks.
+    const float ws_rows2to9[32]{
+         0.491870f,  0.851943f,  0.179601f,  27.287724f,
+        -0.869429f,  0.491609f,  0.049124f,  -4.688456f,
+        -0.046443f, -0.180313f,  0.982512f,  27.857958f,
+         0.0f,       0.0f,       0.0f,        1.0f,
+         0.491870f, -0.869429f, -0.046443f, -16.204483f,
+         0.851943f,  0.491609f, -0.180313f, -15.919544f,
+         0.179601f,  0.049124f,  0.982512f, -32.041382f,
+         0.0f,       0.0f,       0.0f,        1.0f
+    };
+    const edpe::Vec3 stale_moving_pos{-16.12f, -15.919542f, -32.041382f}; // +8.4 cm lag
+    std::array<float, 68> self_cb2 = ws_cb2;
+    std::memcpy(&self_cb2[8], ws_rows2to9, sizeof(ws_rows2to9));
+    edpe::Vec3 extracted_pos{};
+    if (!edpe::cobra_camera::extractWorldCamPosFromDeferredCb2(
+            self_cb2.data(), self_cb2.size(), &extracted_pos)) return 74;
+    if (std::fabs(extracted_pos.x - (-16.204483f)) > 1e-4f ||
+        std::fabs(extracted_pos.y - (-15.919544f)) > 1e-4f ||
+        std::fabs(extracted_pos.z - (-32.041382f)) > 1e-4f) return 75;
+
+    std::array<float, 68> self_cb2_whole = self_cb2;
+    if (!edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+            self_cb2_whole.data(), self_cb2_whole.size(), ws_cb1_col_major, inv_jitter, dxUv, dyUv, &stale_moving_pos)) return 76;
+    if (edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+            self_cb2_whole.data(), self_cb2_whole.size(), ws_cb1_col_major, inv_jitter, dxUv, dyUv, &stale_moving_pos)) return 77;
+
+    std::array<float, 68> self_cb2_missing = self_cb2_whole;
+    std::memcpy(&self_cb2_missing[56], &ws_cb2[56], 12 * sizeof(float));
+    if (!edpe::cobra_camera::repairRowMajorDeferredMissingPhase(
+            self_cb2_missing.data(), self_cb2_missing.size(), ws_cb1_jit_cm, dxUv, dyUv, &stale_moving_pos)) return 78;
+
+    // Inconsistent InvView/WorldView must fail extraction and reject stale external pos.
+    std::array<float, 68> bad_self_cb2 = self_cb2;
+    bad_self_cb2[11] += 1.0f;
+    if (edpe::cobra_camera::extractWorldCamPosFromDeferredCb2(
+            bad_self_cb2.data(), bad_self_cb2.size(), &extracted_pos)) return 79;
+    if (edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+            bad_self_cb2.data(), bad_self_cb2.size(), ws_cb1_col_major, inv_jitter, dxUv, dyUv, &stale_moving_pos)) return 80;
+
     return 0; // All temporal math tests passed
 }

@@ -449,6 +449,81 @@ inline void transposeBlock4x4(const float* in16, float* out16) {
     }
 }
 
+// Extracts and validates the camera world position stored directly inside a
+// row-major deferred lighting CB2 (b2[2..4] = WorldView, b2[6..8] = InvView).
+// Relying on this self-consistent world position avoids rejecting valid CB2
+// updates when the main CB1 staged pose differs by a few millimeters during motion.
+inline bool extractWorldCamPosFromDeferredCb2(
+    const float* b2Floats,
+    size_t floatCount,
+    edpe::Vec3* outCamPos) {
+    if (!b2Floats || !outCamPos || floatCount < 17 * 4) return false;
+    for (size_t i = 8; i < 40; ++i) {
+        if (!std::isfinite(b2Floats[i])) return false;
+    }
+    const float* wv = b2Floats + 8;   // b2[2..5]: WorldView + [0,0,0,1]
+    const float* iv = b2Floats + 24;  // b2[6..9]: InvView   + [0,0,0,1]
+    if (std::fabs(wv[12]) > 1e-3f || std::fabs(wv[13]) > 1e-3f ||
+        std::fabs(wv[14]) > 1e-3f || std::fabs(wv[15] - 1.0f) > 1e-3f ||
+        std::fabs(iv[12]) > 1e-3f || std::fabs(iv[13]) > 1e-3f ||
+        std::fabs(iv[14]) > 1e-3f || std::fabs(iv[15] - 1.0f) > 1e-3f) {
+        return false;
+    }
+    for (int r = 0; r < 3; ++r) {
+        for (int r2 = r; r2 < 3; ++r2) {
+            const double dp =
+                static_cast<double>(wv[r * 4 + 0]) * wv[r2 * 4 + 0] +
+                static_cast<double>(wv[r * 4 + 1]) * wv[r2 * 4 + 1] +
+                static_cast<double>(wv[r * 4 + 2]) * wv[r2 * 4 + 2];
+            const double target = (r == r2) ? 1.0 : 0.0;
+            if (std::fabs(dp - target) > 5.0e-3) return false;
+        }
+        for (int c = 0; c < 3; ++c) {
+            if (std::fabs(iv[r * 4 + c] - wv[c * 4 + r]) > 5.0e-3f) return false;
+        }
+    }
+    const double det =
+        static_cast<double>(wv[0]) * (static_cast<double>(wv[5]) * wv[10] - static_cast<double>(wv[6]) * wv[9]) -
+        static_cast<double>(wv[1]) * (static_cast<double>(wv[4]) * wv[10] - static_cast<double>(wv[6]) * wv[8]) +
+        static_cast<double>(wv[2]) * (static_cast<double>(wv[4]) * wv[9] - static_cast<double>(wv[5]) * wv[8]);
+    if (det < 0.85 || det > 1.15) return false;
+
+    const edpe::Vec3 cand{iv[3], iv[7], iv[11]};
+    for (int r = 0; r < 3; ++r) {
+        const float* row = wv + r * 4;
+        const double dotPos =
+            static_cast<double>(row[0]) * cand.x +
+            static_cast<double>(row[1]) * cand.y +
+            static_cast<double>(row[2]) * cand.z;
+        const double absTerms =
+            std::fabs(static_cast<double>(row[0]) * cand.x) +
+            std::fabs(static_cast<double>(row[1]) * cand.y) +
+            std::fabs(static_cast<double>(row[2]) * cand.z);
+        const double tol = std::max(absTerms * 5.0e-5, 1.0e-3);
+        if (std::fabs(dotPos + static_cast<double>(row[3])) > tol) {
+            return false;
+        }
+    }
+    *outCamPos = cand;
+    return true;
+}
+
+inline bool matchRowMajorCols0to2(const float* actual16, const float* expected16) {
+    if (!actual16 || !expected16) return false;
+    for (int r = 0; r < 4; ++r) {
+        const float* a = actual16 + r * 4;
+        const float* e = expected16 + r * 4;
+        const float tol = flatDeferredFloatBound(e) * 8.0f;
+        for (int c = 0; c < 3; ++c) {
+            if (!std::isfinite(a[c]) || std::fabs(a[c] - e[c]) > tol) {
+                return false;
+            }
+        }
+        if (!std::isfinite(a[3])) return false;
+    }
+    return true;
+}
+
 inline bool matchMatrix4x4(
     const float* actual16,
     const float* expected16,
@@ -550,7 +625,12 @@ inline bool repairRowMajorDeferredMissingPhase(
     float expectedRowMajor[16]{};
     transposeBlock4x4(colMajorJitteredForward16, expectedRowMajor);
     float* rows10to16 = b2Floats + 10 * 4;
-    if (!matchMatrix4x4(rows10to16, expectedRowMajor, worldCamPos)) return false;
+    edpe::Vec3 cb2CamPos{};
+    const bool hasCb2Pos = extractWorldCamPosFromDeferredCb2(b2Floats, floatCount, &cb2CamPos);
+    const bool matched =
+        (hasCb2Pos && matchMatrix4x4(rows10to16, expectedRowMajor, &cb2CamPos)) ||
+        matchMatrix4x4(rows10to16, expectedRowMajor, worldCamPos);
+    if (!matched) return false;
     if (!rowMajorInverseRaysNeedJitter(rows10to16, dxUv, dyUv)) return false;
 
     jitterRowMajorInverseUvRay(rows10to16 + 16, dxUv, dyUv);
@@ -572,7 +652,12 @@ inline bool repairRowMajorDeferredWholeOmission(
     float expectedRowMajor[16]{};
     transposeBlock4x4(colMajorUnjitteredForward16, expectedRowMajor);
     float* rows10to16 = b2Floats + 10 * 4;
-    if (!matchMatrix4x4(rows10to16, expectedRowMajor, worldCamPos)) return false;
+    edpe::Vec3 cb2CamPos{};
+    const bool hasCb2Pos = extractWorldCamPosFromDeferredCb2(b2Floats, floatCount, &cb2CamPos);
+    const bool matched =
+        (hasCb2Pos && matchMatrix4x4(rows10to16, expectedRowMajor, &cb2CamPos)) ||
+        matchMatrix4x4(rows10to16, expectedRowMajor, worldCamPos);
+    if (!matched) return false;
 
     float jitteredRowMajor[16]{};
     if (!jitterEliteDotProjectionBlock(rows10to16, jitteredRowMajor, jitter)) return false;
