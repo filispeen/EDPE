@@ -15,6 +15,14 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "EDPE requires 64-bit Windows")
 endif()
 
+option(EDPE_ENABLE_ASAN "Enable MSVC AddressSanitizer (/fsanitize=address)" OFF)
+if(EDPE_ENABLE_ASAN AND MSVC)
+    add_compile_options(/fsanitize=address)
+    # Prebuilt SDK static libraries (FidelityFX DX11) are compiled without ASan STL annotations.
+    add_compile_definitions(_DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
+    add_link_options(/INCREMENTAL:NO)
+endif()
+
 set(NGX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/DLSS")
 if(EXISTS "${NGX_SDK_DIR}/include/nvsdk_ngx.h")
     set(EDPE_HAVE_NGX TRUE)
@@ -176,6 +184,10 @@ target_compile_definitions(crash_logger_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMA
 target_include_directories(crash_logger_test PRIVATE src)
 target_link_libraries(crash_logger_test PRIVATE dbghelp dxgi)
 add_test(NAME crash_logger COMMAND crash_logger_test)
+if(EDPE_ENABLE_ASAN AND MSVC)
+    # crash_logger_test intentionally triggers an access violation to verify SEH crash reporting.
+    set_tests_properties(crash_logger PROPERTIES ENVIRONMENT "ASAN_OPTIONS=handle_segv=0")
+endif()
 add_executable(ui_menu_size_test tests/ui_menu_size_test.cpp)
 target_compile_features(ui_menu_size_test PRIVATE cxx_std_20)
 target_include_directories(ui_menu_size_test PRIVATE external/imgui)
