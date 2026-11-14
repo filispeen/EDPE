@@ -449,15 +449,54 @@ inline void transposeBlock4x4(const float* in16, float* out16) {
     }
 }
 
-inline bool matchMatrix4x4(const float* actual16, const float* expected16) {
+inline bool matchMatrix4x4(
+    const float* actual16,
+    const float* expected16,
+    const edpe::Vec3* worldCamPos = nullptr) {
+    bool allCamRel = true;
     for (int r = 0; r < 4; ++r) {
         const float* a = actual16 + r * 4;
         const float* e = expected16 + r * 4;
         const float tol = flatDeferredFloatBound(e) * 8.0f;
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < 3; ++c) {
             if (!std::isfinite(a[c]) || std::fabs(a[c] - e[c]) > tol) {
                 return false;
             }
+        }
+        if (!std::isfinite(a[3])) {
+            return false;
+        }
+        if (std::fabs(a[3] - e[3]) > tol) {
+            allCamRel = false;
+        }
+    }
+    if (allCamRel) {
+        return true;
+    }
+    if (!worldCamPos ||
+        !std::isfinite(worldCamPos->x) ||
+        !std::isfinite(worldCamPos->y) ||
+        !std::isfinite(worldCamPos->z)) {
+        return false;
+    }
+    // Deferred lighting CB2 can store world-space Proj * WorldView instead of
+    // camera-relative coordinates: row.w == expected.w - dot(row.xyz, worldCamPos).
+    for (int r = 0; r < 4; ++r) {
+        const float* a = actual16 + r * 4;
+        const float* e = expected16 + r * 4;
+        const float tol = flatDeferredFloatBound(e) * 8.0f;
+        const double dotPos =
+            static_cast<double>(a[0]) * worldCamPos->x +
+            static_cast<double>(a[1]) * worldCamPos->y +
+            static_cast<double>(a[2]) * worldCamPos->z;
+        const double absTerms =
+            std::fabs(static_cast<double>(a[0]) * worldCamPos->x) +
+            std::fabs(static_cast<double>(a[1]) * worldCamPos->y) +
+            std::fabs(static_cast<double>(a[2]) * worldCamPos->z);
+        const float worldTol = std::max({tol, static_cast<float>(absTerms) * 5.0e-5f, 1.0e-4f});
+        const double expectedWorldW = static_cast<double>(e[3]) - dotPos;
+        if (std::fabs(static_cast<double>(a[3]) - expectedWorldW) > worldTol) {
+            return false;
         }
     }
     return true;
@@ -503,14 +542,15 @@ inline bool repairRowMajorDeferredMissingPhase(
     size_t floatCount,
     const float* colMajorJitteredForward16,
     float dxUv,
-    float dyUv) {
+    float dyUv,
+    const edpe::Vec3* worldCamPos = nullptr) {
     if (!b2Floats || floatCount < 17 * 4 || !colMajorJitteredForward16) return false;
     if (std::fabs(dxUv) <= 1e-7f && std::fabs(dyUv) <= 1e-7f) return false;
 
     float expectedRowMajor[16]{};
     transposeBlock4x4(colMajorJitteredForward16, expectedRowMajor);
     float* rows10to16 = b2Floats + 10 * 4;
-    if (!matchMatrix4x4(rows10to16, expectedRowMajor)) return false;
+    if (!matchMatrix4x4(rows10to16, expectedRowMajor, worldCamPos)) return false;
     if (!rowMajorInverseRaysNeedJitter(rows10to16, dxUv, dyUv)) return false;
 
     jitterRowMajorInverseUvRay(rows10to16 + 16, dxUv, dyUv);
@@ -523,7 +563,8 @@ inline bool repairRowMajorDeferredWholeOmission(
     const float* colMajorUnjitteredForward16,
     const ProjectionJitter& jitter,
     float dxUv,
-    float dyUv) {
+    float dyUv,
+    const edpe::Vec3* worldCamPos = nullptr) {
     if (!b2Floats || floatCount < 17 * 4 || !colMajorUnjitteredForward16) return false;
     if (std::fabs(dxUv) <= 1e-7f && std::fabs(dyUv) <= 1e-7f &&
         std::fabs(jitter.ndcX) <= 1e-7f && std::fabs(jitter.ndcY) <= 1e-7f) return false;
@@ -531,7 +572,7 @@ inline bool repairRowMajorDeferredWholeOmission(
     float expectedRowMajor[16]{};
     transposeBlock4x4(colMajorUnjitteredForward16, expectedRowMajor);
     float* rows10to16 = b2Floats + 10 * 4;
-    if (!matchMatrix4x4(rows10to16, expectedRowMajor)) return false;
+    if (!matchMatrix4x4(rows10to16, expectedRowMajor, worldCamPos)) return false;
 
     float jitteredRowMajor[16]{};
     if (!jitterEliteDotProjectionBlock(rows10to16, jitteredRowMajor, jitter)) return false;

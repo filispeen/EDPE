@@ -4137,10 +4137,12 @@ inline bool repairAuxiliarySceneConstantBuffer(float* words, size_t floatCount, 
             std::fabs(words[48]) <= 2e-3f &&
             std::fabs(words[49]) <= 2e-3f &&
             std::fabs(words[50]) <= 2e-3f) {
+            const edpe::Vec3 refCamPos = edpe::cameraPosition(refCam);
+            const edpe::Vec3* pRefCamPos = (refCam.scaleX > 0.1f) ? &refCamPos : nullptr;
             const bool repairedMissing = edpe::cobra_camera::repairRowMajorDeferredMissingPhase(
-                words, floatCount, s_last_jittered_forward_block, dxUv, dyUv);
+                words, floatCount, s_last_jittered_forward_block, dxUv, dyUv, pRefCamPos);
             const bool repairedWhole = !repairedMissing && edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
-                words, floatCount, s_last_unjittered_forward_block, jitter, dxUv, dyUv);
+                words, floatCount, s_last_unjittered_forward_block, jitter, dxUv, dyUv, pRefCamPos);
             if (repairedMissing || repairedWhole) {
                 static std::atomic<bool> s_logged_row_deferred_cb2_repair{false};
                 if (!s_logged_row_deferred_cb2_repair.exchange(true, std::memory_order_relaxed)) {

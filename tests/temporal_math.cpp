@@ -393,5 +393,71 @@ int main() {
             rm_cb2_missing.data(), rm_cb2_missing.size(),
             cm_jittered_fwd.data(), dxUv, dyUv)) return 63;
 
+    // World-space Proj * WorldView CB2 (non-zero column 3 translation from camera worldPos)
+    const float ws_cb1_col_major[16]{
+         0.517637f, -1.626622f, 0.0f, -0.046443f,
+         0.896573f,  0.919756f, 0.0f, -0.180313f,
+         0.189010f,  0.091906f, 0.0f,  0.982512f,
+         0.0f,       0.0f,      0.025f, 0.0f
+    };
+    const edpe::Vec3 ws_cam_pos{-16.204481f, -15.919542f, -32.041382f};
+    const edpe::Vec3 ws_wrong_pos{100.0f, -20.0f, 5.0f};
+    std::array<float, 68> ws_cb2{};
+    const float ws_rows10to16[28]{
+         0.517637f,  0.896573f, 0.189010f,  28.717203f,
+        -1.626622f,  0.919756f, 0.091906f,  -8.771667f,
+         0.0f,       0.0f,      0.0f,       0.025000f,
+        -0.046443f, -0.180313f, 0.982512f,  27.857958f,
+         0.934771f,  0.929420f, 0.0f,      -0.978539f,
+         1.619071f, -0.525530f, 0.0f,      -0.727083f,
+         0.341323f, -0.052513f, 0.0f,       0.838108f
+    };
+    std::memcpy(&ws_cb2[40], ws_rows10to16, sizeof(ws_rows10to16));
+    if (edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+            ws_cb2.data(), ws_cb2.size(), ws_cb1_col_major, inv_jitter, dxUv, dyUv, nullptr)) return 64;
+    if (edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+            ws_cb2.data(), ws_cb2.size(), ws_cb1_col_major, inv_jitter, dxUv, dyUv, &ws_wrong_pos)) return 65;
+
+    std::array<float, 68> ws_cb2_whole = ws_cb2;
+    if (!edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+            ws_cb2_whole.data(), ws_cb2_whole.size(), ws_cb1_col_major, inv_jitter, dxUv, dyUv, &ws_cam_pos)) return 66;
+    auto evalWorldClip = [](const float* cb2_rows10to13, const float pt[3], float out4[4]) {
+        for (int r = 0; r < 4; ++r) {
+            out4[r] = cb2_rows10to13[r * 4 + 0] * pt[0] +
+                      cb2_rows10to13[r * 4 + 1] * pt[1] +
+                      cb2_rows10to13[r * 4 + 2] * pt[2] +
+                      cb2_rows10to13[r * 4 + 3];
+        }
+    };
+    const float test_pt[3]{-12.5f, -15.0f, -25.0f};
+    float clip_before[4]{}, clip_after[4]{};
+    evalWorldClip(&ws_cb2[40], test_pt, clip_before);
+    evalWorldClip(&ws_cb2_whole[40], test_pt, clip_after);
+    if (std::fabs((clip_after[0] / clip_after[3]) - (clip_before[0] / clip_before[3] + inv_jitter.ndcX)) > 1e-5f ||
+        std::fabs((clip_after[1] / clip_after[3]) - (clip_before[1] / clip_before[3] + inv_jitter.ndcY)) > 1e-5f) {
+        return 67;
+    }
+    for (int r = 0; r < 3; ++r) {
+        const float expected = evalRowMajorRay(&ws_cb2[56], 0.25f, 0.75f, r);
+        const float actual = evalRowMajorRay(&ws_cb2_whole[56], 0.25f + dxUv, 0.75f + dyUv, r);
+        if (std::fabs(actual - expected) > 1e-5f) return 68;
+    }
+    if (edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+            ws_cb2_whole.data(), ws_cb2_whole.size(), ws_cb1_col_major, inv_jitter, dxUv, dyUv, &ws_cam_pos)) return 69;
+
+    std::array<float, 68> ws_cb2_missing = ws_cb2_whole;
+    std::memcpy(&ws_cb2_missing[56], &ws_cb2[56], 12 * sizeof(float));
+    float ws_cb1_jit_cm[16]{};
+    if (!edpe::jitterEliteProjectionBlock(ws_cb1_col_major, ws_cb1_jit_cm, inv_jitter)) return 70;
+    if (!edpe::cobra_camera::repairRowMajorDeferredMissingPhase(
+            ws_cb2_missing.data(), ws_cb2_missing.size(), ws_cb1_jit_cm, dxUv, dyUv, &ws_cam_pos)) return 71;
+    for (int r = 0; r < 3; ++r) {
+        const float expected = evalRowMajorRay(&ws_cb2[56], 0.25f, 0.75f, r);
+        const float actual = evalRowMajorRay(&ws_cb2_missing[56], 0.25f + dxUv, 0.75f + dyUv, r);
+        if (std::fabs(actual - expected) > 1e-5f) return 72;
+    }
+    if (edpe::cobra_camera::repairRowMajorDeferredMissingPhase(
+            ws_cb2_missing.data(), ws_cb2_missing.size(), ws_cb1_jit_cm, dxUv, dyUv, &ws_cam_pos)) return 73;
+
     return 0; // All temporal math tests passed
 }
