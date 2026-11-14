@@ -296,5 +296,102 @@ int main() {
             cb2_whole_omission.data(), cb2_whole_omission.size(),
             turning_block, inv_jitter, dxUv, dyUv)) return 46;
 
+    // EDO Row-major UvToView (cb1[237..240] & clustered lighting cs cb0[10..13])
+    edpe::CameraProjection edo_cam{};
+    edo_cam.scaleX = 1.052385f;
+    edo_cam.scaleY = 1.870907f;
+    edo_cam.depthB = 0.025f;
+    const std::array<float, 16> base_uv_to_view{
+        2.0f / edo_cam.scaleX, 0.0f, 0.0f, -1.0f / edo_cam.scaleX,
+        0.0f, -2.0f / edo_cam.scaleY, 0.0f,  1.0f / edo_cam.scaleY,
+        0.0f, 0.0f, 0.0f, 1.0f,
+        0.0f, 0.0f, 1.0f / edo_cam.depthB, 0.0f
+    };
+    auto evalRowMajorRay = [](const float* rows, float u, float v, int r) {
+        return rows[r * 4 + 0] * u + rows[r * 4 + 1] * v + rows[r * 4 + 3];
+    };
+    std::array<float, 16> uv_to_view = base_uv_to_view;
+    if (!edpe::cobra_camera::repairRowMajorUvToViewBlock(uv_to_view.data(), edo_cam, dxUv, dyUv)) return 47;
+    for (int r = 0; r < 3; ++r) {
+        const float expected = evalRowMajorRay(base_uv_to_view.data(), 0.37f, 0.61f, r);
+        const float actual = evalRowMajorRay(uv_to_view.data(), 0.37f + dxUv, 0.61f + dyUv, r);
+        if (std::fabs(actual - expected) > 1e-5f) return 48;
+    }
+    if (edpe::cobra_camera::repairRowMajorUvToViewBlock(uv_to_view.data(), edo_cam, dxUv, dyUv)) return 49;
+    if (!edpe::cobra_camera::unjitterRowMajorUvToViewBlock(uv_to_view.data(), edo_cam)) return 50;
+    for (size_t i = 0; i < 16; ++i) {
+        if (std::fabs(uv_to_view[i] - base_uv_to_view[i]) > 1e-5f) return 51;
+    }
+
+    // EDO Cascade Shadow Mask CB2 InvProj (592B cb2[0..4])
+    std::array<float, 20> cascade_cb2{
+        static_cast<float>(kRw), static_cast<float>(kRh),
+        1.0f / static_cast<float>(kRw), 1.0f / static_cast<float>(kRh),
+        1.0f / edo_cam.scaleX, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f / edo_cam.scaleY, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f / edo_cam.depthB,
+        0.0f, 0.0f, 1.0f, 0.0f
+    };
+    auto evalCascadeRay = [](const float* cb, float u, float v, int c) {
+        const float ndc_x = 2.0f * u - 1.0f;
+        const float ndc_y = -2.0f * v + 1.0f;
+        return ndc_x * cb[4 + c] + ndc_y * cb[8 + c] + cb[16 + c];
+    };
+    const std::array<float, 20> base_cascade_cb2 = cascade_cb2;
+    if (!edpe::cobra_camera::repairCascadeShadowMaskInvProj(
+            cascade_cb2.data(), cascade_cb2.size(), edo_cam, inv_jitter)) return 52;
+    for (int c = 0; c < 3; ++c) {
+        const float expected = evalCascadeRay(base_cascade_cb2.data(), 0.29f, 0.73f, c);
+        const float actual = evalCascadeRay(cascade_cb2.data(), 0.29f + dxUv, 0.73f + dyUv, c);
+        if (std::fabs(actual - expected) > 1e-5f) return 53;
+    }
+    if (edpe::cobra_camera::repairCascadeShadowMaskInvProj(
+            cascade_cb2.data(), cascade_cb2.size(), edo_cam, inv_jitter)) return 54;
+
+    // EDO Row-major Deferred Lighting CB2 (cb2[10..16] WholeOmission & MissingPhase)
+    float rm_unjit_fwd[16]{};
+    edpe::cobra_camera::transposeBlock4x4(turning_block, rm_unjit_fwd);
+    float rm_jittered_fwd[16]{};
+    if (!edpe::jitterEliteDotProjectionBlock(rm_unjit_fwd, rm_jittered_fwd, inv_jitter)) return 55;
+    std::array<float, 12> rm_base_rays{
+         1.8f,  0.2f, 0.0f, rm_unjit_fwd[12] - 0.5f * 1.8f - 0.5f * 0.2f,
+        -0.1f, -1.1f, 0.0f, rm_unjit_fwd[13] - 0.5f * (-0.1f) - 0.5f * (-1.1f),
+         0.3f, -0.2f, 0.0f, rm_unjit_fwd[14] - 0.5f * 0.3f - 0.5f * (-0.2f)
+    };
+    std::array<float, 68> rm_cb2_whole{};
+    std::memcpy(&rm_cb2_whole[40], rm_unjit_fwd, sizeof(rm_unjit_fwd));
+    std::memcpy(&rm_cb2_whole[56], rm_base_rays.data(), sizeof(rm_base_rays));
+    if (!edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+            rm_cb2_whole.data(), rm_cb2_whole.size(),
+            turning_block, inv_jitter, dxUv, dyUv)) return 56;
+    for (size_t i = 0; i < 16; ++i) {
+        if (std::fabs(rm_cb2_whole[40 + i] - rm_jittered_fwd[i]) > 1e-5f) return 57;
+    }
+    for (int r = 0; r < 3; ++r) {
+        const float expected = evalRowMajorRay(rm_base_rays.data(), 0.25f, 0.75f, r);
+        const float actual = evalRowMajorRay(&rm_cb2_whole[56], 0.25f + dxUv, 0.75f + dyUv, r);
+        if (std::fabs(actual - expected) > 1e-5f) return 58;
+    }
+    if (edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+            rm_cb2_whole.data(), rm_cb2_whole.size(),
+            turning_block, inv_jitter, dxUv, dyUv)) return 59;
+
+    std::array<float, 68> rm_cb2_missing{};
+    std::memcpy(&rm_cb2_missing[40], rm_jittered_fwd, sizeof(rm_jittered_fwd));
+    std::memcpy(&rm_cb2_missing[56], rm_base_rays.data(), sizeof(rm_base_rays));
+    std::array<float, 16> cm_jittered_fwd{};
+    if (!edpe::jitterEliteProjectionBlock(turning_block, cm_jittered_fwd.data(), inv_jitter)) return 60;
+    if (!edpe::cobra_camera::repairRowMajorDeferredMissingPhase(
+            rm_cb2_missing.data(), rm_cb2_missing.size(),
+            cm_jittered_fwd.data(), dxUv, dyUv)) return 61;
+    for (int r = 0; r < 3; ++r) {
+        const float expected = evalRowMajorRay(rm_base_rays.data(), 0.25f, 0.75f, r);
+        const float actual = evalRowMajorRay(&rm_cb2_missing[56], 0.25f + dxUv, 0.75f + dyUv, r);
+        if (std::fabs(actual - expected) > 1e-5f) return 62;
+    }
+    if (edpe::cobra_camera::repairRowMajorDeferredMissingPhase(
+            rm_cb2_missing.data(), rm_cb2_missing.size(),
+            cm_jittered_fwd.data(), dxUv, dyUv)) return 63;
+
     return 0; // All temporal math tests passed
 }

@@ -404,6 +404,241 @@ inline bool repairDeferredWholeOmission(
 }
 
 // ============================================================================
+// EDO Row-Major & Inverse Projection Jitter Repair Helpers
+// Verified against Elite Dangerous Odyssey D3D11 constant buffers:
+//   - Deferred lighting & shadowed local lights CB2 (752..784B):
+//       b2[10..13] = row-major Proj*View (depthB at float index 51)
+//       b2[14..16] = row-major world-space inverse UV rays (origin in .w)
+//   - Cascade shadow mask CB2 (592B):
+//       b2[0]      = (W, H, 1/W, 1/H)
+//       b2[1..4]   = column-major InvProj (ndcX * cb2[1] + ndcY * cb2[2] + cb2[4])
+//   - Clustered lighting CS cb0 (480B) & Main CB1[237..240]:
+//       row-major UvToView (origin in .w)
+// ============================================================================
+inline void jitterRowMajorInverseUvRay(float* rows3x4, float dxUv, float dyUv) {
+    if (!rows3x4) return;
+    for (int r = 0; r < 3; ++r) {
+        float* row = rows3x4 + r * 4;
+        row[3] -= dxUv * row[0] + dyUv * row[1];
+    }
+}
+
+inline void jitterColumnMajorInverseClip(float* cols4x4, float ndcX, float ndcY) {
+    if (!cols4x4) return;
+    const float* colX = cols4x4 + 0;
+    const float* colY = cols4x4 + 4;
+    float* colW = cols4x4 + 12;
+    for (int c = 0; c < 3; ++c) {
+        colW[c] -= ndcX * colX[c] + ndcY * colY[c];
+    }
+}
+
+inline void jitterRowMajorInverseClip(float* rows4x4, float ndcX, float ndcY) {
+    if (!rows4x4) return;
+    for (int r = 0; r < 4; ++r) {
+        float* row = rows4x4 + r * 4;
+        row[3] -= ndcX * row[0] + ndcY * row[1];
+    }
+}
+
+inline void transposeBlock4x4(const float* in16, float* out16) {
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out16[r * 4 + c] = in16[c * 4 + r];
+        }
+    }
+}
+
+inline bool matchMatrix4x4(const float* actual16, const float* expected16) {
+    for (int r = 0; r < 4; ++r) {
+        const float* a = actual16 + r * 4;
+        const float* e = expected16 + r * 4;
+        const float tol = flatDeferredFloatBound(e) * 8.0f;
+        for (int c = 0; c < 4; ++c) {
+            if (!std::isfinite(a[c]) || std::fabs(a[c] - e[c]) > tol) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Verifies row-major cb2[14..16] against forward vector cb2[13].xyz using
+// the exact Cobra identity: 0.5*dX + 0.5*dY + origin == cb2[13].xyz.
+inline bool rowMajorInverseRaysNeedJitter(const float* rows10to16, float dxUv, float dyUv) {
+    const float* forwardVec = rows10to16 + 3 * 4; // row 13 (.xyz)
+    const float* r14 = rows10to16 + 4 * 4;
+    const float* r15 = rows10to16 + 5 * 4;
+    const float* r16 = rows10to16 + 6 * 4;
+    for (int i = 0; i < 12; ++i) {
+        if (!std::isfinite(r14[i])) return false;
+    }
+    const float rows[3][4] = {
+        {r14[0], r14[1], r14[2], r14[3]},
+        {r15[0], r15[1], r15[2], r15[3]},
+        {r16[0], r16[1], r16[2], r16[3]},
+    };
+    float lenX2 = 0.0f, lenY2 = 0.0f;
+    for (int c = 0; c < 3; ++c) {
+        lenX2 += rows[c][0] * rows[c][0];
+        lenY2 += rows[c][1] * rows[c][1];
+    }
+    if (lenX2 < 1e-4f || lenY2 < 1e-4f) return false;
+    const float scale = std::max({std::sqrt(lenX2), std::sqrt(lenY2), 1.0f});
+    const float allow = std::max(scale * 2.5e-4f, 1e-4f);
+
+    float diffUnjittered = 0.0f;
+    float diffJittered = 0.0f;
+    for (int c = 0; c < 3; ++c) {
+        const float unjitOrig = forwardVec[c] - 0.5f * rows[c][0] - 0.5f * rows[c][1];
+        const float jitOrig = unjitOrig - dxUv * rows[c][0] - dyUv * rows[c][1];
+        diffUnjittered = std::max(diffUnjittered, std::fabs(rows[c][3] - unjitOrig));
+        diffJittered = std::max(diffJittered, std::fabs(rows[c][3] - jitOrig));
+    }
+    return diffUnjittered <= allow && diffUnjittered < diffJittered * 0.5f;
+}
+
+inline bool repairRowMajorDeferredMissingPhase(
+    float* b2Floats,
+    size_t floatCount,
+    const float* colMajorJitteredForward16,
+    float dxUv,
+    float dyUv) {
+    if (!b2Floats || floatCount < 17 * 4 || !colMajorJitteredForward16) return false;
+    if (std::fabs(dxUv) <= 1e-7f && std::fabs(dyUv) <= 1e-7f) return false;
+
+    float expectedRowMajor[16]{};
+    transposeBlock4x4(colMajorJitteredForward16, expectedRowMajor);
+    float* rows10to16 = b2Floats + 10 * 4;
+    if (!matchMatrix4x4(rows10to16, expectedRowMajor)) return false;
+    if (!rowMajorInverseRaysNeedJitter(rows10to16, dxUv, dyUv)) return false;
+
+    jitterRowMajorInverseUvRay(rows10to16 + 16, dxUv, dyUv);
+    return true;
+}
+
+inline bool repairRowMajorDeferredWholeOmission(
+    float* b2Floats,
+    size_t floatCount,
+    const float* colMajorUnjitteredForward16,
+    const ProjectionJitter& jitter,
+    float dxUv,
+    float dyUv) {
+    if (!b2Floats || floatCount < 17 * 4 || !colMajorUnjitteredForward16) return false;
+    if (std::fabs(dxUv) <= 1e-7f && std::fabs(dyUv) <= 1e-7f &&
+        std::fabs(jitter.ndcX) <= 1e-7f && std::fabs(jitter.ndcY) <= 1e-7f) return false;
+
+    float expectedRowMajor[16]{};
+    transposeBlock4x4(colMajorUnjitteredForward16, expectedRowMajor);
+    float* rows10to16 = b2Floats + 10 * 4;
+    if (!matchMatrix4x4(rows10to16, expectedRowMajor)) return false;
+
+    float jitteredRowMajor[16]{};
+    if (!jitterEliteDotProjectionBlock(rows10to16, jitteredRowMajor, jitter)) return false;
+
+    const bool patchRays = rowMajorInverseRaysNeedJitter(rows10to16, dxUv, dyUv);
+    std::memcpy(rows10to16, jitteredRowMajor, sizeof(jitteredRowMajor));
+    if (patchRays) {
+        jitterRowMajorInverseUvRay(rows10to16 + 16, dxUv, dyUv);
+    }
+    return true;
+}
+
+inline bool repairCascadeShadowMaskInvProj(
+    float* cbFloats,
+    size_t floatCount,
+    const CameraProjection& refCam,
+    const ProjectionJitter& jitter) {
+    if (!cbFloats || floatCount < 20) return false;
+    if (refCam.scaleX <= 0.1f || refCam.scaleY <= 0.1f || refCam.depthB < 0.01f) return false;
+    if (std::fabs(jitter.ndcX) <= 1e-7f && std::fabs(jitter.ndcY) <= 1e-7f) return false;
+    for (int i = 0; i < 20; ++i) {
+        if (!std::isfinite(cbFloats[i])) return false;
+    }
+    const float w = cbFloats[0];
+    const float h = cbFloats[1];
+    if (w < 320.0f || h < 240.0f ||
+        std::fabs(cbFloats[2] - 1.0f / w) > 1e-4f ||
+        std::fabs(cbFloats[3] - 1.0f / h) > 1e-4f) {
+        return false;
+    }
+    const float invSx = 1.0f / refCam.scaleX;
+    const float invSy = 1.0f / refCam.scaleY;
+    const float invDb = 1.0f / refCam.depthB;
+    const float* m = cbFloats + 4;
+    if (std::fabs(m[0] - invSx) > 0.02f * invSx ||
+        std::fabs(m[1]) > 1e-3f || std::fabs(m[2]) > 1e-3f || std::fabs(m[3]) > 1e-3f ||
+        std::fabs(m[4]) > 1e-3f || std::fabs(m[5] - invSy) > 0.02f * invSy ||
+        std::fabs(m[6]) > 1e-3f || std::fabs(m[7]) > 1e-3f ||
+        std::fabs(m[8]) > 1e-3f || std::fabs(m[9]) > 1e-3f || std::fabs(m[10]) > 1e-3f ||
+        std::fabs(m[11] - invDb) > 0.05f * invDb ||
+        std::fabs(m[14] - 1.0f) > 1e-3f || std::fabs(m[15]) > 1e-3f) {
+        return false;
+    }
+    if (std::fabs(m[12]) > 1e-5f || std::fabs(m[13]) > 1e-5f) {
+        return false;
+    }
+    jitterColumnMajorInverseClip(cbFloats + 4, jitter.ndcX, jitter.ndcY);
+    return true;
+}
+
+inline bool matchesRowMajorUvToViewBlock(
+    const float* rows4x4,
+    const CameraProjection& refCam) {
+    if (!rows4x4 || refCam.scaleX <= 0.1f || refCam.scaleY <= 0.1f || refCam.depthB < 0.01f) {
+        return false;
+    }
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(rows4x4[i])) return false;
+    }
+    const float invSx = 1.0f / refCam.scaleX;
+    const float invSy = 1.0f / refCam.scaleY;
+    const float invDb = 1.0f / refCam.depthB;
+    return std::fabs(rows4x4[0] - 2.0f * invSx) <= 0.02f * (2.0f * invSx) &&
+           std::fabs(rows4x4[1]) <= 1e-3f && std::fabs(rows4x4[2]) <= 1e-3f &&
+           std::fabs(rows4x4[4]) <= 1e-3f &&
+           std::fabs(rows4x4[5] + 2.0f * invSy) <= 0.02f * (2.0f * invSy) &&
+           std::fabs(rows4x4[6]) <= 1e-3f &&
+           std::fabs(rows4x4[8]) <= 1e-3f && std::fabs(rows4x4[9]) <= 1e-3f &&
+           std::fabs(rows4x4[10]) <= 1e-3f && std::fabs(rows4x4[11] - 1.0f) <= 1e-3f &&
+           std::fabs(rows4x4[12]) <= 1e-3f && std::fabs(rows4x4[13]) <= 1e-3f &&
+           std::fabs(rows4x4[14] - invDb) <= 0.05f * invDb && std::fabs(rows4x4[15]) <= 1e-3f;
+}
+
+inline bool repairRowMajorUvToViewBlock(
+    float* rows4x4,
+    const CameraProjection& refCam,
+    float dxUv,
+    float dyUv) {
+    if (!matchesRowMajorUvToViewBlock(rows4x4, refCam)) return false;
+    if (std::fabs(dxUv) <= 1e-7f && std::fabs(dyUv) <= 1e-7f) return false;
+    // Only jitter if unjittered center (u=0.5, v=0.5) maps to view ray ~(0, 0).
+    if (std::fabs(0.5f * rows4x4[0] + rows4x4[3]) > 1e-4f ||
+        std::fabs(0.5f * rows4x4[5] + rows4x4[7]) > 1e-4f) {
+        return false;
+    }
+    jitterRowMajorInverseUvRay(rows4x4, dxUv, dyUv);
+    return true;
+}
+
+inline bool unjitterRowMajorUvToViewBlock(
+    float* rows4x4,
+    const CameraProjection& refCam) {
+    if (!matchesRowMajorUvToViewBlock(rows4x4, refCam)) return false;
+    const float centerX = 0.5f * rows4x4[0] + rows4x4[3];
+    const float centerY = 0.5f * rows4x4[5] + rows4x4[7];
+    if (std::fabs(centerX) > 0.05f * rows4x4[0] || std::fabs(centerY) > 0.05f * std::fabs(rows4x4[5])) {
+        return false;
+    }
+    if (std::fabs(centerX) <= 1e-6f && std::fabs(centerY) <= 1e-6f) {
+        return false;
+    }
+    rows4x4[3] = -0.5f * rows4x4[0];
+    rows4x4[7] = -0.5f * rows4x4[5];
+    return true;
+}
+
+// ============================================================================
 // Cockpit Vehicle Rig Tracker (ICameraTargetShip::SetTarget RVA 0x1096640)
 // ============================================================================
 struct VehicleRigState {
