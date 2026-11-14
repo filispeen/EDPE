@@ -335,6 +335,9 @@ inline bool repairDeferredMissingPhase(
     if (!b2Floats || floatCount < 17 * 4 || !jitteredForward16 || !unjitteredInverseRays12) {
         return false;
     }
+    if (std::fabs(dxUv) <= 1e-7f && std::fabs(dyUv) <= 1e-7f) {
+        return false;
+    }
     float* rows10to16 = b2Floats + 10 * 4;
     // Verify rows 10..13 match jitteredForward16 within float32 bound
     for (int r = 0; r < 4; ++r) {
@@ -347,14 +350,21 @@ inline bool repairDeferredMissingPhase(
             }
         }
     }
-    // Check if rows 14..16 match unjitteredInverseRays12 (meaning phase is missing in rays)
+    // Check if rows 14..16 match unjitteredInverseRays12 (and are closer to unjittered than already-jittered)
+    float expectedJittered12[12]{};
+    std::memcpy(expectedJittered12, unjitteredInverseRays12, sizeof(expectedJittered12));
+    jitterInverseUvRay(expectedJittered12, dxUv, dyUv);
+
     const float allow = flatDeferredWorldAllowance(rows10to16);
     float diffUnjittered = 0.0f;
+    float diffJittered = 0.0f;
     for (int i = 0; i < 12; ++i) {
         diffUnjittered = std::max(diffUnjittered,
             std::fabs(rows10to16[16 + i] - unjitteredInverseRays12[i]));
+        diffJittered = std::max(diffJittered,
+            std::fabs(rows10to16[16 + i] - expectedJittered12[i]));
     }
-    if (diffUnjittered > allow) {
+    if (diffUnjittered > allow || !(diffUnjittered < diffJittered * 0.5f)) {
         return false;
     }
     jitterInverseUvRay(rows10to16 + 16, dxUv, dyUv);

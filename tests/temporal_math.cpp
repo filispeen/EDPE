@@ -1,8 +1,17 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "temporal_math.h"
 #include "elite_camera.h"
+#include "cobra_camera_inject.h"
 
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 int main() {
@@ -222,6 +231,70 @@ int main() {
 
     if (edpe::estimateEliteTransposeBlockNdcOffset(no_w, &native) ||
         edpe::matchesEliteTransposeProjectionBlock(no_w, parsed)) return 36;
+
+    // Inverse UV frustum ray jitter invariance and unjitter round-trip recovery
+    constexpr unsigned kRw = 2560;
+    constexpr unsigned kRh = 1440;
+    const auto inv_jitter = edpe::projectionJitter(3, kRw, kRh, 32);
+    const float dxUv = inv_jitter.pixelX / static_cast<float>(kRw);
+    const float dyUv = inv_jitter.pixelY / static_cast<float>(kRh);
+    const std::array<float, 12> base_inv_rays{
+         2.0f,  0.1f,  0.2f, 0.0f, // dX
+        -0.1f, -1.2f,  0.15f, 0.0f, // dY
+        -0.95f, 0.55f, -1.0f, 0.0f  // originCorner
+    };
+    auto evalRay = [](const float* rays, float u, float v, int c) {
+        return rays[8 + c] + u * rays[c] + v * rays[4 + c];
+    };
+    std::array<float, 12> shifted_rays = base_inv_rays;
+    edpe::cobra_camera::jitterInverseUvRay(shifted_rays.data(), dxUv, dyUv);
+    for (int c = 0; c < 3; ++c) {
+        const float expectedRay = evalRay(base_inv_rays.data(), 0.37f, 0.61f, c);
+        const float reconstructedRay = evalRay(shifted_rays.data(), 0.37f + dxUv, 0.61f + dyUv, c);
+        if (std::fabs(reconstructedRay - expectedRay) > 1e-6f) return 37;
+    }
+    edpe::cobra_camera::jitterInverseUvRay(
+        shifted_rays.data(), -inv_jitter.ndcX * 0.5f, inv_jitter.ndcY * 0.5f);
+    for (int i = 0; i < 12; ++i) {
+        if (std::fabs(shifted_rays[i] - base_inv_rays[i]) > 1e-6f) return 38;
+    }
+
+    // Deferred lighting CB2 repairDeferredMissingPhase (no double-jitter)
+    std::array<float, 16> cb2_jittered_fwd{};
+    if (!edpe::jitterEliteProjectionBlock(turning_block, cb2_jittered_fwd.data(), inv_jitter)) return 39;
+    std::array<float, 68> cb2_missing_phase{};
+    std::memcpy(&cb2_missing_phase[40], cb2_jittered_fwd.data(), 16 * sizeof(float));
+    std::memcpy(&cb2_missing_phase[56], base_inv_rays.data(), 12 * sizeof(float));
+    if (!edpe::cobra_camera::repairDeferredMissingPhase(
+            cb2_missing_phase.data(), cb2_missing_phase.size(),
+            cb2_jittered_fwd.data(), base_inv_rays.data(), dxUv, dyUv)) return 40;
+    for (int c = 0; c < 3; ++c) {
+        const float expectedRay = evalRay(base_inv_rays.data(), 0.25f, 0.75f, c);
+        const float repairedRay = evalRay(&cb2_missing_phase[56], 0.25f + dxUv, 0.75f + dyUv, c);
+        if (std::fabs(repairedRay - expectedRay) > 1e-6f) return 41;
+    }
+    if (edpe::cobra_camera::repairDeferredMissingPhase(
+            cb2_missing_phase.data(), cb2_missing_phase.size(),
+            cb2_jittered_fwd.data(), base_inv_rays.data(), dxUv, dyUv)) return 42;
+
+    // Deferred lighting CB2 repairDeferredWholeOmission (no double-jitter)
+    std::array<float, 68> cb2_whole_omission{};
+    std::memcpy(&cb2_whole_omission[40], turning_block, 16 * sizeof(float));
+    std::memcpy(&cb2_whole_omission[56], base_inv_rays.data(), 12 * sizeof(float));
+    if (!edpe::cobra_camera::repairDeferredWholeOmission(
+            cb2_whole_omission.data(), cb2_whole_omission.size(),
+            turning_block, inv_jitter, dxUv, dyUv)) return 43;
+    for (size_t i = 0; i < 16; ++i) {
+        if (std::fabs(cb2_whole_omission[40 + i] - cb2_jittered_fwd[i]) > 1e-5f) return 44;
+    }
+    for (int c = 0; c < 3; ++c) {
+        const float expectedRay = evalRay(base_inv_rays.data(), 0.25f, 0.75f, c);
+        const float repairedRay = evalRay(&cb2_whole_omission[56], 0.25f + dxUv, 0.75f + dyUv, c);
+        if (std::fabs(repairedRay - expectedRay) > 1e-6f) return 45;
+    }
+    if (edpe::cobra_camera::repairDeferredWholeOmission(
+            cb2_whole_omission.data(), cb2_whole_omission.size(),
+            turning_block, inv_jitter, dxUv, dyUv)) return 46;
 
     return 0; // All temporal math tests passed
 }
