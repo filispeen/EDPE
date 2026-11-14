@@ -13,11 +13,7 @@
 
 namespace edpe {
 
-#ifndef EDPE_VERSION
-#define EDPE_VERSION "dev"
-#endif
-
-inline constexpr const char* kVersion = EDPE_VERSION;
+extern const char* const kVersion;
 
 inline bool isRunningInEliteProcess() {
     wchar_t modulePath[MAX_PATH]{};

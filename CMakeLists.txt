@@ -7,10 +7,6 @@ else()
     set(EDPE_BUILD_VERSION "dev")
 endif()
 
-if(NOT EDPE_BUILD_VERSION STREQUAL "dev")
-    add_compile_definitions(EDPE_VERSION="${EDPE_BUILD_VERSION}")
-endif()
-
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "EDPE requires 64-bit Windows")
 endif()
@@ -65,8 +61,13 @@ add_library(EDPE_DXGI SHARED
     src/jitter_debug_pass.cpp
     src/jitter_view_recorder.cpp
     src/hud_debug_pass.cpp
+    src/version.cpp
     src/dxgi_proxy.def
 )
+if(NOT EDPE_BUILD_VERSION STREQUAL "dev")
+    set_source_files_properties(src/version.cpp PROPERTIES
+        COMPILE_DEFINITIONS EDPE_VERSION="${EDPE_BUILD_VERSION}")
+endif()
 target_compile_features(EDPE_DXGI PRIVATE cxx_std_20)
 target_compile_definitions(EDPE_DXGI PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_source_files_properties(src/shaders/ui_layer_composite_cs.hlsl PROPERTIES HEADER_FILE_ONLY TRUE)
@@ -170,7 +171,7 @@ add_executable(jitter_view_report_test tests/jitter_view_report_test.cpp)
 target_compile_features(jitter_view_report_test PRIVATE cxx_std_20)
 target_include_directories(jitter_view_report_test PRIVATE src)
 add_test(NAME jitter_view_report COMMAND jitter_view_report_test)
-add_executable(crash_logger_test tests/crash_logger_test.cpp src/crash_logger.cpp src/log.cpp)
+add_executable(crash_logger_test tests/crash_logger_test.cpp src/crash_logger.cpp src/log.cpp src/version.cpp)
 target_compile_features(crash_logger_test PRIVATE cxx_std_20)
 target_compile_definitions(crash_logger_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(crash_logger_test PRIVATE src)
