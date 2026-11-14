@@ -33,6 +33,8 @@ jobs:
   build-and-release:
     name: Build and Publish Release
     runs-on: windows-latest
+    env:
+      HAS_NEXUSMODS_API_KEY: ${{ secrets.NEXUSMODS_API_KEY != '' }}
 
     steps:
       - name: Checkout repository
@@ -163,9 +165,14 @@ jobs:
           $sha256 = (Get-FileHash -Path $archiveName -Algorithm SHA256).Hash
 
           Write-Host "Created archive: $archiveName (SHA-256: $sha256)"
+          $cleanVersion = $tag -replace '^v', ''
+          $tagMsg = if (Test-Path "tag-message.md") { (Get-Content -Path "tag-message.md" -Raw -Encoding utf8).Trim() } else { "EDPE Release $tag" }
+          $delim = "NEXUS_EOF_$([guid]::NewGuid().ToString('N'))"
           "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha256=$sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "clean_version=$cleanVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "changelog<<$delim`n$tagMsg`n$delim" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Publish GitHub Release
         id: release
@@ -243,3 +250,24 @@ jobs:
           } catch {
             Write-Warning "Failed to notify Discord: $_"
           }
+
+      - name: Upload Release to Nexus Mods
+        if: >-
+          env.HAS_NEXUSMODS_API_KEY == 'true' &&
+          vars.NEXUSMODS_FILE_ID != '' &&
+          github.ref_type == 'tag' &&
+          !(inputs.prerelease || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha'))
+        continue-on-error: true
+        uses: Nexus-Mods/upload-action@v1
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          file_id: ${{ vars.NEXUSMODS_FILE_ID }}
+          mod_id: ${{ vars.NEXUSMODS_MOD_ID }}
+          filename: ${{ steps.package.outputs.archive_name }}
+          version: ${{ steps.package.outputs.clean_version }}
+          display_name: EDPE ${{ steps.package.outputs.tag }}
+          description: Automated release from GitHub (${{ steps.release.outputs.url }})
+          category: main
+          archive_existing_version: 'true'
+          update_mod_version: 'true'
+          changelog: ${{ vars.NEXUSMODS_MOD_ID != '' && steps.package.outputs.changelog || '' }}
