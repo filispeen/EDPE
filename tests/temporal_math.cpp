@@ -188,5 +188,40 @@ int main() {
         if (!edpe::parseEliteCamera(scene.data(), scene.size(), &jittered_cam)) return 27;
     }
 
+    // 208-byte CB0 transpose projection validation and jitter recovery
+    float dot_turning[16]{};
+    for (unsigned row = 0; row < 4; ++row)
+        for (unsigned col = 0; col < 4; ++col)
+            dot_turning[row * 4 + col] = turning_block[col * 4 + row];
+    if (!edpe::estimateEliteTransposeBlockNdcOffset(dot_turning, &native) ||
+        std::fabs(native.x) > 1e-5f || std::fabs(native.y) > 1e-5f) return 28;
+    if (!edpe::matchesEliteTransposeProjectionBlock(dot_turning, parsed)) return 29;
+
+    for (unsigned frame = 0; frame < 16; ++frame) {
+        const auto jitter = edpe::projectionJitter(frame, 2560, 1440);
+        float dot_jittered[16]{};
+        if (!edpe::jitterEliteDotProjectionBlock(dot_turning, dot_jittered, jitter)) return 30;
+        edpe::NdcOffset recovered{};
+        if (!edpe::estimateEliteTransposeBlockNdcOffset(dot_jittered, &recovered) ||
+            std::fabs(recovered.x - jitter.ndcX) > 1e-5f ||
+            std::fabs(recovered.y - jitter.ndcY) > 1e-5f) return 31;
+        if (!edpe::matchesEliteTransposeProjectionBlock(dot_jittered, parsed)) return 32;
+    }
+
+    float bad_dot[16]{};
+    for (size_t i = 0; i < 16; ++i) bad_dot[i] = dot_turning[i];
+    bad_dot[11] = 0.0f; // Invalid depthB
+    if (edpe::matchesEliteTransposeProjectionBlock(bad_dot, parsed)) return 33;
+    bad_dot[11] = dot_turning[11];
+    bad_dot[10] = 0.5f; // Unexpected non-zero orthogonal/clip Z cell
+    if (edpe::matchesEliteTransposeProjectionBlock(bad_dot, parsed)) return 34;
+
+    auto wrong_fov_cam = parsed;
+    wrong_fov_cam.scaleX *= 1.10f;
+    if (edpe::matchesEliteTransposeProjectionBlock(dot_turning, wrong_fov_cam)) return 35;
+
+    if (edpe::estimateEliteTransposeBlockNdcOffset(no_w, &native) ||
+        edpe::matchesEliteTransposeProjectionBlock(no_w, parsed)) return 36;
+
     return 0; // All temporal math tests passed
 }
