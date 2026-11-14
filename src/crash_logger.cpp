@@ -533,13 +533,18 @@ static LONG WINAPI edpeUnhandledExceptionFilter(EXCEPTION_POINTERS* ep) {
 }
 
 static LONG WINAPI edpeVectoredExceptionHandler(PEXCEPTION_POINTERS ep) {
-    if (!ep || !ep->ExceptionRecord || edpe::g_inSafeMemProbe) {
+    if (!ep || !ep->ExceptionRecord) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
     switch (code) {
         case EXCEPTION_ACCESS_VIOLATION:
         case EXCEPTION_IN_PAGE_ERROR:
+            if (edpe::isInSafeMemProbe()) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            writeCrashDump(ep);
+            break;
         case EXCEPTION_ILLEGAL_INSTRUCTION:
         case EXCEPTION_INT_DIVIDE_BY_ZERO:
         case EXCEPTION_STACK_OVERFLOW:

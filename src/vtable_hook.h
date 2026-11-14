@@ -98,7 +98,38 @@ inline HMODULE probeSystemD3D11Module() {
 
 namespace edpe {
 
-inline thread_local bool g_inSafeMemProbe = false;
+inline DWORD safeMemProbeTlsIndex() {
+    static volatile LONG s_tlsSlot = -1;
+    LONG slot = s_tlsSlot;
+    if (slot == -1) {
+        const DWORD allocated = TlsAlloc();
+        if (allocated == TLS_OUT_OF_INDEXES) return TLS_OUT_OF_INDEXES;
+        const LONG prev = InterlockedCompareExchange(&s_tlsSlot, static_cast<LONG>(allocated), -1);
+        if (prev != -1) {
+            TlsFree(allocated);
+            return static_cast<DWORD>(prev);
+        }
+        slot = static_cast<LONG>(allocated);
+    }
+    return static_cast<DWORD>(slot);
+}
+
+inline bool isInSafeMemProbe() {
+    const DWORD slot = safeMemProbeTlsIndex();
+    if (slot == TLS_OUT_OF_INDEXES) return false;
+    const DWORD lastErr = GetLastError();
+    const bool active = (TlsGetValue(slot) != nullptr);
+    SetLastError(lastErr);
+    return active;
+}
+
+inline void setInSafeMemProbe(bool active) {
+    const DWORD slot = safeMemProbeTlsIndex();
+    if (slot == TLS_OUT_OF_INDEXES) return;
+    const DWORD lastErr = GetLastError();
+    TlsSetValue(slot, active ? reinterpret_cast<LPVOID>(static_cast<uintptr_t>(1)) : nullptr);
+    SetLastError(lastErr);
+}
 
 enum class HookMode {
     InPlace,  // Patch entries directly inside the object's existing vtable
@@ -124,7 +155,7 @@ inline bool safeReadPtr(const void* addr, void** outVal) {
         *outVal = nullptr;
         return false;
     }
-    g_inSafeMemProbe = true;
+    setInSafeMemProbe(true);
     bool ok = false;
     void* val = nullptr;
     __try {
@@ -134,14 +165,14 @@ inline bool safeReadPtr(const void* addr, void** outVal) {
         val = nullptr;
         ok = false;
     }
-    g_inSafeMemProbe = false;
+    setInSafeMemProbe(false);
     *outVal = val;
     return ok;
 }
 
 inline bool safeWritePtr(void* addr, void* val) {
     if (!addr) return false;
-    g_inSafeMemProbe = true;
+    setInSafeMemProbe(true);
     bool ok = false;
     __try {
         *reinterpret_cast<void**>(addr) = val;
@@ -149,7 +180,7 @@ inline bool safeWritePtr(void* addr, void* val) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         ok = false;
     }
-    g_inSafeMemProbe = false;
+    setInSafeMemProbe(false);
     return ok;
 }
 

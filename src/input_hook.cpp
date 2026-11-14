@@ -16,38 +16,55 @@
 
 namespace edpe {
 
+static bool isValidRva(DWORD rva, DWORD sizeNeeded, DWORD imageSize) {
+    if (rva == 0 || imageSize == 0 || sizeNeeded > imageSize) return false;
+    return rva <= imageSize - sizeNeeded;
+}
+
 bool patchIatEntry(HMODULE module, const char* targetDll, const char* targetFunction, void* hook, void** orig) {
     if (!module || !targetDll || !targetFunction || !hook) return false;
 
+    auto* base = reinterpret_cast<uint8_t*>(module);
     auto* dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(module);
     if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    if (dosHeader->e_lfanew <= 0 || dosHeader->e_lfanew >= 0x100000) return false;
 
-    auto* ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
-        reinterpret_cast<uint8_t*>(module) + dosHeader->e_lfanew);
+    auto* ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dosHeader->e_lfanew);
     if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return false;
+    if (ntHeaders->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+
+    const DWORD imageSize = ntHeaders->OptionalHeader.SizeOfImage;
+    if (imageSize < sizeof(IMAGE_NT_HEADERS)) return false;
 
     const auto& importDataDir = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (importDataDir.VirtualAddress == 0 || importDataDir.Size == 0) return false;
+    if (!isValidRva(importDataDir.VirtualAddress, sizeof(IMAGE_IMPORT_DESCRIPTOR), imageSize)) return false;
 
-    auto* importDesc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(
-        reinterpret_cast<uint8_t*>(module) + importDataDir.VirtualAddress);
+    auto* importDesc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + importDataDir.VirtualAddress);
+    const auto* importEnd = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
+        base + importDataDir.VirtualAddress +
+        (importDataDir.Size <= imageSize - importDataDir.VirtualAddress
+             ? importDataDir.Size
+             : imageSize - importDataDir.VirtualAddress));
 
-    for (; importDesc->Name != 0; ++importDesc) {
-        const char* currentDll = reinterpret_cast<const char*>(
-            reinterpret_cast<uint8_t*>(module) + importDesc->Name);
+    for (; importDesc + 1 <= importEnd && importDesc->Name != 0; ++importDesc) {
+        if (!isValidRva(importDesc->Name, 1, imageSize)) continue;
+        const char* currentDll = reinterpret_cast<const char*>(base + importDesc->Name);
         if (_stricmp(currentDll, targetDll) != 0) continue;
 
-        auto* thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(
-            reinterpret_cast<uint8_t*>(module) +
-            (importDesc->OriginalFirstThunk ? importDesc->OriginalFirstThunk : importDesc->FirstThunk));
-        auto* iat = reinterpret_cast<PIMAGE_THUNK_DATA>(
-            reinterpret_cast<uint8_t*>(module) + importDesc->FirstThunk);
+        // Require OriginalFirstThunk: a zero OriginalFirstThunk forces walking FirstThunk,
+        // which already holds resolved 64-bit VAs at runtime rather than RVAs.
+        if (!isValidRva(importDesc->OriginalFirstThunk, sizeof(IMAGE_THUNK_DATA), imageSize)) continue;
+        if (!isValidRva(importDesc->FirstThunk, sizeof(IMAGE_THUNK_DATA), imageSize)) continue;
+
+        auto* thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(base + importDesc->OriginalFirstThunk);
+        auto* iat = reinterpret_cast<PIMAGE_THUNK_DATA>(base + importDesc->FirstThunk);
 
         for (; thunk->u1.AddressOfData != 0; ++thunk, ++iat) {
             if (IMAGE_SNAP_BY_ORDINAL(thunk->u1.Ordinal)) continue;
+            if (thunk->u1.AddressOfData > imageSize - sizeof(WORD) - 1) continue;
 
-            auto* importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(
-                reinterpret_cast<uint8_t*>(module) + thunk->u1.AddressOfData);
+            const DWORD nameRva = static_cast<DWORD>(thunk->u1.AddressOfData);
+            auto* importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + nameRva);
             if (strcmp(reinterpret_cast<const char*>(importByName->Name), targetFunction) == 0) {
                 DWORD oldProtect = 0;
                 if (!VirtualProtect(&iat->u1.Function, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -57,7 +74,8 @@ bool patchIatEntry(HMODULE module, const char* targetDll, const char* targetFunc
                     *orig = reinterpret_cast<void*>(iat->u1.Function);
                 }
                 iat->u1.Function = reinterpret_cast<ULONG_PTR>(hook);
-                VirtualProtect(&iat->u1.Function, sizeof(void*), oldProtect, &oldProtect);
+                DWORD ignored = 0;
+                VirtualProtect(&iat->u1.Function, sizeof(void*), oldProtect, &ignored);
                 return true;
             }
         }
