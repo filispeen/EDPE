@@ -141,6 +141,16 @@ inline bool safeWritePtr(void* addr, void* val) {
     }
 }
 
+/// Reads a single pointer-sized vptr slot with SEH protection and no VirtualQuery syscall.
+inline void* safeReadPtrFast(const void* addr) noexcept {
+    if (!addr) return nullptr;
+    __try {
+        return *reinterpret_cast<void* const*>(addr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
 inline bool isExecutableCodePtr(const void* p) {
     if (!p) return false;
     MEMORY_BASIC_INFORMATION mbi{};
@@ -460,6 +470,21 @@ public:
         m_instance = nullptr;
         m_vtable = nullptr;
         m_initialized = false;
+    }
+
+    /// Fast lock-free/syscall-free check for LiveCopy mode on an actively invoked instance;
+    /// falls back to full reclaim() only if the instance's vptr drifted.
+    bool reclaimLive(void* liveInstance) {
+        if (isLiveCopyVptrValid(liveInstance)) {
+            return false;
+        }
+        return reclaim();
+    }
+
+    bool isLiveCopyVptrValid(const void* liveInstance) const noexcept {
+        return m_initialized && m_mode == HookMode::LiveCopy &&
+               m_privateTable && liveInstance && m_instance == liveInstance &&
+               safeReadPtrFast(liveInstance) == m_privateTable;
     }
 
     bool isInitialized() const { return m_initialized; }

@@ -112,7 +112,8 @@ jobs:
           variant: sccache
           key: ${{ runner.os }}-sccache-${{ github.ref_name }}
           restore-keys: |
-            ${{ runner.os }}-sccache-
+            sccache-${{ runner.os }}-sccache-${{ github.event.repository.default_branch }}-
+            sccache-${{ runner.os }}-sccache-
           max-size: 2G
 
       - name: Configure CMake
@@ -120,13 +121,13 @@ jobs:
         shell: pwsh
         run: |
           $ver = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
-          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build EDPE (Release)
         if: ${{ !inputs.has-artifact }}
         shell: pwsh
         run: |
-          cmake --build build --config Release --parallel
+          cmake --build build --target proxy_stage --parallel
 
       - name: Download Staged Binaries
         if: ${{ inputs.has-artifact }}

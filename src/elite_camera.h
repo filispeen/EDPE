@@ -68,4 +68,72 @@ inline bool parseEliteCamera(const float* words, size_t count, CameraProjection*
     return true;
 }
 
+// Inverse of jitterEliteDotProjectionBlock on the 208-byte CB0 transpose layout
+// (cb0[4..7], i.e. transposed cb1[270..273]). Row 3 holds view-Z forward.
+inline bool estimateEliteTransposeBlockNdcOffset(const float* block16, NdcOffset* outOffset) {
+    if (!block16 || !outOffset) return false;
+    double ww = 0.0, xw = 0.0, yw = 0.0;
+    for (size_t col = 0; col < 3; ++col) {
+        const double x = block16[col];
+        const double y = block16[4 + col];
+        const double w = block16[12 + col];
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w)) return false;
+        ww += w * w;
+        xw += x * w;
+        yw += y * w;
+    }
+    if (!(ww > 1e-6)) return false;
+    outOffset->x = static_cast<float>(xw / ww);
+    outOffset->y = static_cast<float>(yw / ww);
+    return true;
+}
+
+// Validates that a 16-float transpose projection block matches refCam's orientation,
+// FOV scales (within 2%), and perspective depthB layout before injecting jitter.
+inline bool matchesEliteTransposeProjectionBlock(const float* block16,
+    const CameraProjection& refCam) {
+    if (!block16 || !(refCam.scaleX > 0.0f && refCam.scaleY > 0.0f)) return false;
+    for (size_t i = 0; i < 16; ++i)
+        if (!std::isfinite(block16[i])) return false;
+    // Transposed row 3 col 2 (depthB) lands at index 11; unused projection cells must be near zero.
+    if (!(block16[11] >= 0.01f && block16[11] <= 0.25f)) return false;
+    if (std::fabs(block16[3]) > 0.002f || std::fabs(block16[7]) > 0.002f ||
+        std::fabs(block16[8]) > 0.002f || std::fabs(block16[9]) > 0.002f ||
+        std::fabs(block16[10]) > 0.002f || std::fabs(block16[15]) > 0.002f) {
+        return false;
+    }
+    const double ww = static_cast<double>(block16[12]) * block16[12] +
+                      static_cast<double>(block16[13]) * block16[13] +
+                      static_cast<double>(block16[14]) * block16[14];
+    if (ww < 0.96 || ww > 1.04) return false;
+
+    NdcOffset ndc{};
+    if (!estimateEliteTransposeBlockNdcOffset(block16, &ndc)) return false;
+    if (std::fabs(ndc.x) > 0.05f || std::fabs(ndc.y) > 0.05f) return false;
+
+    double lenSq0 = 0.0, lenSq1 = 0.0;
+    double r0[3]{}, r1[3]{};
+    for (size_t i = 0; i < 3; ++i) {
+        r0[i] = static_cast<double>(block16[i]) - static_cast<double>(ndc.x) * block16[12 + i];
+        r1[i] = static_cast<double>(block16[4 + i]) - static_cast<double>(ndc.y) * block16[12 + i];
+        lenSq0 += r0[i] * r0[i];
+        lenSq1 += r1[i] * r1[i];
+    }
+    const double len0 = std::sqrt(lenSq0);
+    const double len1 = std::sqrt(lenSq1);
+    if (!(len0 > 0.0 && len1 > 0.0)) return false;
+    if (std::fabs(len0 - refCam.scaleX) > 0.02 * refCam.scaleX ||
+        std::fabs(len1 - refCam.scaleY) > 0.02 * refCam.scaleY) {
+        return false;
+    }
+
+    double trace = 0.0;
+    for (size_t row = 0; row < 3; ++row) {
+        trace += (r0[row] / len0) * refCam.worldFromView[row * 4] +
+                 (r1[row] / len1) * refCam.worldFromView[row * 4 + 1] +
+                 static_cast<double>(block16[12 + row]) * refCam.worldFromView[row * 4 + 2];
+    }
+    return trace > 2.95;
+}
+
 } // namespace edpe

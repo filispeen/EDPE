@@ -4,6 +4,7 @@
 #include "camera_delta.h"
 #include "dxbc_fanout.h"
 #include "elite_camera.h"
+#include "cobra_camera_inject.h"
 #include "log.h"
 #include "motion_pass.h"
 #include "shader_probe.h"
@@ -51,6 +52,7 @@ constexpr size_t kDrawIndexedInstanced = 20;
 constexpr size_t kDrawInstanced = 21;
 constexpr size_t kOMSetRenderTargets = 33;
 constexpr size_t kOMSetRenderTargetsAndUnorderedAccessViews = 34;
+constexpr size_t kUpdateSubresource = 48;
 constexpr size_t kExecuteCommandList = 58;
 constexpr size_t kFinishCommandList = 114;
 constexpr unsigned kPairFirstSample = 100;
@@ -72,6 +74,8 @@ using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 using MapFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*,
     UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
 using UnmapFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
+using UpdateSubresourceFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*,
+    UINT, const D3D11_BOX*, const void*, UINT, UINT);
 using DrawIndexedInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     UINT, UINT, INT, UINT);
 using DrawInstancedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
@@ -138,6 +142,7 @@ std::atomic<DrawIndexedFn> original_draw_indexed{nullptr};
 std::atomic<DrawFn> original_draw{nullptr};
 std::atomic<MapFn> original_map{nullptr};
 std::atomic<UnmapFn> original_unmap{nullptr};
+std::atomic<UpdateSubresourceFn> original_update_subresource{nullptr};
 std::atomic<DrawIndexedInstancedFn> original_draw_indexed_instanced{nullptr};
 std::atomic<DrawInstancedFn> original_draw_instanced{nullptr};
 std::atomic<ID3D11DeviceContext*> observed_context{nullptr};
@@ -165,6 +170,7 @@ struct HookedTableEntry {
     FinishCommandListFn orig_finish = nullptr;
     MapFn orig_map = nullptr;
     UnmapFn orig_unmap = nullptr;
+    UpdateSubresourceFn orig_update_subresource = nullptr;
     VSSetConstantBuffersFn orig_vs_cb = nullptr;
     DrawIndexedFn orig_draw_indexed = nullptr;
     DrawFn orig_draw = nullptr;
@@ -176,6 +182,9 @@ static std::atomic<size_t> s_hooked_table_count{0};
 static HookedTableEntry s_hooked_tables[kMaxHookedTables]{};
 static std::array<std::unique_ptr<edpe::VTableHook>, kMaxHookedTables> s_context_vtable_hooks{};
 static std::mutex s_hooked_tables_mutex;
+static std::atomic<ID3D11DeviceContext*> s_primary_hook_ctx{nullptr};
+static std::atomic<void**> s_primary_live_table{nullptr};
+static std::atomic<edpe::VTableHook*> s_primary_vtable_hook{nullptr};
 
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_engine_velocity_texture;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_engine_velocity_srv;
@@ -184,9 +193,7 @@ static unsigned long long s_map_shader_seen_frame = ~0ull;
 static float s_last_jittered_forward_block[16]{};
 static float s_last_unjittered_forward_block[16]{};
 static float s_last_unjittered_inv_rays[12]{};
-static bool s_has_reference_cb0_blocks = false;
-static Microsoft::WRL::ComPtr<ID3D11Buffer> s_deferred_cb2_staging;
-static Microsoft::WRL::ComPtr<ID3D11Buffer> s_deferred_cb2_override;
+static unsigned long long s_reference_cb0_blocks_frame = ~0ull;
 static constexpr size_t kDofRingSize = 8;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dof_ring_tex[kDofRingSize]{};
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dof_ring_srv[kDofRingSize]{};
@@ -214,6 +221,7 @@ struct ClonedContextVtable {
     OMSetRenderTargetsAndUnorderedAccessViewsFn orig_om_uav = nullptr;
     MapFn orig_map = nullptr;
     UnmapFn orig_unmap = nullptr;
+    UpdateSubresourceFn orig_update_subresource = nullptr;
     void* methods[134]{};
 };
 static constexpr size_t kMaxClonedContexts = 16;
@@ -440,8 +448,9 @@ static unsigned s_consecutive_skipped_frames = 0;
 static edpe::CameraProjection s_anchor_camera{};
 static bool s_anchor_valid = false;
 static unsigned long long s_anchor_frame = ~0ull;
+static edpe::CameraProjection s_last_true_camera{};
+static unsigned long long s_last_true_camera_frame = ~0ull;
 static bool s_probe_seen_this_frame = false;
-static unsigned s_spike_reject_streak = 0;
 static unsigned s_consecutive_fallback_frames = 0;
 static unsigned s_unreconstructed_jitter_streak = 0;
 
@@ -585,60 +594,54 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
 
     out_scene_cut = false;
     if (s_has_staged_camera && s_staged_camera_frame == rendered_frame) {
-        float dtRatio = 1.0f;
-        if (s_last_frame_dt > 1e-5f && s_current_frame_dt > 1e-5f) {
-            dtRatio = s_current_frame_dt / s_last_frame_dt;
-        }
-
         if (s_camera_now.scaleX > 0.0f) {
-            const float rotTrace = edpe::cameraRotationTrace(s_staged_camera, s_camera_now);
+            const edpe::CameraProjection& prevRef =
+                (s_consecutive_fallback_frames > 0 && s_last_true_camera.scaleX > 0.0f)
+                    ? s_last_true_camera
+                    : s_camera_now;
+            const float rotTrace = edpe::cameraRotationTrace(s_staged_camera, prevRef);
             const bool fovChanged =
-                std::fabs(s_camera_now.scaleX - s_staged_camera.scaleX) > 0.01f * s_camera_now.scaleX;
+                std::fabs(prevRef.scaleX - s_staged_camera.scaleX) > 0.01f * prevRef.scaleX;
 
             s_prev_valid_velocity = s_last_valid_velocity;
             if (rotTrace < 2.414f || fovChanged) {
                 out_scene_cut = true;
                 s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                s_camera_previous = s_camera_now;
+                s_camera_previous_frame = s_camera_frame;
+            } else if (s_consecutive_fallback_frames > 0 && s_last_true_camera.scaleX > 0.0f) {
+                s_camera_previous = s_last_true_camera;
+                s_camera_previous_frame = s_last_true_camera_frame;
+                const edpe::Vec3 trueDelta =
+                    edpe::cameraPosition(s_staged_camera) - edpe::cameraPosition(s_last_true_camera);
+                const float trueDist = edpe::length(trueDelta);
+                const unsigned long long gap =
+                    (rendered_frame > s_last_true_camera_frame)
+                        ? (rendered_frame - s_last_true_camera_frame)
+                        : 1ull;
+                if (trueDist > 50.0f) {
+                    out_scene_cut = true;
+                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                } else {
+                    out_scene_cut = false;
+                    s_last_valid_velocity = (s_consecutive_fallback_frames == 1 && trueDist <= 2.0f)
+                        ? (trueDelta * (1.0f / static_cast<float>(gap)))
+                        : edpe::Vec3{0.0f, 0.0f, 0.0f};
+                }
             } else {
-                out_scene_cut = false;
+                s_camera_previous = s_camera_now;
+                s_camera_previous_frame = s_camera_frame;
                 const edpe::Vec3 newDelta =
                     edpe::cameraPosition(s_staged_camera) - edpe::cameraPosition(s_camera_now);
-                const edpe::Vec3 right = edpe::cameraRight(s_staged_camera);
-                const edpe::Vec3 up    = edpe::cameraUp(s_staged_camera);
-                const edpe::Vec3 fwd   = edpe::cameraForward(s_staged_camera);
-
-                const float dLen   = edpe::length(newDelta);
-                const float dRight = std::fabs(edpe::dot(newDelta, right));
-                const float dUp    = std::fabs(edpe::dot(newDelta, up));
-                const float dFwd   = std::fabs(edpe::dot(newDelta, fwd));
-
-                const bool isLateralSpike = (dRight >= 0.80f * dLen && dUp < 0.045f && dFwd < 0.045f);
-                const bool isCockpitHeadSpike = (dRight < 0.025f && dUp >= 0.65f * dLen && dFwd >= 0.45f * dLen);
-
-                const bool looksLikeSuddenSpike =
-                    (rotTrace > 2.992f && dLen >= 0.032f && dLen <= 0.36f &&
-                     (isLateralSpike || isCockpitHeadSpike));
-
-                if (looksLikeSuddenSpike && s_anchor_valid && (rendered_frame <= s_anchor_frame + 2) &&
-                    !edpe::matchesAnchorPrediction(s_staged_camera, s_anchor_camera, s_last_valid_velocity, dtRatio)) {
-                    if (++s_spike_reject_streak < 6) {
-                        // Відхиляємо staged камеру - утримуємо попередню валідну камеру з екстраполяцією:
-                        s_has_staged_camera = false;
-                        s_camera_previous = s_camera_now;
-                        s_camera_previous_frame = s_camera_frame;
-                        const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
-                        edpe::cameraSetPosition(s_camera_now, extPos);
-                        s_camera_frame = rendered_frame;
-                        out_scene_cut = false;
-                        s_last_committed_scene_cut = out_scene_cut;
-                        return;
-                    }
+                const float newDist = edpe::length(newDelta);
+                if (newDist > 50.0f) {
+                    out_scene_cut = true;
+                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                } else {
+                    out_scene_cut = false;
+                    s_last_valid_velocity = newDelta;
                 }
-
-                s_last_valid_velocity = newDelta;
             }
-            s_camera_previous = s_camera_now;
-            s_camera_previous_frame = s_camera_frame;
         } else {
             s_camera_previous = s_staged_camera;
             s_camera_previous_frame = rendered_frame;
@@ -648,28 +651,34 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         }
 
         s_consecutive_fallback_frames = 0;
-        s_spike_reject_streak = 0;
         s_cut_rejection_streak = 0;
         s_teleport_rejection_streak = 0;
         s_anchor_camera = s_staged_camera;
         s_anchor_valid = true;
         s_anchor_frame = rendered_frame;
 
+        s_last_true_camera = s_staged_camera;
+        s_last_true_camera_frame = rendered_frame;
         s_camera_now = s_staged_camera;
         s_camera_frame = rendered_frame;
         s_has_staged_camera = false;
         s_staged_from_in_scene = false;
     } else if (s_camera_now.scaleX > 0.0f) {
-        // Fallback: жоден пас не оновив камеру — плавна екстраполяція без скидання TAA/DLAA
-        if (++s_consecutive_fallback_frames > 2) {
-            s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+        // Fallback: жоден пас не оновив камеру — обмежена екстраполяція щонайбільше на 1 кадр
+        ++s_consecutive_fallback_frames;
+        if (s_consecutive_fallback_frames > 2) {
             s_anchor_valid = false;
+            s_camera_reset = true;
         }
         s_prev_valid_velocity = s_last_valid_velocity;
         s_camera_previous = s_camera_now;
         s_camera_previous_frame = s_camera_frame;
-        const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
-        edpe::cameraSetPosition(s_camera_now, extPos);
+        if (s_consecutive_fallback_frames == 1 && edpe::length(s_last_valid_velocity) <= 1.0f) {
+            const edpe::Vec3 extPos = edpe::cameraPosition(s_camera_now) + s_last_valid_velocity;
+            edpe::cameraSetPosition(s_camera_now, extPos);
+        } else {
+            s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+        }
         s_camera_frame = rendered_frame;
         out_scene_cut = false;
     }
@@ -885,6 +894,7 @@ static bool s_post_ldr_backbuffer_no_dsv = false;
 static unsigned s_post_ldr_backbuffer_ui_draws = 0;
 static std::uint64_t s_current_hud_vs_hash = 0;
 static std::uint64_t s_current_hud_ps_hash = 0;
+static unsigned long long s_last_primary_cockpit_hud_frame = ~0ull;
 struct HudPairFrameStat {
     std::uint64_t vs = 0;
     std::uint64_t ps = 0;
@@ -982,31 +992,41 @@ std::atomic<ID3D11Buffer*> scene_map_target{nullptr}; // Weak; valid only for th
 struct MappedBufferEntry {
     ID3D11Resource* resource = nullptr;
     void* mapped_ptr = nullptr;
+    UINT byte_width = 0;
 };
-static constexpr size_t kMaxTrackedMappedBuffers = 16;
+static constexpr size_t kMaxTrackedMappedBuffers = 32;
 static MappedBufferEntry s_tracked_mapped_buffers[kMaxTrackedMappedBuffers]{};
 static std::mutex s_tracked_mapped_buffers_mutex;
+static std::atomic<int> s_tracked_mapped_count{0};
 
-inline void trackMappedBuffer(ID3D11Resource* resource, void* ptr) {
+inline void trackMappedBuffer(ID3D11Resource* resource, void* ptr, UINT byteWidth = 5376) {
     if (!resource) return;
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         if (s_tracked_mapped_buffers[i].resource == resource || s_tracked_mapped_buffers[i].resource == nullptr) {
+            if (s_tracked_mapped_buffers[i].resource == nullptr) {
+                s_tracked_mapped_count.fetch_add(1, std::memory_order_release);
+            }
             s_tracked_mapped_buffers[i].resource = resource;
             s_tracked_mapped_buffers[i].mapped_ptr = ptr;
+            s_tracked_mapped_buffers[i].byte_width = byteWidth;
             return;
         }
     }
 }
 
-inline void* popMappedBuffer(ID3D11Resource* resource) {
-    if (!resource) return nullptr;
+inline void* popMappedBuffer(ID3D11Resource* resource, UINT* outByteWidth = nullptr) {
+    if (outByteWidth) *outByteWidth = 0;
+    if (!resource || s_tracked_mapped_count.load(std::memory_order_acquire) <= 0) return nullptr;
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         if (s_tracked_mapped_buffers[i].resource == resource) {
             void* ptr = s_tracked_mapped_buffers[i].mapped_ptr;
+            if (outByteWidth) *outByteWidth = s_tracked_mapped_buffers[i].byte_width;
             s_tracked_mapped_buffers[i].resource = nullptr;
             s_tracked_mapped_buffers[i].mapped_ptr = nullptr;
+            s_tracked_mapped_buffers[i].byte_width = 0;
+            s_tracked_mapped_count.fetch_sub(1, std::memory_order_release);
             return ptr;
         }
     }
@@ -1014,26 +1034,35 @@ inline void* popMappedBuffer(ID3D11Resource* resource) {
 }
 
 inline void clearTrackedMappedBuffers() {
+    if (s_tracked_mapped_count.load(std::memory_order_acquire) == 0) return;
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         s_tracked_mapped_buffers[i].resource = nullptr;
         s_tracked_mapped_buffers[i].mapped_ptr = nullptr;
+        s_tracked_mapped_buffers[i].byte_width = 0;
     }
+    s_tracked_mapped_count.store(0, std::memory_order_release);
 }
 
 inline void clearTrackedMappedBuffersExcept(ID3D11Resource* keep) {
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
+    int remaining = 0;
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         if (s_tracked_mapped_buffers[i].resource != keep) {
             s_tracked_mapped_buffers[i].resource = nullptr;
             s_tracked_mapped_buffers[i].mapped_ptr = nullptr;
+            s_tracked_mapped_buffers[i].byte_width = 0;
+        } else if (s_tracked_mapped_buffers[i].resource != nullptr) {
+            ++remaining;
         }
     }
+    s_tracked_mapped_count.store(remaining, std::memory_order_release);
 }
 
 static std::atomic<bool> s_hud_probe_armed_once{false};
 std::atomic<bool> map_hook_active{false};
 std::atomic<bool> unmap_hook_active{false};
+std::atomic<bool> update_subresource_hook_active{false};
 std::atomic<unsigned> scene_maps{0};
 std::atomic<unsigned> scene_unmaps{0};
 std::atomic<unsigned> scene_maps_after_draw{0};
@@ -1136,6 +1165,7 @@ static ID3D11RenderTargetView* s_cached_hdr_rtv0 = nullptr;
 struct CachedShaderHashEntry {
     const void* shader = nullptr;
     std::uint64_t hash = 0;
+    bool known = false;
 };
 static constexpr size_t kShaderHashCacheSize = 512;
 static CachedShaderHashEntry s_vs_hash_cache[kShaderHashCacheSize]{};
@@ -1144,17 +1174,17 @@ static inline std::uint64_t lookupOrFetchShaderHash(ID3D11DeviceChild* shader,
     CachedShaderHashEntry (&cache)[kShaderHashCacheSize]) {
     if (!shader) return 0;
     const size_t slot = (reinterpret_cast<uintptr_t>(shader) >> 4) & (kShaderHashCacheSize - 1);
-    if (cache[slot].shader == shader && cache[slot].hash != 0) {
+    if (cache[slot].shader == shader && cache[slot].known) {
         return cache[slot].hash;
     }
     std::uint64_t hash = 0;
     UINT sz = sizeof(hash);
-    if (SUCCEEDED(shader->GetPrivateData(kEdpeShaderHashGuid, &sz, &hash)) && sz == sizeof(hash) && hash != 0) {
-        cache[slot].shader = shader;
-        cache[slot].hash = hash;
-        return hash;
-    }
-    return 0;
+    const bool ok = SUCCEEDED(shader->GetPrivateData(kEdpeShaderHashGuid, &sz, &hash)) &&
+                    sz == sizeof(hash) && hash != 0;
+    cache[slot].shader = shader;
+    cache[slot].hash = ok ? hash : 0;
+    cache[slot].known = true;
+    return cache[slot].hash;
 }
 
 static inline bool getFastBoundShaderHashes(ID3D11DeviceContext* context,
@@ -1382,18 +1412,12 @@ enum class HudDrawResult {
     HudReplay
 };
 
-bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
-    // Verified Cockpit HUD & HDR UI shader families.
-    // Explicitly excludes non-HUD Pass 35 world shaders:
-    // - 0xD1281DF454A153AD / 0x97DBC87FCAA429C4 (sun corona & radar glow; taking it pulls the real sun over the cockpit)
-    // - 0x5559BD94B6852E83 / 0xB12F7A618E1BDE98 (3D depth-sampling target & ship holograms)
-    // - 0x71DD8B8B09060A81 / 0x2D037A047171BF3B (world-space brackets)
-    // - 0xB018D143700AB803 / 0x258B95AC99520C1F (null-output depth/stencil quad)
-    // - 0x4EF6DDB075A927FA (main menu hangar / loading screen quad)
+bool isPrimaryCockpitHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
+    // Primary cockpit / HUD / HDR UI shader families whose execution confirms an
+    // active cockpit or UI overlay rather than bare on-foot 3D hangar/world draws.
     if (vs_hash == 0x81216C77F90DEDD6ull || // Cockpit holo panels (stock lit A2965EC2, EDHM 16F88966, unlit B4786E0A, text 41B9D7B2, icons B357E4E5, radar sweep C610FB6F, AB82734F)
         vs_hash == 0x1989E6D3B405FDE0ull || // Cockpit holo panels (DisableGuiEffects variant PS EAB8A1C95A13FFBE)
         vs_hash == 0x925ACEDA0153AA5Bull || // Planetary / Orbital Cruise shadowless holo panels (kUiVsHoloNoShadow)
-        vs_hash == 0xB7790CBFC6554097ull || // Flight HUD vector lines, altimeter ladder & pitch ladder (PS 8DEF46452FA459F5 / EDHM B1CA8D8EEF7C886D)
         vs_hash == 0xE508648660A352B2ull || // HUD sprite & target/distance/planetary label composite (kHudSprite, PS 499044B497EE6B2C / 63ABD86359B57D01)
         vs_hash == 0x5DA53D8B0133341Eull || // Target direction indicator quad (kTargetIndicator)
         vs_hash == 0xDF3503CD07F9B10Cull || // Radar disc & stalks hologram family (kHoloFamiliesTake)
@@ -1414,14 +1438,28 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
            (vs_hash == 0x1989B75BF034ECC3ull && ps_hash == 0xDB79AE788E049DFDull) || // Radar contact triangles & elevation stalks
            (vs_hash == 0xC7FA0C0F5DD49180ull && ps_hash == 0x6EEF165A350DA30Full) || // Orbit / exclusion lines (kOrbitLines)
            (vs_hash == 0xA47A3315FFF5E2E4ull && ps_hash == 0x869FFF43E875906Eull) || // Supercruise speed/distance bars (kSupercruiseBars)
-           (vs_hash == 0x9BFC7FD232328391ull && ps_hash == 0xDBF1725726018F52ull) || // Supercruise space dust particles (kSpaceDust)
-           (vs_hash == 0xE904D334BC8B11EAull && ps_hash == 0x095030F27D2C362Aull) || // Normal-space dust particles (kNormalSpaceDust)
            (vs_hash == 0x1012E00B3CB44469ull && ps_hash == 0x666EF0C4C616F67Eull) || // HDR UI glyph atlas text / SRV turret HUD (kGuiText)
            (vs_hash == 0xA3E5D3FCBC1165F8ull && ps_hash == 0x019E81F4EECFB371ull) || // HDR UI BC7 icon pages / SRV turret HUD (kGuiIcons)
            (vs_hash == 0x1E8D013722FE71B8ull && ps_hash == 0x3D62E1CE0B0ECDF6ull) || // HDR UI solid/gradient widget primitives (kUiWidget)
            (vs_hash == 0x12382D2EA45E9632ull && ps_hash == 0x855C469156AB997Full) || // Galaxy/System Map & Orrery canvas (kMapCanvas)
            (vs_hash == 0xC31238331D8AC3D4ull &&                                      // Galaxy/System Map & Orrery sprites (kMapSprite)
             (ps_hash == 0xBD0FEB3276C8B2D7ull || ps_hash == 0x539A4858CE3A3477ull || ps_hash == 0x964221955A9E77E7ull));
+}
+
+bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
+    // Verified Cockpit HUD & HDR UI shader families.
+    // Explicitly excludes non-HUD Pass 35 world shaders:
+    // - 0xD1281DF454A153AD / 0x97DBC87FCAA429C4 (sun corona & radar glow; taking it pulls the real sun over the cockpit)
+    // - 0x5559BD94B6852E83 / 0xB12F7A618E1BDE98 (3D depth-sampling target & ship holograms)
+    // - 0x71DD8B8B09060A81 / 0x2D037A047171BF3B (world-space brackets)
+    // - 0xB018D143700AB803 / 0x258B95AC99520C1F (null-output depth/stencil quad)
+    // - 0x4EF6DDB075A927FA (main menu hangar / loading screen quad)
+    if (isPrimaryCockpitHudShaderPair(vs_hash, ps_hash)) {
+        return true;
+    }
+    return vs_hash == 0xB7790CBFC6554097ull || // Flight HUD vector lines, altimeter ladder & pitch ladder (PS 8DEF46452FA459F5 / EDHM B1CA8D8EEF7C886D)
+           (vs_hash == 0x9BFC7FD232328391ull && ps_hash == 0xDBF1725726018F52ull) || // Supercruise space dust particles (kSpaceDust)
+           (vs_hash == 0xE904D334BC8B11EAull && ps_hash == 0x095030F27D2C362Aull);   // Normal-space dust particles (kNormalSpaceDust)
 }
 
 bool isGlassShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
@@ -1523,7 +1561,9 @@ static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
     s_has_clean_cb1_data = false;
     s_clean_camera_cb_dirty = false;
     s_clean_camera_frame = ~0ull;
+    s_reference_cb0_blocks_frame = ~0ull;
     s_hud_mask_finalized_frame = ~0ull;
+    s_last_primary_cockpit_hud_frame = ~0ull;
     s_pass53_blit_seen_frame = ~0ull;
     s_last_full_hdr_post_source.Reset();
     s_last_full_hdr_post_frame = ~0ull;
@@ -2381,7 +2421,9 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     bool cb1_is_jittered = false;
     bool cb1_substituted = false;
     bool ps_srv1_substituted = false;
-    if (s_hud_mask_active_pass) {
+    const bool depth_tested_without_stencil =
+        (orig_depth_enable && !orig_stencil_enable && depth_to_bind != nullptr);
+    if (s_hud_mask_active_pass && !depth_tested_without_stencil) {
         context->VSGetConstantBuffers(1, 1, orig_cb1.GetAddressOf());
         ID3D11Resource* jitteredRes = s_jittered_cb1_buffer.load(std::memory_order_acquire);
         cb1_is_jittered = (orig_cb1 && jitteredRes && orig_cb1.Get() == jitteredRes &&
@@ -2707,6 +2749,17 @@ HudDrawResult observeHudDrawImpl(ID3D11DeviceContext* context, char kind, UINT i
     }
 
     if (isHudShaderPair(vs_hash, ps_hash)) {
+        if (isPrimaryCockpitHudShaderPair(vs_hash, ps_hash)) {
+            s_last_primary_cockpit_hud_frame = motion_color_frame;
+        } else {
+            const bool cockpit_hud_active =
+                (s_last_primary_cockpit_hud_frame != ~0ull &&
+                 motion_color_frame <= s_last_primary_cockpit_hud_frame + 2) ||
+                s_swapchain_width.load(std::memory_order_relaxed) <= 64;
+            if (!cockpit_hud_active) {
+                return HudDrawResult::None;
+            }
+        }
         s_current_hud_vs_hash = vs_hash;
         s_current_hud_ps_hash = ps_hash;
         if (!hud_first_match_seen) {
@@ -2989,7 +3042,7 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             return false;
         }
         const bool isFullScreenCopyCandidate =
-            (s_post_ldr_backbuffer_no_dsv && count >= 3 && count <= 6 && instance_count == 1);
+            (s_post_ldr_backbuffer_bound && count >= 3 && count <= 6 && instance_count == 1);
         if (!isFullScreenCopyCandidate &&
             (s_hud_draws_replayed_frame == 0 ||
              (!isPauseOrModalMenuActive(current_frame) && count < 300 && count != 4 && count != 6))) {
@@ -3058,7 +3111,7 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             s_jitter_debug_view.load(std::memory_order_relaxed) ||
             s_hud_debug_view.load(std::memory_order_relaxed);
         if (bbRes && wantUpscale && !s_upscale_evaluated_this_frame &&
-            s_post_ldr_backbuffer_bound && s_post_ldr_backbuffer_no_dsv &&
+            s_post_ldr_backbuffer_bound &&
             count >= 3 && count <= 6 && instance_count == 1 &&
             scene_ldr_source && scene_ldr_frame == current_frame) {
             Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> psSrv0;
@@ -3069,8 +3122,14 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
                 Microsoft::WRL::ComPtr<ID3D11DepthStencilView> curDsv;
                 context->OMGetRenderTargets(1, curRtv.GetAddressOf(), curDsv.GetAddressOf());
+                bool dsvIsSceneDepth = false;
+                if (curDsv && scene_depth_source) {
+                    Microsoft::WRL::ComPtr<ID3D11Resource> dsvRes;
+                    curDsv->GetResource(&dsvRes);
+                    dsvIsSceneDepth = (dsvRes && dsvRes.Get() == static_cast<ID3D11Resource*>(scene_depth_source.Get()));
+                }
                 Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
-                if (curRtv && !curDsv) {
+                if (curRtv && !dsvIsSceneDepth) {
                     curRtv->GetResource(&rtvRes);
                 }
                 Microsoft::WRL::ComPtr<ID3D11Texture2D> bbTex;
@@ -3080,13 +3139,11 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                     bbTex->GetDesc(&rtvDesc);
                     if (!isValidPass53Target &&
                         rtvRes.Get() != static_cast<ID3D11Resource*>(scene_ldr_source.Get())) {
-                        // In dual-device setups (e.g. NVIDIA Smooth Motion NvPresent64.dll),
-                        // s_swapchain_backbuffer belongs to presentDevice while Pass 53 renders into
-                        // an output-sized LDR surface on sceneDevice.
+                        // Accept any output-sized single-sample LDR target receiving the Pass 53 copy from
+                        // scene_ldr_source (both dual-device Smooth Motion and single-device offscreen paths).
                         Microsoft::WRL::ComPtr<ID3D11Device> ctxDev;
                         context->GetDevice(&ctxDev);
                         if (ctxDev && sameD3D11Device(bbTex.Get(), ctxDev.Get()) &&
-                            !sameD3D11Device(bbRes, ctxDev.Get()) &&
                             rtvDesc.SampleDesc.Count == 1 &&
                             isLdrSceneColorFormat(rtvDesc.Format)) {
                             const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
@@ -3232,7 +3289,8 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                  td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
                  td.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
             if (isHdrFmt && td.Width == sceneW && td.Height == sceneH &&
-                td.SampleDesc.Count == 1 && (td.BindFlags & D3D11_BIND_RENDER_TARGET)) {
+                td.SampleDesc.Count == 1 &&
+                (td.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE))) {
                 hdrSlot = i;
                 hdrSlotRes = res;
                 break;
@@ -3773,7 +3831,12 @@ void beginHudDrawProbe() {
     };
     for (size_t i = 0; i < tblCount; ++i) {
         if (!s_hooked_tables[i].is_immediate) continue;
-        installOnEntry(i, kVSSetConstantBuffers, s_hooked_tables[i].orig_vs_cb, original_vs_set_buffers, &observedVSSetConstantBuffers);
+        const bool isLiveCopy = s_context_vtable_hooks[i] &&
+            s_context_vtable_hooks[i]->isInitialized() &&
+            s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy;
+        if (!isLiveCopy || vs_buffer_probe_active.load(std::memory_order_relaxed)) {
+            installOnEntry(i, kVSSetConstantBuffers, s_hooked_tables[i].orig_vs_cb, original_vs_set_buffers, &observedVSSetConstantBuffers);
+        }
         if (installOnEntry(i, kDrawIndexed, s_hooked_tables[i].orig_draw_indexed, original_draw_indexed, &observedDrawIndexed))
             hud_draw_hook_mask |= 1u;
         if (installOnEntry(i, kDraw, s_hooked_tables[i].orig_draw, original_draw, &observedDraw))
@@ -3805,12 +3868,14 @@ void beginHudDrawProbe() {
     EdpeLog(L"  VS=0xE508648660A352B2 PS=0x63ABD86359B57D01 (target reticle sprite)");
 }
 
-static inline bool areDrawAndOmHooksIntact(void** tbl) {
+static inline bool areDrawAndOmHooksIntact(void** tbl, bool checkVsCb) {
     if (!tbl) return false;
     if (tbl[kOMSetRenderTargets] != reinterpret_cast<void*>(&observedOMSetRenderTargets) ||
         tbl[kOMSetRenderTargetsAndUnorderedAccessViews] !=
-            reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews) ||
-        tbl[kVSSetConstantBuffers] != reinterpret_cast<void*>(&observedVSSetConstantBuffers)) {
+            reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews)) {
+        return false;
+    }
+    if (checkVsCb && tbl[kVSSetConstantBuffers] != reinterpret_cast<void*>(&observedVSSetConstantBuffers)) {
         return false;
     }
     if (hud_draw_probe_active.load(std::memory_order_relaxed)) {
@@ -3826,14 +3891,25 @@ static inline bool areDrawAndOmHooksIntact(void** tbl) {
 }
 
 void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
+    const bool vsProbeActive = vs_buffer_probe_active.load(std::memory_order_relaxed);
+    if (activeCtx && activeCtx == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+        edpe::VTableHook* primaryHook = s_primary_vtable_hook.load(std::memory_order_acquire);
+        void** primaryTbl = s_primary_live_table.load(std::memory_order_acquire);
+        if (primaryHook && primaryTbl &&
+            primaryHook->isLiveCopyVptrValid(activeCtx) &&
+            areDrawAndOmHooksIntact(primaryTbl, vsProbeActive)) {
+            return;
+        }
+    }
+
     const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
     if (activeCtx) {
         for (size_t i = 0; i < tblCount; ++i) {
             if (s_hooked_tables[i].context == activeCtx &&
                 s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
-                s_context_vtable_hooks[i]->reclaim();
+                s_context_vtable_hooks[i]->reclaimLive(activeCtx);
                 if (s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy &&
-                    areDrawAndOmHooksIntact(s_hooked_tables[i].table)) {
+                    areDrawAndOmHooksIntact(s_hooked_tables[i].table, vsProbeActive)) {
                     return;
                 }
                 break;
@@ -3857,20 +3933,20 @@ void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
         }
     };
 
-    const bool needVsCb = vs_buffer_probe_active.load(std::memory_order_relaxed) ||
-                          hud_draw_probe_active.load(std::memory_order_relaxed);
-    const bool needDraws = hud_draw_probe_active.load(std::memory_order_acquire) &&
-                           isHudDrawInterceptWindowActive();
+    const bool hudProbeActive = hud_draw_probe_active.load(std::memory_order_acquire);
+    const bool needDraws = hudProbeActive && isHudDrawInterceptWindowActive();
 
     for (size_t i = 0; i < tblCount; ++i) {
         if (!s_hooked_tables[i].is_immediate) continue;
+        bool isLiveCopy = false;
         if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
-            s_context_vtable_hooks[i]->reclaim();
+            s_context_vtable_hooks[i]->reclaimLive(s_hooked_tables[i].context);
+            isLiveCopy = (s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy);
         }
         rearmSlotOnEntry(i, kOMSetRenderTargets, reinterpret_cast<void*>(&observedOMSetRenderTargets), 0);
         rearmSlotOnEntry(i, kOMSetRenderTargetsAndUnorderedAccessViews,
             reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews), 0);
-        if (needVsCb) {
+        if (vsProbeActive || (!isLiveCopy && hudProbeActive)) {
             rearmSlotOnEntry(i, kVSSetConstantBuffers,
                 reinterpret_cast<void*>(&observedVSSetConstantBuffers), 0);
         }
@@ -3946,6 +4022,12 @@ template <typename Fn>
 inline Fn resolveContextOriginalSlot(ID3D11DeviceContext* context, size_t slot, void* observer,
                                      const std::atomic<Fn>& fallback) {
     if (context) {
+        if (s_hooked_table_count.load(std::memory_order_acquire) == 1 &&
+            context == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+            if (const Fn fast = fallback.load(std::memory_order_acquire)) {
+                return fast;
+            }
+        }
         void** table = *reinterpret_cast<void***>(context);
         const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
         for (size_t i = 0; i < tblCount; ++i) {
@@ -4000,8 +4082,19 @@ UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context) {
         reinterpret_cast<void*>(&observedUnmap), original_unmap);
 }
 
-static constexpr size_t kRejectedCacheSize = 256;
+void STDMETHODCALLTYPE observedUpdateSubresource(ID3D11DeviceContext* context,
+    ID3D11Resource* pDstResource, UINT DstSubresource, const D3D11_BOX* pDstBox,
+    const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch);
+
+UpdateSubresourceFn resolveOriginalUpdateSubresource(ID3D11DeviceContext* context) {
+    return resolveContextOriginalSlot(context, kUpdateSubresource,
+        reinterpret_cast<void*>(&observedUpdateSubresource), original_update_subresource);
+}
+
+static constexpr size_t kRejectedCacheSize = 2048;
 static std::atomic<ID3D11Resource*> s_rejected_map_resources[kRejectedCacheSize]{};
+static std::atomic<ID3D11Resource*> s_accepted_dot_cb_resources[kRejectedCacheSize]{};
+static std::atomic<UINT> s_accepted_dot_cb_bytes[kRejectedCacheSize]{};
 
 inline bool isResourceCachedRejected(ID3D11Resource* res) {
     const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
@@ -4013,91 +4106,310 @@ inline void cacheRejectedResource(ID3D11Resource* res) {
     s_rejected_map_resources[slot].store(res, std::memory_order_relaxed);
 }
 
+inline UINT getCachedDotCbByteWidth(ID3D11Resource* res) {
+    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
+    if (s_accepted_dot_cb_resources[slot].load(std::memory_order_relaxed) == res) {
+        return s_accepted_dot_cb_bytes[slot].load(std::memory_order_relaxed);
+    }
+    return 0;
+}
+
+inline void cacheDotCbResource(ID3D11Resource* res, UINT byteWidth) {
+    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
+    s_accepted_dot_cb_bytes[slot].store(byteWidth, std::memory_order_relaxed);
+    s_accepted_dot_cb_resources[slot].store(res, std::memory_order_relaxed);
+}
+
 inline void clearRejectedResourceCache() {
     for (size_t i = 0; i < kRejectedCacheSize; ++i) {
         s_rejected_map_resources[i].store(nullptr, std::memory_order_relaxed);
+        s_accepted_dot_cb_resources[i].store(nullptr, std::memory_order_relaxed);
+        s_accepted_dot_cb_bytes[i].store(0, std::memory_order_relaxed);
     }
+}
+
+inline bool areFiniteFloats(const float* values, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (!std::isfinite(values[i])) return false;
+    }
+    return true;
+}
+
+inline void computeUvJitterDelta(const edpe::ProjectionJitter& jitter, float& dxUv, float& dyUv) {
+    const UINT rw = s_observed_scene_width.load(std::memory_order_relaxed);
+    const UINT rh = s_observed_scene_height.load(std::memory_order_relaxed);
+    dxUv = (rw > 0) ? (jitter.pixelX / static_cast<float>(rw)) : (jitter.ndcX * 0.5f);
+    dyUv = (rh > 0) ? (jitter.pixelY / static_cast<float>(rh)) : (-jitter.ndcY * 0.5f);
+}
+
+inline bool isInSceneWindowLocked(unsigned long long cur_frame) {
+    return (s_hdr_slot0_seen_frame != cur_frame) ||
+           (s_verified_ldr_tonemap_frame != cur_frame &&
+            !s_ldr_tonemap_candidate_bound &&
+            !s_post_ldr_backbuffer_bound);
+}
+
+inline bool repairAuxiliarySceneConstantBuffer(float* words, size_t floatCount, unsigned long long cur_frame) {
+    if (!words || floatCount < 20) return false;
+    if (!isInSceneWindowLocked(cur_frame) || !ContextCensusIsJitterActive()) return false;
+
+    const edpe::CameraProjection& refCam =
+        (s_has_staged_camera && s_staged_camera_frame == cur_frame)
+            ? s_staged_camera
+            : s_camera_now;
+    const edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
+    float dxUv = 0.0f, dyUv = 0.0f;
+    computeUvJitterDelta(jitter, dxUv, dyUv);
+
+    if (refCam.scaleX > 0.1f &&
+        edpe::cobra_camera::repairCascadeShadowMaskInvProj(words, floatCount, refCam, jitter)) {
+        static std::atomic<bool> s_logged_cascade_cb2_repair{false};
+        if (!s_logged_cascade_cb2_repair.exchange(true, std::memory_order_relaxed)) {
+            EdpeLog(L"EDPE: repaired cascade shadow mask CB2 InvProj jitter phase");
+        }
+        return true;
+    }
+
+    if (s_reference_cb0_blocks_frame == cur_frame && floatCount >= 68) {
+        const float refDepthB = s_last_unjittered_forward_block[14];
+        if (refDepthB >= 0.01f &&
+            std::isfinite(words[51]) &&
+            std::fabs(words[51] - refDepthB) <= 1e-3f &&
+            std::fabs(words[48]) <= 2e-3f &&
+            std::fabs(words[49]) <= 2e-3f &&
+            std::fabs(words[50]) <= 2e-3f) {
+            const edpe::Vec3 refCamPos = edpe::cameraPosition(refCam);
+            const edpe::Vec3* pRefCamPos = (refCam.scaleX > 0.1f) ? &refCamPos : nullptr;
+            const bool repairedMissing = edpe::cobra_camera::repairRowMajorDeferredMissingPhase(
+                words, floatCount, s_last_jittered_forward_block, dxUv, dyUv, pRefCamPos);
+            const bool repairedWhole = !repairedMissing && edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+                words, floatCount, s_last_unjittered_forward_block, jitter, dxUv, dyUv, pRefCamPos);
+            if (repairedMissing || repairedWhole) {
+                static std::atomic<bool> s_logged_row_deferred_cb2_repair{false};
+                if (!s_logged_row_deferred_cb2_repair.exchange(true, std::memory_order_relaxed)) {
+                    EdpeLog(repairedMissing
+                        ? L"EDPE: repaired deferred lighting/shadow CB2 (row-major) inverse rays jitter phase"
+                        : L"EDPE: repaired deferred lighting/shadow CB2 (row-major) full camera block jitter phase");
+                }
+                return true;
+            }
+            static std::atomic<unsigned> s_row_cb2_miss_logs{0};
+            if (s_row_cb2_miss_logs.load(std::memory_order_relaxed) < 12) {
+                float expUnjit[16]{}, expJit[16]{};
+                edpe::cobra_camera::transposeBlock4x4(s_last_unjittered_forward_block, expUnjit);
+                edpe::cobra_camera::transposeBlock4x4(s_last_jittered_forward_block, expJit);
+                const float* rows10to16 = words + 40;
+                const bool colsUnjit = edpe::cobra_camera::matchRowMajorCols0to2(rows10to16, expUnjit);
+                const bool colsJitNeedsRays =
+                    !colsUnjit &&
+                    edpe::cobra_camera::matchRowMajorCols0to2(rows10to16, expJit) &&
+                    edpe::cobra_camera::rowMajorInverseRaysNeedJitter(rows10to16, dxUv, dyUv);
+                if (colsUnjit || colsJitNeedsRays) {
+                    if (s_row_cb2_miss_logs.fetch_add(1, std::memory_order_relaxed) < 12) {
+                        edpe::Vec3 cb2Pos{};
+                        const bool hasCb2Pos = edpe::cobra_camera::extractWorldCamPosFromDeferredCb2(
+                            words, floatCount, &cb2Pos);
+                        wchar_t msg[256];
+                        swprintf_s(msg,
+                            L"EDPE DIAG: row CB2 3x3 matched (%s) frame=%llu floats=%zu staged=%llu ref=(%.3f,%.3f,%.3f) cb2PosOk=%d cb2=(%.3f,%.3f,%.3f)",
+                            colsUnjit ? L"unjit" : L"jit+rays",
+                            cur_frame, floatCount, s_staged_camera_frame,
+                            refCamPos.x, refCamPos.y, refCamPos.z,
+                            hasCb2Pos ? 1 : 0, cb2Pos.x, cb2Pos.y, cb2Pos.z);
+                        EdpeLog(msg);
+                    }
+                }
+            }
+        }
+        if (refDepthB >= 0.01f &&
+            std::isfinite(words[54]) &&
+            std::fabs(words[54] - refDepthB) <= 1e-3f &&
+            std::fabs(words[52]) <= 2e-3f &&
+            std::fabs(words[53]) <= 2e-3f &&
+            std::fabs(words[55]) <= 2e-3f) {
+            const bool repairedMissing = edpe::cobra_camera::repairDeferredMissingPhase(
+                words, floatCount, s_last_jittered_forward_block, s_last_unjittered_inv_rays, dxUv, dyUv);
+            const bool repairedWhole = !repairedMissing && edpe::cobra_camera::repairDeferredWholeOmission(
+                words, floatCount, s_last_unjittered_forward_block, jitter, dxUv, dyUv);
+            if (repairedMissing || repairedWhole) {
+                static std::atomic<bool> s_logged_deferred_cb2_repair{false};
+                if (!s_logged_deferred_cb2_repair.exchange(true, std::memory_order_relaxed)) {
+                    EdpeLog(repairedMissing
+                        ? L"EDPE: repaired deferred lighting/shadow CB2 inverse frustum ray jitter phase"
+                        : L"EDPE: repaired deferred lighting/shadow CB2 full camera block jitter phase");
+                }
+                return true;
+            }
+        }
+    }
+
+    if (floatCount >= 56 && refCam.scaleX > 0.1f &&
+        edpe::cobra_camera::repairRowMajorUvToViewBlock(words + 40, refCam, dxUv, dyUv)) {
+        static std::atomic<bool> s_logged_clustered_cb0_repair{false};
+        if (!s_logged_clustered_cb0_repair.exchange(true, std::memory_order_relaxed)) {
+            EdpeLog(L"EDPE: repaired clustered lighting compute CB0 UvToView jitter phase");
+        }
+        return true;
+    }
+
+    return false;
 }
 
 HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
-    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
     const MapFn forward = resolveOriginalMap(context);
     const HRESULT result = forward ? forward(
         context, resource, subresource, type, flags, mapped) : E_FAIL;
-    if (s_in_edpe_present.load(std::memory_order_acquire)) return result;
-    if (SUCCEEDED(result) && isObservedImmediateContext(context) &&
-        resource && map_hook_active.load(std::memory_order_acquire)) {
-        ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
-        bool is_scene_cb = (resource == target);
+    if (FAILED(result) || !resource ||
+        s_in_edpe_present.load(std::memory_order_acquire) ||
+        !map_hook_active.load(std::memory_order_acquire) ||
+        !isObservedImmediateContext(context)) {
+        return result;
+    }
+    ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
+    bool is_scene_cb = (resource == target);
+    UINT dot_cb_bytes = is_scene_cb ? 0u : getCachedDotCbByteWidth(resource);
+    if (!is_scene_cb && dot_cb_bytes == 0) {
+        if (isResourceCachedRejected(resource)) {
+            return result;
+        }
         const bool probe_active = vs_buffer_probe_active.load(std::memory_order_relaxed);
-        if (!is_scene_cb) {
-            if (!isResourceCachedRejected(resource)) {
-                edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
-                D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-                resource->GetType(&dimension);
-                if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
-                    ID3D11Buffer* buffer = nullptr;
-                    if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Buffer),
-                            reinterpret_cast<void**>(&buffer)))) {
-                        D3D11_BUFFER_DESC desc{};
-                        buffer->GetDesc(&desc);
-                        if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
-                            (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
-                            const bool had_target = (target != nullptr);
-                            scene_map_target.store(buffer, std::memory_order_release);
-                            if (probe_active) clearTrackedMappedBuffersExcept(buffer);
-                            target = buffer;
-                            is_scene_cb = true;
-                            if (!had_target && !scene_maps_before_bind.load(std::memory_order_relaxed)) {
-                                scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
-                                EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
-                            }
-                        } else {
-                            cacheRejectedResource(resource);
-                        }
-                        buffer->Release();
+        edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
+        D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+        resource->GetType(&dimension);
+        if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            ID3D11Buffer* buffer = nullptr;
+            if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Buffer),
+                    reinterpret_cast<void**>(&buffer)))) {
+                D3D11_BUFFER_DESC desc{};
+                buffer->GetDesc(&desc);
+                if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
+                    (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+                    const bool had_target = (target != nullptr);
+                    scene_map_target.store(buffer, std::memory_order_release);
+                    if (probe_active) clearTrackedMappedBuffersExcept(buffer);
+                    target = buffer;
+                    is_scene_cb = true;
+                    if (!had_target && !scene_maps_before_bind.load(std::memory_order_relaxed)) {
+                        scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
+                        EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
                     }
+                } else if ((desc.ByteWidth == 208 || (desc.ByteWidth >= 272 && desc.ByteWidth <= 4096)) &&
+                           desc.Usage == D3D11_USAGE_DYNAMIC &&
+                           (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+                    cacheDotCbResource(resource, desc.ByteWidth);
+                    dot_cb_bytes = desc.ByteWidth;
                 } else {
                     cacheRejectedResource(resource);
                 }
+                buffer->Release();
             }
+        } else {
+            cacheRejectedResource(resource);
         }
-        if (is_scene_cb) {
-            trackMappedBuffer(resource, mapped ? mapped->pData : nullptr);
-            scene_maps.fetch_add(1, std::memory_order_relaxed);
-            scene_mapped_data.store(mapped ? mapped->pData : nullptr, std::memory_order_release);
-            if (draw_indexed_calls.load(std::memory_order_relaxed) ||
-                draw_calls.load(std::memory_order_relaxed) ||
-                draw_indexed_instanced_calls.load(std::memory_order_relaxed) ||
-                draw_instanced_calls.load(std::memory_order_relaxed))
-                scene_maps_after_draw.fetch_add(1, std::memory_order_relaxed);
-        }
+    }
+    if (is_scene_cb) {
+        trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, 5376);
+        scene_maps.fetch_add(1, std::memory_order_relaxed);
+        scene_mapped_data.store(mapped ? mapped->pData : nullptr, std::memory_order_release);
+        if (draw_indexed_calls.load(std::memory_order_relaxed) ||
+            draw_calls.load(std::memory_order_relaxed) ||
+            draw_indexed_instanced_calls.load(std::memory_order_relaxed) ||
+            draw_instanced_calls.load(std::memory_order_relaxed))
+            scene_maps_after_draw.fetch_add(1, std::memory_order_relaxed);
+    } else if (dot_cb_bytes > 0) {
+        trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, dot_cb_bytes);
     }
     return result;
 }
 
 void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource) {
-    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
     const UnmapFn forward = resolveOriginalUnmap(context);
     if (!s_in_edpe_present.load(std::memory_order_acquire) &&
-        isObservedImmediateContext(context) &&
+        unmap_hook_active.load(std::memory_order_acquire) &&
         resource &&
-        unmap_hook_active.load(std::memory_order_acquire)) {
-        void* mapped_ptr = popMappedBuffer(resource);
+        isObservedImmediateContext(context)) {
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
-        if (!mapped_ptr && resource == target) {
-            mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
-        }
-        if (!mapped_ptr) {
-            if (resource == target) ++s_ustat.noMapped;
+        if (resource != target &&
+            ((s_tracked_mapped_count.load(std::memory_order_acquire) <= 0 &&
+              scene_mapped_data.load(std::memory_order_relaxed) == nullptr) ||
+             isResourceCachedRejected(resource))) {
             if (forward) forward(context, resource, subresource);
             rearmHudDrawProbe(context);
             return;
         }
+        UINT mapped_byte_width = 0;
+        void* mapped_ptr = popMappedBuffer(resource, &mapped_byte_width);
+        if (!mapped_ptr && resource == target) {
+            mapped_ptr = scene_mapped_data.exchange(nullptr, std::memory_order_acq_rel);
+            mapped_byte_width = 5376;
+        }
+        if (!mapped_ptr) {
+            if (resource == target) {
+                std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+                ++s_ustat.noMapped;
+            }
+            if (forward) forward(context, resource, subresource);
+            rearmHudDrawProbe(context);
+            return;
+        }
+        std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
         edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
-        if (mapped_ptr) {
+        if (mapped_ptr && mapped_byte_width == 208) {
+            const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+            float* mutable_unmap_words = static_cast<float*>(mapped_ptr);
+            const edpe::CameraProjection& refCam =
+                (s_has_staged_camera && s_staged_camera_frame == cur_frame)
+                    ? s_staged_camera
+                    : s_camera_now;
+            if (refCam.scaleX > 0.0f &&
+                edpe::matchesEliteTransposeProjectionBlock(&mutable_unmap_words[16], refCam)) {
+                edpe::NdcOffset existing_ndc_offset{};
+                if (edpe::estimateEliteTransposeBlockNdcOffset(&mutable_unmap_words[16], &existing_ndc_offset) &&
+                    std::isfinite(existing_ndc_offset.x) && std::isfinite(existing_ndc_offset.y) &&
+                    (std::fabs(existing_ndc_offset.x) > 1e-6f || std::fabs(existing_ndc_offset.y) > 1e-6f) &&
+                    std::fabs(existing_ndc_offset.x) <= 0.05f && std::fabs(existing_ndc_offset.y) <= 0.05f) {
+                    float unjittered_block[16]{};
+                    const edpe::ProjectionJitter unjitter{0.0f, 0.0f, -existing_ndc_offset.x, -existing_ndc_offset.y};
+                    if (edpe::jitterEliteDotProjectionBlock(&mutable_unmap_words[16], unjittered_block, unjitter)) {
+                        std::memcpy(&mutable_unmap_words[16], unjittered_block, sizeof(unjittered_block));
+                    }
+                }
+                if (isInSceneWindowLocked(cur_frame) && ContextCensusIsJitterActive()) {
+                    const edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
+                    float jittered_block[16]{};
+                    if (edpe::jitterEliteDotProjectionBlock(&mutable_unmap_words[16], jittered_block, jitter)) {
+                        std::memcpy(&mutable_unmap_words[16], jittered_block, sizeof(jittered_block));
+                        s_injected_jitter = jitter;
+                        s_last_rendered_jitter = jitter;
+                        s_scene_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
+                        s_jitter_injected_frame = cur_frame;
+                        jittered_writes_count.fetch_add(1, std::memory_order_relaxed);
+                        static std::atomic<bool> s_logged_dot_cb0_jitter{false};
+                        if (!s_logged_dot_cb0_jitter.exchange(true, std::memory_order_relaxed)) {
+                            EdpeLog(L"EDPE: injected projection jitter into 208-byte CB0 transpose block");
+                        }
+                    } else {
+                        jitter_rejection_count.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+            if (forward) forward(context, resource, subresource);
+            rearmHudDrawProbe(context);
+            return;
+        }
+        if (mapped_ptr && mapped_byte_width >= 272 && mapped_byte_width <= 4096) {
+            const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+            repairAuxiliarySceneConstantBuffer(
+                static_cast<float*>(mapped_ptr),
+                static_cast<size_t>(mapped_byte_width) / sizeof(float),
+                cur_frame);
+            if (forward) forward(context, resource, subresource);
+            rearmHudDrawProbe(context);
+            return;
+        }
+        if (mapped_ptr && mapped_byte_width == 5376) {
             scene_unmaps.fetch_add(1, std::memory_order_relaxed);
             ++s_ustat.total;
             unsigned long long camera = 14695981039346656037ull;
@@ -4136,6 +4448,17 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 const edpe::ProjectionJitter unjitter{0.0f, 0.0f, -existing_ndc_offset.x, -existing_ndc_offset.y};
                 if (edpe::jitterEliteProjectionBlock(&mutable_unmap_words[1080], unjittered_block, unjitter)) {
                     std::memcpy(&mutable_unmap_words[1080], unjittered_block, sizeof(unjittered_block));
+                    if (areFiniteFloats(&mutable_unmap_words[98 * 4], 12)) {
+                        edpe::cobra_camera::jitterInverseUvRay(
+                            &mutable_unmap_words[98 * 4],
+                            -existing_ndc_offset.x * 0.5f,
+                            existing_ndc_offset.y * 0.5f);
+                    }
+                    const edpe::CameraProjection& unjitRefCam =
+                        (s_has_staged_camera && s_staged_camera_frame == cur_frame)
+                            ? s_staged_camera
+                            : s_camera_now;
+                    edpe::cobra_camera::unjitterRowMajorUvToViewBlock(&mutable_unmap_words[237 * 4], unjitRefCam);
                 }
             }
             const float* words = mutable_unmap_words;
@@ -4164,9 +4487,10 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             // and rotation. The strict parser rejects those writes (codes 7, 8, 10). Build the
             // camera from the block orientation so the pilot pose keeps updating every frame.
             bool block_cam_ok = false;
+            const edpe::CameraProjection& blockRef =
+                (s_has_staged_camera && s_staged_camera_frame == cur_frame) ? s_staged_camera : s_camera_now;
             if (!parse_ok && (parse_fail_reason == 7 || parse_fail_reason == 8 || parse_fail_reason == 10) &&
-                s_camera_now.scaleX > 0.0f &&
-                !(s_hdr_slot0_seen_frame == cur_frame && motion_color_frame == cur_frame)) {
+                blockRef.scaleX > 0.0f) {
                 bool finite_block = true;
                 for (size_t i = 1080; i < 1096; ++i)
                     if (!std::isfinite(words[i])) { finite_block = false; break; }
@@ -4178,9 +4502,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                     const double bsx = std::sqrt(xl), bsy = std::sqrt(yl);
                     bool ok =
-                        std::fabs(bsx - s_camera_now.scaleX) < 2e-3 &&
-                        std::fabs(bsy - s_camera_now.scaleY) < 2e-3 &&
-                        std::fabs(words[1094] - s_camera_now.depthB) < 1e-4f &&
+                        std::fabs(bsx - blockRef.scaleX) < 2e-3 &&
+                        std::fabs(bsy - blockRef.scaleY) < 2e-3 &&
+                        words[1094] >= 0.01f && words[1094] <= 0.25f &&
                         std::fabs(words[1082]) <= 0.002f && std::fabs(words[1086]) <= 0.002f &&
                         std::fabs(words[1090]) <= 0.002f && std::fabs(words[1092]) <= 0.002f &&
                         std::fabs(words[1093]) <= 0.002f && std::fabs(words[1095]) <= 0.002f;
@@ -4201,7 +4525,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         }
                     }
                     if (ok) {
-                        edpe::CameraProjection bc = s_camera_now;
+                        edpe::CameraProjection bc = blockRef;
                         for (size_t row = 0; row < 3; ++row) {
                             bc.worldFromView[row * 4] = static_cast<float>(words[1080 + row * 4] / bsx);
                             bc.worldFromView[row * 4 + 1] = static_cast<float>(words[1081 + row * 4] / bsy);
@@ -4210,10 +4534,33 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         bc.scaleX = static_cast<float>(bsx);
                         bc.scaleY = static_cast<float>(bsy);
                         bc.depthB = words[1094];
-                        edpe::cameraSetPosition(bc, edpe::cameraPosition(s_camera_now) + s_last_valid_velocity);
-                        parsed_camera = bc;
-                        block_cam_ok = true;
-                        ++s_ustat.blockOnly;
+
+                        bool row932ValidPos = std::isfinite(words[935]) && std::isfinite(words[939]) && std::isfinite(words[943]);
+                        if (row932ValidPos) {
+                            double rowTrace = 0.0;
+                            for (size_t row = 0; row < 3; ++row) {
+                                for (size_t axis = 0; axis < 3; ++axis) {
+                                    rowTrace += static_cast<double>(words[932 + row * 4 + axis]) *
+                                                static_cast<double>(bc.worldFromView[row * 4 + axis]);
+                                }
+                            }
+                            row932ValidPos = (rowTrace > 2.85);
+                        }
+                        const bool hasStagedPos = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
+                        if (row932ValidPos) {
+                            edpe::cameraSetPosition(bc, {words[935], words[939], words[943]});
+                        } else if (hasStagedPos) {
+                            edpe::cameraSetPosition(bc, edpe::cameraPosition(s_staged_camera));
+                        } else {
+                            edpe::cameraSetPosition(bc, edpe::cameraPosition(s_camera_now) + s_last_valid_velocity);
+                        }
+
+                        if ((row932ValidPos || hasStagedPos || s_consecutive_fallback_frames <= 2) &&
+                            edpe::cameraRotationTrace(bc, blockRef) > 2.40f) {
+                            parsed_camera = bc;
+                            block_cam_ok = true;
+                            ++s_ustat.blockOnly;
+                        }
                     }
                 }
             }
@@ -4230,6 +4577,40 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 if (s_last_frame_dt > 1e-5f && s_current_frame_dt > 1e-5f) {
                     dtRatio = s_current_frame_dt / s_last_frame_dt;
                 }
+                const float committedStep =
+                    (s_camera_now.scaleX > 0.0f && s_camera_previous.scaleX > 0.0f)
+                        ? edpe::length(edpe::cameraPosition(s_camera_now) - edpe::cameraPosition(s_camera_previous))
+                        : 0.0f;
+                const float predictedStep =
+                    edpe::length(s_last_valid_velocity * std::clamp(dtRatio, 0.25f, 4.0f));
+                const float maxIntraDist =
+                    std::clamp(0.05f + 1.5f * std::max(committedStep, predictedStep), 0.05f, 0.35f);
+                auto pickNearestPoseRef = [&](float& outDist, float& outTrace) -> const edpe::CameraProjection* {
+                    const bool hasStaged = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
+                    const bool hasNow = (s_camera_now.scaleX > 0.0f);
+                    if (!hasStaged && !hasNow) return nullptr;
+                    if (hasStaged && !hasNow) {
+                        outDist = edpe::length(
+                            edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
+                        outTrace = edpe::cameraRotationTrace(parsed_camera, s_staged_camera);
+                        return &s_staged_camera;
+                    }
+                    if (!hasStaged) {
+                        outDist = edpe::length(
+                            edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_camera_now));
+                        outTrace = edpe::cameraRotationTrace(parsed_camera, s_camera_now);
+                        return &s_camera_now;
+                    }
+                    const float distStaged = edpe::length(
+                        edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
+                    const float traceStaged = edpe::cameraRotationTrace(parsed_camera, s_staged_camera);
+                    const float distNow = edpe::length(
+                        edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_camera_now));
+                    const float traceNow = edpe::cameraRotationTrace(parsed_camera, s_camera_now);
+                    outDist = std::min(distStaged, distNow);
+                    outTrace = std::max(traceStaged, traceNow);
+                    return (distNow < distStaged) ? &s_camera_now : &s_staged_camera;
+                };
 
                 if (!main_gbuffer_already_finished) {
                     const bool anchor_fresh = s_anchor_valid && (cur_frame <= s_anchor_frame + 2);
@@ -4242,7 +4623,10 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const bool probe_vs_committed = (s_camera_now.scaleX > 0.0f) && !matches_anchor &&
                         isStereoEyeOrIpdProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio);
 
-                    const bool is_probe = probe_vs_anchor || probe_vs_committed;
+                    const bool allow_fallback_recovery =
+                        (s_consecutive_fallback_frames >= 1) &&
+                        !(s_has_staged_camera && s_staged_camera_frame == cur_frame);
+                    const bool is_probe = !allow_fallback_recovery && (probe_vs_anchor || probe_vs_committed);
 
                     if (is_probe) {
                         s_probe_seen_this_frame = true;
@@ -4259,6 +4643,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     //    is accepted immediately so fast head-look/mouse-look turns never drop camera updates.
                     // 2) Any camera/FOV change persisting >= 2 frames is accepted as a new baseline even if
                     //    Cobra unmaps VS cb1 before binding the 4-MRT G-buffer.
+                    bool cut_streak_satisfied = false;
                     if (!passes_filter && !is_probe &&
                         cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                         cameraRotationDeterminant(parsed_camera) <= 1.15f &&
@@ -4281,7 +4666,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             }
                             if (s_cut_rejection_streak >= 2 && s_consecutive_fallback_frames >= 1) {
                                 passes_filter = true;
-                                s_cut_rejection_streak = 0;
+                                cut_streak_satisfied = true;
                                 s_anchor_valid = false;
                             }
                         }
@@ -4306,7 +4691,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                     s_last_teleport_rejection_frame = cur_frame;
                                     ++s_teleport_rejection_streak;
                                 }
-                                if (s_teleport_rejection_streak < 2 || s_consecutive_fallback_frames < 1) {
+                                if (!cut_streak_satisfied &&
+                                    (s_teleport_rejection_streak < 2 || s_consecutive_fallback_frames < 1)) {
                                     allow_stage = false;
                                 }
                             } else if (jumpResidual <= 15.0f) {
@@ -4325,13 +4711,15 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             } else if (s_staged_from_in_scene) {
                                 const float intraDist = edpe::length(
                                     edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
-                                if (intraDist > 0.03f) {
+                                if (intraDist > maxIntraDist) {
                                      allow_stage = false;
                                 }
                             }
                         }
 
                         if (allow_stage) {
+                            s_cut_rejection_streak = 0;
+                            s_teleport_rejection_streak = 0;
                             s_staged_camera = parsed_camera;
                             s_has_staged_camera = true;
                             s_staged_camera_frame = cur_frame;
@@ -4344,34 +4732,35 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             // Keep Pass 13 G-buffer decal and stencil passes (which bind fewer than 4 MRTs
                             // after the 4-MRT G-buffer unbinds, so in_main_scene is false) jitter-aligned
                             // with the main G-buffer whenever they unmap the same main camera.
-                            const float intraDist = edpe::length(
-                                edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
-                            const float intraTrace = edpe::cameraRotationTrace(parsed_camera, s_staged_camera);
-                            const bool sameStagedFov =
-                                std::fabs(parsed_camera.scaleX - s_staged_camera.scaleX) <= 0.02f * s_staged_camera.scaleX &&
-                                std::fabs(parsed_camera.scaleY - s_staged_camera.scaleY) <= 0.02f * s_staged_camera.scaleY &&
-                                std::fabs(parsed_camera.depthB - s_staged_camera.depthB) <= 1e-3f;
-                            if (intraDist <= 0.04f && intraTrace > 2.95f && sameStagedFov &&
-                                cameraRotationDeterminant(parsed_camera) >= 0.85f &&
-                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
-                                !isReflectionOrAuxiliaryCamera(parsed_camera, s_staged_camera, {0.0f, 0.0f, 0.0f}, 1.0f) &&
-                                !isRearOrAuxiliaryProbe(parsed_camera, s_staged_camera)) {
-                                is_main_camera = true;
+                            float intraDist = 0.0f;
+                            float intraTrace = 0.0f;
+                            if (const edpe::CameraProjection* nearRef = pickNearestPoseRef(intraDist, intraTrace)) {
+                                const bool sameStagedFov =
+                                    std::fabs(parsed_camera.scaleX - nearRef->scaleX) <= 0.02f * nearRef->scaleX &&
+                                    std::fabs(parsed_camera.scaleY - nearRef->scaleY) <= 0.02f * nearRef->scaleY;
+                                if (intraDist <= maxIntraDist && intraTrace > 2.95f && sameStagedFov &&
+                                    cameraRotationDeterminant(parsed_camera) >= 0.85f &&
+                                    parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
+                                    !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, {0.0f, 0.0f, 0.0f}, 1.0f) &&
+                                    !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
+                                    is_main_camera = true;
+                                }
                             }
                         }
                     } else if (!is_probe && s_has_staged_camera && s_staged_camera_frame == cur_frame) {
                         // Coherent phase-group jitter for same-pose scene sub-passes whose near plane
                         // was adjusted per-item (e.g. 0.0675 vs 0.025) while sharing the main scene grid.
-                        const float intraDist = edpe::length(
-                            edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
-                        const float intraTrace = edpe::cameraRotationTrace(parsed_camera, s_staged_camera);
-                        if (intraDist <= 0.04f && intraTrace > 2.98f &&
-                            isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH) &&
-                            cameraRotationDeterminant(parsed_camera) >= 0.85f &&
-                            cameraRotationDeterminant(parsed_camera) <= 1.15f &&
-                            parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
-                            !isRearOrAuxiliaryProbe(parsed_camera, s_staged_camera)) {
-                            is_main_camera = true;
+                        float intraDist = 0.0f;
+                        float intraTrace = 0.0f;
+                        if (const edpe::CameraProjection* nearRef = pickNearestPoseRef(intraDist, intraTrace)) {
+                            if (intraDist <= maxIntraDist && intraTrace > 2.95f &&
+                                isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH) &&
+                                cameraRotationDeterminant(parsed_camera) >= 0.85f &&
+                                cameraRotationDeterminant(parsed_camera) <= 1.15f &&
+                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
+                                !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
+                                is_main_camera = true;
+                            }
                         }
                     }
 
@@ -4411,18 +4800,14 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 } else {
                     ++s_ustat.gbufDone;
-                    const edpe::CameraProjection& refCam =
-                        (s_has_staged_camera && s_staged_camera_frame == cur_frame)
-                            ? s_staged_camera
-                            : s_camera_now;
-                    if (refCam.scaleX > 0.0f) {
-                        const float lateDist = edpe::length(
-                            edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(refCam));
-                        const float lateTrace = edpe::cameraRotationTrace(parsed_camera, refCam);
-                        if (lateDist < 0.1f && lateTrace > 2.95f) {
+                    float lateDist = 0.0f;
+                    float lateTrace = 0.0f;
+                    if (const edpe::CameraProjection* nearRef = pickNearestPoseRef(lateDist, lateTrace)) {
+                        if (lateDist < 0.5f && lateTrace > 2.95f) {
                             ++s_ustat.nearLate;
                             if (s_ustat.firstNearLateIdx == 0) s_ustat.firstNearLateIdx = s_ustat.total;
-                            if (parse_ok) {
+                            if ((parse_ok || block_cam_ok) &&
+                                std::fabs(parsed_camera.depthB - nearRef->depthB) <= 1e-3f) {
                                 std::memcpy(s_last_clean_cb1_data, words, 5376);
                                 s_has_clean_cb1_data = true;
                                 s_clean_camera_cb_dirty = true;
@@ -4433,14 +4818,14 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                  !s_ldr_tonemap_candidate_bound &&
                                  !s_post_ldr_backbuffer_bound);
                             const bool sameRefFov =
-                                std::fabs(parsed_camera.scaleX - refCam.scaleX) <= 0.02f * refCam.scaleX &&
-                                std::fabs(parsed_camera.scaleY - refCam.scaleY) <= 0.02f * refCam.scaleY &&
-                                std::fabs(parsed_camera.depthB - refCam.depthB) <= 1e-3f;
-                            if (preTonemapScenePass && lateDist <= 0.04f && lateTrace > 2.99f && sameRefFov &&
+                                std::fabs(parsed_camera.scaleX - nearRef->scaleX) <= 0.02f * nearRef->scaleX &&
+                                std::fabs(parsed_camera.scaleY - nearRef->scaleY) <= 0.02f * nearRef->scaleY &&
+                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f;
+                            if (preTonemapScenePass && lateDist <= maxIntraDist && lateTrace > 2.95f && sameRefFov &&
                                 cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                                 parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
-                                !isReflectionOrAuxiliaryCamera(parsed_camera, refCam, {0.0f, 0.0f, 0.0f}, 1.0f) &&
-                                !isRearOrAuxiliaryProbe(parsed_camera, refCam)) {
+                                !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, {0.0f, 0.0f, 0.0f}, 1.0f) &&
+                                !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
                                 is_main_camera = true;
                             }
                         }
@@ -4450,8 +4835,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 ++s_ustat.parseFail;
             }
 
-            const bool block_only_pilot = block_cam_ok;
-            const bool jitter_candidate = is_main_camera || block_only_pilot;
+            const bool jitter_candidate = is_main_camera;
 
             // Phase 5: Projection jitter injection into words 1080..1095
             // Inject jitter ONLY into authoritative primary scene camera projections during G-Buffer
@@ -4484,7 +4868,22 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         s_clean_camera_cb_dirty = true;
                         s_clean_camera_frame = cur_frame;
 
+                        std::memcpy(s_last_unjittered_forward_block, &mutable_words[1080], 16 * sizeof(float));
+                        std::memcpy(s_last_jittered_forward_block, jittered_block, 16 * sizeof(float));
+                        std::memcpy(s_last_unjittered_inv_rays, &mutable_words[98 * 4], 12 * sizeof(float));
+                        s_reference_cb0_blocks_frame = cur_frame;
+
                         std::memcpy(&mutable_words[1080], jittered_block, sizeof(jittered_block));
+                        {
+                            float dxUv = 0.0f, dyUv = 0.0f;
+                            computeUvJitterDelta(jitter, dxUv, dyUv);
+                            if (areFiniteFloats(&mutable_words[98 * 4], 12) &&
+                                (std::fabs(mutable_words[98 * 4]) > 1e-4f ||
+                                 std::fabs(mutable_words[98 * 4 + 5]) > 1e-4f)) {
+                                edpe::cobra_camera::jitterInverseUvRay(&mutable_words[98 * 4], dxUv, dyUv);
+                            }
+                            edpe::cobra_camera::repairRowMajorUvToViewBlock(&mutable_words[237 * 4], parsed_camera, dxUv, dyUv);
+                        }
                         s_jittered_cb1_buffer.store(resource, std::memory_order_release);
                         jitter_applied_this_unmap = true;
                         s_injected_jitter = jitter;
@@ -4511,7 +4910,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 }
             }
             if (!jitter_applied_this_unmap) {
-                if (s_jittered_cb1_buffer.load(std::memory_order_acquire) == resource) {
+                if (s_hdr_slot0_seen_frame == cur_frame &&
+                    s_jittered_cb1_buffer.load(std::memory_order_acquire) == resource) {
                     // Cobra re-mapped and unmapped this buffer without jitter (e.g. Pass 35 unjittered camera
                     // or per-widget constants); mark it as no longer jittered and do NOT overwrite
                     // s_last_clean_cb1_data (which could otherwise be clobbered by offscreen 2D panel RTTs).
@@ -4523,6 +4923,57 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
     if (forward) forward(context, resource, subresource);
     if (!s_in_edpe_present.load(std::memory_order_acquire) && isObservedImmediateContext(context)) {
         rearmHudDrawProbe(context);
+    }
+}
+
+void STDMETHODCALLTYPE observedUpdateSubresource(ID3D11DeviceContext* context,
+    ID3D11Resource* pDstResource, UINT DstSubresource, const D3D11_BOX* pDstBox,
+    const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch) {
+    const UpdateSubresourceFn forward = resolveOriginalUpdateSubresource(context);
+    if (!s_in_edpe_present.load(std::memory_order_acquire) &&
+        update_subresource_hook_active.load(std::memory_order_acquire) &&
+        DstSubresource == 0 && !pDstBox && pDstResource && pSrcData &&
+        isObservedImmediateContext(context) &&
+        ContextCensusIsJitterActive()) {
+        UINT cbBytes = getCachedDotCbByteWidth(pDstResource);
+        if (cbBytes == 0 && !isResourceCachedRejected(pDstResource)) {
+            ID3D11Buffer* buf = nullptr;
+            if (SUCCEEDED(pDstResource->QueryInterface(__uuidof(ID3D11Buffer),
+                    reinterpret_cast<void**>(&buf))) && buf) {
+                D3D11_BUFFER_DESC desc{};
+                buf->GetDesc(&desc);
+                buf->Release();
+                if (desc.ByteWidth >= 272 && desc.ByteWidth <= 4096 &&
+                    (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
+                    cacheDotCbResource(pDstResource, desc.ByteWidth);
+                    cbBytes = desc.ByteWidth;
+                } else {
+                    cacheRejectedResource(pDstResource);
+                }
+            } else {
+                cacheRejectedResource(pDstResource);
+            }
+        }
+        if (cbBytes >= 272 && cbBytes <= 4096) {
+            std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+            const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+            if (isInSceneWindowLocked(cur_frame)) {
+                alignas(16) uint8_t patchedBuf[4096];
+                std::memcpy(patchedBuf, pSrcData, cbBytes);
+                if (repairAuxiliarySceneConstantBuffer(
+                        reinterpret_cast<float*>(patchedBuf),
+                        static_cast<size_t>(cbBytes) / sizeof(float),
+                        cur_frame)) {
+                    if (forward) {
+                        forward(context, pDstResource, DstSubresource, pDstBox, patchedBuf, SrcRowPitch, SrcDepthPitch);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    if (forward) {
+        forward(context, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
     }
 }
 
@@ -4675,7 +5126,10 @@ void beginDrawProbe() {
 void endVSBufferProbe() {
     endDrawProbe();
     if (!vs_buffer_probe_active.exchange(false, std::memory_order_acq_rel)) return;
-    const bool restored = !hud_draw_probe_active.load(std::memory_order_acquire) &&
+    edpe::VTableHook* primaryHook = s_primary_vtable_hook.load(std::memory_order_acquire);
+    const bool liveCopyPrimary = primaryHook && primaryHook->isInitialized() &&
+        primaryHook->mode() == edpe::HookMode::LiveCopy;
+    const bool restored = (liveCopyPrimary || !hud_draw_probe_active.load(std::memory_order_acquire)) &&
         patched_table && patchSlot(patched_table,
         kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers),
         reinterpret_cast<void*>(original_vs_set_buffers.load(std::memory_order_acquire)));
@@ -6152,6 +6606,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_camera_reset = true;
             if (s_consecutive_skipped_frames > 15) {
                 s_camera_now = {};
+                s_last_true_camera = {};
+                s_last_true_camera_frame = ~0ull;
+                s_consecutive_fallback_frames = 0;
+                s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                 s_anchor_valid = false;
                 s_cut_rejection_streak = 0;
                 s_teleport_rejection_streak = 0;
@@ -7465,11 +7923,16 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     const auto current_frame = last_present_frame.load(std::memory_order_relaxed);
     bool is_scene_device_ctx = true;
     if (motion_color_source && motion_color_frame == current_frame) {
-        Microsoft::WRL::ComPtr<ID3D11Device> ctxDev, sceneDev;
-        context->GetDevice(&ctxDev);
-        motion_color_source->GetDevice(&sceneDev);
-        if (ctxDev && sceneDev && ctxDev.Get() != sceneDev.Get()) {
-            is_scene_device_ctx = false;
+        ID3D11Device* sceneDevPtr = s_scene_device.load(std::memory_order_acquire);
+        ID3D11Device* presentDevPtr = s_present_device.load(std::memory_order_acquire);
+        if (!(context == s_primary_hook_ctx.load(std::memory_order_acquire) &&
+              sceneDevPtr != nullptr && sceneDevPtr == presentDevPtr)) {
+            Microsoft::WRL::ComPtr<ID3D11Device> ctxDev, sceneDev;
+            context->GetDevice(&ctxDev);
+            motion_color_source->GetDevice(&sceneDev);
+            if (ctxDev && sceneDev && ctxDev.Get() != sceneDev.Get()) {
+                is_scene_device_ctx = false;
+            }
         }
     }
     if (isObservedImmediateContext(context) && is_scene_device_ctx) {
@@ -7596,8 +8059,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             scene_ldr_source.Reset();
             scene_ldr_frame = ~0ull;
             s_pass53_blit_seen_frame = ~0ull;
-        } else if (count >= 1 && targets && targets[0] &&
-                   s_hdr_slot0_seen_frame == current_frame) {
+        } else if (count >= 1 && targets && targets[0]) {
             const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
             const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
             if (sceneW > 0 && sceneH > 0) {
@@ -7620,7 +8082,21 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                             tex0->GetDesc(&td);
                             if (td.Width == sceneW && td.Height == sceneH &&
                                 td.SampleDesc.Count == 1) {
+                                auto ensureTonemapProbeArmed = [&]() {
+                                    if (s_hdr_slot0_seen_frame != current_frame) {
+                                        s_hdr_slot0_seen_frame = current_frame;
+                                        if (reconstruction_active) {
+                                            if (!hud_draw_hook_mask) {
+                                                beginHudDrawProbe();
+                                            } else {
+                                                rearmHudDrawProbe(context);
+                                            }
+                                            hud_draw_probe_active.store(true, std::memory_order_relaxed);
+                                        }
+                                    }
+                                };
                                 if (isLdrSceneColorFormat(td.Format)) {
+                                    ensureTonemapProbeArmed();
                                     const bool alreadyHaveDifferentLdr =
                                         (scene_ldr_frame == current_frame && scene_ldr_source &&
                                          scene_ldr_source.Get() != tex0.Get());
@@ -7647,6 +8123,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                                 } else if (td.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
                                            td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
                                            td.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS) {
+                                    ensureTonemapProbeArmed();
                                     s_last_full_hdr_post_source = tex0;
                                     s_last_full_hdr_post_frame = current_frame;
                                 }
@@ -8365,6 +8842,13 @@ void rearmContextHooks() {
             patched_table[kUnmap],
             reinterpret_cast<void*>(&observedUnmap));
     }
+    const auto forward_update_sub = original_update_subresource.load(std::memory_order_acquire);
+    if (forward_update_sub && update_subresource_hook_active.load(std::memory_order_acquire) &&
+        patched_table[kUpdateSubresource] != reinterpret_cast<void*>(&observedUpdateSubresource)) {
+        patchSlot(patched_table, kUpdateSubresource,
+            patched_table[kUpdateSubresource],
+            reinterpret_cast<void*>(&observedUpdateSubresource));
+    }
     }
     if (hud_draw_probe_active.load(std::memory_order_acquire)) {
         installHudStateRearmHooks();
@@ -8374,6 +8858,7 @@ void rearmContextHooks() {
     const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
     const bool map_active = map_hook_active.load(std::memory_order_acquire);
     const bool unmap_active = unmap_hook_active.load(std::memory_order_acquire);
+    const bool update_sub_active = update_subresource_hook_active.load(std::memory_order_acquire);
     for (size_t i = 0; i < tblCount; ++i) {
         auto& entry = s_hooked_tables[i];
         if (!entry.table) continue;
@@ -8398,6 +8883,11 @@ void rearmContextHooks() {
             entry.table[kUnmap] != reinterpret_cast<void*>(&observedUnmap)) {
             patchSlot(entry.table, kUnmap, entry.table[kUnmap],
                 reinterpret_cast<void*>(&observedUnmap));
+        }
+        if (update_sub_active && entry.orig_update_subresource &&
+            entry.table[kUpdateSubresource] != reinterpret_cast<void*>(&observedUpdateSubresource)) {
+            patchSlot(entry.table, kUpdateSubresource, entry.table[kUpdateSubresource],
+                reinterpret_cast<void*>(&observedUpdateSubresource));
         }
     }
 }
@@ -8651,17 +9141,27 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
 
         auto map_forward = reinterpret_cast<MapFn>(table[kMap]);
         auto unmap_forward = reinterpret_cast<UnmapFn>(table[kUnmap]);
+        auto update_sub_forward = reinterpret_cast<UpdateSubresourceFn>(table[kUpdateSubresource]);
         if (map_forward && map_forward != &observedMap) original_map.store(map_forward, std::memory_order_release);
         if (unmap_forward && unmap_forward != &observedUnmap) original_unmap.store(unmap_forward, std::memory_order_release);
+        if (update_sub_forward && update_sub_forward != &observedUpdateSubresource) {
+            original_update_subresource.store(update_sub_forward, std::memory_order_release);
+        }
 
         bool map_ok = map_forward && (map_forward == &observedMap || patchSlot(table, kMap,
             reinterpret_cast<void*>(map_forward), reinterpret_cast<void*>(&observedMap)));
         bool unmap_ok = unmap_forward && (unmap_forward == &observedUnmap || patchSlot(table, kUnmap,
             reinterpret_cast<void*>(unmap_forward), reinterpret_cast<void*>(&observedUnmap)));
+        bool update_sub_ok = update_sub_forward && (update_sub_forward == &observedUpdateSubresource ||
+            patchSlot(table, kUpdateSubresource,
+                reinterpret_cast<void*>(update_sub_forward),
+                reinterpret_cast<void*>(&observedUpdateSubresource)));
         map_hook_active.store(map_ok, std::memory_order_release);
         unmap_hook_active.store(unmap_ok, std::memory_order_release);
-        wchar_t hook_msg[128];
-        swprintf_s(hook_msg, L"EDPE: Map/Unmap hooks armed map=%u unmap=%u", map_ok, unmap_ok);
+        update_subresource_hook_active.store(update_sub_ok, std::memory_order_release);
+        wchar_t hook_msg[160];
+        swprintf_s(hook_msg, L"EDPE: Map/Unmap/UpdateSubresource hooks armed map=%u unmap=%u update=%u",
+            map_ok, unmap_ok, update_sub_ok);
         EdpeLog(hook_msg);
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
@@ -8769,18 +9269,26 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             if (s_probe_seen_this_frame && !s_has_staged_camera) {
                 // Зондовий кадр без основної сцени: не накладаємо штраф standdown і не скидаємо фазу
             } else if (++s_unreconstructed_jitter_streak >= 8) {
-                s_jitter_standdown_until.store(rendered_frame + 2ull, std::memory_order_relaxed);
-                wchar_t standdown_msg[200];
-                swprintf_s(standdown_msg, L"EDPE: jitter stood down for 2 frames (unreconstructed streak=%u)",
-                    s_unreconstructed_jitter_streak);
-                EdpeLog(standdown_msg);
+                const unsigned long long standdown_frames = s_jitter_standdown_len;
+                s_jitter_standdown_until.store(rendered_frame + standdown_frames, std::memory_order_relaxed);
+                if (s_jitter_standdown_len < 64) {
+                    s_jitter_standdown_len = (std::min)(s_jitter_standdown_len * 2, 64ull);
+                }
+                if (s_unreconstructed_jitter_streak == 8 ||
+                    (s_unreconstructed_jitter_streak % 32 == 0)) {
+                    wchar_t standdown_msg[200];
+                    swprintf_s(standdown_msg, L"EDPE: jitter stood down for %llu frames (unreconstructed streak=%u)",
+                        standdown_frames, s_unreconstructed_jitter_streak);
+                    EdpeLog(standdown_msg);
+                }
             }
         }
         s_probe_seen_this_frame = false;
         s_ustat = UnmapFrameStats{};
         if (!s_upscale_evaluated_this_frame) {
             bool dummy_cut = false;
-            if (s_has_staged_camera && s_staged_camera_frame == rendered_frame) {
+            if ((s_has_staged_camera && s_staged_camera_frame == rendered_frame) ||
+                motion_color_frame == rendered_frame) {
                 commitMainCamera(rendered_frame, dummy_cut);
             }
         }
@@ -8907,7 +9415,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
     s_jittered_cb1_buffer.store(nullptr, std::memory_order_relaxed);
         clearTrackedMappedBuffers();
-        clearRejectedResourceCache();
+        if ((last_present_frame.load(std::memory_order_relaxed) % 300ull) == 0ull) {
+            clearRejectedResourceCache();
+        }
         static uint64_t s_watchdog_last_camera_seen = 0;
         static unsigned s_watchdog_no_camera_frames = 0;
         const uint64_t cur_camera_seen = s_valid_camera_seen_counter.load(std::memory_order_relaxed);
@@ -9485,6 +9995,10 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_has_staged_camera = false;
         s_staged_from_in_scene = false;
         s_staged_camera_frame = ~0ull;
+        s_camera_now = {};
+        s_last_true_camera = {};
+        s_last_true_camera_frame = ~0ull;
+        s_consecutive_fallback_frames = 0;
         s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
         s_prev_valid_velocity = {0.0f, 0.0f, 0.0f};
         s_teleport_rejection_streak = 0;
@@ -9582,6 +10096,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
                     reinterpret_cast<void*>(&observedUnmap),
                     reinterpret_cast<void*>(entry.orig_unmap));
             }
+            if (entry.orig_update_subresource) {
+                patchSlot(entry.table, kUpdateSubresource,
+                    reinterpret_cast<void*>(&observedUpdateSubresource),
+                    reinterpret_cast<void*>(entry.orig_update_subresource));
+            }
         }
     }
     if (patched_table) {
@@ -9595,6 +10114,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
                 reinterpret_cast<void*>(&observedUnmap),
                 reinterpret_cast<void*>(original_unmap.load(std::memory_order_acquire)));
         }
+        if (update_subresource_hook_active.exchange(false, std::memory_order_acq_rel)) {
+            patchSlot(patched_table, kUpdateSubresource,
+                reinterpret_cast<void*>(&observedUpdateSubresource),
+                reinterpret_cast<void*>(original_update_subresource.load(std::memory_order_acquire)));
+        }
     }
     for (size_t i = 0; i < s_hooked_table_count.load(std::memory_order_acquire); ++i) {
         if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
@@ -9603,6 +10127,9 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_hooked_tables[i] = {};
     }
     s_hooked_table_count.store(0, std::memory_order_release);
+    s_primary_hook_ctx.store(nullptr, std::memory_order_release);
+    s_primary_live_table.store(nullptr, std::memory_order_release);
+    s_primary_vtable_hook.store(nullptr, std::memory_order_release);
     scene_map_target.store(nullptr, std::memory_order_release);
     scene_mapped_data.store(nullptr, std::memory_order_release);
     s_hud_probe_armed_once.store(false, std::memory_order_release);
@@ -9980,6 +10507,7 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
     if (is_immediate) {
         entry.orig_map = reinterpret_cast<MapFn>(vtHook->liveStubForSlot(kMap));
         entry.orig_unmap = reinterpret_cast<UnmapFn>(vtHook->liveStubForSlot(kUnmap));
+        entry.orig_update_subresource = reinterpret_cast<UpdateSubresourceFn>(vtHook->liveStubForSlot(kUpdateSubresource));
         entry.orig_vs_cb = reinterpret_cast<VSSetConstantBuffersFn>(vtHook->liveStubForSlot(kVSSetConstantBuffers));
         entry.orig_draw_indexed = reinterpret_cast<DrawIndexedFn>(vtHook->liveStubForSlot(kDrawIndexed));
         entry.orig_draw = reinterpret_cast<DrawFn>(vtHook->liveStubForSlot(kDraw));
@@ -9990,6 +10518,9 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
         }
         if (!original_unmap.load(std::memory_order_relaxed)) {
             original_unmap.store(entry.orig_unmap, std::memory_order_release);
+        }
+        if (!original_update_subresource.load(std::memory_order_relaxed)) {
+            original_update_subresource.store(entry.orig_update_subresource, std::memory_order_release);
         }
         if (!original_vs_set_buffers.load(std::memory_order_relaxed)) {
             original_vs_set_buffers.store(entry.orig_vs_cb, std::memory_order_release);
@@ -10014,9 +10545,15 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             void* ignoredOut = nullptr;
             vtHook->hook(context, kUnmap, reinterpret_cast<void*>(&observedUnmap), &ignoredOut, mode);
         }
+        if (update_subresource_hook_active.load(std::memory_order_acquire)) {
+            void* ignoredOut = nullptr;
+            vtHook->hook(context, kUpdateSubresource, reinterpret_cast<void*>(&observedUpdateSubresource), &ignoredOut, mode);
+        }
         if (hud_draw_probe_active.load(std::memory_order_acquire)) {
             void* ignoredOut = nullptr;
-            vtHook->hook(context, kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers), &ignoredOut, mode);
+            if (mode != edpe::HookMode::LiveCopy || vs_buffer_probe_active.load(std::memory_order_acquire)) {
+                vtHook->hook(context, kVSSetConstantBuffers, reinterpret_cast<void*>(&observedVSSetConstantBuffers), &ignoredOut, mode);
+            }
             vtHook->hook(context, kDrawIndexed, reinterpret_cast<void*>(&observedDrawIndexed), &ignoredOut, mode);
             vtHook->hook(context, kDraw, reinterpret_cast<void*>(&observedDraw), &ignoredOut, mode);
             vtHook->hook(context, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), &ignoredOut, mode);
@@ -10026,6 +10563,11 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
 
     s_hooked_tables[count] = entry;
     s_context_vtable_hooks[count] = std::move(vtHook);
+    if (is_immediate && s_primary_hook_ctx.load(std::memory_order_acquire) == nullptr) {
+        s_primary_live_table.store(entry.table, std::memory_order_release);
+        s_primary_vtable_hook.store(s_context_vtable_hooks[count].get(), std::memory_order_release);
+        s_primary_hook_ctx.store(context, std::memory_order_release);
+    }
     s_hooked_table_count.store(count + 1, std::memory_order_release);
 }
 

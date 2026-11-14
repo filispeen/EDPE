@@ -93,7 +93,8 @@ jobs:
           variant: sccache
           key: ${{ runner.os }}-sccache-${{ github.ref_name }}
           restore-keys: |
-            ${{ runner.os }}-sccache-
+            sccache-${{ runner.os }}-sccache-${{ github.event.repository.default_branch }}-
+            sccache-${{ runner.os }}-sccache-
           max-size: 2G
 
       - name: Configure CMake
@@ -120,19 +121,20 @@ jobs:
           } else {
             'dev'
           }
-          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build EDPE (Release)
         shell: pwsh
         run: |
-          cmake --build build --config Release --parallel
+          cmake --build build --parallel
 
       - name: Run Tests
         shell: pwsh
         run: |
-          ctest --test-dir build -C Release --output-on-failure
+          ctest --test-dir build --output-on-failure
 
       - name: Upload Staged Binaries
+        if: (github.ref_type == 'tag' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'rc') || startsWith(github.ref_name, 'exp') || startsWith(github.ref_name, 'experimental'))) || inputs.rc == true || inputs.experimental == true
         uses: actions/upload-artifact@v4
         with:
           name: edpe-stage-binaries
