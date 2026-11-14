@@ -163,8 +163,11 @@ jobs:
 
           Write-Host "Created archive: $archiveName (SHA-256: $sha256)"
           "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha256=$sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Publish GitHub Release
+        id: release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -178,3 +181,64 @@ jobs:
           draft: false
           prerelease: ${{ inputs.prerelease || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
           make_latest: ${{ (inputs.prerelease || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha')) && 'false' || 'true' }}
+
+      - name: Notify Discord (#releases-and-roadmap)
+        shell: pwsh
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_RELEASE_CHANNEL_ID }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          ARCHIVE_SHA256: ${{ steps.package.outputs.sha256 }}
+          IS_PRERELEASE: ${{ inputs.prerelease || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+        run: |
+          if (-not $env:DISCORD_BOT_TOKEN -or -not $env:DISCORD_CHANNEL_ID) {
+            Write-Host "DISCORD_BOT_TOKEN or DISCORD_RELEASE_CHANNEL_ID not set; skipping Discord post."
+            return
+          }
+
+          $changelog = ""
+          if (Test-Path "tag-message.md") {
+            $changelog = (Get-Content -Path "tag-message.md" -Raw -Encoding utf8).Trim()
+          }
+          if ($changelog.Length -gt 3500) {
+            $changelog = $changelog.Substring(0, 3500) + "`n..."
+          }
+
+          $isPre = ($env:IS_PRERELEASE -eq "true")
+          $title = if ($isPre) { "EDPE $($env:RELEASE_TAG) (Pre-release)" } else { "EDPE $($env:RELEASE_TAG)" }
+          $color = if ($isPre) { 0xF39C12 } else { 0x2ECC71 }
+
+          $payload = @{
+            embeds = @(
+              @{
+                title = $title
+                url = $env:RELEASE_URL
+                description = $changelog
+                color = $color
+                fields = @(
+                  @{ name = "Archive"; value = "``$($env:ARCHIVE_NAME)``"; inline = $true }
+                  @{ name = "Download"; value = "[GitHub Release]($($env:RELEASE_URL))"; inline = $true }
+                  @{ name = "SHA-256"; value = "``$($env:ARCHIVE_SHA256)``"; inline = $false }
+                )
+                footer = @{ text = "EDPE Automated Release" }
+              }
+            )
+          } | ConvertTo-Json -Depth 6
+
+          $headers = @{
+            "Authorization" = "Bot $($env:DISCORD_BOT_TOKEN)"
+            "User-Agent"    = "EDPE-Release-Notifier/1.0"
+          }
+
+          try {
+            Invoke-RestMethod -Method Post `
+              -Uri "https://discord.com/api/v10/channels/$($env:DISCORD_CHANNEL_ID)/messages" `
+              -Headers $headers `
+              -ContentType "application/json; charset=utf-8" `
+              -Body ([System.Text.Encoding]::UTF8.GetBytes($payload)) | Out-Null
+            Write-Host "Posted release announcement to Discord channel $($env:DISCORD_CHANNEL_ID)."
+          } catch {
+            Write-Warning "Failed to notify Discord: $_"
+          }
