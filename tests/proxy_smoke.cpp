@@ -429,7 +429,15 @@ int wmain(int argc, wchar_t** argv) {
             &motion_probe))) return 10;
     std::memcpy(motion_probe.pData, probe_values, sizeof(probe_values));
     context->Unmap(probe_buffer, 0);
-    const bool motion_requested = request_motion_pair(0);
+    // Allow asynchronous camera-pair depth staging readback to finish on slower/WARP CI runners
+    bool motion_requested = false;
+    for (int retry = 0; retry < 60; ++retry) {
+        motion_requested = request_motion_pair(0);
+        if (motion_requested) break;
+        context->Flush();
+        swap_chain->Present(0, 0);
+        Sleep(5);
+    }
     const HRESULT motion_arm_present = swap_chain->Present(0, 0);
     HRESULT motion_present = S_OK;
     bool glass_target_restored = false;
