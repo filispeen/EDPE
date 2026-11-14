@@ -664,6 +664,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         if (++s_consecutive_fallback_frames > 2) {
             s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
             s_anchor_valid = false;
+            s_camera_reset = true;
         }
         s_prev_valid_velocity = s_last_valid_velocity;
         s_camera_previous = s_camera_now;
@@ -2989,7 +2990,7 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             return false;
         }
         const bool isFullScreenCopyCandidate =
-            (s_post_ldr_backbuffer_no_dsv && count >= 3 && count <= 6 && instance_count == 1);
+            (s_post_ldr_backbuffer_bound && count >= 3 && count <= 6 && instance_count == 1);
         if (!isFullScreenCopyCandidate &&
             (s_hud_draws_replayed_frame == 0 ||
              (!isPauseOrModalMenuActive(current_frame) && count < 300 && count != 4 && count != 6))) {
@@ -3058,7 +3059,7 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             s_jitter_debug_view.load(std::memory_order_relaxed) ||
             s_hud_debug_view.load(std::memory_order_relaxed);
         if (bbRes && wantUpscale && !s_upscale_evaluated_this_frame &&
-            s_post_ldr_backbuffer_bound && s_post_ldr_backbuffer_no_dsv &&
+            s_post_ldr_backbuffer_bound &&
             count >= 3 && count <= 6 && instance_count == 1 &&
             scene_ldr_source && scene_ldr_frame == current_frame) {
             Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> psSrv0;
@@ -3069,8 +3070,14 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
                 Microsoft::WRL::ComPtr<ID3D11DepthStencilView> curDsv;
                 context->OMGetRenderTargets(1, curRtv.GetAddressOf(), curDsv.GetAddressOf());
+                bool dsvIsSceneDepth = false;
+                if (curDsv && scene_depth_source) {
+                    Microsoft::WRL::ComPtr<ID3D11Resource> dsvRes;
+                    curDsv->GetResource(&dsvRes);
+                    dsvIsSceneDepth = (dsvRes && dsvRes.Get() == static_cast<ID3D11Resource*>(scene_depth_source.Get()));
+                }
                 Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
-                if (curRtv && !curDsv) {
+                if (curRtv && !dsvIsSceneDepth) {
                     curRtv->GetResource(&rtvRes);
                 }
                 Microsoft::WRL::ComPtr<ID3D11Texture2D> bbTex;
@@ -3080,13 +3087,11 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                     bbTex->GetDesc(&rtvDesc);
                     if (!isValidPass53Target &&
                         rtvRes.Get() != static_cast<ID3D11Resource*>(scene_ldr_source.Get())) {
-                        // In dual-device setups (e.g. NVIDIA Smooth Motion NvPresent64.dll),
-                        // s_swapchain_backbuffer belongs to presentDevice while Pass 53 renders into
-                        // an output-sized LDR surface on sceneDevice.
+                        // Accept any output-sized single-sample LDR target receiving the Pass 53 copy from
+                        // scene_ldr_source (both dual-device Smooth Motion and single-device offscreen paths).
                         Microsoft::WRL::ComPtr<ID3D11Device> ctxDev;
                         context->GetDevice(&ctxDev);
                         if (ctxDev && sameD3D11Device(bbTex.Get(), ctxDev.Get()) &&
-                            !sameD3D11Device(bbRes, ctxDev.Get()) &&
                             rtvDesc.SampleDesc.Count == 1 &&
                             isLdrSceneColorFormat(rtvDesc.Format)) {
                             const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
@@ -3232,7 +3237,8 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                  td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
                  td.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
             if (isHdrFmt && td.Width == sceneW && td.Height == sceneH &&
-                td.SampleDesc.Count == 1 && (td.BindFlags & D3D11_BIND_RENDER_TARGET)) {
+                td.SampleDesc.Count == 1 &&
+                (td.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE))) {
                 hdrSlot = i;
                 hdrSlotRes = res;
                 break;
@@ -4211,9 +4217,12 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         bc.scaleY = static_cast<float>(bsy);
                         bc.depthB = words[1094];
                         edpe::cameraSetPosition(bc, edpe::cameraPosition(s_camera_now) + s_last_valid_velocity);
-                        parsed_camera = bc;
-                        block_cam_ok = true;
-                        ++s_ustat.blockOnly;
+                        if (s_consecutive_fallback_frames <= 2 &&
+                            edpe::cameraRotationTrace(bc, s_camera_now) > 2.40f) {
+                            parsed_camera = bc;
+                            block_cam_ok = true;
+                            ++s_ustat.blockOnly;
+                        }
                     }
                 }
             }
@@ -4259,6 +4268,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     //    is accepted immediately so fast head-look/mouse-look turns never drop camera updates.
                     // 2) Any camera/FOV change persisting >= 2 frames is accepted as a new baseline even if
                     //    Cobra unmaps VS cb1 before binding the 4-MRT G-buffer.
+                    bool cut_streak_satisfied = false;
                     if (!passes_filter && !is_probe &&
                         cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                         cameraRotationDeterminant(parsed_camera) <= 1.15f &&
@@ -4281,7 +4291,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             }
                             if (s_cut_rejection_streak >= 2 && s_consecutive_fallback_frames >= 1) {
                                 passes_filter = true;
-                                s_cut_rejection_streak = 0;
+                                cut_streak_satisfied = true;
                                 s_anchor_valid = false;
                             }
                         }
@@ -4306,7 +4316,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                     s_last_teleport_rejection_frame = cur_frame;
                                     ++s_teleport_rejection_streak;
                                 }
-                                if (s_teleport_rejection_streak < 2 || s_consecutive_fallback_frames < 1) {
+                                if (!cut_streak_satisfied &&
+                                    (s_teleport_rejection_streak < 2 || s_consecutive_fallback_frames < 1)) {
                                     allow_stage = false;
                                 }
                             } else if (jumpResidual <= 15.0f) {
@@ -4332,6 +4343,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         }
 
                         if (allow_stage) {
+                            s_cut_rejection_streak = 0;
+                            s_teleport_rejection_streak = 0;
                             s_staged_camera = parsed_camera;
                             s_has_staged_camera = true;
                             s_staged_camera_frame = cur_frame;
@@ -4450,8 +4463,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 ++s_ustat.parseFail;
             }
 
-            const bool block_only_pilot = block_cam_ok;
-            const bool jitter_candidate = is_main_camera || block_only_pilot;
+            const bool jitter_candidate = is_main_camera;
 
             // Phase 5: Projection jitter injection into words 1080..1095
             // Inject jitter ONLY into authoritative primary scene camera projections during G-Buffer
@@ -7596,8 +7608,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             scene_ldr_source.Reset();
             scene_ldr_frame = ~0ull;
             s_pass53_blit_seen_frame = ~0ull;
-        } else if (count >= 1 && targets && targets[0] &&
-                   s_hdr_slot0_seen_frame == current_frame) {
+        } else if (count >= 1 && targets && targets[0]) {
             const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
             const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
             if (sceneW > 0 && sceneH > 0) {
@@ -7620,7 +7631,21 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                             tex0->GetDesc(&td);
                             if (td.Width == sceneW && td.Height == sceneH &&
                                 td.SampleDesc.Count == 1) {
+                                auto ensureTonemapProbeArmed = [&]() {
+                                    if (s_hdr_slot0_seen_frame != current_frame) {
+                                        s_hdr_slot0_seen_frame = current_frame;
+                                        if (reconstruction_active) {
+                                            if (!hud_draw_hook_mask) {
+                                                beginHudDrawProbe();
+                                            } else {
+                                                rearmHudDrawProbe(context);
+                                            }
+                                            hud_draw_probe_active.store(true, std::memory_order_relaxed);
+                                        }
+                                    }
+                                };
                                 if (isLdrSceneColorFormat(td.Format)) {
+                                    ensureTonemapProbeArmed();
                                     const bool alreadyHaveDifferentLdr =
                                         (scene_ldr_frame == current_frame && scene_ldr_source &&
                                          scene_ldr_source.Get() != tex0.Get());
@@ -7647,6 +7672,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                                 } else if (td.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
                                            td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
                                            td.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS) {
+                                    ensureTonemapProbeArmed();
                                     s_last_full_hdr_post_source = tex0;
                                     s_last_full_hdr_post_frame = current_frame;
                                 }
@@ -8769,18 +8795,26 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             if (s_probe_seen_this_frame && !s_has_staged_camera) {
                 // Зондовий кадр без основної сцени: не накладаємо штраф standdown і не скидаємо фазу
             } else if (++s_unreconstructed_jitter_streak >= 8) {
-                s_jitter_standdown_until.store(rendered_frame + 2ull, std::memory_order_relaxed);
-                wchar_t standdown_msg[200];
-                swprintf_s(standdown_msg, L"EDPE: jitter stood down for 2 frames (unreconstructed streak=%u)",
-                    s_unreconstructed_jitter_streak);
-                EdpeLog(standdown_msg);
+                const unsigned long long standdown_frames = s_jitter_standdown_len;
+                s_jitter_standdown_until.store(rendered_frame + standdown_frames, std::memory_order_relaxed);
+                if (s_jitter_standdown_len < 64) {
+                    s_jitter_standdown_len = (std::min)(s_jitter_standdown_len * 2, 64ull);
+                }
+                if (s_unreconstructed_jitter_streak == 8 ||
+                    (s_unreconstructed_jitter_streak % 32 == 0)) {
+                    wchar_t standdown_msg[200];
+                    swprintf_s(standdown_msg, L"EDPE: jitter stood down for %llu frames (unreconstructed streak=%u)",
+                        standdown_frames, s_unreconstructed_jitter_streak);
+                    EdpeLog(standdown_msg);
+                }
             }
         }
         s_probe_seen_this_frame = false;
         s_ustat = UnmapFrameStats{};
         if (!s_upscale_evaluated_this_frame) {
             bool dummy_cut = false;
-            if (s_has_staged_camera && s_staged_camera_frame == rendered_frame) {
+            if ((s_has_staged_camera && s_staged_camera_frame == rendered_frame) ||
+                motion_color_frame == rendered_frame) {
                 commitMainCamera(rendered_frame, dummy_cut);
             }
         }
