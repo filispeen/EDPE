@@ -4,6 +4,7 @@
 #include "ngx_context.h"
 #include "config.h"
 #include "profiler.h"
+#include "ui.h"
 #include "log.h"
 
 #include <imgui.h>
@@ -118,25 +119,16 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
         telemetry_.upscalerFrametimeMs = 0.0f;
     }
 
-    // Resolution dimensions
-    UINT outW = 0, outH = 0;
-    if (swapChain) {
+    // Populate output resolution once up front; refresh periodically in updateTelemetry().
+    if (swapChain && (cachedOutputWidth_ == 0 || cachedOutputHeight_ == 0)) {
         DXGI_SWAP_CHAIN_DESC scDesc{};
         if (SUCCEEDED(swapChain->GetDesc(&scDesc))) {
-            outW = scDesc.BufferDesc.Width;
-            outH = scDesc.BufferDesc.Height;
+            cachedOutputWidth_ = scDesc.BufferDesc.Width;
+            cachedOutputHeight_ = scDesc.BufferDesc.Height;
         }
     }
-    UINT sceneW = 0, sceneH = 0;
-    ContextCensusGetSceneRenderSize(&sceneW, &sceneH);
-    if (!sceneW || !sceneH) {
-        sceneW = outW;
-        sceneH = outH;
-    }
-    telemetry_.renderWidth = sceneW;
-    telemetry_.renderHeight = sceneH;
-    telemetry_.outputWidth = outW;
-    telemetry_.outputHeight = outH;
+    const UINT outW = cachedOutputWidth_;
+    const UINT outH = cachedOutputHeight_;
 
     // Game frametime is time spent by game engine before upscaler / composite
     telemetry_.gameFrametimeMs = (std::max)(0.0f, telemetry_.totalFrametimeMs - telemetry_.upscalerFrametimeMs);
@@ -151,11 +143,30 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
         historyCount_++;
     }
 
+    const auto& cfg = Config::instance();
+    const bool uiOrStatsNeeded = cfg.showPerfOverlay || UiMenuVisible() || cfg.enableProfiler || cfg.captureOverlayInComparison;
+    if (!uiOrStatsNeeded) {
+        return;
+    }
+
+    UINT sceneW = 0, sceneH = 0;
+    ContextCensusGetSceneRenderSize(&sceneW, &sceneH);
+    if (!sceneW || !sceneH) {
+        sceneW = outW;
+        sceneH = outH;
+    }
+    telemetry_.renderWidth = sceneW;
+    telemetry_.renderHeight = sceneH;
+    telemetry_.outputWidth = outW;
+    telemetry_.outputHeight = outH;
+
     // Rate-limit hardware telemetry to ~4 times per second (250 ms) BEFORE updating cached display strings
     if (perfFreq_.QuadPart > 0) {
         const double elapsedSinceUpdateMs = static_cast<double>(now.QuadPart - lastTelemetryUpdate_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
         if (lastTelemetryUpdate_.QuadPart == 0 || elapsedSinceUpdateMs >= 250.0) {
             updateTelemetry(swapChain);
+            telemetry_.outputWidth = cachedOutputWidth_;
+            telemetry_.outputHeight = cachedOutputHeight_;
             lastTelemetryUpdate_ = now;
         }
     }
@@ -362,6 +373,12 @@ void PerfTracker::updateCachedStats() {
 
 void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
     if (!swapChain) return;
+
+    DXGI_SWAP_CHAIN_DESC scDesc{};
+    if (SUCCEEDED(swapChain->GetDesc(&scDesc))) {
+        cachedOutputWidth_ = scDesc.BufferDesc.Width;
+        cachedOutputHeight_ = scDesc.BufferDesc.Height;
+    }
 
     // 1. Static GPU adapter information
     if (!gpuInfoCached_) {

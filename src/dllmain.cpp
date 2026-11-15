@@ -1,7 +1,8 @@
 #include "crash_logger.h"
+#include "log.h"
 #include <windows.h>
 
-BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID lpvReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(module);
         edpe::installCrashLogger();
@@ -11,6 +12,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
         *crashPtr = 42;
 #endif
     } else if (reason == DLL_PROCESS_DETACH) {
+        EdpeLogShutdown(lpvReserved == nullptr);
         edpe::uninstallCrashLogger();
     }
     return TRUE;

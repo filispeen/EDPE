@@ -89,6 +89,7 @@ public:
     void shutdown();
     void updateCachedStats();
     void refreshCachedStats() { updateCachedStats(); }
+    void invalidateResolution() { cachedOutputWidth_ = 0; cachedOutputHeight_ = 0; }
 
 private:
     PerfTracker();
@@ -150,6 +151,8 @@ private:
     NvmlGetMem_t nvmlGetMem_ = nullptr;
 
     // Telemetry rate limiting
+    uint32_t cachedOutputWidth_ = 0;
+    uint32_t cachedOutputHeight_ = 0;
     LARGE_INTEGER lastTelemetryUpdate_{};
     std::thread nvmlWorkerThread_;
     std::atomic<bool> nvmlRunning_{false};

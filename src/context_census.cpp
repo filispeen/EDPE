@@ -3052,9 +3052,6 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
         return false;
     }
 
-    std::uint64_t vs_hash = 0, ps_hash = 0;
-    getFastBoundShaderHashes(context, vs_hash, ps_hash);
-
     auto issueDraw = [&]() {
         switch (kind) {
         case 'X':
@@ -3090,14 +3087,19 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
          (s_verified_ldr_tonemap_frame == current_frame ||
           scene_ldr_frame == current_frame ||
           s_pass53_blit_seen_frame == current_frame));
-    const bool isModalOrEscMenuDraw =
-        isPostTonemapMenuStage &&
-        ((vs_hash == 0xC4B4B334B26E81A9ull && ps_hash == 0x0146ABCC53240479ull) ||
-         (vs_hash == 0xA888D51024D9798Eull && ps_hash == 0x015EF9349EC097E8ull && count >= 300) ||
-         (vs_hash == 0x5DAD41AA66757CE3ull && ps_hash == 0x25D5F73A4616093Bull) ||
-         (vs_hash == 0x4EF6DDB075A927FAull));
-    if (isModalOrEscMenuDraw) {
-        s_pause_menu_seen_frame = current_frame;
+    std::uint64_t vs_hash = 0, ps_hash = 0;
+    bool shadersFetched = false;
+    if (isPostTonemapMenuStage) {
+        getFastBoundShaderHashes(context, vs_hash, ps_hash);
+        shadersFetched = true;
+        const bool isModalOrEscMenuDraw =
+            ((vs_hash == 0xC4B4B334B26E81A9ull && ps_hash == 0x0146ABCC53240479ull) ||
+             (vs_hash == 0xA888D51024D9798Eull && ps_hash == 0x015EF9349EC097E8ull && count >= 300) ||
+             (vs_hash == 0x5DAD41AA66757CE3ull && ps_hash == 0x25D5F73A4616093Bull) ||
+             (vs_hash == 0x4EF6DDB075A927FAull));
+        if (isModalOrEscMenuDraw) {
+            s_pause_menu_seen_frame = current_frame;
+        }
     }
 
     // Pass 53 Output Copy interception (before Pass 54 2D LDR UI / Main Menu / ESC Menu / Station Services):
@@ -3365,6 +3367,9 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
     // 2. Tonemap Re-issue: save game shader resources, re-issue tonemap with HdrLayer on slot t1
     //    and output to LdrLayer (RGB channels), then transfer alpha from HdrLayer.a to LdrLayer.a.
     if (s_hud_tonemapped_valid_frame != current_frame) {
+        if (!shadersFetched) {
+            getFastBoundShaderHashes(context, vs_hash, ps_hash);
+        }
         Microsoft::WRL::ComPtr<ID3D11Buffer> gameExposureCb;
         context->PSGetConstantBuffers(2, 1, gameExposureCb.GetAddressOf());
         if (edpe::UiLayer::instance().beginTonemapReissue(
@@ -8174,8 +8179,15 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     dsv_binds.fetch_add(1, std::memory_order_relaxed);
     ctxData->dsv_binds.fetch_add(1, std::memory_order_relaxed);
 
+    // Once the main 3D scene has already transitioned from 4-MRT (Binds 1-3) to RTV0 lighting (Binds 4-7)
+    // in this frame, ignore any late 1-second auxiliary 4-MRT pass so it cannot clobber depth/color/LDR targets.
+    const bool main_gbuffer_already_finished =
+        (s_hdr_slot0_seen_frame == current_frame && scene_depth_source &&
+         motion_color_source && motion_color_frame == current_frame);
+
     bool scene_mrt = false;
-    if (count >= 4 && targets && targets[0] && targets[1] && targets[2] && targets[3]) {
+    if (!main_gbuffer_already_finished && count >= 4 && targets &&
+        targets[0] && targets[1] && targets[2] && targets[3]) {
         D3D11_RENDER_TARGET_VIEW_DESC views[4]{};
         for (UINT slot = 0; slot < 4; ++slot) targets[slot]->GetDesc(&views[slot]);
         scene_mrt = views[0].Format == DXGI_FORMAT_R10G10B10A2_UNORM &&
@@ -8187,33 +8199,26 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     bool is_main_scene = false;
     bool hud_probe_begin = false;
     if (scene_mrt) {
-        // Once the main 3D scene has already transitioned from 4-MRT (Binds 1-3) to RTV0 lighting (Binds 4-7)
-        // in this frame, ignore any late 1-second auxiliary 4-MRT pass so it cannot clobber depth/color/LDR targets.
-        const bool main_gbuffer_already_finished =
-            (s_hdr_slot0_seen_frame == current_frame && scene_depth_source &&
-             motion_color_source && motion_color_frame == current_frame);
-        if (!main_gbuffer_already_finished) {
-            ID3D11Resource* dsv_res = nullptr;
-            dsv->GetResource(&dsv_res);
-            if (dsv_res) {
-                Microsoft::WRL::ComPtr<ID3D11Texture2D> depthTex;
-                if (SUCCEEDED(dsv_res->QueryInterface(__uuidof(ID3D11Texture2D),
-                        reinterpret_cast<void**>(depthTex.GetAddressOf())))) {
-                    D3D11_TEXTURE2D_DESC dd{};
-                    depthTex->GetDesc(&dd);
-                    const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
-                    const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
-                    const bool same_frame = (s_observed_scene_frame == current_frame);
-                    if (isMainSceneMrtDepth(dd, outW, outH, same_frame)) {
-                        is_main_scene = true;
-                        scene_depth_source = depthTex;
-                        s_observed_scene_width.store(dd.Width, std::memory_order_relaxed);
-                        s_observed_scene_height.store(dd.Height, std::memory_order_relaxed);
-                        s_observed_scene_frame = current_frame;
-                    }
+        ID3D11Resource* dsv_res = nullptr;
+        dsv->GetResource(&dsv_res);
+        if (dsv_res) {
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> depthTex;
+            if (SUCCEEDED(dsv_res->QueryInterface(__uuidof(ID3D11Texture2D),
+                    reinterpret_cast<void**>(depthTex.GetAddressOf())))) {
+                D3D11_TEXTURE2D_DESC dd{};
+                depthTex->GetDesc(&dd);
+                const UINT outW = s_swapchain_width.load(std::memory_order_relaxed);
+                const UINT outH = s_swapchain_height.load(std::memory_order_relaxed);
+                const bool same_frame = (s_observed_scene_frame == current_frame);
+                if (isMainSceneMrtDepth(dd, outW, outH, same_frame)) {
+                    is_main_scene = true;
+                    scene_depth_source = depthTex;
+                    s_observed_scene_width.store(dd.Width, std::memory_order_relaxed);
+                    s_observed_scene_height.store(dd.Height, std::memory_order_relaxed);
+                    s_observed_scene_frame = current_frame;
                 }
-                dsv_res->Release();
             }
+            dsv_res->Release();
         }
 
         if (is_main_scene) {
@@ -8323,18 +8328,21 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             ID3D11RenderTargetView* hdrRtv = nullptr;
             if (is_main_scene || scene_mrt) {
                 ctx_seen[index].mrt_hdr_view = targets[3];
-                if (is_main_scene) hdrRtv = targets[3];
+                if (is_main_scene && !(reconstruction_active && scene_hdr_color_frame == frame)) {
+                    hdrRtv = targets[3];
+                }
             } else if (ctx_seen[index].mrt_hdr_view && count && targets &&
                 targets[0] == ctx_seen[index].mrt_hdr_view) {
                 ctx_seen[index].scene_match_frame = frame;
-                if (motion_color_source && sameRenderTargetResource(targets[0], motion_color_source.Get())) {
+                if (reconstruction_active && motion_color_source &&
+                    sameRenderTargetResource(targets[0], motion_color_source.Get())) {
                     hdrRtv = targets[0];
                 }
-            } else if (count && targets && targets[0] &&
+            } else if (reconstruction_active && count && targets && targets[0] &&
                        motion_color_source && sameRenderTargetResource(targets[0], motion_color_source.Get())) {
                 hdrRtv = targets[0];
             }
-            if (hdrRtv) {
+            if (hdrRtv && reconstruction_active) {
                 ID3D11Resource* res = nullptr;
                 hdrRtv->GetResource(&res);
                 if (res) {
@@ -8764,7 +8772,11 @@ void rearmContextHooks() {
     const size_t hookCount = s_hooked_table_count.load(std::memory_order_acquire);
     for (size_t i = 0; i < hookCount; ++i) {
         if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
-            s_context_vtable_hooks[i]->reclaim();
+            if (s_hooked_tables[i].context) {
+                s_context_vtable_hooks[i]->reclaimLive(s_hooked_tables[i].context);
+            } else {
+                s_context_vtable_hooks[i]->reclaim();
+            }
         }
     }
     static bool s_swap_logged = false;
@@ -9515,8 +9527,12 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             edpe::JitterLogger::instance().pushFrame(jlog);
         }
     }
-    if ((edpe::Config::instance().devMode || !edpe::UpscalerManager::instance().isReconstructionActive()) &&
-        frame % 1024 == 0 && observed_swap_chain == swap_chain) {
+    const bool devModeEnabled = edpe::Config::instance().devMode;
+    const bool periodicInterval =
+        (observed_swap_chain == swap_chain) &&
+        (frame == 1024 || (devModeEnabled && frame % 1024 == 0));
+    if (periodicInterval &&
+        (devModeEnabled || !edpe::UpscalerManager::instance().isReconstructionActive())) {
         wchar_t callMsg[256];
         swprintf_s(callMsg,
             L"EDPE: context calls frame=%llu OMSetRenderTargets=%llu OMSetRenderTargetsAndUnorderedAccessViews=%llu FinishCommandList=%llu ExecuteCommandList=%llu",
@@ -9556,7 +9572,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
         findSceneContextData(true);
     }
-    if (frame % 1024 == 0 && observed_swap_chain == swap_chain &&
+    if (periodicInterval &&
         !edpe::UpscalerManager::instance().isReconstructionActive()) {
         const size_t ctxCount = s_tracked_context_count.load(std::memory_order_acquire);
         const unsigned slotActive = patched_table && patched_table[kOMSetRenderTargets] ==
