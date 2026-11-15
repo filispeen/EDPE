@@ -15,6 +15,16 @@ enum class ProfileZone : uint32_t {
     Count
 };
 
+enum class GpuProfileZone : uint32_t {
+    DepthCopy = 0,
+    MotionPass,
+    ColorPrep,
+    UpscaleEval,
+    UiComposite,
+    HudBloom,
+    Count
+};
+
 class Profiler {
 public:
     static Profiler& instance() {
@@ -35,11 +45,33 @@ public:
         currentTicks_[static_cast<uint32_t>(zone)].fetch_add(ticks, std::memory_order_relaxed);
     }
 
-    void onFrameEnd() {
+    void submitGpuSample(const double (&zoneMs)[static_cast<uint32_t>(GpuProfileZone::Count)]) {
         if (!isEnabled()) return;
+        const uint32_t gpuCount = static_cast<uint32_t>(GpuProfileZone::Count);
+        for (uint32_t i = 0; i < gpuCount; ++i) {
+            gpuWindowSumMs_[i] += zoneMs[i];
+        }
+        ++gpuWindowSamples_;
+    }
+
+    void setDirectColorStatus(bool active, uint32_t format) {
+        directColorActive_.store(active, std::memory_order_relaxed);
+        directColorFormat_.store(format, std::memory_order_relaxed);
+    }
+
+    bool isDirectColorActive() const {
+        return directColorActive_.load(std::memory_order_relaxed);
+    }
+
+    uint32_t getDirectColorFormat() const {
+        return directColorFormat_.load(std::memory_order_relaxed);
+    }
+
+    bool onFrameEnd() {
+        if (!isEnabled()) return false;
         if (freq_.QuadPart == 0) {
             QueryPerformanceFrequency(&freq_);
-            if (freq_.QuadPart == 0) return;
+            if (freq_.QuadPart == 0) return false;
         }
 
         const uint32_t count = static_cast<uint32_t>(ProfileZone::Count);
@@ -55,12 +87,34 @@ public:
                 windowTicks_[i] = 0;
             }
             framesInWindow_ = 0;
+
+            const uint32_t gpuCount = static_cast<uint32_t>(GpuProfileZone::Count);
+            if (gpuWindowSamples_ > 0) {
+                const double invSamples = 1.0 / static_cast<double>(gpuWindowSamples_);
+                for (uint32_t i = 0; i < gpuCount; ++i) {
+                    gpuAvgMs_[i] = static_cast<float>(gpuWindowSumMs_[i] * invSamples);
+                    gpuWindowSumMs_[i] = 0.0;
+                }
+                gpuWindowSamples_ = 0;
+            } else {
+                for (uint32_t i = 0; i < gpuCount; ++i) {
+                    gpuAvgMs_[i] = 0.0f;
+                    gpuWindowSumMs_[i] = 0.0;
+                }
+            }
+            return true;
         }
+        return false;
     }
 
     float getAvgMs(ProfileZone zone) const {
         const uint32_t idx = static_cast<uint32_t>(zone);
         return idx < static_cast<uint32_t>(ProfileZone::Count) ? avgMs_[idx] : 0.0f;
+    }
+
+    float getGpuAvgMs(GpuProfileZone zone) const {
+        const uint32_t idx = static_cast<uint32_t>(zone);
+        return idx < static_cast<uint32_t>(GpuProfileZone::Count) ? gpuAvgMs_[idx] : 0.0f;
     }
 
 private:
@@ -69,10 +123,15 @@ private:
     }
 
     std::atomic<bool> enabled_{false};
+    std::atomic<bool> directColorActive_{false};
+    std::atomic<uint32_t> directColorFormat_{0};
     LARGE_INTEGER freq_{};
     std::atomic<int64_t> currentTicks_[static_cast<uint32_t>(ProfileZone::Count)]{};
     int64_t windowTicks_[static_cast<uint32_t>(ProfileZone::Count)]{};
     float avgMs_[static_cast<uint32_t>(ProfileZone::Count)]{};
+    double gpuWindowSumMs_[static_cast<uint32_t>(GpuProfileZone::Count)]{};
+    float gpuAvgMs_[static_cast<uint32_t>(GpuProfileZone::Count)]{};
+    uint32_t gpuWindowSamples_{0};
     uint32_t framesInWindow_{0};
 };
 

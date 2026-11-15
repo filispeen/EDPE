@@ -744,11 +744,149 @@ static unsigned long long s_clean_hdr_scene_frame = ~0ull;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_hud_merged_hdr_texture;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_hud_merged_hdr_srv;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_hud_merged_hdr_rtv;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_hud_bloom_src_srv;
+static ID3D11Resource* s_hud_bloom_src_res = nullptr;
+static DXGI_FORMAT s_hud_bloom_src_fmt = DXGI_FORMAT_UNKNOWN;
 static UINT s_hud_merged_hdr_width = 0;
 static UINT s_hud_merged_hdr_height = 0;
 static DXGI_FORMAT s_hud_merged_hdr_format = DXGI_FORMAT_UNKNOWN;
 static ID3D11Resource* s_hud_merged_hdr_source_res = nullptr;
 static unsigned long long s_hud_merged_hdr_frame = ~0ull;
+
+struct GpuPassTimer {
+    static constexpr uint32_t kRingSize = 4;
+    static constexpr uint32_t kZoneCount = static_cast<uint32_t>(edpe::GpuProfileZone::Count);
+
+    struct FrameQueries {
+        Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
+        Microsoft::WRL::ComPtr<ID3D11Query> start[kZoneCount];
+        Microsoft::WRL::ComPtr<ID3D11Query> end[kZoneCount];
+        uint32_t activeMask = 0;
+        unsigned long long frameId = ~0ull;
+        bool open = false;
+        bool submitted = false;
+    };
+
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* activeContext = nullptr;
+    FrameQueries ring[kRingSize]{};
+    uint32_t writeIdx = 0;
+    uint32_t readIdx = 0;
+    uint32_t inFlight = 0;
+
+    void reset() {
+        for (auto& slot : ring) {
+            slot.disjoint.Reset();
+            for (uint32_t z = 0; z < kZoneCount; ++z) {
+                slot.start[z].Reset();
+                slot.end[z].Reset();
+            }
+            slot.activeMask = 0;
+            slot.frameId = ~0ull;
+            slot.open = false;
+            slot.submitted = false;
+        }
+        device = nullptr;
+        activeContext = nullptr;
+        writeIdx = readIdx = inFlight = 0;
+    }
+
+    bool ensureInit(ID3D11Device* dev) {
+        if (!dev) return false;
+        if (device != dev) {
+            reset();
+            D3D11_QUERY_DESC dq{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+            D3D11_QUERY_DESC tq{D3D11_QUERY_TIMESTAMP, 0};
+            for (auto& slot : ring) {
+                if (FAILED(dev->CreateQuery(&dq, &slot.disjoint))) {
+                    reset();
+                    return false;
+                }
+                for (uint32_t z = 0; z < kZoneCount; ++z) {
+                    if (FAILED(dev->CreateQuery(&tq, &slot.start[z])) ||
+                        FAILED(dev->CreateQuery(&tq, &slot.end[z]))) {
+                        reset();
+                        return false;
+                    }
+                }
+            }
+            device = dev;
+        }
+        return true;
+    }
+
+    void harvest(ID3D11DeviceContext* ctx) {
+        if (!ctx) return;
+        while (inFlight > 0) {
+            auto& slot = ring[readIdx];
+            if (!slot.submitted || !slot.disjoint) break;
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dData{};
+            if (ctx->GetData(slot.disjoint.Get(), &dData, sizeof(dData), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+                break;
+            }
+            if (!dData.Disjoint && dData.Frequency > 0) {
+                double zoneMs[kZoneCount]{};
+                bool allReady = true;
+                for (uint32_t z = 0; z < kZoneCount; ++z) {
+                    if (!(slot.activeMask & (1u << z))) continue;
+                    UINT64 t0 = 0, t1 = 0;
+                    if (ctx->GetData(slot.start[z].Get(), &t0, sizeof(t0), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+                        ctx->GetData(slot.end[z].Get(), &t1, sizeof(t1), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+                        allReady = false;
+                        break;
+                    }
+                    if (t1 >= t0) {
+                        zoneMs[z] = static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(dData.Frequency);
+                    }
+                }
+                if (!allReady) break;
+                edpe::Profiler::instance().submitGpuSample(zoneMs);
+            }
+            slot.submitted = false;
+            slot.activeMask = 0;
+            readIdx = (readIdx + 1) % kRingSize;
+            --inFlight;
+        }
+    }
+
+    void beginZone(ID3D11DeviceContext* ctx, ID3D11Device* dev, edpe::GpuProfileZone zone) {
+        if (!edpe::Profiler::instance().isEnabled() || !ctx || !dev) return;
+        if (!ensureInit(dev)) return;
+        harvest(ctx);
+        auto& slot = ring[writeIdx];
+        if (!slot.open) {
+            if (slot.submitted || inFlight >= kRingSize) return;
+            slot.activeMask = 0;
+            slot.open = true;
+            activeContext = ctx;
+            ctx->Begin(slot.disjoint.Get());
+        } else if (activeContext != ctx) {
+            return;
+        }
+        ctx->End(slot.start[static_cast<uint32_t>(zone)].Get());
+    }
+
+    void endZone(ID3D11DeviceContext* ctx, edpe::GpuProfileZone zone) {
+        if (!edpe::Profiler::instance().isEnabled() || !ctx) return;
+        auto& slot = ring[writeIdx];
+        if (!slot.open || activeContext != ctx) return;
+        const uint32_t zi = static_cast<uint32_t>(zone);
+        ctx->End(slot.end[zi].Get());
+        slot.activeMask |= (1u << zi);
+    }
+
+    void endFrame() {
+        auto& slot = ring[writeIdx];
+        if (!slot.open || !activeContext) return;
+        activeContext->End(slot.disjoint.Get());
+        slot.open = false;
+        slot.submitted = true;
+        activeContext = nullptr;
+        writeIdx = (writeIdx + 1) % kRingSize;
+        ++inFlight;
+    }
+};
+static GpuPassTimer s_gpu_pass_timer;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_early_color_snapshot;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_depth_snapshot;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_hud_mask_snapshot;
@@ -1673,6 +1811,9 @@ static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
     s_hud_merged_hdr_texture.Reset();
     s_hud_merged_hdr_srv.Reset();
     s_hud_merged_hdr_rtv.Reset();
+    s_hud_bloom_src_srv.Reset();
+    s_hud_bloom_src_res = nullptr;
+    s_hud_bloom_src_fmt = DXGI_FORMAT_UNKNOWN;
     s_hud_merged_hdr_width = 0;
     s_hud_merged_hdr_height = 0;
     s_hud_merged_hdr_format = DXGI_FORMAT_UNKNOWN;
@@ -1796,6 +1937,9 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     s_hud_merged_hdr_texture.Reset();
     s_hud_merged_hdr_srv.Reset();
     s_hud_merged_hdr_rtv.Reset();
+    s_hud_bloom_src_srv.Reset();
+    s_hud_bloom_src_res = nullptr;
+    s_hud_bloom_src_fmt = DXGI_FORMAT_UNKNOWN;
     s_hud_merged_hdr_width = 0;
     s_hud_merged_hdr_height = 0;
     s_hud_merged_hdr_format = DXGI_FORMAT_UNKNOWN;
@@ -3002,9 +3146,9 @@ void mergeHudIntoHdrTarget(ID3D11DeviceContext* context, ID3D11RenderTargetView*
     rearmHudDrawProbe(context);
 }
 
-// Build H' = H * T + HUD in a dedicated native-sized scratch HDR texture (s_hud_merged_hdr_texture,
-// never overwriting s_clean_hdr_scene_texture) and feed H' to Pass 36 Bloom level 0 and Pass 52
-// HUD+scene tonemapping without modifying the game's HUD-free HDR scene texture (H) in-place!
+// Build H' = H * T + HUD in a dedicated scratch HDR texture matching the input HDR resolution
+// (never overwriting s_clean_hdr_scene_texture) and feed H' to Pass 36 Bloom level 0 without
+// modifying the game's HUD-free HDR scene texture (H) in-place or supersampling above scene res!
 ID3D11ShaderResourceView* buildHudMergedHdrScratchForBloom(
     ID3D11DeviceContext* context, ID3D11Resource* hdrSourceRes,
     ID3D11ShaderResourceView* hdrSourceSrv = nullptr) {
@@ -3029,8 +3173,8 @@ ID3D11ShaderResourceView* buildHudMergedHdrScratchForBloom(
     context->GetDevice(&device);
     if (!device) return nullptr;
 
-    const UINT targetW = (s_hud_mask_width > desc.Width) ? s_hud_mask_width : desc.Width;
-    const UINT targetH = (s_hud_mask_height > desc.Height) ? s_hud_mask_height : desc.Height;
+    const UINT targetW = desc.Width;
+    const UINT targetH = desc.Height;
     const DXGI_FORMAT viewFmt =
         (desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS)
             ? DXGI_FORMAT_R16G16B16A16_FLOAT
@@ -3042,6 +3186,9 @@ ID3D11ShaderResourceView* buildHudMergedHdrScratchForBloom(
         s_hud_merged_hdr_texture.Reset();
         s_hud_merged_hdr_srv.Reset();
         s_hud_merged_hdr_rtv.Reset();
+        s_hud_bloom_src_srv.Reset();
+        s_hud_bloom_src_res = nullptr;
+        s_hud_bloom_src_fmt = DXGI_FORMAT_UNKNOWN;
         D3D11_TEXTURE2D_DESC copyDesc = desc;
         copyDesc.Width = targetW;
         copyDesc.Height = targetH;
@@ -3064,24 +3211,32 @@ ID3D11ShaderResourceView* buildHudMergedHdrScratchForBloom(
         s_hud_merged_hdr_format = viewFmt;
     }
 
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> tempSrcSrv;
     ID3D11ShaderResourceView* srcSrvToUse = hdrSourceSrv;
-    if (!srcSrvToUse && (targetW != desc.Width || targetH != desc.Height)) {
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.Format = viewFmt;
-        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        sd.Texture2D.MipLevels = 1;
-        if (SUCCEEDED(device->CreateShaderResourceView(hdrTex.Get(), &sd, &tempSrcSrv))) {
-            srcSrvToUse = tempSrcSrv.Get();
+    if (!srcSrvToUse && (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+        if (s_hud_bloom_src_res != hdrSourceRes || s_hud_bloom_src_fmt != viewFmt || !s_hud_bloom_src_srv) {
+            s_hud_bloom_src_srv.Reset();
+            s_hud_bloom_src_res = nullptr;
+            s_hud_bloom_src_fmt = DXGI_FORMAT_UNKNOWN;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = viewFmt;
+            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd.Texture2D.MipLevels = 1;
+            if (SUCCEEDED(device->CreateShaderResourceView(hdrTex.Get(), &sd, &s_hud_bloom_src_srv))) {
+                s_hud_bloom_src_res = hdrSourceRes;
+                s_hud_bloom_src_fmt = viewFmt;
+            }
         }
+        srcSrvToUse = s_hud_bloom_src_srv.Get();
     }
 
+    s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::HudBloom);
     if (srcSrvToUse) {
         mergeHudIntoHdrTarget(context, s_hud_merged_hdr_rtv.Get(), targetW, targetH, srcSrvToUse);
     } else {
         context->CopyResource(s_hud_merged_hdr_texture.Get(), hdrTex.Get());
         mergeHudIntoHdrTarget(context, s_hud_merged_hdr_rtv.Get(), targetW, targetH, nullptr);
     }
+    s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::HudBloom);
     s_hud_merged_into_hdr_this_frame = true;
     s_hud_merged_hdr_source_res = hdrSourceRes;
     s_hud_merged_hdr_frame = current_frame;
@@ -7029,6 +7184,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         resetTemporalPathDebounce();
         edpe::UiLayer::instance().shutdown();
         resetHudMaskResources(nullptr);
+        s_gpu_pass_timer.reset();
         s_temporal_resources_device = device.Get();
     }
 
@@ -7096,6 +7252,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
         useDirectColorSrv = (s_direct_color_srv != nullptr);
     }
+    edpe::Profiler::instance().setDirectColorStatus(useDirectColorSrv, static_cast<uint32_t>(srcColorDesc.Format));
     if (!useDirectColorSrv) {
         if (!s_dlaa_input) {
             D3D11_TEXTURE2D_DESC inDesc{};
@@ -7122,7 +7279,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_dlaa_input_srv.Reset();
             return;
         }
+        s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::ColorPrep);
         context->CopyResource(s_dlaa_input.Get(), colorSource);
+        s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::ColorPrep);
     }
     ID3D11Texture2D* activeColorInputTex = useDirectColorSrv ? colorSource : s_dlaa_input.Get();
     ID3D11ShaderResourceView* activeColorInputSrv = useDirectColorSrv ? s_direct_color_srv.Get() : s_dlaa_input_srv.Get();
@@ -7302,7 +7461,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             !sameD3D11Device(scene_depth_source.Get(), device.Get())) {
             return;
         }
+        s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::DepthCopy);
         context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
+        s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::DepthCopy);
         s_has_motion_prev_depth = (s_motion_prev_depth && s_motion_prev_depth_view);
 
         if (!motion_pass) {
@@ -7311,15 +7472,17 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             motion_pass = std::move(candidate);
         }
 
+        s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::MotionPass);
         if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
             motion_pass->clear(context);
         } else {
             // Render motion vectors at render resolution using current and previous camera projections and jitter phases
             motion_pass->render(motion_depth_view.Get(),
                 s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
-                jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv);
-            rearmContextHooks();
+                jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv, nullptr,
+                /*preserveContextState=*/false);
         }
+        s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
 
         if (!motion_pass->output()) return;
 
@@ -7467,7 +7630,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
 
         bool compOk = false;
+        s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UpscaleEval);
         const bool upscalerEvalOk = upscaler.evaluate(context, inputs, nullptr, evalDestination);
+        s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::UpscaleEval);
         rearmContextHooks();
         edpe::updateCrashUpscalerState(
             static_cast<int>(upscaler.getBackend()),
@@ -7503,6 +7668,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                                          ((allowBackbufferWrite && s_backbuffer_rtv) || s_backbuffer_uav || s_comp_final_uav) &&
                                          (hudWasDiverted || colorSource != backbuffer));
             s_diag_composite_path = canCompositeUi ? 1 : 2;
+            s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UiComposite);
             if (canCompositeUi) {
                 if (edpe::UiLayer::instance().device() != device.Get() ||
                     edpe::UiLayer::instance().width() != backbufferDesc.Width ||
@@ -7548,6 +7714,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             } else {
                 compOk = true;
             }
+            s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::UiComposite);
 
             if (s_cmp_seq.active && s_cmp_seq.phase == CmpPhase::Warmup &&
                 s_cmp_seq.idx < s_cmp_seq.list.size() &&
@@ -9814,7 +9981,29 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         }
     }
     if (!(flags & DXGI_PRESENT_TEST) && observed_swap_chain == swap_chain) {
-        edpe::Profiler::instance().onFrameEnd();
+        s_gpu_pass_timer.endFrame();
+        auto& prof = edpe::Profiler::instance();
+        if (prof.onFrameEnd()) {
+            const float cpuMap = prof.getAvgMs(edpe::ProfileZone::MapUnmap);
+            const float cpuOm = prof.getAvgMs(edpe::ProfileZone::OMSetRenderTargets);
+            const float cpuDelta = prof.getAvgMs(edpe::ProfileZone::CameraDeltaCopy);
+            const float cpuDraw = prof.getAvgMs(edpe::ProfileZone::DrawProbe);
+            const float cpuUpscale = prof.getAvgMs(edpe::ProfileZone::TemporalUpscale);
+            const float gpuDepth = prof.getGpuAvgMs(edpe::GpuProfileZone::DepthCopy);
+            const float gpuMotion = prof.getGpuAvgMs(edpe::GpuProfileZone::MotionPass);
+            const float gpuColor = prof.getGpuAvgMs(edpe::GpuProfileZone::ColorPrep);
+            const float gpuEval = prof.getGpuAvgMs(edpe::GpuProfileZone::UpscaleEval);
+            const float gpuUi = prof.getGpuAvgMs(edpe::GpuProfileZone::UiComposite);
+            const float gpuBloom = prof.getGpuAvgMs(edpe::GpuProfileZone::HudBloom);
+            const float gpuTotal = gpuDepth + gpuMotion + gpuColor + gpuEval + gpuUi + gpuBloom;
+            wchar_t profMsg[384];
+            swprintf_s(profMsg,
+                L"EDPE PROFILE (120f avg) frame=%llu | CPU map=%.3f om=%.3f delta=%.3f draw=%.3f upscaleHook=%.3f ms | GPU total=%.3f (depthCopy=%.3f motion=%.3f colorPrep=%.3f eval=%.3f uiComp=%.3f hudBloom=%.3f) directColor=%u fmt=%u",
+                frame, cpuMap, cpuOm, cpuDelta, cpuDraw, cpuUpscale,
+                gpuTotal, gpuDepth, gpuMotion, gpuColor, gpuEval, gpuUi, gpuBloom,
+                prof.isDirectColorActive() ? 1u : 0u, prof.getDirectColorFormat());
+            EdpeLog(profMsg);
+        }
     }
 }
 

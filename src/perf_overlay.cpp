@@ -361,13 +361,26 @@ void PerfTracker::updateCachedStats() {
     }
 
     if (Profiler::instance().isEnabled()) {
-        profilerDisplay_.mapMs = Profiler::instance().getAvgMs(ProfileZone::MapUnmap);
-        profilerDisplay_.omMs = Profiler::instance().getAvgMs(ProfileZone::OMSetRenderTargets);
-        profilerDisplay_.deltaMs = Profiler::instance().getAvgMs(ProfileZone::CameraDeltaCopy);
-        profilerDisplay_.drawMs = Profiler::instance().getAvgMs(ProfileZone::DrawProbe);
-        profilerDisplay_.upscaleMs = Profiler::instance().getAvgMs(ProfileZone::TemporalUpscale);
+        auto& prof = Profiler::instance();
+        profilerDisplay_.mapMs = prof.getAvgMs(ProfileZone::MapUnmap);
+        profilerDisplay_.omMs = prof.getAvgMs(ProfileZone::OMSetRenderTargets);
+        profilerDisplay_.deltaMs = prof.getAvgMs(ProfileZone::CameraDeltaCopy);
+        profilerDisplay_.drawMs = prof.getAvgMs(ProfileZone::DrawProbe);
+        profilerDisplay_.upscaleMs = prof.getAvgMs(ProfileZone::TemporalUpscale);
         const float measuredSum = profilerDisplay_.mapMs + profilerDisplay_.omMs + profilerDisplay_.deltaMs + profilerDisplay_.drawMs;
         profilerDisplay_.unaccountedMs = (std::max)(0.0f, cachedStats_.gameFrametimeMs - measuredSum);
+
+        profilerDisplay_.gpuDepthCopyMs = prof.getGpuAvgMs(GpuProfileZone::DepthCopy);
+        profilerDisplay_.gpuMotionMs = prof.getGpuAvgMs(GpuProfileZone::MotionPass);
+        profilerDisplay_.gpuColorPrepMs = prof.getGpuAvgMs(GpuProfileZone::ColorPrep);
+        profilerDisplay_.gpuUpscaleEvalMs = prof.getGpuAvgMs(GpuProfileZone::UpscaleEval);
+        profilerDisplay_.gpuUiCompositeMs = prof.getGpuAvgMs(GpuProfileZone::UiComposite);
+        profilerDisplay_.gpuHudBloomMs = prof.getGpuAvgMs(GpuProfileZone::HudBloom);
+        profilerDisplay_.gpuEdpeTotalMs =
+            profilerDisplay_.gpuDepthCopyMs + profilerDisplay_.gpuMotionMs +
+            profilerDisplay_.gpuColorPrepMs + profilerDisplay_.gpuUpscaleEvalMs +
+            profilerDisplay_.gpuUiCompositeMs + profilerDisplay_.gpuHudBloomMs;
+        profilerDisplay_.directColorActive = prof.isDirectColorActive();
     }
 }
 
@@ -717,13 +730,18 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
 
         if (cfg.enableProfiler) {
             ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Profiler (120f avg):");
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "CPU Profiler (120f avg):");
             ImGui::Text("  Map/Unmap (CB/Jitter): %6.3f ms", profilerDisplay_.mapMs);
             ImGui::Text("  OMSetRenderTargets:    %6.3f ms", profilerDisplay_.omMs);
             ImGui::Text("  Camera Delta Copy:     %6.3f ms", profilerDisplay_.deltaMs);
             ImGui::Text("  HUD Draw Probe:        %6.3f ms", profilerDisplay_.drawMs);
             ImGui::Text("  Upscale Prep & Eval:   %6.3f ms", profilerDisplay_.upscaleMs);
             ImGui::Text("  Unaccounted (Game):    %6.3f ms", profilerDisplay_.unaccountedMs);
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 1.0f, 1.0f), "GPU Passes (120f avg -> edpe.log):");
+            ImGui::Text("  DepthCopy / Motion:    %6.3f / %6.3f ms", profilerDisplay_.gpuDepthCopyMs, profilerDisplay_.gpuMotionMs);
+            ImGui::Text("  ColorPrep (%s):   %6.3f ms", profilerDisplay_.directColorActive ? "Direct" : "Copy  ", profilerDisplay_.gpuColorPrepMs);
+            ImGui::Text("  UpscaleEval / UI Comp: %6.3f / %6.3f ms", profilerDisplay_.gpuUpscaleEvalMs, profilerDisplay_.gpuUiCompositeMs);
+            ImGui::Text("  HudBloom / EDPE Total: %6.3f / %6.3f ms", profilerDisplay_.gpuHudBloomMs, profilerDisplay_.gpuEdpeTotalMs);
         }
     }
     ImGui::End();

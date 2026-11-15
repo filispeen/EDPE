@@ -110,6 +110,14 @@ private:
         float drawMs = 0.0f;
         float upscaleMs = 0.0f;
         float unaccountedMs = 0.0f;
+        float gpuDepthCopyMs = 0.0f;
+        float gpuMotionMs = 0.0f;
+        float gpuColorPrepMs = 0.0f;
+        float gpuUpscaleEvalMs = 0.0f;
+        float gpuUiCompositeMs = 0.0f;
+        float gpuHudBloomMs = 0.0f;
+        float gpuEdpeTotalMs = 0.0f;
+        bool directColorActive = false;
     };
     ProfilerDisplaySnapshot profilerDisplay_{};
 
