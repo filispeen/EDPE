@@ -4,7 +4,7 @@
 
 [![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version)](https://github.com/filispeen/EDPE/releases/latest)
 [![CI](https://github.com/filispeen/EDPE/actions/workflows/CI.yml/badge.svg)](https://github.com/filispeen/EDPE/actions/workflows/CI.yml)
-[![Status](https://img.shields.io/badge/status-v0.7.0%20Verified%20In--Game-success.svg)](STATUS.md)
+[![Status](https://img.shields.io/badge/status-v0.7.1%20Verified%20In--Game-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
 [![Tests](https://img.shields.io/badge/tests-15%2F15%20Passing-brightgreen.svg)]()
 
@@ -12,16 +12,16 @@
 
 EDPE is a `dxgi.dll` proxy for the 2D Direct3D 11 renderer in Elite Dangerous (Cobra engine). It intercepts DXGI and Direct3D 11 calls to add temporal anti-aliasing and upscaling, leaving game binaries, gameplay, and network code untouched.
 
-## Current status (`v0.7.0`)
+## Current status (`v0.7.1`)
 
-As of November 2026 (`v0.7.0`), the working pipeline covers:
+As of November 2026 (`v0.7.1`), the working pipeline covers:
 
-* `dxgi.dll` proxy forwarding system DXGI calls while hooking `IDXGIFactory::CreateSwapChain`, `IDXGISwapChain::Present`, and `D3D11CreateDevice` / `D3D11CreateDeviceAndSwapChain` via IAT. Constant buffer discovery stops once the scene camera is found, and `Unmap()` skips untracked buffers.
+* `dxgi.dll` proxy forwarding system DXGI calls while hooking `IDXGIFactory::CreateSwapChain`, `IDXGISwapChain::Present`, and `D3D11CreateDevice` / `D3D11CreateDeviceAndSwapChain` via IAT. Constant buffer discovery stops once the scene camera is found, `Map()`/`Unmap()` and `OMSetRenderTargets()` use pre-filtered, per-frame memoized camera/jitter paths and a persistent 4-way RTV metadata cache, and `edpe.log` writes on a dedicated background worker thread.
 * Reversed-Z scene depth discovery (`DSV #2`, `DXGI_FORMAT_R32G8X24_TYPELESS`, $B=0.025$) and once-per-frame parsing of the 5376-byte `CB0` camera buffer, with a 2nd-order kinematic filter and projection fallback to reject auxiliary eye, mirror, canopy reflection, and sagittal probes.
-* Halton `(2,3)` subpixel projection jitter injected into `CB0` words `1080`-`1095` (standing down when reconstruction is off), paired with a GPU pass that renders current-to-previous motion vectors to `DXGI_FORMAT_R16G16_FLOAT`, including analytical rotational motion at infinity for the skybox and stars.
-* Backend-neutral `TemporalFrameInputs` feeding `IUpscalerBackend` implementations for NVIDIA DLAA and DLSS Super Resolution (NGX Project ID `48d353f3-d07b-4048-876b-09f8622f5a27`, presets `Auto`, `J`, `K`, `L`, `M`), AMD FSR 3.1.2 Native AA and Super Resolution (native D3D11 compute), and native D3D11 TAA. Render scale is detected from scene depth versus swapchain dimensions, and `Custom.4.4.fxcfg` / `Custom.4.0.fxcfg` `<SSAAMultiplier>` stays synced when enabled.
-* Native UI and cockpit HUD separation (`UiLayer` and `UiCompositePass`): pre-HUD clean scene color goes to the upscaler, cockpit holographic draws are redirected to `s_hud_mask_texture` (`R11G11B10_FLOAT`) with viewport unjittering, and native menus plus HUD are composited back over the reconstructed world.
-* Multi-device DXGI Keyed Mutex synchronization, color-source debouncing, crash minidump logging, DirectInput and `WndProc` input isolation when the menu is open (protecting flight controls and HOTAS), async GPU timestamp queries, and optional QPC per-pass profiling.
+* Halton `(2,3)` subpixel projection jitter injected into `CB0` words `1080`-`1095` (standing down when reconstruction is off), paired with an optimized GPU pass (CPU precomputed relative camera transform) that renders current-to-previous motion vectors to `DXGI_FORMAT_R16G16_FLOAT`, including analytical rotational motion at infinity for the skybox and stars.
+* Backend-neutral `TemporalFrameInputs` feeding `IUpscalerBackend` implementations for NVIDIA DLAA and DLSS Super Resolution (NGX Project ID `48d353f3-d07b-4048-876b-09f8622f5a27`, presets `Auto`, `E`, `J`, `K`, `L`, `M`), AMD FSR 3.1.2 Native AA and Super Resolution (native D3D11 compute), and native D3D11 TAA. Render scale is detected from scene depth versus swapchain dimensions, and `Custom.4.4.fxcfg` / `Custom.4.0.fxcfg` `<SSAAMultiplier>` stays synced when enabled.
+* Native UI and cockpit HUD separation (`UiLayer` and `UiCompositePass`): pre-HUD clean scene color goes to the upscaler without redundant intermediate copies, cockpit holographic draws are redirected to `s_hud_mask_texture` (`R11G11B10_FLOAT`) with viewport unjittering, and native menus plus HUD are composited back over the reconstructed world.
+* Multi-device DXGI Keyed Mutex synchronization, color-source debouncing, crash minidump logging, DirectInput and `WndProc` input isolation when the menu is open (protecting flight controls and HOTAS), async GPU timestamp queries (zero overhead when the Performance HUD and profiler are disabled), and optional `EnableProfiler=1` QPC/GPU sub-pass profiling (`EDPE PROFILE` / `EDPE PROFILE_SUB`).
 * Dear ImGui overlay (`F5`, ProggyForever vector font), toggleable Performance HUD (`F7`) with a 120-sample frametime graph (`8.3 ms` and `16.6 ms` reference lines, 15 Hz text refresh, background NVML GPU/VRAM polling), sequential comparison capture to `comparison/` (16-frame warmup, 5-second wait between backends), and `DEV=0` / `DEV=1` gating for developer panels and `F9` (`jitter_view.log`).
 
 ## Roadmap
@@ -93,7 +93,7 @@ If an upscaler backend fails to initialize or evaluate, EDPE disables jitter, re
 Inside the `F5` menu:
 
 * `HUD & UI Scaling`: toggle the Performance HUD, pick one of 8 anchor positions (or drag the HUD directly while the menu is open), and adjust `HUD Scale` and `UI Scale` (`0.50x` to `2.50x`).
-* `Upscaler & Image Quality`: switch between `Native (Bypass)`, `NVIDIA DLSS / DLAA`, `AMD FSR (Native AA / SR)`, and `TAA (Temporal Anti-Aliasing)`, choose the DLSS preset (`Auto`, `J`, `K`, `L`, `M`), adjust sharpening (`0.00` to `1.00`), and toggle `Preserve Native UI`.
+* `Upscaler & Image Quality`: switch between `Native (Bypass)`, `NVIDIA DLSS / DLAA`, `AMD FSR (Native AA / SR)`, and `TAA (Temporal Anti-Aliasing)`, choose the DLSS preset (`Auto`, `E (CNN Fast)`, `J`, `K`, `L`, `M`), adjust sharpening (`0.00` to `1.00`), and toggle `Preserve Native UI`.
 * `Debug View`: switch between `None` and `Subpixel Jitter` to highlight jittered pixels in green over a desaturated scene. (The HUD mask debug pass in `hud_debug_pass.cpp` has no UI toggle and is only exercised by `hud_debug_test` or `[HUD] DebugView=1` in `edpe.ini`.)
 * Developer panels (`DEV=1`): sequential comparison capture across active backends (`comparison/`), DSV bind sequence and snapshot viewers (depth, scene color, emissive, motion, HUD mask), jitter overrides and `jitter.log` controls, and motion vector tuning (`ZeroMotion`, `InvertX`, `InvertY`, `Scale`).
 
@@ -115,7 +115,7 @@ Example `edpe.ini` matching the keys read by `src/config.h` (note that `edpe.ini
 [Upscaler]
 ; 0 = Native (Bypass), 1 = NVIDIA DLSS/DLAA, 2 = AMD FSR, 3 = Native D3D11 TAA
 Backend=0
-; DLSS Preset: 0 = Auto (K), 10 = J, 11 = K, 12 = L, 13 = M
+; DLSS Preset: 0 = Auto (K), 5 = E (CNN Fast), 10 = J, 11 = K, 12 = L, 13 = M
 Preset=0
 AutoSyncEliteConfig=1
 PreserveNativeUi=1
@@ -248,7 +248,7 @@ EDPE/
 │   ├── jitter_debug_pass.cpp / .h      # Subpixel jitter debug visualization pass
 │   ├── jitter_logger.cpp / .h          # Background jitter.log writer
 │   ├── jitter_view_recorder.cpp / .h   # F9 jitter_view.log recorder (DEV=1)
-│   ├── log.cpp / .h                    # Thread-safe edpe.log writer
+│   ├── log.cpp / .h                    # Asynchronous background edpe.log writer
 │   ├── motion_pass.cpp / .h            # GPU camera-depth and skybox motion pass
 │   ├── ngx_context.cpp / .h            # NVIDIA NGX DLAA/DLSS wrapper
 │   ├── perf_overlay.cpp / .h           # F7 Performance HUD and NVML poller
