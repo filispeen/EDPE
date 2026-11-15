@@ -3837,16 +3837,26 @@ static inline bool isHudDrawInterceptWindowActive() {
 
 static inline bool shouldInspectHudOrTonemapDraw(UINT count, UINT instances) {
     if ((s_hud_mask_active_pass && motion_color_bound) ||
-        s_post_ldr_backbuffer_bound ||
         motion_pair_active ||
         draw_probe_active.load(std::memory_order_relaxed)) {
         return true;
+    }
+    const auto cur = last_present_frame.load(std::memory_order_relaxed);
+    if (s_post_ldr_backbuffer_bound) {
+        if (s_verified_ldr_tonemap_frame != cur) {
+            return true;
+        }
+        if (count >= 3 && count <= 6 && instances == 1) {
+            return true;
+        }
+        return s_hud_draws_replayed_frame > 0 &&
+               (isPauseOrModalMenuActive(cur) || count >= 300 || count == 4 || count == 6);
     }
     // Outside Pass 53/54 backbuffer binding and Pass 22b/35 HUD passes, only
     // non-instanced 3..6-vertex fullscreen passes before verified tonemap need inspection.
     if (s_ldr_tonemap_candidate_bound) {
         return count >= 3 && count <= 6 && instances <= 1 &&
-               s_verified_ldr_tonemap_frame != last_present_frame.load(std::memory_order_relaxed);
+               s_verified_ldr_tonemap_frame != cur;
     }
     return false;
 }
@@ -4421,6 +4431,48 @@ inline void syncSceneWindowAtomic(unsigned long long cur_frame) {
     }
 }
 
+inline bool couldBeTransposeProjection208(const float* words) {
+    if (!words) return false;
+    // Necessary invariants of matchesEliteTransposeProjectionBlock(&words[16]):
+    // block16[11] (words[27]) in [0.01, 0.25], and block16[3, 7, 15] near zero.
+    return words[27] >= 0.01f && words[27] <= 0.25f &&
+           std::fabs(words[19]) <= 0.002f &&
+           std::fabs(words[23]) <= 0.002f &&
+           std::fabs(words[31]) <= 0.002f;
+}
+
+inline bool couldBeAuxiliaryCameraCb(const float* words, size_t floatCount) {
+    if (!words || floatCount < 20) return false;
+    // Path 1: Cascade shadow mask InvProj (floatCount >= 20)
+    if (words[0] >= 320.0f && words[1] >= 240.0f &&
+        std::isfinite(words[0]) && std::isfinite(words[1]) &&
+        std::fabs(words[18] - 1.0f) <= 1e-3f && std::fabs(words[19]) <= 1e-3f &&
+        std::fabs(words[2] - 1.0f / words[0]) <= 1e-4f &&
+        std::fabs(words[3] - 1.0f / words[1]) <= 1e-4f) {
+        return true;
+    }
+    // Path 4: Row-major UvToView block at words+40 (floatCount >= 56)
+    if (floatCount >= 56 &&
+        std::fabs(words[51] - 1.0f) <= 1e-3f && std::fabs(words[55]) <= 1e-3f &&
+        std::fabs(words[41]) <= 1e-3f && std::fabs(words[42]) <= 1e-3f) {
+        return true;
+    }
+    // Paths 2 & 3: Row-major / Col-major deferred camera CB2 (floatCount >= 68)
+    if (floatCount >= 68) {
+        if (std::isfinite(words[51]) && words[51] >= 0.01f &&
+            std::fabs(words[48]) <= 2e-3f && std::fabs(words[49]) <= 2e-3f &&
+            std::fabs(words[50]) <= 2e-3f) {
+            return true;
+        }
+        if (std::isfinite(words[54]) && words[54] >= 0.01f &&
+            std::fabs(words[52]) <= 2e-3f && std::fabs(words[53]) <= 2e-3f &&
+            std::fabs(words[55]) <= 2e-3f) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline bool repairAuxiliarySceneConstantBuffer(float* words, size_t floatCount, unsigned long long cur_frame) {
     if (!words || floatCount < 20) return false;
     if (!isInSceneWindowLocked(cur_frame) || !ContextCensusIsJitterActive()) return false;
@@ -4645,8 +4697,17 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             rearmHudDrawProbeFast(context);
             return;
         }
+        if (mapped_byte_width == 208 &&
+            !couldBeTransposeProjection208(static_cast<const float*>(mapped_ptr))) {
+            if (forward) forward(context, resource, subresource);
+            rearmHudDrawProbeFast(context);
+            return;
+        }
         if (mapped_byte_width >= 272 && mapped_byte_width <= 4096 &&
-            (!jitterActive || s_scene_window_closed_frame.load(std::memory_order_acquire) == cur_frame)) {
+            (!jitterActive ||
+             s_scene_window_closed_frame.load(std::memory_order_acquire) == cur_frame ||
+             !couldBeAuxiliaryCameraCb(static_cast<const float*>(mapped_ptr),
+                                       static_cast<size_t>(mapped_byte_width) / sizeof(float)))) {
             if (forward) forward(context, resource, subresource);
             rearmHudDrawProbeFast(context);
             return;
@@ -4707,24 +4768,26 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
         if (mapped_ptr && mapped_byte_width == 5376) {
             scene_unmaps.fetch_add(1, std::memory_order_relaxed);
             ++s_ustat.total;
-            unsigned long long camera = 14695981039346656037ull;
-            unsigned long long projection = camera;
-            const auto* data = static_cast<const unsigned char*>(mapped_ptr);
-            for (size_t i = 932 * 4; i < 944 * 4; ++i)
-                camera = (camera ^ data[i]) * 1099511628211ull;
-            for (size_t i = 1080 * 4; i < 1096 * 4; ++i)
-                projection = (projection ^ data[i]) * 1099511628211ull;
-            if (scene_hashed_writes.fetch_add(1, std::memory_order_relaxed) == 0) {
-                scene_first_camera_hash.store(camera, std::memory_order_relaxed);
-                scene_first_projection_hash.store(projection, std::memory_order_relaxed);
-            } else {
-                if (camera != scene_last_camera_hash.load(std::memory_order_relaxed))
-                    scene_camera_changes.fetch_add(1, std::memory_order_relaxed);
-                if (projection != scene_last_projection_hash.load(std::memory_order_relaxed))
-                    scene_projection_changes.fetch_add(1, std::memory_order_relaxed);
+            if (draw_probe_active.load(std::memory_order_relaxed)) {
+                unsigned long long camera = 14695981039346656037ull;
+                unsigned long long projection = camera;
+                const auto* data = static_cast<const unsigned char*>(mapped_ptr);
+                for (size_t i = 932 * 4; i < 944 * 4; ++i)
+                    camera = (camera ^ data[i]) * 1099511628211ull;
+                for (size_t i = 1080 * 4; i < 1096 * 4; ++i)
+                    projection = (projection ^ data[i]) * 1099511628211ull;
+                if (scene_hashed_writes.fetch_add(1, std::memory_order_relaxed) == 0) {
+                    scene_first_camera_hash.store(camera, std::memory_order_relaxed);
+                    scene_first_projection_hash.store(projection, std::memory_order_relaxed);
+                } else {
+                    if (camera != scene_last_camera_hash.load(std::memory_order_relaxed))
+                        scene_camera_changes.fetch_add(1, std::memory_order_relaxed);
+                    if (projection != scene_last_projection_hash.load(std::memory_order_relaxed))
+                        scene_projection_changes.fetch_add(1, std::memory_order_relaxed);
+                }
+                scene_last_camera_hash.store(camera, std::memory_order_relaxed);
+                scene_last_projection_hash.store(projection, std::memory_order_relaxed);
             }
-            scene_last_camera_hash.store(camera, std::memory_order_relaxed);
-            scene_last_projection_hash.store(projection, std::memory_order_relaxed);
 
             // Track the unjittered main-view camera for the motion pass.
             // Phase 3: Candidate staging and jitter injection (Two-Phase Staging & Commit)
@@ -5251,7 +5314,11 @@ void STDMETHODCALLTYPE observedUpdateSubresource(ID3D11DeviceContext* context,
         }
         if (cbBytes >= 272 && cbBytes <= 4096) {
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
-            if (s_scene_window_closed_frame.load(std::memory_order_acquire) != cur_frame) {
+            const bool alignedSrc = (reinterpret_cast<uintptr_t>(pSrcData) % alignof(float)) == 0;
+            if (s_scene_window_closed_frame.load(std::memory_order_acquire) != cur_frame &&
+                (!alignedSrc ||
+                 couldBeAuxiliaryCameraCb(static_cast<const float*>(pSrcData),
+                                          static_cast<size_t>(cbBytes) / sizeof(float)))) {
                 std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
                 if (isInSceneWindowLocked(cur_frame)) {
                     alignas(16) uint8_t patchedBuf[4096];
