@@ -186,6 +186,57 @@ static std::atomic<ID3D11DeviceContext*> s_primary_hook_ctx{nullptr};
 static std::atomic<void**> s_primary_live_table{nullptr};
 static std::atomic<edpe::VTableHook*> s_primary_vtable_hook{nullptr};
 
+static constexpr size_t kMaxSmoothMotionAux = 8;
+static std::atomic<size_t> s_sm_aux_device_count{0};
+static std::atomic<size_t> s_sm_aux_context_count{0};
+static std::atomic<ID3D11Device*> s_sm_aux_devices[kMaxSmoothMotionAux]{};
+static std::atomic<ID3D11DeviceContext*> s_sm_aux_contexts[kMaxSmoothMotionAux]{};
+
+template <typename T>
+static bool containsAtomicPtr(const std::atomic<T*>* items,
+    const std::atomic<size_t>& count, T* needle) {
+    if (!needle) return false;
+    const size_t n = count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < n && i < kMaxSmoothMotionAux; ++i) {
+        if (items[i].load(std::memory_order_acquire) == needle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <typename T>
+static void recordUniqueAtomicPtr(std::atomic<T*>* items,
+    std::atomic<size_t>& count, T* value) {
+    if (!value || containsAtomicPtr(items, count, value)) return;
+    const size_t slot = count.fetch_add(1, std::memory_order_acq_rel);
+    if (slot < kMaxSmoothMotionAux) {
+        items[slot].store(value, std::memory_order_release);
+    }
+}
+
+static void recordSmoothMotionDevice(ID3D11Device* device, ID3D11DeviceContext* immContext) {
+    recordUniqueAtomicPtr(s_sm_aux_devices, s_sm_aux_device_count, device);
+    recordUniqueAtomicPtr(s_sm_aux_contexts, s_sm_aux_context_count, immContext);
+}
+
+static bool isSmoothMotionDevice(ID3D11Device* device) {
+    return containsAtomicPtr(s_sm_aux_devices, s_sm_aux_device_count, device);
+}
+
+static bool isSmoothMotionContext(ID3D11DeviceContext* context) {
+    return containsAtomicPtr(s_sm_aux_contexts, s_sm_aux_context_count, context);
+}
+
+static void clearSmoothMotionTracking() {
+    s_sm_aux_device_count.store(0, std::memory_order_release);
+    s_sm_aux_context_count.store(0, std::memory_order_release);
+    for (size_t i = 0; i < kMaxSmoothMotionAux; ++i) {
+        s_sm_aux_devices[i].store(nullptr, std::memory_order_release);
+        s_sm_aux_contexts[i].store(nullptr, std::memory_order_release);
+    }
+}
+
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_engine_velocity_texture;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_engine_velocity_srv;
 static unsigned long long s_engine_velocity_frame = ~0ull;
@@ -340,6 +391,8 @@ ID3D11DeviceContext* activeSceneContext() {
 
 bool isObservedImmediateContext(ID3D11DeviceContext* context) {
     if (!context) return false;
+    if (isSmoothMotionContext(context)) return false;
+    if (context == s_primary_hook_ctx.load(std::memory_order_acquire)) return true;
     if (context == observed_context.load(std::memory_order_acquire)) return true;
     const size_t count = s_tracked_context_count.load(std::memory_order_acquire);
     for (size_t i = 0; i < count; ++i) {
@@ -347,7 +400,7 @@ bool isObservedImmediateContext(ID3D11DeviceContext* context) {
             return context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
         }
     }
-    return context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+    return false;
 }
 
 extern std::atomic<UINT> s_observed_scene_width;
@@ -3902,6 +3955,7 @@ void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
         }
     }
 
+    std::lock_guard<std::mutex> hookedTablesLock(s_hooked_tables_mutex);
     const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
     if (activeCtx) {
         for (size_t i = 0; i < tblCount; ++i) {
@@ -7995,15 +8049,17 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             }
             const unsigned long long lastOffscreenOk =
                 s_last_offscreen_upscale_frame.load(std::memory_order_relaxed);
+            const unsigned long long hudWindowMaxAge =
+                edpe::isSmoothMotionDetected() ? 6ull : 3ull;
             const bool hudDoorOpen =
                 (edpe::Config::instance().hdrInput ||
                  (s_recent_scene_ldr_source != nullptr &&
                   current_frame >= s_recent_scene_ldr_frame &&
-                  (current_frame - s_recent_scene_ldr_frame) <= 3 &&
+                  (current_frame - s_recent_scene_ldr_frame) <= hudWindowMaxAge &&
                   (!s_has_debounced_source || !s_debounced_is_backbuffer))) &&
                 (lastOffscreenOk != ~0ull &&
                  current_frame >= lastOffscreenOk &&
-                 (current_frame - lastOffscreenOk) <= 3);
+                 (current_frame - lastOffscreenOk) <= hudWindowMaxAge);
             s_hud_mask_active_pass =
                 (upscale_active && s_preserve_native_ui.load(std::memory_order_relaxed) && hudDoorOpen) ||
                 s_hud_debug_view.load(std::memory_order_relaxed) ||
@@ -9117,6 +9173,15 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         ID3D11Device* device = nullptr;
         if (FAILED(swap_chain->GetDevice(__uuidof(ID3D11Device),
                 reinterpret_cast<void**>(&device)))) return;
+        if (isSmoothMotionDevice(device) ||
+            (edpe::isSmoothMotionDetected() && GetPrimaryD3D11Device() != nullptr && device != GetPrimaryD3D11Device())) {
+            if (ID3D11Device* primaryDev = GetPrimaryD3D11Device()) {
+                EdpeLog(L"EDPE: Smooth Motion swapchain device detected on first Present; anchoring hooks on primary scene device");
+                device->Release();
+                device = primaryDev;
+                device->AddRef();
+            }
+        }
         ID3D11DeviceContext* context = nullptr;
         device->GetImmediateContext(&context);
         device->Release();
@@ -9415,7 +9480,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
     s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
     s_jittered_cb1_buffer.store(nullptr, std::memory_order_relaxed);
         clearTrackedMappedBuffers();
-        if ((last_present_frame.load(std::memory_order_relaxed) % 300ull) == 0ull) {
+        if ((last_present_frame.load(std::memory_order_relaxed) % 30ull) == 0ull) {
             clearRejectedResourceCache();
         }
         static uint64_t s_watchdog_last_camera_seen = 0;
@@ -10130,6 +10195,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     s_primary_hook_ctx.store(nullptr, std::memory_order_release);
     s_primary_live_table.store(nullptr, std::memory_order_release);
     s_primary_vtable_hook.store(nullptr, std::memory_order_release);
+    clearSmoothMotionTracking();
     scene_map_target.store(nullptr, std::memory_order_release);
     scene_mapped_data.store(nullptr, std::memory_order_release);
     s_hud_probe_armed_once.store(false, std::memory_order_release);
@@ -10434,8 +10500,25 @@ unsigned ContextCensusGetHudDrawsReplayed() {
 
 
 
+void ContextCensusMarkSmoothMotionDevice(ID3D11Device* device, ID3D11DeviceContext* immContext) {
+    recordSmoothMotionDevice(device, immContext);
+}
+
+bool ContextCensusIsSmoothMotionDevice(ID3D11Device* device) {
+    return isSmoothMotionDevice(device);
+}
+
 void ContextCensusHookContext(ID3D11DeviceContext* context) {
     if (!context) return;
+    if (isSmoothMotionContext(context)) return;
+    if (s_sm_aux_device_count.load(std::memory_order_acquire) != 0) {
+        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+        context->GetDevice(&dev);
+        if (isSmoothMotionDevice(dev.Get())) {
+            recordSmoothMotionDevice(dev.Get(), context);
+            return;
+        }
+    }
     void** rawTable = *reinterpret_cast<void***>(context);
     if (!rawTable) return;
 
