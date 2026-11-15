@@ -5,6 +5,7 @@
 #include "sharpen_pass.h"
 
 
+#include <atomic>
 #include <cstdint>
 #include <d3d11.h>
 #include <memory>
@@ -216,6 +217,11 @@ public:
 
     void requestReset() { pendingReset_ = true; }
 
+    void setTelemetryVisibility(bool needTiming, bool needStatusText) {
+        telemetryTimingEnabled_.store(needTiming, std::memory_order_relaxed);
+        telemetryStatusEnabled_.store(needStatusText, std::memory_order_relaxed);
+    }
+
     const UpscalerDiagnostics& getDiagnostics() const { return diagnostics_; }
 
     // Last measured GPU time (ms) of the given backend. The active backend reports its live
@@ -256,6 +262,8 @@ private:
     size_t timingWriteIndex_ = 0;
     float lastGpuTimeMs_ = 0.0f;
     unsigned evalCount_{0};
+    std::atomic<bool> telemetryTimingEnabled_{false};
+    std::atomic<bool> telemetryStatusEnabled_{false};
 
     // Per-backend async GPU timing for evaluateBackend (indexed by UpscalerBackend value).
     static constexpr size_t kBackendCount = 4;

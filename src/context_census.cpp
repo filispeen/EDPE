@@ -6823,7 +6823,6 @@ struct ScopedD3D11PipelineState {
         if (rs) rs->Release();
         if (blend) blend->Release();
         if (ds) ds->Release();
-        rearmContextHooks();
         abandonAmortizedAndRearmHudProbe(ctx);
     }
 

@@ -429,6 +429,7 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     g_ngx_state.reset_requested = true;
 
     const wchar_t* presetName =
+        effectivePreset == 5u ? L"E" :
         effectivePreset == 10u ? L"J" :
         effectivePreset == 11u ? L"K" :
         effectivePreset == 12u ? L"L" :

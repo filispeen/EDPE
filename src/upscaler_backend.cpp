@@ -973,7 +973,12 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         backend->resetHistory();
     }
 
-    // Poll oldest GPU timestamp slot non-blockingly before reusing it.
+    const bool collectTiming =
+        (evalCount_ < 4) || telemetryTimingEnabled_.load(std::memory_order_relaxed);
+    const bool collectStatusText =
+        (evalCount_ == 0) || telemetryStatusEnabled_.load(std::memory_order_relaxed);
+
+    // Poll oldest GPU timestamp slot non-blockingly before reusing it (or drain in-flight slots when disabled).
     auto& slot = timingRing_[timingWriteIndex_];
     if (context && slot.inFlight && slot.disjoint && slot.start && slot.end) {
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
@@ -989,13 +994,16 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         }
     }
 
-    const bool canQueryGpu = context && !slot.inFlight && slot.disjoint && slot.start && slot.end;
+    const bool canQueryGpu = collectTiming && context && !slot.inFlight && slot.disjoint && slot.start && slot.end;
     if (canQueryGpu) {
         context->Begin(slot.disjoint.Get());
         context->End(slot.start.Get());
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    std::chrono::high_resolution_clock::time_point t0{};
+    if (collectTiming) {
+        t0 = std::chrono::high_resolution_clock::now();
+    }
     bool evalSuccess = false;
     {
         EvaluatingUpscalerGuard evalGuard;
@@ -1011,7 +1019,6 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
             }
         }
     }
-    auto t1 = std::chrono::high_resolution_clock::now();
     if (evalSuccess) {
         ++evalCount_;
     }
@@ -1023,8 +1030,13 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         timingWriteIndex_ = (timingWriteIndex_ + 1) % kTimingRingSize;
     }
 
-    const float cpuTimeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
-    diagnostics_.gpuTimeMs = (lastGpuTimeMs_ > 0.0f) ? lastGpuTimeMs_ : cpuTimeMs;
+    if (collectTiming) {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        const float cpuTimeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        diagnostics_.gpuTimeMs = (lastGpuTimeMs_ > 0.0f) ? lastGpuTimeMs_ : cpuTimeMs;
+    } else if (lastGpuTimeMs_ > 0.0f) {
+        diagnostics_.gpuTimeMs = lastGpuTimeMs_;
+    }
     diagnostics_.success = evalSuccess;
 
     if (!evalSuccess) {
@@ -1051,9 +1063,11 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         EdpeLog(message);
     }
 
-    swprintf_s(diagnostics_.statusMessage, L"Reconstructed (%ux%u -> %ux%u) %.3f ms",
-        inputs.renderWidth, inputs.renderHeight, inputs.outputWidth, inputs.outputHeight,
-        diagnostics_.gpuTimeMs);
+    if (collectStatusText) {
+        swprintf_s(diagnostics_.statusMessage, L"Reconstructed (%ux%u -> %ux%u) %.3f ms",
+            inputs.renderWidth, inputs.renderHeight, inputs.outputWidth, inputs.outputHeight,
+            diagnostics_.gpuTimeMs);
+    }
     pendingReset_ = false;
     return true;
 }

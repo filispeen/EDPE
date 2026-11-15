@@ -144,7 +144,9 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
     }
 
     const auto& cfg = Config::instance();
-    const bool uiOrStatsNeeded = cfg.showPerfOverlay || UiMenuVisible() || cfg.enableProfiler || cfg.captureOverlayInComparison;
+    const bool menuOpen = UiMenuVisible();
+    const bool uiOrStatsNeeded = cfg.showPerfOverlay || menuOpen || cfg.enableProfiler || cfg.captureOverlayInComparison;
+    upscaler.setTelemetryVisibility(uiOrStatsNeeded, menuOpen);
     if (!uiOrStatsNeeded) {
         return;
     }
