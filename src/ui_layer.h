@@ -170,6 +170,13 @@ private:
     bool multLayerCleared_ = false;
     UINT width_ = 0;
     UINT height_ = 0;
+
+    void updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView);
+    UINT cbWidth_ = 0;
+    UINT cbHeight_ = 0;
+    bool cbHasMult_ = false;
+    bool cbDebugView_ = false;
+    bool cbValid_ = false;
 };
 
 } // namespace edpe

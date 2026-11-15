@@ -54,7 +54,7 @@ bool NvidiaUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext
 }
 
 namespace {
-DXGI_FORMAT sanitizeNvidiaUavFormat(DXGI_FORMAT format) {
+DXGI_FORMAT sanitizeConcreteUavFormat(DXGI_FORMAT format) {
     switch (format) {
     case DXGI_FORMAT_R8G8B8A8_TYPELESS:
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -74,6 +74,24 @@ DXGI_FORMAT sanitizeNvidiaUavFormat(DXGI_FORMAT format) {
         return format;
     }
 }
+
+/// Returns true if the upscaler can evaluate its UAV output straight into destinationTexture.
+bool canWriteDirectOutputUav(const D3D11_TEXTURE2D_DESC& desc,
+                             uint32_t expectedWidth,
+                             uint32_t expectedHeight,
+                             ID3D11Texture2D* destinationTexture,
+                             ID3D11Texture2D* inputColor,
+                             DXGI_FORMAT sanitizedFormat) {
+    return destinationTexture &&
+           destinationTexture != inputColor &&
+           desc.Width == expectedWidth &&
+           desc.Height == expectedHeight &&
+           desc.SampleDesc.Count == 1 &&
+           desc.Usage == D3D11_USAGE_DEFAULT &&
+           (desc.BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE)) ==
+               (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE) &&
+           desc.Format == sanitizedFormat;
+}
 } // namespace
 
 void NvidiaUpscalerBackend::shutdown() {
@@ -90,7 +108,7 @@ void NvidiaUpscalerBackend::shutdown() {
 }
 
 bool NvidiaUpscalerBackend::ensureOutputTexture(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT format) {
-    const DXGI_FORMAT uavFormat = sanitizeNvidiaUavFormat(format);
+    const DXGI_FORMAT uavFormat = sanitizeConcreteUavFormat(format);
     if (outputTexture_ && outputUav_ && outputDevice_ == device &&
         outputWidth_ == width && outputHeight_ == height && outputFormat_ == uavFormat) {
         return true;
@@ -163,19 +181,26 @@ bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.color->GetDesc(&outDesc);
     }
 
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
-    if (!ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
-        return false;
+    const DXGI_FORMAT uavFormat = sanitizeConcreteUavFormat(outDesc.Format);
+    const bool directDest = canWriteDirectOutputUav(
+        outDesc, inputs.outputWidth, inputs.outputHeight, destinationTexture, inputs.color, uavFormat);
+
+    if (!directDest) {
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        if (!ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
+            return false;
+        }
     }
 
+    ID3D11Texture2D* evalOut = directDest ? destinationTexture : outputTexture_.Get();
     ID3D11Resource* colorIn = inputs.color;
     ID3D11Resource* depthIn = inputs.depth;
     ID3D11Resource* motionIn = inputs.motionVectors;
 
     const UpscaleMode mode = UpscalerManager::instance().getMode();
     bool evalOk = NgxContext::evaluateDlss(context, params,
-        colorIn, outputTexture_.Get(), depthIn, motionIn,
+        colorIn, evalOut, depthIn, motionIn,
         inputs.renderWidth, inputs.renderHeight,
         inputs.outputWidth, inputs.outputHeight,
         mode, NgxContext::get_preset());
@@ -184,9 +209,11 @@ bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         return false;
     }
 
-    ID3D11Texture2D* dest = destinationTexture ? destinationTexture : inputs.color;
-    if (dest) {
-        context->CopyResource(dest, outputTexture_.Get());
+    if (!directDest) {
+        ID3D11Texture2D* dest = destinationTexture ? destinationTexture : inputs.color;
+        if (dest) {
+            context->CopyResource(dest, outputTexture_.Get());
+        }
     }
     return true;
 }
@@ -544,7 +571,12 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.color->GetDesc(&outDesc);
     }
 
-    if (!impl_->ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
+    const DXGI_FORMAT uavFormat = sanitizeConcreteUavFormat(outDesc.Format);
+    const bool directDest = canWriteDirectOutputUav(
+        outDesc, inputs.outputWidth, inputs.outputHeight, destinationTexture, inputs.color, uavFormat);
+
+    if (!directDest &&
+        !impl_->ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
         return false;
     }
 
@@ -578,8 +610,9 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
 
     // Reactive mask removed: HUD and UI are composited via separate native layer.
 
-    dispatchDesc.output = ffxGetResourceDX11_Fsr31(impl_->outputTexture.Get(),
-        GetFfxResourceDescriptionDX11(impl_->outputTexture.Get()), L"FSR3_Output", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D11Texture2D* evalOut = directDest ? destinationTexture : impl_->outputTexture.Get();
+    dispatchDesc.output = ffxGetResourceDX11_Fsr31(evalOut,
+        GetFfxResourceDescriptionDX11(evalOut), L"FSR3_Output", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 
     // Jitter & Motion parameters
     dispatchDesc.jitterOffset.x = params.jitterX;
@@ -626,9 +659,11 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         return false;
     }
 
-    ID3D11Texture2D* dest = destinationTexture ? destinationTexture : inputs.color;
-    if (dest) {
-        context->CopyResource(dest, impl_->outputTexture.Get());
+    if (!directDest) {
+        ID3D11Texture2D* dest = destinationTexture ? destinationTexture : inputs.color;
+        if (dest) {
+            context->CopyResource(dest, impl_->outputTexture.Get());
+        }
     }
     return true;
 #else
@@ -938,7 +973,12 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         backend->resetHistory();
     }
 
-    // Poll oldest GPU timestamp slot non-blockingly before reusing it.
+    const bool collectTiming =
+        (evalCount_ < 4) || telemetryTimingEnabled_.load(std::memory_order_relaxed);
+    const bool collectStatusText =
+        (evalCount_ == 0) || telemetryStatusEnabled_.load(std::memory_order_relaxed);
+
+    // Poll oldest GPU timestamp slot non-blockingly before reusing it (or drain in-flight slots when disabled).
     auto& slot = timingRing_[timingWriteIndex_];
     if (context && slot.inFlight && slot.disjoint && slot.start && slot.end) {
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
@@ -954,13 +994,16 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         }
     }
 
-    const bool canQueryGpu = context && !slot.inFlight && slot.disjoint && slot.start && slot.end;
+    const bool canQueryGpu = collectTiming && context && !slot.inFlight && slot.disjoint && slot.start && slot.end;
     if (canQueryGpu) {
         context->Begin(slot.disjoint.Get());
         context->End(slot.start.Get());
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+    std::chrono::high_resolution_clock::time_point t0{};
+    if (collectTiming) {
+        t0 = std::chrono::high_resolution_clock::now();
+    }
     bool evalSuccess = false;
     {
         EvaluatingUpscalerGuard evalGuard;
@@ -976,7 +1019,6 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
             }
         }
     }
-    auto t1 = std::chrono::high_resolution_clock::now();
     if (evalSuccess) {
         ++evalCount_;
     }
@@ -988,8 +1030,13 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         timingWriteIndex_ = (timingWriteIndex_ + 1) % kTimingRingSize;
     }
 
-    const float cpuTimeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
-    diagnostics_.gpuTimeMs = (lastGpuTimeMs_ > 0.0f) ? lastGpuTimeMs_ : cpuTimeMs;
+    if (collectTiming) {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        const float cpuTimeMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        diagnostics_.gpuTimeMs = (lastGpuTimeMs_ > 0.0f) ? lastGpuTimeMs_ : cpuTimeMs;
+    } else if (lastGpuTimeMs_ > 0.0f) {
+        diagnostics_.gpuTimeMs = lastGpuTimeMs_;
+    }
     diagnostics_.success = evalSuccess;
 
     if (!evalSuccess) {
@@ -1016,9 +1063,11 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         EdpeLog(message);
     }
 
-    swprintf_s(diagnostics_.statusMessage, L"Reconstructed (%ux%u -> %ux%u) %.3f ms",
-        inputs.renderWidth, inputs.renderHeight, inputs.outputWidth, inputs.outputHeight,
-        diagnostics_.gpuTimeMs);
+    if (collectStatusText) {
+        swprintf_s(diagnostics_.statusMessage, L"Reconstructed (%ux%u -> %ux%u) %.3f ms",
+            inputs.renderWidth, inputs.renderHeight, inputs.outputWidth, inputs.outputHeight,
+            diagnostics_.gpuTimeMs);
+    }
     pendingReset_ = false;
     return true;
 }

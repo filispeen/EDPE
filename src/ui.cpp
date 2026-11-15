@@ -1896,12 +1896,17 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 "Preset J (Transformer)",
                 "Preset K (Transformer)",
                 "Preset L",
-                "Preset M"
+                "Preset M",
+                "Preset E (CNN Fast)"
             };
             const uint32_t curPreset = edpe::NgxContext::get_preset();
-            int preset_idx = (curPreset >= 10u && curPreset <= 13u) ? static_cast<int>(curPreset - 9u) : 0;
+            int preset_idx = 0;
+            if (curPreset == 5u) preset_idx = 5;
+            else if (curPreset >= 10u && curPreset <= 13u) preset_idx = static_cast<int>(curPreset - 9u);
             if (ImGui::Combo("NVIDIA DLSS Preset", &preset_idx, preset_items, IM_ARRAYSIZE(preset_items))) {
-                const uint32_t newPreset = (preset_idx == 0) ? 0u : static_cast<uint32_t>(preset_idx + 9);
+                uint32_t newPreset = 0u;
+                if (preset_idx == 5) newPreset = 5u;
+                else if (preset_idx >= 1 && preset_idx <= 4) newPreset = static_cast<uint32_t>(preset_idx + 9);
                 edpe::NgxContext::set_preset(newPreset);
                 cfg.dlssPreset = static_cast<int>(newPreset);
                 cfg.save();

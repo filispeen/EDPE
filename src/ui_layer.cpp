@@ -74,9 +74,9 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
 
     // Оскільки коефіцієнт пропускання T = prod(1 - alpha) накопичується у лінійному
     // HDR-просторі до тонемапінгу (Pass 35), ослаблення фону виконується у лінійному
-    // світлі перед поверненням у гамма-простір sRGB:
-    float3 worldLin = srgbToLinear(world.rgb);
-    float3 attenWorld = linearToSrgb(worldLin * (transmittance * cleanMult));
+    // світлі перед поверненням у гамма-простір sRGB; при atten == 1 пропускаємо pow(2.4):
+    float3 atten = transmittance * cleanMult;
+    float3 attenWorld = all(atten >= 0.999) ? world.rgb : linearToSrgb(srgbToLinear(world.rgb) * atten);
     float3 finalRgb = uiRgb + attenWorld;
     uOut[id.xy] = float4(saturate(finalRgb), world.a);
 }
@@ -145,8 +145,8 @@ float4 ps_main(VSOut pin) : SV_Target {
     float4 world = tWorld.Load(p);
     float3 cleanMult = all(mult >= 0.999) ? float3(1.0, 1.0, 1.0) : mult;
 
-    float3 worldLin = srgbToLinear(world.rgb);
-    float3 attenWorld = linearToSrgb(worldLin * (transmittance * cleanMult));
+    float3 atten = transmittance * cleanMult;
+    float3 attenWorld = all(atten >= 0.999) ? world.rgb : linearToSrgb(srgbToLinear(world.rgb) * atten);
     float3 finalRgb = uiRgb + attenWorld;
     return float4(saturate(finalRgb), world.a);
 }
@@ -473,6 +473,7 @@ void UiLayer::shutdown() {
     compositePs_.Reset();
     constantBuffer_.Reset();
     compositeCs_.Reset();
+    cbValid_ = false;
     device_.Reset();
 
     isIntercepting_ = false;
@@ -996,6 +997,27 @@ bool matchesDevice(ID3D11DeviceChild* child, ID3D11Device* expectedDevice) {
 
 } // namespace
 
+void UiLayer::updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView) {
+    if (cbValid_ && cbWidth_ == outputWidth && cbHeight_ == outputHeight &&
+        cbHasMult_ == hasMultiplyDraws_ && cbDebugView_ == debugView) {
+        return;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(context->Map(constantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        auto* data = reinterpret_cast<uint32_t*>(mapped.pData);
+        data[0] = outputWidth;
+        data[1] = outputHeight;
+        data[2] = hasMultiplyDraws_ ? 1 : 0;
+        data[3] = debugView ? 1 : 0;
+        context->Unmap(constantBuffer_.Get(), 0);
+        cbWidth_ = outputWidth;
+        cbHeight_ = outputHeight;
+        cbHasMult_ = hasMultiplyDraws_;
+        cbDebugView_ = debugView;
+        cbValid_ = true;
+    }
+}
+
 bool UiLayer::composite(ID3D11DeviceContext* context,
                         ID3D11ShaderResourceView* worldReconstruction,
                         ID3D11UnorderedAccessView* backbufferUav,
@@ -1020,15 +1042,7 @@ bool UiLayer::composite(ID3D11DeviceContext* context,
     }
 
     // Оновлюємо константи
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (SUCCEEDED(context->Map(constantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        auto* data = reinterpret_cast<uint32_t*>(mapped.pData);
-        data[0] = outputWidth;
-        data[1] = outputHeight;
-        data[2] = hasMultiplyDraws_ ? 1 : 0;
-        data[3] = debugView ? 1 : 0;
-        context->Unmap(constantBuffer_.Get(), 0);
-    }
+    updateCompositeConstants(context, outputWidth, outputHeight, debugView);
 
     // Біндимо ресурси (t0 = world, t1 = ldrUi, t2 = mult, t3 = hdrUi)
     ID3D11ShaderResourceView* srvs[4] = {
@@ -1076,15 +1090,7 @@ bool UiLayer::compositeToRtv(ID3D11DeviceContext* context,
     }
     EvaluatingUpscalerGuard guard;
 
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (SUCCEEDED(context->Map(constantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        auto* data = reinterpret_cast<uint32_t*>(mapped.pData);
-        data[0] = outputWidth;
-        data[1] = outputHeight;
-        data[2] = hasMultiplyDraws_ ? 1 : 0;
-        data[3] = debugView ? 1 : 0;
-        context->Unmap(constantBuffer_.Get(), 0);
-    }
+    updateCompositeConstants(context, outputWidth, outputHeight, debugView);
 
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> origRtv;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> origDsv;
@@ -1146,12 +1152,11 @@ bool UiLayer::compositeToRtv(ID3D11DeviceContext* context,
 
     context->Draw(3, 0);
 
-    ID3D11ShaderResourceView* nullSrvs[4] = {nullptr, nullptr, nullptr, nullptr};
-    context->PSSetShaderResources(0, 4, nullSrvs);
-    ID3D11RenderTargetView* nullRtv = nullptr;
-    context->OMSetRenderTargets(1, &nullRtv, nullptr);
-
     if (!callerRestoresState) {
+        ID3D11ShaderResourceView* nullSrvs[4] = {nullptr, nullptr, nullptr, nullptr};
+        context->PSSetShaderResources(0, 4, nullSrvs);
+        ID3D11RenderTargetView* nullRtv = nullptr;
+        context->OMSetRenderTargets(1, &nullRtv, nullptr);
         context->PSSetShaderResources(0, 4, origSrvs);
         for (int i = 0; i < 4; ++i) {
             if (origSrvs[i]) origSrvs[i]->Release();
