@@ -3599,12 +3599,20 @@ static inline bool isHudDrawInterceptWindowActive() {
     return true;
 }
 
-static inline bool shouldInspectHudOrTonemapDraw() {
-    return (s_hud_mask_active_pass && motion_color_bound) ||
-           s_ldr_tonemap_candidate_bound ||
-           s_post_ldr_backbuffer_bound ||
-           motion_pair_active ||
-           draw_probe_active.load(std::memory_order_relaxed);
+static inline bool shouldInspectHudOrTonemapDraw(UINT count, UINT instances) {
+    if ((s_hud_mask_active_pass && motion_color_bound) ||
+        s_post_ldr_backbuffer_bound ||
+        motion_pair_active ||
+        draw_probe_active.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    // Outside Pass 53/54 backbuffer binding and Pass 22b/35 HUD passes, only
+    // non-instanced 3..6-vertex fullscreen passes before verified tonemap need inspection.
+    if (s_ldr_tonemap_candidate_bound) {
+        return count >= 3 && count <= 6 && instances <= 1 &&
+               s_verified_ldr_tonemap_frame != last_present_frame.load(std::memory_order_relaxed);
+    }
+    return false;
 }
 
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
@@ -3614,7 +3622,7 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
         if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         return;
     }
-    if (!shouldInspectHudOrTonemapDraw()) {
+    if (!shouldInspectHudOrTonemapDraw(count, 1)) {
         if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         abandonAmortizedAndRearmHudProbe(context);
         return;
@@ -3650,7 +3658,7 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
         if (const auto forward = resolveOriginalDraw(context)) forward(context, count, start);
         return;
     }
-    if (!shouldInspectHudOrTonemapDraw()) {
+    if (!shouldInspectHudOrTonemapDraw(count, 1)) {
         if (const auto forward = resolveOriginalDraw(context)) forward(context, count, start);
         abandonAmortizedAndRearmHudProbe(context);
         return;
@@ -3690,7 +3698,7 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
         }
         return;
     }
-    if (!shouldInspectHudOrTonemapDraw()) {
+    if (!shouldInspectHudOrTonemapDraw(index_count, instance_count)) {
         if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
             forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
         }
@@ -3740,7 +3748,7 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         }
         return;
     }
-    if (!shouldInspectHudOrTonemapDraw()) {
+    if (!shouldInspectHudOrTonemapDraw(vertex_count, instance_count)) {
         if (const auto forward = resolveOriginalDrawInstanced(context)) {
             forward(context, vertex_count, instance_count, start_vertex, start_instance);
         }
@@ -6919,9 +6927,19 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_dlaa_input_srv.Reset();
         }
     }
+    const auto activeBackend = upscaler.getBackend();
+    const bool backendSupportsDirectColor =
+        (activeBackend == edpe::UpscalerBackend::Taa) ||
+        ((activeBackend == edpe::UpscalerBackend::NvidiaDlss ||
+          activeBackend == edpe::UpscalerBackend::AmdFsr) &&
+         srcColorDesc.Format == inputFormat &&
+         srcColorDesc.Usage == D3D11_USAGE_DEFAULT &&
+         srcColorDesc.SampleDesc.Count == 1 &&
+         srcColorDesc.Width == depthDesc.Width &&
+         srcColorDesc.Height == depthDesc.Height);
     bool useDirectColorSrv = false;
     if (colorSource != backbuffer &&
-        upscaler.getBackend() == edpe::UpscalerBackend::Taa &&
+        backendSupportsDirectColor &&
         !debug_view_active && !s_cmp_seq.active &&
         (srcColorDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
         if (s_direct_color_tex != colorSource || s_direct_color_fmt != inputFormat || !s_direct_color_srv) {
@@ -7229,9 +7247,19 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             D3D11_TEXTURE2D_DESC td = backbufferDesc;
             td.Format = outFormat;
             td.Usage = D3D11_USAGE_DEFAULT;
-            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            UINT uavSupport = 0;
+            const bool canBindUav =
+                SUCCEEDED(device->CheckFormatSupport(outFormat, &uavSupport)) &&
+                (uavSupport & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) != 0;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET |
+                           (canBindUav ? D3D11_BIND_UNORDERED_ACCESS : 0u);
             td.CPUAccessFlags = td.MiscFlags = 0;
-            if (FAILED(device->CreateTexture2D(&td, nullptr, &s_dlss_output_texture)) ||
+            HRESULT hrOut = device->CreateTexture2D(&td, nullptr, &s_dlss_output_texture);
+            if (FAILED(hrOut) && (td.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) {
+                td.BindFlags &= ~D3D11_BIND_UNORDERED_ACCESS;
+                hrOut = device->CreateTexture2D(&td, nullptr, &s_dlss_output_texture);
+            }
+            if (FAILED(hrOut) ||
                 FAILED(device->CreateShaderResourceView(s_dlss_output_texture.Get(), nullptr, &s_dlss_output_srv))) {
                 s_dlss_output_texture.Reset();
                 s_dlss_output_srv.Reset();
