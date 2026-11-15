@@ -88,14 +88,15 @@ bool patchIatEntry(HMODULE module, const char* targetDll, const char* targetFunc
 namespace {
 
 void hookVtableSlot(void** vtbl, int index, void* newFunc, void** origFunc) {
-    if (!vtbl || vtbl[index] == newFunc) return;
+    if (!vtbl || !newFunc || vtbl[index] == newFunc) return;
     DWORD oldProtect = 0;
     if (VirtualProtect(&vtbl[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
         if (origFunc && *origFunc == nullptr) {
             *origFunc = vtbl[index];
         }
-        vtbl[index] = newFunc;
-        VirtualProtect(&vtbl[index], sizeof(void*), oldProtect, &oldProtect);
+        InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(&vtbl[index]), newFunc);
+        DWORD ignored = 0;
+        VirtualProtect(&vtbl[index], sizeof(void*), oldProtect, &ignored);
     }
 }
 
@@ -147,9 +148,18 @@ PFN_DirectInput8Create g_pfnDirectInput8Create = nullptr;
 PFN_CreateDeviceW orig_CreateDeviceW = nullptr;
 PFN_CreateDeviceA orig_CreateDeviceA = nullptr;
 
+thread_local int t_createDeviceDepth = 0;
+
+struct CreateDeviceDepthGuard {
+    int& depth;
+    explicit CreateDeviceDepthGuard(int& d) : depth(d) { ++depth; }
+    ~CreateDeviceDepthGuard() { --depth; }
+};
+
 HRESULT STDMETHODCALLTYPE Hooked_CreateDeviceW(IDirectInput8W* self, REFGUID rguid, LPDIRECTINPUTDEVICE8W* lplpDevice, LPUNKNOWN pUnkOuter) {
+    CreateDeviceDepthGuard guard(t_createDeviceDepth);
     HRESULT hr = orig_CreateDeviceW ? orig_CreateDeviceW(self, rguid, lplpDevice, pUnkOuter) : E_FAIL;
-    if (SUCCEEDED(hr) && lplpDevice && *lplpDevice) {
+    if (guard.depth == 1 && SUCCEEDED(hr) && lplpDevice && *lplpDevice) {
         if (IsEqualGUID(rguid, GUID_SysMouse) || IsEqualGUID(rguid, GUID_SysKeyboard)) {
             *lplpDevice = new SafeDirectInputDevice8WProxy(*lplpDevice, IID_IDirectInputDevice8W);
             EdpeLog(IsEqualGUID(rguid, GUID_SysMouse)
@@ -161,8 +171,9 @@ HRESULT STDMETHODCALLTYPE Hooked_CreateDeviceW(IDirectInput8W* self, REFGUID rgu
 }
 
 HRESULT STDMETHODCALLTYPE Hooked_CreateDeviceA(IDirectInput8A* self, REFGUID rguid, LPDIRECTINPUTDEVICE8A* lplpDevice, LPUNKNOWN pUnkOuter) {
+    CreateDeviceDepthGuard guard(t_createDeviceDepth);
     HRESULT hr = orig_CreateDeviceA ? orig_CreateDeviceA(self, rguid, lplpDevice, pUnkOuter) : E_FAIL;
-    if (SUCCEEDED(hr) && lplpDevice && *lplpDevice) {
+    if (guard.depth == 1 && SUCCEEDED(hr) && lplpDevice && *lplpDevice) {
         if (IsEqualGUID(rguid, GUID_SysMouse) || IsEqualGUID(rguid, GUID_SysKeyboard)) {
             *lplpDevice = new SafeDirectInputDevice8AProxy(*lplpDevice, IID_IDirectInputDevice8A);
             EdpeLog(IsEqualGUID(rguid, GUID_SysMouse)
@@ -178,11 +189,17 @@ void hookDirectInput8Vtable(REFIID riidltf, void* diInstance) {
     if (IsEqualIID(riidltf, IID_IDirectInput8W)) {
         auto* di = reinterpret_cast<IDirectInput8W*>(diInstance);
         void** diVtbl = *reinterpret_cast<void***>(di);
-        hookVtableSlot(diVtbl, 3, reinterpret_cast<void*>(&Hooked_CreateDeviceW), reinterpret_cast<void**>(&orig_CreateDeviceW));
+        if (diVtbl && diVtbl[3] != reinterpret_cast<void*>(&Hooked_CreateDeviceW) &&
+            diVtbl[3] != reinterpret_cast<void*>(&Hooked_CreateDeviceA)) {
+            hookVtableSlot(diVtbl, 3, reinterpret_cast<void*>(&Hooked_CreateDeviceW), reinterpret_cast<void**>(&orig_CreateDeviceW));
+        }
     } else if (IsEqualIID(riidltf, IID_IDirectInput8A)) {
         auto* di = reinterpret_cast<IDirectInput8A*>(diInstance);
         void** diVtbl = *reinterpret_cast<void***>(di);
-        hookVtableSlot(diVtbl, 3, reinterpret_cast<void*>(&Hooked_CreateDeviceA), reinterpret_cast<void**>(&orig_CreateDeviceA));
+        if (diVtbl && diVtbl[3] != reinterpret_cast<void*>(&Hooked_CreateDeviceA) &&
+            diVtbl[3] != reinterpret_cast<void*>(&Hooked_CreateDeviceW)) {
+            hookVtableSlot(diVtbl, 3, reinterpret_cast<void*>(&Hooked_CreateDeviceA), reinterpret_cast<void**>(&orig_CreateDeviceA));
+        }
     }
 }
 

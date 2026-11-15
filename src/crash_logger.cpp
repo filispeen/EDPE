@@ -408,17 +408,7 @@ static void writeCrashDump(EXCEPTION_POINTERS* ep) {
     pSym->SizeOfStruct = sizeof(SYMBOL_INFO);
     pSym->MaxNameLen = 255;
 
-    int frameIndex = 0;
-    while (frameIndex < 64) {
-        if (!StackWalk64(machineType, hProcess, hThread, &frame, &ctxCopy, nullptr,
-                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) {
-            break;
-        }
-        if (frame.AddrPC.Offset == 0) {
-            break;
-        }
-
-        const DWORD64 addr = frame.AddrPC.Offset;
+    auto logResolvedFrame = [&](int idx, DWORD64 addr, const char* tag) {
         HMODULE hMod = nullptr;
         wchar_t frameModName[MAX_PATH] = L"unknown";
         DWORD64 frameModBase = 0;
@@ -442,38 +432,93 @@ static void writeCrashDump(EXCEPTION_POINTERS* ep) {
         bool hasLine = SymGetLineFromAddr64(hProcess, addr, &lineDisp, &lineInfo) == TRUE;
 
         if (hasSymbol && hasLine) {
-            writeFormat(file, "#%02d 0x%016llX %ls+0x%llX (%s+0x%llX) [%s:%lu]\r\n",
-                        frameIndex, addr, frameModName, offsetInMod, pSym->Name, displacement,
-                        lineInfo.FileName, lineInfo.LineNumber);
+            writeFormat(file, "#%02d 0x%016llX %ls+0x%llX (%s+0x%llX) [%s:%lu]%s\r\n",
+                        idx, addr, frameModName, offsetInMod, pSym->Name, displacement,
+                        lineInfo.FileName, lineInfo.LineNumber, tag ? tag : "");
         } else if (hasSymbol) {
-            writeFormat(file, "#%02d 0x%016llX %ls+0x%llX (%s+0x%llX)\r\n",
-                        frameIndex, addr, frameModName, offsetInMod, pSym->Name, displacement);
+            writeFormat(file, "#%02d 0x%016llX %ls+0x%llX (%s+0x%llX)%s\r\n",
+                        idx, addr, frameModName, offsetInMod, pSym->Name, displacement, tag ? tag : "");
         } else {
-            writeFormat(file, "#%02d 0x%016llX %ls+0x%llX\r\n",
-                        frameIndex, addr, frameModName, offsetInMod);
+            writeFormat(file, "#%02d 0x%016llX %ls+0x%llX%s\r\n",
+                        idx, addr, frameModName, offsetInMod, tag ? tag : "");
         }
+    };
+
+    int frameIndex = 0;
+    while (frameIndex < 64) {
+        if (!StackWalk64(machineType, hProcess, hThread, &frame, &ctxCopy, nullptr,
+                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) {
+            break;
+        }
+        if (frame.AddrPC.Offset == 0) {
+            break;
+        }
+        logResolvedFrame(frameIndex, frame.AddrPC.Offset, "");
         frameIndex++;
     }
 
-    if (frameIndex == 0) {
+#if defined(_M_X64)
+    // When RIP == 0 (null function pointer call), StackWalk64 cannot look up unwind data for address 0.
+    // Recover the caller return address from [RSP] and resume StackWalk64 from there.
+    if (frameIndex == 0 && ctx && ctx->Rip == 0 && ctx->Rsp != 0) {
+        void* retPtr = nullptr;
+        if (edpe::safeReadPtr(reinterpret_cast<const void*>(ctx->Rsp), &retPtr) && retPtr) {
+            const DWORD64 retAddr = reinterpret_cast<DWORD64>(retPtr);
+            logResolvedFrame(frameIndex++, retAddr, " [caller at RSP]");
+
+            ctxCopy = *ctx;
+            ctxCopy.Rip = retAddr;
+            ctxCopy.Rsp = ctx->Rsp + sizeof(DWORD64);
+            frame = {};
+            frame.AddrPC.Offset = ctxCopy.Rip;
+            frame.AddrPC.Mode = AddrModeFlat;
+            frame.AddrFrame.Offset = ctxCopy.Rbp;
+            frame.AddrFrame.Mode = AddrModeFlat;
+            frame.AddrStack.Offset = ctxCopy.Rsp;
+            frame.AddrStack.Mode = AddrModeFlat;
+
+            bool skippedSelf = false;
+            while (frameIndex < 64) {
+                if (!StackWalk64(machineType, hProcess, hThread, &frame, &ctxCopy, nullptr,
+                                 SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) {
+                    break;
+                }
+                if (frame.AddrPC.Offset == 0) {
+                    break;
+                }
+                if (!skippedSelf && frame.AddrPC.Offset == retAddr) {
+                    skippedSelf = true;
+                    continue;
+                }
+                skippedSelf = true;
+                logResolvedFrame(frameIndex++, frame.AddrPC.Offset, "");
+            }
+        }
+    }
+
+    if (ctx && ctx->Rsp != 0 && frameIndex <= 1) {
+        writeRaw(file, "--- Stack Return Candidates (from crashing RSP) ---\r\n");
+        int shown = 0;
+        for (int slot = 0; slot < 64 && shown < 24; ++slot) {
+            const ULONG_PTR slotAddr = static_cast<ULONG_PTR>(ctx->Rsp) + static_cast<ULONG_PTR>(slot) * sizeof(void*);
+            void* candidate = nullptr;
+            if (!edpe::safeReadPtr(reinterpret_cast<const void*>(slotAddr), &candidate)) {
+                break;
+            }
+            if (edpe::isExecutableCodePtr(candidate)) {
+                char tagBuf[32]{};
+                snprintf(tagBuf, sizeof(tagBuf), " [RSP+0x%X]", slot * 8);
+                logResolvedFrame(shown++, reinterpret_cast<DWORD64>(candidate), tagBuf);
+            }
+        }
+    }
+#endif
+
+    if (frameIndex == 0 && !ctx) {
         void* backtraceAddrs[64]{};
         USHORT captured = CaptureStackBackTrace(0, 64, backtraceAddrs, nullptr);
         for (USHORT i = 0; i < captured; ++i) {
-            const DWORD64 addr = reinterpret_cast<DWORD64>(backtraceAddrs[i]);
-            HMODULE hMod = nullptr;
-            wchar_t frameModName[MAX_PATH] = L"unknown";
-            DWORD64 frameModBase = 0;
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   reinterpret_cast<LPCWSTR>(addr), &hMod) && hMod) {
-                frameModBase = reinterpret_cast<DWORD64>(hMod);
-                wchar_t modPath[MAX_PATH] = {0};
-                if (GetModuleFileNameW(hMod, modPath, MAX_PATH)) {
-                    wchar_t* p = wcsrchr(modPath, L'\\');
-                    wcscpy_s(frameModName, p ? (p + 1) : modPath);
-                }
-            }
-            const DWORD64 offsetInMod = addr - frameModBase;
-            writeFormat(file, "#%02d 0x%016llX %ls+0x%llX\r\n", i, addr, frameModName, offsetInMod);
+            logResolvedFrame(i, reinterpret_cast<DWORD64>(backtraceAddrs[i]), "");
         }
     }
     writeRaw(file, "\r\n");
