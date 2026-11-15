@@ -35,48 +35,57 @@ Inspecting `EDAA`'s Elite Dangerous implementation confirms every practical deta
    * `xessD3D12GetInitParams` / **`xessD3D12BuildPipelines(hContext, pipelineLibrary, blocking, initFlags)`**: compiles XeSS neural-network PSOs up front; **must run asynchronously (`blocking = false` on a worker thread or deferred background pass)** so Elite does not stutter 1–3 seconds at cockpit spawn.
    * Ring of **8 `ID3D12CommandAllocator` instances** tied to monotonic `ID3D12Fence` values so in-flight XeSS dispatches never overwrite active command lists.
 3. **Zero-Copy Texture Sharing:**
-   * Color, Depth (`R32_FLOAT` copy extracted from `DSV #2`), Motion Vectors (`R16G16_FLOAT`), Output, and Responsive Mask (`R8_UNORM`) are created on `ID3D11Device` with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED`, exported via `IDXGIResource1::CreateSharedHandle`, and opened once on `ID3D12Device::OpenSharedHandle`.
+   * Color, Depth (`R32_FLOAT` copy extracted from `DSV #2` specifically for WDDM D3D11↔D3D12 `SHARED_NTHANDLE` sharing), Motion Vectors (`R16G16_FLOAT`), Output, and Responsive Mask (`R8_UNORM`) are created on `ID3D11Device` with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED`, exported via `IDXGIResource1::CreateSharedHandle`, and opened once on `ID3D12Device::OpenSharedHandle`.
    * Synchronized via `ID3D12Device::CreateFence(..., D3D12_FENCE_FLAG_SHARED)` → `ID3D11Device5::OpenSharedFence`, bracketing execution with `ID3D11DeviceContext4::Signal` → D3D12 `Wait` → `xessD3D12Execute` → D3D12 `Signal` → `ID3D11DeviceContext4::Wait`.
 4. **Native D3D11 Path (`libxess_dx11.dll`, `xess_d3d11.h`):**
    * On Intel Arc (`xessD3D11CreateContext(d3d11Device, &hContext)`), XeSS requires **no** external descriptor heaps, **no** `BuildPipelines` step, and **no** D3D12 fence synchronization — only `xessD3D11Init(hContext, &d3d11InitParams)` and `xessD3D11Execute(hContext, &d3d11ExecParams)`.
+   * Per *Intel XeSS-SR Developer Guide 2.0* (*Resource Formats*), native D3D11 (`libxess_dx11.dll`) directly accepts `DXGI_FORMAT_R32G8X24_TYPELESS` / `DXGI_FORMAT_D32_FLOAT_S8X24_UINT` (`DSV #2`), interpreting it internally as `R32_FLOAT_X8X24_TYPELESS` with **no** intermediate `R32_FLOAT` depth copy needed on Intel Arc!
 
 ---
 
 ## 3. Exact SDK Structures & EDPE Convention Mapping (`SDK-DOCUMENTED`)
 
-### 3.1 Quality Settings & Scaling Ratios (`inc/xess/xess.h`)
-| XeSS Enum | Value | Linear Scale Factor | Render % (at 2560×1440) | EDPE `UpscaleMode` Mapping ([`src/temporal_inputs.h`](../src/temporal_inputs.h#L21-L28)) |
+### 3.1 Quality Settings, Legacy Scale Alignment & `<SSAAMultiplier>` (`inc/xess/xess.h`)
+| XeSS Enum | Value | Default XeSS 1.3+/2.0 Scale | With `xessForceLegacyScaleFactors(true)` | EDPE `UpscaleMode` ([`src/temporal_inputs.h`](../src/temporal_inputs.h#L13-L28)) & `<SSAAMultiplier>` ([`src/config.h`](../src/config.h#L206-L275)) |
 |:---|---:|---:|---:|:---|
-| `XESS_QUALITY_SETTING_ULTRA_PERFORMANCE` | `100` | `3.0x` | 33.3% (854×480) | `UpscaleMode::UltraPerformance` |
-| `XESS_QUALITY_SETTING_PERFORMANCE` | `101` | `2.3x` | 43.5% (1114×626) | `UpscaleMode::Performance` *(note scale diff vs 2.0x)* |
-| `XESS_QUALITY_SETTING_BALANCED` | `102` | `2.0x` | 50.0% (1280×720) | `UpscaleMode::Balanced` |
-| `XESS_QUALITY_SETTING_QUALITY` | `103` | `1.7x` | 58.8% (1506×847) | `UpscaleMode::Quality` |
-| `XESS_QUALITY_SETTING_ULTRA_QUALITY` | `104` | `1.5x` | 66.7% (1706×960) | Optional sub-tier / map near `Quality` |
-| `XESS_QUALITY_SETTING_ULTRA_QUALITY_PLUS` | `105` | `1.3x` | 76.9% (1970×1108) | Optional sub-tier |
-| `XESS_QUALITY_SETTING_AA` | `106` | `1.0x` | 100% (2560×1440) | `UpscaleMode::NativeAA` |
+| `XESS_QUALITY_SETTING_ULTRA_PERFORMANCE` | `100` | `3.0x` | **`3.0x`** | `UpscaleMode::UltraPerformance` (`0.333333`) |
+| `XESS_QUALITY_SETTING_PERFORMANCE` | `101` | `2.3x` | **`2.0x`** | `UpscaleMode::Performance` (`0.500000`) |
+| `XESS_QUALITY_SETTING_BALANCED` | `102` | `2.0x` | **`1.7x`** | `UpscaleMode::Balanced` (`0.580000`) |
+| `XESS_QUALITY_SETTING_QUALITY` | `103` | `1.7x` | **`1.5x`** | `UpscaleMode::Quality` (`0.666667`) |
+| `XESS_QUALITY_SETTING_ULTRA_QUALITY` | `104` | `1.5x` | `1.3x` | *(Optional fallback mapping if legacy flags omitted)* |
+| `XESS_QUALITY_SETTING_ULTRA_QUALITY_PLUS` | `105` | `1.3x` | `1.3x` | *(Unused unless sub-tier exposed)* |
+| `XESS_QUALITY_SETTING_AA` | `106` | `1.0x` | **`1.0x`** | `UpscaleMode::NativeAA` (`1.000000`) |
 
-> **`SDK-DOCUMENTED` Query Rule:** Always call `xessGetInputResolution(hContext, &outputRes, qualitySetting, &inputRes)` and `xessGetOptimalInputResolution(...)` rather than hardcoding factors, and reconcile with Cobra's `<SSAAMultiplier>` ([`src/config.h`](../src/config.h#L206-L275)). Because XeSS accepts arbitrary input resolutions within `minInputResolution`..`outputResolution`, EDPE's existing `<SSAAMultiplier>` factors (`0.666667`, `0.58`, `0.50`, `0.333333`) work directly as valid XeSS inputs.
+> **`SDK-DOCUMENTED` Preset Scale Conflict Fix (`xessForceLegacyScaleFactors`):**
+> Starting with XeSS 1.3+, Intel shifted preset scaling upward (`Quality=1.7x`, `Balanced=2.0x`, `Performance=2.3x`), which conflicts with EDPE's [`getTargetSsaaMultiplier`](../src/config.h#L206-L215) (`1.5x / 1.7x / 2.0x / 3.0x`). Calling **`xessForceLegacyScaleFactors(xessContext_, true)`** immediately after `xessD3D11CreateContext` / `xessD3D12CreateContext` restores exact `1.5x / 1.7x / 2.0x / 3.0x` alignment with Cobra's `<SSAAMultiplier>` and guarantees `xessGetOptimalInputResolution()` matches Cobra's actual render buffer dimensions!
+> ```cpp
+> xess_result_t status = xessD3D12CreateContext(d3d12Device, &xessContext_);
+> if (status == XESS_RESULT_SUCCESS) {
+>     // Align XeSS 1.3+/2.0 presets with EDPE's <SSAAMultiplier> grid (1.5x / 1.7x / 2.0x / 3.0x):
+>     xessForceLegacyScaleFactors(xessContext_, true);
+> }
+> ```
 
 ### 3.2 Critical Halton Jitter Phase-Count Discovery (`SDK-DOCUMENTED` vs. EDPE `src/config.h`)
 The official Intel XeSS Programming Guide mandates:
 $$\text{jitterPhaseCount} \ge \left\lceil 8 \times \left(\frac{\text{outputWidth}}{\text{renderWidth}}\right)^2 \right\rceil$$
 
-| Mode / Scale Factor | Min Halton Phases Required by XeSS | EDPE `v0.7.0` Default ([`src/config.h`](../src/config.h#L298)) |
+| Mode / Scale Factor (with Legacy Grid) | Min Halton Phases Required by XeSS | EDPE `v0.7.0` Default `jitterPhaseCount` ([`src/config.h#L298`](../src/config.h#L298)) |
 |:---|:---:|:---:|
 | `NativeAA` (`1.0x`) | **8** | `32` (OK) |
 | `Quality` (`1.5x`) | **18** | `32` (OK) |
-| `Balanced` (`1.7x`–`2.0x`) | **24–32** | `32` (Borderline at 2.0x) |
-| `Performance` (`2.0x`–`2.3x`) | **32–43** | `32` (**Undersampled at 2.3x!**) |
-| `Ultra Performance` (`3.0x`) | **72** | `32` (**Severely undersampled — causes shimmering/Moire!**) |
+| `Balanced` (`1.7x`) | **24** | `32` (OK) |
+| `Performance` (`2.0x`; `2.3x` if non-legacy) | **32** (`43` at `2.3x`) | `32` (OK with `xessForceLegacyScaleFactors(true)`) |
+| `Ultra Performance` (`3.0x`) | **72** | `32` (**Undersampled — causes shimmering/Moire!**) |
 
-> **Required EDPE Fix:** Add automatic Halton period sizing in `TemporalInputBuilder` / `Config` whenever `jitterPhaseCount` is in Auto mode (`0` or below the mode minimum): `std::max(32u, static_cast<unsigned>(std::ceil(8.0f * scale * scale)))` (e.g., `72` for Ultra Performance). Verify Halton `(2,3)` period clamping does not disrupt `NvidiaUpscalerBackend` or `AmdUpscalerBackend` (both DLSS and FSR already support $\ge 32$ / dynamic Halton lengths).
+> **Required EDPE Fix:** Add automatic Halton period sizing in `TemporalInputBuilder` / `Config` whenever `jitterPhaseCount` is in Auto mode (`0` or below the mode minimum): `std::max(32u, static_cast<unsigned>(std::ceil(8.0f * scale * scale)))` (yielding `72` for Ultra Performance `3.0x`, while keeping `Quality/Balanced/Performance` at `32`). Verify Halton `(2,3)` period extension does not disrupt `NvidiaUpscalerBackend` or `AmdUpscalerBackend`.
 
 ### 3.3 `translateToIntel()` Convention Mapping (`TemporalFrameInputs` $\rightarrow$ `xess.h`)
 All flags verified directly in `inc/xess/xess.h` (`_xess_init_flags_t`):
 
 | `TemporalFrameInputs` Property | XeSS Parameter / Init Flag | Exact Value & Rationale |
 |:---|:---|:---|
-| `depthInverted = true` | `XESS_INIT_FLAG_INVERTED_DEPTH` | **Enabled.** Cobra `DSV #2` is reversed-Z ($B=0.025$, far clear `0.0`). |
+| `depthInverted = true` | `XESS_INIT_FLAG_INVERTED_DEPTH` | **Enabled.** Cobra `DSV #2` is reversed-Z ($B=0.025$, far clear `0.0`). On `libxess_dx11.dll`, pass `DSV #2` (`R32G8X24_TYPELESS`) natively; on `libxess.dll` (D3D12 bridge), pass `R32_FLOAT` copy. |
 | `motionIsLowRes = true` | `XESS_INIT_FLAG_HIGH_RES_MV` | **Unset (`0`).** EDPE `MotionPass` emits render-resolution MVs. |
 | `motionVectors` (`R16G16_FLOAT`) | `XESS_INIT_FLAG_USE_NDC_VELOCITY` | **Unset (`0`).** EDPE writes **render-pixel displacement**, not NDC velocity. |
 | MV units & sign (`current -> prev`) | `xessSetVelocityScale(hContext, x, y)` *(init)* or `inputWidth / outputWidth` check | Per `xess.h`, pixel-space velocities (`HIGH_RES_MV` unset) expect **current-to-previous pixel displacement** (`+x` right, `+y` down in texture UV space). Must be validated deterministically via `motion_gpu_test` & cockpit yaw/pitch test (`AGENTS.md`), configurable via `motionScaleX/Y`. |
@@ -86,16 +95,16 @@ All flags verified directly in `inc/xess/xess.h` (`_xess_init_flags_t`):
 | `exposure` (`nullptr` initially) | `XESS_INIT_FLAG_EXPOSURE_SCALE_TEXTURE` | Optional if `ENABLE_AUTOEXPOSURE` is used. |
 | Reactive / Responsive Mask (`R8_UNORM`) | `XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK` + `pResponsivePixelMaskTexture` | Ideal optional hook for emissive `RTV3` thrusters/lasers/canopy sparks (`docs/render-pipeline-observations.md` lines 107–110), **excluding** native HUD (already separated by `UiLayer`). |
 | `inputs.reset` | `execParams.resetHistory = inputs.reset ? 1 : 0` | Triggered on `CameraDelta` jump/hyperjump/station cut. |
-| Texture Mip LOD Bias (`src/d3d11_proxy.cpp`) | Negative bias on `PSSetSamplers` / `CreateSamplerState` | XeSS programming guide uses standard $\text{mipBias} = \log_2(\text{renderWidth} / \text{outputWidth}) - 1.0$ (or matching EDPE's existing DLSS/FSR sampler LOD bias). |
+| Texture Mip LOD Bias (`src/d3d11_proxy.cpp`) | Negative bias on `PSSetSamplers` / `CreateSamplerState` | XeSS programming guide uses standard $\text{mipBias} = \log_2(\text{renderWidth} / \text{outputWidth}) - 1.0$ (matching EDPE's existing `observedCreateSamplerState` bias in `src/d3d11_proxy.cpp#L99-L106`). |
 
 ---
 
 ## 4. Integration Architecture in EDPE (`EXPERIMENTAL`)
 
 ### 4.1 Extension of `src/temporal_inputs.h` and `src/upscaler_backend.h`
-1. Add `IntelXess = 4` to `enum class UpscalerBackend` (`src/temporal_inputs.h`).
+1. Add `IntelXess = 4` to `enum class UpscalerBackend` (`src/temporal_inputs.h#L13-L18`) and align `Config::upscalerBackend` (`src/config.h#L285`).
 2. Add `IntelXessInputParams` and `translateToIntel(const TemporalFrameInputs&, IntelXessInputParams*, const wchar_t**)` matching [`translateToNvidia`](../src/temporal_inputs.h#L216-L243) and [`translateToAmd`](../src/temporal_inputs.h#L259-L283).
-3. Update `UpscalerManager::kBackendCount` in [`src/upscaler_backend.h`](../src/upscaler_backend.h#L261) from `4` to `5` (or `6` if Phase 18 adds `NvidiaDlssRR`) and register `IntelUpscalerBackend intelBackend_;`.
+3. Update `UpscalerManager::kBackendCount` ([`src/upscaler_backend.h#L261`](../src/upscaler_backend.h#L261)) from `4` to `5` (or `6` if Phase 18 adds `NvidiaDlssRR`) and register `IntelUpscalerBackend intelBackend_;` alongside the existing backend members ([`src/upscaler_backend.h#L242-L246`](../src/upscaler_backend.h#L242-L246)).
 4. Implement `IntelUpscalerBackend` via PIMPL (`struct Impl; std::unique_ptr<Impl> impl_;`, identical to `AmdUpscalerBackend`) so XeSS headers never leak into non-XeSS translation units:
 
 ```cpp

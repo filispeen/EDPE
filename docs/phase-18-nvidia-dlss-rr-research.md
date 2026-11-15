@@ -37,9 +37,9 @@ Inspecting `NVSDK_NGX_D3D11_DLSSD_Eval_Params` (`nvsdk_ngx_helpers_dlssd_d3d.h`)
 | `pInMotionVectors` | **Required** (render-pixel displacement) | EDPE `MotionPass` (`R16G16_FLOAT`) | **Available & Verified.** |
 | **`pInDiffuseAlbedo`** | **Required** (surface diffuse reflectance `[0,1]`) | **`MRT RTV0`** (`DXGI_FORMAT_R10G10B10A2_UNORM`) | **Available.** Need shader check for packed `.a` / metalness vs raw diffuse albedo (DLSS-RR expects diffuse albedo separable from metallic `F0` specular albedo!). |
 | **`pInSpecularAlbedo`** | **Required** (Fresnel-modulated specular reflectance, e.g., `EnvBRDFApprox2`) | **Not stored directly in Cobra G-Buffer!** | **GAP:** Requires an extra EDPE compute pass synthesizing `EnvBRDFApprox2(F0, roughness, NoV)` from `RTV0` + `RTV2` + `RTV1` + `DSV #2` (matching `NVIDIA-RTX/Streamline` `ProgrammingGuideDLSS_RR.md` §3.4). |
-| **`pInNormals`** | **Required** (world or view normals, explicit rough/smooth encoding flags) | **`MRT RTV1`** (`DXGI_FORMAT_R8G8B8A8_UNORM`, world normals) | **Partially Available.** Must verify exact packing (likely `N * 0.5 + 0.5` or octahedral/signed encoding) in Cobra's deferred geometry pixel shaders via DXBC inspection. |
-| **`pInRoughness`** | **Required** (linear roughness `[0,1]` — **perceptual vs linear matters!**) | **`MRT RTV2`** (`DXGI_FORMAT_R8G8B8A8_UNORM`: roughness, metalness) | **Partially Available.** Must inspect which channel (`R` vs `G` vs `A`) stores roughness and whether it is $\alpha = r^2$ or $r$. |
-| **`pInWorldToViewMatrix` & `pInViewToClipMatrix`** | **Required** for DLSS-RR (`NVSDK_NGX_D3D11_DLSSD_Eval_Params`) | Parsed every frame from 5376B `CB0` (`src/elite_camera.h`)! | **Available & Verified.** Convert EDPE row-major/right-handed camera matrices into exact column/row convention checked by NGX `DLSSD`. |
+| **`pInNormals`** | **Required** (unpacked world or view normals in `[-1..1]`, explicit rough/smooth flags) | **`MRT RTV1`** (`DXGI_FORMAT_R8G8B8A8_UNORM`, packed world normals) | **Requires Compute Unpacking.** Cannot pass raw `RTV1` blindly (`DLSSD` expects unit `[-1..1]` vectors / `NormalRoughness`); must extract exact Cobra deferred-lighting unpacking formula (biased `[0,1]` vs octahedral + `.a` material flags) into `DlssRrGBufferPrepCs`. |
+| **`pInRoughness`** | **Required** (linear roughness `[0,1]` — **perceptual vs linear matters!**) | **`MRT RTV2`** (`DXGI_FORMAT_R8G8B8A8_UNORM`: roughness, metalness) | **Partially Available.** Inspect which channel (`R`/`G`/`A`) holds roughness ($\alpha = r^2$ vs $r$) and unpack alongside `RTV1` in `DlssRrGBufferPrepCs`. |
+| **`pInWorldToViewMatrix` & `pInViewToClipMatrix`** | **Required** for DLSS-RR (`NVSDK_NGX_D3D11_DLSSD_Eval_Params`) | Parsed every frame from **5376-byte (1344-float)** `CB0` ([`src/elite_camera.h#L10-L69`](../src/elite_camera.h#L10-L69), camera rows `932..943`, projection block `1080..1095`) | **Available & Verified.** Convert EDPE row-major/right-handed camera matrices into exact column/row convention checked by NGX `DLSSD`. |
 | `pInExposureTexture` / `PreExposure` | Strongly recommended (`IsHDR`) | Not currently extracted | Set `AutoExposure` flag or compute luminance reduction if HDR range varies wildly near stars/white dwarfs. |
 | `pInSpecularHitDistance` / `pInSpecularMotionVectors` | **Optional** (dramatically improves moving glossy reflections) | **Zero** (`Cobra` is rasterized deferred + planar/cube probes, **NO DXR rays**) | **FUNDAMENTAL LIMITATION (see §4).** |
 | `pInBiasCurrentColorMask` / `pInAlpha` | Optional (reactive/transparent glass) | Canopy glass hashes + `RTV3` emissive already isolated | Available for canopy glass / HUD-free masking. |
@@ -69,11 +69,14 @@ Before committing to full user-facing exposure (`NvidiaDlssRR` in `UpscalerBacke
 ### Step 18.1: G-Buffer Channel Verification (Read-Only DXBC + Snapshot Analysis)
 * Using EDPE's existing shader probe (`dxbc_hash.cpp`, RenderDoc frame capture):
   1. Confirm exact channel assignment in **`RTV0` (`R10G10B10A2_UNORM`)**, **`RTV1` (`R8G8B8A8_UNORM`)**, and **`RTV2` (`R8G8B8A8_UNORM`)** at Pass 10 exit (`STATUS.md` lines 24–43).
-  2. Determine world-normal encoding (range `[0,1]` vs signed/octahedral; `DLSSD` expects unit normals or specific `NVSDK_NGX_DLSS_Denoise_Mode_DLUnified` / `RoughnessMode_Packed`).
+  2. Inspect Cobra's **deferred-lighting pixel shaders** (`DXBC` disassembly) to extract the **exact normal-unpacking math for `MRT RTV1`** (verify biased `[0,1] -> [-1,1]` vs octahedral encoding vs `.a` material bits) and roughness linearization ($\alpha$ vs $r$) in `MRT RTV2`.
   3. Capture `RTV0..2` + `s_clean_hdr_scene_texture` into BMP/EXR snapshots (`F8` Dev mode) to verify no HUD/canopy glass contamination exists inside `RTV1`/`RTV2`.
 
 ### Step 18.2: Isolated `nvngx_dlssd.dll` Probe in `tools/ngx_probe/` & `NvidiaDlssRRBackend` (`DEV=1` Gated)
-* Add a small D3D11 compute shader creating `R16G16B16A16_FLOAT` Diffuse Albedo, `SpecAlbedo` (`EnvBRDFApprox2`), `NormalRoughness`, and matrices from `CB0`.
+* Add a single unified pre-pass D3D11 compute shader **`DlssRrGBufferPrepCs`** outputting:
+  * Unpacked world/view-space unit normals in `[-1..1]` (`R16G16B16A16_FLOAT` `pInNormals` / packed `NormalRoughness`),
+  * `R16G16B16A16_FLOAT` Diffuse Albedo (`pInDiffuseAlbedo`) & `EnvBRDFApprox2` Specular Albedo (`pInSpecularAlbedo`),
+  * Extracted linear Roughness (`pInRoughness`) and camera matrices converted from the 5376-byte (1344-float) `CB0`.
 * Compare **image quality + GPU frametime** in EDPE's automated comparison benchmark (`STATUS.md` line 49) across three scenes:
   * **Coriolis Station exterior** (dense metallic grates / specular reflections)
   * **Station hangar interior** (SSR floor + emissive lights)

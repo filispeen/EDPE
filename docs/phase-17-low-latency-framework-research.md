@@ -50,14 +50,15 @@ Official repository: **`GPUOpen-LibrariesAndSDKs/AntiLag2-SDK`** (**MIT License*
   * `AMD::AntiLag2DX11::DeInitialize(&ctx)` on teardown.
 * **DX12 API (`ffx_antilag2_dx12.h` — `APIData_v2` for Phase 14 FSR FG):**
   * `AMD::AntiLag2DX12::Initialize(&ctx, ID3D12Device* device)`
-  * `AMD::AntiLag2DX12::Update(&ctx, bool enabled, unsigned int maxFPS)`
+  * `AMD::AntiLag2DX12::Update(&ctx, bool enabled, unsigned int maxFPS)`:
+    > **`SDK-DOCUMENTED` Known Limitation ([`AntiLag2-SDK#3`](https://github.com/GPUOpen-LibrariesAndSDKs/AntiLag2-SDK/issues/3)):** When AMD FSR Frame Generation is active, the driver **ignores the `maxFPS` limiter** inside `AntiLag2DX12::Update`. Do **not** rely on Anti-Lag 2's `maxFPS` as a frame-rate cap while FSR FG runs — use external/swapchain pacing instead.
   * `AMD::AntiLag2DX12::MarkEndOfFrameRendering(&ctx)`: marks end of GPU submission before Present/FG.
-  * `AMD::AntiLag2DX12::SetFrameGenFrameType(&ctx, bool bInterpolatedFrame)`: **critical FG invariant** — tells the AMD driver inside `presentCallback` / interpolation path whether the upcoming Present is a real simulated frame (`false`) or an interpolated frame (`true`) so Anti-Lag 2 only aligns CPU pace against real frames!
+  * `AMD::AntiLag2DX12::SetFrameGenFrameType(&ctx, bool bInterpolatedFrame)`: **critical FSR 2.4 ownership caveat** — starting with FSR 3.1.1+ / FSR SDK 2.4.0, FidelityFX's `FrameInterpolationSwapChain` **automatically calls `SetFrameGenFrameType` internally** once the Anti-Lag 2 context is associated with the swapchain via DXGI private data. Do **not** call `SetFrameGenFrameType` manually alongside FSR 2.4!
 * *Fallback for pre-RDNA / older Adrenalin drivers:* If `amdxc64.dll` rejects `IAmdExtAntiLagApi` (`featureID` unsupported), Anti-Lag 2 safely returns an error code and driver-level Anti-Lag (1) handles pacing; EDPE reports status clearly in ImGui (`"AMD Anti-Lag 2 (Driver Fallback)"` or `"Unavailable"`).
 
 ### 2.3 Intel XeLL & Cross-Vendor Bridge Insights (`REFERENCE-CODE`)
 * Inspecting **`optiscaler/fakenvapi`** (`ll_antilag2.cpp`, `ll_xell.cpp`, `low_latency_d3d.cpp`, **MIT License**) provides two verified architectural lessons for EDPE:
-  1. **Intel XeLL (`libxell.dll`):** Intel Arc GPUs expose `xellD3D12CreateContext`, `xellSleep`, `xellAddMarkerData`, and `xellGetFramesReports` (requires D3D12 device from Phase 13A; optional third backend `LowLatencyBackend::IntelXeLL`).
+  1. **Intel XeLL (`libxell.dll` — D3D12 Only, Phase 17B):** Per Intel's official *Xe Low Latency (XeLL) Developer Guide* (`xell_d3d12.h`), `libxell.dll` exposes `xellD3D12CreateContext(ID3D12Device*, xell_context_handle_t*)`, `xellSleep`, `xellAddMarkerData`, and `xellGetFramesReports`. **There is no `ID3D11Device` entry point.** Consequently, `LowLatencyMode::IntelXeLL` is **strictly gated to Phase 17B** (when an active `ID3D12Device` exists via Phase 13A/13B) and must remain hidden/disabled when EDPE operates in pure D3D11 mode (`Phase 17A`).
   2. **`CallSpot` Injection Ordering:** Real games sometimes fail to invoke `Sleep` before OS/game input polling, leaving input sampled *before* the sleep stall (adding up to 16 ms unnecessary latency). `fakenvapi` distinguishes `SleepCall` (ideal: immediately *before* game input / simulation) vs `SimulationStart` fallback (when game doesn't expose an explicit sleep boundary).
 
 ---
@@ -99,8 +100,8 @@ sequenceDiagram
 3. **`RenderSubmitStart` / `RenderSubmitEnd` ([`src/context_census.cpp`](../src/context_census.cpp)):**
    * `RenderSubmitStart`: at the first primary 3D scene `OMSetRenderTargets` / `CB0 Unmap` latch (`s_camera_now`) per frame.
    * `RenderSubmitEnd` + `PresentStart`: immediately inside `Hooked_Present` right before submitting the upscaler / composite / original `Present` (avoiding counting the sleep stall itself inside GPU render latency!).
-4. **`AntiLag2DX12::MarkEndOfFrameRendering` & `SetFrameGenFrameType`:**
-   * When Phase 14 (FSR FG) runs on the D3D12 proxy queue, forward real vs. interpolated flag (`SetFrameGenFrameType(isInterpolated)`) and `MarkEndOfFrameRendering` per `ffx_antilag2_dx12.h`.
+4. **`AntiLag2DX12::MarkEndOfFrameRendering` & Swapchain Integration:**
+   * When Phase 14 (FSR FG) runs on the D3D12 proxy queue, call `MarkEndOfFrameRendering` right before FG dispatch and attach the Anti-Lag 2 context to the FSR swapchain via DXGI private data so FSR SDK 2.4 handles `SetFrameGenFrameType` automatically.
 
 ---
 
@@ -112,10 +113,10 @@ Per `AGENTS.md`, Cobra hooks never call `NvAPI_*`, `slReflex*`, or `AMD::AntiLag
 // Proposed src/latency_backend.h
 enum class LowLatencyMode : uint32_t {
     Off = 0,
-    NvidiaReflexOn = 1,
-    NvidiaReflexBoost = 2,
-    AmdAntiLag2 = 3,
-    IntelXeLL = 4          // Optional Phase 17B / D3D12
+    NvidiaReflexOn = 1,    // Phase 17A (NVAPI D3D11) / Phase 17B (sl.reflex)
+    NvidiaReflexBoost = 2, // Phase 17A (NVAPI D3D11) / Phase 17B (sl.reflex)
+    AmdAntiLag2 = 3,       // Phase 17A (DX11) / Phase 17B (DX12)
+    IntelXeLL = 4          // Strictly Phase 17B (requires active ID3D12Device from Phase 13; unavailable in pure D3D11)
 };
 
 enum class LatencyMarker : uint32_t {
@@ -158,8 +159,9 @@ public:
 
 ### Key Guardrails
 1. **Mutually Exclusive Active Pacing:** Only **one** latency sleep loop may run per frame (`Streamline sl.reflex` overrides standalone `NvAPI Reflex` when Phase 15 DLSS-G is active; `ffx_antilag2_dx12` supersedes `ffx_antilag2_dx11` when Phase 14 FSR FG wraps the swapchain).
-2. **FPS Cap Interaction:** Setting an in-app frame limit via Reflex/Anti-Lag 2 (`minimumIntervalUs` / `maxFPS`) uses low-overhead driver/sleep pacing **instead of** double-stalling on driver V-Sync backpressure. Expose optional `MaxFPS = 0` (`edpe.ini [Latency]`) and greyed-out reason tooltips in Dear ImGui (`F5`).
-3. **Standalone Latency Telemetry in `F7` Perf HUD:** Even without an LDAT hardware mouse analyzer, `NvAPI_D3D_GetLatency` / `slReflexGetState` breakdown (`Sim` + `Queue` + `GPU`) immediately proves whether Reflex eliminated driver render-queue buildup in Elite stations!
+2. **FPS Cap Interaction & `AntiLag2-SDK#3`:** Setting an in-app frame limit via Reflex (`minimumIntervalUs`) or standalone Anti-Lag 2 DX11 (`maxFPS`) avoids driver V-Sync backpressure. However, when Phase 14 FSR FG is active, `AMD::AntiLag2DX12::Update` ignores `maxFPS` ([`AntiLag2-SDK#3`](https://github.com/GPUOpen-LibrariesAndSDKs/AntiLag2-SDK/issues/3)); fall back to external/swapchain pacing cleanly and expose `MaxFPS = 0` (`edpe.ini [Latency]`) with accurate status/tooltips in Dear ImGui (`F5`).
+3. **Pure D3D11 Capability Gating:** In standalone D3D11 mode (`Phase 17A`, `d3d12Dev == nullptr`), `IntelXeLL` reports `isAvailable() == false` (`unavailableReason() = L"Intel XeLL requires D3D12 interop (Phase 13/17B)"`) and stays hidden/greyed out in Dear ImGui.
+4. **Standalone Latency Telemetry in `F7` Perf HUD:** Even without an LDAT hardware mouse analyzer, `NvAPI_D3D_GetLatency` / `slReflexGetState` breakdown (`Sim` + `Queue` + `GPU`) immediately proves whether Reflex eliminated driver render-queue buildup in Elite stations!
 
 ---
 

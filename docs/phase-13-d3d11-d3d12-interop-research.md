@@ -25,7 +25,7 @@ Elite Dangerous (Cobra engine) is a native **Direct3D 11** application (`VERIFIE
 Three real-world interoperability architectures exist in the Windows graphics ecosystem.
 
 ### Option A1 — Native D3D11 + Secondary D3D12 Compute Bridge (Shared NT Handles + Fences)
-Used in production for Elite Dangerous by **`Siegfried-Origin/EDAA`** (`addon/src/xess.cpp`, MIT license, `REFERENCE-CODE`) and by zero-copy GPU capture/compositor bridges.
+Used in production for Elite Dangerous by **`Siegfried-Origin/EDAA`** ([`addon/src/xess.cpp`](https://github.com/Siegfried-Origin/EDAA/blob/master/addon/src/xess.cpp), MIT license, `REFERENCE-CODE`) and by zero-copy GPU capture/compositor bridges.
 
 * **How it works:**
   1. Elite Dangerous creates and runs entirely on its native `ID3D11Device` and `IDXGISwapChain`.
@@ -69,7 +69,7 @@ Used in production for adding D3D12 Frame Generation to D3D11 games by **`optisc
 
 ### 3.1 Shared Textures vs Depth Format Constraint
 Cobra's scene depth `DSV #2` is `DXGI_FORMAT_R32G8X24_TYPELESS` (`D32_FLOAT_S8X24_UINT`).
-* **`SDK-DOCUMENTED` Pitfall:** `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` is **NOT supported** by D3D11/D3D12 on planar depth-stencil formats (`R32G8X24_TYPELESS` / `D32_FLOAT_S8X24_UINT`) on many drivers, and upscalers (XeSS, DLSS-G, FSR FG) do not need stencil bits anyway.
+* **`SDK-DOCUMENTED` WDDM Interop Pitfall:** `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` is **NOT supported** across WDDM D3D11↔D3D12 shared heaps on planar depth-stencil formats (`R32G8X24_TYPELESS` / `D32_FLOAT_S8X24_UINT`), and upscalers (XeSS, DLSS-G, FSR FG) do not need stencil bits anyway. *(Note: On Intel Arc's **native D3D11** path `libxess_dx11.dll`, `R32G8X24_TYPELESS` IS supported directly without copying; the `R32_FLOAT` copy is strictly for the D3D11→D3D12 shared bridge.)*
 * **Solution (used in both `EDAA` and `OptiScaler`):** Allocate the shared depth buffer as **`DXGI_FORMAT_R32_FLOAT`** with `D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET` (or `UNORDERED_ACCESS`) and run a tiny fullscreen/compute copy pass extracting `.r` from `DSV #2` SRV into the shared `R32_FLOAT` texture before signaling `fence11`. (Alternatively, piggyback this 1-line write onto EDPE's existing `MotionPass` compute shader to avoid an extra full-screen pass!)
 
 ### 3.2 `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` vs `KEYEDMUTEX`
@@ -106,6 +106,10 @@ sequenceDiagram
 
 Notice how clean the `EDAA` (`addon/src/xess.cpp`) pattern adapts to EDPE's COM/RAII style (`AGENTS.md`), matching the exact adapter LUID already captured in `src/d3d11_proxy.cpp`:
 
+> **`SDK-DOCUMENTED` State & Handle Invariants:**
+> 1. Shared cross-API D3D12 textures (`D3D12_HEAP_FLAG_SHARED`) enter and leave D3D12 command lists in **`D3D12_RESOURCE_STATE_COMMON`**. Because backends such as Intel XeSS do **not** emit automatic state transitions (`XeSS-SR Developer Guide 2.0`), EDPE must explicitly call `transitionResource(...)` to transition inputs (`COMMON` → `NON_PIXEL_SHADER_RESOURCE`) and outputs (`COMMON` → `UNORDERED_ACCESS`), then transition back to `D3D12_RESOURCE_STATE_COMMON` before `queue_->Signal(...)`.
+> 2. Both `CreateSharedHandle` calls (fence & textures) return kernel NT `HANDLE`s that must be closed immediately after `OpenSharedHandle` / `OpenSharedFence` via `CloseHandle` on **every** code path (including early failure returns) to avoid handle leaks during `ResizeBuffers`.
+
 ```cpp
 // Proposed isolated module: src/d3d12_bridge.h (Phase 13A)
 #pragma once
@@ -136,6 +140,22 @@ struct SharedBridgeTexture {
 class D3D11D3D12Bridge {
 public:
     static constexpr uint32_t kAllocatorCount = 4;
+
+    static void transitionResource(
+        ID3D12GraphicsCommandList* cmdList,
+        ID3D12Resource* resource,
+        D3D12_RESOURCE_STATES before,
+        D3D12_RESOURCE_STATES after) {
+        if (!cmdList || !resource || before == after) return;
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        barrier.Transition.pResource = resource;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+        cmdList->ResourceBarrier(1, &barrier);
+    }
 
     bool initialize(ID3D11Device* d3d11Device) {
         if (!d3d11Device) return false;
@@ -180,12 +200,14 @@ public:
         if (FAILED(device12_->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
                                           IID_PPV_ARGS(&fence12_))) ||
             FAILED(device12_->CreateSharedHandle(fence12_.Get(), nullptr,
-                                                 GENERIC_ALL, nullptr, &sharedFenceHandle))) {
+                                                 GENERIC_ALL, nullptr, &sharedFenceHandle)) ||
+            !sharedFenceHandle) {
+            if (sharedFenceHandle) CloseHandle(sharedFenceHandle);
             return false;
         }
         const HRESULT openHr = device11_5_->OpenSharedFence(
             sharedFenceHandle, IID_PPV_ARGS(&fence11_));
-        CloseHandle(sharedFenceHandle);
+        CloseHandle(sharedFenceHandle); // Always close immediately before error checks
         if (FAILED(openHr)) return false;
 
         fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -215,12 +237,14 @@ public:
         if (FAILED(out.d3d11.As(&res1)) ||
             FAILED(res1->CreateSharedHandle(
                 nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-                nullptr, &ntHandle))) {
+                nullptr, &ntHandle)) ||
+            !ntHandle) {
+            if (ntHandle) CloseHandle(ntHandle);
             out.reset();
             return false;
         }
         const HRESULT hr = device12_->OpenSharedHandle(ntHandle, IID_PPV_ARGS(&out.d3d12));
-        CloseHandle(ntHandle);
+        CloseHandle(ntHandle); // Always close NT handle immediately regardless of hr
         if (FAILED(hr)) {
             out.reset();
             return false;

@@ -42,8 +42,8 @@ EDPE already satisfies the foundational prerequisites mandated by `AGENTS.md` be
    * **Strategic Implication:** Unlike middleware injectors such as `OptiScaler` that must heuristically guess where the HUD was drawn (`HUDFix`), EDPE **already owns a true HUD-less reconstructed world surface and separated UI overlay layers**, directly satisfying the hardest prerequisite for both AMD FSR FG (Phase 14) and NVIDIA DLSS-G (Phase 15).
 3. **`VERIFIED` Multi-Backend Upscaler Boundary (`src/upscaler_backend.h`):**
    * `IUpscalerBackend` isolates NVIDIA NGX (`NvidiaUpscalerBackend`), AMD FSR 3.1.2 (`AmdUpscalerBackend`), and Native TAA (`TaaUpscalerBackend`) behind `UpscalerManager`, with fail-open fallback and async timestamp queries.
-4. **`VERIFIED` Hooking & Input Safety (`src/dxgi_proxy.cpp`, `src/d3d11_proxy.cpp`, `src/dxgi_observer.cpp`, `src/input_hook.cpp`):**
-   * EDPE runs as `dxgi.dll`, bypasses redirected `d3d11.dll` (e.g., EDHM/3Dmigoto) via `chooseSystemD3D11`, and isolates `WndProc` and `DirectInput8` when the Dear ImGui menu (`F5`) is active.
+4. **`VERIFIED` Hooking & Input Safety (`src/dxgi_proxy.cpp`, `src/d3d11_proxy.cpp`, `src/vtable_hook.h`, `src/system_dll.h`, `src/dxgi_observer.cpp`, `src/input_hook.cpp`):**
+   * EDPE runs as `dxgi.dll`, bypasses redirected `d3d11.dll` (e.g., EDHM/3Dmigoto) via `LoadSystemDll` (`src/system_dll.h#L6-L13`), `chooseSystemD3D11` (`src/vtable_hook.h#L45`), and `resolveRealSystemD3D11` (`src/d3d11_proxy.cpp#L129-L145`), and isolates `WndProc` and `DirectInput8` when the Dear ImGui menu (`F5`) is active.
 
 ---
 
@@ -51,18 +51,20 @@ EDPE already satisfies the foundational prerequisites mandated by `AGENTS.md` be
 
 ```mermaid
 flowchart TD
-    V07["EDPE v0.7.0 Baseline (D3D11 SR + UiLayer + dxgi.dll)"] --> P17A["Phase 17A: Native D3D11 Low Latency (NVAPI Reflex & Anti-Lag 2 DX11)"]
+    V07["EDPE v0.7.0 Baseline (D3D11 SR + UiLayer + dxgi.dll)"] --> P17A["Phase 17A: Standalone D3D11 Low Latency (NVAPI Reflex & Anti-Lag 2 DX11)"]
     V07 --> P19["Phase 19: Proxy Chaining & EDHM/ReShade Hardening"]
     V07 --> P16A["Phase 16A: Intel XeSS Native D3D11 (Intel Arc via libxess_dx11.dll)"]
     V07 --> P13A["Phase 13A: Shared-Handle D3D11<->D3D12 Compute Bridge (NT Handles + ID3D11Fence)"]
 
     P13A --> P16B["Phase 16B: Intel XeSS Cross-Vendor (libxess.dll XMX + DP4a)"]
+    P13A --> P17B["Phase 17B: D3D12 Latency (Streamline sl.reflex, Anti-Lag 2 DX12, Intel XeLL)"]
     P13A --> P18["Phase 18: NVIDIA DLSS-RR Research & G-Buffer Audit"]
     P13A --> P13B["Phase 13B: D3D12 Flip-Model Proxy Swapchain Presentation Prototype"]
 
-    P17A --> P14["Phase 14: AMD FSR 3.1/4 Frame Generation Prototype"]
+    P17A --> P17B
+    P17B --> P14["Phase 14: AMD FSR 3.1/4 Frame Generation Prototype"]
     P13B --> P14
-    P17A --> P15["Phase 15: NVIDIA Streamline (ManualHooking + sl.reflex + sl.dlss_g)"]
+    P17B --> P15["Phase 15: NVIDIA Streamline (ManualHooking + sl.reflex + sl.dlss_g)"]
     P13B --> P15
 
     P19 --> P14
@@ -73,12 +75,12 @@ flowchart TD
 
 | Step | Phase Scope | Rationale |
 |:---:|:---|:---|
-| **1** | **Phase 17A** (Standalone D3D11 Reflex + Anti-Lag 2) | Requires **zero** D3D12 interop; immediately slashes HOTAS/mouse latency in GPU-bound stations/planets and establishes `ILatencyBackend` + frame-marker hooks required *before* FG (`AGENTS.md`). |
-| **2** | **Phase 19** (Proxy Chaining + EDHM Shader Resilience) | Hardens `UiLayer` against EDHM pixel-shader hash overrides and enables ReShade (`ReShade64.dll`) / Special K coexistence *before* adding FG swapchain wrappers that amplify overlay crashes. |
-| **3** | **Phase 13A + Phase 16** (Compute D3D11↔D3D12 Bridge + Intel XeSS) | Validates zero-copy NT Shared Handles + `ID3D11Fence`/`ID3D12Fence` synchronization **without** touching DXGI swapchain ownership yet (exact approach proven in Elite by `Siegfried-Origin/EDAA`). Delivers Intel XeSS (both native Arc `libxess_dx11.dll` and cross-vendor `libxess.dll` DP4a). |
-| **4** | **Phase 18** (DLSS-RR Feasibility Probe) | Evaluates official NGX `NVSDK_NGX_Feature_RayReconstruction` (`nvngx_dlssd.dll`, which supports both D3D11 and D3D12) against Cobra's `RTV0..3` G-Buffer before committing to complex reflection-vector synthesis. |
+| **1** | **Phase 17A** (Standalone D3D11 Reflex + Anti-Lag 2 DX11) | Requires **zero** D3D12 interop; immediately slashes HOTAS/mouse latency in GPU-bound stations/planets and establishes `ILatencyBackend` + frame-marker hooks required *before* FG (`AGENTS.md`). Note: `Intel XeLL` (`libxell.dll`) is D3D12-only and deferred to **Phase 17B**. |
+| **2** | **Phase 19** (Proxy Chaining + EDHM Context-Gated HUD Fallback) | Hardens `UiLayer`'s 14 `(vsHash, psHash)` pairs against EDHM pixel-shader overrides and enables ReShade (`ReShade64.dll`) / Special K coexistence *before* adding FG swapchain wrappers that amplify overlay crashes. |
+| **3** | **Phase 13A + Phase 16** (Compute D3D11↔D3D12 Bridge + Intel XeSS) | Validates zero-copy NT Shared Handles + `ID3D11Fence`/`ID3D12Fence` synchronization **without** touching DXGI swapchain ownership yet (proven in Elite by `Siegfried-Origin/EDAA`). Delivers Intel XeSS (both native Arc `libxess_dx11.dll` and cross-vendor `libxess.dll` DP4a). |
+| **4** | **Phase 18** (DLSS-RR Feasibility Probe) | Evaluates official NGX `NVSDK_NGX_Feature_RayReconstruction` (`nvngx_dlssd.dll`, which supports both D3D11 and D3D12) against unpacked Cobra `RTV0..3` G-Buffer (`DlssRrGBufferPrepCs`) before committing to production integration. |
 | **5** | **Phase 13B** (D3D12 Flip-Model Proxy Swapchain) | Isolates and measures the hardest piece of D3D11 FG: presenting a D3D12 Flip-model swapchain for a D3D11 game (`OptiScaler` `Dx11wDx12SC` pattern), measuring copy cost, resize stability, and HDR/tearing pacing *before* loading FG DLLs. |
-| **6** | **Phase 14** (AMD FSR Frame Generation via `ffx_api`) | Prototype cross-vendor FG (works on RTX/GTX/RDNA/Arc with FSR 3.1.6 and RDNA4 ML FG with FSR 4.0) using EDPE's clean `s_clean_hdr_scene_texture` + `UiLayer` and `ffx_antilag2_dx12.h`. |
+| **6** | **Phase 14** (AMD FSR Frame Generation via `ffx_api`) | Prototype cross-vendor FG (works on RTX/GTX/RDNA/Arc with FSR 3.1.6 and RDNA4 ML FG with FSR 4.0) using EDPE's clean `s_clean_hdr_scene_texture`, 3-layer `UiLayer` (`packedUiColorAndAlpha` or `presentCallback`), and `ffx_antilag2_dx12.h`. |
 | **7** | **Phase 15** (NVIDIA Streamline `sl.dlss_g` + `sl.reflex`) | Integrate Streamline v2.14+ using **`PreferenceFlag::eUseManualHooking`** (`slUpgradeInterface` / `slGetNativeInterface`) so EDPE's `dxgi.dll` proxy avoids fighting `sl.interposer.dll`, adding capability-driven 2x/3x/4x & Dynamic MFG. |
 
 ---
@@ -107,11 +109,20 @@ enum class FrameGenerationBackend : uint32_t {
 
 struct FrameGenerationInputs {
     // Shared D3D12 handles (bridged from EDPE D3D11 via Phase 13 NT handles)
-    ID3D12Resource* hudlessColor = nullptr;      // Reconstructed world BEFORE UiCompositePass
-    ID3D12Resource* finalBackbuffer = nullptr;   // Post-UI composited backbuffer (fallback/reference)
-    ID3D12Resource* uiColorAndAlpha = nullptr;   // Native-res UI texture (R8G8B8A8_UNORM premul)
-    ID3D12Resource* depth = nullptr;             // Reversed-Z depth (R32_FLOAT copy from DSV #2)
-    ID3D12Resource* motionVectors = nullptr;     // Current->prev render-pixel MVs (R16G16_FLOAT)
+    ID3D12Resource* hudlessColor = nullptr;         // Reconstructed world BEFORE UiCompositePass
+    ID3D12Resource* finalBackbuffer = nullptr;      // Post-UI composited backbuffer (fallback/reference)
+
+    // Option A (DLSS-G kBufferTypeUIColorAndAlpha & FSR RegisterUiResourceDX12):
+    // Packed on D3D11 from hdrLayerTex_ + ldrLayerTex_ + multLayerTex_ via packPremultipliedUiForFgCs:
+    ID3D12Resource* packedUiColorAndAlpha = nullptr; // Native-res premul R8G8B8A8_UNORM
+
+    // Option B (FSR presentCallback exact 3-layer D3D12 port of kUiLayerCompositePsHlsl):
+    ID3D12Resource* uiHdrLayer = nullptr;           // hdrLayerTex_ (R16G16B16A16_FLOAT, .a = transmittance)
+    ID3D12Resource* uiLdrLayer = nullptr;           // ldrLayerTex_ (R8G8B8A8_UNORM)
+    ID3D12Resource* uiMultLayer = nullptr;          // multLayerTex_ (R8G8B8A8_UNORM, panel backdrop darkening)
+
+    ID3D12Resource* depth = nullptr;                // Reversed-Z depth (R32_FLOAT copy from DSV #2)
+    ID3D12Resource* motionVectors = nullptr;        // Current->prev render-pixel MVs (R16G16_FLOAT)
 
     uint32_t renderWidth = 0;
     uint32_t renderHeight = 0;
@@ -121,7 +132,7 @@ struct FrameGenerationInputs {
     float jitterX = 0.0f;
     float jitterY = 0.0f;
     float frameTimeMs = 0.0f;
-    uint64_t frameIndex = 0;                     // Monotonic +1; jump or reset=true resets FG
+    uint64_t frameIndex = 0;                        // Monotonic +1; jump or reset=true resets FG
     bool reset = false;
     bool isHdr = false;
 
@@ -132,9 +143,9 @@ struct FrameGenerationInputs {
 // Independent Low-Latency contract (Phase 17, PLAN.md §44)
 enum class LatencyBackendType : uint32_t {
     Off = 0,
-    NvidiaReflex = 1,       // NVAPI (standalone) or sl.reflex (when DLSS-G active)
-    AmdAntiLag2 = 2,        // ffx_antilag2_dx11.h / ffx_antilag2_dx12.h
-    IntelXeLL = 3           // Optional research via libxell.dll (D3D12 bridge)
+    NvidiaReflex = 1,       // NVAPI (Phase 17A D3D11) or sl.reflex (Phase 17B DLSS-G)
+    AmdAntiLag2 = 2,        // ffx_antilag2_dx11.h (Phase 17A) / ffx_antilag2_dx12.h (Phase 17B)
+    IntelXeLL = 3           // Strictly Phase 17B / D3D12-only via libxell.dll (unavailable in pure D3D11)
 };
 
 enum class LatencyMode : uint32_t {
@@ -157,7 +168,7 @@ Per `AGENTS.md` ("Licensing: inspect the license, record provenance, do not redi
 | `GPUOpen-LibrariesAndSDKs/FidelityFX-SDK` (`2.x`) | **MIT** | Cleanly usable in source/static/DLL form (`ffx_api.h`, `ffx_framegeneration.h`, `amd_fidelityfx_framegeneration.dll`). Preserve AMD copyright notice. |
 | `GPUOpen-LibrariesAndSDKs/AntiLag2-SDK` | **MIT** | Header-only (`ffx_antilag2_dx11.h`, `ffx_antilag2_dx12.h`), zero extra binary dependencies; talks to `atidxx64.dll` / `amdxc64.dll` in driver. |
 | `intel/xess` (`v2.x`) | **MIT** (C headers); **Intel Simplified Software License** (`libxess.dll`, `libxess_dx11.dll`) | Delay-load DLLs cleanly (`__HrLoadAllImportsForDll` / `LoadLibraryExW`) so missing runtime DLLs fail open without breaking startup. |
-| `Siegfried-Origin/EDAA` | **MIT** | Elite Dangerous-specific ReShade addon with verified D3D11↔D3D12 XeSS bridge (`addon/src/xess.cpp`) and Elite HUD/shadow discoveries. Safe to study and adapt with MIT attribution. |
+| [`Siegfried-Origin/EDAA`](https://github.com/Siegfried-Origin/EDAA) | **MIT** | Open-source Elite Dangerous ReShade addon on GitHub with verified D3D11↔D3D12 XeSS bridge ([`addon/src/xess.cpp`](https://github.com/Siegfried-Origin/EDAA/blob/master/addon/src/xess.cpp)) and Elite HUD/shadow discoveries. Safe to study and adapt with MIT attribution. |
 | `optiscaler/fakenvapi` | **MIT** | Reference for NVAPI↔Anti-Lag 2 / XeLL / LatencyFlex marker mapping and FG frame-type swapchain private data. |
 | `optiscaler/OptiScaler` | **GPL-3.0** | **Reference study only — DO NOT copy source code verbatim** into a permissive/non-GPL target without relicensing the project under GPL-3.0. Study architectural behaviors (`Dx11wDx12SC`, `LoadReShade`, `ManualHooking` interactions, known driver pitfalls). |
 | `characterecho-sean/edvr-unofficial-patch` | **GPL-3.0** | Reference study only (`docs/third-party/EDVR-LICENSE.txt`). Already referenced for `LoadLibraryExW` EDHM recursive trap (`docs/troubleshooting.md`). |

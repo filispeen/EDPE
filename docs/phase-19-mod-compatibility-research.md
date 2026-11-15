@@ -9,11 +9,11 @@
 
 ## 1. Existing Elite Dangerous Ecosystem Conflict Map (`VERIFIED` + `REFERENCE-CODE`)
 
-Elite Dangerous players heavily rely on third-party graphics tools stacked in the game folder (`EliteDangerous64.exe`). Right now in `v0.7.0`, EDPE occupies `dxgi.dll` and already partially protects against a custom `d3d11.dll` (`chooseSystemD3D11` in [`src/system_dll.h`](../src/system_dll.h) / [`src/d3d11_proxy.cpp`](../src/d3d11_proxy.cpp)), **but critical multi-mod gaps remain**:
+Elite Dangerous players heavily rely on third-party graphics tools stacked in the game folder (`EliteDangerous64.exe`). Right now in `v0.7.0`, EDPE occupies `dxgi.dll` and already protects against a custom `d3d11.dll` (`LoadSystemDll` in [`src/system_dll.h#L6-L13`](../src/system_dll.h#L6-L13), `chooseSystemD3D11` in [`src/vtable_hook.h#L45`](../src/vtable_hook.h#L45), and `resolveRealSystemD3D11` in [`src/d3d11_proxy.cpp#L129-L145`](../src/d3d11_proxy.cpp#L129-L145)), **but critical multi-mod gaps remain**:
 
 | Tool / Overlay | Default Filename / Injection Method | Conflict with EDPE `v0.7.0` | Provenance / Reference Evidence |
 |:---|:---|:---|:---|
-| **EDHM-UI (`3Dmigoto`)** | `d3d11.dll` (+ `d3dcompiler_47.dll`, `nvapi64.dll` wrapper) | **HIGH (Functional):** Overrides Cobra's cockpit HUD pixel shaders with custom bytecode! **Breaks EDPE [`UiLayer::shouldInterceptDraw`](../src/ui_layer.cpp)** exact shader-hash allowlist, causing EDHM-recolored HUDs to lose native protection and ghost through DLSS/FSR! | `EDHM-UI` / `3Dmigoto` (`bo3b/3Dmigoto`); `Siegfried-Origin/EDAA` [`docs/addon.md`](https://github.com/Siegfried-Origin/EDAA) |
+| **EDHM-UI (`3Dmigoto`)** | `d3d11.dll` (+ `d3dcompiler_47.dll`, `nvapi64.dll` wrapper) | **HIGH (Functional):** Overrides Cobra's cockpit HUD pixel shaders with custom HLSL bytecode from `ShaderFixes/`! **Breaks the 14 `(vsHash, psHash)` pairs** in [`UiLayer::shouldInterceptDraw`](../src/ui_layer.cpp#L579-L595), causing EDHM-recolored holographic panels/gauges to miss native protection and ghost through DLSS/FSR! | `EDHM-UI` / `3Dmigoto` (`bo3b/3Dmigoto`); `Siegfried-Origin/EDAA` |
 | **ReShade (Non-Addon & Addon)** | `dxgi.dll` (collides directly!) or `d3d11.dll` | **CRITICAL (File Collision):** Both EDPE and ReShade ship as **`dxgi.dll`**. Even when chained, ReShade may abort (`RESHADE_DISABLE_LOADING_CHECK` issue) or inject **before** EDPE upscaling / **before** FG presentation, breaking depth alignment and blurring sharpened ReShade passes. | `crosire/reshade`; `OptiScaler/dllmain.cpp` (`LoadReShade`, env var fix) |
 | **Special K (`SpecialK64.dll`)** | `dxgi.dll` / global injection service | **HIGH (Hook Order & FG Clash):** If Special K hooks DXGI `Present` *after* AMD/NVIDIA FG wraps the swapchain, swapchain destruction or double overlays deadlock (`OptiScaler` notes). | `OptiScaler/dllmain.cpp` (`SpecialK64.dll` pre-hook timing) |
 | **RTSS / Steam / Discord / NVIDIA App Overlays** | In-process Detours/IAT `Present` hooks | Overlays drawn *before* Frame Generation's final swapchain present get fed into optical flow/motion or torn between generated frames; conversely RTSS frame limiters conflict with Reflex/Anti-Lag 2 (Phase 17). | `OptiScaler` + NVIDIA Streamline `ProgrammingGuideDLSS_G.md` |
@@ -22,31 +22,35 @@ Elite Dangerous players heavily rely on third-party graphics tools stacked in th
 
 ## 2. Solving EDHM (`3Dmigoto` `d3d11.dll`) Coexistence (`VERIFIED` in EDPE Source)
 
-### 2.1 Existing Strength: `LoadSystemDll` / `chooseSystemD3D11`
-Inspecting [`src/d3d11_proxy.cpp`](../src/d3d11_proxy.cpp) and [`src/dxgi_proxy.cpp`](../src/dxgi_proxy.cpp) confirms EDPE already prevents infinite proxy recursion by resolving `d3d11.dll` / `dxgi.dll` via `GetSystemDirectoryW` when chaining system exports, and intercepts `D3D11CreateDevice` / `CreateSwapChain`. When EDHM's `d3d11.dll` sits alongside EDPE's `dxgi.dll`:
+### 2.1 Existing Strength: `LoadSystemDll` / `chooseSystemD3D11` / `resolveRealSystemD3D11`
+Inspecting [`src/system_dll.h#L6-L13`](../src/system_dll.h#L6-L13), [`src/vtable_hook.h#L45`](../src/vtable_hook.h#L45), and [`src/d3d11_proxy.cpp#L129-L145`](../src/d3d11_proxy.cpp#L129-L145) confirms EDPE already prevents infinite proxy recursion by resolving `d3d11.dll` / `dxgi.dll` via `GetSystemDirectoryW` + `LOAD_LIBRARY_SEARCH_SYSTEM32` when forwarding device/factory exports, while keeping EDPE's device-creation and context hooks intact. When EDHM's `d3d11.dll` sits alongside EDPE's `dxgi.dll`:
 * Elite loads EDHM's `d3d11.dll` for `D3D11CreateDevice` AND loads EDPE's `dxgi.dll` for `CreateDXGIFactory1`.
-* **Hook Chain Invariant:** `Game -> EDHM d3d11.dll (replaces PS bytecode in CreatePixelShader / PSSetShader) -> EDPE ContextCensus hook -> System d3d11.dll`. Because EDPE hooks the *live* `ID3D11DeviceContext` vtable returned to the game (or chains above/below EDHM depending on install order), EDPE receives **EDHM's modified pixel shader bytecode hashes** in `PSSetShader`!
+* **Hook Chain Reality:** 3Dmigoto (`EDHM`) intercepts shader loading and calls `CreatePixelShader` on the underlying system device with **EDHM's modified HLSL bytecode from `ShaderFixes/`** (or swaps shaders dynamically in `PSSetShader`). Therefore, hooking `observedCreatePixelShader` ([`src/d3d11_proxy.cpp#L57-L68`](../src/d3d11_proxy.cpp#L57-L68)) observes **EDHM's modified `psHash`**, not Cobra's vanilla bytecode hash!
 
-### 2.2 The Broken Link: `UiLayer` Exact Shader-Hash Matching vs. EDHM Overrides
-In [`STATUS.md`](../STATUS.md#L163-L168) and `src/ui_layer.cpp`, EDPE identifies Pass 35 cockpit HUD draws using four exact `VS + PS` FNV/CRC bytecode hashes:
-* `VS=0x81216C77F90DEDD6, PS=0xAB82734FE19EFB9D` (icons/text/gauges)
-* `VS=0x2CECEC3065EF0D4A, PS=0xA4D03619D631B186` (holographic panels/radar)
-* `VS=0x5559BD94B6852E83, PS=0xEA02FAC2BD6C643C` (target hologram)
-* `VS=0x5559BD94B6852E83, PS=0xE95634B0F61D218F` (player hologram)
+### 2.2 Exact Source Reality: `UiLayer::shouldInterceptDraw` vs. EDHM Overrides
+Inspecting the actual code of [`UiLayer::shouldInterceptDraw`](../src/ui_layer.cpp#L559-L596) reveals two distinct shader groups inside Pass 35 (when `isHdrTarget == true`):
 
-**Why EDHM Breaks This:** EDHM (`d3dx.ini` `[ShaderOverride*]`) replaces those exact **Pixel Shaders** with custom HLSL bytecode (recoloring shields, radar, gauges, thermal profiles). Consequently, `PS` hashes no longer match `0xAB82734F...`, `0xA4D03619...`, etc.! **Critically, EDHM rarely replaces the Vertex Shaders (`0x81216C77F90DEDD6`, `0x2CECEC3065EF0D4A`, `0x5559BD94B6852E83`), OR replaces only a subset while keeping identical Pass 35 render-target + blend state.**
+1. **Already EDHM-Resilient (`src/ui_layer.cpp#L564-L577`) — 13 Pure UI `VS-only` Hashes:**
+   * `0x81216C77F90DEDD6ull`, `0x1989E6D3B405FDE0ull`, `0x925ACEDA0153AA5Bull`, `0xB7790CBFC6554097ull`, `0xE508648660A352B2ull`, `0x5DA53D8B0133341Eull`, `0xDF3503CD07F9B10Cull`, `0x5453D19B6D362364ull`, `0x44DDCDEBAEA137D8ull`, `0xA2C2D5510BF1926Dull`, `0x9B34C331902DC1EDull`, `0x9611A454527F7FEBull`, `0xB932058F26B76691ull`.
+   * Because these 13 vertex shaders already match **independently of `psHash`**, draws using them continue to work cleanly even when EDHM replaces their pixel shaders!
+2. **Vulnerable to EDHM (`src/ui_layer.cpp#L579-L595`) — 14 VS Groups / 18 Exact `(vsHash, psHash)` Pairs:**
+   * Includes `0x2CECEC3065EF0D4Aull` (`ps == 0xA4D03619D631B186ull`: holographic panels/center radar), `0x5559BD94B6852E83ull` (player/target 3D holograms), `0xB12F7A618E1BDE98ull`, `0xC31238331D8AC3D4ull` (3 PS variants), plus 10 additional paired UI shaders.
+   * **Why Blindly Moving Lines `579-595` to Unconditional VS-Only Is Dangerous:** Several vertex shaders in those 14 groups are shared utility vertex shaders reused by non-HUD world geometry/glass earlier in the frame. Converting them to unconditional `vsHash`-only matching risks capturing 3D scene elements into `UiLayer`!
+   * **Why EDHM Breaks Lines `579-595`:** EDHM's `[ShaderOverride*]` directives replace the pixel shaders (`PS`) on radar, holo-panels, ship holograms, and cockpit gauges so `psHash` no longer matches lines `579-595`.
 
 ### 2.3 Three-Tier Resilient HUD Classification Strategy (`EXPERIMENTAL`)
-To guarantee 100% EDHM compatibility without breaking EDPE's non-HUD scene draws:
+To protect 100% of EDHM-modified HUD elements **without** misclassifying shared 3D geometry:
 
-1. **Tier 1 (Vertex-Shader-Anchored Pass 35 Rule — Highest Precision):**
-   * Verify in EDHM's `ShaderFixes/` whether EDHM leaves Cobra's 3 HUD **Vertex Shaders** (`0x81216C77F90DEDD6`, `0x2CECEC3065EF0D4A`, `0x5559BD94B6852E83`) untouched!
-   * When Pass 35 is active (`RTV0 == sceneHdrTarget` after deferred lighting, depth test/write state matching HUD overlay, additive/alpha blend active), **any draw using those verified HUD Vertex Shaders** (regardless of custom EDHM Pixel Shader hash!) is redirected into `UiLayer`!
-   * Still run the existing exact `VS + PS` match first as fast path; fall back to `VS + PassState` match if an unknown `PS` appears inside Pass 35.
-2. **Tier 2 (`edpe.ini` User/EDHM Override List):**
-   * Allow `[HUD]` `CustomVertexShaders=` / `CustomPixelShaders=` hex hash overrides + an in-menu (`DEV=1`) *"Capture Unknown Pass 35 Shaders"* diagnostic button that logs unrecognised `VS/PS` hashes seen inside Pass 35 with zero stuttering.
-3. **Tier 3 (Pre-EDHM Bytecode Check / Hook Order Guard):**
-   * Inspect if EDHM hooks `CreatePixelShader` via IAT or vtable; log in `edpe.log` whenever `GetModuleHandleW(L"d3d11.dll")` resolves inside the game directory (`EDHM / 3Dmigoto detected`), so users immediately see active mod-compatibility status in `F5`.
+1. **Tier 1 (Context-Gated VS Fallback for `src/ui_layer.cpp#L579-L595` — Primary Solution):**
+   * Run the existing exact checks (`L564-L577` VS-only + `L579-L595` exact `(vsHash, psHash)` pairs) first as the zero-cost fast path.
+   * When an exact `psHash` misses on one of the **14 VS hashes from `L579-L595`**, allow fallback `VS-only` interception **ONLY when ALL context gates hold**:
+     1. **HUD Phase Latched:** At least one draw matching the **13 pure UI `VS-only` hashes (`L564-L577`)** (or an exact `(vsHash, psHash)` HUD pair) has already occurred on the current HDR `RTV0` in the current frame (Pass 35 HUD phase active), **AND**
+     2. **HUD Depth-Stencil State:** `OMGetDepthStencilState` confirms depth writes are disabled (`D3D11_DEPTH_WRITE_MASK_ZERO`, matching holographic UI overlays rather than opaque world meshes), **AND**
+     3. Optional `edpe.ini [HUD] EdhmCompatMode = Auto | Force | Off` (enabled automatically when non-System32 `d3d11.dll` is detected!).
+2. **Tier 2 (`edpe.ini` User/EDHM Allowlist + Diagnostic Capture):**
+   * Support `[HUD]` `CustomPixelShaders=` / `CustomVertexShaders=` hex allowlists in `edpe.ini` (loaded into [`UiLayer`](../src/ui_layer.h)), plus an in-menu (`DEV=1`) *"Log Unmatched Pass 35 Shaders"* diagnostic capture for edge-case EDHM themes that replace a Vertex Shader too.
+3. **Tier 3 (EDHM/3Dmigoto Detection & Honest Caveat on `CreatePixelShader`):**
+   * Because 3Dmigoto substitutes compiled HLSL from `ShaderFixes/` before calling system `CreatePixelShader`, `observedCreatePixelShader` ([`src/d3d11_proxy.cpp#L57-L68`](../src/d3d11_proxy.cpp#L57-L68)) cannot recover Cobra's original `psHash`. Use `GetModuleHandleW(L"d3d11.dll")` path inspection strictly to detect EDHM presence, auto-arm **Tier 1 Context-Gated VS Fallback**, and report status clearly in `F5` / `edpe.log`.
 
 ---
 
@@ -97,7 +101,7 @@ EDPE (`F5` overlay & `edpe.log`) should detect loaded modules on startup (`EnumP
 
 | Detected Module | Detection Signal | Automatic EDPE Action | User Status in `F5` Overlay |
 |:---|:---|:---|:---|
-| `d3d11.dll` in game dir (`EDHM / 3Dmigoto`) | Path != `System32` | Enable Pass 35 VS-anchored HUD fallback (`Tier 1`); bypass local `d3d11.dll` for EDPE internal helpers | `"EDHM / 3Dmigoto detected (VS-anchored HUD protection active)"` |
+| `d3d11.dll` in game dir (`EDHM / 3Dmigoto`) | Path != `System32` | Arm **Tier 1 Context-Gated VS Fallback** for `L579-L595` HUD draws; bypass local `d3d11.dll` via `chooseSystemD3D11` | `"EDHM / 3Dmigoto detected (Context-gated HUD protection active)"` |
 | `ReShade64.dll` (via `[Proxy]`) or `ReShade64` loaded | `GetModuleHandleW` / `edpe.ini` | Set `RESHADE_DISABLE_LOADING_CHECK=1`, chain factory creation so ReShade runs post-upscale | `"ReShade chained (post-upscale order)"` |
 | `ReShade` competing as `dxgi.dll` | Export fingerprint mismatch / user conflict | Log warning; instruct renaming ReShade to `ReShade64.dll` via `[Proxy]` | Warning banner if two `dxgi` overlays detected |
 | `SpecialK64.dll` | `GetModuleHandleW(L"SpecialK64.dll")` | Warn if Phase 14/15 FG is enabled concurrently; coordinate hook timing before FG swapchain wrap | `"Special K active (FG swapchain warning if unstable)"` |
@@ -109,8 +113,8 @@ EDPE (`F5` overlay & `edpe.log`) should detect loaded modules on startup (`EnumP
 
 1. **Automated Unit Tests (`tests/proxy_chaining_test.cpp`):**
    * Verify `edpe.ini` `[Proxy]` parser handles missing/invalid `ChainDxgiDll` safely without crashing or regressing `proxy_smoke`.
-   * Verify Tier-1 Pass 35 HUD classifier still isolates all 30 holographic draws when a synthetic Pixel Shader hash is mutated (`UiLayer` test extension).
+   * Verify **Tier-1 Context-Gated VS Fallback**: mutate `psHash` on any of the 14 groups in `src/ui_layer.cpp#L579-L595` and assert interception succeeds **only** when Pass 35 HUD phase + `DepthWriteMask == ZERO` are active (and rejects shared VS draws outside Pass 35 HUD!).
 2. **Real-World Stack Matrix Tests (In-Game):**
-   * **Test A (`EDPE dxgi.dll` + `EDHM d3d11.dll`):** Verify recolored cockpit HUD stays razor-sharp at DLSS `Performance` (50% scale) with zero ghosting during pitch/roll.
+   * **Test A (`EDPE dxgi.dll` + `EDHM d3d11.dll`):** Verify recolored cockpit HUD, radar, and ship holograms stay razor-sharp at DLSS `Performance` (50% scale) with zero ghosting during pitch/roll.
    * **Test B (`EDPE dxgi.dll` -> `ReShade64.dll`):** Verify `Home` opens ReShade AND `F5` opens EDPE cleanly with zero input conflicts, ReShade shaders apply cleanly without subpixel jitter wobble, and resize (`Alt+Enter`) stays crash-free.
    * **Test C (`EDPE` + `EDHM` + `ReShade64` + `Steam Overlay`):** 10-minute station/supercruise/planet stability run with `edpe.log` confirming clean module order and zero loader deadlocks.
