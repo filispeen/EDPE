@@ -4718,6 +4718,54 @@ inline bool repairAuxiliarySceneConstantBuffer(float* words, size_t floatCount, 
     return false;
 }
 
+enum class SubZone : size_t {
+    MapMiss = 0,
+    Unmap208,
+    UnmapAux,
+    UnmapDrv,
+    Unmap5376,
+    Unmap5376Jit,
+    OmRtvScan,
+    OmDsvSeen,
+    Count
+};
+
+struct SubZoneState {
+    std::atomic<long long> ticks[static_cast<size_t>(SubZone::Count)]{};
+    std::atomic<unsigned> calls[static_cast<size_t>(SubZone::Count)]{};
+    std::atomic<unsigned> omRtvMiss{0};
+    std::atomic<unsigned> omRtvTexProbe{0};
+};
+
+static SubZoneState s_sub_prof{};
+
+class SubProfScope {
+public:
+    explicit SubProfScope(SubZone z) noexcept : zone_(z) {
+        if (edpe::Profiler::instance().isEnabled()) {
+            active_ = true;
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            start_ = qpc.QuadPart;
+        }
+    }
+    ~SubProfScope() {
+        if (active_) {
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            const size_t idx = static_cast<size_t>(zone_);
+            s_sub_prof.ticks[idx].fetch_add(qpc.QuadPart - start_, std::memory_order_relaxed);
+            s_sub_prof.calls[idx].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    SubProfScope(const SubProfScope&) = delete;
+    SubProfScope& operator=(const SubProfScope&) = delete;
+private:
+    SubZone zone_;
+    long long start_{0};
+    bool active_{false};
+};
+
 HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
     const MapFn forward = resolveOriginalMap(context);
@@ -4743,6 +4791,7 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
         }
         const bool probe_active = vs_buffer_probe_active.load(std::memory_order_relaxed);
         edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
+        SubProfScope subProfMapMiss(SubZone::MapMiss);
         D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
         resource->GetType(&dimension);
         if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
@@ -4854,7 +4903,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
         std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
         edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
         if (mapped_ptr && mapped_byte_width == 208) {
-            float* mutable_unmap_words = static_cast<float*>(mapped_ptr);
+            {
+                SubProfScope subProf208(SubZone::Unmap208);
+                float* mutable_unmap_words = static_cast<float*>(mapped_ptr);
             const edpe::CameraProjection& refCam =
                 (s_has_staged_camera && s_staged_camera_frame == cur_frame)
                     ? s_staged_camera
@@ -4900,20 +4951,31 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 }
             }
-            if (forward) forward(context, resource, subresource);
-            rearmHudDrawProbeFast(context);
+            }
+            {
+                SubProfScope subProfDrv(SubZone::UnmapDrv);
+                if (forward) forward(context, resource, subresource);
+                rearmHudDrawProbeFast(context);
+            }
             return;
         }
         if (mapped_ptr && mapped_byte_width >= 272 && mapped_byte_width <= 4096) {
-            repairAuxiliarySceneConstantBuffer(
-                static_cast<float*>(mapped_ptr),
-                static_cast<size_t>(mapped_byte_width) / sizeof(float),
-                cur_frame);
-            if (forward) forward(context, resource, subresource);
-            rearmHudDrawProbeFast(context);
+            {
+                SubProfScope subProfAux(SubZone::UnmapAux);
+                repairAuxiliarySceneConstantBuffer(
+                    static_cast<float*>(mapped_ptr),
+                    static_cast<size_t>(mapped_byte_width) / sizeof(float),
+                    cur_frame);
+            }
+            {
+                SubProfScope subProfDrv(SubZone::UnmapDrv);
+                if (forward) forward(context, resource, subresource);
+                rearmHudDrawProbeFast(context);
+            }
             return;
         }
         if (mapped_ptr && mapped_byte_width == 5376) {
+            SubProfScope subProf5376(SubZone::Unmap5376);
             scene_unmaps.fetch_add(1, std::memory_order_relaxed);
             ++s_ustat.total;
             if (draw_probe_active.load(std::memory_order_relaxed)) {
@@ -5365,6 +5427,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             bool jitter_applied_this_unmap = false;
             if (jitter_candidate && !ContextCensusIsJitterActive()) ++s_ustat.jitterOff;
             if (jitter_candidate && ContextCensusIsJitterActive()) {
+                SubProfScope subProfJit(SubZone::Unmap5376Jit);
                 float* mutable_words = static_cast<float*>(mapped_ptr);
                 bool valid_projection = true;
                 for (size_t i = 0; i < 16; ++i) {
@@ -8542,6 +8605,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         s_post_ldr_backbuffer_no_dsv = false;
         if ((motion_pair_active || reconstruction_active) && motion_color_source &&
             motion_color_frame == current_frame) {
+            SubProfScope subProfOmRtv(SubZone::OmRtvScan);
             struct RtvMetaEntry {
                 ID3D11RenderTargetView* rtv = nullptr;
                 ID3D11Resource* res = nullptr;
@@ -8575,6 +8639,9 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                 if (entry.rtv == view) {
                     return entry;
                 }
+                if (edpe::Profiler::instance().isEnabled()) {
+                    s_sub_prof.omRtvMiss.fetch_add(1, std::memory_order_relaxed);
+                }
                 entry = RtvMetaEntry{};
                 entry.rtv = view;
                 ID3D11Resource* res = nullptr;
@@ -8596,6 +8663,9 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             auto ensureRtvTexMeta = [&](RtvMetaEntry& entry) {
                 if (entry.texProbed || !entry.rtv) return;
                 entry.texProbed = true;
+                if (edpe::Profiler::instance().isEnabled()) {
+                    s_sub_prof.omRtvTexProbe.fetch_add(1, std::memory_order_relaxed);
+                }
                 ID3D11Resource* res = nullptr;
                 entry.rtv->GetResource(&res);
                 if (res) {
@@ -8843,6 +8913,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
     }
     syncSceneWindowAtomic(current_frame);
     }
+    SubProfScope subProfOmDsv(SubZone::OmDsvSeen);
     PerContextData* ctxData = getOrCreateContextData(context);
     if (!ctxData) return;
 
@@ -8937,19 +9008,23 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             scene_ldr_frame = ~0ull;
 
             if (reconstruction_active) {
+                const bool needHdrTex =
+                    (scene_hdr_color_frame != current_frame || motion_color_source.Get() != targets[3]);
                 motion_color_source = targets[3];
                 motion_color_frame = current_frame;
                 motion_color_bound = true;
-                ID3D11Resource* hdrRes = nullptr;
-                targets[3]->GetResource(&hdrRes);
-                if (hdrRes) {
-                    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
-                    if (SUCCEEDED(hdrRes->QueryInterface(__uuidof(ID3D11Texture2D),
-                            reinterpret_cast<void**>(tex.GetAddressOf())))) {
-                        scene_hdr_color_source = tex;
-                        scene_hdr_color_frame = current_frame;
+                if (needHdrTex) {
+                    ID3D11Resource* hdrRes = nullptr;
+                    targets[3]->GetResource(&hdrRes);
+                    if (hdrRes) {
+                        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+                        if (SUCCEEDED(hdrRes->QueryInterface(__uuidof(ID3D11Texture2D),
+                                reinterpret_cast<void**>(tex.GetAddressOf())))) {
+                            scene_hdr_color_source = tex;
+                            scene_hdr_color_frame = current_frame;
+                        }
+                        hdrRes->Release();
                     }
-                    hdrRes->Release();
                 }
                 if (!hud_draw_hook_mask) {
                     beginHudDrawProbe();
@@ -9026,11 +9101,13 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             } else if (ctx_seen[index].mrt_hdr_view && count && targets &&
                 targets[0] == ctx_seen[index].mrt_hdr_view) {
                 ctx_seen[index].scene_match_frame = frame;
-                if (reconstruction_active && motion_color_source &&
+                if (reconstruction_active && scene_hdr_color_frame != frame &&
+                    motion_color_source &&
                     sameRenderTargetResource(targets[0], motion_color_source.Get())) {
                     hdrRtv = targets[0];
                 }
-            } else if (reconstruction_active && count && targets && targets[0] &&
+            } else if (reconstruction_active && scene_hdr_color_frame != frame &&
+                       count && targets && targets[0] &&
                        motion_color_source && sameRenderTargetResource(targets[0], motion_color_source.Get())) {
                 hdrRtv = targets[0];
             }
@@ -10357,6 +10434,40 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 gpuTotal, gpuDepth, gpuMotion, gpuColor, gpuEval, gpuUi, gpuBloom,
                 prof.isDirectColorActive() ? 1u : 0u, prof.getDirectColorFormat());
             EdpeLog(profMsg);
+
+            double qpcFreq = 0.0;
+            {
+                LARGE_INTEGER f{};
+                if (QueryPerformanceFrequency(&f) && f.QuadPart > 0) {
+                    qpcFreq = static_cast<double>(f.QuadPart);
+                }
+            }
+            const auto subMs = [&](SubZone z) -> float {
+                const long long t = s_sub_prof.ticks[static_cast<size_t>(z)].exchange(0, std::memory_order_relaxed);
+                return (qpcFreq > 0.0)
+                    ? static_cast<float>((static_cast<double>(t) * 1000.0) / (qpcFreq * 120.0))
+                    : 0.0f;
+            };
+            const auto subCalls = [&](SubZone z) -> float {
+                const unsigned c = s_sub_prof.calls[static_cast<size_t>(z)].exchange(0, std::memory_order_relaxed);
+                return static_cast<float>(c) / 120.0f;
+            };
+            const float rtvMiss = static_cast<float>(s_sub_prof.omRtvMiss.exchange(0, std::memory_order_relaxed)) / 120.0f;
+            const float rtvTex = static_cast<float>(s_sub_prof.omRtvTexProbe.exchange(0, std::memory_order_relaxed)) / 120.0f;
+            wchar_t subMsg[384];
+            swprintf_s(subMsg,
+                L"EDPE PROFILE_SUB (120f avg) frame=%llu | mapMiss=%.3f(%.1f) u208=%.3f(%.1f) uAux=%.3f(%.1f) uDrv=%.3f(%.1f) u5376=%.3f(%.1f) jit=%.3f(%.1f) | omRtv=%.3f(%.1f) rtvMiss=%.1f texProbe=%.1f omDsv=%.3f(%.1f)",
+                frame,
+                subMs(SubZone::MapMiss), subCalls(SubZone::MapMiss),
+                subMs(SubZone::Unmap208), subCalls(SubZone::Unmap208),
+                subMs(SubZone::UnmapAux), subCalls(SubZone::UnmapAux),
+                subMs(SubZone::UnmapDrv), subCalls(SubZone::UnmapDrv),
+                subMs(SubZone::Unmap5376), subCalls(SubZone::Unmap5376),
+                subMs(SubZone::Unmap5376Jit), subCalls(SubZone::Unmap5376Jit),
+                subMs(SubZone::OmRtvScan), subCalls(SubZone::OmRtvScan),
+                rtvMiss, rtvTex,
+                subMs(SubZone::OmDsvSeen), subCalls(SubZone::OmDsvSeen));
+            EdpeLog(subMsg);
         }
     }
 }
