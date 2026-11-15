@@ -97,6 +97,7 @@ static std::atomic<unsigned long long> s_rendered_scene_frame_id{0};
 
 std::atomic<OMSetRenderTargetsFn> original{nullptr};
 std::atomic<OMSetRenderTargetsFn> original_deferred_om{nullptr};
+std::atomic<OMSetRenderTargetsFn> s_primary_orig_om{nullptr};
 OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context);
 MapFn resolveOriginalMap(ID3D11DeviceContext* context);
 UnmapFn resolveOriginalUnmap(ID3D11DeviceContext* context);
@@ -107,6 +108,7 @@ DrawIndexedInstancedFn resolveOriginalDrawIndexedInstanced(ID3D11DeviceContext* 
 DrawInstancedFn resolveOriginalDrawInstanced(ID3D11DeviceContext* context);
 std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_om_uav{nullptr};
 std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> original_deferred_om_uav{nullptr};
+std::atomic<OMSetRenderTargetsAndUnorderedAccessViewsFn> s_primary_orig_om_uav{nullptr};
 std::atomic<ExecuteCommandListFn> original_execute_command_list{nullptr};
 std::atomic<ExecuteCommandListFn> original_deferred_execute_command_list{nullptr};
 std::atomic<FinishCommandListFn> original_finish_command_list{nullptr};
@@ -125,6 +127,7 @@ static std::atomic<bool> s_log_exec_imm{false}, s_log_exec_def{false};
 static void logContextHookOnce(ID3D11DeviceContext* context, size_t slot, const wchar_t* hookName,
     std::atomic<bool>& immFlag, std::atomic<bool>& defFlag) {
     if (!context) return;
+    if (immFlag.load(std::memory_order_relaxed) && defFlag.load(std::memory_order_relaxed)) return;
     const auto type = context->GetType();
     std::atomic<bool>& flag = (type == D3D11_DEVICE_CONTEXT_IMMEDIATE) ? immFlag : defFlag;
     if (!flag.exchange(true, std::memory_order_acq_rel)) {
@@ -185,6 +188,10 @@ static std::mutex s_hooked_tables_mutex;
 static std::atomic<ID3D11DeviceContext*> s_primary_hook_ctx{nullptr};
 static std::atomic<void**> s_primary_live_table{nullptr};
 static std::atomic<edpe::VTableHook*> s_primary_vtable_hook{nullptr};
+static std::atomic<bool> s_primary_live_mode{false};
+static std::atomic<bool> s_any_pipeline_sample_active{false};
+static std::atomic<unsigned long long> s_scene_window_closed_frame{~0ull};
+static std::atomic<unsigned long long> s_last_jitter_active_frame{~0ull};
 
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_engine_velocity_texture;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_engine_velocity_srv;
@@ -232,6 +239,7 @@ static std::mutex s_cloned_contexts_mutex;
 struct PerContextData {
     ID3D11DeviceContext* context = nullptr;
     ID3D11Device* owningDevice = nullptr;
+    bool isImmediate = false;
     std::atomic<unsigned long long> omCalls{0};
     std::atomic<unsigned long long> gameOmCalls{0};
     std::atomic<unsigned long long> edpeOmCalls{0};
@@ -257,12 +265,25 @@ static std::atomic<size_t> s_tracked_context_count{0};
 static std::mutex s_tracked_contexts_mutex;
 static std::atomic<ID3D11DeviceContext*> s_last_warned_scene_ctx{nullptr};
 
+static std::atomic<PerContextData*> s_primary_ctx_data{nullptr};
+
 PerContextData* getOrCreateContextData(ID3D11DeviceContext* context) {
     if (!context) return nullptr;
+    if (context == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+        if (PerContextData* cached = s_primary_ctx_data.load(std::memory_order_acquire);
+            cached && cached->context == context) {
+            return cached;
+        }
+    }
     const size_t fastCount = s_tracked_context_count.load(std::memory_order_acquire);
     if (fastCount == 1 && context == observed_context.load(std::memory_order_relaxed) &&
         s_tracked_contexts[0] && s_tracked_contexts[0]->context == context) {
         return s_tracked_contexts[0].get();
+    }
+    for (size_t i = 0; i < fastCount; ++i) {
+        if (s_tracked_contexts[i] && s_tracked_contexts[i]->context == context) {
+            return s_tracked_contexts[i].get();
+        }
     }
     ID3D11Device* curDevice = nullptr;
     context->GetDevice(&curDevice);
@@ -290,6 +311,7 @@ PerContextData* getOrCreateContextData(ID3D11DeviceContext* context) {
     auto data = std::make_unique<PerContextData>();
     data->context = context;
     data->owningDevice = curDevice;
+    data->isImmediate = (context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE);
 
     PerContextData* ptr = data.get();
     s_tracked_contexts[cur_count] = std::move(data);
@@ -340,11 +362,14 @@ ID3D11DeviceContext* activeSceneContext() {
 
 bool isObservedImmediateContext(ID3D11DeviceContext* context) {
     if (!context) return false;
-    if (context == observed_context.load(std::memory_order_acquire)) return true;
+    if (context == observed_context.load(std::memory_order_acquire) ||
+        context == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+        return true;
+    }
     const size_t count = s_tracked_context_count.load(std::memory_order_acquire);
     for (size_t i = 0; i < count; ++i) {
         if (s_tracked_contexts[i] && s_tracked_contexts[i]->context == context) {
-            return context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+            return s_tracked_contexts[i]->isImmediate;
         }
     }
     return context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
@@ -998,9 +1023,39 @@ static constexpr size_t kMaxTrackedMappedBuffers = 32;
 static MappedBufferEntry s_tracked_mapped_buffers[kMaxTrackedMappedBuffers]{};
 static std::mutex s_tracked_mapped_buffers_mutex;
 static std::atomic<int> s_tracked_mapped_count{0};
+static std::atomic<uint64_t> s_mapped_cache_epoch{1};
+
+struct LocalMappedCache {
+    static constexpr size_t kCap = 16;
+    uint64_t epoch = 0;
+    size_t count = 0;
+    MappedBufferEntry entries[kCap]{};
+};
+
+inline LocalMappedCache& localMappedCache() {
+    thread_local LocalMappedCache cache;
+    const uint64_t curEpoch = s_mapped_cache_epoch.load(std::memory_order_acquire);
+    if (cache.epoch != curEpoch) {
+        cache.count = 0;
+        cache.epoch = curEpoch;
+    }
+    return cache;
+}
 
 inline void trackMappedBuffer(ID3D11Resource* resource, void* ptr, UINT byteWidth = 5376) {
     if (!resource) return;
+    LocalMappedCache& local = localMappedCache();
+    for (size_t i = 0; i < local.count; ++i) {
+        if (local.entries[i].resource == resource) {
+            local.entries[i].mapped_ptr = ptr;
+            local.entries[i].byte_width = byteWidth;
+            return;
+        }
+    }
+    if (local.count < LocalMappedCache::kCap) {
+        local.entries[local.count++] = {resource, ptr, byteWidth};
+        return;
+    }
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         if (s_tracked_mapped_buffers[i].resource == resource || s_tracked_mapped_buffers[i].resource == nullptr) {
@@ -1017,7 +1072,19 @@ inline void trackMappedBuffer(ID3D11Resource* resource, void* ptr, UINT byteWidt
 
 inline void* popMappedBuffer(ID3D11Resource* resource, UINT* outByteWidth = nullptr) {
     if (outByteWidth) *outByteWidth = 0;
-    if (!resource || s_tracked_mapped_count.load(std::memory_order_acquire) <= 0) return nullptr;
+    if (!resource) return nullptr;
+    LocalMappedCache& local = localMappedCache();
+    for (size_t i = local.count; i > 0; --i) {
+        const size_t idx = i - 1;
+        if (local.entries[idx].resource == resource) {
+            void* ptr = local.entries[idx].mapped_ptr;
+            if (outByteWidth) *outByteWidth = local.entries[idx].byte_width;
+            local.entries[idx] = local.entries[local.count - 1];
+            --local.count;
+            return ptr;
+        }
+    }
+    if (s_tracked_mapped_count.load(std::memory_order_acquire) <= 0) return nullptr;
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
         if (s_tracked_mapped_buffers[i].resource == resource) {
@@ -1034,6 +1101,7 @@ inline void* popMappedBuffer(ID3D11Resource* resource, UINT* outByteWidth = null
 }
 
 inline void clearTrackedMappedBuffers() {
+    s_mapped_cache_epoch.fetch_add(1, std::memory_order_release);
     if (s_tracked_mapped_count.load(std::memory_order_acquire) == 0) return;
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
@@ -1045,6 +1113,15 @@ inline void clearTrackedMappedBuffers() {
 }
 
 inline void clearTrackedMappedBuffersExcept(ID3D11Resource* keep) {
+    LocalMappedCache& local = localMappedCache();
+    for (size_t i = 0; i < local.count;) {
+        if (local.entries[i].resource != keep) {
+            local.entries[i] = local.entries[--local.count];
+        } else {
+            ++i;
+        }
+    }
+    if (s_tracked_mapped_count.load(std::memory_order_acquire) == 0) return;
     std::lock_guard lock(s_tracked_mapped_buffers_mutex);
     int remaining = 0;
     for (size_t i = 0; i < kMaxTrackedMappedBuffers; ++i) {
@@ -3310,6 +3387,7 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
     if (isLdrTonemapDraw && rtvTex) {
         s_ldr_tonemap_candidate_bound = true;
         s_verified_ldr_tonemap_frame = current_frame;
+        s_scene_window_closed_frame.store(current_frame, std::memory_order_release);
         if (scene_ldr_source.Get() != rtvTex.Get() || scene_ldr_frame != current_frame) {
             scene_ldr_source = rtvTex;
             scene_ldr_frame = current_frame;
@@ -3594,6 +3672,9 @@ static inline bool isHudDrawInterceptWindowActive() {
     if (g_is_evaluating_upscaler.load(std::memory_order_relaxed)) return false;
     if (motion_pair_active || draw_probe_active.load(std::memory_order_relaxed)) return true;
     if (!hud_draw_probe_active.load(std::memory_order_relaxed) || s_upscale_evaluated_this_frame) return false;
+    if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
+        !s_jitter_debug_view.load(std::memory_order_relaxed) &&
+        !s_hud_debug_view.load(std::memory_order_relaxed)) return false;
     const auto cur = last_present_frame.load(std::memory_order_relaxed);
     if (s_hdr_slot0_seen_frame != cur) return false;
     return true;
@@ -3809,9 +3890,23 @@ void restoreHudStateRearmHooks() {
     // No-op: state-setting methods are no longer hooked in-place.
 }
 
+void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx);
+
+inline void rearmHudDrawProbeFast(ID3D11DeviceContext* activeCtx) {
+    if (activeCtx &&
+        s_primary_live_mode.load(std::memory_order_relaxed) &&
+        activeCtx == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+        void** primaryTbl = s_primary_live_table.load(std::memory_order_acquire);
+        if (primaryTbl && *reinterpret_cast<void* const*>(activeCtx) == primaryTbl) {
+            return;
+        }
+    }
+    rearmHudDrawProbe(activeCtx);
+}
+
 void abandonAmortizedAndRearmHudProbe(ID3D11DeviceContext* context) {
     if (!context) return;
-    rearmHudDrawProbe(context);
+    rearmHudDrawProbeFast(context);
 }
 
 void beginHudDrawProbe() {
@@ -4035,8 +4130,7 @@ template <typename Fn>
 inline Fn resolveContextOriginalSlot(ID3D11DeviceContext* context, size_t slot, void* observer,
                                      const std::atomic<Fn>& fallback) {
     if (context) {
-        if (s_hooked_table_count.load(std::memory_order_acquire) == 1 &&
-            context == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+        if (context == s_primary_hook_ctx.load(std::memory_order_acquire)) {
             if (const Fn fast = fallback.load(std::memory_order_acquire)) {
                 return fast;
             }
@@ -4162,6 +4256,16 @@ inline bool isInSceneWindowLocked(unsigned long long cur_frame) {
             !s_post_ldr_backbuffer_bound);
 }
 
+inline void syncSceneWindowAtomic(unsigned long long cur_frame) {
+    if (isInSceneWindowLocked(cur_frame)) {
+        if (s_scene_window_closed_frame.load(std::memory_order_relaxed) == cur_frame) {
+            s_scene_window_closed_frame.store(~0ull, std::memory_order_release);
+        }
+    } else {
+        s_scene_window_closed_frame.store(cur_frame, std::memory_order_release);
+    }
+}
+
 inline bool repairAuxiliarySceneConstantBuffer(float* words, size_t floatCount, unsigned long long cur_frame) {
     if (!words || floatCount < 20) return false;
     if (!isInSceneWindowLocked(cur_frame) || !ContextCensusIsJitterActive()) return false;
@@ -4281,7 +4385,12 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
     }
     ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
     bool is_scene_cb = (resource == target);
-    UINT dot_cb_bytes = is_scene_cb ? 0u : getCachedDotCbByteWidth(resource);
+    const bool jitterActive = ContextCensusIsJitterActive();
+    if (!is_scene_cb && !jitterActive && target != nullptr &&
+        !vs_buffer_probe_active.load(std::memory_order_relaxed)) {
+        return result;
+    }
+    UINT dot_cb_bytes = (is_scene_cb || !jitterActive) ? 0u : getCachedDotCbByteWidth(resource);
     if (!is_scene_cb && dot_cb_bytes == 0) {
         if (isResourceCachedRejected(resource)) {
             return result;
@@ -4307,7 +4416,8 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
                         scene_maps_before_bind.fetch_add(1, std::memory_order_relaxed);
                         EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
                     }
-                } else if ((desc.ByteWidth == 208 || (desc.ByteWidth >= 272 && desc.ByteWidth <= 4096)) &&
+                } else if (jitterActive &&
+                           (desc.ByteWidth == 208 || (desc.ByteWidth >= 272 && desc.ByteWidth <= 4096)) &&
                            desc.Usage == D3D11_USAGE_DYNAMIC &&
                            (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
                     cacheDotCbResource(resource, desc.ByteWidth);
@@ -4331,7 +4441,11 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
             draw_instanced_calls.load(std::memory_order_relaxed))
             scene_maps_after_draw.fetch_add(1, std::memory_order_relaxed);
     } else if (dot_cb_bytes > 0) {
-        trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, dot_cb_bytes);
+        const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+        if (dot_cb_bytes == 208 ||
+            s_scene_window_closed_frame.load(std::memory_order_acquire) != cur_frame) {
+            trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, dot_cb_bytes);
+        }
     }
     return result;
 }
@@ -4344,12 +4458,21 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
         resource &&
         isObservedImmediateContext(context)) {
         ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
-        if (resource != target &&
-            ((s_tracked_mapped_count.load(std::memory_order_acquire) <= 0 &&
-              scene_mapped_data.load(std::memory_order_relaxed) == nullptr) ||
-             isResourceCachedRejected(resource))) {
+        const bool jitterActive = ContextCensusIsJitterActive();
+        const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+        if (jitterActive) {
+            s_last_jitter_active_frame.store(cur_frame, std::memory_order_relaxed);
+        } else if (resource != target) {
+            const auto lastJitterFrame = s_last_jitter_active_frame.load(std::memory_order_relaxed);
+            if (lastJitterFrame == ~0ull || cur_frame > lastJitterFrame + 4ull) {
+                if (forward) forward(context, resource, subresource);
+                rearmHudDrawProbeFast(context);
+                return;
+            }
+        }
+        if (resource != target && isResourceCachedRejected(resource)) {
             if (forward) forward(context, resource, subresource);
-            rearmHudDrawProbe(context);
+            rearmHudDrawProbeFast(context);
             return;
         }
         UINT mapped_byte_width = 0;
@@ -4364,13 +4487,18 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 ++s_ustat.noMapped;
             }
             if (forward) forward(context, resource, subresource);
-            rearmHudDrawProbe(context);
+            rearmHudDrawProbeFast(context);
+            return;
+        }
+        if (mapped_byte_width >= 272 && mapped_byte_width <= 4096 &&
+            (!jitterActive || s_scene_window_closed_frame.load(std::memory_order_acquire) == cur_frame)) {
+            if (forward) forward(context, resource, subresource);
+            rearmHudDrawProbeFast(context);
             return;
         }
         std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
         edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
         if (mapped_ptr && mapped_byte_width == 208) {
-            const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
             float* mutable_unmap_words = static_cast<float*>(mapped_ptr);
             const edpe::CameraProjection& refCam =
                 (s_has_staged_camera && s_staged_camera_frame == cur_frame)
@@ -4389,7 +4517,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         std::memcpy(&mutable_unmap_words[16], unjittered_block, sizeof(unjittered_block));
                     }
                 }
-                if (isInSceneWindowLocked(cur_frame) && ContextCensusIsJitterActive()) {
+                if (isInSceneWindowLocked(cur_frame) && jitterActive) {
                     const edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
                     float jittered_block[16]{};
                     if (edpe::jitterEliteDotProjectionBlock(&mutable_unmap_words[16], jittered_block, jitter)) {
@@ -4409,17 +4537,16 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 }
             }
             if (forward) forward(context, resource, subresource);
-            rearmHudDrawProbe(context);
+            rearmHudDrawProbeFast(context);
             return;
         }
         if (mapped_ptr && mapped_byte_width >= 272 && mapped_byte_width <= 4096) {
-            const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
             repairAuxiliarySceneConstantBuffer(
                 static_cast<float*>(mapped_ptr),
                 static_cast<size_t>(mapped_byte_width) / sizeof(float),
                 cur_frame);
             if (forward) forward(context, resource, subresource);
-            rearmHudDrawProbe(context);
+            rearmHudDrawProbeFast(context);
             return;
         }
         if (mapped_ptr && mapped_byte_width == 5376) {
@@ -4968,19 +5095,21 @@ void STDMETHODCALLTYPE observedUpdateSubresource(ID3D11DeviceContext* context,
             }
         }
         if (cbBytes >= 272 && cbBytes <= 4096) {
-            std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
             const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
-            if (isInSceneWindowLocked(cur_frame)) {
-                alignas(16) uint8_t patchedBuf[4096];
-                std::memcpy(patchedBuf, pSrcData, cbBytes);
-                if (repairAuxiliarySceneConstantBuffer(
-                        reinterpret_cast<float*>(patchedBuf),
-                        static_cast<size_t>(cbBytes) / sizeof(float),
-                        cur_frame)) {
-                    if (forward) {
-                        forward(context, pDstResource, DstSubresource, pDstBox, patchedBuf, SrcRowPitch, SrcDepthPitch);
+            if (s_scene_window_closed_frame.load(std::memory_order_acquire) != cur_frame) {
+                std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+                if (isInSceneWindowLocked(cur_frame)) {
+                    alignas(16) uint8_t patchedBuf[4096];
+                    std::memcpy(patchedBuf, pSrcData, cbBytes);
+                    if (repairAuxiliarySceneConstantBuffer(
+                            reinterpret_cast<float*>(patchedBuf),
+                            static_cast<size_t>(cbBytes) / sizeof(float),
+                            cur_frame)) {
+                        if (forward) {
+                            forward(context, pDstResource, DstSubresource, pDstBox, patchedBuf, SrcRowPitch, SrcDepthPitch);
+                        }
+                        return;
                     }
-                    return;
                 }
             }
         }
@@ -5218,14 +5347,22 @@ void logDepthState(ID3D11DeviceContext* context, const PipelineSample& sample,
 }
 
 void endPipelineSample(ID3D11DeviceContext* context) {
+    if (!s_any_pipeline_sample_active.load(std::memory_order_acquire)) return;
     std::lock_guard lock(seen_mutex);
+    bool anyActive = false;
     for (auto& sample : pipeline_samples) {
         if (!sample.active) continue;
         ID3D11DeviceContext* ctx = sample.context ? sample.context : context;
-        if (context && sample.context && sample.context != context) continue;
+        if (context && sample.context && sample.context != context) {
+            anyActive = true;
+            continue;
+        }
         logDepthState(ctx, sample, L"end");
         ctx->End(sample.query);
         sample.active = false;
+    }
+    if (!anyActive) {
+        s_any_pipeline_sample_active.store(false, std::memory_order_release);
     }
 }
 
@@ -5250,6 +5387,7 @@ void beginPipelineSample(ID3D11DeviceContext* context, unsigned bind) {
     sample.after_present = last_present_frame.load(std::memory_order_relaxed);
     sample.wait = 0;
     sample.active = true;
+    s_any_pipeline_sample_active.store(true, std::memory_order_release);
     context->Begin(sample.query);
     logDepthState(context, sample, L"start");
 }
@@ -8092,7 +8230,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             scene_ldr_source.Reset();
             scene_ldr_frame = ~0ull;
             s_pass53_blit_seen_frame = ~0ull;
-        } else if (count >= 1 && targets && targets[0]) {
+        } else if (count >= 1 && targets && targets[0] && !s_upscale_evaluated_this_frame) {
             const UINT sceneW = s_observed_scene_width.load(std::memory_order_relaxed);
             const UINT sceneH = s_observed_scene_height.load(std::memory_order_relaxed);
             if (sceneW > 0 && sceneH > 0) {
@@ -8193,6 +8331,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             }
         }
     }
+    syncSceneWindowAtomic(current_frame);
     }
     PerContextData* ctxData = getOrCreateContextData(context);
     if (!ctxData) return;
@@ -8226,7 +8365,11 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
 
     bool is_main_scene = false;
     bool hud_probe_begin = false;
+    std::unique_lock<std::recursive_mutex> deferredSceneLock(g_scene_ctx_mutex, std::defer_lock);
     if (scene_mrt) {
+        if (!isObservedImmediateContext(context)) {
+            deferredSceneLock.lock();
+        }
         ID3D11Resource* dsv_res = nullptr;
         dsv->GetResource(&dsv_res);
         if (dsv_res) {
@@ -8540,6 +8683,12 @@ thread_local bool s_in_om_detour = false;
 
 OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context) {
     if (!context) return original.load(std::memory_order_acquire);
+    if (context == s_primary_hook_ctx.load(std::memory_order_acquire) &&
+        s_cloned_context_count.load(std::memory_order_acquire) == 0) {
+        if (const auto fast = s_primary_orig_om.load(std::memory_order_acquire)) {
+            return fast;
+        }
+    }
     void** table = *reinterpret_cast<void***>(context);
     const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
     for (size_t i = 0; i < cloneCount; ++i) {
@@ -8568,6 +8717,12 @@ OMSetRenderTargetsFn resolveOriginalOM(ID3D11DeviceContext* context) {
 
 OMSetRenderTargetsAndUnorderedAccessViewsFn resolveOriginalOMUav(ID3D11DeviceContext* context) {
     if (!context) return original_om_uav.load(std::memory_order_acquire);
+    if (context == s_primary_hook_ctx.load(std::memory_order_acquire) &&
+        s_cloned_context_count.load(std::memory_order_acquire) == 0) {
+        if (const auto fast = s_primary_orig_om_uav.load(std::memory_order_acquire)) {
+            return fast;
+        }
+    }
     void** table = *reinterpret_cast<void***>(context);
     const size_t cloneCount = s_cloned_context_count.load(std::memory_order_acquire);
     for (size_t i = 0; i < cloneCount; ++i) {
@@ -8604,10 +8759,15 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         if (forward) forward(context, count, targets, dsv);
         return;
     }
-    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+    const bool immediate = isObservedImmediateContext(context);
+    const bool in_edpe = s_in_edpe_present.load(std::memory_order_acquire);
+    std::unique_lock<std::recursive_mutex> lock(g_scene_ctx_mutex, std::defer_lock);
+    if (immediate && !in_edpe) {
+        lock.lock();
+    }
     if (s_in_om_detour) {
         if (forward) forward(context, count, targets, dsv);
-        if (isObservedImmediateContext(context)) rearmHudDrawProbe(context);
+        if (immediate) rearmHudDrawProbe(context);
         return;
     }
     struct DetourGuard {
@@ -8619,7 +8779,6 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     logContextHookOnce(context, kOMSetRenderTargets, L"OMSetRenderTargets", s_log_om_imm, s_log_om_def);
 
     PerContextData* ctxData = getOrCreateContextData(context);
-    const bool in_edpe = s_in_edpe_present.load(std::memory_order_acquire);
     if (ctxData) {
         ctxData->omCalls.fetch_add(1, std::memory_order_relaxed);
         if (in_edpe) {
@@ -8641,8 +8800,11 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
         if (forward) forward(context, count, targets, dsv);
         return;
     }
-    if (isObservedImmediateContext(context)) {
-        endVSBufferProbe();
+    if (immediate) {
+        if (vs_buffer_probe_active.load(std::memory_order_relaxed) ||
+            draw_probe_active.load(std::memory_order_relaxed)) {
+            endVSBufferProbe();
+        }
         endPipelineSample(context);
     }
     if (forward) forward(context, count, targets, dsv);
@@ -8664,10 +8826,15 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
         if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
         return;
     }
-    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+    const bool immediate = isObservedImmediateContext(context);
+    const bool in_edpe = s_in_edpe_present.load(std::memory_order_acquire);
+    std::unique_lock<std::recursive_mutex> lock(g_scene_ctx_mutex, std::defer_lock);
+    if (immediate && !in_edpe) {
+        lock.lock();
+    }
     if (s_in_om_detour) {
         if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
-        if (isObservedImmediateContext(context)) rearmHudDrawProbe(context);
+        if (immediate) rearmHudDrawProbe(context);
         return;
     }
     struct DetourGuard {
@@ -8680,7 +8847,6 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
         L"OMSetRenderTargetsAndUnorderedAccessViews", s_log_om_uav_imm, s_log_om_uav_def);
 
     PerContextData* ctxData = getOrCreateContextData(context);
-    const bool in_edpe = s_in_edpe_present.load(std::memory_order_acquire);
     if (ctxData) {
         ctxData->omUavCalls.fetch_add(1, std::memory_order_relaxed);
         if (in_edpe) {
@@ -8702,14 +8868,17 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
         if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
         return;
     }
-    if (isObservedImmediateContext(context)) {
-        endVSBufferProbe();
+    if (immediate) {
+        if (vs_buffer_probe_active.load(std::memory_order_relaxed) ||
+            draw_probe_active.load(std::memory_order_relaxed)) {
+            endVSBufferProbe();
+        }
         endPipelineSample(context);
     }
     if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
 
     if (numRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
-        if (isObservedImmediateContext(context)) {
+        if (immediate) {
             rearmHudDrawProbe(context);
         }
         return;
@@ -9446,6 +9615,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_has_staged_camera = false;
         s_staged_from_in_scene = false;
         s_hdr_slot0_seen_frame = ~0ull;
+        s_scene_window_closed_frame.store(~0ull, std::memory_order_release);
         s_pass53_blit_seen_frame = ~0ull;
         s_jitter_injected_frame = ~0ull;
         s_hud_mask_cleared_for_frame = false;
@@ -10174,6 +10344,13 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     s_primary_hook_ctx.store(nullptr, std::memory_order_release);
     s_primary_live_table.store(nullptr, std::memory_order_release);
     s_primary_vtable_hook.store(nullptr, std::memory_order_release);
+    s_primary_live_mode.store(false, std::memory_order_release);
+    s_primary_orig_om.store(nullptr, std::memory_order_release);
+    s_primary_orig_om_uav.store(nullptr, std::memory_order_release);
+    s_primary_ctx_data.store(nullptr, std::memory_order_release);
+    s_any_pipeline_sample_active.store(false, std::memory_order_release);
+    s_scene_window_closed_frame.store(~0ull, std::memory_order_release);
+    s_last_jitter_active_frame.store(~0ull, std::memory_order_release);
     scene_map_target.store(nullptr, std::memory_order_release);
     scene_mapped_data.store(nullptr, std::memory_order_release);
     s_hud_probe_armed_once.store(false, std::memory_order_release);
@@ -10610,6 +10787,10 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
     if (is_immediate && s_primary_hook_ctx.load(std::memory_order_acquire) == nullptr) {
         s_primary_live_table.store(entry.table, std::memory_order_release);
         s_primary_vtable_hook.store(s_context_vtable_hooks[count].get(), std::memory_order_release);
+        s_primary_live_mode.store(mode == edpe::HookMode::LiveCopy, std::memory_order_release);
+        s_primary_orig_om.store(entry.orig_om, std::memory_order_release);
+        s_primary_orig_om_uav.store(entry.orig_om_uav, std::memory_order_release);
+        s_primary_ctx_data.store(getOrCreateContextData(context), std::memory_order_release);
         s_primary_hook_ctx.store(context, std::memory_order_release);
     }
     s_hooked_table_count.store(count + 1, std::memory_order_release);
