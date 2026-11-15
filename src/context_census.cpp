@@ -1402,6 +1402,22 @@ static inline std::uint64_t lookupOrFetchShaderHash(ID3D11DeviceChild* shader,
     return cache[slot].hash;
 }
 
+static inline std::uint64_t getFastBoundVsHash(ID3D11DeviceContext* context) {
+    ID3D11VertexShader* vs = nullptr;
+    context->VSGetShader(&vs, nullptr, nullptr);
+    const std::uint64_t hash = lookupOrFetchShaderHash(vs, s_vs_hash_cache);
+    if (vs) vs->Release();
+    return hash;
+}
+
+static inline std::uint64_t getFastBoundPsHash(ID3D11DeviceContext* context) {
+    ID3D11PixelShader* ps = nullptr;
+    context->PSGetShader(&ps, nullptr, nullptr);
+    const std::uint64_t hash = lookupOrFetchShaderHash(ps, s_ps_hash_cache);
+    if (ps) ps->Release();
+    return hash;
+}
+
 static inline bool getFastBoundShaderHashes(ID3D11DeviceContext* context,
     std::uint64_t& outVsHash, std::uint64_t& outPsHash) {
     if (motion_pair_active) {
@@ -1418,14 +1434,8 @@ static inline bool getFastBoundShaderHashes(ID3D11DeviceContext* context,
         if (FAILED(ps->GetPrivateData(kEdpeShaderHashGuid, &sz, &outPsHash)) || sz != sizeof(outPsHash)) return false;
         return true;
     }
-    ID3D11VertexShader* vs = nullptr;
-    ID3D11PixelShader* ps = nullptr;
-    context->VSGetShader(&vs, nullptr, nullptr);
-    context->PSGetShader(&ps, nullptr, nullptr);
-    outVsHash = lookupOrFetchShaderHash(vs, s_vs_hash_cache);
-    outPsHash = lookupOrFetchShaderHash(ps, s_ps_hash_cache);
-    if (vs) vs->Release();
-    if (ps) ps->Release();
+    outVsHash = getFastBoundVsHash(context);
+    outPsHash = getFastBoundPsHash(context);
     return outVsHash != 0 && outPsHash != 0;
 }
 
@@ -1681,6 +1691,46 @@ bool isGlassShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
     return (vs_hash == 0xF512712C40D93C12ull &&
             (ps_hash == 0x4A71EB0D34E9F2EFull || ps_hash == 0xAFED1D4B087E18A9ull)) ||
            (vs_hash == 0x8C091FFD08644E02ull && ps_hash == 0x70F56E2EB7032E1Aull);
+}
+
+static inline bool isCandidateHudGlassOrStencilVs(std::uint64_t vs_hash) {
+    switch (vs_hash) {
+    // isPrimaryCockpitHudShaderPair
+    case 0x81216C77F90DEDD6ull:
+    case 0x1989E6D3B405FDE0ull:
+    case 0x925ACEDA0153AA5Bull:
+    case 0xE508648660A352B2ull:
+    case 0x5DA53D8B0133341Eull:
+    case 0xDF3503CD07F9B10Cull:
+    case 0x5453D19B6D362364ull:
+    case 0x44DDCDEBAEA137D8ull:
+    case 0xA2C2D5510BF1926Dull:
+    case 0x9B34C331902DC1EDull:
+    case 0x9611A454527F7FEBull:
+    case 0xB932058F26B76691ull:
+    case 0x2CECEC3065EF0D4Aull:
+    case 0x5559BD94B6852E83ull:
+    case 0xB12F7A618E1BDE98ull:
+    case 0xF8D8A92E96419901ull:
+    case 0x1989B75BF034ECC3ull:
+    case 0xC7FA0C0F5DD49180ull:
+    case 0xA47A3315FFF5E2E4ull:
+    case 0x1012E00B3CB44469ull:
+    case 0xA3E5D3FCBC1165F8ull:
+    case 0x1E8D013722FE71B8ull:
+    case 0x12382D2EA45E9632ull:
+    case 0xC31238331D8AC3D4ull:
+    // isHudShaderPair extra VS
+    case 0xB7790CBFC6554097ull:
+    case 0x9BFC7FD232328391ull:
+    case 0xE904D334BC8B11EAull:
+    // isGlassShaderPair
+    case 0xF512712C40D93C12ull:
+    case 0x8C091FFD08644E02ull:
+        return true;
+    default:
+        return false;
+    }
 }
 
 inline constexpr char kHudHdrMergeShader[] = R"hlsl(
@@ -2921,8 +2971,17 @@ HudDrawResult observeHudDrawImpl(ID3D11DeviceContext* context, char kind, UINT i
         if (hud_first_match_seen) ++hud_after_copy_draws;
     }
     std::uint64_t vs_hash = 0, ps_hash = 0;
-    if (!getFastBoundShaderHashes(context, vs_hash, ps_hash)) {
-        if (motion_pair_active) ++hud_shader_missing_hash;
+    if (!motion_pair_active) {
+        vs_hash = getFastBoundVsHash(context);
+        if (!vs_hash || !isCandidateHudGlassOrStencilVs(vs_hash)) {
+            return HudDrawResult::None;
+        }
+        ps_hash = getFastBoundPsHash(context);
+        if (!ps_hash) {
+            return HudDrawResult::None;
+        }
+    } else if (!getFastBoundShaderHashes(context, vs_hash, ps_hash)) {
+        ++hud_shader_missing_hash;
         return HudDrawResult::None;
     }
     if (motion_pair_active) {
@@ -4363,40 +4422,86 @@ UpdateSubresourceFn resolveOriginalUpdateSubresource(ID3D11DeviceContext* contex
         reinterpret_cast<void*>(&observedUpdateSubresource), original_update_subresource);
 }
 
-static constexpr size_t kRejectedCacheSize = 2048;
-static std::atomic<ID3D11Resource*> s_rejected_map_resources[kRejectedCacheSize]{};
-static std::atomic<ID3D11Resource*> s_accepted_dot_cb_resources[kRejectedCacheSize]{};
-static std::atomic<UINT> s_accepted_dot_cb_bytes[kRejectedCacheSize]{};
+static constexpr size_t kResourceCacheSets = 1024;
+static constexpr size_t kResourceCacheWays = 2;
+
+struct RejectedResourceSet {
+    std::atomic<ID3D11Resource*> ways[kResourceCacheWays]{};
+    std::atomic<unsigned> nextVictim{0};
+};
+
+struct DotCbResourceSet {
+    std::atomic<ID3D11Resource*> ways[kResourceCacheWays]{};
+    std::atomic<UINT> bytes[kResourceCacheWays]{};
+    std::atomic<unsigned> nextVictim{0};
+};
+
+static RejectedResourceSet s_rejected_map_cache[kResourceCacheSets]{};
+static DotCbResourceSet s_accepted_dot_cb_cache[kResourceCacheSets]{};
+
+inline size_t resourceCacheSetIndex(ID3D11Resource* res) {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(res);
+    return ((addr >> 4) ^ (addr >> 15)) & (kResourceCacheSets - 1);
+}
 
 inline bool isResourceCachedRejected(ID3D11Resource* res) {
-    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
-    return s_rejected_map_resources[slot].load(std::memory_order_relaxed) == res;
+    const auto& set = s_rejected_map_cache[resourceCacheSetIndex(res)];
+    return set.ways[0].load(std::memory_order_relaxed) == res ||
+           set.ways[1].load(std::memory_order_relaxed) == res;
 }
 
 inline void cacheRejectedResource(ID3D11Resource* res) {
-    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
-    s_rejected_map_resources[slot].store(res, std::memory_order_relaxed);
+    auto& set = s_rejected_map_cache[resourceCacheSetIndex(res)];
+    if (set.ways[0].load(std::memory_order_relaxed) == res ||
+        set.ways[1].load(std::memory_order_relaxed) == res) {
+        return;
+    }
+    if (set.ways[0].load(std::memory_order_relaxed) == nullptr) {
+        set.ways[0].store(res, std::memory_order_relaxed);
+        return;
+    }
+    if (set.ways[1].load(std::memory_order_relaxed) == nullptr) {
+        set.ways[1].store(res, std::memory_order_relaxed);
+        return;
+    }
+    const size_t victim = set.nextVictim.fetch_add(1, std::memory_order_relaxed) & 1u;
+    set.ways[victim].store(res, std::memory_order_relaxed);
 }
 
 inline UINT getCachedDotCbByteWidth(ID3D11Resource* res) {
-    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
-    if (s_accepted_dot_cb_resources[slot].load(std::memory_order_relaxed) == res) {
-        return s_accepted_dot_cb_bytes[slot].load(std::memory_order_relaxed);
+    const auto& set = s_accepted_dot_cb_cache[resourceCacheSetIndex(res)];
+    if (set.ways[0].load(std::memory_order_relaxed) == res) {
+        return set.bytes[0].load(std::memory_order_relaxed);
+    }
+    if (set.ways[1].load(std::memory_order_relaxed) == res) {
+        return set.bytes[1].load(std::memory_order_relaxed);
     }
     return 0;
 }
 
 inline void cacheDotCbResource(ID3D11Resource* res, UINT byteWidth) {
-    const size_t slot = (reinterpret_cast<uintptr_t>(res) >> 4) & (kRejectedCacheSize - 1);
-    s_accepted_dot_cb_bytes[slot].store(byteWidth, std::memory_order_relaxed);
-    s_accepted_dot_cb_resources[slot].store(res, std::memory_order_relaxed);
+    auto& set = s_accepted_dot_cb_cache[resourceCacheSetIndex(res)];
+    size_t targetWay = kResourceCacheWays;
+    if (set.ways[0].load(std::memory_order_relaxed) == res ||
+        set.ways[0].load(std::memory_order_relaxed) == nullptr) {
+        targetWay = 0;
+    } else if (set.ways[1].load(std::memory_order_relaxed) == res ||
+               set.ways[1].load(std::memory_order_relaxed) == nullptr) {
+        targetWay = 1;
+    } else {
+        targetWay = set.nextVictim.fetch_add(1, std::memory_order_relaxed) & 1u;
+    }
+    set.bytes[targetWay].store(byteWidth, std::memory_order_relaxed);
+    set.ways[targetWay].store(res, std::memory_order_relaxed);
 }
 
 inline void clearRejectedResourceCache() {
-    for (size_t i = 0; i < kRejectedCacheSize; ++i) {
-        s_rejected_map_resources[i].store(nullptr, std::memory_order_relaxed);
-        s_accepted_dot_cb_resources[i].store(nullptr, std::memory_order_relaxed);
-        s_accepted_dot_cb_bytes[i].store(0, std::memory_order_relaxed);
+    for (size_t i = 0; i < kResourceCacheSets; ++i) {
+        for (size_t w = 0; w < kResourceCacheWays; ++w) {
+            s_rejected_map_cache[i].ways[w].store(nullptr, std::memory_order_relaxed);
+            s_accepted_dot_cb_cache[i].ways[w].store(nullptr, std::memory_order_relaxed);
+            s_accepted_dot_cb_cache[i].bytes[w].store(0, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -5164,7 +5269,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         if (lateDist < 0.5f && lateTrace > 2.95f) {
                             ++s_ustat.nearLate;
                             if (s_ustat.firstNearLateIdx == 0) s_ustat.firstNearLateIdx = s_ustat.total;
-                            if ((parse_ok || block_cam_ok) &&
+                            if (jitterActive && s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                                s_clean_camera_frame != cur_frame &&
+                                (parse_ok || block_cam_ok) &&
                                 std::fabs(parsed_camera.depthB - nearRef->depthB) <= 1e-3f) {
                                 std::memcpy(s_last_clean_cb1_data, words, 5376);
                                 s_has_clean_cb1_data = true;
@@ -5221,10 +5328,13 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
                     float jittered_block[16]{};
                     if (edpe::jitterEliteProjectionBlock(&mutable_words[1080], jittered_block, jitter)) {
-                        std::memcpy(s_last_clean_cb1_data, mutable_words, 5376);
-                        s_has_clean_cb1_data = true;
-                        s_clean_camera_cb_dirty = true;
-                        s_clean_camera_frame = cur_frame;
+                        if (s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                            (in_main_scene || s_clean_camera_frame != cur_frame)) {
+                            std::memcpy(s_last_clean_cb1_data, mutable_words, 5376);
+                            s_has_clean_cb1_data = true;
+                            s_clean_camera_cb_dirty = true;
+                            s_clean_camera_frame = cur_frame;
+                        }
 
                         std::memcpy(s_last_unjittered_forward_block, &mutable_words[1080], 16 * sizeof(float));
                         std::memcpy(s_last_jittered_forward_block, jittered_block, 16 * sizeof(float));
@@ -8361,17 +8471,22 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         if ((motion_pair_active || reconstruction_active) && motion_color_source &&
             motion_color_frame == current_frame) {
             bool bound = false;
+            bool slot0_matches = false;
             UINT non_null_count = 0;
             for (UINT slot = 0; targets && slot < count; ++slot) {
                 if (targets[slot]) {
                     ++non_null_count;
-                    bound |= sameRenderTargetResource(targets[slot], motion_color_source.Get());
+                    if (!bound && sameRenderTargetResource(targets[slot], motion_color_source.Get())) {
+                        bound = true;
+                        if (slot == 0) {
+                            slot0_matches = true;
+                        }
+                    }
                 }
             }
             // Cobra transitions the HDR color target from MRT RTV3 (Binds 1-3) to RTV0 (Binds 4-7).
             // In Cobra Odyssey, OMSetRenderTargets is called with NumViews=8 and null in unused slots.
-            const bool is_hdr_slot0 = count >= 1 && targets && targets[0] &&
-                sameRenderTargetResource(targets[0], motion_color_source.Get()) &&
+            const bool is_hdr_slot0 = count >= 1 && targets && targets[0] && slot0_matches &&
                 (non_null_count < 4 || (count > 3 && targets[3] == nullptr));
 
         if (motion_color_bound && !bound) {
@@ -8422,24 +8537,31 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                 hud_draw_probe_active.store(true, std::memory_order_relaxed);
             }
             if (s_hud_mask_active_pass) {
-                Microsoft::WRL::ComPtr<ID3D11Device> dev;
-                context->GetDevice(&dev);
-                if (dev && targets && count >= 1 && targets[0]) {
-                    ID3D11Resource* r0 = nullptr;
-                    targets[0]->GetResource(&r0);
-                    if (r0) {
-                        ID3D11Texture2D* t0 = nullptr;
-                        if (SUCCEEDED(r0->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t0)))) {
-                            D3D11_TEXTURE2D_DESC td{};
-                            t0->GetDesc(&td);
-                            const UINT swapW = s_swapchain_width.load(std::memory_order_relaxed);
-                            const UINT swapH = s_swapchain_height.load(std::memory_order_relaxed);
-                            const UINT hudW = (swapW > 0) ? swapW : td.Width;
-                            const UINT hudH = (swapH > 0) ? swapH : td.Height;
-                            ensureHudMaskResources(dev.Get(), hudW, hudH);
-                            t0->Release();
+                const UINT swapW = s_swapchain_width.load(std::memory_order_relaxed);
+                const UINT swapH = s_swapchain_height.load(std::memory_order_relaxed);
+                const bool hudMaskReady =
+                    s_hud_mask_texture &&
+                    swapW > 0 && swapH > 0 &&
+                    s_hud_mask_width == swapW && s_hud_mask_height == swapH &&
+                    s_hud_mask_device == s_scene_device.load(std::memory_order_relaxed);
+                if (!hudMaskReady) {
+                    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+                    context->GetDevice(&dev);
+                    if (dev && targets && count >= 1 && targets[0]) {
+                        ID3D11Resource* r0 = nullptr;
+                        targets[0]->GetResource(&r0);
+                        if (r0) {
+                            ID3D11Texture2D* t0 = nullptr;
+                            if (SUCCEEDED(r0->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t0)))) {
+                                D3D11_TEXTURE2D_DESC td{};
+                                t0->GetDesc(&td);
+                                const UINT hudW = (swapW > 0) ? swapW : td.Width;
+                                const UINT hudH = (swapH > 0) ? swapH : td.Height;
+                                ensureHudMaskResources(dev.Get(), hudW, hudH);
+                                t0->Release();
+                            }
+                            r0->Release();
                         }
-                        r0->Release();
                     }
                 }
                 if (s_hud_mask_rtv && !s_hud_mask_cleared_for_frame) {
