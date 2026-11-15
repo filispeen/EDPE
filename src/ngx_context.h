@@ -83,7 +83,7 @@ public:
     static uint32_t get_quality_mode();
     static void set_quality_mode(uint32_t mode);
 
-    // Preset values: 0 = Auto (Preset K), 10 = Preset J, 11 = Preset K, 12 = Preset L, 13 = Preset M
+    // Preset values: 0 = Auto (Preset K), 5 = Preset E (CNN Fast), 10 = Preset J, 11 = Preset K, 12 = Preset L, 13 = Preset M
     static uint32_t get_preset();
     static void set_preset(uint32_t preset);
 

@@ -25,7 +25,7 @@ struct NgxFeatureState {
     bool dlss_available = false;
     bool dlaa_available = false;
     uint32_t quality_mode = 0; // 0=Unknown, 1=Quality, 2=Balanced, 3=Performance, 4=UltraPerformance
-    uint32_t preset = 0;       // 0=Auto(K), 10=J, 11=K, 12=L, 13=M
+    uint32_t preset = 0;       // 0=Auto(K), 5=E(CNN Fast), 10=J, 11=K, 12=L, 13=M
     uint32_t active_perf_quality = 0;
     uint32_t active_preset = 0;
     uint32_t render_width = 0;
@@ -64,10 +64,14 @@ static NgxFeatureSlot g_feature_slots[2]{}; // [0] = LDR, [1] = HDR
 static ID3D11Device* g_ngx_device = nullptr;
 static ID3D11Texture2D* g_exposure_one = nullptr;
 
+static uint32_t resolveSrPreset(uint32_t preset) {
+    return (preset == 5u || (preset >= 10u && preset <= 13u)) ? preset : 11u;
+}
+
 // Presets L (12) and M (13) are calibrated for Ultra-Performance / Performance ratios;
 // clamp DLAA, UltraQuality, and MaxQuality to Preset K (11) to prevent high-contrast ringing.
 static uint32_t dlaaSafePreset(uint32_t preset, NVSDK_NGX_PerfQuality_Value quality) {
-    const uint32_t base = (preset >= 10u && preset <= 13u) ? preset : 11u;
+    const uint32_t base = resolveSrPreset(preset);
     if ((quality == NVSDK_NGX_PerfQuality_Value_DLAA ||
          quality == NVSDK_NGX_PerfQuality_Value_UltraQuality ||
          quality == NVSDK_NGX_PerfQuality_Value_MaxQuality) &&
@@ -375,7 +379,7 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     }
 
     // Apply selected DLSS Transformer/CNN preset (defaulting to Preset K = 11).
-    const uint32_t srPreset = (preset >= 10u && preset <= 13u) ? preset : 11u;
+    const uint32_t srPreset = resolveSrPreset(preset);
     NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, effectivePreset);
     NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, effectivePreset);
     NVSDK_NGX_Parameter_SetUI(g_ngx_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, srPreset);
