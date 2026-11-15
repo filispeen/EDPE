@@ -10,328 +10,263 @@
 
 </div>
 
-**EDPE (Elite Dangerous Performance Enhanced)** is a standalone graphics enhancement proxy mod targeting the **2D Direct3D 11 renderer of Elite Dangerous** (Cobra engine).
+EDPE is a `dxgi.dll` proxy for the 2D Direct3D 11 renderer in Elite Dangerous (Cobra engine). It intercepts DXGI and Direct3D 11 calls to add temporal anti-aliasing and upscaling, leaving game binaries, gameplay, and network code untouched.
 
-Elite Dangerous natively lacks modern temporal reconstruction technologies in its standard 2D rendering path. EDPE injects temporal anti-aliasing and super-resolution reconstruction into the engine pipeline via non-invasive graphics API observation—without modifying game binaries, game logic, or network code.
+## Current status (`v0.7.0`)
 
----
+As of November 2026 (`v0.7.0`), the working pipeline covers:
 
-## Current Status: Milestone `v0.7.0` (Cockpit Holographic HUD Mask & Composite Pass, Vector Font Overlay, Keyed Mutex Synchronization)
+* `dxgi.dll` proxy forwarding system DXGI calls while hooking `IDXGIFactory::CreateSwapChain`, `IDXGISwapChain::Present`, and `D3D11CreateDevice` / `D3D11CreateDeviceAndSwapChain` via IAT. Constant buffer discovery stops once the scene camera is found, and `Unmap()` skips untracked buffers.
+* Reversed-Z scene depth discovery (`DSV #2`, `DXGI_FORMAT_R32G8X24_TYPELESS`, $B=0.025$) and once-per-frame parsing of the 5376-byte `CB0` camera buffer, with a 2nd-order kinematic filter and projection fallback to reject auxiliary eye, mirror, canopy reflection, and sagittal probes.
+* Halton `(2,3)` subpixel projection jitter injected into `CB0` words `1080`-`1095` (standing down when reconstruction is off), paired with a GPU pass that renders current-to-previous motion vectors to `DXGI_FORMAT_R16G16_FLOAT`, including analytical rotational motion at infinity for the skybox and stars.
+* Backend-neutral `TemporalFrameInputs` feeding `IUpscalerBackend` implementations for NVIDIA DLAA and DLSS Super Resolution (NGX Project ID `48d353f3-d07b-4048-876b-09f8622f5a27`, presets `Auto`, `J`, `K`, `L`, `M`), AMD FSR 3.1.2 Native AA and Super Resolution (native D3D11 compute), and native D3D11 TAA. Render scale is detected from scene depth versus swapchain dimensions, and `Custom.4.4.fxcfg` / `Custom.4.0.fxcfg` `<SSAAMultiplier>` stays synced when enabled.
+* Native UI and cockpit HUD separation (`UiLayer` and `UiCompositePass`): pre-HUD clean scene color goes to the upscaler, cockpit holographic draws are redirected to `s_hud_mask_texture` (`R11G11B10_FLOAT`) with viewport unjittering, and native menus plus HUD are composited back over the reconstructed world.
+* Multi-device DXGI Keyed Mutex synchronization, color-source debouncing, crash minidump logging, DirectInput and `WndProc` input isolation when the menu is open (protecting flight controls and HOTAS), async GPU timestamp queries, and optional QPC per-pass profiling.
+* Dear ImGui overlay (`F5`, ProggyForever vector font), toggleable Performance HUD (`F7`) with a 120-sample frametime graph (`8.3 ms` and `16.6 ms` reference lines, 15 Hz text refresh, background NVML GPU/VRAM polling), sequential comparison capture to `comparison/` (16-frame warmup, 5-second wait between backends), and `DEV=0` / `DEV=1` gating for developer panels and `F9` (`jitter_view.log`).
 
-As of **November 2026 (`v0.7.0`)**, EDPE has achieved:
-
-* **Cockpit Holographic HUD Mask & Composite Pass:** Dedicated holographic UI extraction and subpixel projection unjittering pass (`s_hud_mask_texture` in `R11G11B10_FLOAT`) composited via `UiCompositePass`, eliminating motion blur, ghosting, and cutout artifacts on cockpit holographic panels and target displays.
-* **HUD Debug Visualizer:** Dedicated real-time visual inspection pass for cockpit HUD geometry and isolated UI mask elements.
-* **Vector Font Dear ImGui Overlay:** ImGui overlay refactored with ProggyForever vector font, delivering crisp, non-blurry menu rendering across 1080p, 1440p, and 4K displays.
-* **Color Source Debounce & Stability:** Cross-device Keyed Mutex synchronization and swapchain color debounce resolving transient flickering during camera transitions and scene re-renders.
-* **Real-Time Frametime Graph in Performance HUD (`F7`):** Multi-curve 120-sample rolling history graph rendered directly in the HUD overlay, displaying Total Frametime (Orange), Game Frametime (White), and Upscaler/Reconstruction Frametime (Cyan) with 60 FPS (16.67 ms) and 30 FPS (33.33 ms) grid reference lines. Color-coded numerical metrics are padded with leading spaces for stable, non-jumping readouts.
-* **Multi-Backend Comparison Benchmark Tool:** Automated sequential capture across all upscaler backends (`Native / Bypass`, `NVIDIA DLSS / DLAA`, `AMD FSR Native AA / SR`, `Native D3D11 TAA`) with 5-second backend warmup. Saves uncompressed comparison frames with optional on-frame HUD telemetry and GPU reconstruction time stamps directly to `edpe-captures/comparison/`.
-* **Rate-Limited Telemetry & QPC Profiler:** Display telemetry and QPC profiler metrics are rate-limited to 66.66 ms (~15 Hz), preventing number flickering and reducing UI render overhead on the GPU and CPU at high frame rates.
-* **Developer Mode Toggle (`DEV=0` / `DEV=1`):** User-friendly menu simplification for regular players (`DEV=0` by default in `edpe.ini`). Hides developer capture/tuning controls and selectively gates developer hotkeys (`F8`, `F9`), leaving a clean interface with `F5: menu | F7: perf HUD`.
-* **Sticky Bottom Footer & UI Refinements:** Menu footer dynamically anchors to the bottom edge of the Dear ImGui window, featuring a clickable author link (`by FILISPEEN`) linking directly to GitHub.
-* **Cross-Device Scene Rendering & Multi-GPU Interop:** Native support for multi-device and cross-adapter rendering pipelines (such as RTX 4080 systems in Odyssey) using DXGI Keyed Mutex synchronization, completely resolving the issue where DLAA remained stuck in bypass mode (Issue #5).
-* **Native UI Composite Pass (`UiCompositePass`):** Dedicated graphics pass that isolates native-resolution HUD, cockpits, holograms, and menus from the pre-UI scene LDR buffer and composites them cleanly over the reconstructed DLAA/DLSS/FSR world.
-* **Auxiliary Camera & Eye Probe Filtering:** High-precision rejection filters for secondary camera views (stereo eye probes, rear mirror probes, sagittal cockpit head probes, canopy reflections, IPD probes), eliminating camera deadlock, periodic 1-second strobing, and view-axis disorientation.
-* **Two-Phase Camera Staging & Kinematic Prediction:** 2nd-order kinematic probe filtering with forward anchor prediction and pilot camera fallback derived directly from the projection block when rows 932-943 are incoherent.
-* **Runtime Sharpening Control:** Real-time interactive sharpening slider (0.0-1.0) in the Dear ImGui overlay (`F5`) wired directly to upscaler backends (NVIDIA NGX / AMD FidelityFX).
-* **Subpixel Jitter & Strobe Stability:** Synchronized Halton (2,3) jitter sign conventions and fail-open stand-down, resolving image vibration, ghosting streaks, and teleport recovery during camera cuts.
-* **Performance HUD Reliability:** Fixed 0.0 FPS and frametime latching during and after loading screens.
-
-* **Consolidated DXGI Proxy (`dxgi.dll`):** Single drop-in proxy library handling DXGI swapchain observation, D3D11 device creation hooks, temporal reconstruction, and runtime overlay management without black screens, crashes, or rendering artifacts.
-* **Hot-Path CPU Overhead Elimination:** Eliminated large FPS drops during active temporal reconstruction (TAA, DLAA, DLSS). Constant buffer discovery in `Map()` terminates immediately upon identifying the scene camera; `Unmap()` skips untracked resources without stale buffer checks; HUD draw probes are armed once rather than re-armed each frame.
-* **Background NVML Hardware Polling:** GPU utilization and VRAM statistics are polled asynchronously on a dedicated worker thread with a 500 ms cached value, preventing NVML driver stalls on the render thread.
-* **Overlay Input Isolation & HOTAS Protection:** Robust input isolation using DirectInput proxying and window message filtering (`WM_INPUT`, cursor clipping, and focus resets), preventing mouse and keyboard interference with flight controls and HOTAS peripherals (addressing Issue #1).
-* **Canopy Reflection Sub-Camera Filter:** Depth/luma filtering that isolates and rejects cockpit canopy reflection passes, eliminating station pulsing, jitter artifacts, and edge halos in native TAA and temporal upscalers.
-* **Analytical Skybox / Star Motion Vectors:** Rotational motion vectors at infinity for stars and skybox, preventing star erasure, smearing, and corona artifacts during high-speed ship maneuvers.
-* **Scene Depth Discovery:** Successfully isolated authoritative reversed-Z scene depth buffer (`DSV #2`, `DXGI_FORMAT_R32G8X24_TYPELESS`, $B=0.025$).
-* **Dynamic Camera Matrix Tracking:** Parses the 5376-byte dynamic constant buffer (`CB0`), extracting view, projection, and depth parameters each frame.
-* **Projection Jitter Injection:** Generates Halton (2,3) subpixel projection jitter and injects it into dynamic CB0 projection matrix words (1080–1095) with **automatic fail-open stand-down** when reconstruction is disabled.
-* **Camera-Depth Motion Vectors:** Real-time GPU motion pass generates per-pixel current→previous screen-space motion vectors (`DXGI_FORMAT_R16G16_FLOAT`).
-* **Vendor-Neutral Temporal Input Layer:** Abstracted `TemporalFrameInputs` structure decoupling engine state from vendor reconstruction SDKs.
-* **Native D3D11 TAA (Temporal Anti-Aliasing):** Vendor-neutral native temporal anti-aliasing reconstruction pass utilizing Halton (2,3) projection jitter accumulation, camera-depth motion reprojection, and 3x3 YCoCg variance clipping with zero external SDK dependencies.
-* **NVIDIA DLAA Evaluation:** Official NVIDIA NGX SDK integrated with EDPE-owned Project ID (`48d353f3-d07b-4048-876b-09f8622f5a27`). DLAA runs on the finished swapchain backbuffer at `Present` prior to overlay rendering, achieving **rock-solid temporal anti-aliasing with ~0.3 ms GPU overhead** and zero subpixel image vibration.
-* **NVIDIA DLSS Super Resolution:** Reconstructs true sub-native 3D scenes (via Cobra in-game Supersampling < 1.0x) into native resolution, supporting Quality, Balanced, Performance, and Ultra Performance with DLSS Presets (Auto, J, K, L, M).
-* **AMD FSR 3.1.2 Verified In-Game:** Verified in Elite Dangerous Odyssey for both FSR Native AA at 1.0x SSAA and FSR Super Resolution at sub-native render scales (< 1.0x SSAA) via native D3D11 compute path.
-* **Real-Time Performance HUD Overlay (`F7` / `F5`):** Built-in heads-up display showing live FPS, game frametime, upscaler frametime, total frametime, active GPU adapter name, GPU usage %, and dedicated VRAM usage (used/total and %). Features scaling slider (0.5x–2.0x), interactive mouse dragging in F5 menu, persistent screen positioning in `edpe.ini`, and complete transparent click-through protection against input leaks.
-* **Integrated High-Precision QPC Profiler:** Microsecond-precision breakdown of engine, motion pass, upscaler execution, UI composition, and overhead with toggleable in-game display.
-* **Subpixel Jitter Debug View & Log Recorder (`F8` / `F9`):** Real-time on-screen jitter visualization and frame-indexed logging to `jitter_view.log` for tracking subpixel jitter offsets, luma correlation, and frame stability.
-* **Automatic Scaling Detection:** Zero-configuration render scaling detection comparing scene depth dimensions against window resolution, automatically choosing DLAA / FSR Native AA / TAA (at 1.0x) or DLSS / FSR Super Resolution (at < 1.0x).
-* **Native UI Protection & Composite:** Dedicated shader pass (`UiCompositePass`) preserves native-resolution HUD, text, cockpits, and menus, seamlessly compositing them over reconstructed DLSS/FSR frames.
-* **Automated Test Suite:** 15 automated tests passing in CTest covering math, camera deltas, pixel formats, proxy and vtable hooks, GPU motion passes, jitter reports, crash logger, HUD debug, and UI composition.
-
----
-
-## Roadmap & Technology Matrix
-
-| Phase | Technology / Milestone | Status | Description |
-|:---:|:---|:---:|:---|
-| **0–2** | **Reconnaissance & Resource Census** | ✅ **Verified** | Identified D3D11 context calls, swapchain layout (2560×1440 R8G8B8A8), MRT bindings, and CB0 lifecycle. |
-| **3** | **Scene Depth Extraction** | ✅ **Verified** | DSV #2 reversed-Z depth buffer confirmed ($B=0.025$) with coherent full-frame geometry. |
-| **4** | **Camera & Projection Tracking** | ✅ **Verified** | 5376-byte dynamic CB0 parsed; primary 3D camera latched once per frame. |
-| **5** | **Projection Jitter Injection** | ✅ **Verified** | Halton (2,3) injected into CB0 with fail-open bypass when upscaler is inactive. |
-| **6** | **Motion Vectors Pass** | ✅ **Verified** | Screen-space camera-depth motion vectors rendered to `R16G16_FLOAT`. |
-| **7** | **Shared Temporal Input Layer** | ✅ **Verified** | Backend-neutral `TemporalFrameInputs` and `IUpscalerBackend` architecture implemented. |
-| **8** | **NVIDIA DLAA** | ✅ **Verified** | Official NGX DLAA evaluated at native resolution; ~0.3 ms GPU time, pristine anti-aliasing. |
-| **9–10** | **True Render Scale & NVIDIA DLSS SR** | ✅ **Verified** | Lower 3D scene render resolution via Cobra SSAA (< 1.0x) with full DLSS SR reconstruction and zero-configuration auto-scaling. |
-| **11** | **AMD FSR Super Resolution & Native AA** | ✅ **Verified** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated and verified in-game; supports FSR Native AA & FSR Super Resolution with fail-open fallback. |
-| **12** | **Native-Resolution HUD Separation** | ✅ **Verified** (Works with menus; cockpit UI refined) | Native-res HUD composited over upscaled DLSS/FSR 3D scene (`UiCompositePass`), protecting cockpit/UI crispness. |
-| **13–15** | **D3D11/D3D12 Interop & Frame Generation** | 🔬 **Research** | NVIDIA DLSS Frame Generation (Streamline) & AMD FSR Frame Generation via interop bridge. |
-| **16** | **Intel XeSS Super Resolution & Native AA** | 📋 **Planned / Research** | Intel XeSS 1.3+ AI temporal upscaler with dual-engine execution: Intel XMX hardware acceleration on Arc and universal DP4a fallback across all vendors via D3D11/D3D12 bridge. |
-| **17** | **Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag)** | 📋 **Planned** | Standalone and FG-coupled input latency minimization via NVIDIA Reflex SDK (Low Latency / Boost) and AMD Anti-Lag / Anti-Lag 2 SDK, dynamic sleep pacing, marker injection, and latency telemetry. |
-| **18** | **NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)** | 📋 **Research** | AI-driven Ray Reconstruction / neural denoising replacing hand-tuned temporal filters for reflections and lighting via NGX Ray Reconstruction. |
-| **19** | **Third-Party Mod Compatibility (ReShade, EDHM, 3Dmigoto)** | 📋 **Planned** | Proxy DLL chaining (`edpe.ini` `[Proxy]`), post-upscale ReShade injection, non-destructive HUD heuristics for EDHM custom colors, and cooperative input routing. |
-
-See [STATUS.md](STATUS.md) for verified facts and [PLAN.md](PLAN.md) for the complete roadmap.
-
----
+See [STATUS.md](STATUS.md) for verified test and capture logs, and [PLAN.md](PLAN.md) for planned future phases (D3D11/D3D12 interop, Frame Generation, Intel XeSS, NVIDIA Reflex / AMD Anti-Lag, DLSS-NR, and third-party mod chaining).
 
 ## Architecture
 
-EDPE enforces a strict separation: Elite-specific engine reverse-engineering belongs to EDPE; vendor-specific reconstruction logic lives behind modular backend interfaces.
+Elite-specific observation and temporal input generation stay inside EDPE; vendor SDK calls sit behind `IUpscalerBackend`.
 
 ```mermaid
 flowchart TD
-    Game["Elite Dangerous (Cobra Engine D3D11)"] --> Proxy["EDPE Proxy Injection<br/>(dxgi.dll)"]
+    Game["Elite Dangerous (Cobra D3D11)"] --> Proxy["dxgi.dll Proxy & IAT Hooks"]
 
-    Proxy --> Census["Context Census & CB0 Tracking<br/>• Reverse-Z Depth (DSV #2)<br/>• Camera matrices (CB0 Map/Unmap)<br/>• Emissive glow pass (RTV3)"]
-    Proxy --> Swapchain["Swapchain Observer<br/>• Backbuffer tracking<br/>• First-Present hook<br/>• WndProc message handler"]
+    Proxy --> Census["Context Census & CB0 Tracking<br/>Reverse-Z Depth (DSV #2)<br/>CB0 Camera Matrices<br/>HUD Draw Redirection (UiLayer)"]
+    Proxy --> Swapchain["Swapchain Observer<br/>Backbuffer & Present Hooks<br/>WndProc / DirectInput Filter"]
 
-    Census --> TemporalGen["Temporal Input Generation<br/>• Halton (2,3) projection jitter<br/>• GPU camera-depth motion vectors"]
+    Census --> TemporalGen["Temporal Input Generation<br/>Halton (2,3) Jitter<br/>GPU Motion Pass (R16G16_FLOAT)"]
 
-    TemporalGen --> SharedInputs["Shared TemporalFrameInputs<br/>(color, depth, motion, jitter, camera)"]
+    TemporalGen --> SharedInputs["TemporalFrameInputs"]
     Swapchain --> SharedInputs
 
-    subgraph Backends ["Reconstruction Backends"]
-        Nvidia["NVIDIA Backend<br/>(NGX DLAA / DLSS SR)"]
-        Amd["AMD Backend<br/>(FSR Native AA / SR)"]
-        Taa["Native TAA<br/>(D3D11 Reconstruction)"]
+    subgraph Backends ["IUpscalerBackend"]
+        Nvidia["NVIDIA NGX<br/>(DLAA / DLSS SR)"]
+        Amd["AMD FidelityFX<br/>(FSR 3.1.2 Native AA / SR)"]
+        Taa["Native D3D11 TAA"]
     end
 
     SharedInputs --> Nvidia
     SharedInputs --> Amd
     SharedInputs --> Taa
 
-    Nvidia --> Reconstructed["Reconstructed 3D Scene"]
-    Amd --> Reconstructed
-    Taa --> Reconstructed
+    Nvidia --> Composite["UiCompositePass<br/>(Native HUD & Menus)"]
+    Amd --> Composite
+    Taa --> Composite
 
-    Reconstructed --> ImGui["Dear ImGui Overlay (F5)"]
+    Composite --> ImGui["Dear ImGui Menu (F5) & Perf HUD (F7)"]
     ImGui --> Present["IDXGISwapChain::Present"]
 ```
 
-### Core Architectural Principles
-1. **API Observation over Binary Patching:** Intercepts D3D11/DXGI COM interfaces and buffer unmaps instead of patching game executable memory.
-2. **Fail-Open Design:** If any upscaler or temporal input fails, EDPE automatically stands down, disables projection jitter, restores original rendering, and presents the native frame safely.
-3. **No Duplicate Pipelines:** Common temporal inputs (`TemporalFrameInputs`) are calculated once and translated into vendor-specific conventions (NVIDIA/AMD/TAA) at the backend boundary.
-4. **Fair Play Guarantee:** Rendering enhancements only. No gameplay automation, no networking hooks, no security bypasses.
+If an upscaler backend fails to initialize or evaluate, EDPE disables jitter, restores the unscaled game frame, and presents normally.
 
----
+## Controls and hotkeys
 
-## In-Game Controls & Hotkeys
-
-| Hotkey | Action | Description |
+| Hotkey | Action | Notes |
 |:---:|:---|:---|
-| **`F5`** | **Toggle EDPE Menu** | Opens/closes the Dear ImGui control panel. When closed, all mouse and keyboard inputs pass freely to the game. |
-| **`F7`** | **Toggle Performance HUD** | Toggles the real-time telemetry overlay (FPS, frametimes, frametime history graph, GPU adapter, GPU usage %, dedicated VRAM). |
-| **`F8`** | **Toggle Jitter Debug View** | *(DEV Mode)* Toggles the real-time visual overlay for subpixel jitter inspection. |
-| **`F9`** | **Record Jitter Diagnostics** | *(DEV Mode)* Starts recording subpixel jitter, luma, and camera motion telemetry to `jitter_view.log`. |
-| **`Insert`** | **Game Pass-Through** | Configured to pass transparently to the original game window procedure. |
+| `F5` | Toggle EDPE menu | Opens and closes the Dear ImGui panel. When closed, mouse and keyboard input passes straight to the game. |
+| `F7` | Toggle Performance HUD | Shows or hides FPS, 1% low FPS, game/upscaler/total frametimes, frametime graph, GPU usage, and VRAM usage. |
+| `F9` | Record jitter diagnostics | Available only when `DEV=1`. Starts or stops frame-indexed logging to `jitter_view.log`. |
 
-### Dear ImGui Control Panel Features (`F5`)
-* **Upscaler Backend Selector:** Switch seamlessly between `Native (Bypass)`, `NVIDIA DLSS / DLAA`, `AMD FSR (Native AA / SR)`, and `Native D3D11 TAA`.
-* **Live GPU Reconstruction Time & Profiler:** Asynchronous GPU timestamp queries and optional QPC microsecond profiler detailing exact upscaler overhead (~0.3 ms for DLAA).
-* **Jitter Controls & Diagnostics:** Real-time toggle, subpixel vibration test override, phase count cycle slider (default: 32), X/Y inversion, and axis swap.
-* **Motion Vector Tuning:** Motion scale slider, X/Y inversion toggles, zero-motion force mode, and skybox rotational motion toggle.
-* **Interactive Buffer Viewers:** Dedicated preview windows for Scene Depth, Scene Color, Emissive Glow (Early HDR), and Motion Vectors.
-* **Configuration Persistence:** Save runtime tuning adjustments directly to `edpe.ini` via the UI button.
+Inside the `F5` menu:
+
+* `HUD & UI Scaling`: toggle the Performance HUD, pick one of 8 anchor positions (or drag the HUD directly while the menu is open), and adjust `HUD Scale` and `UI Scale` (`0.50x` to `2.50x`).
+* `Upscaler & Image Quality`: switch between `Native (Bypass)`, `NVIDIA DLSS / DLAA`, `AMD FSR (Native AA / SR)`, and `TAA (Temporal Anti-Aliasing)`, choose the DLSS preset (`Auto`, `J`, `K`, `L`, `M`), adjust sharpening (`0.00` to `1.00`), and toggle `Preserve Native UI`.
+* `Debug View`: switch between `None` and `Subpixel Jitter` to highlight jittered pixels in green over a desaturated scene. (The HUD mask debug pass in `hud_debug_pass.cpp` has no UI toggle and is only exercised by `hud_debug_test` or `[HUD] DebugView=1` in `edpe.ini`.)
+* Developer panels (`DEV=1`): sequential comparison capture across active backends (`comparison/`), DSV bind sequence and snapshot viewers (depth, scene color, emissive, motion, HUD mask), jitter overrides and `jitter.log` controls, and motion vector tuning (`ZeroMotion`, `InvertX`, `InvertY`, `Scale`).
 
 ## Configuration (`edpe.ini`)
 
-EDPE automatically reads and writes configuration parameters from `edpe.ini` located in the game directory.
+EDPE reads and writes `edpe.ini` in the same folder as `EliteDangerous64.exe`, and writes runtime diagnostics to `edpe.log`.
 
-> **Note on Upscaling Mode:** The upscaling mode is automatically determined by Elite Dangerous's in-game Supersampling setting (`Options -> Graphics -> Display -> Supersampling` or `<SSAAMultiplier>` in `Custom.4.4.fxcfg`):
-> * `1.0x`: Native AA (NVIDIA DLAA / AMD FSR Native AA / Native D3D11 TAA)
-> * `0.67x`: Quality (~1.5x upscaling)
-> * `0.58x`: Balanced (~1.7x upscaling)
-> * `0.50x`: Performance (~2.0x upscaling)
-> * `0.33x`: Ultra Performance (~3.0x upscaling)
->
-> EDPE continuously inspects the internal 3D scene render dimensions against the presentation swapchain, dynamically configuring the upscaler mode without requiring manual mode configuration.
+Upscaling quality ratios follow Elite Dangerous's in-game **Supersampling** setting (`Options -> Graphics -> Display -> Supersampling` or `<SSAAMultiplier>` in `Custom.4.4.fxcfg` / `Custom.4.0.fxcfg`), determined automatically from scene depth dimensions:
+
+* `1.0x`: Native AA (DLAA, FSR Native AA, or TAA)
+* `0.67x`: Quality
+* `0.58x`: Balanced
+* `0.50x`: Performance
+* `0.33x`: Ultra Performance
+
+Example `edpe.ini` matching the keys read by `src/config.h` (note that `edpe.ini` in the repository ships with a minimal subset, and missing keys fall back to `config.h` defaults):
 
 ```ini
 [Upscaler]
-; Upscaler backend: 0 = Native (Bypass), 1 = NVIDIA DLSS/DLAA, 2 = AMD FSR, 3 = Native D3D11 TAA
+; 0 = Native (Bypass), 1 = NVIDIA DLSS/DLAA, 2 = AMD FSR, 3 = Native D3D11 TAA
 Backend=0
-; DLSS Preset: 0 = Auto, 1 = J, 2 = K, 3 = L, 4 = M
+; DLSS Preset: 0 = Auto (K), 10 = J, 11 = K, 12 = L, 13 = M
 Preset=0
 AutoSyncEliteConfig=1
 PreserveNativeUi=1
 HdrInput=0
-Sharpness=0.0
+Sharpness=0.50
 
 [Jitter]
-InvertX=0           ; Invert horizontal jitter passed to upscaler
-InvertY=0           ; Invert vertical jitter passed to upscaler
-SwapXY=0            ; Swap jitter X and Y axes
-Scale=1.00          ; Multiplier for jitter offset (0.0 = disable)
-PhaseCount=32       ; Sequence phase repeat count (DLAA standard: 32)
+Enabled=1
+InvertX=0
+InvertY=0
+SwapXY=0
+Scale=1.00
+; Repo edpe.ini defaults to 8; config.h fallback is 32 if omitted
+PhaseCount=8
 
 [Motion]
-ZeroMotion=0        ; Force stationary motion vectors (0,0) for debugging
-InvertX=0           ; Invert horizontal motion vector direction
-InvertY=0           ; Invert vertical motion vector direction
-Scale=1.00          ; Scale multiplier for motion vectors
+ZeroMotion=0
+InvertX=0
+InvertY=0
+Scale=1.00
 
 [Overlay]
-ShowPerfOverlay=1   ; Toggle real-time performance telemetry HUD (F7)
-EnableProfiler=0    ; High-precision QPC per-pass execution profiler
-Corner=1            ; 0 = Top-Left, 1 = Top-Right, 2 = Bottom-Left, 3 = Bottom-Right
-Scale=1.50          ; HUD scale multiplier (0.5x - 2.0x)
-UiScale=1.00        ; Menu UI scale multiplier (0.5x - 2.5x)
-PosX=1900.0         ; Custom dragged X position (-1.0 = use corner default)
-PosY=496.0          ; Custom dragged Y position (-1.0 = use corner default)
-DEV=0               ; 0 = Standard gamer mode (hides dev tools, gates F8/F9), 1 = Full developer mode
+ShowPerfOverlay=1
+EnableProfiler=0
+; 0=Top-Left, 1=Top, 2=Top-Right, 3=Left, 4=Right, 5=Bottom-Left, 6=Bottom, 7=Bottom-Right
+Corner=1
+Scale=1.50          ; Performance HUD scale (0.50 - 2.50 in UI)
+UiScale=1.00        ; Menu UI scale (0.50 - 2.50 in UI)
+PosX=1900.0         ; Custom dragged X (-1.0 uses Corner)
+PosY=496.0          ; Custom dragged Y (-1.0 uses Corner)
+DEV=0               ; 0 = standard mode, 1 = show dev panels and enable F9
 ```
 
-Runtime diagnostics and initialization events are written to `edpe.log` beside the game executable.
+## Building
 
----
+Requirements:
 
-## Building EDPE
+* Windows 10/11 x64
+* Visual Studio 2022 with **Desktop development with C++** (MSVC x64 toolchain and Windows SDK)
+* CMake 3.25 or newer
+* Python 3 (CMake runs `tools/fetch_ffx_dx11.py` automatically if `external/ffx-dx11` is missing)
+* `external/imgui` Git submodule
+* Optional: NVIDIA NGX SDK under `external/DLSS` (if omitted, CMake builds without DLAA/DLSS support)
 
-### Prerequisites
-* Windows 10/11 x64.
-* Visual Studio 2022 with **Desktop development with C++** (MSVC x64 toolchain, Windows 10/11 SDK).
-* CMake 3.25 or newer.
-* Python 3 (for fetching AMD FidelityFX DX11 SDK).
-* Dear ImGui Git submodule.
-* NVIDIA NGX SDK (for DLAA/DLSS; placed under `external/DLSS`).
-* AMD FidelityFX DX11 SDK (fetched via `python tools/fetch_ffx_dx11.py`).
+Clone and initialize submodules:
 
-### 1. Clone & Initialize Submodules
 ```powershell
 git clone https://github.com/filispeen/EDPE.git
 cd EDPE
 git submodule update --init --recursive
 ```
 
-*(Optional)* You can run `install-build-requirements.ps1` from an elevated PowerShell to automatically configure dependencies:
+Optionally, `install-build-requirements.ps1` installs Git, CMake, and Visual Studio Build Tools via `winget` and initializes submodules:
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install-build-requirements.ps1
 ```
 
-### 2. Compile via x64 Developer PowerShell
-Open **x64 Native Tools Command Prompt for VS 2022** (or x64 Developer PowerShell) and run:
+Configure and build from an **x64 Native Tools Command Prompt for VS 2022** (or x64 Developer PowerShell):
 
 ```powershell
 cmake -S . -B build -A x64
 cmake --build build --config Release --parallel
 ```
 
-The build produces:
-* `build/dxgi.dll`: Consolidated proxy library (DXGI swapchain observer, D3D11 device hooks, upscalers, ImGui overlay).
-* `build/stage/`: Pre-staged directory containing:
-  * `dxgi.dll`
-  * `nvngx_dlss.dll` (if NGX SDK is present)
+Build outputs:
 
-### 3. Run Automated Tests
+* `build/Release/dxgi.dll`: compiled proxy DLL
+* `build/stage/dxgi.dll` (and `build/stage/nvngx_dlss.dll` when `external/DLSS` is present): staged runtime files
+
+Run the 15 automated tests with CTest:
+
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
 ```
-All 15 automated unit and integration tests should pass:
-* `temporal_math`: Halton sequence generation, projection math, matrix rejection bounds.
-* `camera_delta`: Camera displacement and scene reset detection.
-* `capture_format`: Half-float, float11/10 unpackers, depth contrast, Reinhard tone mapping.
-* `temporal_inputs`: Temporal input validation, vendor translation conventions, fail-open logic.
-* `motion_gpu`: Direct3D 11 GPU motion vector compute/pixel pass.
-* `ui_composite`: Native-resolution UI preservation and alpha blending pass.
-* `hud_debug`: Cockpit holographic HUD mask geometry and UI extraction test.
-* `dxbc_fanout`: Shader bytecode interception and hash validation.
-* `jitter_view_report`: Subpixel jitter diagnostics and luma correlation verification.
-* `crash_logger`: Minidump generation and fault-injection safety verification.
-* `ui_menu_size`: Dear ImGui menu dimensions, layout bounds, and DPI scaling test.
-* `vtable_hook`: LiveCopy vtable hook initialization, drift detection, and unhook restoration test.
-* `proxy_smoke`: DLL proxy loading and swapchain hook smoke checks.
-* `proxy_shader_probe`: Shader bytecode interception verification.
-* `proxy_alias_smoke`: Consolidated `dxgi.dll` staged loading smoke checks.
 
----
+Test targets in `CMakeLists.txt`:
 
-## Installation & Deployment
+* `temporal_math`: Halton sequence generation, projection blocks, matrix rejection invariants
+* `camera_delta`: camera delta math, event flags, scene reset detection
+* `capture_format`: half-float, float11/10 unpackers, depth contrast, Reinhard tone mapping
+* `temporal_inputs`: scaling math, input validation, NVIDIA/AMD conventions, fail-open behavior
+* `motion_gpu`: Direct3D 11 GPU motion pass
+* `ui_composite`: native UI isolation and holographic HUD mask compositing
+* `hud_debug`: HUD debug pass modes and null fallback safety
+* `dxbc_fanout`: shader bytecode interception and hashing
+* `jitter_view_report`: jitter diagnostics report generation
+* `crash_logger`: SEH crash minidump generation
+* `ui_menu_size`: Dear ImGui menu sizing and layout bounds
+* `vtable_hook`: `LiveCopy` vtable hook initialization, drift detection, and unhook restoration
+* `proxy_smoke`: DLL load, Present hook, and input pass-through
+* `proxy_shader_probe`: shader bytecode interception smoke test
+* `proxy_alias_smoke`: staged `dxgi.dll` loading smoke test
 
-1. Build the project or obtain the latest release package from [Releases](https://github.com/filispeen/EDPE/releases/latest).
-2. Locate your Elite Dangerous installation folder (the directory containing `EliteDangerous64.exe`, typically under `Products\elite-dangerous-odyssey-64` or `Products\elite-dangerous-64`).
-3. Copy the staged proxy libraries into the game folder:
-   * Copy `build/stage/dxgi.dll` $\rightarrow$ `EliteDangerous64.exe` directory
-   * *(For NVIDIA DLAA/DLSS)* Copy `build/stage/nvngx_dlss.dll` $\rightarrow$ `EliteDangerous64.exe` directory
-   * If an older `d3d11.dll` from previous EDPE versions remains in the game folder, make sure to delete it (EDPE now runs exclusively as `dxgi.dll`).
-4. Launch Elite Dangerous normally through the Frontier Launcher or Steam.
-5. In game, press **`F5`** to toggle the EDPE overlay and verify that your desired upscaler or TAA backend is active.
-6. Check `edpe.log` beside `EliteDangerous64.exe` for detailed diagnostic logs.
+## Installation
 
-### Uninstallation
-To remove EDPE, simply delete or rename `dxgi.dll` and `nvngx_dlss.dll` from the game directory. Elite Dangerous will immediately revert to standard engine rendering.
+1. Build the project or download a release archive from [Releases](https://github.com/filispeen/EDPE/releases/latest).
+2. Open the folder containing `EliteDangerous64.exe` (for example `Products\elite-dangerous-odyssey-64` or `Products\elite-dangerous-64`).
+3. Copy `build/stage/dxgi.dll` (and `build/stage/nvngx_dlss.dll` for NVIDIA DLAA/DLSS) next to `EliteDangerous64.exe`. Remove any legacy `d3d11.dll` from older versions.
+4. Launch Elite Dangerous through the Frontier Launcher or Steam.
+5. Press `F5` in-game to open the menu and select an upscaler backend. Check `edpe.log` next to `EliteDangerous64.exe` if something fails to initialize.
 
----
+To uninstall, delete or rename `dxgi.dll` and `nvngx_dlss.dll` in the game folder.
 
-## Project Structure
+## Project structure
 
 ```text
 EDPE/
-├── external/                # Third-party dependencies (imgui, DLSS SDK, FidelityFX SDK)
+├── external/
+│   └── imgui/                          # Dear ImGui submodule (plus optional DLSS / ffx-dx11 SDKs)
 ├── src/
-│   ├── config.c / .h        # Central configuration (kVersion, edpe.ini serialization)
-│   ├── context_census.cpp/.h# Direct3D 11 pipeline observation, CB0 parsing, jitter injection
-│   ├── d3d11_proxy.cpp / .h # D3D11CreateDevice hook & system DLL forwarding
-│   ├── dxgi_proxy.cpp / .def# DXGI factory hooks and export forwarding (dxgi.dll)
-│   ├── dxgi_observer.cpp    # Swapchain creation & Present hooks
-│   ├── motion_pass.cpp / .h # GPU camera-depth motion vector generation pass
-│   ├── ngx_context.cpp / .h # NVIDIA NGX DLAA/DLSS evaluation wrapper
-│   ├── upscaler_backend.cpp/.h # Multi-upscaler manager & backends (DLSS, FSR 3.1.2, TAA)
-│   ├── taa_pass.cpp / .h    # Native Direct3D 11 TAA reconstruction pass
-│   ├── ui_composite_pass.cpp/.h # Native UI composite pass (HUD preservation)
-│   ├── hud_debug_pass.cpp/.h# Cockpit holographic HUD mask geometry and debug pass
-│   ├── jitter_debug_pass.cpp/.h # Subpixel jitter real-time visualization pass
-│   ├── jitter_logger.cpp/.h # Jitter diagnostics logger
-│   ├── jitter_view_recorder.cpp/.h # Subpixel jitter telemetry recorder (F9)
-│   ├── crash_logger.cpp/.h  # Minidump generation and crash diagnostics
-│   ├── input_hook.cpp / .h  # Window procedure (WndProc) filtering and DirectInput hook
-│   ├── perf_overlay.cpp/.h  # Real-time performance telemetry HUD & frametime graph (F7)
-│   ├── profiler.h           # High-precision QPC per-pass execution profiler
-│   ├── temporal_inputs.h    # Shared TemporalFrameInputs data contract
-│   ├── temporal_math.h      # Halton sequences, camera delta projection math
-│   ├── log.cpp / .h         # Thread-safe diagnostic logging (edpe.log)
-│   └── ui.cpp / .h          # Dear ImGui overlay, telemetry HUD, F5-F9 hotkeys, snapshot visualizers
-├── tests/                   # Automated unit & integration test suites (15 tests)
+│   ├── shaders/
+│   │   └── ui_layer_composite_cs.hlsl  # Compute shader for native UI layer compositing
+│   ├── camera_delta.h                  # Camera motion delta and reset detection
+│   ├── capture_format.h                # Texture format unpackers and tone-mapping helpers
+│   ├── cobra_camera_inject.h           # CB0 projection jitter injection helpers
+│   ├── code_hook.h / vtable_hook.h     # Inline/IAT and LiveCopy vtable hooking utilities
+│   ├── config.h / version.cpp          # Central edpe.ini serialization and kVersion
+│   ├── context_census.cpp / .h         # D3D11 observation, CB0 parsing, pipeline orchestration
+│   ├── crash_logger.cpp / .h           # Unhandled exception handler and minidump writer
+│   ├── d3d11_proxy.cpp / .h            # D3D11CreateDevice IAT hooks
+│   ├── dinput_proxy.h                  # DirectInput8 isolation when menu is active
+│   ├── dllmain.cpp                     # DLL entry point
+│   ├── dxbc_hash.cpp / dxbc_fanout.h   # DXBC shader hashing and draw fanout
+│   ├── dxgi_observer.cpp               # Swapchain Present / ResizeBuffers observation
+│   ├── dxgi_proxy.cpp / .def           # dxgi.dll export forwarding and factory hooks
+│   ├── elite_camera.h                  # 5376-byte CB0 camera parser
+│   ├── hud_debug_pass.cpp / .h         # HUD mask debug shader pass (with hud_debug_shader.h)
+│   ├── input_hook.cpp / .h             # WndProc and DirectInput interception
+│   ├── jitter_debug_pass.cpp / .h      # Subpixel jitter debug visualization pass
+│   ├── jitter_logger.cpp / .h          # Background jitter.log writer
+│   ├── jitter_view_recorder.cpp / .h   # F9 jitter_view.log recorder (DEV=1)
+│   ├── log.cpp / .h                    # Thread-safe edpe.log writer
+│   ├── motion_pass.cpp / .h            # GPU camera-depth and skybox motion pass
+│   ├── ngx_context.cpp / .h            # NVIDIA NGX DLAA/DLSS wrapper
+│   ├── perf_overlay.cpp / .h           # F7 Performance HUD and NVML poller
+│   ├── profiler.h                      # QPC per-pass profiler
+│   ├── sharpen_pass.cpp / .h           # Sharpening pass helpers
+│   ├── taa_pass.cpp / .h               # Native D3D11 TAA compute pass
+│   ├── temporal_inputs.h               # Backend-neutral TemporalFrameInputs contract
+│   ├── temporal_math.h                 # Halton sequence and matrix validation math
+│   ├── ui.cpp / .h                     # Dear ImGui F5 menu, snapshot windows, hotkeys
+│   ├── ui_composite_pass.cpp / .h      # Native UI and HUD mask composite pass
+│   ├── ui_layer.cpp / .h               # Live cockpit HUD draw redirection layer
+│   └── upscaler_backend.cpp / .h       # IUpscalerBackend implementations (DLSS, FSR 3.1.2, TAA)
+├── tests/                              # 13 source files producing 15 CTest targets
 ├── tools/
-│   ├── fetch_ffx_dx11.py    # Automation script for fetching and building FidelityFX DX11 SDK
-│   └── ngx_probe/           # Standalone diagnostic probe for hardware NGX verification
-├── docs/                    # Technical research, reverse-engineering notes & input contracts
-├── PLAN.md                  # Authoritative architectural roadmap
-├── STATUS.md                # Verified empirical findings and implementation log
-└── AGENTS.md                # Engineering guidelines, governance, and architecture rules
+│   ├── fetch_ffx_dx11.py               # Fetches and builds FidelityFX DX11 SDK
+│   └── ngx_probe/                      # Standalone hardware NGX diagnostic probe
+├── docs/                               # Reverse-engineering notes and backend input contracts
+├── PLAN.md                             # 19-phase architectural roadmap
+├── STATUS.md                           # Verified empirical findings and milestone log
+└── AGENTS.md                           # Project architecture and engineering rules
 ```
 
----
+## Documentation
 
-## Important Documentation References
+* [STATUS.md](STATUS.md): verified facts, milestone logs, and test status
+* [PLAN.md](PLAN.md): full 19-phase roadmap
+* [AGENTS.md](AGENTS.md): engineering rules and architecture boundaries
+* [BUILD.md](BUILD.md): legacy NMake build notes
+* [docs/render-pipeline-observations.md](docs/render-pipeline-observations.md): Elite Dangerous MRT layout, depth buffers, and pass order
+* [docs/nvidia-dlaa-input-contract.md](docs/nvidia-dlaa-input-contract.md): NVIDIA NGX DLAA input requirements
+* [docs/amd-fsr-input-contract.md](docs/amd-fsr-input-contract.md): AMD FidelityFX FSR input requirements
+* [docs/elite-input-conventions.md](docs/elite-input-conventions.md): Cobra camera, coordinate system, and projection conventions
+* [docs/shared-temporal-inputs.md](docs/shared-temporal-inputs.md): `TemporalFrameInputs` specification
 
-* [STATUS.md](STATUS.md): Up-to-date verified empirical facts, test results, and milestone logs.
-* [PLAN.md](PLAN.md): Detailed 19-phase architectural roadmap.
-* [AGENTS.md](AGENTS.md): Project governance, architecture constraints, and contribution rules.
-* [render-pipeline-observations.md](docs/render-pipeline-observations.md): Reverse-engineering findings on Elite's MRT layout, depth buffers, and lighting passes.
-* [nvidia-dlaa-input-contract.md](docs/nvidia-dlaa-input-contract.md): Specifications for NVIDIA NGX DLAA integration.
-* [elite-input-conventions.md](docs/elite-input-conventions.md): Camera, coordinate system, and projection conventions.
+## Acknowledgments
 
----
-
-## Acknowledgments & Research
-
-* **EDVR Unofficial Patch** ([characterecho-sean/edvr-unofficial-patch](https://github.com/characterecho-sean/edvr-unofficial-patch)): Conceptual reference for depth discovery and motion injection in the Cobra engine.
-* **Dear ImGui** ([ocornut/imgui](https://github.com/ocornut/imgui)): Runtime debugging interface.
-* **NVIDIA NGX SDK**: Temporal anti-aliasing and deep learning reconstruction technology.
-* **AMD FidelityFX SDK**: High-quality open-source temporal upscaling technology.
-
----
+* [characterecho-sean/edvr-unofficial-patch](https://github.com/characterecho-sean/edvr-unofficial-patch): reference for depth discovery and motion injection in Cobra
+* [ocornut/imgui](https://github.com/ocornut/imgui): Dear ImGui overlay
+* NVIDIA NGX SDK and AMD FidelityFX SDK
 
 світла пам'ять соні, моїй любій кішці яка померла 24 січня 26-го року около 1:00 AM
