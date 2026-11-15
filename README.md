@@ -24,7 +24,27 @@ As of November 2026 (`v0.7.0`), the working pipeline covers:
 * Multi-device DXGI Keyed Mutex synchronization, color-source debouncing, crash minidump logging, DirectInput and `WndProc` input isolation when the menu is open (protecting flight controls and HOTAS), async GPU timestamp queries, and optional QPC per-pass profiling.
 * Dear ImGui overlay (`F5`, ProggyForever vector font), toggleable Performance HUD (`F7`) with a 120-sample frametime graph (`8.3 ms` and `16.6 ms` reference lines, 15 Hz text refresh, background NVML GPU/VRAM polling), sequential comparison capture to `comparison/` (16-frame warmup, 5-second wait between backends), and `DEV=0` / `DEV=1` gating for developer panels and `F9` (`jitter_view.log`).
 
-See [STATUS.md](STATUS.md) for verified test and capture logs, and [PLAN.md](PLAN.md) for planned future phases (D3D11/D3D12 interop, Frame Generation, Intel XeSS, NVIDIA Reflex / AMD Anti-Lag, DLSS-NR, and third-party mod chaining).
+## Roadmap
+
+| Phase | Milestone | Status | Summary |
+|:---:|:---|:---|:---|
+| 0-2 | Reconnaissance and resource census | Verified | Tracked D3D11 context calls, swapchain layout (`2560x1440 R8G8B8A8`), MRT bindings, and `CB0` lifecycle. |
+| 3 | Scene depth extraction | Verified | Confirmed `DSV #2` reversed-Z depth buffer ($B=0.025$) for full-frame geometry. |
+| 4 | Camera and projection tracking | Verified | Parsed the 5376-byte dynamic `CB0` and latched the primary 3D camera once per frame. |
+| 5 | Projection jitter injection | Verified | Injected Halton `(2,3)` jitter into `CB0` with fail-open bypass when upscaling is off. |
+| 6 | Motion vectors pass | Verified | Generated screen-space camera-depth motion vectors into `R16G16_FLOAT` plus skybox rotational motion. |
+| 7 | Shared temporal input layer | Verified | Implemented backend-neutral `TemporalFrameInputs` and `IUpscalerBackend`. |
+| 8 | NVIDIA DLAA | Verified | Integrated official NGX DLAA at native resolution (~0.3 ms GPU time at 1440p). |
+| 9-10 | Render scale and NVIDIA DLSS SR | Verified | Lowered 3D render scale via Cobra `<SSAAMultiplier>` (< 1.0x) with automatic resolution detection. |
+| 11 | AMD FSR 3.1.2 | Verified | Integrated native D3D11 FidelityFX FSR 3.1.2 for both Native AA and Super Resolution. |
+| 12 | Native-resolution HUD separation | Verified | Redirected cockpit HUD draws to `s_hud_mask_texture` (`UiLayer`) and composited native UI over the upscaled scene (`UiCompositePass`). |
+| 13-15 | D3D11/D3D12 interop and Frame Generation | Not started | Planned D3D11/D3D12 bridge for NVIDIA DLSS Frame Generation (Streamline) and AMD FSR Frame Generation. |
+| 16 | Intel XeSS | Planned | Planned Intel XeSS Native AA and Super Resolution (XMX on Arc, DP4a fallback) via D3D11/D3D12 interop. |
+| 17 | Low-latency integration | Planned | Planned standalone and FG-coupled latency pacing via NVIDIA Reflex and AMD Anti-Lag / Anti-Lag 2. |
+| 18 | NVIDIA DLSS-NR | Research | Investigating NGX Ray Reconstruction for reflections and lighting. |
+| 19 | Third-party mod compatibility | Planned | Planned proxy DLL chaining and compatibility with ReShade, EDHM, and 3Dmigoto. |
+
+See [STATUS.md](STATUS.md) for verified test and capture logs, and [PLAN.md](PLAN.md) for the full technical roadmap.
 
 ## Architecture
 
