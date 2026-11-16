@@ -13,11 +13,7 @@
 
 namespace edpe {
 
-#ifndef EDPE_VERSION
-#define EDPE_VERSION "dev"
-#endif
-
-inline constexpr const char* kVersion = EDPE_VERSION;
+extern const char* const kVersion;
 
 inline bool isRunningInEliteProcess() {
     wchar_t modulePath[MAX_PATH]{};
@@ -288,7 +284,7 @@ public:
 
     int upscalerBackend = 0;
     int upscaleMode = 0;
-    int dlssPreset = 0; // 0=Auto(K), 10=J, 11=K, 12=L, 13=M
+    int dlssPreset = 0; // 0=Auto(K), 5=E(CNN Fast), 10=J, 11=K, 12=L, 13=M
     float sharpness = 0.0f;
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;

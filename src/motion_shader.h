@@ -114,8 +114,78 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
     return worldMv;
 }
 
+float2 reprojectRel(float4 pixel, float4 rel0, float4 rel1, float4 rel2,
+    float translationStep, float celestialDepthThresh,
+    float4 invProj, float4 prevProjHalf, float depthB, bool clampCockpit) {
+    if (info.y <= 0 || info.z <= 0 || scales.x <= 0 || scales.y <= 0) return 0;
+    int2 pixCoord = int2(pixel.xy);
+    float depth = sceneDepth.Load(int3(pixCoord, 0));
+    int modeFlags = int(info.w + 0.1);
+    bool hasPrevDepth = (modeFlags & 1) != 0;
+    bool hasEngineVel = (modeFlags & 2) != 0;
+
+    float2 rawPixel = pixel.xy - jitterInfo.xy;
+    float2 ndc = rawPixel * invProj.xy + float2(-1.0, 1.0);
+
+    // 1. Skybox, distant stars, nebula, celestial background, and star bloom:
+    if (depth <= 0.0 || depth > 1.0 || depth < celestialDepthThresh) {
+        float3 viewRay = float3(ndc * invProj.zw, 1.0);
+        float3 priorRay = float3(dot(rel0.xyz, viewRay),
+                                 dot(rel1.xyz, viewRay),
+                                 dot(rel2.xyz, viewRay));
+        if (priorRay.z <= 0.0) return 0.0;
+        float2 priorPixel = priorRay.xy * rcp(priorRay.z) * prevProjHalf.xy + prevProjHalf.zw;
+        return priorPixel - rawPixel;
+    }
+
+    // 2. Per-object velocity from G-buffer MRT6 (when bound and valid):
+    if (hasEngineVel) {
+        float4 engVel = engineVelocity.Load(int3(pixCoord, 0));
+        if (all(isfinite(engVel.xy)) && engVel.w > 0.0 &&
+            (abs(engVel.x) > 1e-5 || abs(engVel.y) > 1e-5) &&
+            abs(engVel.x) < 2.0 && abs(engVel.y) < 2.0) {
+            float2 jitterDeltaPx = jitterInfo.zw - jitterInfo.xy;
+            return float2(-engVel.x * prevProjHalf.z, engVel.y * prevProjHalf.w) - jitterDeltaPx;
+        }
+    }
+
+    float z = depthB / depth;
+
+    // 3. Static/world geometry camera-depth reprojection via CPU-composed relative transform:
+    float3 view = float3(ndc * invProj.zw * z, z);
+    float3 prior = float3(dot(rel0.xyz, view) + rel0.w,
+                          dot(rel1.xyz, view) + rel1.w,
+                          dot(rel2.xyz, view) + rel2.w);
+    if (prior.z <= 0.0) return 0.0;
+    float2 priorPixel = prior.xy * rcp(prior.z) * prevProjHalf.xy + prevProjHalf.zw;
+    float2 worldMv = priorPixel - rawPixel;
+
+    // 4. Fast depth-validated cockpit vs. world geometry disambiguation:
+    if (clampCockpit && z < 10.0) {
+        if (z < 3.5 && translationStep > 0.35) {
+            return 0.0;
+        }
+        if (hasPrevDepth && translationStep > 0.001 && dot(worldMv, worldMv) > 0.0625) {
+            int2 maxCoord = int2(info.y - 1.0, info.z - 1.0);
+            int2 pWorld = clamp(int2(priorPixel + jitterInfo.zw), int2(0, 0), maxCoord);
+            int2 pStatic = clamp(int2(rawPixel + jitterInfo.zw), int2(0, 0), maxCoord);
+            float dWorld = prevSceneDepth.Load(int3(pWorld, 0));
+            float dStatic = prevSceneDepth.Load(int3(pStatic, 0));
+            float expectedPriorDepth = depthB / prior.z;
+            float tol = max(1e-5, 0.025 * depth);
+            bool worldMatches = (dWorld > 0.0 && dWorld <= 1.0) && (abs(dWorld - expectedPriorDepth) <= tol);
+            bool staticMatches = (dStatic > 0.0 && dStatic <= 1.0) && (abs(dStatic - depth) <= tol);
+            if (!worldMatches && staticMatches) {
+                return 0.0;
+            }
+        }
+    }
+
+    return worldMv;
+}
+
 float2 ps(float4 pixel : SV_POSITION) : SV_Target {
-    return reproject(pixel, now0, now1, now2, prev0, prev1, prev2, scales, info.x, true);
+    return reprojectRel(pixel, now0, now1, now2, prev0.x, prev0.y, prev1, prev2, info.x, true);
 }
 
 float2 ps_gpu(float4 pixel : SV_POSITION) : SV_Target {

@@ -49,7 +49,8 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     const CameraProjection& previous, UINT width, UINT height,
     float jitterX, float jitterY, float prevJitterX, float prevJitterY, bool reset,
     ID3D11ShaderResourceView* prevDepth,
-    ID3D11ShaderResourceView* engineVelocity) {
+    ID3D11ShaderResourceView* engineVelocity,
+    bool preserveContextState) {
     if (!device_ || !depth || !width || !height ||
         !(now.scaleX > 0 && now.scaleY > 0 && now.depthB > 0 &&
           previous.scaleX > 0 && previous.scaleY > 0) ||
@@ -63,18 +64,43 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     const int modeFlags =
         ((prevDepth && !reset) ? 1 : 0) |
         ((engineVelocity && !reset) ? 2 : 0);
+    // Precompute relative view-space transform M_rel = R_prev^T * R_now,
+    // t_rel = R_prev^T * (t_now - t_prev) once on CPU to halve per-pixel ALU.
+    const float dx = now.worldFromView[3] - previous.worldFromView[3];
+    const float dy = now.worldFromView[7] - previous.worldFromView[7];
+    const float dz = now.worldFromView[11] - previous.worldFromView[11];
     float values[36]{};
-    for (unsigned i = 0; i < 12; ++i) {
-        values[i] = now.worldFromView[i];
-        values[12 + i] = previous.worldFromView[i];
+    for (unsigned r = 0; r < 3; ++r) {
+        const float p0 = previous.worldFromView[0 * 4 + r];
+        const float p1 = previous.worldFromView[1 * 4 + r];
+        const float p2 = previous.worldFromView[2 * 4 + r];
+        for (unsigned c = 0; c < 3; ++c) {
+            values[r * 4 + c] =
+                p0 * now.worldFromView[0 * 4 + c] +
+                p1 * now.worldFromView[1 * 4 + c] +
+                p2 * now.worldFromView[2 * 4 + c];
+        }
+        values[r * 4 + 3] = p0 * dx + p1 * dy + p2 * dz;
     }
+    const float wf = static_cast<float>(width);
+    const float hf = static_cast<float>(height);
+    values[12] = std::sqrt(dx * dx + dy * dy + dz * dz); // prev0.x = translationStep
+    values[13] = (now.depthB > 0.0f) ? (now.depthB / 50000.0f) : 1e-6f; // prev0.y = celestialDepthThresh
+    values[16] = 2.0f / wf;          // prev1.x
+    values[17] = -2.0f / hf;         // prev1.y
+    values[18] = 1.0f / now.scaleX;  // prev1.z
+    values[19] = 1.0f / now.scaleY;  // prev1.w
+    values[20] = previous.scaleX * (0.5f * wf);   // prev2.x
+    values[21] = -previous.scaleY * (0.5f * hf);  // prev2.y
+    values[22] = 0.5f * wf;                       // prev2.z
+    values[23] = 0.5f * hf;                       // prev2.w
     values[24] = now.scaleX;
     values[25] = now.scaleY;
     values[26] = previous.scaleX;
     values[27] = previous.scaleY;
     values[28] = now.depthB;
-    values[29] = static_cast<float>(width);
-    values[30] = static_cast<float>(height);
+    values[29] = wf;
+    values[30] = hf;
     values[31] = static_cast<float>(modeFlags);
     values[32] = jitterX;
     values[33] = jitterY;
@@ -83,7 +109,7 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     return renderInternal(depth,
         (prevDepth && !reset) ? prevDepth : nullptr,
         (engineVelocity && !reset) ? engineVelocity : nullptr,
-        values, nullptr, nullptr, width, height);
+        values, nullptr, nullptr, width, height, preserveContextState);
 }
 
 bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
@@ -117,14 +143,14 @@ bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
     return renderInternal(depth,
         (prevDepth && !reset) ? prevDepth : nullptr,
         (engineVelocity && !reset) ? engineVelocity : nullptr,
-        values, now, previous, width, height);
+        values, now, previous, width, height, true);
 }
 
 bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     ID3D11ShaderResourceView* prevDepth,
     ID3D11ShaderResourceView* engineVelocity,
     const float (&values)[36], ID3D11Buffer* now, ID3D11Buffer* previous,
-    UINT width, UINT height) {
+    UINT width, UINT height, bool preserveContextState) {
     if (!device_ || !depth || !width || !height) return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     depth->GetDesc(&srv_desc);
@@ -143,9 +169,11 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
         depth_desc.SampleDesc.Count != 1 || depth_desc.MipLevels != 1 ||
         depth_desc.ArraySize != 1 ||
         depth_desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS) return false;
-    ID3D11DepthStencilView* bound_dsv = nullptr;
-    context_->OMGetRenderTargets(0, nullptr, &bound_dsv);
-    if (bound_dsv) { bound_dsv->Release(); return false; }
+    if (preserveContextState) {
+        ID3D11DepthStencilView* bound_dsv = nullptr;
+        context_->OMGetRenderTargets(0, nullptr, &bound_dsv);
+        if (bound_dsv) { bound_dsv->Release(); return false; }
+    }
 
     if (!output_texture_ || width != width_ || height != height_) {
         D3D11_TEXTURE2D_DESC output_desc{};
@@ -173,7 +201,16 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     context_->UpdateSubresource(constants_.Get(), 0, nullptr, values, 0, 0);
 
     Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
-    context_->SwapDeviceContextState(state_.Get(), &prior);
+    if (preserveContextState) {
+        context_->SwapDeviceContextState(state_.Get(), &prior);
+    } else {
+        static constexpr float kBlendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        context_->RSSetState(nullptr);
+        context_->RSSetScissorRects(0, nullptr);
+        context_->OMSetBlendState(nullptr, kBlendFactor, 0xFFFFFFFFu);
+        context_->OMSetDepthStencilState(nullptr, 0);
+        context_->GSSetShader(nullptr, nullptr, 0);
+    }
     auto* rtv = output_rtv_.Get();
     ID3D11ShaderResourceView* srvs[3] = {depth, prevDepth, engineVelocity};
     ID3D11Buffer* buffers[] = {constants_.Get(), now, previous};
@@ -191,7 +228,9 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     ID3D11ShaderResourceView* empty_srvs[3] = {nullptr, nullptr, nullptr};
     context_->PSSetShaderResources(0, 3, empty_srvs);
     context_->OMSetRenderTargets(0, nullptr, nullptr);
-    context_->SwapDeviceContextState(prior.Get(), nullptr);
+    if (preserveContextState) {
+        context_->SwapDeviceContextState(prior.Get(), nullptr);
+    }
 
     return true;
 }

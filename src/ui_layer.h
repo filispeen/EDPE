@@ -46,6 +46,11 @@ public:
     bool beginSupercruiseBars(ID3D11DeviceContext* context, UINT renderW, UINT renderH);
     void endSupercruiseBars(ID3D11DeviceContext* context);
 
+    // Додаткові LDR-буфери для відокремлення наекранного шолома (EID 18188):
+    // visorDelta = tVisorLdr - tCleanLdr додається поверх реконструйованого 3D-світу.
+    void setVisorDeltaSrvs(ID3D11ShaderResourceView* visorLdr, ID3D11ShaderResourceView* cleanLdr);
+    void resetVisorDelta();
+
     // Повторний запуск тонемапу (Tonemap Re-issue):
     bool beginTonemapReissue(ID3D11DeviceContext* context,
                              ID3D11ShaderResourceView* gameLut = nullptr,
@@ -107,6 +112,9 @@ private:
     // Чорна 1x1 текстура для обнулення слотів Bloom при повторному виклику тонемапу:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> zeroBloomTex_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> zeroBloomSrv_;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> visorSampler_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> visorLdrSrv_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cleanLdrSrv_;
 
     // Ресурси для бінарного патчу 3D-голограм (PS b13):
     Microsoft::WRL::ComPtr<ID3D11PixelShader> holoPatchedPs_[3];
@@ -170,6 +178,14 @@ private:
     bool multLayerCleared_ = false;
     UINT width_ = 0;
     UINT height_ = 0;
+
+    void updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView);
+    UINT cbWidth_ = 0;
+    UINT cbHeight_ = 0;
+    bool cbHasMult_ = false;
+    bool cbDebugView_ = false;
+    bool cbHasVisorDelta_ = false;
+    bool cbValid_ = false;
 };
 
 } // namespace edpe

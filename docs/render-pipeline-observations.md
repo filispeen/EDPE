@@ -116,3 +116,42 @@ Following the nvidia-dlaa-input-contract.md implications and PLAN.md expected or
 - **Forbidden in hot path:** blocking GPU readback, `Map()` on full-resolution textures, blocking `GetData` loops, per-frame NGX feature recreation.
 - **Fail open:** If NGX/DLAA fails, disable upscaler, disable jitter, restore original frame, Present normally. Never black-screen Elite.
 - **Async timing:** Use asynchronous D3D11 timestamp queries for NGX DLSS, motion-vector generation, and total EDPE GPU cost.
+
+## On-foot viewmodel & 208B CB0 findings (2026-11-16, Issue #11)
+
+- **Date:** 2026-11-16. Source: vanilla Odyssey RenderDoc capture `edo(issue11).rdc` (2560×1440, 8642 actions).
+- **Method:** RenderDoc `pixel_history`, `get_buffer_data`, `get_shader_bindings`, and `disassemble_shader` across Z-prepass (`6652–7126`), G-buffer (`7158–14617`), and sky/planet/atmosphere passes (`15736–16208`).
+- **VERIFIED (On-foot viewmodel ordering & Z-prepass vs G-buffer):**
+  - Event `6652` (on-foot weapon/tool Z-prepass, `depth = 0.248466` at `(2000, 1100)`) runs **before** the main world Z-prepass (`6796`, `scaleX=1.0525, scaleY=1.871, depthB=0.025`) using a viewmodel sub-pass projection (`scaleX=1.2935, scaleY=2.300, depthB=0.0675` in `cb1[270..273]`).
+  - G-buffer draws `7189` and `14617` (`scaleX=1.2935, depthB=0.0675`) shade against Z-prepass depth (`6652`) with `DepthFunc == EQUAL`; `16208` (post-deferred viewmodel atmosphere reading linearized depth `8724`) also uses `scaleX=1.2935, depthB=0.0675` in both `cb0` (`208` bytes) and `cb1`.
+  - **Confidence:** High (directly observed in capture `cb0`/`cb1` buffers and pixel history).
+  - **Implication:** Per-frame jitter decisions for viewmodel sub-passes must lock on first encounter (so Z-prepass, G-buffer, and post-deferred agree), and sub-pass writes must never overwrite `s_last_unjittered_forward_block` / `s_last_clean_cb1_data` used by world `depthB=0.025` deferred `CB2` repair and HUD replay.
+- **VERIFIED (208-byte `cb0` celestial/scaled ModelViewProj):**
+  - Planet (`15736`), scaled planet atmosphere (`16044`, model scale `492878.0`), and viewmodel atmosphere (`16208`) all bind `cb0[4..7]` (`words[16..31]` of 208-byte `cb0`) as `transpose(Model * ViewProj)` with `cb0[6]` (`words[24..27]`) equal to `(0, 0, 0, depthB)` and non-zero translation/scale.
+  - **Confidence:** High (verified via shader disassembly `8628fdf1` / `5ea854d6` and buffer contents).
+  - **Implication:** Validate `cb0[6]` = `(0, 0, 0, depthB)`, normalized FOV scales `len0/lenW` and `len1/lenW`, orthogonality, and positive right-handed determinant rather than requiring unit `lenW == 1` and zero translation.
+- **VERIFIED (Planetary rings pass order & Preserve Native UI isolation):**
+  - Planetary rings (`15837, 15851, 15866, 15880, 15935, 15949, 15964, 15978`, `5334` vertices with `4096x1` ring LUTs, plus planet passes `15897` / `15913` / `15919`) render into linear HDR `8728` against depth `8723` **before** atmospheric transmittance (`16044`) and sky scattering (`16137`).
+  - Diverting any pre-sky depth-tested world shader (`0xB12F7A618E1BDE98 / 0x42AC0CACC9CDF72B`, `0x5559BD94B6852E83`, or unlocked space dust) into `HdrLayer` traps its low linear HDR color and `< 1` transmittance in `HdrLayer` while `16137` brightens the sky behind it, darkening the ring band over sky and planet when `UiLayer::composite` runs.
+  - **Confidence:** High (verified via `edo(issue11).rdc` `pixel_history` at `(1660, 280)` and `(1715, 340)`, shader disassembly, and `shot1`/`shot2`/`shot3`).
+  - **Implication:** Exclude `0x5559BD94B6852E83` and `0xB12F7A618E1BDE98` from `isHudShaderPair` / `UiLayer::shouldInterceptDraw`, require confirmed ship-cockpit holo shaders (`isConfirmedShipCockpitHudPair`) before unlocking cockpit-only shaders (`kSpaceDust` / `kNormalSpaceDust` / `0xB7790CBF`), and guard `captureEarlyMotionColor` against overwriting an already-latched `from_hud` snapshot in the same frame.
+
+
+## On-foot Helmet Visor Fullscreen Pass (`EID 18188`, `edo(issue11).rdc`, 2026-11-16)
+- **Method:** RenderDoc pipeline inspection, `pixel_history`, and DXBC disassembly of `F:\Code\C++\EDPE\edo(issue11).rdc` (`2560x1440`, Odyssey on-foot settle).
+- **Evidence:**
+  - `EID 18098`: `CopySubresourceRegion` copies clean pre-visor HDR `8728` (`R11G11B10_FLOAT`) into `8731`.
+  - `EID 18120..18162`: `DrawInstanced(3, 1)` builds downsampled blurred HDR `8698` (`320x180`).
+  - `EID 18188`: `DrawInstanced(3, 1)` (`TriangleStrip`, `SV_VERTEXID`, no vertex buffer) renders the curved helmet visor rim streaks, frost/droplets, and visor tint onto `RTV0 = 8728` (`DSV = 8723`, `stencil: 0 -> 4`, dual-source outputs `o0` + `o1`):
+    - `VS ResourceId::110929` (`b678d36d-5d404fd2-dd954269-c11c2adf`, `cb1[91]`, `cb2[2]`, `t0`): outputs screen-locked unjittered clip coords (`o3.zw = (0.99, 1.0)`) and screen UV `o1.xy`.
+    - `PS ResourceId::110930` (`c7167686-a5850b4a-f73bbcd8-24903a6a`, `cb1[333]`, `cb2[9]`, `t0..t4`): samples curved visor streaks `t3` using unjittered `v3.xy * cb1[332].zw`, droplets/normals `t2`/`t4` using unjittered `v1.xy`, and already-jittered pre-visor HDR background `t1 = 8731` twice.
+  - Because `8728` and `8731` carry camera Halton subpixel jitter `+J_N` while `EID 18188` draws at unjittered screen coordinates, temporal unjitter (`-J_N` in DLAA/DLSS/FSR/XeSS) shifts the static visor curves/droplets across Halton frames, producing subpixel shimmer and doubled visor streaks.
+- **Confidence:** High (verified via shader disassembly, `pixel_history` at `(180, 400)` and `(100, 100)`, and WARP D3D11 + `D3DDisassemble` test in `tests/dxbc_fanout.cpp`).
+- **Implication:** Patch `VS 110929` (`o1.xy += -J_N / res`) and `PS 110930` (`v3.xy += -J_N` for visor terms while restoring `+J_N / res` right before `t1` background samples) in `edpe::patchVisorVertexShader` / `edpe::patchVisorPixelShader` (`src/dxbc_fanout.h`), invoked lazily via `tryVisorJitterAlignDraw` in `observedDrawInstanced` (`src/context_census.cpp`) whenever projection jitter is active, failing open on unsupported shaders.
+- **VERIFIED Follow-up — Camera-rotation ghosting (`шлейфи`) when keeping `EID 18188` inside `8728`:**
+  - Confirmed in live Odyssey (`edpe.log` `VS=B553BB479B7C0B97 PS=68ABCB9FEF6CA66C`, `2560x1440`, DLAA + Jitter Debug View): even when `EID 18188` is subpixel-jitter aligned inside `8728`, `EID 18188` has `DepthWriteMask = ZERO` and is camera-locked (`MV_real = 0`) over sky/distant pixels that have non-zero camera-rotation motion vectors (`MV_world != 0`).
+  - Keeping `EID 18188` baked inside `scene_ldr_source` causes temporal upscalers (and `JitterDebugPass`) to reproject rotating sky pixels from history pixels that held the previous frame's static visor curves, producing bright smeared trails (`шлейфи`) across the sky whenever panning the camera.
+  - Because `PS 110930` adds faint ambient HDR visor glare (~`0.001..0.023`) over the whole screen and refracts `t1 = 8731`, tonemapping `HdrLayer` against black causes gamma washout and loses refraction. Instead, when `Preserve Native UI` or `Subpixel Jitter` debug view is active:
+    1. Copy clean pre-visor `8728` -> `s_visor_pre_hdr_tex` and `s_visor_hdr_tex`; draw unjittered `EID 18188` onto `s_visor_hdr_rtv` (read-only depth/stencil), then replay `EID 18188` with `RenderTargetWriteMask = 0` onto `8728+8723` so `DSV 8723` keeps `stencil = 0 -> 4` while `8728` remains 100% visor-free.
+    2. At Pass 52 Tonemap (`observePostHudDrawAndTonemap`), re-issue the exact bound game tonemapper (`LUT t0`, `Bloom t2`, exposure `cb2`, viewport) with `PS hdrSlot = s_visor_hdr_srv` into `s_visor_ldr_rtv` (plus `s_visor_pre_hdr_srv` into `s_visor_clean_ldr_rtv` if HDR was modified after `EID 18188` or redirected by post-process).
+    3. Post-upscale in `UiLayer::composite` / `compositeToRtv`, add `(tVisorLdr - tCleanLdr) * atten` onto the reconstructed world (`t0`), keeping `in-scene cb13` jitter alignment as fallback when `Preserve Native UI` is disabled.

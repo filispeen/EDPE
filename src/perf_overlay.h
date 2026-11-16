@@ -87,6 +87,7 @@ public:
     void shutdown();
     void updateCachedStats();
     void refreshCachedStats() { updateCachedStats(); }
+    void invalidateResolution() { cachedOutputWidth_ = 0; cachedOutputHeight_ = 0; }
 
 private:
     PerfTracker();
@@ -107,6 +108,14 @@ private:
         float drawMs = 0.0f;
         float upscaleMs = 0.0f;
         float unaccountedMs = 0.0f;
+        float gpuDepthCopyMs = 0.0f;
+        float gpuMotionMs = 0.0f;
+        float gpuColorPrepMs = 0.0f;
+        float gpuUpscaleEvalMs = 0.0f;
+        float gpuUiCompositeMs = 0.0f;
+        float gpuHudBloomMs = 0.0f;
+        float gpuEdpeTotalMs = 0.0f;
+        bool directColorActive = false;
     };
     ProfilerDisplaySnapshot profilerDisplay_{};
 
@@ -148,6 +157,8 @@ private:
     NvmlGetMem_t nvmlGetMem_ = nullptr;
 
     // Telemetry rate limiting
+    uint32_t cachedOutputWidth_ = 0;
+    uint32_t cachedOutputHeight_ = 0;
     LARGE_INTEGER lastTelemetryUpdate_{};
     std::thread nvmlWorkerThread_;
     std::atomic<bool> nvmlRunning_{false};

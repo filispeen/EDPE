@@ -71,12 +71,20 @@ inline bool matchesAnchorPrediction(
     return length(cameraPosition(cand) - predicted) < 0.045f;
 }
 
+inline bool isIpdHarmonicDistance(float dist) {
+    return std::fabs(dist - 0.0682f) < 0.010f ||
+           std::fabs(dist - 0.1364f) < 0.012f ||
+           std::fabs(dist - 0.2728f) < 0.015f;
+}
+
 inline bool isRearOrAuxiliaryProbe(
     const CameraProjection& candidate,
     const CameraProjection& baseline,
     const Vec3& last_velocity = {0.0f, 0.0f, 0.0f},
     float dtRatio = 1.0f)
 {
+    (void)last_velocity;
+    (void)dtRatio;
     if (baseline.scaleX <= 0.0f || baseline.scaleY <= 0.0f) {
         return false;
     }
@@ -86,29 +94,7 @@ inline bool isRearOrAuxiliaryProbe(
     const float rawDist = length(candPos - prevPos);
     const float rotTrace = cameraRotationTrace(candidate, baseline);
 
-    // 1. IPD-гармоніки (1x 68.2 мм, 2x 136.4 мм, 4x 272.8 мм) при ідентичній орієнтації (rotTrace > 2.9995f):
-    // Під час кругового огляду головою (вліво->вправо->вліво) камера повертається (rotTrace < 2.9995f)
-    // і рухається по дузі шиї, тому реальний поворот голови ніколи не повинен відхилятися як IPD-зонд!
-    if (rotTrace > 2.9995f && rawDist >= 0.032f && rawDist <= 0.36f) {
-        const float d68  = std::fabs(rawDist - 0.0682f);
-        const float d136 = std::fabs(rawDist - 0.1364f);
-        const float d273 = std::fabs(rawDist - 0.2728f);
-        if (d68 < 0.008f || d136 < 0.008f || d273 < 0.008f) {
-            return true;
-        }
-
-        const float clampedDtRatio = std::clamp(dtRatio, 0.25f, 4.0f);
-        const Vec3 predictedPos = prevPos + (last_velocity * clampedDtRatio);
-        const float resDist = length(candPos - predictedPos);
-        const float r68  = std::fabs(resDist - 0.0682f);
-        const float r136 = std::fabs(resDist - 0.1364f);
-        const float r273 = std::fabs(resDist - 0.2728f);
-        if (r68 < 0.008f || r136 < 0.008f || r273 < 0.008f) {
-            return true;
-        }
-    }
-
-    // 2. Дзеркальний зонд заднього огляду / ліхтаря кабіни або 180-град інвертований зонд:
+    // Дзеркальний зонд заднього огляду / ліхтаря кабіни або 180-град інвертований зонд:
     // Розгортання ~180 град (rotTrace < -0.5f при rawDist < 1.5м, або rotTrace < 0.5f зі зміщенням 0.05м..1.5м).
     if ((rotTrace < -0.5f && rawDist < 1.5f) ||
         (rotTrace < 0.5f && rawDist >= 0.05f && rawDist < 1.5f)) {
@@ -153,19 +139,17 @@ inline bool isStereoEyeOrIpdProbe(
     const Vec3 up      = cameraUp(candidate);
     const Vec3 fwd     = cameraForward(candidate);
 
-    // 3. Перевірка 1: Прямий латеральний зсув відносно baseline (від 1x IPD 68.2 мм до 4x IPD 272.8 мм).
-    // Спрацьовує при стаціонарному кораблі або при внутрішньокадровому порівнянні пасів (last_velocity == 0).
+    // 3. Перевірка 1: Прямий латеральний/наголовний IPD-зсув відносно baseline (1x 68.2 мм, 2x 136.4 мм, 4x 272.8 мм).
+    // Спрацьовує лише при стаціонарній камері або при внутрішньокадровому порівнянні пасів (last_velocity == 0).
     const Vec3 rawDelta = candPos - prevPos;
     const float rawDist = length(rawDelta);
-    if (rawDist >= 0.032f && rawDist <= 0.36f) {
+    if (length(last_velocity) < 0.025f && isIpdHarmonicDistance(rawDist)) {
         const float dRight = std::fabs(dot(rawDelta, right));
         const float dUp    = std::fabs(dot(rawDelta, up));
         const float dFwd   = std::fabs(dot(rawDelta, fwd));
-        const float prevLateralSpeed = std::fabs(dot(last_velocity, right));
 
         // 3a. Латеральний стерео-очний зонд (IPD 68.2 мм, 136.4 мм, 272.8 мм)
-        const bool isLateralIpd = (prevLateralSpeed < 0.025f &&
-            dRight >= 0.80f * rawDist && dUp < 0.045f && dFwd < 0.045f);
+        const bool isLateralIpd = (dRight >= 0.80f * rawDist && dUp < 0.045f && dFwd < 0.045f);
 
         // 3b. Кабінний / наголовний зонд Cobra Odyssey (136.4 мм: +10.98 см Up, +8.09 см Fwd, 0.00 см Right)
         const bool isCockpitHeadProbe = (dRight < 0.025f &&
@@ -182,7 +166,7 @@ inline bool isStereoEyeOrIpdProbe(
     const Vec3 residual = candPos - predictedPos;
     const float resDist = length(residual);
 
-    if (resDist >= 0.032f && resDist <= 0.36f) {
+    if (isIpdHarmonicDistance(resDist)) {
         const float rRight   = std::fabs(dot(residual, right));
         const float rUp      = std::fabs(dot(residual, up));
         const float rForward = std::fabs(dot(residual, fwd));
@@ -326,5 +310,100 @@ private:
     bool have_previous_ = false;
     bool lost_ = false;
 };
+
+// Tracks per-frame jitter decisions for same-pose scene sub-passes (e.g. viewmodel/near-plane
+// passes whose near plane/FOV differ from the main world camera) so Z-prepass, G-buffer, and
+// post-deferred passes sharing that projection always receive identical jitter decisions.
+struct SceneSubpassEntry {
+    float scaleX = 0.0f;
+    float scaleY = 0.0f;
+    float depthB = 0.0f;
+    bool jittered = false;
+};
+
+class SceneSubpassTracker {
+public:
+    static constexpr size_t kMaxSubpasses = 4;
+
+    void reset() {
+        frame_ = ~0ull;
+        count_ = 0;
+    }
+
+    void beginFrame(unsigned long long frame) {
+        if (frame_ != frame) {
+            frame_ = frame;
+            count_ = 0;
+        }
+    }
+
+    const SceneSubpassEntry* find(unsigned long long frame, float scaleX, float scaleY, float depthB) const {
+        if (frame_ != frame) return nullptr;
+        for (size_t i = 0; i < count_; ++i) {
+            const auto& e = entries_[i];
+            if (std::fabs(e.depthB - depthB) <= 1e-3f &&
+                std::fabs(e.scaleX - scaleX) <= 0.01f * e.scaleX &&
+                std::fabs(e.scaleY - scaleY) <= 0.01f * e.scaleY) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    const SceneSubpassEntry* findJittered(unsigned long long frame, float scaleX, float scaleY, float depthB) const {
+        const auto* e = find(frame, scaleX, scaleY, depthB);
+        return (e && e->jittered) ? e : nullptr;
+    }
+
+    const SceneSubpassEntry* findJitteredByDepthB(unsigned long long frame, float depthB) const {
+        if (frame_ != frame) return nullptr;
+        for (size_t i = 0; i < count_; ++i) {
+            const auto& e = entries_[i];
+            if (e.jittered && std::fabs(e.depthB - depthB) <= 1e-3f) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    bool recordOrGet(unsigned long long frame, float scaleX, float scaleY, float depthB, bool proposedJitter) {
+        beginFrame(frame);
+        if (const auto* existing = find(frame, scaleX, scaleY, depthB)) {
+            return existing->jittered;
+        }
+        if (count_ < kMaxSubpasses) {
+            entries_[count_++] = {scaleX, scaleY, depthB, proposedJitter};
+        }
+        return proposedJitter;
+    }
+
+    size_t count() const { return count_; }
+    size_t countForFrame(unsigned long long frame) const { return (frame_ == frame) ? count_ : 0; }
+    const SceneSubpassEntry& entry(size_t i) const { return entries_[i]; }
+
+private:
+    unsigned long long frame_ = ~0ull;
+    SceneSubpassEntry entries_[kMaxSubpasses]{};
+    size_t count_ = 0;
+};
+
+// Returns true when `candidate` shares the same camera pose/chirality as `ref`
+// within a scene-internal sub-pass perspective range (different FOV / near plane
+// such as the on-foot viewmodel Z-prepass / G-buffer), so it is never mistaken
+// for a camera cut or auxiliary probe.
+inline bool isSamePoseSceneSubpass(const CameraProjection& candidate,
+                                   const CameraProjection& ref,
+                                   float maxIntraDist,
+                                   float dtRatio = 1.0f) {
+    if (ref.scaleX <= 0.0f) return false;
+    const float det = cameraRotationDeterminant(candidate);
+    if (det < 0.85f || det > 1.15f) return false;
+    if (candidate.depthB < 0.01f || candidate.depthB > 0.25f) return false;
+    const float dist = length(cameraPosition(candidate) - cameraPosition(ref));
+    if (dist > maxIntraDist) return false;
+    const float trace = cameraRotationTrace(candidate, ref);
+    if (trace <= 2.95f) return false;
+    return !isRearOrAuxiliaryProbe(candidate, ref, {0.0f, 0.0f, 0.0f}, dtRatio);
+}
 
 } // namespace edpe

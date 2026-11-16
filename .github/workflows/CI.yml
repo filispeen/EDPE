@@ -93,7 +93,8 @@ jobs:
           variant: sccache
           key: ${{ runner.os }}-sccache-${{ github.ref_name }}
           restore-keys: |
-            ${{ runner.os }}-sccache-
+            sccache-${{ runner.os }}-sccache-${{ github.event.repository.default_branch }}-
+            sccache-${{ runner.os }}-sccache-
           max-size: 2G
 
       - name: Configure CMake
@@ -120,24 +121,102 @@ jobs:
           } else {
             'dev'
           }
-          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build EDPE (Release)
         shell: pwsh
         run: |
-          cmake --build build --config Release --parallel
+          cmake --build build --parallel
 
       - name: Run Tests
         shell: pwsh
         run: |
-          ctest --test-dir build -C Release --output-on-failure
+          ctest --test-dir build --output-on-failure
 
       - name: Upload Staged Binaries
+        if: (github.ref_type == 'tag' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'rc') || startsWith(github.ref_name, 'exp') || startsWith(github.ref_name, 'experimental'))) || inputs.rc == true || inputs.experimental == true
         uses: actions/upload-artifact@v4
         with:
           name: edpe-stage-binaries
           path: build/stage/
           retention-days: 1
+
+  asan:
+    name: ASan Build and Test
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache NVIDIA DLSS SDK
+        id: cache-dlss
+        uses: actions/cache@v4
+        with:
+          path: external/DLSS
+          key: dlss-sdk-${{ runner.os }}-v1
+          restore-keys: |
+            dlss-sdk-${{ runner.os }}-
+
+      - name: Clone NVIDIA DLSS SDK
+        if: steps.cache-dlss.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "external/DLSS/include/nvsdk_ngx.h")) {
+            Write-Host "Cloning official NVIDIA DLSS SDK (sparse)..."
+            git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+            Push-Location external/DLSS
+            git sparse-checkout set include lib/Windows_x86_64
+            Pop-Location
+            Remove-Item -Recurse -Force external/DLSS/.git
+          }
+
+      - name: Cache FidelityFX DX11 SDK
+        id: cache-ffx
+        uses: actions/cache@v4
+        with:
+          path: external/ffx-dx11
+          key: ffx-sdk-${{ runner.os }}-${{ hashFiles('tools/fetch_ffx_dx11.py') }}
+          restore-keys: |
+            ffx-sdk-${{ runner.os }}-
+
+      - name: Fetch FidelityFX DX11 SDK
+        if: steps.cache-ffx.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          python tools/fetch_ffx_dx11.py
+
+      - name: Set up sccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          variant: sccache
+          key: ${{ runner.os }}-sccache-asan-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-asan-
+          max-size: 2G
+
+      - name: Configure CMake (ASan)
+        shell: pwsh
+        run: |
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DEDPE_ENABLE_ASAN=ON -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+
+      - name: Build EDPE (ASan)
+        shell: pwsh
+        run: |
+          cmake --build build --config RelWithDebInfo --parallel
+
+      - name: Run Tests (ASan)
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C RelWithDebInfo --output-on-failure
 
   release:
     name: Publish Release

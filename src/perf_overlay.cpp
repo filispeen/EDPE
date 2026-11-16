@@ -4,6 +4,7 @@
 #include "ngx_context.h"
 #include "config.h"
 #include "profiler.h"
+#include "ui.h"
 #include "log.h"
 
 #include <imgui.h>
@@ -117,25 +118,16 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
         telemetry_.upscalerFrametimeMs = 0.0f;
     }
 
-    // Resolution dimensions
-    UINT outW = 0, outH = 0;
-    if (swapChain) {
+    // Populate output resolution once up front; refresh periodically in updateTelemetry().
+    if (swapChain && (cachedOutputWidth_ == 0 || cachedOutputHeight_ == 0)) {
         DXGI_SWAP_CHAIN_DESC scDesc{};
         if (SUCCEEDED(swapChain->GetDesc(&scDesc))) {
-            outW = scDesc.BufferDesc.Width;
-            outH = scDesc.BufferDesc.Height;
+            cachedOutputWidth_ = scDesc.BufferDesc.Width;
+            cachedOutputHeight_ = scDesc.BufferDesc.Height;
         }
     }
-    UINT sceneW = 0, sceneH = 0;
-    ContextCensusGetSceneRenderSize(&sceneW, &sceneH);
-    if (!sceneW || !sceneH) {
-        sceneW = outW;
-        sceneH = outH;
-    }
-    telemetry_.renderWidth = sceneW;
-    telemetry_.renderHeight = sceneH;
-    telemetry_.outputWidth = outW;
-    telemetry_.outputHeight = outH;
+    const UINT outW = cachedOutputWidth_;
+    const UINT outH = cachedOutputHeight_;
 
     // Game frametime is time spent by game engine before upscaler / composite
     telemetry_.gameFrametimeMs = (std::max)(0.0f, telemetry_.totalFrametimeMs - telemetry_.upscalerFrametimeMs);
@@ -150,11 +142,32 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
         historyCount_++;
     }
 
+    const auto& cfg = Config::instance();
+    const bool menuOpen = UiMenuVisible();
+    const bool uiOrStatsNeeded = cfg.showPerfOverlay || menuOpen || cfg.enableProfiler || cfg.captureOverlayInComparison;
+    upscaler.setTelemetryVisibility(uiOrStatsNeeded, menuOpen);
+    if (!uiOrStatsNeeded) {
+        return;
+    }
+
+    UINT sceneW = 0, sceneH = 0;
+    ContextCensusGetSceneRenderSize(&sceneW, &sceneH);
+    if (!sceneW || !sceneH) {
+        sceneW = outW;
+        sceneH = outH;
+    }
+    telemetry_.renderWidth = sceneW;
+    telemetry_.renderHeight = sceneH;
+    telemetry_.outputWidth = outW;
+    telemetry_.outputHeight = outH;
+
     // Rate-limit hardware telemetry to ~4 times per second (250 ms) BEFORE updating cached display strings
     if (perfFreq_.QuadPart > 0) {
         const double elapsedSinceUpdateMs = static_cast<double>(now.QuadPart - lastTelemetryUpdate_.QuadPart) * 1000.0 / static_cast<double>(perfFreq_.QuadPart);
         if (lastTelemetryUpdate_.QuadPart == 0 || elapsedSinceUpdateMs >= 250.0) {
             updateTelemetry(swapChain);
+            telemetry_.outputWidth = cachedOutputWidth_;
+            telemetry_.outputHeight = cachedOutputHeight_;
             lastTelemetryUpdate_ = now;
         }
     }
@@ -349,18 +362,37 @@ void PerfTracker::updateCachedStats() {
     }
 
     if (Profiler::instance().isEnabled()) {
-        profilerDisplay_.mapMs = Profiler::instance().getAvgMs(ProfileZone::MapUnmap);
-        profilerDisplay_.omMs = Profiler::instance().getAvgMs(ProfileZone::OMSetRenderTargets);
-        profilerDisplay_.deltaMs = Profiler::instance().getAvgMs(ProfileZone::CameraDeltaCopy);
-        profilerDisplay_.drawMs = Profiler::instance().getAvgMs(ProfileZone::DrawProbe);
-        profilerDisplay_.upscaleMs = Profiler::instance().getAvgMs(ProfileZone::TemporalUpscale);
+        auto& prof = Profiler::instance();
+        profilerDisplay_.mapMs = prof.getAvgMs(ProfileZone::MapUnmap);
+        profilerDisplay_.omMs = prof.getAvgMs(ProfileZone::OMSetRenderTargets);
+        profilerDisplay_.deltaMs = prof.getAvgMs(ProfileZone::CameraDeltaCopy);
+        profilerDisplay_.drawMs = prof.getAvgMs(ProfileZone::DrawProbe);
+        profilerDisplay_.upscaleMs = prof.getAvgMs(ProfileZone::TemporalUpscale);
         const float measuredSum = profilerDisplay_.mapMs + profilerDisplay_.omMs + profilerDisplay_.deltaMs + profilerDisplay_.drawMs;
         profilerDisplay_.unaccountedMs = (std::max)(0.0f, cachedStats_.gameFrametimeMs - measuredSum);
+
+        profilerDisplay_.gpuDepthCopyMs = prof.getGpuAvgMs(GpuProfileZone::DepthCopy);
+        profilerDisplay_.gpuMotionMs = prof.getGpuAvgMs(GpuProfileZone::MotionPass);
+        profilerDisplay_.gpuColorPrepMs = prof.getGpuAvgMs(GpuProfileZone::ColorPrep);
+        profilerDisplay_.gpuUpscaleEvalMs = prof.getGpuAvgMs(GpuProfileZone::UpscaleEval);
+        profilerDisplay_.gpuUiCompositeMs = prof.getGpuAvgMs(GpuProfileZone::UiComposite);
+        profilerDisplay_.gpuHudBloomMs = prof.getGpuAvgMs(GpuProfileZone::HudBloom);
+        profilerDisplay_.gpuEdpeTotalMs =
+            profilerDisplay_.gpuDepthCopyMs + profilerDisplay_.gpuMotionMs +
+            profilerDisplay_.gpuColorPrepMs + profilerDisplay_.gpuUpscaleEvalMs +
+            profilerDisplay_.gpuUiCompositeMs + profilerDisplay_.gpuHudBloomMs;
+        profilerDisplay_.directColorActive = prof.isDirectColorActive();
     }
 }
 
 void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
     if (!swapChain) return;
+
+    DXGI_SWAP_CHAIN_DESC scDesc{};
+    if (SUCCEEDED(swapChain->GetDesc(&scDesc))) {
+        cachedOutputWidth_ = scDesc.BufferDesc.Width;
+        cachedOutputHeight_ = scDesc.BufferDesc.Height;
+    }
 
     // 1. Static GPU adapter information
     if (!gpuInfoCached_) {
@@ -699,13 +731,18 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
 
         if (cfg.enableProfiler) {
             ImGui::Separator();
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Profiler (120f avg):");
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "CPU Profiler (120f avg):");
             ImGui::Text("  Map/Unmap (CB/Jitter): %6.3f ms", profilerDisplay_.mapMs);
             ImGui::Text("  OMSetRenderTargets:    %6.3f ms", profilerDisplay_.omMs);
             ImGui::Text("  Camera Delta Copy:     %6.3f ms", profilerDisplay_.deltaMs);
             ImGui::Text("  HUD Draw Probe:        %6.3f ms", profilerDisplay_.drawMs);
             ImGui::Text("  Upscale Prep & Eval:   %6.3f ms", profilerDisplay_.upscaleMs);
             ImGui::Text("  Unaccounted (Game):    %6.3f ms", profilerDisplay_.unaccountedMs);
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 1.0f, 1.0f), "GPU Passes (120f avg -> edpe.log):");
+            ImGui::Text("  DepthCopy / Motion:    %6.3f / %6.3f ms", profilerDisplay_.gpuDepthCopyMs, profilerDisplay_.gpuMotionMs);
+            ImGui::Text("  ColorPrep (%s):   %6.3f ms", profilerDisplay_.directColorActive ? "Direct" : "Copy  ", profilerDisplay_.gpuColorPrepMs);
+            ImGui::Text("  UpscaleEval / UI Comp: %6.3f / %6.3f ms", profilerDisplay_.gpuUpscaleEvalMs, profilerDisplay_.gpuUiCompositeMs);
+            ImGui::Text("  HudBloom / EDPE Total: %6.3f / %6.3f ms", profilerDisplay_.gpuHudBloomMs, profilerDisplay_.gpuEdpeTotalMs);
         }
     }
     ImGui::End();

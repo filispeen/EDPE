@@ -679,5 +679,145 @@ int main() {
     }
     context->Unmap(staging.Get(), 0);
 
+    // Test 21: UiLayer visor delta compute shader (src/shaders/ui_layer_composite_cs.hlsl)
+    // Verifies:
+    //  - col 0 (no HUD, no visor delta): exact reconstructed world color (no black-floor washout)
+    //  - col 1 (no HUD, +glare visor delta): world + visorDelta
+    //  - col 2 (no HUD, -droplet visor delta): clamp(world + visorDelta, 0, 1)
+    //  - col 3 (opaque HUD T=0.0, +glare visor delta): HUD sits in front of visor (visorDelta attenuated by T=0)
+    {
+        const wchar_t* hlslPath = L"" EDPE_SOURCE_DIR "/src/shaders/ui_layer_composite_cs.hlsl";
+        ComPtr<ID3DBlob> csBlob, errBlob;
+        if (FAILED(D3DCompileFromFile(hlslPath, nullptr, nullptr, "cs_main", "cs_5_0", 0, 0, &csBlob, &errBlob)) ||
+            !csBlob) {
+            return 100;
+        }
+        ComPtr<ID3D11ComputeShader> layerCs;
+        if (FAILED(device->CreateComputeShader(csBlob->GetBufferPointer(), csBlob->GetBufferSize(), nullptr, &layerCs))) {
+            return 101;
+        }
+
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        ComPtr<ID3D11SamplerState> smp;
+        if (FAILED(device->CreateSamplerState(&sd, &smp))) return 102;
+
+        struct UiLayerCb {
+            uint32_t outputSize[2];
+            uint32_t hasMultiply;
+            uint32_t debugView;
+            uint32_t hasVisorDelta;
+            uint32_t pad[3];
+        };
+        const UiLayerCb cbInit{{4, 4}, 0, 0, 1, {0, 0, 0}};
+        D3D11_BUFFER_DESC cbd{sizeof(UiLayerCb), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        D3D11_SUBRESOURCE_DATA cbData{&cbInit, 0, 0};
+        ComPtr<ID3D11Buffer> cb;
+        if (FAILED(device->CreateBuffer(&cbd, &cbData, &cb))) return 103;
+
+        D3D11_TEXTURE2D_DESC uavDesc = outDesc;
+        uavDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> csOutTex, wTex, uiTex, mTex, hTex, vLdrTex, cLdrTex;
+        ComPtr<ID3D11UnorderedAccessView> csOutUav;
+        ComPtr<ID3D11ShaderResourceView> wSrv, uiSrv, mSrv, hSrv, vLdrSrv, cLdrSrv;
+
+        auto packRgbaA = [](uint8_t r, uint8_t g, uint8_t b, uint8_t a) -> uint32_t {
+            return (static_cast<uint32_t>(a) << 24) | (static_cast<uint32_t>(b) << 16) |
+                   (static_cast<uint32_t>(g) << 8) | r;
+        };
+        std::array<uint32_t, 16> wPx{}, uiPx{}, mPx{}, vPx{}, cPx{};
+        wPx.fill(packRgbaA(100, 100, 100, 255));
+        mPx.fill(packRgbaA(255, 255, 255, 255));
+        uiPx.fill(packRgbaA(0, 0, 0, 255));
+        cPx.fill(packRgbaA(80, 80, 80, 255));
+        vPx.fill(packRgbaA(80, 80, 80, 255));
+
+        std::array<float, 16 * 4> hPx{};
+        for (int i = 0; i < 16; ++i) {
+            hPx[i * 4 + 3] = 1.0f; // transmittance = 1.0
+        }
+        // Apply per-column visor/HUD test cases across row 1 (leaving pixel (0,0) clean for blackFloor test)
+        // col 0: clean -> delta 0
+        // col 1: +glare (+40 on B/G/R)
+        vPx[1 * 4 + 1] = packRgbaA(120, 110, 100, 255); // delta = (+40, +30, +20)
+        // col 2: -droplet (-30 on R/G/B)
+        vPx[1 * 4 + 2] = packRgbaA(50, 60, 70, 255);    // delta = (-30, -20, -10)
+        // col 3: opaque cyan HUD (T=0.0, ui=(0, 200, 220)) with +glare behind it
+        vPx[1 * 4 + 3] = packRgbaA(200, 200, 200, 255);
+        uiPx[1 * 4 + 3] = packRgbaA(0, 200, 220, 255);
+        hPx[(1 * 4 + 3) * 4 + 1] = 1.0f;
+        hPx[(1 * 4 + 3) * 4 + 3] = 0.0f; // T = 0.0 (opaque HUD)
+
+        D3D11_TEXTURE2D_DESC hdrDesc = outDesc;
+        hdrDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+
+        D3D11_SUBRESOURCE_DATA wInit{wPx.data(), 4 * 4, 0};
+        D3D11_SUBRESOURCE_DATA uiInit{uiPx.data(), 4 * 4, 0};
+        D3D11_SUBRESOURCE_DATA mInit{mPx.data(), 4 * 4, 0};
+        D3D11_SUBRESOURCE_DATA hInit{hPx.data(), 4 * 16, 0};
+        D3D11_SUBRESOURCE_DATA vInit{vPx.data(), 4 * 4, 0};
+        D3D11_SUBRESOURCE_DATA cInit{cPx.data(), 4 * 4, 0};
+
+        if (FAILED(device->CreateTexture2D(&uavDesc, nullptr, &csOutTex)) ||
+            FAILED(device->CreateUnorderedAccessView(csOutTex.Get(), nullptr, &csOutUav)) ||
+            FAILED(device->CreateTexture2D(&outDesc, &wInit, &wTex)) ||
+            FAILED(device->CreateShaderResourceView(wTex.Get(), nullptr, &wSrv)) ||
+            FAILED(device->CreateTexture2D(&outDesc, &uiInit, &uiTex)) ||
+            FAILED(device->CreateShaderResourceView(uiTex.Get(), nullptr, &uiSrv)) ||
+            FAILED(device->CreateTexture2D(&outDesc, &mInit, &mTex)) ||
+            FAILED(device->CreateShaderResourceView(mTex.Get(), nullptr, &mSrv)) ||
+            FAILED(device->CreateTexture2D(&hdrDesc, &hInit, &hTex)) ||
+            FAILED(device->CreateShaderResourceView(hTex.Get(), nullptr, &hSrv)) ||
+            FAILED(device->CreateTexture2D(&outDesc, &vInit, &vLdrTex)) ||
+            FAILED(device->CreateShaderResourceView(vLdrTex.Get(), nullptr, &vLdrSrv)) ||
+            FAILED(device->CreateTexture2D(&outDesc, &cInit, &cLdrTex)) ||
+            FAILED(device->CreateShaderResourceView(cLdrTex.Get(), nullptr, &cLdrSrv))) {
+            return 104;
+        }
+
+        ID3D11ShaderResourceView* srvs[6] = {wSrv.Get(), uiSrv.Get(), mSrv.Get(), hSrv.Get(), vLdrSrv.Get(), cLdrSrv.Get()};
+        ID3D11UnorderedAccessView* uav = csOutUav.Get();
+        ID3D11Buffer* cbs[1] = {cb.Get()};
+        ID3D11SamplerState* smps[1] = {smp.Get()};
+        context->CSSetShaderResources(0, 6, srvs);
+        context->CSSetSamplers(0, 1, smps);
+        context->CSSetConstantBuffers(0, 1, cbs);
+        context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        context->CSSetShader(layerCs.Get(), nullptr, 0);
+        context->Dispatch(1, 1, 1);
+
+        ID3D11ShaderResourceView* nullSrvs[6]{};
+        ID3D11UnorderedAccessView* nullUav = nullptr;
+        context->CSSetShaderResources(0, 6, nullSrvs);
+        context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+
+        context->CopyResource(staging.Get(), csOutTex.Get());
+        if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 105;
+        const auto* outRow1 = static_cast<const uint8_t*>(mapped.pData) + 1 * mapped.RowPitch;
+        // Col 0: exact world (100, 100, 100)
+        if (std::abs(int(outRow1[0]) - 100) > 1 || std::abs(int(outRow1[1]) - 100) > 1 || std::abs(int(outRow1[2]) - 100) > 1) {
+            context->Unmap(staging.Get(), 0);
+            return 106;
+        }
+        // Col 1: (100+40, 100+30, 100+20) = (140, 130, 120)
+        if (std::abs(int(outRow1[4]) - 140) > 2 || std::abs(int(outRow1[5]) - 130) > 2 || std::abs(int(outRow1[6]) - 120) > 2) {
+            context->Unmap(staging.Get(), 0);
+            return 107;
+        }
+        // Col 2: (100-30, 100-20, 100-10) = (70, 80, 90)
+        if (std::abs(int(outRow1[8]) - 70) > 2 || std::abs(int(outRow1[9]) - 80) > 2 || std::abs(int(outRow1[10]) - 90) > 2) {
+            context->Unmap(staging.Get(), 0);
+            return 108;
+        }
+        // Col 3: opaque HUD (0, 200, 220), zero visor bleed-through
+        if (std::abs(int(outRow1[12]) - 0) > 2 || std::abs(int(outRow1[13]) - 200) > 2 || std::abs(int(outRow1[14]) - 220) > 2) {
+            context->Unmap(staging.Get(), 0);
+            return 109;
+        }
+        context->Unmap(staging.Get(), 0);
+    }
+
     return 0;
 }

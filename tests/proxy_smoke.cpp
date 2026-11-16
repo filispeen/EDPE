@@ -429,7 +429,15 @@ int wmain(int argc, wchar_t** argv) {
             &motion_probe))) return 10;
     std::memcpy(motion_probe.pData, probe_values, sizeof(probe_values));
     context->Unmap(probe_buffer, 0);
-    const bool motion_requested = request_motion_pair(0);
+    // Allow asynchronous camera-pair depth staging readback to finish on slower/WARP CI runners
+    bool motion_requested = false;
+    for (int retry = 0; retry < 60; ++retry) {
+        motion_requested = request_motion_pair(0);
+        if (motion_requested) break;
+        context->Flush();
+        swap_chain->Present(0, 0);
+        Sleep(5);
+    }
     const HRESULT motion_arm_present = swap_chain->Present(0, 0);
     HRESULT motion_present = S_OK;
     bool glass_target_restored = false;
@@ -575,12 +583,25 @@ int wmain(int argc, wchar_t** argv) {
     context->OMSetRenderTargets(0, nullptr, depth_view);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     context->Flush();
+    auto log_has_motion_result = [&]() -> bool {
+        const HANDLE probe = CreateFileW(log_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (probe == INVALID_HANDLE_VALUE) return false;
+        char buf[65536]{};
+        DWORD n = 0;
+        const BOOL ok = ReadFile(probe, buf, sizeof(buf) - 1, &n, nullptr);
+        CloseHandle(probe);
+        if (!ok) return false;
+        return std::strstr(buf, "EDPE: motion candidate currentAfterPresent=") != nullptr ||
+               std::strstr(buf, "EDPE: motion candidate grid unavailable") != nullptr;
+    };
     for (int i = 0; i < 8; ++i) swap_chain->Present(0, 0);
-    // Allow asynchronous motion grid readback to complete on slower/WARP CI runners
-    for (int retry = 0; retry < 60 && scene_depth_candidate() != 0; ++retry) {
+    // Allow asynchronous motion grid readback (and async log flush) to complete on loaded/WARP runners
+    for (int retry = 0; retry < 60 && !log_has_motion_result(); ++retry) {
+        Sleep(2);
+        if (log_has_motion_result()) break;
         context->Flush();
         swap_chain->Present(0, 0);
-        Sleep(5);
     }
     const bool scene_candidate_held = scene_depth_candidate() == 0;
     SendMessageW(window, WM_KEYDOWN, 'A', 0);

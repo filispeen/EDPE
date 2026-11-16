@@ -562,6 +562,7 @@ static void writeCrashDump(EXCEPTION_POINTERS* ep) {
     }
     writeRaw(file, "\r\n");
 
+    EdpeLogFlush();
     EdpeLogDumpRecent(file);
 
     CloseHandle(file);

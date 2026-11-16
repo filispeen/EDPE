@@ -13,16 +13,21 @@ namespace edpe {
 namespace {
 
 inline constexpr char kUiLayerCompositeCsHlsl[] = R"hlsl(
-Texture2D<float4>   tWorld : register(t0); // Апскейлений 3D світ (після DLSS/FSR/TAA)
-Texture2D<float4>   tUi    : register(t1); // Тонемаплений колір UI (LdrLayer.rgb)
-Texture2D<float4>   tMult  : register(t2); // Шар мультиплікативного затемнення (vignette / drop shadow)
-Texture2D<float4>   tHdrUi : register(t3); // Лінійний HDR-шар UI (RGB = емісія, A = Transmittance T = prod(1 - alpha))
-RWTexture2D<float4> uOut   : register(u0); // Вихідний буфер
+Texture2D<float4>   tWorld    : register(t0); // Апскейлений 3D світ (після DLSS/FSR/TAA)
+Texture2D<float4>   tUi       : register(t1); // Тонемаплений колір UI (LdrLayer.rgb)
+Texture2D<float4>   tMult     : register(t2); // Шар мультиплікативного затемнення (vignette / drop shadow)
+Texture2D<float4>   tHdrUi    : register(t3); // Лінійний HDR-шар UI (RGB = емісія, A = Transmittance T = prod(1 - alpha))
+Texture2D<float4>   tVisorLdr : register(t4); // Тонемаплена сцена + наекранний шолом (для дельта-композиту)
+Texture2D<float4>   tCleanLdr : register(t5); // Тонемаплена сцена без шолома
+SamplerState        sLinear   : register(s0);
+RWTexture2D<float4> uOut      : register(u0); // Вихідний буфер
 
 cbuffer CompositeParams : register(b0) {
     uint2 outputSize;
     uint  hasMultiply;
     uint  debugView;
+    uint  hasVisorDelta;
+    uint3 _pad;
 };
 
 float3 srgbToLinear(float3 c) {
@@ -48,10 +53,20 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     float transmittance = saturate(hdrUi.a);
     float3 mult = (hasMultiply != 0) ? tMult.Load(p).rgb : float3(1.0, 1.0, 1.0);
 
+    float3 visorDelta = float3(0.0, 0.0, 0.0);
+    if (debugView == 0 && hasVisorDelta != 0) {
+        float2 uv = (float2(p.xy) + 0.5) / float2(outputSize);
+        visorDelta = tVisorLdr.SampleLevel(sLinear, uv, 0).rgb - tCleanLdr.SampleLevel(sLinear, uv, 0).rgb;
+    }
+
     // Якщо піксель не містить ні емісійного UI, ні напівпрозорої підкладки (transmittance == 1),
-    // миттєво повертаємо піксель 3D-світу без читання tUi та без перетворень:
+    // повертаємо піксель 3D-світу (плюс дельта шолома, якщо активна) без читання tUi:
     if (debugView == 0 && all(hdrUi.rgb <= 1e-5) && transmittance >= 0.999 && all(mult >= 0.999)) {
-        uOut[id.xy] = tWorld.Load(p);
+        float4 worldOnly = tWorld.Load(p);
+        if (hasVisorDelta != 0) {
+            worldOnly.rgb = saturate(worldOnly.rgb + visorDelta);
+        }
+        uOut[id.xy] = worldOnly;
         return;
     }
 
@@ -74,24 +89,29 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
 
     // Оскільки коефіцієнт пропускання T = prod(1 - alpha) накопичується у лінійному
     // HDR-просторі до тонемапінгу (Pass 35), ослаблення фону виконується у лінійному
-    // світлі перед поверненням у гамма-простір sRGB:
-    float3 worldLin = srgbToLinear(world.rgb);
-    float3 attenWorld = linearToSrgb(worldLin * (transmittance * cleanMult));
-    float3 finalRgb = uiRgb + attenWorld;
+    // світлі перед поверненням у гамма-простір sRGB; при atten == 1 пропускаємо pow(2.4):
+    float3 atten = transmittance * cleanMult;
+    float3 attenWorld = all(atten >= 0.999) ? world.rgb : linearToSrgb(srgbToLinear(world.rgb) * atten);
+    float3 finalRgb = uiRgb + attenWorld + visorDelta * atten;
     uOut[id.xy] = float4(saturate(finalRgb), world.a);
 }
 )hlsl";
 
 inline constexpr char kUiLayerCompositePsHlsl[] = R"hlsl(
-Texture2D<float4> tWorld : register(t0);
-Texture2D<float4> tUi    : register(t1);
-Texture2D<float4> tMult  : register(t2);
-Texture2D<float4> tHdrUi : register(t3);
+Texture2D<float4> tWorld    : register(t0);
+Texture2D<float4> tUi       : register(t1);
+Texture2D<float4> tMult     : register(t2);
+Texture2D<float4> tHdrUi    : register(t3);
+Texture2D<float4> tVisorLdr : register(t4);
+Texture2D<float4> tCleanLdr : register(t5);
+SamplerState      sLinear   : register(s0);
 
 cbuffer CompositeParams : register(b0) {
     uint2 outputSize;
     uint  hasMultiply;
     uint  debugView;
+    uint  hasVisorDelta;
+    uint3 _pad;
 };
 
 struct VSOut {
@@ -126,8 +146,18 @@ float4 ps_main(VSOut pin) : SV_Target {
     float transmittance = saturate(hdrUi.a);
     float3 mult = (hasMultiply != 0) ? tMult.Load(p).rgb : float3(1.0, 1.0, 1.0);
 
+    float3 visorDelta = float3(0.0, 0.0, 0.0);
+    if (debugView == 0 && hasVisorDelta != 0) {
+        float2 uv = (float2(p.xy) + 0.5) / float2(outputSize);
+        visorDelta = tVisorLdr.SampleLevel(sLinear, uv, 0).rgb - tCleanLdr.SampleLevel(sLinear, uv, 0).rgb;
+    }
+
     if (debugView == 0 && all(hdrUi.rgb <= 1e-5) && transmittance >= 0.999 && all(mult >= 0.999)) {
-        return tWorld.Load(p);
+        float4 worldOnly = tWorld.Load(p);
+        if (hasVisorDelta != 0) {
+            worldOnly.rgb = saturate(worldOnly.rgb + visorDelta);
+        }
+        return worldOnly;
     }
 
     float4 ui = tUi.Load(p);
@@ -145,9 +175,9 @@ float4 ps_main(VSOut pin) : SV_Target {
     float4 world = tWorld.Load(p);
     float3 cleanMult = all(mult >= 0.999) ? float3(1.0, 1.0, 1.0) : mult;
 
-    float3 worldLin = srgbToLinear(world.rgb);
-    float3 attenWorld = linearToSrgb(worldLin * (transmittance * cleanMult));
-    float3 finalRgb = uiRgb + attenWorld;
+    float3 atten = transmittance * cleanMult;
+    float3 attenWorld = all(atten >= 0.999) ? world.rgb : linearToSrgb(srgbToLinear(world.rgb) * atten);
+    float3 finalRgb = uiRgb + attenWorld + visorDelta * atten;
     return float4(saturate(finalRgb), world.a);
 }
 )hlsl";
@@ -301,9 +331,20 @@ bool UiLayer::initialize(ID3D11Device* device) {
         }
     }
 
-    // Створення константного буфера композитингу
+    // Створення лінійного семплера та константного буфера композитингу
+    {
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(device_->CreateSamplerState(&sd, &visorSampler_))) {
+            return false;
+        }
+    }
     D3D11_BUFFER_DESC cbd{};
-    cbd.ByteWidth = sizeof(uint32_t) * 4;
+    cbd.ByteWidth = sizeof(uint32_t) * 8;
     cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -473,6 +514,11 @@ void UiLayer::shutdown() {
     compositePs_.Reset();
     constantBuffer_.Reset();
     compositeCs_.Reset();
+    visorSampler_.Reset();
+    visorLdrSrv_.Reset();
+    cleanLdrSrv_.Reset();
+    cbHasVisorDelta_ = false;
+    cbValid_ = false;
     device_.Reset();
 
     isIntercepting_ = false;
@@ -538,7 +584,23 @@ void UiLayer::resize(ID3D11Device* device, UINT width, UINT height) {
     }
 }
 
+void UiLayer::setVisorDeltaSrvs(ID3D11ShaderResourceView* visorLdr, ID3D11ShaderResourceView* cleanLdr) {
+    if (visorLdr && cleanLdr) {
+        visorLdrSrv_ = visorLdr;
+        cleanLdrSrv_ = cleanLdr;
+    } else {
+        visorLdrSrv_.Reset();
+        cleanLdrSrv_.Reset();
+    }
+}
+
+void UiLayer::resetVisorDelta() {
+    visorLdrSrv_.Reset();
+    cleanLdrSrv_.Reset();
+}
+
 void UiLayer::beginFrame(ID3D11DeviceContext* context) {
+    resetVisorDelta();
     if (!context || !hdrLayerRtv_) return;
     EvaluatingUpscalerGuard guard;
 
@@ -577,10 +639,6 @@ bool UiLayer::shouldInterceptDraw(uint64_t vsHash, uint64_t psHash, bool isHdrTa
         return true;
     }
     return (vsHash == 0x2CECEC3065EF0D4Aull && psHash == 0xA4D03619D631B186ull) ||
-           (vsHash == 0x5559BD94B6852E83ull &&
-            (psHash == 0xEA02FAC2BD6C643Cull || psHash == 0xE95634B0F61D218Full)) ||
-           (vsHash == 0xB12F7A618E1BDE98ull &&
-            (psHash == 0x203DF51758AADC4Dull || psHash == 0x42AC0CACC9CDF72Bull)) ||
            (vsHash == 0xF8D8A92E96419901ull && psHash == 0x16196F69ADE35E77ull) ||
            (vsHash == 0x1989B75BF034ECC3ull && psHash == 0xDB79AE788E049DFDull) ||
            (vsHash == 0xC7FA0C0F5DD49180ull && psHash == 0x6EEF165A350DA30Full) ||
@@ -996,6 +1054,34 @@ bool matchesDevice(ID3D11DeviceChild* child, ID3D11Device* expectedDevice) {
 
 } // namespace
 
+void UiLayer::updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView) {
+    const bool hasVisorDelta = (visorLdrSrv_ != nullptr && cleanLdrSrv_ != nullptr);
+    if (cbValid_ && cbWidth_ == outputWidth && cbHeight_ == outputHeight &&
+        cbHasMult_ == hasMultiplyDraws_ && cbDebugView_ == debugView &&
+        cbHasVisorDelta_ == hasVisorDelta) {
+        return;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(context->Map(constantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        auto* data = reinterpret_cast<uint32_t*>(mapped.pData);
+        data[0] = outputWidth;
+        data[1] = outputHeight;
+        data[2] = hasMultiplyDraws_ ? 1 : 0;
+        data[3] = debugView ? 1 : 0;
+        data[4] = hasVisorDelta ? 1 : 0;
+        data[5] = 0;
+        data[6] = 0;
+        data[7] = 0;
+        context->Unmap(constantBuffer_.Get(), 0);
+        cbWidth_ = outputWidth;
+        cbHeight_ = outputHeight;
+        cbHasMult_ = hasMultiplyDraws_;
+        cbDebugView_ = debugView;
+        cbHasVisorDelta_ = hasVisorDelta;
+        cbValid_ = true;
+    }
+}
+
 bool UiLayer::composite(ID3D11DeviceContext* context,
                         ID3D11ShaderResourceView* worldReconstruction,
                         ID3D11UnorderedAccessView* backbufferUav,
@@ -1020,24 +1106,20 @@ bool UiLayer::composite(ID3D11DeviceContext* context,
     }
 
     // Оновлюємо константи
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (SUCCEEDED(context->Map(constantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        auto* data = reinterpret_cast<uint32_t*>(mapped.pData);
-        data[0] = outputWidth;
-        data[1] = outputHeight;
-        data[2] = hasMultiplyDraws_ ? 1 : 0;
-        data[3] = debugView ? 1 : 0;
-        context->Unmap(constantBuffer_.Get(), 0);
-    }
+    updateCompositeConstants(context, outputWidth, outputHeight, debugView);
 
-    // Біндимо ресурси (t0 = world, t1 = ldrUi, t2 = mult, t3 = hdrUi)
-    ID3D11ShaderResourceView* srvs[4] = {
+    // Біндимо ресурси (t0 = world, t1 = ldrUi, t2 = mult, t3 = hdrUi, t4 = visorLdr, t5 = cleanLdr)
+    ID3D11ShaderResourceView* srvs[6] = {
         worldReconstruction,
         ldrLayerSrv_.Get(),
         multLayerSrv_.Get(),
-        hdrLayerSrv_.Get()
+        hdrLayerSrv_.Get(),
+        visorLdrSrv_.Get(),
+        cleanLdrSrv_.Get()
     };
-    context->CSSetShaderResources(0, 4, srvs);
+    context->CSSetShaderResources(0, 6, srvs);
+    ID3D11SamplerState* smp = visorSampler_.Get();
+    context->CSSetSamplers(0, 1, &smp);
     context->CSSetUnorderedAccessViews(0, 1, &backbufferUav, nullptr);
     context->CSSetConstantBuffers(0, 1, constantBuffer_.GetAddressOf());
     context->CSSetShader(compositeCs_.Get(), nullptr, 0);
@@ -1048,9 +1130,11 @@ bool UiLayer::composite(ID3D11DeviceContext* context,
     context->Dispatch(groupsX, groupsY, 1);
 
     // Розбіндинг
-    ID3D11ShaderResourceView* nullSrvs[4] = {nullptr, nullptr, nullptr, nullptr};
+    ID3D11ShaderResourceView* nullSrvs[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    ID3D11SamplerState* nullSmp = nullptr;
     ID3D11UnorderedAccessView* nullUav = nullptr;
-    context->CSSetShaderResources(0, 4, nullSrvs);
+    context->CSSetShaderResources(0, 6, nullSrvs);
+    context->CSSetSamplers(0, 1, &nullSmp);
     context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
 
     if (prevRtv || prevDsv) {
@@ -1076,15 +1160,7 @@ bool UiLayer::compositeToRtv(ID3D11DeviceContext* context,
     }
     EvaluatingUpscalerGuard guard;
 
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (SUCCEEDED(context->Map(constantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        auto* data = reinterpret_cast<uint32_t*>(mapped.pData);
-        data[0] = outputWidth;
-        data[1] = outputHeight;
-        data[2] = hasMultiplyDraws_ ? 1 : 0;
-        data[3] = debugView ? 1 : 0;
-        context->Unmap(constantBuffer_.Get(), 0);
-    }
+    updateCompositeConstants(context, outputWidth, outputHeight, debugView);
 
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> origRtv;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> origDsv;
@@ -1101,7 +1177,8 @@ bool UiLayer::compositeToRtv(ID3D11DeviceContext* context,
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> origRs;
     D3D11_VIEWPORT origVp{};
     UINT origVpCount = 1;
-    ID3D11ShaderResourceView* origSrvs[4]{};
+    ID3D11ShaderResourceView* origSrvs[6]{};
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> origSampler;
     Microsoft::WRL::ComPtr<ID3D11Buffer> origPsCb0;
 
     if (!callerRestoresState) {
@@ -1115,7 +1192,8 @@ bool UiLayer::compositeToRtv(ID3D11DeviceContext* context,
         context->OMGetDepthStencilState(origDs.GetAddressOf(), &origStencilRef);
         context->RSGetState(origRs.GetAddressOf());
         context->RSGetViewports(&origVpCount, &origVp);
-        context->PSGetShaderResources(0, 4, origSrvs);
+        context->PSGetShaderResources(0, 6, origSrvs);
+        context->PSGetSamplers(0, 1, origSampler.GetAddressOf());
         context->PSGetConstantBuffers(0, 1, origPsCb0.GetAddressOf());
     }
 
@@ -1134,28 +1212,33 @@ bool UiLayer::compositeToRtv(ID3D11DeviceContext* context,
     context->PSSetShader(compositePs_.Get(), nullptr, 0);
     context->GSSetShader(nullptr, nullptr, 0);
 
-    ID3D11ShaderResourceView* srvs[4] = {
+    ID3D11ShaderResourceView* srvs[6] = {
         worldReconstruction,
         ldrLayerSrv_.Get(),
         multLayerSrv_.Get(),
-        hdrLayerSrv_.Get()
+        hdrLayerSrv_.Get(),
+        visorLdrSrv_.Get(),
+        cleanLdrSrv_.Get()
     };
-    context->PSSetShaderResources(0, 4, srvs);
+    context->PSSetShaderResources(0, 6, srvs);
+    ID3D11SamplerState* smp = visorSampler_.Get();
+    context->PSSetSamplers(0, 1, &smp);
     ID3D11Buffer* cb0 = constantBuffer_.Get();
     context->PSSetConstantBuffers(0, 1, &cb0);
 
     context->Draw(3, 0);
 
-    ID3D11ShaderResourceView* nullSrvs[4] = {nullptr, nullptr, nullptr, nullptr};
-    context->PSSetShaderResources(0, 4, nullSrvs);
-    ID3D11RenderTargetView* nullRtv = nullptr;
-    context->OMSetRenderTargets(1, &nullRtv, nullptr);
-
     if (!callerRestoresState) {
-        context->PSSetShaderResources(0, 4, origSrvs);
-        for (int i = 0; i < 4; ++i) {
+        ID3D11ShaderResourceView* nullSrvs[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+        context->PSSetShaderResources(0, 6, nullSrvs);
+        ID3D11RenderTargetView* nullRtv = nullptr;
+        context->OMSetRenderTargets(1, &nullRtv, nullptr);
+        context->PSSetShaderResources(0, 6, origSrvs);
+        for (int i = 0; i < 6; ++i) {
             if (origSrvs[i]) origSrvs[i]->Release();
         }
+        ID3D11SamplerState* restoreSmp = origSampler.Get();
+        context->PSSetSamplers(0, 1, &restoreSmp);
         ID3D11Buffer* restoreCb0 = origPsCb0.Get();
         context->PSSetConstantBuffers(0, 1, &restoreCb0);
         context->VSSetShader(origVs.Get(), nullptr, 0);

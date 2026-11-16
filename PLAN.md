@@ -8,7 +8,7 @@ The initial focus is temporal upscaling and anti-aliasing:
 
 * NVIDIA DLSS Super Resolution;
 * NVIDIA DLAA;
-* NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising);
+* NVIDIA DLSS-NR (Neural Rendering);
 * AMD FSR temporal upscaling / Native AA;
 * Intel XeSS Super Resolution / Native AA;
 * native D3D11 TAA;
@@ -1869,9 +1869,9 @@ public:
 
 ---
 
-# 41. Phase 18 — NVIDIA DLSS-NR (Ray Reconstruction / Neural Denoising)
+# 41. Phase 18 — NVIDIA DLSS-NR (Neural Rendering)
 
-Investigate and prototype NVIDIA DLSS Ray Reconstruction / Neural Radiance Denoiser (DLSS-NR / DLSS-RR) support via NVIDIA NGX (`NVSDK_NGX_Feature_RayReconstruction`) or Streamline (`SL_FEATURE_DLSS_RR`).
+Investigate and prototype NVIDIA DLSS Neural Radiance Denoiser (DLSS-NR) support via NVIDIA NGX (`NVSDK_NGX_Feature_RayReconstruction`) or Streamline.
 
 DLSS-NR replaces traditional handcrafted temporal/spatial denoisers by feeding noisy diffuse/specular signals into an AI neural model that reconstructs higher-quality lighting, specular reflections, and ambient occlusion while simultaneously performing temporal super-resolution.
 
@@ -1891,7 +1891,7 @@ Goals:
 
 1. **G-Buffer Discovery in Cobra:**
    Identify and isolate render-target binds containing view/world normals and surface roughness during the deferred G-Buffer lighting pass.
-2. **NGX Ray Reconstruction Dispatch:**
+2. **NGX Neural Denoising Dispatch:**
    Initialize and dispatch `NVSDK_NGX_D3D11_CreateFeature` with `NVSDK_NGX_Feature_RayReconstruction` (or through the D3D12/Streamline bridge).
 3. **Fail-Open Fallback:**
    If normal/roughness buffers are unavailable or if the active GPU lacks required Tensor Core capabilities, safely fall back to standard DLSS Super Resolution or DLAA.

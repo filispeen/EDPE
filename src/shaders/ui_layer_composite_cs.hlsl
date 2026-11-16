@@ -1,13 +1,18 @@
-Texture2D<float4>   tWorld : register(t0); // Апскейлений 3D світ (після DLSS/FSR/TAA)
-Texture2D<float4>   tUi    : register(t1); // Тонемаплений колір UI (LdrLayer.rgb)
-Texture2D<float4>   tMult  : register(t2); // Шар мультиплікативного затемнення (vignette / drop shadow)
-Texture2D<float4>   tHdrUi : register(t3); // Лінійний HDR-шар UI (RGB = емісія, A = Transmittance T = prod(1 - alpha))
-RWTexture2D<float4> uOut   : register(u0); // Вихідний буфер
+Texture2D<float4>   tWorld    : register(t0); // Апскейлений 3D світ (після DLSS/FSR/TAA)
+Texture2D<float4>   tUi       : register(t1); // Тонемаплений колір UI (LdrLayer.rgb)
+Texture2D<float4>   tMult     : register(t2); // Шар мультиплікативного затемнення (vignette / drop shadow)
+Texture2D<float4>   tHdrUi    : register(t3); // Лінійний HDR-шар UI (RGB = емісія, A = Transmittance T = prod(1 - alpha))
+Texture2D<float4>   tVisorLdr : register(t4); // Тонемаплена сцена + наекранний шолом (для дельта-композиту)
+Texture2D<float4>   tCleanLdr : register(t5); // Тонемаплена сцена без шолома
+SamplerState        sLinear   : register(s0);
+RWTexture2D<float4> uOut      : register(u0); // Вихідний буфер
 
 cbuffer CompositeParams : register(b0) {
     uint2 outputSize;
     uint  hasMultiply;
     uint  debugView;
+    uint  hasVisorDelta;
+    uint3 _pad;
 };
 
 float3 srgbToLinear(float3 c) {
@@ -33,10 +38,20 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     float transmittance = saturate(hdrUi.a);
     float3 mult = (hasMultiply != 0) ? tMult.Load(p).rgb : float3(1.0, 1.0, 1.0);
 
+    float3 visorDelta = float3(0.0, 0.0, 0.0);
+    if (debugView == 0 && hasVisorDelta != 0) {
+        float2 uv = (float2(p.xy) + 0.5) / float2(outputSize);
+        visorDelta = tVisorLdr.SampleLevel(sLinear, uv, 0).rgb - tCleanLdr.SampleLevel(sLinear, uv, 0).rgb;
+    }
+
     // Якщо піксель не містить ні емісійного UI, ні напівпрозорої підкладки (transmittance == 1),
-    // миттєво повертаємо піксель 3D-світу без читання tUi та без перетворень:
+    // повертаємо піксель 3D-світу (плюс дельта шолома, якщо активна) без читання tUi:
     if (debugView == 0 && all(hdrUi.rgb <= 1e-5) && transmittance >= 0.999 && all(mult >= 0.999)) {
-        uOut[id.xy] = tWorld.Load(p);
+        float4 worldOnly = tWorld.Load(p);
+        if (hasVisorDelta != 0) {
+            worldOnly.rgb = saturate(worldOnly.rgb + visorDelta);
+        }
+        uOut[id.xy] = worldOnly;
         return;
     }
 
@@ -61,7 +76,8 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     // HDR-просторі до тонемапінгу (Pass 35), ослаблення фону виконується у лінійному
     // світлі перед поверненням у гамма-простір sRGB:
     float3 worldLin = srgbToLinear(world.rgb);
-    float3 attenWorld = linearToSrgb(worldLin * (transmittance * cleanMult));
-    float3 finalRgb = uiRgb + attenWorld;
+    float3 atten = transmittance * cleanMult;
+    float3 attenWorld = linearToSrgb(worldLin * atten);
+    float3 finalRgb = uiRgb + attenWorld + visorDelta * atten;
     uOut[id.xy] = float4(saturate(finalRgb), world.a);
 }

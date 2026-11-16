@@ -257,7 +257,9 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
         return result;
     }
     const auto frame = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (frame <= 8 || (frame <= 32768 && frame % 1024 == 0)) logContextDispatch(swap_chain, frame);
+    if (frame <= 8 || (edpe::Config::instance().devMode && frame <= 32768 && frame % 1024 == 0)) {
+        logContextDispatch(swap_chain, frame);
+    }
     edpe::PerfTracker::instance().onPresentStart(swap_chain);
     ContextCensusOnPresent(swap_chain, frame, flags);
     UiOnPresent(swap_chain, flags);

@@ -2,6 +2,7 @@
 #include "crash_logger.h"
 #include "context_census.h"
 #include "config.h"
+#include "dxbc_fanout.h"
 #include "input_hook.h"
 #include "log.h"
 #include "shader_probe.h"
@@ -46,7 +47,8 @@ HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     const HRESULT result = original_create_vertex_shader.load(std::memory_order_acquire)(
         device, bytecode, size, linkage, shader);
     if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
-        if (retain_vertex_bytecode.load(std::memory_order_relaxed))
+        if (retain_vertex_bytecode.load(std::memory_order_relaxed) ||
+            edpe::isVisorVertexShaderBytecode(bytecode, size))
             (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
         const auto hash = EdpeShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
@@ -427,15 +429,21 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
                 static_cast<unsigned>(fl), devFlags, callerMod.c_str(), stackStr.c_str());
             EdpeLog(extraMsg);
             if (_wcsicmp(callerMod.c_str(), L"NvPresent64.dll") == 0) {
+                ContextCensusMarkSmoothMotionDevice(device, immContext.Get());
                 if (!s_smooth_motion_detected.exchange(true, std::memory_order_acq_rel)) {
                     EdpeLog(L"EDPE: WARNING: NVIDIA Smooth Motion (NvPresent64.dll) secondary device detected; anchoring temporal pass on scene device and bypassing cross-device KeyedMutex bridge");
                 }
             }
         } else if (GetModuleHandleW(L"NvPresent64.dll") != nullptr) {
+            ContextCensusMarkSmoothMotionDevice(device, immContext.Get());
             if (!s_smooth_motion_detected.exchange(true, std::memory_order_acq_rel)) {
                 EdpeLog(L"EDPE: WARNING: NVIDIA Smooth Motion (NvPresent64.dll) secondary device detected; anchoring temporal pass on scene device and bypassing cross-device KeyedMutex bridge");
             }
         }
+    }
+
+    if (ContextCensusIsSmoothMotionDevice(device)) {
+        return;
     }
 
     hookShaderCreation(device);

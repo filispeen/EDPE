@@ -33,6 +33,8 @@ void ContextCensusHookDeferredContext(ID3D11DeviceContext* context);
 void ContextCensusHookContext(ID3D11DeviceContext* context);
 void ContextCensusRegisterDevice(ID3D11Device* device, ID3D11DeviceContext* immContext);
 bool ContextCensusIsDeviceRegistered(ID3D11Device* device);
+void ContextCensusMarkSmoothMotionDevice(ID3D11Device* device, ID3D11DeviceContext* immContext);
+bool ContextCensusIsSmoothMotionDevice(ID3D11Device* device);
 void ContextCensusLogPresentDevice(IDXGISwapChain* swapChain, ID3D11Device* presentDevice);
 unsigned long long ContextCensusGetDsvBinds();
 void ContextCensusOnSwapChainRelease(IUnknown* object);
