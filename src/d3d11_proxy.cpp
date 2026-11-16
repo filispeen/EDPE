@@ -2,6 +2,7 @@
 #include "crash_logger.h"
 #include "context_census.h"
 #include "config.h"
+#include "dxbc_fanout.h"
 #include "input_hook.h"
 #include "log.h"
 #include "shader_probe.h"
@@ -46,7 +47,8 @@ HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     const HRESULT result = original_create_vertex_shader.load(std::memory_order_acquire)(
         device, bytecode, size, linkage, shader);
     if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
-        if (retain_vertex_bytecode.load(std::memory_order_relaxed))
+        if (retain_vertex_bytecode.load(std::memory_order_relaxed) ||
+            edpe::isVisorVertexShaderBytecode(bytecode, size))
             (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
         const auto hash = EdpeShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);

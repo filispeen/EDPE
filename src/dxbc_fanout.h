@@ -547,6 +547,41 @@ inline bool colourFanout(const void* data,size_t bytes,std::vector<BYTE>& output
     } catch(const std::exception& e){reason=e.what();return false;}
 }
 
+inline bool isVisorVertexShaderBytecode(const void* data, size_t bytes) {
+    if (!data || bytes < 128 || bytes > 65536) return false;
+    const auto* p = static_cast<const BYTE*>(data);
+    if (memcmp(p, "DXBC", 4) != 0) return false;
+    UINT totalSize = 0, chunkCount = 0;
+    memcpy(&totalSize, p + 24, 4);
+    memcpy(&chunkCount, p + 28, 4);
+    if (totalSize != bytes || chunkCount > 128 || 32ull + chunkCount * 4ull > bytes) return false;
+    for (UINT i = 0; i < chunkCount; ++i) {
+        UINT off = 0;
+        memcpy(&off, p + 32 + 4 * i, 4);
+        if (off + 8 > bytes) return false;
+        UINT tag = 0, size = 0;
+        memcpy(&tag, p + off, 4);
+        memcpy(&size, p + off + 4, 4);
+        if (size > bytes - (off + 8)) return false;
+        if (tag == 0x58454853u || tag == 0x52444853u) {
+            if (size < 16 || (size % 4u) != 0) return false;
+            UINT ver = 0, words = 0;
+            memcpy(&ver, p + off + 8, 4);
+            memcpy(&words, p + off + 12, 4);
+            if (ver != 0x00010050u || words != size / 4u) return false;
+            std::vector<UINT> t(words);
+            memcpy(t.data(), p + off + 8, size);
+            try {
+                (void)dxbc_fanout_detail::patchVisorVertexTokens(t);
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 inline bool patchVisorVertexShader(const void* data, size_t bytes,
                                    std::vector<BYTE>& output, std::string& reason) {
     output.clear();

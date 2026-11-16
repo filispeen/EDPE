@@ -164,6 +164,12 @@ Out main(In i) {
         return 10;
     }
 
+    if (edpe::isVisorVertexShaderBytecode(vs_code->GetBufferPointer(), vs_code->GetBufferSize()) ||
+        !edpe::isVisorVertexShaderBytecode(v_vs_blob->GetBufferPointer(), v_vs_blob->GetBufferSize())) {
+        std::fprintf(stderr, "isVisorVertexShaderBytecode classification failed\n");
+        return 12;
+    }
+
     std::vector<BYTE> v_vs_patched, v_ps_patched;
     if (!edpe::patchVisorVertexShader(v_vs_blob->GetBufferPointer(), v_vs_blob->GetBufferSize(),
             v_vs_patched, reason)) {

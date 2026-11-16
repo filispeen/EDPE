@@ -3841,32 +3841,63 @@ bool tryVisorJitterAlignDraw(ID3D11DeviceContext* context, UINT vertex_count, UI
     if (vs_hash != s_visor_cached_vs_hash || ps_hash != s_visor_cached_ps_hash ||
         !s_visor_patched_vs || !s_visor_patched_ps) {
         UINT vsBytes = 0, psBytes = 0;
-        if (FAILED(origVs->GetPrivateData(kEdpeVertexBytecodeGuid, &vsBytes, nullptr)) ||
-            FAILED(origPs->GetPrivateData(kEdpePixelBytecodeGuid, &psBytes, nullptr)) ||
-            vsBytes < 32 || vsBytes > 1024 * 1024 ||
+        if (FAILED(origPs->GetPrivateData(kEdpePixelBytecodeGuid, &psBytes, nullptr)) ||
             psBytes < 32 || psBytes > 1024 * 1024) {
             recordVisorNegativePair(vs_hash, ps_hash);
             return false;
         }
-        std::vector<BYTE> vsRaw(vsBytes), psRaw(psBytes);
-        if (FAILED(origVs->GetPrivateData(kEdpeVertexBytecodeGuid, &vsBytes, vsRaw.data())) ||
-            FAILED(origPs->GetPrivateData(kEdpePixelBytecodeGuid, &psBytes, psRaw.data()))) {
+        std::vector<BYTE> psRaw(psBytes);
+        if (FAILED(origPs->GetPrivateData(kEdpePixelBytecodeGuid, &psBytes, psRaw.data()))) {
             recordVisorNegativePair(vs_hash, ps_hash);
             return false;
         }
-        std::vector<BYTE> vsPatchedBytes, psPatchedBytes;
-        std::string vsReason, psReason;
-        const bool vsOk = edpe::patchVisorVertexShader(vsRaw.data(), vsRaw.size(), vsPatchedBytes, vsReason);
-        const bool psOk = edpe::patchVisorPixelShader(psRaw.data(), psRaw.size(), psPatchedBytes, psReason);
-        if (!vsOk || !psOk) {
+        std::vector<BYTE> psPatchedBytes;
+        std::string psReason;
+        if (!edpe::patchVisorPixelShader(psRaw.data(), psRaw.size(), psPatchedBytes, psReason)) {
+            if (SUCCEEDED(origVs->GetPrivateData(kEdpeVertexBytecodeGuid, &vsBytes, nullptr)) &&
+                vsBytes >= 32 && vsBytes <= 1024 * 1024) {
+                std::vector<BYTE> vsProbe(vsBytes);
+                if (SUCCEEDED(origVs->GetPrivateData(kEdpeVertexBytecodeGuid, &vsBytes, vsProbe.data())) &&
+                    edpe::isVisorVertexShaderBytecode(vsProbe.data(), vsProbe.size())) {
+                    wchar_t rmsg[256];
+                    swprintf_s(rmsg,
+                        L"EDPE: visor align skipped DrawInstanced(3,1) VS=%016llX (ok) PS=%016llX (%u B: %hs)",
+                        vs_hash, ps_hash, psBytes, psReason.c_str());
+                    EdpeLog(rmsg);
+                }
+            }
+            recordVisorNegativePair(vs_hash, ps_hash);
+            return false;
+        }
+        if (FAILED(origVs->GetPrivateData(kEdpeVertexBytecodeGuid, &vsBytes, nullptr)) ||
+            vsBytes < 32 || vsBytes > 1024 * 1024) {
+            static unsigned s_visor_vs_missing_logs = 0;
+            if (s_visor_vs_missing_logs < 4) {
+                ++s_visor_vs_missing_logs;
+                wchar_t rmsg[224];
+                swprintf_s(rmsg,
+                    L"EDPE: visor align skipped DrawInstanced(3,1) VS=%016llX (no VS bytecode) PS=%016llX (%u B: ok)",
+                    vs_hash, ps_hash, psBytes);
+                EdpeLog(rmsg);
+            }
+            recordVisorNegativePair(vs_hash, ps_hash);
+            return false;
+        }
+        std::vector<BYTE> vsRaw(vsBytes);
+        if (FAILED(origVs->GetPrivateData(kEdpeVertexBytecodeGuid, &vsBytes, vsRaw.data()))) {
+            recordVisorNegativePair(vs_hash, ps_hash);
+            return false;
+        }
+        std::vector<BYTE> vsPatchedBytes;
+        std::string vsReason;
+        if (!edpe::patchVisorVertexShader(vsRaw.data(), vsRaw.size(), vsPatchedBytes, vsReason)) {
             static unsigned s_visor_reject_logs = 0;
             if (s_visor_reject_logs < 12) {
                 ++s_visor_reject_logs;
                 wchar_t rmsg[256];
                 swprintf_s(rmsg,
-                    L"EDPE: visor align skipped DrawInstanced(3,1) VS=%016llX (%u B: %hs) PS=%016llX (%u B: %hs)",
-                    vs_hash, vsBytes, vsOk ? "ok" : vsReason.c_str(),
-                    ps_hash, psBytes, psOk ? "ok" : psReason.c_str());
+                    L"EDPE: visor align skipped DrawInstanced(3,1) VS=%016llX (%u B: %hs) PS=%016llX (%u B: ok)",
+                    vs_hash, vsBytes, vsReason.c_str(), ps_hash, psBytes);
                 EdpeLog(rmsg);
             }
             recordVisorNegativePair(vs_hash, ps_hash);
