@@ -1,0 +1,226 @@
+name: Repo Activity (Discord)
+
+on:
+  issues:
+    types: [opened, closed, reopened]
+  pull_request_target:
+    types: [opened, closed, reopened]
+  push:
+    branches:
+      - '**'
+
+jobs:
+  notify-commit:
+    name: Notify Discord Commit (#repo-activity)
+    if: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Send Discord Commit Embed
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_REPO_ACTIVITY_CHANNEL_ID }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          MAX_FILES: "8"
+        run: |
+          if [ -z "$DISCORD_BOT_TOKEN" ] || [ -z "$DISCORD_CHANNEL_ID" ]; then
+            echo "DISCORD_BOT_TOKEN or DISCORD_REPO_ACTIVITY_CHANNEL_ID not set; skipping."
+            exit 0
+          fi
+
+          COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          COMMIT_AUTHOR_USERNAME=$(git log -1 --pretty=%ae | cut -d'@' -f1)
+          COMMIT_SHORT_SHA=$(git log -1 --pretty=%h)
+          COMMIT_URL="${SERVER_URL}/${REPO}/commit/${CURRENT_SHA}"
+          AUTHOR_URL="${SERVER_URL}/${COMMIT_AUTHOR_USERNAME}"
+          BRANCH_URL="${SERVER_URL}/${REPO}/tree/${REF_NAME}"
+
+          DIFF_BASE="$BEFORE_SHA"
+          if [ -z "$DIFF_BASE" ] || [ "$DIFF_BASE" = "0000000000000000000000000000000000000000" ]; then
+            DIFF_BASE=$(git rev-parse "${CURRENT_SHA}^" 2>/dev/null || echo "$CURRENT_SHA")
+          fi
+
+          LINES_ADDED=$(git diff --numstat "$DIFF_BASE" "$CURRENT_SHA" | awk '{added+=$1} END {print added+0}')
+          LINES_REMOVED=$(git diff --numstat "$DIFF_BASE" "$CURRENT_SHA" | awk '{removed+=$2} END {print removed+0}')
+          FILES_CHANGED=$(git diff --name-only "$DIFF_BASE" "$CURRENT_SHA" | wc -l | tr -d ' ')
+
+          FILE_LIST=$(git diff --numstat "$DIFF_BASE" "$CURRENT_SHA" | head -n "$MAX_FILES" | while read -r added removed file; do
+            FILE_URL="${SERVER_URL}/${REPO}/blob/${COMMIT_SHORT_SHA}/${file}"
+            if [ "$added" = "-" ]; then
+              echo "- [\`${file}\`](${FILE_URL}) (binary)"
+            else
+              echo "- [\`${file}\`](${FILE_URL}) +${added} -${removed}"
+            fi
+          done)
+
+          TOTAL_FILES=$(git diff --name-only "$DIFF_BASE" "$CURRENT_SHA" | wc -l | tr -d ' ')
+          if [ "$TOTAL_FILES" -gt "$MAX_FILES" ]; then
+            MORE_FILES=$((TOTAL_FILES - MAX_FILES))
+            FILE_LIST="${FILE_LIST}"$'\n'"...and ${MORE_FILES} more file(s)"
+          fi
+
+          if [ -z "$FILE_LIST" ]; then
+            FILE_LIST="_No file diff available._"
+          fi
+
+          if [ ${#COMMIT_MESSAGE} -gt 500 ]; then
+            COMMIT_MESSAGE="${COMMIT_MESSAGE:0:497}..."
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO" \
+            --arg url "$COMMIT_URL" \
+            --arg message "$COMMIT_MESSAGE" \
+            --arg author "$COMMIT_AUTHOR" \
+            --arg author_url "$AUTHOR_URL" \
+            --arg branch "$REF_NAME" \
+            --arg branch_url "$BRANCH_URL" \
+            --arg sha "$COMMIT_SHORT_SHA" \
+            --arg files "$FILES_CHANGED" \
+            --arg added "$LINES_ADDED" \
+            --arg removed "$LINES_REMOVED" \
+            --arg file_list "$FILE_LIST" \
+            --argjson color 5814783 \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+            '{
+              embeds: [{
+                title: ("New commit in " + $repo),
+                url: $url,
+                description: $message,
+                color: $color,
+                fields: [
+                  { name: "Author", value: ("[" + $author + "](" + $author_url + ")"), inline: true },
+                  { name: "Branch", value: ("[" + $branch + "](" + $branch_url + ")"), inline: true },
+                  { name: "Commit", value: ("[`" + $sha + "`](" + $url + ")"), inline: true },
+                  { name: "Files Changed", value: ($files + " file(s)"), inline: true },
+                  { name: "Lines Added", value: ("```diff\n+" + $added + "\n```"), inline: true },
+                  { name: "Lines Removed", value: ("```diff\n-" + $removed + "\n```"), inline: true },
+                  { name: "Changed Files", value: (if ($file_list | length) > 1024 then ($file_list[0:1000] + "\n... (truncated)") else $file_list end), inline: false }
+                ],
+                timestamp: $timestamp,
+                footer: {
+                  text: "GitHub Actions",
+                  icon_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"
+                }
+              }]
+            }')
+
+          curl -sS -X POST \
+            -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: EDPE-Repo-Activity/1.0" \
+            -d "$PAYLOAD" \
+            "https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages" \
+            --fail-with-body > /dev/null || echo "Warning: Failed to send Discord commit notification"
+
+  notify-issue-pr:
+    name: Notify Discord Issue/PR (#repo-activity)
+    if: ${{ github.event_name == 'issues' || github.event_name == 'pull_request_target' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Discord Embed
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_REPO_ACTIVITY_CHANNEL_ID }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+          channel_id = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
+          if not token or not channel_id:
+              print("DISCORD_BOT_TOKEN or DISCORD_REPO_ACTIVITY_CHANNEL_ID not set; skipping.")
+              raise SystemExit(0)
+
+          with open(os.environ["GITHUB_EVENT_PATH"], "r", encoding="utf-8") as f:
+              ev = json.load(f)
+
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          repo = os.environ.get("GITHUB_REPOSITORY", "filispeen/EDPE")
+
+          def truncate(text, limit=300):
+              text = (text or "").strip()
+              if len(text) > limit:
+                  return text[:limit].rstrip() + "..."
+              return text
+
+          embed = None
+
+          if event_name == "issues":
+              action = ev.get("action", "updated")
+              issue = ev.get("issue", {})
+              colors = {"opened": 0x2ECC71, "closed": 0x8E44AD, "reopened": 0xE67E22}
+              labels = [lbl.get("name", "") for lbl in issue.get("labels", []) if lbl.get("name")]
+              fields = [
+                  {"name": "Action", "value": action, "inline": True},
+                  {"name": "Author", "value": issue.get("user", {}).get("login", "unknown"), "inline": True},
+              ]
+              if labels:
+                  fields.append({"name": "Labels", "value": ", ".join(labels), "inline": True})
+              embed = {
+                  "title": f"[Issue #{issue.get('number')}] {truncate(issue.get('title'), 180)}",
+                  "url": issue.get("html_url"),
+                  "description": truncate(issue.get("body"), 350) or "_No description provided._",
+                  "color": colors.get(action, 0x3498DB),
+                  "fields": fields,
+                  "footer": {"text": repo},
+              }
+
+          elif event_name == "pull_request_target":
+              action = ev.get("action", "updated")
+              pr = ev.get("pull_request", {})
+              if action == "closed" and pr.get("merged"):
+                  action_label = "merged"
+                  color = 0x9B59B6
+              else:
+                  action_label = action
+                  color = {"opened": 0x2ECC71, "closed": 0xE74C3C, "reopened": 0xE67E22}.get(action, 0x3498DB)
+              head_ref = pr.get("head", {}).get("ref", "?")
+              base_ref = pr.get("base", {}).get("ref", "?")
+              embed = {
+                  "title": f"[PR #{pr.get('number')}] {truncate(pr.get('title'), 180)}",
+                  "url": pr.get("html_url"),
+                  "description": truncate(pr.get("body"), 350) or "_No description provided._",
+                  "color": color,
+                  "fields": [
+                      {"name": "Action", "value": action_label, "inline": True},
+                      {"name": "Author", "value": pr.get("user", {}).get("login", "unknown"), "inline": True},
+                      {"name": "Branch", "value": f"`{head_ref}` -> `{base_ref}`", "inline": True},
+                  ],
+                  "footer": {"text": repo},
+              }
+
+          if not embed:
+              print(f"Unhandled event: {event_name}")
+              raise SystemExit(0)
+
+          req = urllib.request.Request(
+              f"https://discord.com/api/v10/channels/{channel_id}/messages",
+              data=json.dumps({"embeds": [embed]}).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bot {token}",
+                  "Content-Type": "application/json",
+                  "User-Agent": "EDPE-Repo-Activity/1.0",
+              },
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print(f"Posted {event_name} embed to #{channel_id}: HTTP {resp.status}")
+          except urllib.error.HTTPError as e:
+              print(f"Warning: Discord API returned {e.code}: {e.read().decode('utf-8', errors='replace')}")
+          PY
