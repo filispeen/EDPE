@@ -429,15 +429,21 @@ void processDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* context, UI
                 static_cast<unsigned>(fl), devFlags, callerMod.c_str(), stackStr.c_str());
             EdpeLog(extraMsg);
             if (_wcsicmp(callerMod.c_str(), L"NvPresent64.dll") == 0) {
+                ContextCensusMarkSmoothMotionDevice(device, immContext.Get());
                 if (!s_smooth_motion_detected.exchange(true, std::memory_order_acq_rel)) {
                     EdpeLog(L"EDPE: WARNING: NVIDIA Smooth Motion (NvPresent64.dll) secondary device detected; anchoring temporal pass on scene device and bypassing cross-device KeyedMutex bridge");
                 }
             }
         } else if (GetModuleHandleW(L"NvPresent64.dll") != nullptr) {
+            ContextCensusMarkSmoothMotionDevice(device, immContext.Get());
             if (!s_smooth_motion_detected.exchange(true, std::memory_order_acq_rel)) {
                 EdpeLog(L"EDPE: WARNING: NVIDIA Smooth Motion (NvPresent64.dll) secondary device detected; anchoring temporal pass on scene device and bypassing cross-device KeyedMutex bridge");
             }
         }
+    }
+
+    if (ContextCensusIsSmoothMotionDevice(device)) {
+        return;
     }
 
     hookShaderCreation(device);
