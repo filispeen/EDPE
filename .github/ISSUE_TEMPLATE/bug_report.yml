@@ -1,6 +1,6 @@
 name: Bug report
 description: Report a rendering, stability, or performance problem in EDPE
-title: "[Bug]: "
+title: "Feet pictures selection in debug view dropdown doesn't do anything"
 labels: ["bug"]
 body:
   - type: markdown
@@ -52,7 +52,7 @@ body:
       placeholder: |
         GPU: RTX 4080
         Driver: 
-        Windows: 11 23H2
+        Windows: 11 26H2
     validations:
       required: true
 
