@@ -7,6 +7,7 @@
 [![Status](https://img.shields.io/badge/status-v0.7.2%20Verified%20In--Game-success.svg)](STATUS.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
 [![Tests](https://img.shields.io/badge/tests-15%2F15%20Passing-brightgreen.svg)]()
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/KxDBRcKwMK)
 
 </div>
 
