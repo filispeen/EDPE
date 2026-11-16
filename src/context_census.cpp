@@ -201,6 +201,7 @@ static float s_last_jittered_forward_block[16]{};
 static float s_last_unjittered_forward_block[16]{};
 static float s_last_unjittered_inv_rays[12]{};
 static unsigned long long s_reference_cb0_blocks_frame = ~0ull;
+static edpe::SceneSubpassTracker s_scene_subpasses{};
 static constexpr size_t kDofRingSize = 8;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_dof_ring_tex[kDofRingSize]{};
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_dof_ring_srv[kDofRingSize]{};
@@ -4564,11 +4565,11 @@ inline void syncSceneWindowAtomic(unsigned long long cur_frame) {
 inline bool couldBeTransposeProjection208(const float* words) {
     if (!words) return false;
     // Necessary invariants of matchesEliteTransposeProjectionBlock(&words[16]):
-    // block16[11] (words[27]) in [0.01, 0.25], and block16[3, 7, 15] near zero.
+    // cb0[6] (words[24..27]) is (0, 0, 0, depthB) even when Model*ViewProj scales or translates.
     return words[27] >= 0.01f && words[27] <= 0.25f &&
-           std::fabs(words[19]) <= 0.002f &&
-           std::fabs(words[23]) <= 0.002f &&
-           std::fabs(words[31]) <= 0.002f;
+           std::fabs(words[24]) <= 0.002f &&
+           std::fabs(words[25]) <= 0.002f &&
+           std::fabs(words[26]) <= 0.002f;
 }
 
 inline bool couldBeAuxiliaryCameraCb(const float* words, size_t floatCount) {
@@ -4927,17 +4928,22 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 static bool s_dot208_win_jit = false;
                 static float s_dot208_px = 0.0f, s_dot208_py = 0.0f;
                 static float s_dot208_ref_sx = 0.0f;
+                static float s_dot208_ref_db = 0.0f;
+                static size_t s_dot208_subpass_cnt = 0;
                 static bool s_dot208_matched = false;
                 static bool s_dot208_modified = false;
                 static bool s_dot208_jit_ok = false;
                 alignas(16) static float s_dot208_in[16]{};
                 alignas(16) static float s_dot208_out[16]{};
                 const bool dotHasStaged = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
+                const size_t dotSubpassCnt = s_scene_subpasses.countForFrame(cur_frame);
                 const bool dotMemoHit =
                     (s_dot208_frame == cur_frame &&
                      s_dot208_staged == dotHasStaged &&
                      s_dot208_win_jit == winJitActive &&
                      s_dot208_ref_sx == refCam.scaleX &&
+                     s_dot208_ref_db == refCam.depthB &&
+                     s_dot208_subpass_cnt == dotSubpassCnt &&
                      (!winJitActive || (curDotJit.pixelX == s_dot208_px && curDotJit.pixelY == s_dot208_py)) &&
                      std::memcmp(local_dot16, s_dot208_in, sizeof(local_dot16)) == 0);
                 if (dotMemoHit) {
@@ -4963,9 +4969,21 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     s_dot208_staged = dotHasStaged;
                     s_dot208_win_jit = winJitActive;
                     s_dot208_ref_sx = refCam.scaleX;
+                    s_dot208_ref_db = refCam.depthB;
+                    s_dot208_subpass_cnt = dotSubpassCnt;
                     s_dot208_px = curDotJit.pixelX;
                     s_dot208_py = curDotJit.pixelY;
-                    s_dot208_matched = edpe::matchesEliteTransposeProjectionBlock(local_dot16, refCam);
+                    bool dotMatched = edpe::matchesEliteTransposeProjectionBlock(local_dot16, refCam);
+                    if (!dotMatched) {
+                        if (const auto* sp = s_scene_subpasses.findJitteredByDepthB(cur_frame, local_dot16[11])) {
+                            edpe::CameraProjection subCam = refCam;
+                            subCam.scaleX = sp->scaleX;
+                            subCam.scaleY = sp->scaleY;
+                            subCam.depthB = sp->depthB;
+                            dotMatched = edpe::matchesEliteTransposeProjectionBlock(local_dot16, subCam);
+                        }
+                    }
+                    s_dot208_matched = dotMatched;
                     s_dot208_modified = false;
                     s_dot208_jit_ok = false;
                     if (s_dot208_matched) {
@@ -5064,6 +5082,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             const bool in_main_scene = s_inside_main_scene.load(std::memory_order_acquire);
             if (motion_color_frame == cur_frame && s_ustat.gbufStartIdx == 0) s_ustat.gbufStartIdx = s_ustat.total;
             bool is_main_camera = false;
+            bool is_subpass_camera = false;
             float* mutable_unmap_words = static_cast<float*>(mapped_ptr);
             // Snapshot camera & projection blocks once into cached stack memory to avoid
             // repeated uncached reads from write-combined D3D11_MAP_WRITE_DISCARD buffers.
@@ -5299,6 +5318,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     static bool s_cb1_flt_passes = false;
                     static bool s_cb1_flt_allow_stage = false;
                     static bool s_cb1_flt_is_main = false;
+                    static bool s_cb1_flt_is_subpass = false;
                     const bool hasStagedNow = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
                     const float curVpW = words[1328];
                     const float curVpH = words[1329];
@@ -5317,6 +5337,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             ++s_ustat.probe;
                         }
                         is_main_camera = s_cb1_flt_is_main;
+                        is_subpass_camera = s_cb1_flt_is_subpass;
                         if (s_cb1_flt_allow_stage) {
                             if (in_main_scene) s_staged_from_in_scene = true;
                             s_valid_camera_seen_counter.fetch_add(1, std::memory_order_relaxed);
@@ -5463,19 +5484,45 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 }
                             }
                         }
-                    } else if (!is_probe && s_has_staged_camera && s_staged_camera_frame == cur_frame) {
+                    } else if (!is_probe &&
+                               cameraRotationDeterminant(parsed_camera) >= 0.85f &&
+                               cameraRotationDeterminant(parsed_camera) <= 1.15f &&
+                               parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
+                               isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH)) {
                         // Coherent phase-group jitter for same-pose scene sub-passes whose near plane
-                        // was adjusted per-item (e.g. 0.0675 vs 0.025) while sharing the main scene grid.
+                        // / FOV was adjusted for viewmodels (e.g. 0.0675 / 1.2935 vs world 0.025 / 1.0525).
+                        // Locked per (scaleX, scaleY, depthB) per frame so early Z-prepass and late G-buffer
+                        // always make the exact same jitter decision even before world camera staging.
+                        const auto* existingSubpass = s_scene_subpasses.find(
+                            cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB);
                         float intraDist = 0.0f;
                         float intraTrace = 0.0f;
-                        if (const edpe::CameraProjection* nearRef = pickNearestPoseRef(intraDist, intraTrace)) {
-                            if (intraDist <= maxIntraDist && intraTrace > 2.95f &&
-                                isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH) &&
-                                cameraRotationDeterminant(parsed_camera) >= 0.85f &&
-                                cameraRotationDeterminant(parsed_camera) <= 1.15f &&
-                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
-                                !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
+                        const bool canCheckRef =
+                            (s_has_staged_camera && s_staged_camera_frame == cur_frame) ||
+                            (s_camera_now.scaleX > 0.0f &&
+                             s_verified_ldr_tonemap_frame != cur_frame &&
+                             s_cut_rejection_streak == 0 &&
+                             s_teleport_rejection_streak == 0);
+                        const edpe::CameraProjection* nearRef = canCheckRef
+                            ? pickNearestPoseRef(intraDist, intraTrace)
+                            : nullptr;
+                        const bool poseOk =
+                            nearRef != nullptr &&
+                            intraDist <= maxIntraDist &&
+                            intraTrace > 2.95f &&
+                            !isRearOrAuxiliaryProbe(parsed_camera, *nearRef);
+                        if (existingSubpass) {
+                            if (existingSubpass->jittered && poseOk) {
                                 is_main_camera = true;
+                                is_subpass_camera = true;
+                            }
+                        } else {
+                            const bool lockJitter = s_scene_subpasses.recordOrGet(
+                                cur_frame, parsed_camera.scaleX, parsed_camera.scaleY,
+                                parsed_camera.depthB, poseOk);
+                            if (lockJitter) {
+                                is_main_camera = true;
+                                is_subpass_camera = true;
                             }
                         }
                     }
@@ -5523,6 +5570,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             s_cb1_flt_passes = passes_filter;
                             s_cb1_flt_allow_stage = allow_stage;
                             s_cb1_flt_is_main = is_main_camera;
+                            s_cb1_flt_is_subpass = is_subpass_camera;
 
                             EdpeLog(diagMsg);
                         }
@@ -5539,6 +5587,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         s_cb1_flt_passes = passes_filter;
                         s_cb1_flt_allow_stage = allow_stage;
                         s_cb1_flt_is_main = is_main_camera;
+                        s_cb1_flt_is_subpass = is_subpass_camera;
                     }
                     }
                 } else {
@@ -5566,12 +5615,21 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 std::fabs(parsed_camera.scaleX - nearRef->scaleX) <= 0.02f * nearRef->scaleX &&
                                 std::fabs(parsed_camera.scaleY - nearRef->scaleY) <= 0.02f * nearRef->scaleY &&
                                 parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f;
-                            if (preTonemapScenePass && lateDist <= maxIntraDist && lateTrace > 2.95f && sameRefFov &&
-                                cameraRotationDeterminant(parsed_camera) >= 0.85f &&
+                            const bool matchedSubpass = !sameRefFov &&
+                                (s_scene_subpasses.findJittered(
+                                    cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB) != nullptr);
+                            const float lateDet = cameraRotationDeterminant(parsed_camera);
+                            if (preTonemapScenePass && lateDist <= maxIntraDist && lateTrace > 2.95f &&
+                                lateDet >= 0.85f && lateDet <= 1.15f &&
                                 parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
-                                !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, {0.0f, 0.0f, 0.0f}, 1.0f) &&
                                 !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
-                                is_main_camera = true;
+                                if (sameRefFov &&
+                                    !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, {0.0f, 0.0f, 0.0f}, 1.0f)) {
+                                    is_main_camera = true;
+                                } else if (matchedSubpass) {
+                                    is_main_camera = true;
+                                    is_subpass_camera = true;
+                                }
                             }
                         }
                     }
@@ -5626,7 +5684,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const bool jitOk = forwardCached ||
                         edpe::jitterEliteProjectionBlock(local_proj1080, jittered_block, jitter);
                     if (jitOk) {
-                        if (s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                        if (!is_subpass_camera && s_preserve_native_ui.load(std::memory_order_relaxed) &&
                             (s_clean_camera_frame != cur_frame ||
                              (in_main_scene && s_clean_camera_in_scene_frame != cur_frame))) {
                             std::memcpy(s_last_clean_cb1_data, mutable_words, 5376);
@@ -5638,7 +5696,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             }
                         }
 
-                        if (!forwardCached) {
+                        if (!is_subpass_camera && !forwardCached) {
                             std::memcpy(s_last_unjittered_forward_block, local_proj1080, 16 * sizeof(float));
                             std::memcpy(s_last_jittered_forward_block, jittered_block, 16 * sizeof(float));
                             s_reference_cb0_blocks_frame = cur_frame;

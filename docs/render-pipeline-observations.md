@@ -116,3 +116,17 @@ Following the nvidia-dlaa-input-contract.md implications and PLAN.md expected or
 - **Forbidden in hot path:** blocking GPU readback, `Map()` on full-resolution textures, blocking `GetData` loops, per-frame NGX feature recreation.
 - **Fail open:** If NGX/DLAA fails, disable upscaler, disable jitter, restore original frame, Present normally. Never black-screen Elite.
 - **Async timing:** Use asynchronous D3D11 timestamp queries for NGX DLSS, motion-vector generation, and total EDPE GPU cost.
+
+## On-foot viewmodel & 208B CB0 findings (2026-11-16, Issue #11)
+
+- **Date:** 2026-11-16. Source: vanilla Odyssey RenderDoc capture `edo(issue11).rdc` (2560×1440, 8642 actions).
+- **Method:** RenderDoc `pixel_history`, `get_buffer_data`, `get_shader_bindings`, and `disassemble_shader` across Z-prepass (`6652–7126`), G-buffer (`7158–14617`), and sky/planet/atmosphere passes (`15736–16208`).
+- **VERIFIED (On-foot viewmodel ordering & Z-prepass vs G-buffer):**
+  - Event `6652` (on-foot weapon/tool Z-prepass, `depth = 0.248466` at `(2000, 1100)`) runs **before** the main world Z-prepass (`6796`, `scaleX=1.0525, scaleY=1.871, depthB=0.025`) using a viewmodel sub-pass projection (`scaleX=1.2935, scaleY=2.300, depthB=0.0675` in `cb1[270..273]`).
+  - G-buffer draws `7189` and `14617` (`scaleX=1.2935, depthB=0.0675`) shade against Z-prepass depth (`6652`) with `DepthFunc == EQUAL`; `16208` (post-deferred viewmodel atmosphere reading linearized depth `8724`) also uses `scaleX=1.2935, depthB=0.0675` in both `cb0` (`208` bytes) and `cb1`.
+  - **Confidence:** High (directly observed in capture `cb0`/`cb1` buffers and pixel history).
+  - **Implication:** Per-frame jitter decisions for viewmodel sub-passes must lock on first encounter (so Z-prepass, G-buffer, and post-deferred agree), and sub-pass writes must never overwrite `s_last_unjittered_forward_block` / `s_last_clean_cb1_data` used by world `depthB=0.025` deferred `CB2` repair and HUD replay.
+- **VERIFIED (208-byte `cb0` celestial/scaled ModelViewProj):**
+  - Planet (`15736`), scaled planet atmosphere (`16044`, model scale `492878.0`), and viewmodel atmosphere (`16208`) all bind `cb0[4..7]` (`words[16..31]` of 208-byte `cb0`) as `transpose(Model * ViewProj)` with `cb0[6]` (`words[24..27]`) equal to `(0, 0, 0, depthB)` and non-zero translation/scale.
+  - **Confidence:** High (verified via shader disassembly `8628fdf1` / `5ea854d6` and buffer contents).
+  - **Implication:** Validate `cb0[6]` = `(0, 0, 0, depthB)`, normalized FOV scales `len0/lenW` and `len1/lenW`, orthogonality, and positive right-handed determinant rather than requiring unit `lenW == 1` and zero translation.

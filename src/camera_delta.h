@@ -311,4 +311,80 @@ private:
     bool lost_ = false;
 };
 
+// Tracks per-frame jitter decisions for same-pose scene sub-passes (e.g. viewmodel/near-plane
+// passes whose near plane/FOV differ from the main world camera) so Z-prepass, G-buffer, and
+// post-deferred passes sharing that projection always receive identical jitter decisions.
+struct SceneSubpassEntry {
+    float scaleX = 0.0f;
+    float scaleY = 0.0f;
+    float depthB = 0.0f;
+    bool jittered = false;
+};
+
+class SceneSubpassTracker {
+public:
+    static constexpr size_t kMaxSubpasses = 4;
+
+    void reset() {
+        frame_ = ~0ull;
+        count_ = 0;
+    }
+
+    void beginFrame(unsigned long long frame) {
+        if (frame_ != frame) {
+            frame_ = frame;
+            count_ = 0;
+        }
+    }
+
+    const SceneSubpassEntry* find(unsigned long long frame, float scaleX, float scaleY, float depthB) const {
+        if (frame_ != frame) return nullptr;
+        for (size_t i = 0; i < count_; ++i) {
+            const auto& e = entries_[i];
+            if (std::fabs(e.depthB - depthB) <= 1e-3f &&
+                std::fabs(e.scaleX - scaleX) <= 0.01f * e.scaleX &&
+                std::fabs(e.scaleY - scaleY) <= 0.01f * e.scaleY) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    const SceneSubpassEntry* findJittered(unsigned long long frame, float scaleX, float scaleY, float depthB) const {
+        const auto* e = find(frame, scaleX, scaleY, depthB);
+        return (e && e->jittered) ? e : nullptr;
+    }
+
+    const SceneSubpassEntry* findJitteredByDepthB(unsigned long long frame, float depthB) const {
+        if (frame_ != frame) return nullptr;
+        for (size_t i = 0; i < count_; ++i) {
+            const auto& e = entries_[i];
+            if (e.jittered && std::fabs(e.depthB - depthB) <= 1e-3f) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    bool recordOrGet(unsigned long long frame, float scaleX, float scaleY, float depthB, bool proposedJitter) {
+        beginFrame(frame);
+        if (const auto* existing = find(frame, scaleX, scaleY, depthB)) {
+            return existing->jittered;
+        }
+        if (count_ < kMaxSubpasses) {
+            entries_[count_++] = {scaleX, scaleY, depthB, proposedJitter};
+        }
+        return proposedJitter;
+    }
+
+    size_t count() const { return count_; }
+    size_t countForFrame(unsigned long long frame) const { return (frame_ == frame) ? count_ : 0; }
+    const SceneSubpassEntry& entry(size_t i) const { return entries_[i]; }
+
+private:
+    unsigned long long frame_ = ~0ull;
+    SceneSubpassEntry entries_[kMaxSubpasses]{};
+    size_t count_ = 0;
+};
+
 } // namespace edpe

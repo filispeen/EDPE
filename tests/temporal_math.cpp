@@ -501,5 +501,61 @@ int main() {
     if (edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
             bad_self_cb2.data(), bad_self_cb2.size(), ws_cb1_col_major, inv_jitter, dxUv, dyUv, &stale_moving_pos)) return 80;
 
+    // Captured 208-byte CB0 transpose Model*ViewProj layouts (edo(issue11).rdc):
+    // Planet (15736, translated), Atmosphere (16044, scaled by 492878 + translated),
+    // Terrain Proj (6796, identity rot), and Viewmodel Atmosphere (16208, sub-pass depthB/FOV).
+    const edpe::CameraProjection worldCamRef{
+        {-0.385895f, 0.489945f, -0.78169f, -112.6217f,
+         -0.876311f, -0.459539f, 0.144578f, 180.6429f,
+         -0.288382f, 0.740796f, 0.606678f, 193.4490f},
+        1.0525f, 1.871f, 0.025f};
+    const float planetMvpT[16]{
+        -0.40611f, -0.922217f, -0.303488f, 179.564621f,
+         0.916597f, -0.859747f,  1.385995f,  -9.583491f,
+         0.0f,       0.0f,       0.0f,        0.025f,
+        -0.781705f,  0.144592f,  0.606655f, -231.513412f};
+    const float atmoMvpT[16]{
+        -200162.859f, -454540.468f, -149582.796f, 0.0f,
+         451770.437f, -423750.187f,  683126.375f, -724944.375f,
+         0.0f,         0.0f,         0.0f,        0.025f,
+        -385285.187f,  71266.414f,   299007.062f, 22424.172f};
+    const float terrainProjT[16]{
+        1.052385f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.870908f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.025f,
+        0.0f, 0.0f, 1.0f, 0.0f};
+    if (!edpe::matchesEliteTransposeProjectionBlock(planetMvpT, worldCamRef) ||
+        !edpe::matchesEliteTransposeProjectionBlock(atmoMvpT, worldCamRef) ||
+        !edpe::matchesEliteTransposeProjectionBlock(terrainProjT, worldCamRef)) return 81;
+
+    float atmoJittered[16]{};
+    const auto cb0Jit = edpe::projectionJitter(4, 3440, 1440);
+    if (!edpe::jitterEliteDotProjectionBlock(atmoMvpT, atmoJittered, cb0Jit) ||
+        !edpe::matchesEliteTransposeProjectionBlock(atmoJittered, worldCamRef)) return 82;
+    edpe::NdcOffset atmoRecovered{};
+    if (!edpe::estimateEliteTransposeBlockNdcOffset(atmoJittered, &atmoRecovered) ||
+        std::fabs(atmoRecovered.x - cb0Jit.ndcX) > 1e-4f ||
+        std::fabs(atmoRecovered.y - cb0Jit.ndcY) > 1e-4f) return 83;
+
+    // Viewmodel 0.0675 / 1.2935 block (16208) must fail world 0.025 / 1.0525 ref,
+    // pass viewmodel sub-pass ref, and mirrored reflection (det < 0) must be rejected.
+    const float vmMvpT[16]{
+        -0.499218f, -1.13365f, -0.373068f, 0.0f,
+         1.126741f, -1.056857f, 1.703756f, 0.0f,
+         0.0f,       0.0f,      0.0f,      0.0675f,
+        -0.781705f,  0.144592f, 0.606655f, 0.0f};
+    if (edpe::matchesEliteTransposeProjectionBlock(vmMvpT, worldCamRef)) return 84;
+    edpe::CameraProjection vmCamRef = worldCamRef;
+    vmCamRef.scaleX = 1.2935f;
+    vmCamRef.scaleY = 2.300f;
+    vmCamRef.depthB = 0.0675f;
+    if (!edpe::matchesEliteTransposeProjectionBlock(vmMvpT, vmCamRef)) return 85;
+    float mirroredMvpT[16]{};
+    std::memcpy(mirroredMvpT, planetMvpT, sizeof(mirroredMvpT));
+    mirroredMvpT[0] = -mirroredMvpT[0];
+    mirroredMvpT[1] = -mirroredMvpT[1];
+    mirroredMvpT[2] = -mirroredMvpT[2];
+    if (edpe::matchesEliteTransposeProjectionBlock(mirroredMvpT, worldCamRef)) return 86;
+
     return 0; // All temporal math tests passed
 }
