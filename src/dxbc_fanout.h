@@ -205,7 +205,8 @@ static std::vector<UINT> patchHoloTokens(const std::vector<UINT>& t, HoloRemapKi
     return out;
 }
 
-static std::vector<BYTE> patchHoloContainer(const std::vector<BYTE>& in, HoloRemapKind kind) {
+template <typename PatchFn>
+static std::vector<BYTE> patchShaderContainer(const std::vector<BYTE>& in, PatchFn&& patchTokens) {
     if (in.size() > 1024 * 1024 || in.size() < 32 || word(in, 28) > 128 ||
         memcmp(in.data(), "DXBC", 4) || word(in, 24) != in.size()) {
         throw std::runtime_error("container");
@@ -221,11 +222,11 @@ static std::vector<BYTE> patchHoloContainer(const std::vector<BYTE>& in, HoloRem
         if (off + 8 > in.size() || size > in.size() - (off + 8)) throw std::runtime_error("chunk bounds");
         std::vector<BYTE> b(in.begin() + off + 8, in.begin() + off + 8 + size);
         if (tag == 0x58454853 || tag == 0x52444853) {
-            if (program || b.size() % 4 || word(b, 0) != 0x50 || word(b, 4) != b.size() / 4)
+            if (program || b.size() % 4 || (word(b, 0) & 0xFFFFu) != 0x50u || word(b, 4) != b.size() / 4)
                 throw std::runtime_error("program header");
             std::vector<UINT> t(b.size() / 4);
             memcpy(t.data(), b.data(), b.size());
-            const auto outTokens = patchHoloTokens(t, kind);
+            const auto outTokens = patchTokens(t);
             b.resize(outTokens.size() * 4);
             memcpy(b.data(), outTokens.data(), b.size());
             program = true;
@@ -248,6 +249,294 @@ static std::vector<BYTE> patchHoloContainer(const std::vector<BYTE>& in, HoloRem
     ComputeHashRetail(out.data() + 20, sz - 20, out.data() + 4);
     return out;
 }
+
+static size_t operandLength(const std::vector<UINT>& t, size_t p) {
+    if (p >= t.size()) throw std::runtime_error("operand bounds");
+    const size_t start = p;
+    const UINT tok = t[p++];
+    if (tok & 0x80000000u) {
+        UINT ext = tok;
+        while (ext & 0x80000000u) {
+            if (p >= t.size()) throw std::runtime_error("operand ext bounds");
+            ext = t[p++];
+        }
+    }
+    const UINT numComps = tok & 3u;
+    const UINT type = (tok >> 12) & 255u;
+    const UINT idxDim = (tok >> 20) & 3u;
+    if (type == 4u) { // IMMEDIATE32
+        const size_t words = (numComps == 2u) ? 4u : 1u;
+        if (p + words > t.size()) throw std::runtime_error("imm32 bounds");
+        return (p - start) + words;
+    }
+    if (type == 5u) { // IMMEDIATE64
+        const size_t words = (numComps == 2u) ? 4u : 2u;
+        if (p + words > t.size()) throw std::runtime_error("imm64 bounds");
+        return (p - start) + words;
+    }
+    for (UINT d = 0; d < idxDim; ++d) {
+        const UINT rep = (tok >> (22u + 2u * d)) & 3u;
+        if (rep == 0u) {
+            if (p >= t.size()) throw std::runtime_error("idx imm32 bounds");
+            ++p;
+        } else if (rep == 1u) {
+            if (p + 2 > t.size()) throw std::runtime_error("idx imm64 bounds");
+            p += 2;
+        } else if (rep == 2u) {
+            p += operandLength(t, p);
+        } else {
+            if (p >= t.size()) throw std::runtime_error("idx imm32+rel bounds");
+            ++p;
+            p += operandLength(t, p);
+        }
+    }
+    return p - start;
+}
+
+static bool isSimple1dReg(const std::vector<UINT>& t, size_t p, UINT regType, UINT regIndex) {
+    if (p + 1 >= t.size()) return false;
+    const UINT tok = t[p];
+    if (tok & 0x80000000u) return false;
+    const UINT type = (tok >> 12) & 255u;
+    const UINT idxDim = (tok >> 20) & 3u;
+    const UINT rep0 = (tok >> 22) & 3u;
+    return type == regType && idxDim == 1u && rep0 == 0u && t[p + 1] == regIndex;
+}
+
+static bool isVisorSampleOp(UINT op) {
+    return op >= 69u && op <= 74u; // sample, sample_c, sample_c_lz, sample_l, sample_d, sample_b
+}
+
+// On-foot helmet visor VS: SV_VertexID-only fullscreen triangle (z=0.99, cb1[91], cb2[2]),
+// computing screen-space o1.xy which stays unjittered when world cb1 carries Halton jitter.
+static std::vector<UINT> patchVisorVertexTokens(const std::vector<UINT>& t) {
+    if (t.size() <= 2 || t[0] != 0x00010050u || t[1] != t.size()) {
+        throw std::runtime_error("visor VS version");
+    }
+    bool hasCb1 = false, hasCb2 = false, hasVertexId = false, hasSvPos = false, hasO1Xy = false;
+    bool hasNearZ99 = false;
+    size_t tempAt = 0;
+    UINT temp = 0, o1Mask = 0;
+
+    for (size_t a = 2; a < t.size();) {
+        const UINT n = instructionLength(t, a);
+        const UINT op = t[a] & 2047u;
+        if (op == 89u && n == 4u && t[a + 1] == 0x00208e46u) {
+            if (t[a + 2] == 13u) throw std::runtime_error("b13 occupied");
+            if (t[a + 2] == 1u && t[a + 3] >= 91u) hasCb1 = true;
+            if (t[a + 2] == 2u && t[a + 3] >= 2u) hasCb2 = true;
+        } else if (op == 96u && n == 4u && t[a + 2] == 0u && t[a + 3] == 6u) {
+            hasVertexId = true; // dcl_input_sgv v0.x, vertexid
+        } else if (op == 101u && n == 3u && t[a + 2] == 1u && ((t[a + 1] >> 4) & 15u) == 3u) {
+            hasO1Xy = true; // dcl_output o1.xy
+        } else if (op == 103u && n == 4u && t[a + 2] == 3u && t[a + 3] == 1u) {
+            hasSvPos = true; // dcl_output_siv o3.xyzw, position
+        } else if (op == 104u) {
+            if (n != 2u || tempAt != 0) throw std::runtime_error("temps declaration");
+            tempAt = a;
+            temp = t[a + 1];
+        } else if (tempAt != 0 && op != 53u) {
+            if (op == 54u) { // check for mov o3.zw, l(..., 0.99f, 1.0f)
+                for (size_t k = a + 1; k < a + n; ++k) {
+                    if (t[k] == 0x3f7d70a4u) hasNearZ99 = true;
+                }
+            }
+            size_t p = a + 1;
+            while (p < a + n && (t[p - 1] & 0x80000000u)) ++p;
+            if (p < a + n && isSimple1dReg(t, p, 2u, 1u) && (t[p] & 0xC) == 0u) {
+                const UINT mask = (t[p] >> 4) & 15u;
+                if (mask == 0u || (mask & ~3u) != 0u || (o1Mask & mask) != 0u) {
+                    throw std::runtime_error("unexpected o1 write");
+                }
+                o1Mask |= mask;
+            }
+        }
+        a += n;
+    }
+
+    if (!hasCb1 || !hasCb2 || !hasVertexId || !hasO1Xy || !hasSvPos || !hasNearZ99 ||
+        !tempAt || temp == 0 || temp >= 4096u || o1Mask != 3u) {
+        throw std::runtime_error("not helmet visor VS");
+    }
+
+    std::vector<UINT> out;
+    out.reserve(t.size() + 24);
+    out.push_back(t[0]);
+    out.push_back(0);
+    bool inExec = false;
+    for (size_t a = 2; a < t.size();) {
+        const UINT n = instructionLength(t, a);
+        const UINT op = t[a] & 2047u;
+        if (a == tempAt) {
+            const UINT cbDecl[] = {0x04000059u, 0x00208e46u, 13u, 1u};
+            out.insert(out.end(), cbDecl, cbDecl + 4);
+            out.push_back(t[a]);
+            out.push_back(temp + 1u);
+            inExec = true;
+        } else if (inExec && op != 53u) {
+            const size_t start = out.size();
+            out.insert(out.end(), t.begin() + a, t.begin() + a + n);
+            size_t p = 1;
+            while (p < n && (t[a + p - 1] & 0x80000000u)) ++p;
+            if (p < n && isSimple1dReg(t, a + p, 2u, 1u)) {
+                const UINT mask = (t[a + p] >> 4) & 15u;
+                out[start + p] = (out[start + p] & ~0x000FF000u); // o1 -> r{temp}
+                out[start + p + 1] = temp;
+                if (mask == 1u) {
+                    const UINT addX[] = {0x08000000u, 0x00102012u, 1u, 0x0010000au, temp, 0x0020800au, 13u, 0u};
+                    out.insert(out.end(), addX, addX + 8);
+                } else if (mask == 2u) {
+                    const UINT addY[] = {0x08000000u, 0x00102022u, 1u, 0x0010001au, temp, 0x0020801au, 13u, 0u};
+                    out.insert(out.end(), addY, addY + 8);
+                } else if (mask == 3u) {
+                    const UINT addXy[] = {0x08000000u, 0x00102032u, 1u, 0x00100046u, temp, 0x00208046u, 13u, 0u};
+                    out.insert(out.end(), addXy, addXy + 8);
+                }
+            }
+        } else {
+            out.insert(out.end(), t.begin() + a, t.begin() + a + n);
+        }
+        a += n;
+    }
+    out[1] = UINT(out.size());
+    return out;
+}
+
+// On-foot helmet visor PS: dual-source (o0, o1), samples t0..t4 using unjittered v3.xy * cb1[332].zw
+// and refracts pre-visor HDR t1. Shift v3 -> r{tempPos} = v3 + cb13[0].zw, while adding cb13[1].xy
+// back before t1 reads so refracted jittered world t1 is not un-jittered.
+static std::vector<UINT> patchVisorPixelTokens(const std::vector<UINT>& t) {
+    if (t.size() <= 2 || t[0] != 0x00000050u || t[1] != t.size()) {
+        throw std::runtime_error("visor PS version");
+    }
+    bool hasCb1 = false, hasCb2 = false, hasSvPosV3 = false, hasCb332Mul = false;
+    UINT texCount = 0, outCount = 0, v3Reads = 0, t1Samples = 0, temp = 0;
+    size_t tempAt = 0;
+
+    for (size_t a = 2; a < t.size();) {
+        const UINT n = instructionLength(t, a);
+        const UINT op = t[a] & 2047u;
+        if (op == 89u && n == 4u && t[a + 1] == 0x00208e46u) {
+            if (t[a + 2] == 13u) throw std::runtime_error("b13 occupied");
+            if (t[a + 2] == 1u && t[a + 3] >= 333u) hasCb1 = true;
+            if (t[a + 2] == 2u && t[a + 3] >= 9u) hasCb2 = true;
+        } else if (op == 88u) {
+            ++texCount;
+        } else if (op == 101u) {
+            ++outCount;
+        } else if (op == 100u && n >= 4u && isSimple1dReg(t, a + 1, 1u, 3u) && t[a + 3] == 1u) {
+            hasSvPosV3 = true; // dcl_input_ps_siv v3.xy, position
+        } else if (op == 104u) {
+            if (n != 2u || tempAt != 0) throw std::runtime_error("temps declaration");
+            tempAt = a;
+            temp = t[a + 1];
+        } else if (tempAt != 0 && op != 53u) {
+            size_t p = a + 1;
+            while (p < a + n && (t[p - 1] & 0x80000000u)) ++p;
+            UINT opIdx = 0;
+            size_t coordOff = 0;
+            bool readsT1 = false;
+            while (p < a + n) {
+                const size_t oLen = operandLength(t, p);
+                if (opIdx > 0 && ((t[p] >> 12) & 255u) == 1u && oLen == 2u && t[p + 1] == 3u) {
+                    if (!isSimple1dReg(t, p, 1u, 3u)) throw std::runtime_error("complex v3 operand");
+                    ++v3Reads;
+                    if (op == 56u) { // mul ..., v3..., cb1[332]...
+                        for (size_t k = a + 1; k + 2 < a + n; ++k) {
+                            if (((t[k] >> 12) & 255u) == 8u && t[k + 1] == 1u && t[k + 2] == 332u) {
+                                hasCb332Mul = true;
+                            }
+                        }
+                    }
+                }
+                if (isVisorSampleOp(op)) {
+                    if (opIdx == 1u) coordOff = p;
+                    if (opIdx == 2u && isSimple1dReg(t, p, 7u, 1u)) readsT1 = true;
+                }
+                p += oLen;
+                ++opIdx;
+            }
+            if (readsT1) {
+                if (!coordOff || (t[coordOff] & 0xFFFFE00Fu) != 0x00100006u ||
+                    operandLength(t, coordOff) != 2u) {
+                    throw std::runtime_error("unsupported t1 coord");
+                }
+                ++t1Samples;
+            }
+        }
+        a += n;
+    }
+
+    if (!hasCb1 || !hasCb2 || !hasSvPosV3 || !hasCb332Mul || outCount != 2u || texCount != 5u ||
+        !tempAt || temp == 0 || temp + 2u >= 4096u || v3Reads == 0 || t1Samples == 0) {
+        throw std::runtime_error("not helmet visor PS");
+    }
+
+    const UINT tempPos = temp;
+    const UINT tempUv = temp + 1u;
+    std::vector<UINT> out;
+    out.reserve(t.size() + 32);
+    out.push_back(t[0]);
+    out.push_back(0);
+    bool inExec = false;
+    for (size_t a = 2; a < t.size();) {
+        const UINT n = instructionLength(t, a);
+        const UINT op = t[a] & 2047u;
+        if (a == tempAt) {
+            const UINT cbDecl[] = {0x04000059u, 0x00208e46u, 13u, 2u};
+            out.insert(out.end(), cbDecl, cbDecl + 4);
+            out.push_back(t[a]);
+            out.push_back(temp + 2u);
+            const UINT shiftPos[] = {0x08000000u, 0x00100032u, tempPos, 0x00101046u, 3u, 0x00208ae6u, 13u, 0u};
+            out.insert(out.end(), shiftPos, shiftPos + 8);
+            inExec = true;
+        } else if (inExec && op != 53u) {
+            std::vector<UINT> inst(t.begin() + a, t.begin() + a + n);
+            size_t p = 1;
+            while (p < n && (inst[p - 1] & 0x80000000u)) ++p;
+            UINT opIdx = 0;
+            size_t coordOff = 0;
+            bool readsT1 = false;
+            while (p < n) {
+                const size_t oLen = operandLength(inst, p);
+                if (opIdx > 0 && isSimple1dReg(inst, p, 1u, 3u)) {
+                    inst[p] &= ~0x000FF000u; // v3 -> r{tempPos}
+                    inst[p + 1] = tempPos;
+                }
+                if (isVisorSampleOp(op)) {
+                    if (opIdx == 1u) coordOff = p;
+                    if (opIdx == 2u && isSimple1dReg(inst, p, 7u, 1u)) readsT1 = true;
+                }
+                p += oLen;
+                ++opIdx;
+            }
+            if (readsT1 && coordOff) {
+                const UINT origCoordTok = inst[coordOff];
+                const UINT origCoordReg = inst[coordOff + 1];
+                const UINT addUv[] = {
+                    0x08000000u, 0x00100032u, tempUv,
+                    origCoordTok, origCoordReg,
+                    0x00208046u, 13u, 1u
+                };
+                out.insert(out.end(), addUv, addUv + 8);
+                inst[coordOff] = 0x00100046u; // r{tempUv}.xyxx
+                inst[coordOff + 1] = tempUv;
+            }
+            out.insert(out.end(), inst.begin(), inst.end());
+        } else {
+            out.insert(out.end(), t.begin() + a, t.begin() + a + n);
+        }
+        a += n;
+    }
+    out[1] = UINT(out.size());
+    return out;
+}
+
+static std::vector<BYTE> patchHoloContainer(const std::vector<BYTE>& in, HoloRemapKind kind) {
+    return patchShaderContainer(in, [kind](const std::vector<UINT>& t) {
+        return patchHoloTokens(t, kind);
+    });
+}
 } // namespace dxbc_fanout_detail
 inline bool colourFanout(const void* data,size_t bytes,std::vector<BYTE>& output,std::string& reason) {
     output.clear();reason.clear();
@@ -256,6 +545,44 @@ inline bool colourFanout(const void* data,size_t bytes,std::vector<BYTE>& output
         const auto* p=static_cast<const BYTE*>(data);
         output=dxbc_fanout_detail::patch(std::vector<BYTE>(p,p+bytes));return true;
     } catch(const std::exception& e){reason=e.what();return false;}
+}
+
+inline bool patchVisorVertexShader(const void* data, size_t bytes,
+                                   std::vector<BYTE>& output, std::string& reason) {
+    output.clear();
+    reason.clear();
+    if (!data || bytes < 32 || bytes > 1024 * 1024) {
+        reason = "bytecode size";
+        return false;
+    }
+    try {
+        const auto* p = static_cast<const BYTE*>(data);
+        output = dxbc_fanout_detail::patchShaderContainer(
+            std::vector<BYTE>(p, p + bytes), dxbc_fanout_detail::patchVisorVertexTokens);
+        return true;
+    } catch (const std::exception& e) {
+        reason = e.what();
+        return false;
+    }
+}
+
+inline bool patchVisorPixelShader(const void* data, size_t bytes,
+                                  std::vector<BYTE>& output, std::string& reason) {
+    output.clear();
+    reason.clear();
+    if (!data || bytes < 32 || bytes > 1024 * 1024) {
+        reason = "bytecode size";
+        return false;
+    }
+    try {
+        const auto* p = static_cast<const BYTE*>(data);
+        output = dxbc_fanout_detail::patchShaderContainer(
+            std::vector<BYTE>(p, p + bytes), dxbc_fanout_detail::patchVisorPixelTokens);
+        return true;
+    } catch (const std::exception& e) {
+        reason = e.what();
+        return false;
+    }
 }
 
 struct HoloRemapParams {

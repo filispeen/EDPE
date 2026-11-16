@@ -3739,6 +3739,218 @@ void replayGlassDraw(ID3D11DeviceContext* context, UINT index_count,
     set_targets(context, 1, &restore, depth.Get());
 }
 
+struct VisorJitterCbData {
+    float uvOffsetX;   // -jitterPixelX / renderW
+    float uvOffsetY;   // -jitterPixelY / renderH
+    float pixOffsetX;  // -jitterPixelX
+    float pixOffsetY;  // -jitterPixelY
+    float restoreUvX;  // +jitterPixelX / renderW
+    float restoreUvY;  // +jitterPixelY / renderH
+    float pad0;
+    float pad1;
+};
+static_assert(sizeof(VisorJitterCbData) == 32, "VisorJitterCbData must match cb13[2]");
+
+struct VisorCheckedPair {
+    std::uint64_t vs = 0;
+    std::uint64_t ps = 0;
+};
+
+ID3D11Device* s_visor_device = nullptr;
+Microsoft::WRL::ComPtr<ID3D11Buffer> s_visor_jitter_cb;
+std::uint64_t s_visor_cached_vs_hash = 0;
+std::uint64_t s_visor_cached_ps_hash = 0;
+Microsoft::WRL::ComPtr<ID3D11VertexShader> s_visor_patched_vs;
+Microsoft::WRL::ComPtr<ID3D11PixelShader> s_visor_patched_ps;
+std::array<VisorCheckedPair, 32> s_visor_checked_neg{};
+size_t s_visor_checked_neg_count = 0;
+bool s_visor_align_logged = false;
+
+void resetVisorJitterAlign() {
+    s_visor_device = nullptr;
+    s_visor_jitter_cb.Reset();
+    s_visor_cached_vs_hash = 0;
+    s_visor_cached_ps_hash = 0;
+    s_visor_patched_vs.Reset();
+    s_visor_patched_ps.Reset();
+    s_visor_checked_neg_count = 0;
+    s_visor_align_logged = false;
+}
+
+void recordVisorNegativePair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
+    if (s_visor_checked_neg_count < s_visor_checked_neg.size()) {
+        s_visor_checked_neg[s_visor_checked_neg_count++] = {vs_hash, ps_hash};
+    }
+}
+
+bool tryVisorJitterAlignDraw(ID3D11DeviceContext* context, UINT vertex_count, UINT instance_count,
+                             UINT start_vertex, UINT start_instance) {
+    if (!context || vertex_count != 3 || instance_count != 1 ||
+        !motion_color_source || !motion_color_bound ||
+        !ContextCensusIsJitterActive() ||
+        s_jitter_injected_frame != motion_color_frame) {
+        return false;
+    }
+    const float jx = s_injected_jitter.pixelX;
+    const float jy = s_injected_jitter.pixelY;
+    if (!std::isfinite(jx) || !std::isfinite(jy) ||
+        (std::fabs(jx) <= 1e-4f && std::fabs(jy) <= 1e-4f)) {
+        return false;
+    }
+
+    const auto forward = resolveOriginalDrawInstanced(context);
+    if (!forward) return false;
+
+    std::uint64_t vs_hash = 0, ps_hash = 0;
+    if (!getFastBoundShaderHashes(context, vs_hash, ps_hash) || !vs_hash || !ps_hash) {
+        return false;
+    }
+    for (size_t i = 0; i < s_visor_checked_neg_count; ++i) {
+        if (s_visor_checked_neg[i].vs == vs_hash && s_visor_checked_neg[i].ps == ps_hash) {
+            return false;
+        }
+    }
+
+    ID3D11RenderTargetView* boundRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, boundRtvs, nullptr);
+    const bool rtv0Matches = boundRtvs[0] && sameRenderTargetResource(boundRtvs[0], motion_color_source.Get());
+    bool hasExtraRtv = false;
+    for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+        hasExtraRtv |= (boundRtvs[i] != nullptr);
+        if (boundRtvs[i]) boundRtvs[i]->Release();
+    }
+    if (boundRtvs[0]) boundRtvs[0]->Release();
+    if (!rtv0Matches || hasExtraRtv) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return false;
+    if (device.Get() != s_visor_device) {
+        resetVisorJitterAlign();
+        s_visor_device = device.Get();
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> origVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> origPs;
+    context->VSGetShader(&origVs, nullptr, nullptr);
+    context->PSGetShader(&origPs, nullptr, nullptr);
+    if (!origVs || !origPs) return false;
+
+    if (vs_hash != s_visor_cached_vs_hash || ps_hash != s_visor_cached_ps_hash ||
+        !s_visor_patched_vs || !s_visor_patched_ps) {
+        UINT vsBytes = 0, psBytes = 0;
+        if (FAILED(origVs->GetPrivateData(kEdpeVertexBytecodeGuid, &vsBytes, nullptr)) ||
+            FAILED(origPs->GetPrivateData(kEdpePixelBytecodeGuid, &psBytes, nullptr)) ||
+            vsBytes < 32 || vsBytes > 1024 * 1024 ||
+            psBytes < 32 || psBytes > 1024 * 1024) {
+            recordVisorNegativePair(vs_hash, ps_hash);
+            return false;
+        }
+        std::vector<BYTE> vsRaw(vsBytes), psRaw(psBytes);
+        if (FAILED(origVs->GetPrivateData(kEdpeVertexBytecodeGuid, &vsBytes, vsRaw.data())) ||
+            FAILED(origPs->GetPrivateData(kEdpePixelBytecodeGuid, &psBytes, psRaw.data()))) {
+            recordVisorNegativePair(vs_hash, ps_hash);
+            return false;
+        }
+        std::vector<BYTE> vsPatchedBytes, psPatchedBytes;
+        std::string reason;
+        if (!edpe::patchVisorVertexShader(vsRaw.data(), vsRaw.size(), vsPatchedBytes, reason) ||
+            !edpe::patchVisorPixelShader(psRaw.data(), psRaw.size(), psPatchedBytes, reason)) {
+            recordVisorNegativePair(vs_hash, ps_hash);
+            return false;
+        }
+        Microsoft::WRL::ComPtr<ID3D11VertexShader> newVs;
+        Microsoft::WRL::ComPtr<ID3D11PixelShader> newPs;
+        if (FAILED(device->CreateVertexShader(vsPatchedBytes.data(), vsPatchedBytes.size(), nullptr, &newVs)) ||
+            FAILED(device->CreatePixelShader(psPatchedBytes.data(), psPatchedBytes.size(), nullptr, &newPs))) {
+            EdpeLog(L"EDPE: failed to compile patched visor jitter shaders; failing open");
+            recordVisorNegativePair(vs_hash, ps_hash);
+            return false;
+        }
+        s_visor_patched_vs = std::move(newVs);
+        s_visor_patched_ps = std::move(newPs);
+        s_visor_cached_vs_hash = vs_hash;
+        s_visor_cached_ps_hash = ps_hash;
+    }
+
+    if (!s_visor_jitter_cb) {
+        D3D11_BUFFER_DESC cbd{};
+        cbd.ByteWidth = sizeof(VisorJitterCbData);
+        cbd.Usage = D3D11_USAGE_DEFAULT;
+        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(device->CreateBuffer(&cbd, nullptr, &s_visor_jitter_cb))) {
+            return false;
+        }
+    }
+
+    UINT srcW = s_observed_scene_width.load(std::memory_order_relaxed);
+    UINT srcH = s_observed_scene_height.load(std::memory_order_relaxed);
+    if (srcW == 0 || srcH == 0) {
+        Microsoft::WRL::ComPtr<ID3D11Resource> rtRes;
+        motion_color_source->GetResource(&rtRes);
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> rtTex;
+        if (rtRes && SUCCEEDED(rtRes.As(&rtTex))) {
+            D3D11_TEXTURE2D_DESC td{};
+            rtTex->GetDesc(&td);
+            srcW = td.Width;
+            srcH = td.Height;
+        }
+    }
+    if (srcW == 0 || srcH == 0) return false;
+
+    const VisorJitterCbData cbData{
+        -jx / static_cast<float>(srcW),
+        -jy / static_cast<float>(srcH),
+        -jx,
+        -jy,
+        jx / static_cast<float>(srcW),
+        jy / static_cast<float>(srcH),
+        0.0f,
+        0.0f
+    };
+    context->UpdateSubresource(s_visor_jitter_cb.Get(), 0, nullptr, &cbData, 0, 0);
+
+    Microsoft::WRL::ComPtr<ID3D11Buffer> origVsCb13;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> origPsCb13;
+    context->VSGetConstantBuffers(13, 1, &origVsCb13);
+    context->PSGetConstantBuffers(13, 1, &origPsCb13);
+
+    ID3D11Buffer* cbPtr = s_visor_jitter_cb.Get();
+    const auto origVsSetCb = resolveOriginalVSSetConstantBuffers(context);
+    context->VSSetShader(s_visor_patched_vs.Get(), nullptr, 0);
+    context->PSSetShader(s_visor_patched_ps.Get(), nullptr, 0);
+    if (origVsSetCb) {
+        origVsSetCb(context, 13, 1, &cbPtr);
+    } else {
+        context->VSSetConstantBuffers(13, 1, &cbPtr);
+    }
+    context->PSSetConstantBuffers(13, 1, &cbPtr);
+
+    forward(context, vertex_count, instance_count, start_vertex, start_instance);
+
+    context->VSSetShader(origVs.Get(), nullptr, 0);
+    context->PSSetShader(origPs.Get(), nullptr, 0);
+    ID3D11Buffer* restoreVsCb = origVsCb13.Get();
+    ID3D11Buffer* restorePsCb = origPsCb13.Get();
+    if (origVsSetCb) {
+        origVsSetCb(context, 13, 1, &restoreVsCb);
+    } else {
+        context->VSSetConstantBuffers(13, 1, &restoreVsCb);
+    }
+    context->PSSetConstantBuffers(13, 1, &restorePsCb);
+
+    if (!s_visor_align_logged) {
+        s_visor_align_logged = true;
+        wchar_t message[160];
+        swprintf_s(message, L"EDPE: on-foot visor jitter align active VS=%016llX PS=%016llX (%ux%u)",
+            vs_hash, ps_hash, srcW, srcH);
+        EdpeLog(message);
+    }
+    return true;
+}
+
 void observeFirstSceneDraw(ID3D11DeviceContext* context) {
     if (!vs_scene_buffer_bound.load(std::memory_order_relaxed)) return;
     const bool first = !first_scene_draw_seen.exchange(true, std::memory_order_relaxed);
@@ -3925,12 +4137,14 @@ static inline bool isHudDrawInterceptWindowActive() {
 }
 
 static inline bool shouldInspectHudOrTonemapDraw(UINT count, UINT instances) {
+    const auto cur = last_present_frame.load(std::memory_order_relaxed);
     if ((s_hud_mask_active_pass && motion_color_bound) ||
+        (motion_color_bound && count == 3 && instances == 1 &&
+         s_jitter_injected_frame == motion_color_frame && ContextCensusIsJitterActive()) ||
         motion_pair_active ||
         draw_probe_active.load(std::memory_order_relaxed)) {
         return true;
     }
-    const auto cur = last_present_frame.load(std::memory_order_relaxed);
     if (s_post_ldr_backbuffer_bound) {
         if (s_verified_ldr_tonemap_frame != cur) {
             return true;
@@ -4111,6 +4325,10 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
             start_vertex, 0, start_instance);
     }
     if (!redirected) {
+        if (tryVisorJitterAlignDraw(context, vertex_count, instance_count, start_vertex, start_instance)) {
+            abandonAmortizedAndRearmHudProbe(context);
+            return;
+        }
         if (const auto forward = resolveOriginalDrawInstanced(context)) {
             forward(context, vertex_count, instance_count, start_vertex, start_instance);
         }
@@ -11198,6 +11416,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         motion_grid_context = nullptr;
         motion_snapshot.Reset();
         s_hud_mask_snapshot.Reset();
+        resetVisorJitterAlign();
         motion_pass.reset();
         motion_camera_frames = {~0ull, ~0ull};
         camera_pair_sample_frames = {~0ull, ~0ull};

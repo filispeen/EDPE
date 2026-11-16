@@ -135,3 +135,16 @@ Following the nvidia-dlaa-input-contract.md implications and PLAN.md expected or
   - Diverting any pre-sky depth-tested world shader (`0xB12F7A618E1BDE98 / 0x42AC0CACC9CDF72B`, `0x5559BD94B6852E83`, or unlocked space dust) into `HdrLayer` traps its low linear HDR color and `< 1` transmittance in `HdrLayer` while `16137` brightens the sky behind it, darkening the ring band over sky and planet when `UiLayer::composite` runs.
   - **Confidence:** High (verified via `edo(issue11).rdc` `pixel_history` at `(1660, 280)` and `(1715, 340)`, shader disassembly, and `shot1`/`shot2`/`shot3`).
   - **Implication:** Exclude `0x5559BD94B6852E83` and `0xB12F7A618E1BDE98` from `isHudShaderPair` / `UiLayer::shouldInterceptDraw`, require confirmed ship-cockpit holo shaders (`isConfirmedShipCockpitHudPair`) before unlocking cockpit-only shaders (`kSpaceDust` / `kNormalSpaceDust` / `0xB7790CBF`), and guard `captureEarlyMotionColor` against overwriting an already-latched `from_hud` snapshot in the same frame.
+
+
+## On-foot Helmet Visor Fullscreen Pass (`EID 18188`, `edo(issue11).rdc`, 2026-11-16)
+- **Method:** RenderDoc pipeline inspection, `pixel_history`, and DXBC disassembly of `F:\Code\C++\EDPE\edo(issue11).rdc` (`2560x1440`, Odyssey on-foot settle).
+- **Evidence:**
+  - `EID 18098`: `CopySubresourceRegion` copies clean pre-visor HDR `8728` (`R11G11B10_FLOAT`) into `8731`.
+  - `EID 18120..18162`: `DrawInstanced(3, 1)` builds downsampled blurred HDR `8698` (`320x180`).
+  - `EID 18188`: `DrawInstanced(3, 1)` (`TriangleStrip`, `SV_VERTEXID`, no vertex buffer) renders the curved helmet visor rim streaks, frost/droplets, and visor tint onto `RTV0 = 8728` (`DSV = 8723`, `stencil: 0 -> 4`, dual-source outputs `o0` + `o1`):
+    - `VS ResourceId::110929` (`b678d36d-5d404fd2-dd954269-c11c2adf`, `cb1[91]`, `cb2[2]`, `t0`): outputs screen-locked unjittered clip coords (`o3.zw = (0.99, 1.0)`) and screen UV `o1.xy`.
+    - `PS ResourceId::110930` (`c7167686-a5850b4a-f73bbcd8-24903a6a`, `cb1[333]`, `cb2[9]`, `t0..t4`): samples curved visor streaks `t3` using unjittered `v3.xy * cb1[332].zw`, droplets/normals `t2`/`t4` using unjittered `v1.xy`, and already-jittered pre-visor HDR background `t1 = 8731` twice.
+  - Because `8728` and `8731` carry camera Halton subpixel jitter `+J_N` while `EID 18188` draws at unjittered screen coordinates, temporal unjitter (`-J_N` in DLAA/DLSS/FSR/XeSS) shifts the static visor curves/droplets across Halton frames, producing subpixel shimmer and doubled visor streaks.
+- **Confidence:** High (verified via shader disassembly, `pixel_history` at `(180, 400)` and `(100, 100)`, and WARP D3D11 + `D3DDisassemble` test in `tests/dxbc_fanout.cpp`).
+- **Implication:** Patch `VS 110929` (`o1.xy += -J_N / res`) and `PS 110930` (`v3.xy += -J_N` for visor terms while restoring `+J_N / res` right before `t1` background samples) in `edpe::patchVisorVertexShader` / `edpe::patchVisorPixelShader` (`src/dxbc_fanout.h`), invoked lazily via `tryVisorJitterAlignDraw` in `observedDrawInstanced` (`src/context_census.cpp`) whenever projection jitter is active, failing open on unsupported shaders.
