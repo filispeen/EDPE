@@ -18,7 +18,7 @@ This document synthesizes comprehensive SDK, reverse-engineering, and open-sourc
 | **15** | NVIDIA Streamline / DLSS Frame Generation | [phase-15-nvidia-streamline-dlssg-research.md](phase-15-nvidia-streamline-dlssg-research.md) | `Not started` |
 | **16** | Intel XeSS (Native AA & Super Resolution) | [phase-16-intel-xess-research.md](phase-16-intel-xess-research.md) | `Planned` |
 | **17** | Low-Latency Integration (Reflex & Anti-Lag 2) | [phase-17-low-latency-framework-research.md](phase-17-low-latency-framework-research.md) | `Planned` |
-| **18** | NVIDIA DLSS-NR / Ray Reconstruction | [phase-18-nvidia-dlss-rr-research.md](phase-18-nvidia-dlss-rr-research.md) | `Research` |
+| **18** | NVIDIA DLSS-NR | [phase-18-nvidia-dlss-rr-research.md](phase-18-nvidia-dlss-rr-research.md) | `Research` |
 | **19** | Third-Party Mod Compatibility (ReShade, EDHM, 3Dmigoto, Overlays) | [phase-19-mod-compatibility-research.md](phase-19-mod-compatibility-research.md) | `Planned` |
 
 All technical assertions in these documents follow `PLAN.md` §50 and `AGENTS.md` classification tags:

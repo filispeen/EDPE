@@ -16,7 +16,7 @@ Elite Dangerous (Cobra engine) is a native **Direct3D 11** application (`VERIFIE
 | **Intel XeSS SR / Native AA** (Phase 16) | **Intel Arc only** (`libxess_dx11.dll`, `SDK-DOCUMENTED`) | Cross-vendor DP4a fallback (NVIDIA RTX/GTX, AMD RDNA, Intel Iris Xe) exists **only** in `libxess.dll` via D3D12 (or Vulkan). |
 | **AMD FidelityFX Frame Generation** (Phase 14) | **No** (`SDK-DOCUMENTED`) | `ffx_framegeneration.h` and `ffx_api_framegeneration_dx12.h` require a D3D12 `ID3D12CommandQueue` + D3D12 Flip-model `IDXGISwapChain4` (or Vulkan). |
 | **NVIDIA Streamline DLSS-G** (Phase 15) | **No** (`SDK-DOCUMENTED`) | `sl.dlss_g.dll` supports only D3D12 (or Vulkan) and requires a D3D12 `IDXGISwapChain` + `ID3D12CommandQueue` + HAGS. |
-| **NVIDIA DLSS Ray Reconstruction** (Phase 18) | Yes in NGX (`NVSDK_NGX_D3D11_DLSSD_Eval_Params`), **No** in Streamline (`sl.dlss_d` D3D12/VK preferred) | Needed if integrating via Streamline alongside DLSS-G. |
+| **NVIDIA DLSS-NR** (Phase 18) | Yes in NGX (`NVSDK_NGX_D3D11_DLSSD_Eval_Params`), **No** in Streamline (`sl.dlss_d` D3D12/VK preferred) | Needed if integrating via Streamline alongside DLSS-G. |
 
 ---
 
