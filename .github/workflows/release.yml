@@ -61,6 +61,8 @@ jobs:
             $msg = "EDPE Release $tag"
           }
           if (-not $msg) { $msg = "EDPE Release $tag" }
+          $nexusNotice = "If you'd like to support me, please download the mod from [Nexus Mods](https://www.nexusmods.com/elitedangerous/mods/15?tab=files)."
+          $msg = "$nexusNotice`n`n$msg"
           Set-Content -Path "tag-message.md" -Value $msg -Encoding utf8
           Write-Host "Tag message:"
           Write-Host $msg
