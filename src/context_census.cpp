@@ -1052,6 +1052,23 @@ static bool sameD3D11Device(ID3D11DeviceChild* child, ID3D11Device* expectedDevi
     return dev && dev.Get() == expectedDevice;
 }
 
+bool isLdrSceneColorFormat(DXGI_FORMAT fmt);
+DXGI_FORMAT concreteLdrColorFormat(DXGI_FORMAT fmt);
+static unsigned long long s_visor_diverted_frame = ~0ull;
+static unsigned long long s_visor_ldr_ready_frame = ~0ull;
+static unsigned long long s_visor_use_separate_clean_ldr_frame = ~0ull;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_visor_hdr_srv;
+static bool s_visor_hdr_dirtied_after_draw = false;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_visor_ldr_srv;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_visor_clean_ldr_srv;
+template <typename DrawFn>
+static void renderVisorTonemapVariants(ID3D11DeviceContext* context,
+                                       unsigned long long current_frame,
+                                       int hdrSlot,
+                                       ID3D11Resource* hdrSlotRes,
+                                       ID3D11ShaderResourceView* origHdrSrv,
+                                       const DrawFn& issueDraw);
+
 static bool compositeDivertedHudFallbackToRtv(ID3D11DeviceContext* context,
                                               ID3D11Texture2D* targetTex,
                                               ID3D11RenderTargetView* targetRtv,
@@ -3668,7 +3685,9 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
         return false;
     }
 
-    if (s_hud_draws_replayed_frame == 0) {
+    const bool hasDivertedHud = (s_hud_draws_replayed_frame > 0);
+    const bool hasDivertedVisor = (s_visor_diverted_frame == current_frame && s_visor_hdr_srv != nullptr);
+    if (!hasDivertedHud && !hasDivertedVisor) {
         for (int i = 0; i < 8; ++i) {
             if (psSrvs[i]) psSrvs[i]->Release();
         }
@@ -3688,9 +3707,10 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
 
     // 2. Tonemap Re-issue: save game shader resources, re-issue tonemap with HdrLayer on slot t1
     //    and output to LdrLayer (RGB channels), then transfer alpha from HdrLayer.a to LdrLayer.a.
-    if (s_hud_tonemapped_valid_frame != current_frame) {
+    if (hasDivertedHud && s_hud_tonemapped_valid_frame != current_frame) {
         if (!shadersFetched) {
             getFastBoundShaderHashes(context, vs_hash, ps_hash);
+            shadersFetched = true;
         }
         Microsoft::WRL::ComPtr<ID3D11Buffer> gameExposureCb;
         context->PSGetConstantBuffers(2, 1, gameExposureCb.GetAddressOf());
@@ -3701,6 +3721,15 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             edpe::UiLayer::instance().endTonemapReissue(context);
             s_hud_tonemapped_valid_frame = current_frame;
         }
+    }
+
+    // 3. Visor Tonemap variant: re-issue Pass 52 Tonemap onto s_visor_ldr_rtv using s_visor_hdr_srv
+    //    (exact same LUT t0, Bloom t2, exposure cb2, and viewport as Pass 52) so post-upscale
+    //    delta compositing matches native tonemapping without polluting scene_ldr_source.
+    if (hasDivertedVisor && s_visor_ldr_ready_frame != current_frame &&
+        !isPauseOrModalMenuActive(current_frame)) {
+        renderVisorTonemapVariants(context, current_frame, hdrSlot, hdrSlotRes.Get(), psSrvs[hdrSlot], issueDraw);
+        rearmHudDrawProbe(context);
     }
 
     for (int i = 0; i < 8; ++i) {
@@ -3765,6 +3794,32 @@ Microsoft::WRL::ComPtr<ID3D11PixelShader> s_visor_patched_ps;
 std::array<VisorCheckedPair, 32> s_visor_checked_neg{};
 size_t s_visor_checked_neg_count = 0;
 bool s_visor_align_logged = false;
+bool s_visor_divert_logged = false;
+
+UINT s_visor_hdr_w = 0;
+UINT s_visor_hdr_h = 0;
+DXGI_FORMAT s_visor_hdr_fmt = DXGI_FORMAT_UNKNOWN;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> s_visor_pre_hdr_tex;
+Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_visor_pre_hdr_srv;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> s_visor_hdr_tex;
+Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_visor_hdr_rtv;
+Microsoft::WRL::ComPtr<ID3D11BlendState> s_visor_colorless_blend;
+struct VisorRoDsEntry {
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> orig;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> ro;
+};
+std::array<VisorRoDsEntry, 8> s_visor_ro_ds_cache{};
+
+UINT s_visor_ldr_w = 0;
+UINT s_visor_ldr_h = 0;
+DXGI_FORMAT s_visor_ldr_tex_fmt = DXGI_FORMAT_UNKNOWN;
+DXGI_FORMAT s_visor_ldr_rtv_fmt = DXGI_FORMAT_UNKNOWN;
+DXGI_FORMAT s_visor_ldr_srv_fmt = DXGI_FORMAT_UNKNOWN;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> s_visor_ldr_tex;
+Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_visor_ldr_rtv;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> s_visor_clean_ldr_tex;
+Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_visor_clean_ldr_rtv;
+Microsoft::WRL::ComPtr<ID3D11Resource> s_visor_diverted_hdr_res;
 
 void resetVisorJitterAlign() {
     s_visor_device = nullptr;
@@ -3775,6 +3830,252 @@ void resetVisorJitterAlign() {
     s_visor_patched_ps.Reset();
     s_visor_checked_neg_count = 0;
     s_visor_align_logged = false;
+    s_visor_pre_hdr_tex.Reset();
+    s_visor_pre_hdr_srv.Reset();
+    s_visor_hdr_tex.Reset();
+    s_visor_hdr_rtv.Reset();
+    s_visor_hdr_srv.Reset();
+    s_visor_hdr_w = s_visor_hdr_h = 0;
+    s_visor_hdr_fmt = DXGI_FORMAT_UNKNOWN;
+    s_visor_colorless_blend.Reset();
+    for (auto& e : s_visor_ro_ds_cache) {
+        e.orig.Reset();
+        e.ro.Reset();
+    }
+    s_visor_ldr_tex.Reset();
+    s_visor_ldr_rtv.Reset();
+    s_visor_ldr_srv.Reset();
+    s_visor_clean_ldr_tex.Reset();
+    s_visor_clean_ldr_rtv.Reset();
+    s_visor_clean_ldr_srv.Reset();
+    s_visor_ldr_w = s_visor_ldr_h = 0;
+    s_visor_ldr_tex_fmt = s_visor_ldr_rtv_fmt = s_visor_ldr_srv_fmt = DXGI_FORMAT_UNKNOWN;
+    s_visor_diverted_hdr_res.Reset();
+    s_visor_diverted_frame = ~0ull;
+    s_visor_ldr_ready_frame = ~0ull;
+    s_visor_use_separate_clean_ldr_frame = ~0ull;
+    s_visor_hdr_dirtied_after_draw = false;
+    s_visor_divert_logged = false;
+}
+
+bool ensureVisorScratchHdr(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& srcDesc) {
+    if (!device || srcDesc.Width == 0 || srcDesc.Height == 0) return false;
+    const DXGI_FORMAT viewFmt = concreteLdrColorFormat(srcDesc.Format);
+    if (s_visor_pre_hdr_tex && s_visor_hdr_tex && s_visor_hdr_rtv && s_visor_hdr_srv &&
+        s_visor_hdr_w == srcDesc.Width && s_visor_hdr_h == srcDesc.Height &&
+        s_visor_hdr_fmt == srcDesc.Format && s_visor_colorless_blend) {
+        return true;
+    }
+    s_visor_pre_hdr_tex.Reset();
+    s_visor_pre_hdr_srv.Reset();
+    s_visor_hdr_tex.Reset();
+    s_visor_hdr_rtv.Reset();
+    s_visor_hdr_srv.Reset();
+
+    D3D11_TEXTURE2D_DESC preTd{};
+    preTd.Width = srcDesc.Width;
+    preTd.Height = srcDesc.Height;
+    preTd.MipLevels = preTd.ArraySize = 1;
+    preTd.Format = srcDesc.Format;
+    preTd.SampleDesc.Count = 1;
+    preTd.Usage = D3D11_USAGE_DEFAULT;
+    preTd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_TEXTURE2D_DESC hdrTd = preTd;
+    hdrTd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = viewFmt;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+    rtvDesc.Format = viewFmt;
+    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+
+    if (FAILED(device->CreateTexture2D(&preTd, nullptr, &s_visor_pre_hdr_tex)) ||
+        FAILED(device->CreateShaderResourceView(s_visor_pre_hdr_tex.Get(), &srvDesc, &s_visor_pre_hdr_srv)) ||
+        FAILED(device->CreateTexture2D(&hdrTd, nullptr, &s_visor_hdr_tex)) ||
+        FAILED(device->CreateRenderTargetView(s_visor_hdr_tex.Get(), &rtvDesc, &s_visor_hdr_rtv)) ||
+        FAILED(device->CreateShaderResourceView(s_visor_hdr_tex.Get(), &srvDesc, &s_visor_hdr_srv))) {
+        s_visor_pre_hdr_tex.Reset();
+        s_visor_pre_hdr_srv.Reset();
+        s_visor_hdr_tex.Reset();
+        s_visor_hdr_rtv.Reset();
+        s_visor_hdr_srv.Reset();
+        return false;
+    }
+
+    if (!s_visor_colorless_blend) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = FALSE;
+        bd.RenderTarget[0].RenderTargetWriteMask = 0;
+        if (FAILED(device->CreateBlendState(&bd, &s_visor_colorless_blend))) {
+            s_visor_pre_hdr_tex.Reset();
+            s_visor_pre_hdr_srv.Reset();
+            s_visor_hdr_tex.Reset();
+            s_visor_hdr_rtv.Reset();
+            s_visor_hdr_srv.Reset();
+            return false;
+        }
+    }
+    s_visor_hdr_w = srcDesc.Width;
+    s_visor_hdr_h = srcDesc.Height;
+    s_visor_hdr_fmt = srcDesc.Format;
+    return true;
+}
+
+bool ensureVisorScratchLdr(ID3D11Device* device, UINT width, UINT height,
+                           DXGI_FORMAT texFmt, DXGI_FORMAT rtvFmt, DXGI_FORMAT srvFmt) {
+    if (!device || width == 0 || height == 0) return false;
+    if (s_visor_ldr_tex && s_visor_ldr_rtv && s_visor_ldr_srv &&
+        s_visor_clean_ldr_tex && s_visor_clean_ldr_rtv && s_visor_clean_ldr_srv &&
+        s_visor_ldr_w == width && s_visor_ldr_h == height &&
+        s_visor_ldr_tex_fmt == texFmt && s_visor_ldr_rtv_fmt == rtvFmt &&
+        s_visor_ldr_srv_fmt == srvFmt) {
+        return true;
+    }
+    s_visor_ldr_tex.Reset();
+    s_visor_ldr_rtv.Reset();
+    s_visor_ldr_srv.Reset();
+    s_visor_clean_ldr_tex.Reset();
+    s_visor_clean_ldr_rtv.Reset();
+    s_visor_clean_ldr_srv.Reset();
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = texFmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    rd.Format = rtvFmt;
+    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = srvFmt;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &s_visor_ldr_tex)) ||
+        FAILED(device->CreateRenderTargetView(s_visor_ldr_tex.Get(), &rd, &s_visor_ldr_rtv)) ||
+        FAILED(device->CreateShaderResourceView(s_visor_ldr_tex.Get(), &sd, &s_visor_ldr_srv)) ||
+        FAILED(device->CreateTexture2D(&td, nullptr, &s_visor_clean_ldr_tex)) ||
+        FAILED(device->CreateRenderTargetView(s_visor_clean_ldr_tex.Get(), &rd, &s_visor_clean_ldr_rtv)) ||
+        FAILED(device->CreateShaderResourceView(s_visor_clean_ldr_tex.Get(), &sd, &s_visor_clean_ldr_srv))) {
+        s_visor_ldr_tex.Reset();
+        s_visor_ldr_rtv.Reset();
+        s_visor_ldr_srv.Reset();
+        s_visor_clean_ldr_tex.Reset();
+        s_visor_clean_ldr_rtv.Reset();
+        s_visor_clean_ldr_srv.Reset();
+        return false;
+    }
+    s_visor_ldr_w = width;
+    s_visor_ldr_h = height;
+    s_visor_ldr_tex_fmt = texFmt;
+    s_visor_ldr_rtv_fmt = rtvFmt;
+    s_visor_ldr_srv_fmt = srvFmt;
+    return true;
+}
+
+ID3D11DepthStencilState* getVisorReadOnlyDepthStencilState(ID3D11Device* device,
+                                                           ID3D11DepthStencilState* origDs) {
+    if (!device) return nullptr;
+    for (const auto& entry : s_visor_ro_ds_cache) {
+        if (entry.orig.Get() == origDs && entry.ro) {
+            return entry.ro.Get();
+        }
+    }
+    D3D11_DEPTH_STENCIL_DESC desc{};
+    if (origDs) {
+        origDs->GetDesc(&desc);
+    } else {
+        desc.DepthEnable = FALSE;
+        desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        desc.StencilEnable = FALSE;
+    }
+    if (desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO &&
+        (!desc.StencilEnable || desc.StencilWriteMask == 0)) {
+        return origDs;
+    }
+    desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    desc.StencilWriteMask = 0;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> ro;
+    if (FAILED(device->CreateDepthStencilState(&desc, &ro)) || !ro) {
+        return nullptr;
+    }
+    for (auto& entry : s_visor_ro_ds_cache) {
+        if (!entry.ro) {
+            entry.orig = origDs;
+            entry.ro = ro;
+            return entry.ro.Get();
+        }
+    }
+    s_visor_ro_ds_cache[0].orig = origDs;
+    s_visor_ro_ds_cache[0].ro = ro;
+    return s_visor_ro_ds_cache[0].ro.Get();
+}
+
+template <typename DrawFn>
+static void renderVisorTonemapVariants(ID3D11DeviceContext* context,
+                                       unsigned long long current_frame,
+                                       int hdrSlot,
+                                       ID3D11Resource* hdrSlotRes,
+                                       ID3D11ShaderResourceView* origHdrSrv,
+                                       const DrawFn& issueDraw) {
+    if (!context || hdrSlot < 0 || !s_visor_hdr_srv) return;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> origRtv;
+    context->OMGetRenderTargets(1, origRtv.GetAddressOf(), nullptr);
+    if (!origRtv) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
+    origRtv->GetResource(&rtvRes);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> rtvTex;
+    if (!rtvRes || FAILED(rtvRes.As(&rtvTex)) || !rtvTex) return;
+
+    D3D11_TEXTURE2D_DESC td{};
+    rtvTex->GetDesc(&td);
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    origRtv->GetDesc(&rd);
+
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    context->GetDevice(&dev);
+    if (!dev || !sameD3D11Device(s_visor_hdr_srv.Get(), dev.Get())) return;
+
+    const DXGI_FORMAT rtvFmt = rd.Format;
+    const DXGI_FORMAT srvFmt = concreteLdrColorFormat(td.Format);
+    if (!ensureVisorScratchLdr(dev.Get(), td.Width, td.Height, td.Format, rtvFmt, srvFmt)) {
+        return;
+    }
+
+    ID3D11ShaderResourceView* visorHdrSrv = s_visor_hdr_srv.Get();
+    ID3D11RenderTargetView* visorLdrRtv = s_visor_ldr_rtv.Get();
+    context->OMSetRenderTargets(1, &visorLdrRtv, nullptr);
+    context->PSSetShaderResources(static_cast<UINT>(hdrSlot), 1, &visorHdrSrv);
+    issueDraw();
+
+    const bool needSeparateClean =
+        (hdrSlotRes != s_visor_diverted_hdr_res.Get() || s_visor_hdr_dirtied_after_draw) &&
+        s_visor_pre_hdr_srv != nullptr && s_visor_clean_ldr_rtv != nullptr;
+    if (needSeparateClean) {
+        ID3D11ShaderResourceView* preHdrSrv = s_visor_pre_hdr_srv.Get();
+        ID3D11RenderTargetView* cleanLdrRtv = s_visor_clean_ldr_rtv.Get();
+        context->OMSetRenderTargets(1, &cleanLdrRtv, nullptr);
+        context->PSSetShaderResources(static_cast<UINT>(hdrSlot), 1, &preHdrSrv);
+        issueDraw();
+        s_visor_use_separate_clean_ldr_frame = current_frame;
+    } else {
+        s_visor_use_separate_clean_ldr_frame = ~0ull;
+    }
+
+    ID3D11RenderTargetView* origRtvPtr = origRtv.Get();
+    context->OMSetRenderTargets(1, &origRtvPtr, nullptr);
+    context->PSSetShaderResources(static_cast<UINT>(hdrSlot), 1, &origHdrSrv);
+    s_visor_ldr_ready_frame = current_frame;
 }
 
 void recordVisorNegativePair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
@@ -3786,16 +4087,31 @@ void recordVisorNegativePair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
 bool tryVisorJitterAlignDraw(ID3D11DeviceContext* context, UINT vertex_count, UINT instance_count,
                              UINT start_vertex, UINT start_instance) {
     if (!context || vertex_count != 3 || instance_count != 1 ||
-        !motion_color_source || !motion_color_bound ||
-        !ContextCensusIsJitterActive() ||
-        s_jitter_injected_frame != motion_color_frame) {
+        !motion_color_source || !motion_color_bound) {
         return false;
     }
-    const float jx = s_injected_jitter.pixelX;
-    const float jy = s_injected_jitter.pixelY;
-    if (!std::isfinite(jx) || !std::isfinite(jy) ||
-        (std::fabs(jx) <= 1e-4f && std::fabs(jy) <= 1e-4f)) {
-        return false;
+    const bool reconstructionOrDebug =
+        edpe::UpscalerManager::instance().isReconstructionActive() ||
+        s_jitter_debug_view.load(std::memory_order_relaxed);
+    const bool separateVisor =
+        s_hud_mask_active_pass &&
+        s_preserve_native_ui.load(std::memory_order_relaxed) &&
+        !edpe::Config::instance().hdrInput &&
+        !isPauseOrModalMenuActive(motion_color_frame) &&
+        reconstructionOrDebug;
+
+    float jx = 0.0f;
+    float jy = 0.0f;
+    if (!separateVisor) {
+        if (!ContextCensusIsJitterActive() || s_jitter_injected_frame != motion_color_frame) {
+            return false;
+        }
+        jx = s_injected_jitter.pixelX;
+        jy = s_injected_jitter.pixelY;
+        if (!std::isfinite(jx) || !std::isfinite(jy) ||
+            (std::fabs(jx) <= 1e-4f && std::fabs(jy) <= 1e-4f)) {
+            return false;
+        }
     }
 
     const auto forward = resolveOriginalDrawInstanced(context);
@@ -3812,15 +4128,17 @@ bool tryVisorJitterAlignDraw(ID3D11DeviceContext* context, UINT vertex_count, UI
     }
 
     ID3D11RenderTargetView* boundRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, boundRtvs, nullptr);
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> boundDsv;
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, boundRtvs, boundDsv.GetAddressOf());
     const bool rtv0Matches = boundRtvs[0] && sameRenderTargetResource(boundRtvs[0], motion_color_source.Get());
     bool hasExtraRtv = false;
     for (UINT i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
         hasExtraRtv |= (boundRtvs[i] != nullptr);
         if (boundRtvs[i]) boundRtvs[i]->Release();
     }
-    if (boundRtvs[0]) boundRtvs[0]->Release();
-    if (!rtv0Matches || hasExtraRtv) {
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> origRtv0;
+    origRtv0.Attach(boundRtvs[0]);
+    if (!rtv0Matches || hasExtraRtv || !origRtv0) {
         return false;
     }
 
@@ -3915,6 +4233,75 @@ bool tryVisorJitterAlignDraw(ID3D11DeviceContext* context, UINT vertex_count, UI
         s_visor_patched_ps = std::move(newPs);
         s_visor_cached_vs_hash = vs_hash;
         s_visor_cached_ps_hash = ps_hash;
+    }
+
+    // Separate on-foot helmet visor out of scene HDR target when Preserve Native UI (or Debug View)
+    // is active: draw unjittered visor onto s_visor_hdr_rtv for exact Pass 52 Tonemap delta composition
+    // post-upscale, and replay only stencil updates onto boundDsv so world stays visor-free (zero trails).
+    if (separateVisor) {
+        Microsoft::WRL::ComPtr<ID3D11Resource> rtRes;
+        origRtv0->GetResource(&rtRes);
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> srcTex;
+        if (rtRes && SUCCEEDED(rtRes.As(&srcTex)) && srcTex) {
+            D3D11_TEXTURE2D_DESC srcDesc{};
+            srcTex->GetDesc(&srcDesc);
+            if (ensureVisorScratchHdr(device.Get(), srcDesc)) {
+                Microsoft::WRL::ComPtr<ID3D11BlendState> origBlend;
+                FLOAT origBlendFactor[4]{};
+                UINT origSampleMask = 0xFFFFFFFF;
+                context->OMGetBlendState(origBlend.GetAddressOf(), origBlendFactor, &origSampleMask);
+                Microsoft::WRL::ComPtr<ID3D11DepthStencilState> origDs;
+                UINT origStencilRef = 0;
+                context->OMGetDepthStencilState(origDs.GetAddressOf(), &origStencilRef);
+
+                context->CopyResource(s_visor_pre_hdr_tex.Get(), srcTex.Get());
+                context->CopyResource(s_visor_hdr_tex.Get(), s_visor_pre_hdr_tex.Get());
+
+                ID3D11DepthStencilState* roDs = boundDsv
+                    ? getVisorReadOnlyDepthStencilState(device.Get(), origDs.Get())
+                    : origDs.Get();
+                if (boundDsv && roDs && roDs != origDs.Get()) {
+                    context->OMSetDepthStencilState(roDs, origStencilRef);
+                }
+                ID3D11RenderTargetView* visorRtv = s_visor_hdr_rtv.Get();
+                context->OMSetRenderTargets(1, &visorRtv, boundDsv.Get());
+                forward(context, vertex_count, instance_count, start_vertex, start_instance);
+
+                if (boundDsv && roDs && roDs != origDs.Get()) {
+                    context->OMSetDepthStencilState(origDs.Get(), origStencilRef);
+                }
+                ID3D11RenderTargetView* origRtvPtr = origRtv0.Get();
+                context->OMSetRenderTargets(1, &origRtvPtr, boundDsv.Get());
+                if (boundDsv && s_visor_colorless_blend) {
+                    context->OMSetBlendState(s_visor_colorless_blend.Get(), origBlendFactor, origSampleMask);
+                    forward(context, vertex_count, instance_count, start_vertex, start_instance);
+                    context->OMSetBlendState(origBlend.Get(), origBlendFactor, origSampleMask);
+                }
+
+                s_visor_diverted_frame = motion_color_frame;
+                s_visor_diverted_hdr_res = srcTex.Get();
+                s_visor_hdr_dirtied_after_draw = false;
+                if (!s_visor_divert_logged) {
+                    s_visor_divert_logged = true;
+                    wchar_t message[192];
+                    swprintf_s(message,
+                        L"EDPE: on-foot visor separated to post-upscale delta layer VS=%016llX PS=%016llX (%ux%u)",
+                        vs_hash, ps_hash, srcDesc.Width, srcDesc.Height);
+                    EdpeLog(message);
+                }
+                return true;
+            }
+        }
+        // Fail open to in-scene jitter alignment if scratch creation failed and jitter is active.
+        if (!ContextCensusIsJitterActive() || s_jitter_injected_frame != motion_color_frame) {
+            return false;
+        }
+        jx = s_injected_jitter.pixelX;
+        jy = s_injected_jitter.pixelY;
+        if (!std::isfinite(jx) || !std::isfinite(jy) ||
+            (std::fabs(jx) <= 1e-4f && std::fabs(jy) <= 1e-4f)) {
+            return false;
+        }
     }
 
     if (!s_visor_jitter_cb) {
@@ -4181,6 +4568,7 @@ static inline bool isHudDrawInterceptWindowActive() {
 static inline bool shouldInspectHudOrTonemapDraw(UINT count, UINT instances) {
     const auto cur = last_present_frame.load(std::memory_order_relaxed);
     if ((s_hud_mask_active_pass && motion_color_bound) ||
+        (s_visor_diverted_frame == cur && motion_color_bound) ||
         (motion_color_bound && count == 3 && instances == 1 &&
          s_jitter_injected_frame == motion_color_frame && ContextCensusIsJitterActive()) ||
         motion_pair_active ||
@@ -4238,6 +4626,9 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
         redirected = observePostHudDrawAndTonemap(context, 'I', count, 1, start, base, 0);
     }
     if (!redirected) {
+        if (motion_color_bound && s_visor_diverted_frame == motion_color_frame) {
+            s_visor_hdr_dirtied_after_draw = true;
+        }
         if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         abandonAmortizedAndRearmHudProbe(context);
     }
@@ -4274,6 +4665,9 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
         redirected = observePostHudDrawAndTonemap(context, 'D', count, 1, start, 0, 0);
     }
     if (!redirected) {
+        if (motion_color_bound && s_visor_diverted_frame == motion_color_frame) {
+            s_visor_hdr_dirtied_after_draw = true;
+        }
         if (const auto forward = resolveOriginalDraw(context)) forward(context, count, start);
         abandonAmortizedAndRearmHudProbe(context);
     }
@@ -4318,6 +4712,9 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
             start_index, base_vertex, start_instance);
     }
     if (!redirected) {
+        if (motion_color_bound && s_visor_diverted_frame == motion_color_frame) {
+            s_visor_hdr_dirtied_after_draw = true;
+        }
         if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
             forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
         }
@@ -4370,6 +4767,9 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         if (tryVisorJitterAlignDraw(context, vertex_count, instance_count, start_vertex, start_instance)) {
             abandonAmortizedAndRearmHudProbe(context);
             return;
+        }
+        if (motion_color_bound && s_visor_diverted_frame == motion_color_frame) {
+            s_visor_hdr_dirtied_after_draw = true;
         }
         if (const auto forward = resolveOriginalDrawInstanced(context)) {
             forward(context, vertex_count, instance_count, start_vertex, start_instance);
@@ -8513,8 +8913,16 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             }
             const bool allowBackbufferWrite = evaluatedAtPass53 || (s_pause_menu_seen_frame != rendered);
             const bool hudWasDiverted = (s_hud_draws_replayed_frame > 0 && !isPauseOrModalMenuActive(rendered));
+            const bool visorWasDiverted =
+                (s_visor_diverted_frame == rendered &&
+                 s_visor_ldr_ready_frame == rendered &&
+                 s_visor_ldr_srv != nullptr &&
+                 !isHdrColor &&
+                 colorSource != backbuffer &&
+                 !isPauseOrModalMenuActive(rendered));
             const bool hasHudThisFrame =
                 hudWasDiverted ||
+                visorWasDiverted ||
                 s_hud_debug_view.load(std::memory_order_relaxed);
 
             const bool canCompositeUi = (s_preserve_native_ui.load(std::memory_order_relaxed) &&
@@ -8522,7 +8930,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                                          evalDestination == s_dlss_output_texture.Get() &&
                                          s_dlss_output_srv &&
                                          ((allowBackbufferWrite && s_backbuffer_rtv) || s_backbuffer_uav || s_comp_final_uav) &&
-                                         (hudWasDiverted || colorSource != backbuffer));
+                                         (hudWasDiverted || visorWasDiverted || colorSource != backbuffer));
             s_diag_composite_path = canCompositeUi ? 1 : 2;
             s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UiComposite);
             if (canCompositeUi) {
@@ -8530,6 +8938,18 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     edpe::UiLayer::instance().width() != backbufferDesc.Width ||
                     edpe::UiLayer::instance().height() != backbufferDesc.Height) {
                     edpe::UiLayer::instance().resize(device.Get(), backbufferDesc.Width, backbufferDesc.Height);
+                }
+                if (!hudWasDiverted && !s_hud_debug_view.load(std::memory_order_relaxed)) {
+                    edpe::UiLayer::instance().beginFrame(context);
+                }
+                if (visorWasDiverted) {
+                    ID3D11ShaderResourceView* cleanSrv =
+                        (s_visor_use_separate_clean_ldr_frame == rendered && s_visor_clean_ldr_srv)
+                            ? s_visor_clean_ldr_srv.Get()
+                            : activeColorInputSrv;
+                    edpe::UiLayer::instance().setVisorDeltaSrvs(s_visor_ldr_srv.Get(), cleanSrv);
+                } else {
+                    edpe::UiLayer::instance().resetVisorDelta();
                 }
                 if (allowBackbufferWrite && s_backbuffer_rtv) {
                     compOk = edpe::UiLayer::instance().compositeToRtv(
@@ -8623,8 +9043,22 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
             // Avoid copying presentBackbuffer (29.5 MB at 1440p) on every frame; s_dlss_output_texture
             // already retains the latest reconstructed scene on the render device.
-        } else if (s_diag_eval_stage != 1 && s_hud_draws_replayed_frame > 0 &&
+        } else if (s_diag_eval_stage != 1 &&
+                   (s_hud_draws_replayed_frame > 0 ||
+                    (s_visor_diverted_frame == rendered && s_visor_ldr_ready_frame == rendered && s_visor_ldr_srv)) &&
                    !isPauseOrModalMenuActive(rendered) && s_backbuffer_rtv) {
+            if (s_hud_draws_replayed_frame == 0) {
+                edpe::UiLayer::instance().beginFrame(context);
+            }
+            if (s_visor_diverted_frame == rendered && s_visor_ldr_ready_frame == rendered && s_visor_ldr_srv && !isHdrColor) {
+                ID3D11ShaderResourceView* cleanSrv =
+                    (s_visor_use_separate_clean_ldr_frame == rendered && s_visor_clean_ldr_srv)
+                        ? s_visor_clean_ldr_srv.Get()
+                        : activeColorInputSrv;
+                edpe::UiLayer::instance().setVisorDeltaSrvs(s_visor_ldr_srv.Get(), cleanSrv);
+            } else {
+                edpe::UiLayer::instance().resetVisorDelta();
+            }
             compOk = compositeDivertedHudFallbackToRtv(
                 context, backbuffer, s_backbuffer_rtv.Get(),
                 backbufferDesc.Width, backbufferDesc.Height, /*callerRestoresState=*/true);
@@ -10786,6 +11220,11 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_hud_mask_active_pass = false;
         hud_first_match_seen = false;
         s_hud_draws_replayed_frame = 0;
+        s_visor_diverted_frame = ~0ull;
+        s_visor_ldr_ready_frame = ~0ull;
+        s_visor_use_separate_clean_ldr_frame = ~0ull;
+        s_visor_diverted_hdr_res.Reset();
+        s_visor_hdr_dirtied_after_draw = false;
     s_clean_camera_substitutions.store(0, std::memory_order_relaxed);
     s_jittered_cb1_buffer.store(nullptr, std::memory_order_relaxed);
         clearTrackedMappedBuffers();
