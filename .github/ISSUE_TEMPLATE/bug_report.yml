@@ -39,8 +39,8 @@ body:
   - type: input
     id: quality
     attributes:
-      label: Quality mode and render scale
-      placeholder: DLSS Quality, 67%
+      label: render scale
+      placeholder: 65% 0.65
     validations:
       required: false
 
