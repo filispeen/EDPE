@@ -311,4 +311,99 @@ private:
     bool lost_ = false;
 };
 
+// Tracks per-frame jitter decisions for same-pose scene sub-passes (e.g. viewmodel/near-plane
+// passes whose near plane/FOV differ from the main world camera) so Z-prepass, G-buffer, and
+// post-deferred passes sharing that projection always receive identical jitter decisions.
+struct SceneSubpassEntry {
+    float scaleX = 0.0f;
+    float scaleY = 0.0f;
+    float depthB = 0.0f;
+    bool jittered = false;
+};
+
+class SceneSubpassTracker {
+public:
+    static constexpr size_t kMaxSubpasses = 4;
+
+    void reset() {
+        frame_ = ~0ull;
+        count_ = 0;
+    }
+
+    void beginFrame(unsigned long long frame) {
+        if (frame_ != frame) {
+            frame_ = frame;
+            count_ = 0;
+        }
+    }
+
+    const SceneSubpassEntry* find(unsigned long long frame, float scaleX, float scaleY, float depthB) const {
+        if (frame_ != frame) return nullptr;
+        for (size_t i = 0; i < count_; ++i) {
+            const auto& e = entries_[i];
+            if (std::fabs(e.depthB - depthB) <= 1e-3f &&
+                std::fabs(e.scaleX - scaleX) <= 0.01f * e.scaleX &&
+                std::fabs(e.scaleY - scaleY) <= 0.01f * e.scaleY) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    const SceneSubpassEntry* findJittered(unsigned long long frame, float scaleX, float scaleY, float depthB) const {
+        const auto* e = find(frame, scaleX, scaleY, depthB);
+        return (e && e->jittered) ? e : nullptr;
+    }
+
+    const SceneSubpassEntry* findJitteredByDepthB(unsigned long long frame, float depthB) const {
+        if (frame_ != frame) return nullptr;
+        for (size_t i = 0; i < count_; ++i) {
+            const auto& e = entries_[i];
+            if (e.jittered && std::fabs(e.depthB - depthB) <= 1e-3f) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    bool recordOrGet(unsigned long long frame, float scaleX, float scaleY, float depthB, bool proposedJitter) {
+        beginFrame(frame);
+        if (const auto* existing = find(frame, scaleX, scaleY, depthB)) {
+            return existing->jittered;
+        }
+        if (count_ < kMaxSubpasses) {
+            entries_[count_++] = {scaleX, scaleY, depthB, proposedJitter};
+        }
+        return proposedJitter;
+    }
+
+    size_t count() const { return count_; }
+    size_t countForFrame(unsigned long long frame) const { return (frame_ == frame) ? count_ : 0; }
+    const SceneSubpassEntry& entry(size_t i) const { return entries_[i]; }
+
+private:
+    unsigned long long frame_ = ~0ull;
+    SceneSubpassEntry entries_[kMaxSubpasses]{};
+    size_t count_ = 0;
+};
+
+// Returns true when `candidate` shares the same camera pose/chirality as `ref`
+// within a scene-internal sub-pass perspective range (different FOV / near plane
+// such as the on-foot viewmodel Z-prepass / G-buffer), so it is never mistaken
+// for a camera cut or auxiliary probe.
+inline bool isSamePoseSceneSubpass(const CameraProjection& candidate,
+                                   const CameraProjection& ref,
+                                   float maxIntraDist,
+                                   float dtRatio = 1.0f) {
+    if (ref.scaleX <= 0.0f) return false;
+    const float det = cameraRotationDeterminant(candidate);
+    if (det < 0.85f || det > 1.15f) return false;
+    if (candidate.depthB < 0.01f || candidate.depthB > 0.25f) return false;
+    const float dist = length(cameraPosition(candidate) - cameraPosition(ref));
+    if (dist > maxIntraDist) return false;
+    const float trace = cameraRotationTrace(candidate, ref);
+    if (trace <= 2.95f) return false;
+    return !isRearOrAuxiliaryProbe(candidate, ref, {0.0f, 0.0f, 0.0f}, dtRatio);
+}
+
 } // namespace edpe

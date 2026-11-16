@@ -232,5 +232,42 @@ int main() {
     if (edpe::isStereoEyeOrIpdProbe(strafeReverse, identity(), prevStrafeRight)) return 54;
     if (edpe::isReflectionOrAuxiliaryCamera(strafeReverse, identity(), prevStrafeRight)) return 55;
 
+    // 23. SceneSubpassTracker keeps Z-prepass, G-buffer, and post-deferred sub-pass jitter
+    // decisions consistent per frame even when Z-prepass runs before the main world camera.
+    edpe::SceneSubpassTracker tracker23;
+    if (!tracker23.recordOrGet(10, 1.2935f, 2.300f, 0.0675f, true)) return 56;
+    if (!tracker23.findJittered(10, 1.2935f, 2.300f, 0.0675f)) return 57;
+    if (!tracker23.findJitteredByDepthB(10, 0.0675f)) return 58;
+    // Different frame or wrong near plane must not match.
+    if (tracker23.findJittered(10, 1.2935f, 2.300f, 0.025f)) return 59;
+    // If Z-prepass locked false (e.g. fast flick/cut), G-buffer must also stay false on that frame.
+    if (tracker23.recordOrGet(11, 1.2935f, 2.300f, 0.0675f, false)) return 60;
+    if (tracker23.recordOrGet(11, 1.2935f, 2.300f, 0.0675f, true)) return 61;
+    if (tracker23.findJittered(11, 1.2935f, 2.300f, 0.0675f)) return 62;
+    // Next frame starts fresh and can accept again.
+    if (!tracker23.recordOrGet(12, 1.2935f, 2.300f, 0.0675f, true)) return 63;
+
+    // 24. isSamePoseSceneSubpass identifies a same-pose viewmodel sub-pass before world staging
+    // so it is not misclassified as a camera cut, while still rejecting true cuts or mirrors.
+    edpe::CameraProjection worldBase = identity();
+    worldBase.scaleX = 1.0525f;
+    worldBase.scaleY = 1.871f;
+    worldBase.depthB = 0.025f;
+    edpe::CameraProjection viewmodelSubpass = worldBase;
+    viewmodelSubpass.scaleX = 1.2935f;
+    viewmodelSubpass.scaleY = 2.300f;
+    viewmodelSubpass.depthB = 0.0675f;
+    if (!edpe::isSamePoseSceneSubpass(viewmodelSubpass, worldBase, 0.05f)) return 64;
+    // Camera cut (large jump) must NOT be accepted as a same-pose sub-pass.
+    edpe::CameraProjection farSubpass = viewmodelSubpass;
+    farSubpass.worldFromView[3] = 50.0f;
+    if (edpe::isSamePoseSceneSubpass(farSubpass, worldBase, 0.05f)) return 65;
+    // Mirrored reflection (negative determinant) must be rejected.
+    edpe::CameraProjection mirroredSubpass = viewmodelSubpass;
+    mirroredSubpass.worldFromView[0] = -mirroredSubpass.worldFromView[0];
+    mirroredSubpass.worldFromView[4] = -mirroredSubpass.worldFromView[4];
+    mirroredSubpass.worldFromView[8] = -mirroredSubpass.worldFromView[8];
+    if (edpe::isSamePoseSceneSubpass(mirroredSubpass, worldBase, 0.05f)) return 66;
+
     return 0;
 }
