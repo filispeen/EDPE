@@ -321,7 +321,7 @@ static std::vector<UINT> patchVisorVertexTokens(const std::vector<UINT>& t) {
     for (size_t a = 2; a < t.size();) {
         const UINT n = instructionLength(t, a);
         const UINT op = t[a] & 2047u;
-        if (op == 89u && n == 4u && t[a + 1] == 0x00208e46u) {
+        if (op == 89u && n == 4u && ((t[a + 1] & 0x003FF000u) == 0x00208000u)) {
             if (t[a + 2] == 13u) throw std::runtime_error("b13 occupied");
             if (t[a + 2] == 1u && t[a + 3] >= 91u) hasCb1 = true;
             if (t[a + 2] == 2u && t[a + 3] >= 2u) hasCb2 = true;
@@ -416,7 +416,7 @@ static std::vector<UINT> patchVisorPixelTokens(const std::vector<UINT>& t) {
     for (size_t a = 2; a < t.size();) {
         const UINT n = instructionLength(t, a);
         const UINT op = t[a] & 2047u;
-        if (op == 89u && n == 4u && t[a + 1] == 0x00208e46u) {
+        if (op == 89u && n == 4u && ((t[a + 1] & 0x003FF000u) == 0x00208000u)) {
             if (t[a + 2] == 13u) throw std::runtime_error("b13 occupied");
             if (t[a + 2] == 1u && t[a + 3] >= 333u) hasCb1 = true;
             if (t[a + 2] == 2u && t[a + 3] >= 9u) hasCb2 = true;
@@ -443,7 +443,7 @@ static std::vector<UINT> patchVisorPixelTokens(const std::vector<UINT>& t) {
                     ++v3Reads;
                     if (op == 56u) { // mul ..., v3..., cb1[332]...
                         for (size_t k = a + 1; k + 2 < a + n; ++k) {
-                            if (((t[k] >> 12) & 255u) == 8u && t[k + 1] == 1u && t[k + 2] == 332u) {
+                            if ((t[k] & 0x003FF000u) == 0x00208000u && t[k + 1] == 1u && t[k + 2] == 332u) {
                                 hasCb332Mul = true;
                             }
                         }
@@ -467,7 +467,7 @@ static std::vector<UINT> patchVisorPixelTokens(const std::vector<UINT>& t) {
         a += n;
     }
 
-    if (!hasCb1 || !hasCb2 || !hasSvPosV3 || !hasCb332Mul || outCount != 2u || texCount != 5u ||
+    if (!hasCb1 || !hasCb2 || !hasSvPosV3 || !hasCb332Mul || outCount != 2u || texCount < 4u ||
         !tempAt || temp == 0 || temp + 2u >= 4096u || v3Reads == 0 || t1Samples == 0) {
         throw std::runtime_error("not helmet visor PS");
     }

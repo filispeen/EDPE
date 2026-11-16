@@ -3855,9 +3855,20 @@ bool tryVisorJitterAlignDraw(ID3D11DeviceContext* context, UINT vertex_count, UI
             return false;
         }
         std::vector<BYTE> vsPatchedBytes, psPatchedBytes;
-        std::string reason;
-        if (!edpe::patchVisorVertexShader(vsRaw.data(), vsRaw.size(), vsPatchedBytes, reason) ||
-            !edpe::patchVisorPixelShader(psRaw.data(), psRaw.size(), psPatchedBytes, reason)) {
+        std::string vsReason, psReason;
+        const bool vsOk = edpe::patchVisorVertexShader(vsRaw.data(), vsRaw.size(), vsPatchedBytes, vsReason);
+        const bool psOk = edpe::patchVisorPixelShader(psRaw.data(), psRaw.size(), psPatchedBytes, psReason);
+        if (!vsOk || !psOk) {
+            static unsigned s_visor_reject_logs = 0;
+            if (s_visor_reject_logs < 12) {
+                ++s_visor_reject_logs;
+                wchar_t rmsg[256];
+                swprintf_s(rmsg,
+                    L"EDPE: visor align skipped DrawInstanced(3,1) VS=%016llX (%u B: %hs) PS=%016llX (%u B: %hs)",
+                    vs_hash, vsBytes, vsOk ? "ok" : vsReason.c_str(),
+                    ps_hash, psBytes, psOk ? "ok" : psReason.c_str());
+                EdpeLog(rmsg);
+            }
             recordVisorNegativePair(vs_hash, ps_hash);
             return false;
         }
@@ -9274,7 +9285,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
                 s_hud_debug_view.load(std::memory_order_relaxed) ||
                 s_jitter_debug_view.load(std::memory_order_relaxed);
 
-            if (reconstruction_active) {
+            if (reconstruction_active || s_jitter_debug_view.load(std::memory_order_relaxed)) {
                 if (!hud_draw_hook_mask) {
                     beginHudDrawProbe();
                 } else {
