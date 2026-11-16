@@ -41,7 +41,7 @@ As of November 2026 (`v0.7.1`), the working pipeline covers:
 | 13-15 | D3D11/D3D12 interop and Frame Generation | Not started | Planned D3D11/D3D12 bridge for NVIDIA DLSS Frame Generation (Streamline) and AMD FSR Frame Generation. |
 | 16 | Intel XeSS | Planned | Planned Intel XeSS Native AA and Super Resolution (XMX on Arc, DP4a fallback) via D3D11/D3D12 interop. |
 | 17 | Low-latency integration | Planned | Planned standalone and FG-coupled latency pacing via NVIDIA Reflex and AMD Anti-Lag / Anti-Lag 2. |
-| 18 | NVIDIA DLSS-NR | Research | Investigating NGX Neural Denoising for reflections and lighting. |
+| 18 | NVIDIA DLSS-NR | Research | Investigating NGX Neural Rendering for reflections and lighting. |
 | 19 | Third-party mod compatibility | Planned | Planned proxy DLL chaining and compatibility with ReShade, EDHM, and 3Dmigoto. |
 
 See [STATUS.md](STATUS.md) for verified test and capture logs, and [PLAN.md](PLAN.md) for the full technical roadmap.

@@ -13,7 +13,7 @@ Primary planned technologies:
 ```text
 NVIDIA DLAA
 NVIDIA DLSS Super Resolution
-NVIDIA DLSS-NR (Neural Denoising)
+NVIDIA DLSS-NR (Neural Rendering)
 
 AMD FSR Native AA
 AMD FSR Super Resolution

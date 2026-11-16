@@ -8,7 +8,7 @@ The initial focus is temporal upscaling and anti-aliasing:
 
 * NVIDIA DLSS Super Resolution;
 * NVIDIA DLAA;
-* NVIDIA DLSS-NR (Neural Denoising);
+* NVIDIA DLSS-NR (Neural Rendering);
 * AMD FSR temporal upscaling / Native AA;
 * Intel XeSS Super Resolution / Native AA;
 * native D3D11 TAA;
@@ -1869,7 +1869,7 @@ public:
 
 ---
 
-# 41. Phase 18 — NVIDIA DLSS-NR (Neural Denoising)
+# 41. Phase 18 — NVIDIA DLSS-NR (Neural Rendering)
 
 Investigate and prototype NVIDIA DLSS Neural Radiance Denoiser (DLSS-NR) support via NVIDIA NGX (`NVSDK_NGX_Feature_RayReconstruction`) or Streamline.
 
