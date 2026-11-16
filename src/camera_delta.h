@@ -387,4 +387,23 @@ private:
     size_t count_ = 0;
 };
 
+// Returns true when `candidate` shares the same camera pose/chirality as `ref`
+// within a scene-internal sub-pass perspective range (different FOV / near plane
+// such as the on-foot viewmodel Z-prepass / G-buffer), so it is never mistaken
+// for a camera cut or auxiliary probe.
+inline bool isSamePoseSceneSubpass(const CameraProjection& candidate,
+                                   const CameraProjection& ref,
+                                   float maxIntraDist,
+                                   float dtRatio = 1.0f) {
+    if (ref.scaleX <= 0.0f) return false;
+    const float det = cameraRotationDeterminant(candidate);
+    if (det < 0.85f || det > 1.15f) return false;
+    if (candidate.depthB < 0.01f || candidate.depthB > 0.25f) return false;
+    const float dist = length(cameraPosition(candidate) - cameraPosition(ref));
+    if (dist > maxIntraDist) return false;
+    const float trace = cameraRotationTrace(candidate, ref);
+    if (trace <= 2.95f) return false;
+    return !isRearOrAuxiliaryProbe(candidate, ref, {0.0f, 0.0f, 0.0f}, dtRatio);
+}
+
 } // namespace edpe

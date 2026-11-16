@@ -745,6 +745,7 @@ static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_clean_hdr_scene_rtv;
 static UINT s_clean_hdr_scene_width = 0;
 static UINT s_clean_hdr_scene_height = 0;
 static unsigned long long s_clean_hdr_scene_frame = ~0ull;
+static unsigned long long s_clean_hdr_scene_from_hud_frame = ~0ull;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_hud_merged_hdr_texture;
 static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_hud_merged_hdr_srv;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_hud_merged_hdr_rtv;
@@ -1659,14 +1660,12 @@ enum class HudDrawResult {
     HudReplay
 };
 
-bool isPrimaryCockpitHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
-    // Primary cockpit / HUD / HDR UI shader families whose execution confirms an
-    // active cockpit or UI overlay rather than bare on-foot 3D hangar/world draws.
+bool isConfirmedShipCockpitHudPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
+    // Ship-cockpit holographic instrumentation whose presence proves an active ship
+    // cockpit (as opposed to on-foot suit HUD / menus using kGuiText/kUiWidget).
     if (vs_hash == 0x81216C77F90DEDD6ull || // Cockpit holo panels (stock lit A2965EC2, EDHM 16F88966, unlit B4786E0A, text 41B9D7B2, icons B357E4E5, radar sweep C610FB6F, AB82734F)
         vs_hash == 0x1989E6D3B405FDE0ull || // Cockpit holo panels (DisableGuiEffects variant PS EAB8A1C95A13FFBE)
         vs_hash == 0x925ACEDA0153AA5Bull || // Planetary / Orbital Cruise shadowless holo panels (kUiVsHoloNoShadow)
-        vs_hash == 0xE508648660A352B2ull || // HUD sprite & target/distance/planetary label composite (kHudSprite, PS 499044B497EE6B2C / 63ABD86359B57D01)
-        vs_hash == 0x5DA53D8B0133341Eull || // Target direction indicator quad (kTargetIndicator)
         vs_hash == 0xDF3503CD07F9B10Cull || // Radar disc & stalks hologram family (kHoloFamiliesTake)
         vs_hash == 0x5453D19B6D362364ull || // Radar stalks hologram family (kHoloFamiliesTake)
         vs_hash == 0x44DDCDEBAEA137D8ull || // Radar hologram family
@@ -1677,15 +1676,23 @@ bool isPrimaryCockpitHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash)
         return true;
     }
     return (vs_hash == 0x2CECEC3065EF0D4Aull && ps_hash == 0xA4D03619D631B186ull) || // Cockpit HUD stencil setup (A4D03619, 0x04)
-           (vs_hash == 0x5559BD94B6852E83ull &&                                      // Target & Own-Ship 3D schematic hologram billboards (kHoloTargetSphere)
-            (ps_hash == 0xEA02FAC2BD6C643Cull || ps_hash == 0xE95634B0F61D218Full)) ||
-           (vs_hash == 0xB12F7A618E1BDE98ull &&                                      // Ship/target hologram shells
-            (ps_hash == 0x203DF51758AADC4Dull || ps_hash == 0x42AC0CACC9CDF72Bull)) ||
            (vs_hash == 0xF8D8A92E96419901ull && ps_hash == 0x16196F69ADE35E77ull) || // Hologram icon core (kHoloFamiliesTake)
            (vs_hash == 0x1989B75BF034ECC3ull && ps_hash == 0xDB79AE788E049DFDull) || // Radar contact triangles & elevation stalks
            (vs_hash == 0xC7FA0C0F5DD49180ull && ps_hash == 0x6EEF165A350DA30Full) || // Orbit / exclusion lines (kOrbitLines)
-           (vs_hash == 0xA47A3315FFF5E2E4ull && ps_hash == 0x869FFF43E875906Eull) || // Supercruise speed/distance bars (kSupercruiseBars)
-           (vs_hash == 0x1012E00B3CB44469ull && ps_hash == 0x666EF0C4C616F67Eull) || // HDR UI glyph atlas text / SRV turret HUD (kGuiText)
+           (vs_hash == 0xA47A3315FFF5E2E4ull && ps_hash == 0x869FFF43E875906Eull);   // Supercruise speed/distance bars (kSupercruiseBars)
+}
+
+bool isPrimaryCockpitHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
+    // Primary cockpit / HUD / HDR UI shader families whose execution confirms an
+    // active cockpit or UI overlay rather than bare on-foot 3D hangar/world draws.
+    if (isConfirmedShipCockpitHudPair(vs_hash, ps_hash)) {
+        return true;
+    }
+    if (vs_hash == 0xE508648660A352B2ull || // HUD sprite & target/distance/planetary label composite (kHudSprite, PS 499044B497EE6B2C / 63ABD86359B57D01)
+        vs_hash == 0x5DA53D8B0133341Eull) { // Target direction indicator quad (kTargetIndicator)
+        return true;
+    }
+    return (vs_hash == 0x1012E00B3CB44469ull && ps_hash == 0x666EF0C4C616F67Eull) || // HDR UI glyph atlas text / SRV turret HUD (kGuiText)
            (vs_hash == 0xA3E5D3FCBC1165F8ull && ps_hash == 0x019E81F4EECFB371ull) || // HDR UI BC7 icon pages / SRV turret HUD (kGuiIcons)
            (vs_hash == 0x1E8D013722FE71B8ull && ps_hash == 0x3D62E1CE0B0ECDF6ull) || // HDR UI solid/gradient widget primitives (kUiWidget)
            (vs_hash == 0x12382D2EA45E9632ull && ps_hash == 0x855C469156AB997Full) || // Galaxy/System Map & Orrery canvas (kMapCanvas)
@@ -1695,9 +1702,9 @@ bool isPrimaryCockpitHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash)
 
 bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
     // Verified Cockpit HUD & HDR UI shader families.
-    // Explicitly excludes non-HUD Pass 35 world shaders:
+    // Explicitly excludes non-HUD Pass 35 & pre-atmosphere world shaders:
     // - 0xD1281DF454A153AD / 0x97DBC87FCAA429C4 (sun corona & radar glow; taking it pulls the real sun over the cockpit)
-    // - 0x5559BD94B6852E83 / 0xB12F7A618E1BDE98 (3D depth-sampling target & ship holograms)
+    // - 0x5559BD94B6852E83 / 0xB12F7A618E1BDE98 (3D depth-sampling target, ship holograms, & on-foot 3D world shaders)
     // - 0x71DD8B8B09060A81 / 0x2D037A047171BF3B (world-space brackets)
     // - 0xB018D143700AB803 / 0x258B95AC99520C1F (null-output depth/stencil quad)
     // - 0x4EF6DDB075A927FA (main menu hangar / loading screen quad)
@@ -1731,8 +1738,6 @@ static inline bool isCandidateHudGlassOrStencilVs(std::uint64_t vs_hash) {
     case 0x9611A454527F7FEBull:
     case 0xB932058F26B76691ull:
     case 0x2CECEC3065EF0D4Aull:
-    case 0x5559BD94B6852E83ull:
-    case 0xB12F7A618E1BDE98ull:
     case 0xF8D8A92E96419901ull:
     case 0x1989B75BF034ECC3ull:
     case 0xC7FA0C0F5DD49180ull:
@@ -1849,6 +1854,7 @@ static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
     s_clean_camera_cb_dirty = false;
     s_clean_camera_frame = ~0ull;
     s_clean_camera_in_scene_frame = ~0ull;
+    s_clean_hdr_scene_from_hud_frame = ~0ull;
     s_reference_cb0_blocks_frame = ~0ull;
     s_hud_mask_finalized_frame = ~0ull;
     s_last_primary_cockpit_hud_frame = ~0ull;
@@ -3053,9 +3059,9 @@ HudDrawResult observeHudDrawImpl(ID3D11DeviceContext* context, char kind, UINT i
     }
 
     if (isHudShaderPair(vs_hash, ps_hash)) {
-        if (isPrimaryCockpitHudShaderPair(vs_hash, ps_hash)) {
+        if (isConfirmedShipCockpitHudPair(vs_hash, ps_hash)) {
             s_last_primary_cockpit_hud_frame = motion_color_frame;
-        } else {
+        } else if (!isPrimaryCockpitHudShaderPair(vs_hash, ps_hash)) {
             const bool cockpit_hud_active =
                 (s_last_primary_cockpit_hud_frame != ~0ull &&
                  motion_color_frame <= s_last_primary_cockpit_hud_frame + 2) ||
@@ -5314,12 +5320,14 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     static bool s_cb1_flt_staged_in_scene = false;
                     static UINT s_cb1_flt_outW = 0, s_cb1_flt_outH = 0;
                     static float s_cb1_flt_vpW = 0.0f, s_cb1_flt_vpH = 0.0f;
+                    static size_t s_cb1_flt_subpass_cnt = 0;
                     static bool s_cb1_flt_is_probe = false;
                     static bool s_cb1_flt_passes = false;
                     static bool s_cb1_flt_allow_stage = false;
                     static bool s_cb1_flt_is_main = false;
                     static bool s_cb1_flt_is_subpass = false;
                     const bool hasStagedNow = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
+                    const size_t curSubpassCnt = s_scene_subpasses.countForFrame(cur_frame);
                     const float curVpW = words[1328];
                     const float curVpH = words[1329];
                     const bool fltHit =
@@ -5330,7 +5338,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                          s_cb1_flt_had_staged == hasStagedNow &&
                          s_cb1_flt_staged_in_scene == s_staged_from_in_scene &&
                          s_cb1_flt_outW == outW && s_cb1_flt_outH == outH &&
-                         s_cb1_flt_vpW == curVpW && s_cb1_flt_vpH == curVpH);
+                         s_cb1_flt_vpW == curVpW && s_cb1_flt_vpH == curVpH &&
+                         s_cb1_flt_subpass_cnt == curSubpassCnt);
                     if (fltHit) {
                         if (s_cb1_flt_is_probe) {
                             s_probe_seen_this_frame = true;
@@ -5375,13 +5384,24 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             words, 5376 / sizeof(float), parsed_camera,
                             outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080);
 
+                    float spCheckDist = 0.0f;
+                    float spCheckTrace = 0.0f;
+                    const edpe::CameraProjection* spCheckRef =
+                        pickNearestPoseRef(spCheckDist, spCheckTrace);
+                    const bool is_same_pose_subpass_cand =
+                        !passes_filter && !is_probe && spCheckRef != nullptr &&
+                        isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH) &&
+                        edpe::isSamePoseSceneSubpass(parsed_camera, *spCheckRef, maxIntraDist, dtRatio);
+
                     // Real camera rotation or FOV change:
                     // 1) Pure in-place pilot head/ship rotation (rawDist < 0.05m) with valid FOV and chirality
                     //    is accepted immediately so fast head-look/mouse-look turns never drop camera updates.
                     // 2) Any camera/FOV change persisting >= 2 frames is accepted as a new baseline even if
                     //    Cobra unmaps VS cb1 before binding the 4-MRT G-buffer.
+                    // 3) Same-pose scene sub-passes (e.g. viewmodel Z-prepass before main world G-buffer)
+                    //    must never increment s_cut_rejection_streak or pose-check as cuts.
                     bool cut_streak_satisfied = false;
-                    if (!passes_filter && !is_probe &&
+                    if (!passes_filter && !is_probe && !is_same_pose_subpass_cand &&
                         cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                         cameraRotationDeterminant(parsed_camera) <= 1.15f &&
                         parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
@@ -5495,28 +5515,27 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         // always make the exact same jitter decision even before world camera staging.
                         const auto* existingSubpass = s_scene_subpasses.find(
                             cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB);
-                        float intraDist = 0.0f;
-                        float intraTrace = 0.0f;
-                        const bool canCheckRef =
-                            (s_has_staged_camera && s_staged_camera_frame == cur_frame) ||
-                            (s_camera_now.scaleX > 0.0f &&
-                             s_verified_ldr_tonemap_frame != cur_frame &&
-                             s_cut_rejection_streak == 0 &&
-                             s_teleport_rejection_streak == 0);
-                        const edpe::CameraProjection* nearRef = canCheckRef
-                            ? pickNearestPoseRef(intraDist, intraTrace)
-                            : nullptr;
-                        const bool poseOk =
-                            nearRef != nullptr &&
-                            intraDist <= maxIntraDist &&
-                            intraTrace > 2.95f &&
-                            !isRearOrAuxiliaryProbe(parsed_camera, *nearRef);
                         if (existingSubpass) {
-                            if (existingSubpass->jittered && poseOk) {
+                            // Keep the frame's locked sub-pass jitter decision across Z-prepass and G-buffer.
+                            if (existingSubpass->jittered) {
                                 is_main_camera = true;
                                 is_subpass_camera = true;
                             }
                         } else {
+                            float intraDist = 0.0f;
+                            float intraTrace = 0.0f;
+                            const bool canCheckRef =
+                                (s_has_staged_camera && s_staged_camera_frame == cur_frame) ||
+                                (s_camera_now.scaleX > 0.0f &&
+                                 s_verified_ldr_tonemap_frame != cur_frame &&
+                                 s_cut_rejection_streak == 0 &&
+                                 s_teleport_rejection_streak == 0);
+                            const edpe::CameraProjection* nearRef = canCheckRef
+                                ? pickNearestPoseRef(intraDist, intraTrace)
+                                : nullptr;
+                            const bool poseOk =
+                                nearRef != nullptr &&
+                                edpe::isSamePoseSceneSubpass(parsed_camera, *nearRef, maxIntraDist, dtRatio);
                             const bool lockJitter = s_scene_subpasses.recordOrGet(
                                 cur_frame, parsed_camera.scaleX, parsed_camera.scaleY,
                                 parsed_camera.depthB, poseOk);
@@ -5571,6 +5590,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             s_cb1_flt_allow_stage = allow_stage;
                             s_cb1_flt_is_main = is_main_camera;
                             s_cb1_flt_is_subpass = is_subpass_camera;
+                            s_cb1_flt_subpass_cnt = curSubpassCnt;
 
                             EdpeLog(diagMsg);
                         }
@@ -5583,6 +5603,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         s_cb1_flt_outH = outH;
                         s_cb1_flt_vpW = curVpW;
                         s_cb1_flt_vpH = curVpH;
+                        s_cb1_flt_subpass_cnt = curSubpassCnt;
                         s_cb1_flt_is_probe = is_probe;
                         s_cb1_flt_passes = passes_filter;
                         s_cb1_flt_allow_stage = allow_stage;
@@ -5592,43 +5613,50 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 } else {
                     ++s_ustat.gbufDone;
-                    float lateDist = 0.0f;
-                    float lateTrace = 0.0f;
-                    if (const edpe::CameraProjection* nearRef = pickNearestPoseRef(lateDist, lateTrace)) {
-                        if (lateDist < 0.5f && lateTrace > 2.95f) {
-                            ++s_ustat.nearLate;
-                            if (s_ustat.firstNearLateIdx == 0) s_ustat.firstNearLateIdx = s_ustat.total;
-                            if (jitterActive && s_preserve_native_ui.load(std::memory_order_relaxed) &&
-                                s_clean_camera_frame != cur_frame &&
-                                (parse_ok || block_cam_ok) &&
-                                std::fabs(parsed_camera.depthB - nearRef->depthB) <= 1e-3f) {
-                                std::memcpy(s_last_clean_cb1_data, words, 5376);
-                                s_has_clean_cb1_data = true;
-                                s_clean_camera_cb_dirty = true;
-                                s_clean_camera_frame = cur_frame;
-                            }
-                            const bool preTonemapScenePass =
-                                (s_verified_ldr_tonemap_frame != cur_frame &&
-                                 !s_ldr_tonemap_candidate_bound &&
-                                 !s_post_ldr_backbuffer_bound);
-                            const bool sameRefFov =
-                                std::fabs(parsed_camera.scaleX - nearRef->scaleX) <= 0.02f * nearRef->scaleX &&
-                                std::fabs(parsed_camera.scaleY - nearRef->scaleY) <= 0.02f * nearRef->scaleY &&
-                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f;
-                            const bool matchedSubpass = !sameRefFov &&
-                                (s_scene_subpasses.findJittered(
-                                    cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB) != nullptr);
-                            const float lateDet = cameraRotationDeterminant(parsed_camera);
-                            if (preTonemapScenePass && lateDist <= maxIntraDist && lateTrace > 2.95f &&
-                                lateDet >= 0.85f && lateDet <= 1.15f &&
-                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
-                                !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
-                                if (sameRefFov &&
-                                    !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, {0.0f, 0.0f, 0.0f}, 1.0f)) {
-                                    is_main_camera = true;
-                                } else if (matchedSubpass) {
-                                    is_main_camera = true;
-                                    is_subpass_camera = true;
+                    const auto* existingLateSubpass = s_scene_subpasses.find(
+                        cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB);
+                    if (existingLateSubpass) {
+                        const bool preTonemapScenePass =
+                            (s_verified_ldr_tonemap_frame != cur_frame &&
+                             !s_ldr_tonemap_candidate_bound &&
+                             !s_post_ldr_backbuffer_bound);
+                        if (preTonemapScenePass && existingLateSubpass->jittered) {
+                            is_main_camera = true;
+                            is_subpass_camera = true;
+                        }
+                    } else {
+                        float lateDist = 0.0f;
+                        float lateTrace = 0.0f;
+                        if (const edpe::CameraProjection* nearRef = pickNearestPoseRef(lateDist, lateTrace)) {
+                            if (lateDist < 0.5f && lateTrace > 2.95f) {
+                                ++s_ustat.nearLate;
+                                if (s_ustat.firstNearLateIdx == 0) s_ustat.firstNearLateIdx = s_ustat.total;
+                                if (jitterActive && s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                                    s_clean_camera_frame != cur_frame &&
+                                    (parse_ok || block_cam_ok) &&
+                                    std::fabs(parsed_camera.depthB - nearRef->depthB) <= 1e-3f) {
+                                    std::memcpy(s_last_clean_cb1_data, words, 5376);
+                                    s_has_clean_cb1_data = true;
+                                    s_clean_camera_cb_dirty = true;
+                                    s_clean_camera_frame = cur_frame;
+                                }
+                                const bool preTonemapScenePass =
+                                    (s_verified_ldr_tonemap_frame != cur_frame &&
+                                     !s_ldr_tonemap_candidate_bound &&
+                                     !s_post_ldr_backbuffer_bound);
+                                const bool sameRefFov =
+                                    std::fabs(parsed_camera.scaleX - nearRef->scaleX) <= 0.02f * nearRef->scaleX &&
+                                    std::fabs(parsed_camera.scaleY - nearRef->scaleY) <= 0.02f * nearRef->scaleY &&
+                                    parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f;
+                                const float lateDet = cameraRotationDeterminant(parsed_camera);
+                                if (preTonemapScenePass && lateDist <= maxIntraDist && lateTrace > 2.95f &&
+                                    lateDet >= 0.85f && lateDet <= 1.15f &&
+                                    parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
+                                    !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
+                                    if (sameRefFov &&
+                                        !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, {0.0f, 0.0f, 0.0f}, 1.0f)) {
+                                        is_main_camera = true;
+                                    }
                                 }
                             }
                         }
@@ -5710,14 +5738,16 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             const float invR5 = mutable_words[98 * 4 + 5];
                             if (std::isfinite(invR0) && std::isfinite(invR5) &&
                                 (std::fabs(invR0) > 1e-4f || std::fabs(invR5) > 1e-4f)) {
-                                std::memcpy(s_last_unjittered_inv_rays, &mutable_words[98 * 4], 12 * sizeof(float));
-                                if (areFiniteFloats(s_last_unjittered_inv_rays, 12)) {
-                                    float patched_inv_rays[12]{};
-                                    std::memcpy(patched_inv_rays, s_last_unjittered_inv_rays, sizeof(patched_inv_rays));
+                                float patched_inv_rays[12]{};
+                                std::memcpy(patched_inv_rays, &mutable_words[98 * 4], sizeof(patched_inv_rays));
+                                if (areFiniteFloats(patched_inv_rays, 12)) {
+                                    if (!is_subpass_camera) {
+                                        std::memcpy(s_last_unjittered_inv_rays, patched_inv_rays, sizeof(patched_inv_rays));
+                                    }
                                     edpe::cobra_camera::jitterInverseUvRay(patched_inv_rays, dxUv, dyUv);
                                     std::memcpy(&mutable_words[98 * 4], patched_inv_rays, sizeof(patched_inv_rays));
                                 }
-                            } else if (s_last_unjittered_inv_rays[0] != 0.0f) {
+                            } else if (!is_subpass_camera && s_last_unjittered_inv_rays[0] != 0.0f) {
                                 std::memset(s_last_unjittered_inv_rays, 0, sizeof(s_last_unjittered_inv_rays));
                             }
                             if (parsed_camera.scaleX > 0.1f) {
@@ -6557,7 +6587,10 @@ void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
 
 void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
     if (!motion_color_source) return;
-    if (s_clean_hdr_scene_texture && s_clean_hdr_scene_frame == motion_color_frame && !from_hud) return;
+    if (s_clean_hdr_scene_texture && s_clean_hdr_scene_frame == motion_color_frame &&
+        (!from_hud || s_clean_hdr_scene_from_hud_frame == motion_color_frame)) {
+        return;
+    }
     D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
     motion_color_source->GetDesc(&rtv_desc);
     Microsoft::WRL::ComPtr<ID3D11Resource> resource;
@@ -6598,6 +6631,9 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
     }
     context->CopyResource(s_clean_hdr_scene_texture.Get(), source.Get());
     s_clean_hdr_scene_frame = motion_color_frame;
+    if (from_hud) {
+        s_clean_hdr_scene_from_hud_frame = motion_color_frame;
+    }
 
     motion_early_color_view = s_clean_hdr_scene_srv;
     motion_clean_color_target = s_clean_hdr_scene_rtv;
@@ -7712,6 +7748,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_clean_hdr_scene_rtv.Reset();
         s_clean_hdr_scene_width = s_clean_hdr_scene_height = 0;
         s_clean_hdr_scene_frame = ~0ull;
+        s_clean_hdr_scene_from_hud_frame = ~0ull;
         s_dlaa_input.Reset();
         s_dlaa_input_srv.Reset();
         s_direct_color_srv.Reset();
@@ -11095,6 +11132,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_clean_hdr_scene_rtv.Reset();
         s_clean_hdr_scene_width = s_clean_hdr_scene_height = 0;
         s_clean_hdr_scene_frame = ~0ull;
+        s_clean_hdr_scene_from_hud_frame = ~0ull;
         s_dlaa_input.Reset();
         s_dlaa_input_srv.Reset();
         s_direct_color_srv.Reset();

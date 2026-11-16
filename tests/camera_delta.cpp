@@ -247,5 +247,27 @@ int main() {
     // Next frame starts fresh and can accept again.
     if (!tracker23.recordOrGet(12, 1.2935f, 2.300f, 0.0675f, true)) return 63;
 
+    // 24. isSamePoseSceneSubpass identifies a same-pose viewmodel sub-pass before world staging
+    // so it is not misclassified as a camera cut, while still rejecting true cuts or mirrors.
+    edpe::CameraProjection worldBase = identity();
+    worldBase.scaleX = 1.0525f;
+    worldBase.scaleY = 1.871f;
+    worldBase.depthB = 0.025f;
+    edpe::CameraProjection viewmodelSubpass = worldBase;
+    viewmodelSubpass.scaleX = 1.2935f;
+    viewmodelSubpass.scaleY = 2.300f;
+    viewmodelSubpass.depthB = 0.0675f;
+    if (!edpe::isSamePoseSceneSubpass(viewmodelSubpass, worldBase, 0.05f)) return 64;
+    // Camera cut (large jump) must NOT be accepted as a same-pose sub-pass.
+    edpe::CameraProjection farSubpass = viewmodelSubpass;
+    farSubpass.worldFromView[3] = 50.0f;
+    if (edpe::isSamePoseSceneSubpass(farSubpass, worldBase, 0.05f)) return 65;
+    // Mirrored reflection (negative determinant) must be rejected.
+    edpe::CameraProjection mirroredSubpass = viewmodelSubpass;
+    mirroredSubpass.worldFromView[0] = -mirroredSubpass.worldFromView[0];
+    mirroredSubpass.worldFromView[4] = -mirroredSubpass.worldFromView[4];
+    mirroredSubpass.worldFromView[8] = -mirroredSubpass.worldFromView[8];
+    if (edpe::isSamePoseSceneSubpass(mirroredSubpass, worldBase, 0.05f)) return 66;
+
     return 0;
 }

@@ -578,10 +578,6 @@ bool UiLayer::shouldInterceptDraw(uint64_t vsHash, uint64_t psHash, bool isHdrTa
         return true;
     }
     return (vsHash == 0x2CECEC3065EF0D4Aull && psHash == 0xA4D03619D631B186ull) ||
-           (vsHash == 0x5559BD94B6852E83ull &&
-            (psHash == 0xEA02FAC2BD6C643Cull || psHash == 0xE95634B0F61D218Full)) ||
-           (vsHash == 0xB12F7A618E1BDE98ull &&
-            (psHash == 0x203DF51758AADC4Dull || psHash == 0x42AC0CACC9CDF72Bull)) ||
            (vsHash == 0xF8D8A92E96419901ull && psHash == 0x16196F69ADE35E77ull) ||
            (vsHash == 0x1989B75BF034ECC3ull && psHash == 0xDB79AE788E049DFDull) ||
            (vsHash == 0xC7FA0C0F5DD49180ull && psHash == 0x6EEF165A350DA30Full) ||
