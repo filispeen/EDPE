@@ -30,6 +30,7 @@ body:
         - Native TAA
         - TAA with upscaling
         - All of them
+        - All of them except Bypass
         - With any AA
         - With any upscaler
         - Not sure
