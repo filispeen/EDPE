@@ -5281,6 +5281,10 @@ inline void syncSceneWindowAtomic(unsigned long long cur_frame) {
     }
 }
 
+inline bool isTransposeProjectionCbWidth(UINT byteWidth) {
+    return byteWidth == 192 || byteWidth == 208;
+}
+
 inline bool couldBeTransposeProjection208(const float* words) {
     if (!words) return false;
     // Necessary invariants of matchesEliteTransposeProjectionBlock(&words[16]):
@@ -5538,7 +5542,8 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
                         EdpeLog(L"EDPE: scene constant buffer target discovered via Map()");
                     }
                 } else if (jitterActive &&
-                           (desc.ByteWidth == 208 || (desc.ByteWidth >= 272 && desc.ByteWidth <= 4096)) &&
+                           (isTransposeProjectionCbWidth(desc.ByteWidth) ||
+                            (desc.ByteWidth >= 272 && desc.ByteWidth <= 4096)) &&
                            desc.Usage == D3D11_USAGE_DYNAMIC &&
                            (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
                     cacheDotCbResource(resource, desc.ByteWidth);
@@ -5563,7 +5568,7 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
             scene_maps_after_draw.fetch_add(1, std::memory_order_relaxed);
     } else if (dot_cb_bytes > 0) {
         const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
-        if (dot_cb_bytes == 208 ||
+        if (isTransposeProjectionCbWidth(dot_cb_bytes) ||
             s_scene_window_closed_frame.load(std::memory_order_acquire) != cur_frame) {
             trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, dot_cb_bytes);
         }
@@ -5611,7 +5616,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             rearmHudDrawProbeFast(context);
             return;
         }
-        if (mapped_byte_width == 208 &&
+        if (isTransposeProjectionCbWidth(mapped_byte_width) &&
             !couldBeTransposeProjection208(static_cast<const float*>(mapped_ptr))) {
             if (forward) forward(context, resource, subresource);
             rearmHudDrawProbeFast(context);
@@ -5628,7 +5633,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
         }
         std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
         edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::MapUnmap);
-        if (mapped_ptr && mapped_byte_width == 208) {
+        if (mapped_ptr && isTransposeProjectionCbWidth(mapped_byte_width)) {
             {
                 SubProfScope subProf208(SubZone::Unmap208);
                 float* mutable_unmap_words = static_cast<float*>(mapped_ptr);
@@ -5732,7 +5737,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 jittered_writes_count.fetch_add(1, std::memory_order_relaxed);
                                 static std::atomic<bool> s_logged_dot_cb0_jitter{false};
                                 if (!s_logged_dot_cb0_jitter.exchange(true, std::memory_order_relaxed)) {
-                                    EdpeLog(L"EDPE: injected projection jitter into 208-byte CB0 transpose block");
+                                    EdpeLog(L"EDPE: injected projection jitter into 192/208-byte CB0 transpose block");
                                 }
                             } else {
                                 jitter_rejection_count.fetch_add(1, std::memory_order_relaxed);

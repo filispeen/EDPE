@@ -557,5 +557,20 @@ int main() {
     mirroredMvpT[2] = -mirroredMvpT[2];
     if (edpe::matchesEliteTransposeProjectionBlock(mirroredMvpT, worldCamRef)) return 86;
 
+    // Captured 192-byte CB0 transpose ViewProj layout (EID 4379 forward hair shading):
+    const float hairCb0T[16]{
+        -0.407122f, -0.964933f, -0.103300f, 0.0f,
+        -0.009628f,  0.203164f, -1.859819f, -8.34e-7f,
+         0.0f,       0.0f,       0.0f,       0.025f,
+         0.922126f, -0.384059f, -0.046728f, 0.0f};
+    if (!edpe::matchesEliteTransposeProjectionBlock(hairCb0T, worldCamRef)) return 87;
+    float hairJittered[16]{};
+    if (!edpe::jitterEliteDotProjectionBlock(hairCb0T, hairJittered, cb0Jit) ||
+        !edpe::matchesEliteTransposeProjectionBlock(hairJittered, worldCamRef)) return 88;
+    edpe::NdcOffset hairRecovered{};
+    if (!edpe::estimateEliteTransposeBlockNdcOffset(hairJittered, &hairRecovered) ||
+        std::fabs(hairRecovered.x - cb0Jit.ndcX) > 1e-4f ||
+        std::fabs(hairRecovered.y - cb0Jit.ndcY) > 1e-4f) return 89;
+
     return 0; // All temporal math tests passed
 }
