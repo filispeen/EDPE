@@ -29,6 +29,8 @@ concurrency:
 
 permissions:
   contents: write
+  issues: write
+  pull-requests: read
 
 jobs:
   CI:
@@ -241,3 +243,5 @@ jobs:
     secrets: inherit
     permissions:
       contents: write
+      issues: write
+      pull-requests: read
