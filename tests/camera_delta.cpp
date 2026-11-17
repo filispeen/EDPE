@@ -268,6 +268,27 @@ int main() {
     mirroredSubpass.worldFromView[4] = -mirroredSubpass.worldFromView[4];
     mirroredSubpass.worldFromView[8] = -mirroredSubpass.worldFromView[8];
     if (edpe::isSamePoseSceneSubpass(mirroredSubpass, worldBase, 0.05f)) return 66;
+    // Same-depthB camera (e.g. Camera Suite FOV change or world pass with depthB=0.025)
+    // must NOT be classified as a scene sub-pass so it never blocks camera-cut latching
+    // or poisons SceneSubpassTracker for late forward hair passes (EID 4379 / EID 4553).
+    edpe::CameraProjection cameraSuiteFov = worldBase;
+    cameraSuiteFov.scaleX = 1.428f;
+    cameraSuiteFov.scaleY = 2.539f;
+    cameraSuiteFov.depthB = 0.025f;
+    if (edpe::isSamePoseSceneSubpass(cameraSuiteFov, worldBase, 15.0f)) return 67;
+    // Viewmodel sub-pass before world staging while ship moves (predicted by velocity) must pass.
+    edpe::CameraProjection movingViewmodel = viewmodelSubpass;
+    movingViewmodel.worldFromView[11] = 2.5f;
+    if (!edpe::isSamePoseSceneSubpass(movingViewmodel, worldBase, 0.25f, 1.0f, {0.0f, 0.0f, 2.5f})) return 68;
+
+    // 25. Diagonal forward-right movement (e.g. 0.0506m right, 0.0293m fwd, |d|=0.0585m)
+    // MUST NOT be misclassified as a lateral IPD probe:
+    auto diagMove = identity();
+    diagMove.worldFromView[3] = 0.0506f;
+    diagMove.worldFromView[7] = 0.0001f;
+    diagMove.worldFromView[11] = 0.0293f;
+    if (edpe::isStereoEyeOrIpdProbe(diagMove, identity())) return 67;
+    if (edpe::isReflectionOrAuxiliaryCamera(diagMove, identity())) return 68;
 
     return 0;
 }
