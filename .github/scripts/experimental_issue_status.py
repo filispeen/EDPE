@@ -341,27 +341,27 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
     if phase == "start":
         header_icon, status_text = "🛠️", "In Progress"
         if has_artifact:
-            build_line = "- ✅ **Build EDPE (Release x64)** — built by CI"
-            pkg_line = f"- 🔄 **Package Archive** — `{archive_name}` (downloading staged binaries...)"
+            build_line = "- ✅ **Build EDPE (Release x64)**: built by CI"
+            pkg_line = f"- 🔄 **Package Archive**: `{archive_name}` (downloading staged binaries...)"
             rel_line = "- ⏳ **Publish GitHub Release**"
         else:
-            build_line = "- 🔄 **Build EDPE (Release x64)** — configuring & compiling..."
-            pkg_line = f"- ⏳ **Package Archive** — `{archive_name}`"
+            build_line = "- 🔄 **Build EDPE (Release x64)**: configuring & compiling..."
+            pkg_line = f"- ⏳ **Package Archive**: `{archive_name}`"
             rel_line = "- ⏳ **Publish GitHub Release**"
     elif phase == "after_build":
         header_icon, status_text = "🛠️", "Packaging"
         build_line = "- ✅ **Build EDPE (Release x64)**"
-        pkg_line = f"- 🔄 **Package Archive** — creating `{archive_name}`..."
+        pkg_line = f"- 🔄 **Package Archive**: creating `{archive_name}`..."
         rel_line = "- ⏳ **Publish GitHub Release**"
     elif phase == "after_package":
         header_icon, status_text = "🛠️", "Publishing"
         build_line = (
-            "- ✅ **Build EDPE (Release x64)** — built by CI"
+            "- ✅ **Build EDPE (Release x64)**: built by CI"
             if has_artifact
             else "- ✅ **Build EDPE (Release x64)**"
         )
-        pkg_line = f"- ✅ **Package Archive** — `{archive_name}`"
-        rel_line = "- 🔄 **Publish GitHub Release** — uploading build & creating release..."
+        pkg_line = f"- ✅ **Package Archive**: `{archive_name}`"
+        rel_line = "- 🔄 **Publish GitHub Release**: uploading build & creating release..."
     else:
         outcomes = [
             configure_outcome,
@@ -380,12 +380,12 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
 
         if has_artifact:
             dl_state = download_outcome or "skipped"
-            build_line = "- ✅ **CI Build & Tests** — completed"
+            build_line = "- ✅ **CI Build & Tests**: completed"
             if dl_state != "success":
-                pkg_line = f"- {step_icon(dl_state)} **Download Staged Binaries** — {dl_state}"
+                pkg_line = f"- {step_icon(dl_state)} **Download Staged Binaries**: {dl_state}"
             else:
                 pkg_state = package_outcome or "skipped"
-                pkg_line = f"- {step_icon(pkg_state)} **Package Archive** — `{archive_name}` ({pkg_state})"
+                pkg_line = f"- {step_icon(pkg_state)} **Package Archive**: `{archive_name}` ({pkg_state})"
         else:
             if configure_outcome in ("failure", "cancelled"):
                 build_state = configure_outcome
@@ -393,15 +393,15 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
             else:
                 build_state = build_outcome or "skipped"
                 build_detail = build_state
-            build_line = f"- {step_icon(build_state)} **Build EDPE (Release x64)** — {build_detail}"
+            build_line = f"- {step_icon(build_state)} **Build EDPE (Release x64)**: {build_detail}"
             pkg_state = package_outcome or "skipped"
-            pkg_line = f"- {step_icon(pkg_state)} **Package Archive** — `{archive_name}` ({pkg_state})"
+            pkg_line = f"- {step_icon(pkg_state)} **Package Archive**: `{archive_name}` ({pkg_state})"
 
         rel_state = release_outcome or "skipped"
-        rel_line = f"- {step_icon(rel_state)} **Publish GitHub Release** — {rel_state}"
+        rel_line = f"- {step_icon(rel_state)} **Publish GitHub Release**: {rel_state}"
 
     lines = [
-        f"### {header_icon} Experimental Build `{tag_name}` — {status_text}",
+        f"### {header_icon} Experimental Build `{tag_name}`: {status_text}",
         "",
     ]
     if branch_name:
