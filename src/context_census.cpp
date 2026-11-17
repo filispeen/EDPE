@@ -6123,7 +6123,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const bool matches_staged = hasStagedForFrame &&
                         !isReflectionOrAuxiliaryCamera(parsed_camera, s_staged_camera, {0.0f, 0.0f, 0.0f}, 1.0f);
                     const bool allow_fallback_recovery =
-                        ((s_consecutive_fallback_frames >= 1) || in_main_scene) &&
+                        (s_consecutive_fallback_frames >= 1) &&
                         !hasStagedForFrame;
                     const bool promote_over_probe =
                         hasStagedForFrame && s_staged_was_probe_vs_committed && in_main_scene &&
