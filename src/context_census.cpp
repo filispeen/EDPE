@@ -538,6 +538,7 @@ static edpe::CameraProjection s_staged_camera{};
 static unsigned long long s_staged_camera_frame = ~0ull;
 static bool s_has_staged_camera = false;
 static bool s_staged_from_in_scene = false;
+static bool s_staged_was_probe_vs_committed = false;
 static bool s_last_committed_scene_cut = false;
 static unsigned s_teleport_rejection_streak = 0;
 static unsigned long long s_last_teleport_rejection_frame = ~0ull;
@@ -609,7 +610,8 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
                                            const edpe::CameraProjection& committed_camera,
                                            const edpe::Vec3& last_velocity,
                                            float dtRatio,
-                                           const float* proj1080 = nullptr) {
+                                           const float* proj1080 = nullptr,
+                                           bool checkStereoProbe = true) {
     if (!words || wordCount != 5376 / sizeof(float)) return false;
     if (parsed_camera.scaleX <= 0.0f || parsed_camera.scaleY <= 0.0f) return false;
 
@@ -659,8 +661,19 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
     }
 
     // 6. Повний фільтр допоміжних камер та стерео-зондів відносно зафіксованої камери:
-    if (isReflectionOrAuxiliaryCamera(parsed_camera, committed_camera, last_velocity, dtRatio)) {
-        return false;
+    if (checkStereoProbe) {
+        if (isReflectionOrAuxiliaryCamera(parsed_camera, committed_camera, last_velocity, dtRatio)) {
+            return false;
+        }
+    } else if (committed_camera.scaleX > 0.0f && committed_camera.scaleY > 0.0f) {
+        const float scaleDiffX = std::fabs(parsed_camera.scaleX - committed_camera.scaleX);
+        const float scaleDiffY = std::fabs(parsed_camera.scaleY - committed_camera.scaleY);
+        if (scaleDiffX > 0.02f * committed_camera.scaleX ||
+            scaleDiffY > 0.02f * committed_camera.scaleY ||
+            isRearOrAuxiliaryProbe(parsed_camera, committed_camera, last_velocity, dtRatio) ||
+            cameraRotationTrace(parsed_camera, committed_camera) < 2.40f) {
+            return false;
+        }
     }
 
     return true;
@@ -744,6 +757,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         s_camera_frame = rendered_frame;
         s_has_staged_camera = false;
         s_staged_from_in_scene = false;
+        s_staged_was_probe_vs_committed = false;
     } else if (s_camera_now.scaleX > 0.0f) {
         // Fallback: жоден пас не оновив камеру — обмежена екстраполяція щонайбільше на 1 кадр
         ++s_consecutive_fallback_frames;
@@ -6002,8 +6016,20 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         : 0.0f;
                 const float predictedStep =
                     edpe::length(s_last_valid_velocity * std::clamp(dtRatio, 0.25f, 4.0f));
-                const float maxIntraDist =
+                const float maxSubpassDist =
                     std::clamp(0.05f + 1.5f * std::max(committedStep, predictedStep), 0.05f, 0.35f);
+                const float maxIntraDist =
+                    std::clamp(0.10f + 2.0f * std::max(committedStep, predictedStep), 0.10f, 15.0f);
+                const bool exactMainProjMatch =
+                    (s_reference_cb0_blocks_frame == cur_frame) &&
+                    [&]() {
+                        for (int i = 0; i < 16; ++i) {
+                            if (std::fabs(local_proj1080[i] - s_last_unjittered_forward_block[i]) > 1e-5f) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    }();
                 auto pickNearestPoseRef = [&](float& outDist, float& outTrace) -> const edpe::CameraProjection* {
                     const bool hasStaged = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
                     const bool hasNow = (s_camera_now.scaleX > 0.0f);
@@ -6078,19 +6104,33 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         }
                     } else {
                     const bool anchor_fresh = s_anchor_valid && (cur_frame <= s_anchor_frame + 2);
+                    const float anchorStepFrames =
+                        (anchor_fresh && cur_frame > s_anchor_frame)
+                            ? static_cast<float>(cur_frame - s_anchor_frame)
+                            : 1.0f;
+                    const float anchorDtRatio = dtRatio * anchorStepFrames;
                     const bool matches_anchor = anchor_fresh &&
-                        edpe::matchesAnchorPrediction(parsed_camera, s_anchor_camera, s_last_valid_velocity, dtRatio);
+                        edpe::matchesAnchorPrediction(parsed_camera, s_anchor_camera, s_last_valid_velocity, anchorDtRatio);
 
-                    const bool probe_vs_anchor = anchor_fresh && !matches_anchor &&
-                        isStereoEyeOrIpdProbe(parsed_camera, s_anchor_camera, s_last_valid_velocity, dtRatio);
+                    const bool probe_vs_anchor = anchor_fresh && (cur_frame <= s_anchor_frame + 1) && !matches_anchor &&
+                        isStereoEyeOrIpdProbe(parsed_camera, s_anchor_camera, s_last_valid_velocity, anchorDtRatio);
 
                     const bool probe_vs_committed = (s_camera_now.scaleX > 0.0f) && !matches_anchor &&
                         isStereoEyeOrIpdProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio);
 
+                    const bool hasStagedForFrame =
+                        (s_has_staged_camera && s_staged_camera_frame == cur_frame);
+                    const bool matches_staged = hasStagedForFrame &&
+                        !isReflectionOrAuxiliaryCamera(parsed_camera, s_staged_camera, {0.0f, 0.0f, 0.0f}, 1.0f);
                     const bool allow_fallback_recovery =
-                        (s_consecutive_fallback_frames >= 1) &&
-                        !(s_has_staged_camera && s_staged_camera_frame == cur_frame);
-                    const bool is_probe = !allow_fallback_recovery && (probe_vs_anchor || probe_vs_committed);
+                        ((s_consecutive_fallback_frames >= 1) || in_main_scene) &&
+                        !hasStagedForFrame;
+                    const bool promote_over_probe =
+                        hasStagedForFrame && s_staged_was_probe_vs_committed && in_main_scene &&
+                        !probe_vs_anchor && !probe_vs_committed;
+                    const bool is_probe =
+                        !allow_fallback_recovery && !matches_staged && !promote_over_probe &&
+                        (probe_vs_anchor || probe_vs_committed);
 
                     if (is_probe) {
                         s_probe_seen_this_frame = true;
@@ -6098,18 +6138,33 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
 
                     bool passes_filter = !is_probe &&
-                        isAuthoritativeMainSceneCamera(
-                            words, 5376 / sizeof(float), parsed_camera,
-                            outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080);
+                        ((!hasStagedForFrame &&
+                          isAuthoritativeMainSceneCamera(
+                              words, 5376 / sizeof(float), parsed_camera,
+                              outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, !allow_fallback_recovery)) ||
+                         (hasStagedForFrame &&
+                          (isAuthoritativeMainSceneCamera(
+                               words, 5376 / sizeof(float), parsed_camera,
+                               outW, outH, s_staged_camera, {0.0f, 0.0f, 0.0f}, 1.0f, local_proj1080) ||
+                           (promote_over_probe &&
+                            isAuthoritativeMainSceneCamera(
+                                words, 5376 / sizeof(float), parsed_camera,
+                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, true)) ||
+                           (!s_staged_from_in_scene && in_main_scene &&
+                            isAuthoritativeMainSceneCamera(
+                                words, 5376 / sizeof(float), parsed_camera,
+                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, false)))));
 
                     float spCheckDist = 0.0f;
                     float spCheckTrace = 0.0f;
                     const edpe::CameraProjection* spCheckRef =
                         pickNearestPoseRef(spCheckDist, spCheckTrace);
+                    const edpe::Vec3 spCheckVel =
+                        (spCheckRef == &s_camera_now) ? s_last_valid_velocity : edpe::Vec3{0.0f, 0.0f, 0.0f};
                     const bool is_same_pose_subpass_cand =
                         !passes_filter && !is_probe && spCheckRef != nullptr &&
                         isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH) &&
-                        edpe::isSamePoseSceneSubpass(parsed_camera, *spCheckRef, maxIntraDist, dtRatio);
+                        edpe::isSamePoseSceneSubpass(parsed_camera, *spCheckRef, maxSubpassDist, dtRatio, spCheckVel);
 
                     // Real camera rotation or FOV change:
                     // 1) Pure in-place pilot head/ship rotation (rawDist < 0.05m) with valid FOV and chirality
@@ -6123,7 +6178,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                         cameraRotationDeterminant(parsed_camera) <= 1.15f &&
                         parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
-                        !isRearOrAuxiliaryProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio)) {
+                        (allow_fallback_recovery ||
+                         !isRearOrAuxiliaryProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio))) {
                         const float rawDistToCommitted = (s_camera_now.scaleX > 0.0f)
                             ? edpe::length(edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_camera_now))
                             : 0.0f;
@@ -6134,7 +6190,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             passes_filter = true;
                             s_cut_rejection_streak = 0;
                             s_anchor_valid = false;
-                        } else if (!(s_has_staged_camera && s_staged_camera_frame == cur_frame)) {
+                        } else if (!(s_has_staged_camera && s_staged_camera_frame == cur_frame &&
+                                     (s_staged_from_in_scene || !in_main_scene))) {
                             if (s_last_cut_rejection_frame != cur_frame) {
                                 s_last_cut_rejection_frame = cur_frame;
                                 ++s_cut_rejection_streak;
@@ -6176,7 +6233,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         }
 
                         if (allow_stage && s_has_staged_camera && s_staged_camera_frame == cur_frame) {
-                            if (in_main_scene && !s_staged_from_in_scene) {
+                            if ((in_main_scene && !s_staged_from_in_scene) || promote_over_probe) {
                                 allow_stage = true;
                             } else if (!in_main_scene && s_staged_from_in_scene) {
                                 allow_stage = false;
@@ -6193,11 +6250,14 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         }
 
                         if (allow_stage) {
-                            s_cut_rejection_streak = 0;
-                            s_teleport_rejection_streak = 0;
+                            if (in_main_scene) {
+                                s_cut_rejection_streak = 0;
+                                s_teleport_rejection_streak = 0;
+                            }
                             s_staged_camera = parsed_camera;
                             s_has_staged_camera = true;
                             s_staged_camera_frame = cur_frame;
+                            s_staged_was_probe_vs_committed = (probe_vs_anchor || probe_vs_committed);
                             if (in_main_scene) {
                                 s_staged_from_in_scene = true;
                             }
@@ -6213,10 +6273,12 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 const bool sameStagedFov =
                                     std::fabs(parsed_camera.scaleX - nearRef->scaleX) <= 0.02f * nearRef->scaleX &&
                                     std::fabs(parsed_camera.scaleY - nearRef->scaleY) <= 0.02f * nearRef->scaleY;
-                                if (intraDist <= maxIntraDist && intraTrace > 2.95f && sameStagedFov &&
+                                const edpe::Vec3 nearRefVel =
+                                    (nearRef == &s_camera_now) ? s_last_valid_velocity : edpe::Vec3{0.0f, 0.0f, 0.0f};
+                                if ((intraDist <= maxIntraDist || exactMainProjMatch) && intraTrace > 2.95f && sameStagedFov &&
                                     cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                                     parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
-                                    !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, {0.0f, 0.0f, 0.0f}, 1.0f) &&
+                                    !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, nearRefVel, dtRatio) &&
                                     !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
                                     is_main_camera = true;
                                 }
@@ -6229,37 +6291,45 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH)) {
                         // Coherent phase-group jitter for same-pose scene sub-passes whose near plane
                         // / FOV was adjusted for viewmodels (e.g. 0.0675 / 1.2935 vs world 0.025 / 1.0525).
-                        // Locked per (scaleX, scaleY, depthB) per frame so early Z-prepass and late G-buffer
-                        // always make the exact same jitter decision even before world camera staging.
-                        const auto* existingSubpass = s_scene_subpasses.find(
-                            cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB);
-                        if (existingSubpass) {
-                            // Keep the frame's locked sub-pass jitter decision across Z-prepass and G-buffer.
-                            if (existingSubpass->jittered) {
-                                is_main_camera = true;
-                                is_subpass_camera = true;
-                            }
-                        } else {
-                            float intraDist = 0.0f;
-                            float intraTrace = 0.0f;
-                            const bool canCheckRef =
-                                (s_has_staged_camera && s_staged_camera_frame == cur_frame) ||
-                                (s_camera_now.scaleX > 0.0f &&
-                                 s_verified_ldr_tonemap_frame != cur_frame &&
-                                 s_cut_rejection_streak == 0 &&
-                                 s_teleport_rejection_streak == 0);
-                            const edpe::CameraProjection* nearRef = canCheckRef
-                                ? pickNearestPoseRef(intraDist, intraTrace)
-                                : nullptr;
-                            const bool poseOk =
-                                nearRef != nullptr &&
-                                edpe::isSamePoseSceneSubpass(parsed_camera, *nearRef, maxIntraDist, dtRatio);
-                            const bool lockJitter = s_scene_subpasses.recordOrGet(
-                                cur_frame, parsed_camera.scaleX, parsed_camera.scaleY,
-                                parsed_camera.depthB, poseOk);
-                            if (lockJitter) {
-                                is_main_camera = true;
-                                is_subpass_camera = true;
+                        // Never record the main world near plane (nearRef->depthB) here so rejected world-depthB
+                        // auxiliary passes cannot poison late forward passes (Pass 10 / Pass 57 hair).
+                        float intraDist = 0.0f;
+                        float intraTrace = 0.0f;
+                        const bool canCheckRef =
+                            (s_has_staged_camera && s_staged_camera_frame == cur_frame) ||
+                            (s_camera_now.scaleX > 0.0f &&
+                             s_verified_ldr_tonemap_frame != cur_frame &&
+                             s_cut_rejection_streak == 0 &&
+                             s_teleport_rejection_streak == 0);
+                        const edpe::CameraProjection* nearRef = canCheckRef
+                            ? pickNearestPoseRef(intraDist, intraTrace)
+                            : nullptr;
+                        const bool distinctSubpassDepthB =
+                            nearRef != nullptr &&
+                            std::fabs(parsed_camera.depthB - nearRef->depthB) > 1e-3f &&
+                            !(s_has_staged_camera && s_staged_camera_frame == cur_frame &&
+                              std::fabs(parsed_camera.depthB - s_staged_camera.depthB) <= 1e-3f);
+                        if (distinctSubpassDepthB) {
+                            const auto* existingSubpass = s_scene_subpasses.find(
+                                cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB);
+                            if (existingSubpass) {
+                                // Keep the frame's locked sub-pass jitter decision across Z-prepass and G-buffer.
+                                if (existingSubpass->jittered) {
+                                    is_main_camera = true;
+                                    is_subpass_camera = true;
+                                }
+                            } else {
+                                const edpe::Vec3 subpassVel =
+                                    (nearRef == &s_camera_now) ? s_last_valid_velocity : edpe::Vec3{0.0f, 0.0f, 0.0f};
+                                const bool poseOk =
+                                    edpe::isSamePoseSceneSubpass(parsed_camera, *nearRef, maxSubpassDist, dtRatio, subpassVel);
+                                const bool lockJitter = s_scene_subpasses.recordOrGet(
+                                    cur_frame, parsed_camera.scaleX, parsed_camera.scaleY,
+                                    parsed_camera.depthB, poseOk);
+                                if (lockJitter) {
+                                    is_main_camera = true;
+                                    is_subpass_camera = true;
+                                }
                             }
                         }
                     }
@@ -6331,8 +6401,25 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 } else {
                     ++s_ustat.gbufDone;
-                    const auto* existingLateSubpass = s_scene_subpasses.find(
-                        cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB);
+                    float lateDist = 0.0f;
+                    float lateTrace = 0.0f;
+                    const bool hasStagedLate = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
+                    const edpe::CameraProjection* nearRef = nullptr;
+                    if (hasStagedLate && s_staged_from_in_scene) {
+                        lateDist = edpe::length(
+                            edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_staged_camera));
+                        lateTrace = edpe::cameraRotationTrace(parsed_camera, s_staged_camera);
+                        nearRef = &s_staged_camera;
+                    } else if (hasStagedLate) {
+                        nearRef = pickNearestPoseRef(lateDist, lateTrace);
+                    }
+                    const bool isLateSubpassDepthB =
+                        (nearRef == nullptr) ||
+                        (std::fabs(parsed_camera.depthB - nearRef->depthB) > 1e-3f);
+                    const auto* existingLateSubpass = isLateSubpassDepthB
+                        ? s_scene_subpasses.find(
+                              cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB)
+                        : nullptr;
                     if (existingLateSubpass) {
                         const bool preTonemapScenePass =
                             (s_verified_ldr_tonemap_frame != cur_frame &&
@@ -6342,39 +6429,46 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             is_main_camera = true;
                             is_subpass_camera = true;
                         }
-                    } else {
-                        float lateDist = 0.0f;
-                        float lateTrace = 0.0f;
-                        if (const edpe::CameraProjection* nearRef = pickNearestPoseRef(lateDist, lateTrace)) {
-                            if (lateDist < 0.5f && lateTrace > 2.95f) {
-                                ++s_ustat.nearLate;
-                                if (s_ustat.firstNearLateIdx == 0) s_ustat.firstNearLateIdx = s_ustat.total;
-                                if (jitterActive && s_preserve_native_ui.load(std::memory_order_relaxed) &&
-                                    s_clean_camera_frame != cur_frame &&
-                                    (parse_ok || block_cam_ok) &&
-                                    std::fabs(parsed_camera.depthB - nearRef->depthB) <= 1e-3f) {
-                                    std::memcpy(s_last_clean_cb1_data, words, 5376);
-                                    s_has_clean_cb1_data = true;
-                                    s_clean_camera_cb_dirty = true;
-                                    s_clean_camera_frame = cur_frame;
-                                }
-                                const bool preTonemapScenePass =
-                                    (s_verified_ldr_tonemap_frame != cur_frame &&
-                                     !s_ldr_tonemap_candidate_bound &&
-                                     !s_post_ldr_backbuffer_bound);
-                                const bool sameRefFov =
-                                    std::fabs(parsed_camera.scaleX - nearRef->scaleX) <= 0.02f * nearRef->scaleX &&
-                                    std::fabs(parsed_camera.scaleY - nearRef->scaleY) <= 0.02f * nearRef->scaleY &&
-                                    parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f;
-                                const float lateDet = cameraRotationDeterminant(parsed_camera);
-                                if (preTonemapScenePass && lateDist <= maxIntraDist && lateTrace > 2.95f &&
-                                    lateDet >= 0.85f && lateDet <= 1.15f &&
-                                    parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
-                                    !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
-                                    if (sameRefFov &&
-                                        !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, {0.0f, 0.0f, 0.0f}, 1.0f)) {
-                                        is_main_camera = true;
-                                    }
+                    } else if (nearRef != nullptr) {
+                        if ((lateDist < std::max(0.5f, maxIntraDist * 1.25f) || exactMainProjMatch) &&
+                            lateTrace > 2.95f) {
+                            ++s_ustat.nearLate;
+                            if (s_ustat.firstNearLateIdx == 0) s_ustat.firstNearLateIdx = s_ustat.total;
+                            if (jitterActive && s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                                s_clean_camera_frame != cur_frame &&
+                                (parse_ok || block_cam_ok) &&
+                                std::fabs(parsed_camera.depthB - nearRef->depthB) <= 1e-3f) {
+                                std::memcpy(s_last_clean_cb1_data, words, 5376);
+                                s_has_clean_cb1_data = true;
+                                s_clean_camera_cb_dirty = true;
+                                s_clean_camera_frame = cur_frame;
+                            }
+                            const bool preTonemapScenePass =
+                                (s_verified_ldr_tonemap_frame != cur_frame &&
+                                 !s_ldr_tonemap_candidate_bound &&
+                                 !s_post_ldr_backbuffer_bound);
+                            const bool sameRefFov =
+                                std::fabs(parsed_camera.scaleX - nearRef->scaleX) <= 0.02f * nearRef->scaleX &&
+                                std::fabs(parsed_camera.scaleY - nearRef->scaleY) <= 0.02f * nearRef->scaleY &&
+                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f;
+                            const float lateDet = cameraRotationDeterminant(parsed_camera);
+                            if (preTonemapScenePass &&
+                                (lateDist <= maxIntraDist || exactMainProjMatch) &&
+                                lateTrace > 2.95f &&
+                                lateDet >= 0.85f && lateDet <= 1.15f &&
+                                parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
+                                !isRearOrAuxiliaryProbe(parsed_camera, *nearRef)) {
+                                const bool checkLateStereoProbe =
+                                    (nearRef == &s_staged_camera && s_staged_from_in_scene);
+                                const bool lateMatchesStagedOrPredicted =
+                                    checkLateStereoProbe &&
+                                    (lateDist < 0.03f ||
+                                     edpe::matchesAnchorPrediction(
+                                         parsed_camera, *nearRef, s_last_valid_velocity, dtRatio));
+                                if (sameRefFov &&
+                                    (!checkLateStereoProbe || lateMatchesStagedOrPredicted ||
+                                     !isReflectionOrAuxiliaryCamera(parsed_camera, *nearRef, {0.0f, 0.0f, 0.0f}, 1.0f))) {
+                                    is_main_camera = true;
                                 }
                             }
                         }

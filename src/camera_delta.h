@@ -149,7 +149,7 @@ inline bool isStereoEyeOrIpdProbe(
         const float dFwd   = std::fabs(dot(rawDelta, fwd));
 
         // 3a. Латеральний стерео-очний зонд (IPD 68.2 мм, 136.4 мм, 272.8 мм)
-        const bool isLateralIpd = (dRight >= 0.80f * rawDist && dUp < 0.045f && dFwd < 0.045f);
+        const bool isLateralIpd = (dRight >= 0.96f * rawDist && dUp < 0.015f && dFwd < 0.015f);
 
         // 3b. Кабінний / наголовний зонд Cobra Odyssey (136.4 мм: +10.98 см Up, +8.09 см Fwd, 0.00 см Right)
         const bool isCockpitHeadProbe = (dRight < 0.025f &&
@@ -171,7 +171,7 @@ inline bool isStereoEyeOrIpdProbe(
         const float rUp      = std::fabs(dot(residual, up));
         const float rForward = std::fabs(dot(residual, fwd));
 
-        const bool isResLateralIpd = (rRight >= 0.80f * resDist && rUp < 0.045f && rForward < 0.045f);
+        const bool isResLateralIpd = (rRight >= 0.96f * resDist && rUp < 0.015f && rForward < 0.015f);
         const bool isResCockpitHeadProbe = (rRight < 0.025f && rUp >= 0.65f * resDist && rForward >= 0.45f * resDist);
 
         if (isResLateralIpd || isResCockpitHeadProbe) {
@@ -394,16 +394,24 @@ private:
 inline bool isSamePoseSceneSubpass(const CameraProjection& candidate,
                                    const CameraProjection& ref,
                                    float maxIntraDist,
-                                   float dtRatio = 1.0f) {
+                                   float dtRatio = 1.0f,
+                                   const Vec3& last_velocity = {0.0f, 0.0f, 0.0f}) {
     if (ref.scaleX <= 0.0f) return false;
+    // A scene sub-pass (e.g. viewmodel depthB=0.0675 vs world depthB=0.025) must have a
+    // distinct near plane from the main world camera; same-depthB cameras are world passes.
+    if (std::fabs(candidate.depthB - ref.depthB) <= 1e-3f) return false;
     const float det = cameraRotationDeterminant(candidate);
     if (det < 0.85f || det > 1.15f) return false;
     if (candidate.depthB < 0.01f || candidate.depthB > 0.25f) return false;
-    const float dist = length(cameraPosition(candidate) - cameraPosition(ref));
-    if (dist > maxIntraDist) return false;
+    const Vec3 candPos = cameraPosition(candidate);
+    const Vec3 refPos = cameraPosition(ref);
+    const float rawDist = length(candPos - refPos);
+    const float clampedDtRatio = std::clamp(dtRatio, 0.25f, 4.0f);
+    const float predDist = length(candPos - (refPos + last_velocity * clampedDtRatio));
+    if (std::min(rawDist, predDist) > maxIntraDist) return false;
     const float trace = cameraRotationTrace(candidate, ref);
     if (trace <= 2.95f) return false;
-    return !isRearOrAuxiliaryProbe(candidate, ref, {0.0f, 0.0f, 0.0f}, dtRatio);
+    return !isRearOrAuxiliaryProbe(candidate, ref, last_velocity, dtRatio);
 }
 
 } // namespace edpe
