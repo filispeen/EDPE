@@ -28,6 +28,8 @@ on:
 
 permissions:
   contents: write
+  issues: write
+  pull-requests: read
 
 jobs:
   build-and-release:
@@ -75,6 +77,40 @@ jobs:
           Write-Host "Determined Tag: $tag"
           "build_number=$buildNum" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "tag_name=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Find Linked Issue
+        id: linked_issue
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: discover
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          python .github/scripts/experimental_issue_status.py
+
+      - name: Notify Linked Issue (Build Started)
+        id: issue_start
+        if: ${{ steps.linked_issue.outputs.has_issue == 'true' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: start
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          TAG_NAME: ${{ steps.build_info.outputs.tag_name }}
+          BRANCH_NAME: ${{ steps.linked_issue.outputs.branch_name }}
+          ISSUE_NUMBERS: ${{ steps.linked_issue.outputs.issue_numbers }}
+          HAS_ARTIFACT: ${{ inputs.has-artifact }}
+        run: |
+          python .github/scripts/experimental_issue_status.py
 
       - name: Set up MSVC environment
         if: ${{ !inputs.has-artifact }}
@@ -136,6 +172,7 @@ jobs:
           max-size: 2G
 
       - name: Configure CMake
+        id: configure
         if: ${{ !inputs.has-artifact }}
         shell: pwsh
         run: |
@@ -143,12 +180,33 @@ jobs:
           cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build EDPE (Release)
+        id: build
         if: ${{ !inputs.has-artifact }}
         shell: pwsh
         run: |
           cmake --build build --target proxy_stage --parallel
 
+      - name: Notify Linked Issue (Build Completed)
+        if: ${{ !inputs.has-artifact && steps.issue_start.outputs.comment_ids != '' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: after_build
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          TAG_NAME: ${{ steps.build_info.outputs.tag_name }}
+          BRANCH_NAME: ${{ steps.linked_issue.outputs.branch_name }}
+          COMMENT_IDS: ${{ steps.issue_start.outputs.comment_ids }}
+          HAS_ARTIFACT: ${{ inputs.has-artifact }}
+        run: |
+          python .github/scripts/experimental_issue_status.py
+
       - name: Download Staged Binaries
+        id: download
         if: ${{ inputs.has-artifact }}
         uses: actions/download-artifact@v4
         with:
@@ -183,8 +241,31 @@ jobs:
 
           Write-Host "Created archive: $archiveName (SHA-256: $sha256)"
           "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha256=$sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Notify Linked Issue (Package Ready)
+        if: ${{ steps.issue_start.outputs.comment_ids != '' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: after_package
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          TAG_NAME: ${{ steps.build_info.outputs.tag_name }}
+          BRANCH_NAME: ${{ steps.linked_issue.outputs.branch_name }}
+          COMMENT_IDS: ${{ steps.issue_start.outputs.comment_ids }}
+          HAS_ARTIFACT: ${{ inputs.has-artifact }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          ARCHIVE_SHA256: ${{ steps.package.outputs.sha256 }}
+        run: |
+          python .github/scripts/experimental_issue_status.py
 
       - name: Upload Build Artifact
+        id: upload_artifact
         uses: actions/upload-artifact@v4
         with:
           name: EDPE-experimental-build-${{ steps.build_info.outputs.build_number }}-windows-x64
@@ -192,6 +273,7 @@ jobs:
             ${{ steps.package.outputs.archive_name }}
 
       - name: Publish GitHub Release
+        id: release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -204,3 +286,32 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: true
+
+      - name: Notify Linked Issue (Final Result)
+        if: ${{ always() && steps.issue_start.outputs.comment_ids != '' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: finish
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          TAG_NAME: ${{ steps.build_info.outputs.tag_name }}
+          BRANCH_NAME: ${{ steps.linked_issue.outputs.branch_name }}
+          COMMENT_IDS: ${{ steps.issue_start.outputs.comment_ids }}
+          HAS_ARTIFACT: ${{ inputs.has-artifact }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          ARCHIVE_SHA256: ${{ steps.package.outputs.sha256 }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          RELEASE_ASSETS: ${{ steps.release.outputs.assets }}
+          CONFIGURE_OUTCOME: ${{ steps.configure.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload_artifact.outcome }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+        run: |
+          python .github/scripts/experimental_issue_status.py
