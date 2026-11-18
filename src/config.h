@@ -128,6 +128,16 @@ public:
         devMode = (devVal > 0);
 
         debugViewActive = GetPrivateProfileIntW(L"Pipeline", L"DebugView", 0, path.c_str()) != 0;
+
+        discordRpcEnabled = GetPrivateProfileIntW(L"Discord", L"Enabled", 1, path.c_str()) != 0;
+        wchar_t clientIdBuf[128]{};
+        GetPrivateProfileStringW(L"Discord", L"ClientId", L"", clientIdBuf, 128, path.c_str());
+        discordClientId.clear();
+        for (const wchar_t* p = clientIdBuf; *p != L'\0'; ++p) {
+            if (*p >= L'0' && *p <= L'9') {
+                discordClientId.push_back(static_cast<char>(*p));
+            }
+        }
     }
 
     void save() {
@@ -201,6 +211,12 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
 
         WritePrivateProfileStringW(L"Pipeline", L"DebugView", debugViewActive ? L"1" : L"0", path.c_str());
+
+        WritePrivateProfileStringW(L"Discord", L"Enabled", discordRpcEnabled ? L"1" : L"0", path.c_str());
+        if (!discordClientId.empty()) {
+            std::wstring wClientId(discordClientId.begin(), discordClientId.end());
+            WritePrivateProfileStringW(L"Discord", L"ClientId", wClientId.c_str(), path.c_str());
+        }
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -330,6 +346,9 @@ public:
     bool devMode = false;
 
     bool debugViewActive = false;
+
+    bool discordRpcEnabled = true;
+    std::string discordClientId;
 };
 
 } // namespace edpe

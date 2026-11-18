@@ -4,7 +4,9 @@
 #include "log.h"
 #include "ui.h"
 #include "context_census.h"
+#include "discord_rpc.h"
 #include "perf_overlay.h"
+#include "upscaler_backend.h"
 
 #include <atomic>
 #include <cstddef>
@@ -258,6 +260,26 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
     }
     edpe::PerfTracker::instance().onPresentStart(swap_chain);
     ContextCensusOnPresent(swap_chain, frame, flags);
+    if (frame == 1 || (frame % 60) == 0) {
+        const auto& upscaler = edpe::UpscalerManager::instance();
+        const auto& diag = upscaler.getDiagnostics();
+        edpe::DiscordPresenceInfo rpcInfo;
+        rpcInfo.enabled = edpe::Config::instance().discordRpcEnabled;
+        rpcInfo.backend = upscaler.getBackend();
+        rpcInfo.mode = upscaler.getMode();
+        rpcInfo.renderWidth = diag.renderWidth;
+        rpcInfo.renderHeight = diag.renderHeight;
+        rpcInfo.outputWidth = diag.outputWidth;
+        rpcInfo.outputHeight = diag.outputHeight;
+        if (rpcInfo.outputWidth == 0 || rpcInfo.outputHeight == 0) {
+            DXGI_SWAP_CHAIN_DESC scDesc{};
+            if (SUCCEEDED(swap_chain->GetDesc(&scDesc))) {
+                rpcInfo.outputWidth = scDesc.BufferDesc.Width;
+                rpcInfo.outputHeight = scDesc.BufferDesc.Height;
+            }
+        }
+        edpe::DiscordRpc::instance().update(rpcInfo);
+    }
     UiOnPresent(swap_chain, flags);
     ContextCensusAfterOverlay(swap_chain, flags);
     const HRESULT result = original(swap_chain, sync_interval, flags);

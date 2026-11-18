@@ -4,6 +4,7 @@
 #include "log.h"
 #include "system_dll.h"
 #include "input_hook.h"
+#include "discord_rpc.h"
 
 #include <dxgi1_3.h>
 #include <mutex>
@@ -20,6 +21,9 @@ void syncConfigOnce() {
         }
         auto& cfg = edpe::Config::instance();
         cfg.load();
+        if (edpe::isRunningInEliteProcess()) {
+            edpe::DiscordRpc::instance().start();
+        }
         if (cfg.syncEliteGraphicsConfig()) {
             wchar_t msg[160]{};
             swprintf_s(msg, L"EDPE: synced Elite graphics config (SSAAMultiplier=%.6f)",

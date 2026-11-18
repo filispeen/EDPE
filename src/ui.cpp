@@ -10,6 +10,7 @@
 #include "input_hook.h"
 #include "jitter_logger.h"
 #include "jitter_view_recorder.h"
+#include "discord_rpc.h"
 
 
 #include <d3d11_1.h>
@@ -1741,6 +1742,25 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         if (ImGui::CollapsingHeader("HUD & UI Scaling", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::Checkbox("Show Performance HUD (FPS, Frametimes, GPU, VRAM)", &cfg.showPerfOverlay)) {
                 cfg.save();
+            }
+            if (ImGui::Checkbox("Discord Rich Presence (Elite Dangerous with EDPE)", &cfg.discordRpcEnabled)) {
+                cfg.save();
+                const auto& diag = upscaler.getDiagnostics();
+                edpe::DiscordPresenceInfo rpcInfo;
+                rpcInfo.enabled = cfg.discordRpcEnabled;
+                rpcInfo.backend = upscaler.getBackend();
+                rpcInfo.mode = upscaler.getMode();
+                rpcInfo.renderWidth = diag.renderWidth;
+                rpcInfo.renderHeight = diag.renderHeight;
+                rpcInfo.outputWidth = diag.outputWidth;
+                rpcInfo.outputHeight = diag.outputHeight;
+                edpe::DiscordRpc::instance().update(rpcInfo);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%s)", edpe::DiscordRpc::instance().statusText());
+            if (cfg.discordRpcEnabled &&
+                edpe::DiscordRpc::instance().status() == edpe::DiscordRpcStatus::NoClientId) {
+                TextDisabledWrapped("Set [Discord] ClientId in edpe.ini to activate Discord Rich Presence.");
             }
 
             static const char* const s_pos_tooltips[8] = {

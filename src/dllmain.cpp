@@ -1,4 +1,5 @@
 #include "crash_logger.h"
+#include "discord_rpc.h"
 #include "log.h"
 #include <windows.h>
 
@@ -12,6 +13,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID lpvReserved) {
         *crashPtr = 42;
 #endif
     } else if (reason == DLL_PROCESS_DETACH) {
+        edpe::DiscordRpc::instance().shutdown(false);
         EdpeLogShutdown(lpvReserved == nullptr);
         edpe::uninstallCrashLogger();
     }
