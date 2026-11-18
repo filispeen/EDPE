@@ -51,14 +51,12 @@ public:
     void setVisorDeltaSrvs(ID3D11ShaderResourceView* visorLdr, ID3D11ShaderResourceView* cleanLdr);
     void resetVisorDelta();
 
-    // Повторний запуск тонемапу (Tonemap Re-issue):
+    // Повторний запуск тонемапу (Tonemap Re-issue, модель E = T(H)):
     bool beginTonemapReissue(ID3D11DeviceContext* context,
                              ID3D11ShaderResourceView* gameLut = nullptr,
                              ID3D11Buffer* gameExposureCb = nullptr,
                              int hdrSlot = 1,
-                             uint64_t psHash = 0,
-                             ID3D11ShaderResourceView* gameHdrSrv = nullptr);
-    bool stepTonemapDelta(ID3D11DeviceContext* context, int hdrSlot = 1);
+                             uint64_t psHash = 0);
     void endTonemapReissue(ID3D11DeviceContext* context);
 
     struct TonemapTuning {
@@ -66,8 +64,7 @@ public:
         float uiGamma = 1.0f;
         float bgBrightness = 1.0f;
         float bgGamma = 1.0f;
-        float bgAttenGamma = 2.2f;
-        float tonemapBaseWeight = 1.0f;
+        float bgAttenGamma = 1.0f;
     };
     TonemapTuning getTonemapTuning() const { return tonemapTuning_; }
     void setTonemapTuning(const TonemapTuning& t) { tonemapTuning_ = t; cbValid_ = false; }
@@ -111,15 +108,7 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D11VertexShader> coverageVs_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> coveragePs_;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> hdrDeltaPrepPs_;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> bloomDown0Ps_;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> bloomDownPs_;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> bloomUpBasePs_;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> bloomUpAddPs_;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> bloomCombinePs_;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> bloomCb_;
     Microsoft::WRL::ComPtr<ID3D11BlendState> toneRgbOnlyBlend_;
-    Microsoft::WRL::ComPtr<ID3D11BlendState> toneRevSubtractBlend_;
     Microsoft::WRL::ComPtr<ID3D11BlendState> coverageAlphaOnlyBlend_;
     Microsoft::WRL::ComPtr<ID3D11BlendState> alphaBlend_;
     Microsoft::WRL::ComPtr<ID3D11BlendState> premulBlend_;
@@ -160,40 +149,13 @@ private:
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> hdrLayerRtv_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> hdrLayerSrv_;
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> hdrAttenSceneTex_;  // R16G16B16A16_FLOAT (Scene_HDR * T)
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> hdrAttenSceneRtv_;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> hdrAttenSceneSrv_;
-
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> hdrCombinedTex_;    // R16G16B16A16_FLOAT (Scene_HDR * T + HdrLayer)
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> hdrCombinedRtv_;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> hdrCombinedSrv_;
-
     Microsoft::WRL::ComPtr<ID3D11Texture2D> ldrLayerTex_;       // R8G8B8A8_UNORM
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> ldrLayerRtv_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> ldrLayerSrv_;
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> ldrAttenSceneTex_; // R8G8B8A8_UNORM Tonemap(Scene_HDR * T)
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> ldrAttenSceneRtv_;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> ldrAttenSceneSrv_;
-
     Microsoft::WRL::ComPtr<ID3D11Texture2D> multLayerTex_;      // R8G8B8A8_UNORM
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> multLayerRtv_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> multLayerSrv_;
-
-    static constexpr UINT kBloomLevels = 5;
-    struct BloomMip {
-        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
-        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
-        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
-        UINT w = 0;
-        UINT h = 0;
-    };
-    BloomMip bloomDown_[kBloomLevels]{};
-    BloomMip bloomUp_[kBloomLevels]{};
-    BloomMip bloomCombined_{};
-    bool generateHudBloomLocked(ID3D11DeviceContext* context, ID3D11ShaderResourceView* gameBloomSrv);
-    bool hudBloomApplied_ = false;
-    int hudBloomSlot_ = -1;
 
     // Збережений контекст для відновлення:
     D3D11_VIEWPORT savedViewports_[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
@@ -222,7 +184,6 @@ private:
 
     bool isIntercepting_ = false;
     bool isTonemapReissuing_ = false;
-    bool isTonemapDeltaActive_ = false;
     bool hasMultiplyDraws_ = false;
     bool multLayerCleared_ = false;
     UINT width_ = 0;
@@ -234,14 +195,12 @@ private:
     bool cbHasMult_ = false;
     bool cbDebugView_ = false;
     bool cbHasVisorDelta_ = false;
-    bool cbHasTonemapDelta_ = false;
     TonemapTuning tonemapTuning_{};
     float cbUiBrightness_ = 1.0f;
     float cbUiGamma_ = 1.0f;
     float cbBgBrightness_ = 1.0f;
     float cbBgGamma_ = 1.0f;
-    float cbBgAttenGamma_ = 2.2f;
-    float cbTonemapBaseWeight_ = 1.0f;
+    float cbBgAttenGamma_ = 1.0f;
     bool cbValid_ = false;
 };
 

@@ -3422,12 +3422,8 @@ ID3D11ShaderResourceView* buildHudMergedHdrScratchForBloom(
     }
 
     s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::HudBloom);
-    if (srcSrvToUse) {
-        mergeHudIntoHdrTarget(context, s_hud_merged_hdr_rtv.Get(), targetW, targetH, srcSrvToUse);
-    } else {
-        context->CopyResource(s_hud_merged_hdr_texture.Get(), hdrTex.Get());
-        mergeHudIntoHdrTarget(context, s_hud_merged_hdr_rtv.Get(), targetW, targetH, nullptr);
-    }
+    context->CopyResource(s_hud_merged_hdr_texture.Get(), hdrTex.Get());
+    mergeHudIntoHdrTarget(context, s_hud_merged_hdr_rtv.Get(), targetW, targetH, srcSrvToUse);
     s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::HudBloom);
     s_hud_merged_into_hdr_this_frame = true;
     s_hud_merged_hdr_source_res = hdrSourceRes;
@@ -3665,13 +3661,16 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
         } else if (s_hud_draws_replayed_frame > 0 && !s_hud_merged_into_hdr_this_frame &&
                    !isPauseOrModalMenuActive(current_frame)) {
             const bool isHalfScene =
-                (rtvDesc.Width * 2 >= sceneW - 2 && rtvDesc.Width * 2 <= sceneW + 2 &&
-                 rtvDesc.Height * 2 >= sceneH - 2 && rtvDesc.Height * 2 <= sceneH + 2);
+                (rtvDesc.Width * 2 >= sceneW - 3 && rtvDesc.Width * 2 <= sceneW + 3 &&
+                 rtvDesc.Height * 2 >= sceneH - 3 && rtvDesc.Height * 2 <= sceneH + 3);
+            const bool isQuarterScene =
+                (rtvDesc.Width * 4 >= sceneW - 4 && rtvDesc.Width * 4 <= sceneW + 4 &&
+                 rtvDesc.Height * 4 >= sceneH - 4 && rtvDesc.Height * 4 <= sceneH + 4);
             const bool isHdrFloat =
                 (rtvDesc.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
                  rtvDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
                  rtvDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
-            isHalfSceneHdrDraw = (isHalfScene && isHdrFloat);
+            isHalfSceneHdrDraw = ((isHalfScene || isQuarterScene) && isHdrFloat);
         }
         if (!isLdrTonemapDraw && !isHalfSceneHdrDraw) {
             return false;
@@ -3810,11 +3809,8 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
         Microsoft::WRL::ComPtr<ID3D11Buffer> gameExposureCb;
         context->PSGetConstantBuffers(2, 1, gameExposureCb.GetAddressOf());
         if (edpe::UiLayer::instance().beginTonemapReissue(
-                context, psSrvs[0], gameExposureCb.Get(), hdrSlot, ps_hash, psSrvs[hdrSlot])) {
+                context, psSrvs[0], gameExposureCb.Get(), hdrSlot, ps_hash)) {
             issueDraw();
-            if (edpe::UiLayer::instance().stepTonemapDelta(context, hdrSlot)) {
-                issueDraw();
-            }
             rearmHudDrawProbe(context);
             edpe::UiLayer::instance().endTonemapReissue(context);
             s_hud_tonemapped_valid_frame = current_frame;

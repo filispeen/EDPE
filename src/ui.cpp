@@ -1967,7 +1967,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             changed |= ImGui::SliderFloat("Backdrop Brightness", &tuning.bgBrightness, 0.20f, 1.50f, "%.2f");
             changed |= ImGui::SliderFloat("Backdrop Contrast (Gamma)", &tuning.bgGamma, 0.50f, 2.00f, "%.2f");
             changed |= ImGui::SliderFloat("Backdrop Atten Gamma", &tuning.bgAttenGamma, 0.10f, 3.00f, "%.2f");
-            changed |= ImGui::SliderFloat("Tonemap Base Sub", &tuning.tonemapBaseWeight, 0.00f, 1.50f, "%.2f");
             if (ImGui::Button("Reset HUD Tonemap Defaults")) {
                 tuning = edpe::UiLayer::TonemapTuning{};
                 changed = true;

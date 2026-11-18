@@ -709,9 +709,14 @@ int main() {
             uint32_t hasMultiply;
             uint32_t debugView;
             uint32_t hasVisorDelta;
-            uint32_t pad[3];
+            float    bgBrightness;
+            float    bgGamma;
+            float    uiBrightness;
+            float    uiGamma;
+            float    bgAttenGamma;
+            float    pad[2];
         };
-        const UiLayerCb cbInit{{4, 4}, 0, 0, 1, {0, 0, 0}};
+        const UiLayerCb cbInit{{4, 4}, 0, 0, 1, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, {0.0f, 0.0f}};
         D3D11_BUFFER_DESC cbd{sizeof(UiLayerCb), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
         D3D11_SUBRESOURCE_DATA cbData{&cbInit, 0, 0};
         ComPtr<ID3D11Buffer> cb;
@@ -749,6 +754,12 @@ int main() {
         uiPx[1 * 4 + 3] = packRgbaA(0, 200, 220, 255);
         hPx[(1 * 4 + 3) * 4 + 1] = 1.0f;
         hPx[(1 * 4 + 3) * 4 + 3] = 0.0f; // T = 0.0 (opaque HUD)
+        // Row 2, col 0: translucent panel T=0.25 with UI=(60, 40, 0), world=(120, 120, 120), visorDelta=0
+        // (g=1.0): 60 + 120*0.25 = 90, 40 + 120*0.25 = 70, 0 + 120*0.25 = 30
+        wPx[2 * 4 + 0] = packRgbaA(120, 120, 120, 255);
+        uiPx[2 * 4 + 0] = packRgbaA(60, 40, 0, 255);
+        hPx[(2 * 4 + 0) * 4 + 0] = 0.25f;
+        hPx[(2 * 4 + 0) * 4 + 3] = 0.25f;
 
         D3D11_TEXTURE2D_DESC hdrDesc = outDesc;
         hdrDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -815,6 +826,33 @@ int main() {
         if (std::abs(int(outRow1[12]) - 0) > 2 || std::abs(int(outRow1[13]) - 200) > 2 || std::abs(int(outRow1[14]) - 220) > 2) {
             context->Unmap(staging.Get(), 0);
             return 109;
+        }
+        const auto* outRow2 = static_cast<const uint8_t*>(mapped.pData) + 2 * mapped.RowPitch;
+        // Row 2 Col 0: translucent panel EDVR composite (90, 70, 30)
+        if (std::abs(int(outRow2[0]) - 90) > 2 || std::abs(int(outRow2[1]) - 70) > 2 || std::abs(int(outRow2[2]) - 30) > 2) {
+            context->Unmap(staging.Get(), 0);
+            return 110;
+        }
+        context->Unmap(staging.Get(), 0);
+
+        // Verify independent UI vs Backdrop tuning (UI brightness 1.5, Backdrop brightness 0.5)
+        const UiLayerCb cbTuned{{4, 4}, 0, 0, 1, 0.5f, 1.0f, 1.5f, 1.0f, 1.0f, {0.0f, 0.0f}};
+        context->UpdateSubresource(cb.Get(), 0, nullptr, &cbTuned, 0, 0);
+        context->CSSetShaderResources(0, 6, srvs);
+        context->CSSetSamplers(0, 1, smps);
+        context->CSSetConstantBuffers(0, 1, cbs);
+        context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        context->CSSetShader(layerCs.Get(), nullptr, 0);
+        context->Dispatch(1, 1, 1);
+        context->CSSetShaderResources(0, 6, nullSrvs);
+        context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+        context->CopyResource(staging.Get(), csOutTex.Get());
+        if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 111;
+        const auto* tunedRow2 = static_cast<const uint8_t*>(mapped.pData) + 2 * mapped.RowPitch;
+        // UI=(60,40,0)*1.5=(90,60,0) + world=(120,120,120)*0.25*0.5=(15,15,15) -> (105, 75, 15)
+        if (std::abs(int(tunedRow2[0]) - 105) > 2 || std::abs(int(tunedRow2[1]) - 75) > 2 || std::abs(int(tunedRow2[2]) - 15) > 2) {
+            context->Unmap(staging.Get(), 0);
+            return 112;
         }
         context->Unmap(staging.Get(), 0);
     }
