@@ -102,7 +102,7 @@ jobs:
       - name: Configure CMake
         shell: pwsh
         run: |
-          $ver = if ('${{ github.ref_type }}' -eq 'tag') {
+          $ver = if ('${{ github.ref_type }}' -eq "tag") {
             '${{ github.ref_name }}'
           } elseif ('${{ inputs.experimental }}' -eq 'true') {
             git fetch --depth=1 -f origin '+refs/tags/*:refs/tags/*'
