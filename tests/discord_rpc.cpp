@@ -11,11 +11,11 @@ int main() {
     assert(escapeJsonString("hello \"world\"\\test\n") == "hello \\\"world\\\"\\\\test\\n");
 
     // State formatting
-    assert(formatDiscordState(nullptr) == "Elite Dangerous with EDPE");
-    assert(formatDiscordState("") == "Elite Dangerous with EDPE");
-    assert(formatDiscordState("dev") == "Elite Dangerous with EDPE");
-    assert(formatDiscordState("0.5.0") == "Elite Dangerous with EDPE v0.5.0");
-    assert(formatDiscordState("v0.5.0") == "Elite Dangerous with EDPE v0.5.0");
+    assert(formatDiscordState(nullptr) == "dev");
+    assert(formatDiscordState("") == "dev");
+    assert(formatDiscordState("dev") == "dev");
+    assert(formatDiscordState("0.5.0") == "v0.5.0");
+    assert(formatDiscordState("v0.5.0") == "v0.5.0");
 
     // Details formatting
     {
@@ -70,11 +70,15 @@ int main() {
         const std::string payload = buildSetActivityPayload(
             4242, 1700000000ULL, 7,
             "NVIDIA DLSS Quality (1707x960 -> 2560x1440)",
-            "Elite Dangerous with EDPE v0.5.0");
+            "v0.5.0");
         assert(payload.find("\"cmd\":\"SET_ACTIVITY\"") != std::string::npos);
         assert(payload.find("\"pid\":4242") != std::string::npos);
         assert(payload.find("\"start\":1700000000") != std::string::npos);
-        assert(payload.find("\"state\":\"Elite Dangerous with EDPE v0.5.0\"") != std::string::npos);
+        assert(payload.find("\"state\":\"v0.5.0\"") != std::string::npos);
+        assert(payload.find("\"large_image\":\"https://cdn2.steamgriddb.com/icon/b353d984bb7fcc173edea010bd999b98/32/128x128.png\"") != std::string::npos);
+        assert(payload.find("\"label\":\"Download from Nexus mods\"") != std::string::npos);
+        assert(payload.find("\"url\":\"https://nexusmods.com/elitedangerous/mods/15\"") != std::string::npos);
+        assert(payload.find("\"label\":\"Download from GitHub\"") != std::string::npos);
         assert(payload.find("\"url\":\"https://github.com/filispeen/EDPE\"") != std::string::npos);
         assert(payload.find("\"nonce\":\"7\"") != std::string::npos);
     }

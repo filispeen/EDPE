@@ -1,6 +1,5 @@
 #include "discord_rpc.h"
 #include "config.h"
-#include "log.h"
 
 #include <windows.h>
 #include <chrono>
@@ -14,6 +13,9 @@ namespace {
 
 // Built-in EDPE Discord Application ID.
 constexpr const char* kDefaultDiscordClientId = "1572692832370688090";
+constexpr const char* kEdpeLargeImageUrl =
+    "https://cdn2.steamgriddb.com/icon/b353d984bb7fcc173edea010bd999b98/32/128x128.png";
+constexpr const char* kEdpeNexusUrl = "https://nexusmods.com/elitedangerous/mods/15";
 constexpr const char* kEdpeRepoUrl = "https://github.com/filispeen/EDPE";
 constexpr uint32_t kOpHandshake = 0;
 constexpr uint32_t kOpFrame = 1;
@@ -119,14 +121,12 @@ std::string formatDiscordDetails(const DiscordPresenceInfo& info) {
 
 std::string formatDiscordState(const char* version) {
     if (!version || version[0] == '\0' || std::strcmp(version, "dev") == 0) {
-        return "Elite Dangerous with EDPE";
+        return "dev";
     }
-    std::string out = "Elite Dangerous with EDPE ";
-    if (version[0] != 'v' && version[0] != 'V') {
-        out.push_back('v');
+    if (version[0] == 'v' || version[0] == 'V') {
+        return std::string(version);
     }
-    out += version;
-    return out;
+    return std::string("v") + version;
 }
 
 std::string buildSetActivityPayload(uint32_t pid,
@@ -145,8 +145,12 @@ std::string buildSetActivityPayload(uint32_t pid,
     json += escapeJsonString(state);
     json += "\",\"timestamps\":{\"start\":";
     json += std::to_string(startTimestamp);
-    json += "},\"assets\":{\"large_image\":\"edpe_logo\",\"large_text\":\"EDPE - Elite Dangerous Performance Enhanced\"}";
-    json += ",\"buttons\":[{\"label\":\"Get EDPE on GitHub\",\"url\":\"";
+    json += "},\"assets\":{\"large_image\":\"";
+    json += kEdpeLargeImageUrl;
+    json += "\",\"large_text\":\"EDPE - Elite Dangerous Performance Enhanced\"}";
+    json += ",\"buttons\":[{\"label\":\"Download from Nexus mods\",\"url\":\"";
+    json += kEdpeNexusUrl;
+    json += "\"},{\"label\":\"Download from GitHub\",\"url\":\"";
     json += kEdpeRepoUrl;
     json += "\"}]}},\"nonce\":\"";
     json += std::to_string(nonce);
@@ -222,7 +226,6 @@ const char* DiscordRpc::statusText() const {
 
 void DiscordRpc::workerLoop() {
     auto lastConnectAttempt = std::chrono::steady_clock::time_point{};
-    bool hadLoggedClientIdMissing = false;
 
     while (!stopRequested_.load(std::memory_order_acquire)) {
         DiscordPresenceInfo currentInfo;
@@ -252,13 +255,8 @@ void DiscordRpc::workerLoop() {
                 disconnect(true);
             }
             status_.store(DiscordRpcStatus::NoClientId, std::memory_order_relaxed);
-            if (!hadLoggedClientIdMissing) {
-                EdpeLog(L"EDPE: Discord RPC enabled but [Discord] ClientId is not set in edpe.ini");
-                hadLoggedClientIdMissing = true;
-            }
             continue;
         }
-        hadLoggedClientIdMissing = false;
 
         if (pipeHandle_ == nullptr) {
             const auto now = std::chrono::steady_clock::now();
@@ -268,7 +266,6 @@ void DiscordRpc::workerLoop() {
                 if (tryConnect(clientId)) {
                     status_.store(DiscordRpcStatus::Connected, std::memory_order_relaxed);
                     shouldUpdate = true;
-                    EdpeLog(L"EDPE: Discord RPC connected");
                 } else {
                     status_.store(DiscordRpcStatus::WaitingForDiscord, std::memory_order_relaxed);
                 }

@@ -202,7 +202,7 @@ target_compile_definitions(vtable_hook_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
 target_include_directories(vtable_hook_test PRIVATE src)
 add_test(NAME vtable_hook COMMAND vtable_hook_test)
 
-add_executable(discord_rpc_test tests/discord_rpc.cpp src/discord_rpc.cpp src/log.cpp src/version.cpp)
+add_executable(discord_rpc_test tests/discord_rpc.cpp src/discord_rpc.cpp src/version.cpp)
 target_compile_features(discord_rpc_test PRIVATE cxx_std_20)
 target_compile_definitions(discord_rpc_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(discord_rpc_test PRIVATE src)
