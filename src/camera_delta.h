@@ -406,11 +406,17 @@ inline bool isSamePoseSceneSubpass(const CameraProjection& candidate,
                                    const CameraProjection& ref,
                                    float maxIntraDist,
                                    float dtRatio = 1.0f,
-                                   const Vec3& last_velocity = {0.0f, 0.0f, 0.0f}) {
+                                   const Vec3& last_velocity = {0.0f, 0.0f, 0.0f},
+                                   bool knownSubpassFromCb1 = false) {
     if (ref.scaleX <= 0.0f) return false;
-    // A scene sub-pass (e.g. viewmodel depthB=0.0675 vs world depthB=0.025) must have a
-    // distinct near plane from the main world camera; same-depthB cameras are world passes.
-    if (std::fabs(candidate.depthB - ref.depthB) <= 1e-3f) return false;
+    // A scene sub-pass usually differs in near plane (e.g. viewmodel depthB=0.0675 vs world
+    // depthB=0.025), or shares world depthB=0.025 during ADS when cb1[35..38] confirms
+    // a distinct sub-pass FOV scale (e.g. viewmodel scaleX=3.1901 vs world scaleX=1.2634).
+    const bool distinctDepthB = std::fabs(candidate.depthB - ref.depthB) > 1e-3f;
+    const bool distinctScale =
+        std::fabs(candidate.scaleX - ref.scaleX) > 0.02f * ref.scaleX ||
+        std::fabs(candidate.scaleY - ref.scaleY) > 0.02f * ref.scaleY;
+    if (!distinctDepthB && !(knownSubpassFromCb1 && distinctScale)) return false;
     const float det = cameraRotationDeterminant(candidate);
     if (det < 0.85f || det > 1.15f) return false;
     if (candidate.depthB < 0.01f || candidate.depthB > 0.25f) return false;

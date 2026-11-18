@@ -572,5 +572,96 @@ int main() {
         std::fabs(hairRecovered.x - cb0Jit.ndcX) > 1e-4f ||
         std::fabs(hairRecovered.y - cb0Jit.ndcY) > 1e-4f) return 89;
 
+    // Planetary surface cb1 layout (EDO1.rdc / EDO2.rdc):
+    // cb1[233..235] (words 932..943) holds the planetary horizon rotation + true camera translation,
+    // cb1[241] (words 964..967) duplicates the true camera translation,
+    // cb1[277..279] (words 1108..1119) holds the active pass's view rotation rows, and
+    // cb1[35..38] (words 140..155) holds the Main World Camera inverse projection basis even during ADS viewmodel passes.
+    std::array<float, 1344> planetCb1{};
+    const float horizonRows[12]{
+        0.075821f, 0.534115f,  0.842005f, -168.080521f,
+        0.856850f, -0.466772f, 0.218934f,  357.418030f,
+        0.509960f, 0.704872f, -0.493048f,  333.031158f};
+    std::memcpy(&planetCb1[932], horizonRows, sizeof(horizonRows));
+    planetCb1[964] = -168.080521f;
+    planetCb1[965] =  357.418030f;
+    planetCb1[966] =  333.031158f;
+    planetCb1[967] =  0.0f;
+
+    const float yaw = 0.7f, pitch = -0.25f;
+    const float cy = std::cos(yaw), sy = std::sin(yaw);
+    const float cp = std::cos(pitch), sp = std::sin(pitch);
+    const float viewR[3][3]{
+        {cy, sy * sp, sy * cp},
+        {0.0f, cp, -sp},
+        {-sy, cy * sp, cy * cp}};
+    for (int col = 0; col < 3; ++col) {
+        for (int row = 0; row < 3; ++row) {
+            planetCb1[1108 + col * 4 + row] = viewR[row][col];
+        }
+        planetCb1[1108 + col * 4 + 3] = 0.0f;
+    }
+
+    const float worldSx = 1.263376f, worldSy = 2.246002f, worldDb = 0.025f;
+    for (int row = 0; row < 3; ++row) {
+        planetCb1[140 + row] = viewR[row][0] / worldSx;
+        planetCb1[144 + row] = viewR[row][1] / worldSy;
+        planetCb1[152 + row] = viewR[row][2];
+    }
+    planetCb1[151] = 1.0f / worldDb;
+
+    auto writeProj1080 = [&](float sx, float syScale, float db) {
+        for (int row = 0; row < 3; ++row) {
+            planetCb1[1080 + row * 4 + 0] = viewR[row][0] * sx;
+            planetCb1[1080 + row * 4 + 1] = viewR[row][1] * syScale;
+            planetCb1[1080 + row * 4 + 2] = 0.0f;
+            planetCb1[1080 + row * 4 + 3] = viewR[row][2];
+        }
+        planetCb1[1080 + 12] = 0.0f;
+        planetCb1[1080 + 13] = 0.0f;
+        planetCb1[1080 + 14] = db;
+        planetCb1[1080 + 15] = 0.0f;
+    };
+
+    writeProj1080(worldSx, worldSy, worldDb);
+    edpe::CameraProjection planetParsed{};
+    int planetFail = 0;
+    if (edpe::parseEliteCameraBlocks(&planetCb1[932], &planetCb1[1080], &planetParsed, &planetFail) ||
+        planetFail != 7) return 90;
+    if (!edpe::parseEliteCamera(planetCb1.data(), planetCb1.size(), &planetParsed, &planetFail) ||
+        planetFail != 0) return 91;
+    if (std::fabs(planetParsed.scaleX - worldSx) > 1e-4f ||
+        std::fabs(planetParsed.scaleY - worldSy) > 1e-4f ||
+        std::fabs(planetParsed.depthB - worldDb) > 1e-5f ||
+        std::fabs(planetParsed.worldFromView[3] - (-168.080521f)) > 1e-3f ||
+        std::fabs(planetParsed.worldFromView[7] - 357.418030f) > 1e-3f ||
+        std::fabs(planetParsed.worldFromView[11] - 333.031158f) > 1e-3f ||
+        std::fabs(planetParsed.worldFromView[2] - viewR[0][2]) > 1e-4f) return 92;
+
+    planetCb1[964] += 10.0f;
+    if (edpe::parseEliteCamera(planetCb1.data(), planetCb1.size(), &planetParsed, &planetFail)) return 93;
+    planetCb1[964] -= 10.0f;
+
+    float extSx = 0.0f, extSy = 0.0f, extDb = 0.0f;
+    if (!edpe::extractEliteWorldProjectionScales(planetCb1.data(), planetCb1.size(), &extSx, &extSy, &extDb) ||
+        std::fabs(extSx - worldSx) > 1e-4f ||
+        std::fabs(extSy - worldSy) > 1e-4f ||
+        std::fabs(extDb - worldDb) > 1e-5f) return 94;
+    if (!edpe::matchesEliteWorldProjectionScales(planetCb1.data(), planetCb1.size(), planetParsed) ||
+        edpe::isEliteSubpassVersusWorldCb1(planetCb1.data(), planetCb1.size(), planetParsed)) return 95;
+
+    // ADS viewmodel sub-pass shares depthB=0.025 with world, but has scaleX=3.190096, scaleY=5.671282.
+    writeProj1080(3.190096f, 5.671282f, 0.025f);
+    edpe::CameraProjection adsVmParsed{};
+    if (!edpe::parseEliteCamera(planetCb1.data(), planetCb1.size(), &adsVmParsed, &planetFail) ||
+        edpe::matchesEliteWorldProjectionScales(planetCb1.data(), planetCb1.size(), adsVmParsed) ||
+        !edpe::isEliteSubpassVersusWorldCb1(planetCb1.data(), planetCb1.size(), adsVmParsed)) return 96;
+
+    // Square cubemap frustum (1:1 aspect) must not be classified as a scene sub-pass.
+    edpe::CameraProjection squareCubemap = planetParsed;
+    squareCubemap.scaleX = 1.0f;
+    squareCubemap.scaleY = 1.0f;
+    if (edpe::isEliteSubpassVersusWorldCb1(planetCb1.data(), planetCb1.size(), squareCubemap)) return 97;
+
     return 0; // All temporal math tests passed
 }

@@ -330,5 +330,26 @@ int main() {
     if (recDelta.translation > 1e-5) return 71;
     if (std::fabs(recDelta.rotationDeg - 0.6) > 0.1) return 72;
 
+    // 28. ADS viewmodel sub-pass shares depthB=0.025 with the ADS world camera
+    // (scaleX=3.1901, scaleY=5.6713 vs world scaleX=1.2634, scaleY=2.2460) and is
+    // accepted ONLY when knownSubpassFromCb1=true (preserving Camera Suite rejection when false).
+    edpe::CameraProjection adsWorld = identity();
+    adsWorld.scaleX = 1.2634f;
+    adsWorld.scaleY = 2.2460f;
+    adsWorld.depthB = 0.025f;
+    edpe::CameraProjection adsViewmodel = adsWorld;
+    adsViewmodel.scaleX = 3.1901f;
+    adsViewmodel.scaleY = 5.6713f;
+    adsViewmodel.depthB = 0.025f;
+    if (!edpe::isSamePoseSceneSubpass(adsViewmodel, adsWorld, 0.05f, 1.0f, {0.0f, 0.0f, 0.0f}, true)) return 73;
+    if (edpe::isSamePoseSceneSubpass(adsViewmodel, adsWorld, 0.05f, 1.0f, {0.0f, 0.0f, 0.0f}, false)) return 74;
+
+    edpe::SceneSubpassTracker adsTracker;
+    if (!adsTracker.recordOrGet(20, 1.2935f, 2.300f, 0.0675f, true)) return 75;
+    if (!adsTracker.recordOrGet(20, 3.1901f, 5.6713f, 0.025f, true)) return 76;
+    if (!adsTracker.findJittered(20, 1.2935f, 2.300f, 0.0675f)) return 77;
+    if (!adsTracker.findJittered(20, 3.1901f, 5.6713f, 0.025f)) return 78;
+    if (adsTracker.find(20, 1.2634f, 2.2460f, 0.025f)) return 79;
+
     return 0;
 }
