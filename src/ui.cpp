@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "log.h"
 #include "context_census.h"
+#include "ui_layer.h"
 #include "upscaler_backend.h"
 #include "ngx_context.h"
 #include "capture_format.h"
@@ -1956,6 +1957,24 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ImGui::BeginDisabled();
             ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
             ImGui::EndDisabled();
+        }
+
+        if (ImGui::CollapsingHeader("HUD Tonemapping Tuning")) {
+            auto tuning = edpe::UiLayer::instance().getTonemapTuning();
+            bool changed = false;
+            changed |= ImGui::SliderFloat("UI Brightness", &tuning.uiBrightness, 0.50f, 1.50f, "%.2f");
+            changed |= ImGui::SliderFloat("UI Contrast (Gamma)", &tuning.uiGamma, 0.60f, 1.60f, "%.2f");
+            changed |= ImGui::SliderFloat("Backdrop Brightness", &tuning.bgBrightness, 0.20f, 1.50f, "%.2f");
+            changed |= ImGui::SliderFloat("Backdrop Contrast (Gamma)", &tuning.bgGamma, 0.50f, 2.00f, "%.2f");
+            changed |= ImGui::SliderFloat("Backdrop Atten Gamma", &tuning.bgAttenGamma, 0.10f, 3.00f, "%.2f");
+            changed |= ImGui::SliderFloat("Tonemap Base Sub", &tuning.tonemapBaseWeight, 0.00f, 1.50f, "%.2f");
+            if (ImGui::Button("Reset HUD Tonemap Defaults")) {
+                tuning = edpe::UiLayer::TonemapTuning{};
+                changed = true;
+            }
+            if (changed) {
+                edpe::UiLayer::instance().setTonemapTuning(tuning);
+            }
         }
 
         // Dev Mode Collapsible Sections (Collapsed by default)

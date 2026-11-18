@@ -569,6 +569,7 @@ static std::atomic<bool> s_inside_main_scene{false};
 static std::atomic<bool> s_in_edpe_present{false};
 static edpe::ProjectionJitter s_injected_jitter{};
 static unsigned long long s_jitter_injected_frame = ~0ull;
+static std::atomic<unsigned long long> s_cb0_jittered_frame{~0ull};
 static std::atomic<unsigned long long> s_jitter_standdown_until{0};
 static unsigned long long s_jitter_standdown_len = 60;
 static edpe::ProjectionJitter s_last_rendered_jitter{};
@@ -1762,7 +1763,9 @@ bool isConfirmedShipCockpitHudPair(std::uint64_t vs_hash, std::uint64_t ps_hash)
            (vs_hash == 0xF8D8A92E96419901ull && ps_hash == 0x16196F69ADE35E77ull) || // Hologram icon core (kHoloFamiliesTake)
            (vs_hash == 0x1989B75BF034ECC3ull && ps_hash == 0xDB79AE788E049DFDull) || // Radar contact triangles & elevation stalks
            (vs_hash == 0xC7FA0C0F5DD49180ull && ps_hash == 0x6EEF165A350DA30Full) || // Orbit / exclusion lines (kOrbitLines)
-           (vs_hash == 0xA47A3315FFF5E2E4ull && ps_hash == 0x869FFF43E875906Eull);   // Supercruise speed/distance bars (kSupercruiseBars)
+           (vs_hash == 0xA47A3315FFF5E2E4ull && ps_hash == 0x869FFF43E875906Eull) || // Supercruise speed/distance bars (kSupercruiseBars)
+           (vs_hash == 0x27CC03C6B975C020ull && ps_hash == 0xE477BE9350D37DBBull) || // Cockpit 3D curved holo panel (parallax, stencil 0x04)
+           (vs_hash == 0x320587120A79EEC0ull && ps_hash == 0x5BEB7F1695E118C3ull);   // Cockpit HUD panel overlay (stencil == 0x04)
 }
 
 bool isPrimaryCockpitHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
@@ -1825,6 +1828,9 @@ static inline bool isCandidateHudGlassOrStencilVs(std::uint64_t vs_hash) {
     case 0x1989B75BF034ECC3ull:
     case 0xC7FA0C0F5DD49180ull:
     case 0xA47A3315FFF5E2E4ull:
+    case 0xCC5404AECB474CECull:
+    case 0x27CC03C6B975C020ull:
+    case 0x320587120A79EEC0ull:
     case 0x1012E00B3CB44469ull:
     case 0xA3E5D3FCBC1165F8ull:
     case 0x1E8D013722FE71B8ull:
@@ -2805,9 +2811,21 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     bool cb1_is_jittered = false;
     bool cb1_substituted = false;
     bool ps_srv1_substituted = false;
-    const bool depth_tested_without_stencil =
-        (orig_depth_enable && !orig_stencil_enable && depth_to_bind != nullptr);
-    if (s_hud_mask_active_pass && !depth_tested_without_stencil) {
+    // Unjitter all intercepted HUD draws (even depth-tested draws without stencil such as
+    // cockpit text/icons/gauges and flight vector lines) so Preserved Native UI never inherits
+    // scene subpixel jitter.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> orig_cb0;
+    bool cb0_is_jittered = false;
+    if (s_hud_mask_active_pass) {
+        if (s_cb0_jittered_frame.load(std::memory_order_acquire) == motion_color_frame &&
+            ContextCensusIsJitterActive()) {
+            context->VSGetConstantBuffers(0, 1, orig_cb0.GetAddressOf());
+            if (orig_cb0) {
+                D3D11_BUFFER_DESC cb0Desc{};
+                orig_cb0->GetDesc(&cb0Desc);
+                cb0_is_jittered = (cb0Desc.ByteWidth == 192 || cb0Desc.ByteWidth == 208);
+            }
+        }
         context->VSGetConstantBuffers(1, 1, orig_cb1.GetAddressOf());
         ID3D11Resource* jitteredRes = s_jittered_cb1_buffer.load(std::memory_order_acquire);
         cb1_is_jittered = (orig_cb1 && jitteredRes && orig_cb1.Get() == jitteredRes &&
@@ -2974,9 +2992,11 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         }
     }
 
-    // Only cancel viewport jitter if orig_cb1 was jittered and could not be substituted
-    const float jitterX = (cb1_is_jittered && !cb1_substituted) ? s_injected_jitter.pixelX : 0.0f;
-    const float jitterY = (cb1_is_jittered && !cb1_substituted) ? s_injected_jitter.pixelY : 0.0f;
+    // Cancel viewport jitter when projection came from a jittered 192/208-byte CB0 transpose block
+    // or when orig_cb1 was jittered and could not be substituted.
+    const bool needViewportJitterCancel = cb0_is_jittered || (cb1_is_jittered && !cb1_substituted);
+    const float jitterX = needViewportJitterCancel ? s_injected_jitter.pixelX : 0.0f;
+    const float jitterY = needViewportJitterCancel ? s_injected_jitter.pixelY : 0.0f;
 
     // For 3D Ship/Target Holograms (VS 5559BD94 / PS EA02FAC2 or E95634B0), bind the DXBC-patched PS
     // with cb13 (SV_Position remap to renderW x renderH linear depth at PS t1 + Sobel relief scale).
@@ -3790,8 +3810,11 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
         Microsoft::WRL::ComPtr<ID3D11Buffer> gameExposureCb;
         context->PSGetConstantBuffers(2, 1, gameExposureCb.GetAddressOf());
         if (edpe::UiLayer::instance().beginTonemapReissue(
-                context, psSrvs[0], gameExposureCb.Get(), hdrSlot, ps_hash)) {
+                context, psSrvs[0], gameExposureCb.Get(), hdrSlot, ps_hash, psSrvs[hdrSlot])) {
             issueDraw();
+            if (edpe::UiLayer::instance().stepTonemapDelta(context, hdrSlot)) {
+                issueDraw();
+            }
             rearmHudDrawProbe(context);
             edpe::UiLayer::instance().endTonemapReissue(context);
             s_hud_tonemapped_valid_frame = current_frame;
@@ -4846,8 +4869,77 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         if (motion_color_bound && s_visor_diverted_frame == motion_color_frame) {
             s_visor_hdr_dirtied_after_draw = true;
         }
+        // World light-flare / bloom sprite (EID 4273: VS EA9C5A11 / PS C514FE6E): unjitter
+        // CB1 and CB0 viewport offset in-place so subpixel jitter never causes strobing.
+        bool flareUnjittered = false;
+        Microsoft::WRL::ComPtr<ID3D11Buffer> flareOrigCb1;
+        bool flareCb1Sub = false;
+        D3D11_VIEWPORT flareOrigVps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+        UINT flareVpCount = 0;
+        bool flareVpModified = false;
+        if (motion_color_bound && vertex_count == 6 && ContextCensusIsJitterActive()) {
+            std::uint64_t fvs = 0, fps = 0;
+            getFastBoundShaderHashes(context, fvs, fps);
+            if (fvs == 0xEA9C5A11E64E94F0ull && fps == 0xC514FE6EFBDDBB57ull) {
+                flareUnjittered = true;
+                Microsoft::WRL::ComPtr<ID3D11Buffer> flareOrigCb0;
+                bool flareCb0Jit = false;
+                if (s_cb0_jittered_frame.load(std::memory_order_acquire) == motion_color_frame) {
+                    context->VSGetConstantBuffers(0, 1, flareOrigCb0.GetAddressOf());
+                    if (flareOrigCb0) {
+                        D3D11_BUFFER_DESC d0{};
+                        flareOrigCb0->GetDesc(&d0);
+                        flareCb0Jit = (d0.ByteWidth == 192 || d0.ByteWidth == 208);
+                    }
+                }
+                context->VSGetConstantBuffers(1, 1, flareOrigCb1.GetAddressOf());
+                ID3D11Resource* jitRes = s_jittered_cb1_buffer.load(std::memory_order_acquire);
+                const bool flareCb1Jit = (flareOrigCb1 && jitRes && flareOrigCb1.Get() == jitRes &&
+                                          s_jitter_injected_frame == motion_color_frame);
+                if (flareCb1Jit && s_has_clean_cb1_data && s_clean_camera_frame == motion_color_frame && s_clean_camera_cb) {
+                    if (s_clean_camera_cb_dirty) {
+                        const auto map_fn = resolveOriginalMap(context);
+                        const auto unmap_fn = resolveOriginalUnmap(context);
+                        if (map_fn && unmap_fn) {
+                            D3D11_MAPPED_SUBRESOURCE mapped{};
+                            if (SUCCEEDED(map_fn(context, s_clean_camera_cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                                std::memcpy(mapped.pData, s_last_clean_cb1_data, 5376);
+                                unmap_fn(context, s_clean_camera_cb.Get(), 0);
+                                s_clean_camera_cb_dirty = false;
+                            }
+                        }
+                    }
+                    ID3D11Buffer* cleanBuf = s_clean_camera_cb.Get();
+                    context->VSSetConstantBuffers(1, 1, &cleanBuf);
+                    flareCb1Sub = true;
+                }
+                if (flareCb0Jit || (flareCb1Jit && !flareCb1Sub)) {
+                    flareVpCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+                    context->RSGetViewports(&flareVpCount, flareOrigVps);
+                    if (flareVpCount > 0) {
+                        D3D11_VIEWPORT adj[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+                        for (UINT i = 0; i < flareVpCount; ++i) {
+                            adj[i] = flareOrigVps[i];
+                            adj[i].TopLeftX -= s_injected_jitter.pixelX;
+                            adj[i].TopLeftY -= s_injected_jitter.pixelY;
+                        }
+                        context->RSSetViewports(flareVpCount, adj);
+                        flareVpModified = true;
+                    }
+                }
+            }
+        }
         if (const auto forward = resolveOriginalDrawInstanced(context)) {
             forward(context, vertex_count, instance_count, start_vertex, start_instance);
+        }
+        if (flareUnjittered) {
+            if (flareVpModified) {
+                context->RSSetViewports(flareVpCount, flareOrigVps);
+            }
+            if (flareCb1Sub) {
+                ID3D11Buffer* restoreCb1 = flareOrigCb1.Get();
+                context->VSSetConstantBuffers(1, 1, &restoreCb1);
+            }
         }
         abandonAmortizedAndRearmHudProbe(context);
     }
@@ -5704,6 +5796,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 s_last_rendered_jitter = curDotJit;
                                 s_scene_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
                                 s_jitter_injected_frame = cur_frame;
+                                s_cb0_jittered_frame.store(cur_frame, std::memory_order_release);
                                 jittered_writes_count.fetch_add(1, std::memory_order_relaxed);
                             } else {
                                 jitter_rejection_count.fetch_add(1, std::memory_order_relaxed);
@@ -5757,6 +5850,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 s_last_rendered_jitter = curDotJit;
                                 s_scene_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
                                 s_jitter_injected_frame = cur_frame;
+                                s_cb0_jittered_frame.store(cur_frame, std::memory_order_release);
                                 jittered_writes_count.fetch_add(1, std::memory_order_relaxed);
                                 static std::atomic<bool> s_logged_dot_cb0_jitter{false};
                                 if (!s_logged_dot_cb0_jitter.exchange(true, std::memory_order_relaxed)) {
