@@ -1758,10 +1758,6 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             }
             ImGui::SameLine();
             ImGui::TextDisabled("(%s)", edpe::DiscordRpc::instance().statusText());
-            if (cfg.discordRpcEnabled &&
-                edpe::DiscordRpc::instance().status() == edpe::DiscordRpcStatus::NoClientId) {
-                TextDisabledWrapped("Set [Discord] ClientId in edpe.ini to activate Discord Rich Presence.");
-            }
 
             static const char* const s_pos_tooltips[8] = {
                 "Top-Left", "Top", "Top-Right",

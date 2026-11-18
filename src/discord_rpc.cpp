@@ -12,8 +12,8 @@ namespace edpe {
 
 namespace {
 
-// Optional compile-time fallback if [Discord] ClientId is not set in edpe.ini.
-constexpr const char* kDefaultDiscordClientId = "";
+// Built-in EDPE Discord Application ID.
+constexpr const char* kDefaultDiscordClientId = "1572692832370688090";
 constexpr const char* kEdpeRepoUrl = "https://github.com/filispeen/EDPE";
 constexpr uint32_t kOpHandshake = 0;
 constexpr uint32_t kOpFrame = 1;
@@ -38,10 +38,6 @@ const char* upscaleModeLabel(UpscaleMode mode) {
 }
 
 std::string resolveClientId() {
-    const std::string& configured = Config::instance().discordClientId;
-    if (!configured.empty()) {
-        return configured;
-    }
     return kDefaultDiscordClientId;
 }
 
