@@ -64,7 +64,7 @@ public:
         float uiGamma = 1.0f;
         float bgBrightness = 1.0f;
         float bgGamma = 1.0f;
-        float bgAttenGamma = 1.0f;
+        float bgAttenGamma = 1.49f;
     };
     TonemapTuning getTonemapTuning() const { return tonemapTuning_; }
     void setTonemapTuning(const TonemapTuning& t) { tonemapTuning_ = t; cbValid_ = false; }

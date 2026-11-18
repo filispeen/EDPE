@@ -290,5 +290,45 @@ int main() {
     if (edpe::isStereoEyeOrIpdProbe(diagMove, identity())) return 67;
     if (edpe::isReflectionOrAuxiliaryCamera(diagMove, identity())) return 68;
 
+    // 26. Ship-frame cockpit head probe (+0.1098m ship-Up, +0.0809m ship-Fwd) MUST still be
+    // identified when pilot head is yawed left/right and pitched up (e.g. 20 deg yaw + 20 deg pitch):
+    auto pitchedYawedHead = [&]() {
+        auto c = identity();
+        const float y = 20.0f * 3.14159265f / 180.0f;
+        const float p = -20.0f * 3.14159265f / 180.0f; // pitch up
+        const float cy = std::cos(y), sy = std::sin(y);
+        const float cp = std::cos(p), sp = std::sin(p);
+        // R = Ry * Rx
+        c.worldFromView[0] = cy;       c.worldFromView[1] = sy * sp; c.worldFromView[2]  = sy * cp;
+        c.worldFromView[4] = 0.0f;     c.worldFromView[5] = cp;      c.worldFromView[6]  = -sp;
+        c.worldFromView[8] = -sy;      c.worldFromView[9] = cy * sp; c.worldFromView[10] = cy * cp;
+        return c;
+    };
+    auto turnedHeadBase = pitchedYawedHead();
+    auto turnedHeadProbe = turnedHeadBase;
+    turnedHeadProbe.worldFromView[7] += 0.1098f;
+    turnedHeadProbe.worldFromView[11] += 0.0809f;
+    if (!edpe::isStereoEyeOrIpdProbe(turnedHeadProbe, turnedHeadBase)) return 69;
+    if (!edpe::isReflectionOrAuxiliaryCamera(turnedHeadProbe, turnedHeadBase)) return 70;
+
+    // 27. preservePositionWithOrientation keeps rotated orientation + projection from a panning
+    // probe-offset frame while preserving continuous eye position (preventing fallback yaw stalls).
+    edpe::CameraProjection rotatedProbe = turnedHeadBase;
+    const float panAngle = 0.6f * 3.14159265f / 180.0f;
+    const float cp = std::cos(panAngle), sp = std::sin(panAngle);
+    for (int row = 0; row < 3; ++row) {
+        const float c0 = turnedHeadBase.worldFromView[row * 4 + 0];
+        const float c2 = turnedHeadBase.worldFromView[row * 4 + 2];
+        rotatedProbe.worldFromView[row * 4 + 0] = c0 * cp + c2 * sp;
+        rotatedProbe.worldFromView[row * 4 + 2] = -c0 * sp + c2 * cp;
+    }
+    rotatedProbe.worldFromView[7] += 0.1098f;
+    rotatedProbe.worldFromView[11] += 0.0809f;
+    const edpe::Vec3 basePos = edpe::cameraPosition(turnedHeadBase);
+    const edpe::CameraProjection recovered = edpe::preservePositionWithOrientation(rotatedProbe, basePos);
+    const auto recDelta = edpe::cameraDelta(turnedHeadBase, recovered);
+    if (recDelta.translation > 1e-5) return 71;
+    if (std::fabs(recDelta.rotationDeg - 0.6) > 0.1) return 72;
+
     return 0;
 }

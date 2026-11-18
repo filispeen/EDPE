@@ -104,6 +104,31 @@ inline bool isRearOrAuxiliaryProbe(
     return false;
 }
 
+inline bool matchesIpdOrCockpitProbeDisplacement(
+    const Vec3& delta,
+    float dist,
+    const Vec3& right,
+    const Vec3& up,
+    const Vec3& fwd)
+{
+    if (!isIpdHarmonicDistance(dist)) {
+        return false;
+    }
+    const float dRight = std::fabs(dot(delta, right));
+    const float dUp    = std::fabs(dot(delta, up));
+    const float dFwd   = std::fabs(dot(delta, fwd));
+
+    // Латеральний стерео-очний зонд (IPD 68.2 мм, 136.4 мм, 272.8 мм)
+    const bool isLateralIpd = (dRight >= 0.96f * dist && dUp < 0.015f && dFwd < 0.015f);
+
+    // Кабінний / наголовний зонд Cobra Odyssey (136.4 мм: +10.98 см Up, +8.09 см Fwd у системі корабля):
+    // При повороті/підйомі голови пілота проєкція на head-Right та head-Fwd змінюється, тоді як вертикальна
+    // складова (head-Up >= 0.40 * dist) зберігається у всьому діапазоні огляду в кабіні (yaw ±180°, pitch -30°..+65°).
+    const bool isCockpitHeadProbe = (dUp >= 0.40f * dist);
+
+    return isLateralIpd || isCockpitHeadProbe;
+}
+
 inline bool isStereoEyeOrIpdProbe(
     const CameraProjection& candidate,
     const CameraProjection& baseline,
@@ -119,10 +144,9 @@ inline bool isStereoEyeOrIpdProbe(
         return true;
     }
 
-    // 1. Стерео-очний зонд у межах одного кадру має ідентичну орієнтацію (rotTrace > 2.9995f).
-    // Будь-яке активне обертання камери (rotTrace <= 2.9995f) — це реальний рух голови/корабля.
+    // 1. Стерео-очний зонд у межах кадру має близьку орієнтацію (rotTrace > 2.995f, ~4° допуск під час обертання голови).
     const float rotTrace = cameraRotationTrace(candidate, baseline);
-    if (rotTrace <= 2.9995f) {
+    if (rotTrace <= 2.995f) {
         return false;
     }
 
@@ -143,21 +167,9 @@ inline bool isStereoEyeOrIpdProbe(
     // Спрацьовує лише при стаціонарній камері або при внутрішньокадровому порівнянні пасів (last_velocity == 0).
     const Vec3 rawDelta = candPos - prevPos;
     const float rawDist = length(rawDelta);
-    if (length(last_velocity) < 0.025f && isIpdHarmonicDistance(rawDist)) {
-        const float dRight = std::fabs(dot(rawDelta, right));
-        const float dUp    = std::fabs(dot(rawDelta, up));
-        const float dFwd   = std::fabs(dot(rawDelta, fwd));
-
-        // 3a. Латеральний стерео-очний зонд (IPD 68.2 мм, 136.4 мм, 272.8 мм)
-        const bool isLateralIpd = (dRight >= 0.96f * rawDist && dUp < 0.015f && dFwd < 0.015f);
-
-        // 3b. Кабінний / наголовний зонд Cobra Odyssey (136.4 мм: +10.98 см Up, +8.09 см Fwd, 0.00 см Right)
-        const bool isCockpitHeadProbe = (dRight < 0.025f &&
-            dUp >= 0.65f * rawDist && dFwd >= 0.45f * rawDist);
-
-        if (isLateralIpd || isCockpitHeadProbe) {
-            return true;
-        }
+    if (length(last_velocity) < 0.025f &&
+        matchesIpdOrCockpitProbeDisplacement(rawDelta, rawDist, right, up, fwd)) {
+        return true;
     }
 
     // 4. Перевірка 2: Кінематична нев'язка 2-го порядку (під час стрейфу Q/E та Supercruise).
@@ -166,19 +178,7 @@ inline bool isStereoEyeOrIpdProbe(
     const Vec3 residual = candPos - predictedPos;
     const float resDist = length(residual);
 
-    if (isIpdHarmonicDistance(resDist)) {
-        const float rRight   = std::fabs(dot(residual, right));
-        const float rUp      = std::fabs(dot(residual, up));
-        const float rForward = std::fabs(dot(residual, fwd));
-
-        const bool isResLateralIpd = (rRight >= 0.96f * resDist && rUp < 0.015f && rForward < 0.015f);
-        const bool isResCockpitHeadProbe = (rRight < 0.025f && rUp >= 0.65f * resDist && rForward >= 0.45f * resDist);
-
-        if (isResLateralIpd || isResCockpitHeadProbe) {
-            return true;
-        }
-    }
-    return false;
+    return matchesIpdOrCockpitProbeDisplacement(residual, resDist, right, up, fwd);
 }
 
 inline bool isReflectionOrAuxiliaryCamera(
@@ -212,6 +212,17 @@ inline bool isReflectionOrAuxiliaryCamera(
     }
 
     return false;
+}
+
+// Preserves a continuous eye position while adopting an updated orientation/projection
+// (used when a frame carries only a single-frame ~1 Hz IPD/cockpit probe translation offset).
+inline CameraProjection preservePositionWithOrientation(
+    const CameraProjection& orientationSource,
+    const Vec3& continuousPosition)
+{
+    CameraProjection out = orientationSource;
+    cameraSetPosition(out, continuousPosition);
+    return out;
 }
 
 enum CameraDeltaFlag : unsigned {
