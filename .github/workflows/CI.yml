@@ -101,12 +101,17 @@ jobs:
 
       - name: Configure CMake
         shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          IS_EXPERIMENTAL: ${{ inputs.experimental }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
         run: |
-          $ver = if ('${{ github.ref_type }}' -eq "tag") {
-            '${{ github.ref_name }}'
-          } elseif ('${{ inputs.experimental }}' -eq 'true') {
+          $ver = if ($env:REF_TYPE -eq "tag") {
+            $env:REF_NAME
+          } elseif ($env:IS_EXPERIMENTAL -eq 'true') {
             git fetch --depth=1 -f origin '+refs/tags/*:refs/tags/*'
-            $customNum = "${{ inputs.build_number }}".Trim()
+            $customNum = "$env:BUILD_NUMBER".Trim()
             if (-not [string]::IsNullOrWhiteSpace($customNum)) {
               "exp-build-$customNum"
             } else {
