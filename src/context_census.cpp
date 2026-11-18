@@ -3516,7 +3516,16 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             edpe::UpscalerManager::instance().isReconstructionActive() ||
             s_jitter_debug_view.load(std::memory_order_relaxed) ||
             s_hud_debug_view.load(std::memory_order_relaxed);
-        if (bbRes && wantUpscale && !s_upscale_evaluated_this_frame &&
+        const UINT pass53OutW = s_swapchain_width.load(std::memory_order_relaxed);
+        const UINT pass53OutH = s_swapchain_height.load(std::memory_order_relaxed);
+        const UINT pass53SceneW = s_observed_scene_width.load(std::memory_order_relaxed);
+        const UINT pass53SceneH = s_observed_scene_height.load(std::memory_order_relaxed);
+        const bool pass53SubNative =
+            (pass53OutW > 0 && pass53OutH > 0 && pass53SceneW > 0 && pass53SceneH > 0 &&
+             (pass53SceneW < pass53OutW || pass53SceneH < pass53OutH));
+        const bool allowPass53Eval =
+            s_preserve_native_ui.load(std::memory_order_relaxed) || pass53SubNative;
+        if (bbRes && wantUpscale && allowPass53Eval && !s_upscale_evaluated_this_frame &&
             s_post_ldr_backbuffer_bound &&
             count >= 3 && count <= 6 && instance_count == 1 &&
             scene_ldr_source && scene_ldr_frame == current_frame) {
@@ -8398,10 +8407,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (isSubNative && ldrCandidate) {
             rawColorChoice = ldrCandidate;
         } else if (!isSubNative) {
-            // Always prefer scene_ldr_source (Pass 52 Tonemapping output before Pass 53/54 2D UI)
-            // even when Preserve Native HUD is OFF, so Pass 53/54 2D menus (ESC Pause Menu, Main Menu)
-            // and mouse cursor are composited cleanly over the upscaled/AA output instead of being lost or smeared.
-            const bool ldrAvailable = (ldrCandidate != nullptr);
+            // When Preserve Native UI is ON, prefer scene_ldr_source (Pass 52 Tonemapping output before
+            // Pass 53/54 2D UI). When Preserve Native UI is OFF at native resolution, feed
+            // presentBackbuffer so the upscaler processes the full frame including 2D menus and HUD
+            // instead of overwriting them with scene_ldr_source at Present.
+            const bool ldrAvailable = (preserveUi && ldrCandidate != nullptr);
             rawColorChoice = ldrAvailable ? ldrCandidate : presentBackbuffer;
             static unsigned long long s_native_src_log = ~0ull;
             if (edpe::Config::instance().devMode && (s_native_src_log == ~0ull || frame >= s_native_src_log + 300)) {
@@ -9063,7 +9073,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             if (!evaluatedAtPass53) {
                 s_diag_eval_stage = 2;
             }
-            const bool allowBackbufferWrite = evaluatedAtPass53 || (s_pause_menu_seen_frame != rendered);
+            const bool allowBackbufferWrite = evaluatedAtPass53 || chosenIsBackbuffer || (s_pause_menu_seen_frame != rendered);
             const bool hudWasDiverted = (s_hud_draws_replayed_frame > 0 && !isPauseOrModalMenuActive(rendered));
             const bool visorWasDiverted =
                 (s_visor_diverted_frame == rendered &&
