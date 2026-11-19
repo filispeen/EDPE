@@ -291,6 +291,7 @@ void ObserveDxgiSwapChain(IDXGISwapChain* swap_chain) {
 namespace {
 std::atomic<CreateSwapChainFn> s_origWrappedCreateSwapChain{nullptr};
 std::atomic<CreateSwapChainForHwndFn> s_origWrappedCreateSwapChainForHwnd{nullptr};
+thread_local bool t_inRenderDocFactoryProbe = false;
 
 HRESULT STDMETHODCALLTYPE observedWrappedCreateSwapChain(IDXGIFactory* factory, IUnknown* device,
     DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swap_chain) {
@@ -341,10 +342,24 @@ bool patchWrappedFactorySlot(void** table, size_t slot, void* replacement, void*
 } // namespace
 
 void EnsureRenderDocFactoryHooked() {
-    if (!GetModuleHandleW(L"renderdoc.dll")) return;
+    if (t_inRenderDocFactoryProbe || !GetModuleHandleW(L"renderdoc.dll")) return;
     static std::once_flag s_once;
     std::call_once(s_once, [] {
-        const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
+        struct ProbeGuard {
+            bool& flag;
+            explicit ProbeGuard(bool& f) : flag(f) { flag = true; }
+            ~ProbeGuard() { flag = false; }
+        } guard(t_inRenderDocFactoryProbe);
+        HMODULE system_dxgi = nullptr;
+        wchar_t sysDxgiPath[MAX_PATH]{};
+        const UINT sysLen = GetSystemDirectoryW(sysDxgiPath, MAX_PATH);
+        if (sysLen > 0 && sysLen + 10 < MAX_PATH) {
+            wcscpy_s(sysDxgiPath + sysLen, MAX_PATH - sysLen, L"\\dxgi.dll");
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, sysDxgiPath, &system_dxgi);
+        }
+        if (!system_dxgi) {
+            system_dxgi = LoadSystemDll(L"dxgi.dll");
+        }
         if (!system_dxgi) return;
         const auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory1)>(
             GetProcAddress(system_dxgi, "CreateDXGIFactory1"));

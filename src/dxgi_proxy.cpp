@@ -37,10 +37,14 @@ void syncConfigOnce() {
     static std::once_flag s_once;
     std::call_once(s_once, [] {
         edpe::RenderDocBridge::instance().refresh();
-        edpe::installD3D11Hooks();
+        // Preload system DLLs before patching IATs so RenderDoc's LoadLibrary hook
+        // does not immediately overwrite EDPE's D3D11 IAT entries.
+        LoadSystemDll(L"dxgi.dll");
+        LoadSystemDll(L"d3d11.dll");
         if (edpe::isRunningInEliteProcess()) {
             edpe::installInputHooks();
         }
+        edpe::installD3D11Hooks();
         auto& cfg = edpe::Config::instance();
         cfg.load();
         if (cfg.syncEliteGraphicsConfig()) {
@@ -54,8 +58,10 @@ void syncConfigOnce() {
 
 extern "C" HRESULT WINAPI EdpeCreateDXGIFactory(REFIID iid, void** factory) {
     const bool fromRenderDoc = (t_dxgiFactoryDepth > 0) || IsAddressInRenderDocModule(_ReturnAddress());
-    if (!fromRenderDoc) {
+    if (t_dxgiFactoryDepth == 0) {
         syncConfigOnce();
+        ScopedDepth probeGuard(t_dxgiFactoryDepth);
+        EnsureRenderDocFactoryHooked();
     }
     static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
     if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());
@@ -77,8 +83,10 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory(REFIID iid, void** factory) {
 
 extern "C" HRESULT WINAPI EdpeCreateDXGIFactory1(REFIID iid, void** factory) {
     const bool fromRenderDoc = (t_dxgiFactoryDepth > 0) || IsAddressInRenderDocModule(_ReturnAddress());
-    if (!fromRenderDoc) {
+    if (t_dxgiFactoryDepth == 0) {
         syncConfigOnce();
+        ScopedDepth probeGuard(t_dxgiFactoryDepth);
+        EnsureRenderDocFactoryHooked();
     }
     static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
     if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());
@@ -100,8 +108,10 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory1(REFIID iid, void** factory) {
 
 extern "C" HRESULT WINAPI EdpeCreateDXGIFactory2(UINT flags, REFIID iid, void** factory) {
     const bool fromRenderDoc = (t_dxgiFactoryDepth > 0) || IsAddressInRenderDocModule(_ReturnAddress());
-    if (!fromRenderDoc) {
+    if (t_dxgiFactoryDepth == 0) {
         syncConfigOnce();
+        ScopedDepth probeGuard(t_dxgiFactoryDepth);
+        EnsureRenderDocFactoryHooked();
     }
     static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
     if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());

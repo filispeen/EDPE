@@ -552,7 +552,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
     D3D_FEATURE_LEVEL* feature_level,
     ID3D11DeviceContext** context) {
     const bool fromRenderDoc = (t_d3d11CreateDepth > 0) || IsAddressInRenderDocModule(_ReturnAddress());
-    if (!fromRenderDoc) {
+    if (t_d3d11CreateDepth == 0) {
         syncConfigOnce();
     }
     const HMODULE system_d3d11 = resolveRealSystemD3D11();
@@ -608,7 +608,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDeviceAndSwapChain(
     D3D_FEATURE_LEVEL* pFeatureLevel,
     ID3D11DeviceContext** ppImmediateContext) {
     const bool fromRenderDoc = (t_d3d11CreateDepth > 0) || IsAddressInRenderDocModule(_ReturnAddress());
-    if (!fromRenderDoc) {
+    if (t_d3d11CreateDepth == 0) {
         syncConfigOnce();
     }
     const HMODULE system_d3d11 = resolveRealSystemD3D11();

@@ -113,18 +113,17 @@ int runCaptureSmoke(const wchar_t* dxgiPath) {
         return fail("Missing EDPE dxgi.dll exports");
     }
 
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(pCreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) || !factory) {
+        return fail("CreateDXGIFactory1 failed");
+    }
+
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     if (FAILED(pD3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
             nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context)) || !device || !context) {
+        factory->Release();
         return fail("D3D11CreateDevice failed");
-    }
-
-    IDXGIFactory1* factory = nullptr;
-    if (FAILED(pCreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) || !factory) {
-        context->Release();
-        device->Release();
-        return fail("CreateDXGIFactory1 failed");
     }
 
     WNDCLASSW wc{};
