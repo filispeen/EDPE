@@ -132,6 +132,9 @@ public:
 
         renderDocAnnotations = GetPrivateProfileIntW(L"RenderDoc", L"EnableAnnotations", 1, path.c_str()) != 0;
         RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
+
+        wrapDirectInputMouse = GetPrivateProfileIntW(L"Input", L"WrapDirectInputMouse", 1, path.c_str()) != 0;
+        wrapDirectInputKeyboard = GetPrivateProfileIntW(L"Input", L"WrapDirectInputKeyboard", 1, path.c_str()) != 0;
     }
 
     void save() {
@@ -208,6 +211,9 @@ public:
 
         WritePrivateProfileStringW(L"RenderDoc", L"EnableAnnotations", renderDocAnnotations ? L"1" : L"0", path.c_str());
         RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
+
+        WritePrivateProfileStringW(L"Input", L"WrapDirectInputMouse", wrapDirectInputMouse ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"Input", L"WrapDirectInputKeyboard", wrapDirectInputKeyboard ? L"1" : L"0", path.c_str());
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -339,6 +345,9 @@ public:
     bool debugViewActive = false;
 
     bool renderDocAnnotations = true;
+
+    bool wrapDirectInputMouse = true;
+    bool wrapDirectInputKeyboard = true;
 };
 
 } // namespace edpe

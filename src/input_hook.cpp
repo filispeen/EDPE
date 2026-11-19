@@ -156,16 +156,35 @@ struct CreateDeviceDepthGuard {
     ~CreateDeviceDepthGuard() { --depth; }
 };
 
+template <typename TDevice, typename TProxy>
+void maybeWrapDirectInputDevice(REFGUID rguid, TDevice** lplpDevice, REFIID iid, const wchar_t* proxySuffix) {
+    if (!lplpDevice || !*lplpDevice) return;
+    const bool isMouse = IsEqualGUID(rguid, GUID_SysMouse);
+    const bool isKeyboard = IsEqualGUID(rguid, GUID_SysKeyboard);
+    if (!isMouse && !isKeyboard) return;
+
+    const auto& cfg = edpe::Config::instance();
+    const bool enabled = isMouse ? cfg.wrapDirectInputMouse : cfg.wrapDirectInputKeyboard;
+    if (!enabled) {
+        EdpeLog(isMouse
+            ? L"EDPE: DirectInput SysMouse proxy disabled by config"
+            : L"EDPE: DirectInput SysKeyboard proxy disabled by config");
+        return;
+    }
+
+    *lplpDevice = new TProxy(*lplpDevice, iid);
+    wchar_t msg[128];
+    swprintf_s(msg, L"EDPE: wrapped DirectInput %ls with %ls",
+        isMouse ? L"SysMouse" : L"SysKeyboard", proxySuffix);
+    EdpeLog(msg);
+}
+
 HRESULT STDMETHODCALLTYPE Hooked_CreateDeviceW(IDirectInput8W* self, REFGUID rguid, LPDIRECTINPUTDEVICE8W* lplpDevice, LPUNKNOWN pUnkOuter) {
     CreateDeviceDepthGuard guard(t_createDeviceDepth);
     HRESULT hr = orig_CreateDeviceW ? orig_CreateDeviceW(self, rguid, lplpDevice, pUnkOuter) : E_FAIL;
-    if (guard.depth == 1 && SUCCEEDED(hr) && lplpDevice && *lplpDevice) {
-        if (IsEqualGUID(rguid, GUID_SysMouse) || IsEqualGUID(rguid, GUID_SysKeyboard)) {
-            *lplpDevice = new SafeDirectInputDevice8WProxy(*lplpDevice, IID_IDirectInputDevice8W);
-            EdpeLog(IsEqualGUID(rguid, GUID_SysMouse)
-                ? L"EDPE: wrapped DirectInput SysMouse with SafeDirectInputDevice8WProxy"
-                : L"EDPE: wrapped DirectInput SysKeyboard with SafeDirectInputDevice8WProxy");
-        }
+    if (guard.depth == 1 && SUCCEEDED(hr)) {
+        maybeWrapDirectInputDevice<IDirectInputDevice8W, SafeDirectInputDevice8WProxy>(
+            rguid, lplpDevice, IID_IDirectInputDevice8W, L"SafeDirectInputDevice8WProxy");
     }
     return hr;
 }
@@ -173,13 +192,9 @@ HRESULT STDMETHODCALLTYPE Hooked_CreateDeviceW(IDirectInput8W* self, REFGUID rgu
 HRESULT STDMETHODCALLTYPE Hooked_CreateDeviceA(IDirectInput8A* self, REFGUID rguid, LPDIRECTINPUTDEVICE8A* lplpDevice, LPUNKNOWN pUnkOuter) {
     CreateDeviceDepthGuard guard(t_createDeviceDepth);
     HRESULT hr = orig_CreateDeviceA ? orig_CreateDeviceA(self, rguid, lplpDevice, pUnkOuter) : E_FAIL;
-    if (guard.depth == 1 && SUCCEEDED(hr) && lplpDevice && *lplpDevice) {
-        if (IsEqualGUID(rguid, GUID_SysMouse) || IsEqualGUID(rguid, GUID_SysKeyboard)) {
-            *lplpDevice = new SafeDirectInputDevice8AProxy(*lplpDevice, IID_IDirectInputDevice8A);
-            EdpeLog(IsEqualGUID(rguid, GUID_SysMouse)
-                ? L"EDPE: wrapped DirectInput SysMouse with SafeDirectInputDevice8AProxy"
-                : L"EDPE: wrapped DirectInput SysKeyboard with SafeDirectInputDevice8AProxy");
-        }
+    if (guard.depth == 1 && SUCCEEDED(hr)) {
+        maybeWrapDirectInputDevice<IDirectInputDevice8A, SafeDirectInputDevice8AProxy>(
+            rguid, lplpDevice, IID_IDirectInputDevice8A, L"SafeDirectInputDevice8AProxy");
     }
     return hr;
 }

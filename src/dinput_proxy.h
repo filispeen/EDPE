@@ -20,7 +20,7 @@ public:
     SafeDirectInputDeviceProxy(TDevice* real, REFIID iid)
         : m_real(real), m_iid(iid) {}
 
-    virtual ~SafeDirectInputDeviceProxy() = default;
+    ~SafeDirectInputDeviceProxy() = default;
 
     // --- IUnknown ---
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* ppvObj) override {
