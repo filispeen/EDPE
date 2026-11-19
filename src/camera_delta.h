@@ -263,9 +263,9 @@ inline bool isTransientOriginRebaseHoldEligible(
     bool cutStreakSatisfied)
 {
     if (!inMainScene || cutStreakSatisfied || teleportStreak >= 5) return false;
-    if (jumpResidual <= 15.0f || jumpResidual >= 500.0f) return false;
+    if (jumpResidual <= 15.0f || jumpResidual >= 2000.0f) return false;
     if (isCameraProjectionCut(candidate, committed)) return false;
-    return cameraRotationTrace(candidate, committed) > 2.95f;
+    return cameraRotationTrace(candidate, committed) > 2.414f;
 }
 
 // True when a committed translation step exceeds normal camera bounds (>50m)

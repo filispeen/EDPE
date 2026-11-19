@@ -6236,25 +6236,24 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
             std::uint64_t fvs = 0, fps = 0;
             getFastBoundShaderHashes(context, fvs, fps);
             isFlareShader = (fvs == 0xEA9C5A11E64E94F0ull);
-            context->VSGetShaderResources(0, 1, flareOrigVsT0.GetAddressOf());
-            if (flareOrigVsT0) {
-                flareStableVsT0 = stabilizeFlareDepthForDraw(context, flareOrigVsT0.Get(), motion_color_frame);
-                if (flareStableVsT0) {
-                    flareUnjittered = true;
-                    context->VSSetShaderResources(0, 1, &flareStableVsT0);
-                    static std::atomic<bool> s_logged_flare_depth_stab{false};
-                    if (!s_logged_flare_depth_stab.exchange(true, std::memory_order_relaxed)) {
-                        wchar_t msg[192];
-                        swprintf_s(msg, L"EDPE: flare depth t0 stabilized VS=0x%016llX PS=0x%016llX inst=%u",
-                            static_cast<unsigned long long>(fvs),
-                            static_cast<unsigned long long>(fps),
-                            instance_count);
-                        EdpeLog(msg);
-                    }
-                }
-            }
             if (isFlareShader) {
                 flareUnjittered = true;
+                context->VSGetShaderResources(0, 1, flareOrigVsT0.GetAddressOf());
+                if (flareOrigVsT0) {
+                    flareStableVsT0 = stabilizeFlareDepthForDraw(context, flareOrigVsT0.Get(), motion_color_frame);
+                    if (flareStableVsT0) {
+                        context->VSSetShaderResources(0, 1, &flareStableVsT0);
+                        static std::atomic<bool> s_logged_flare_depth_stab{false};
+                        if (!s_logged_flare_depth_stab.exchange(true, std::memory_order_relaxed)) {
+                            wchar_t msg[192];
+                            swprintf_s(msg, L"EDPE: flare depth t0 stabilized VS=0x%016llX PS=0x%016llX inst=%u",
+                                static_cast<unsigned long long>(fvs),
+                                static_cast<unsigned long long>(fps),
+                                instance_count);
+                            EdpeLog(msg);
+                        }
+                    }
+                }
                 Microsoft::WRL::ComPtr<ID3D11Buffer> flareOrigCb0;
                 bool flareCb0Jit = false;
                 if (s_cb0_jittered_frame.load(std::memory_order_acquire) == motion_color_frame) {
@@ -7761,8 +7760,11 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     //    Cobra unmaps VS cb1 before binding the 4-MRT G-buffer.
                     // 3) Same-pose scene sub-passes (e.g. viewmodel Z-prepass before main world G-buffer)
                     //    must never increment s_cut_rejection_streak or pose-check as cuts.
+                    const bool cb1HasLiveEyePos =
+                        edpe::hasMatchingEliteCb1CameraPosition(words, 5376 / sizeof(float), local_cam932);
                     bool cut_streak_satisfied = false;
                     if (!passes_filter && !is_probe && !is_same_pose_subpass_cand && !is_cb1_subpass &&
+                        (in_main_scene || s_consecutive_fallback_frames >= 1 || cb1HasLiveEyePos) &&
                         cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                         cameraRotationDeterminant(parsed_camera) <= 1.15f &&
                         parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
@@ -7801,18 +7803,17 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         allow_stage = true;
 
                         // Per-FRAME hologram jump guard (passes 25-26 share one frame).
-                        // When Cobra temporarily switches the local-origin anchor (~22-23.5m) on foot
-                        // for 1-4 consecutive frames inside the main 4-MRT G-buffer (same orientation
-                        // & projection), provisionally stage it so CB1 keeps subpixel jitter while
-                        // commitMainCamera holds continuous position; if it persists >= 5 frames,
-                        // accept it as a real teleport / scene cut.
+                        // When Cobra temporarily switches the local-origin anchor (~22-23.5m or planetary ~425-520m)
+                        // on foot for 1-4 consecutive frames inside the main 4-MRT G-buffer (same projection),
+                        // provisionally stage it so CB1 keeps subpixel jitter while commitMainCamera holds
+                        // continuous position; if it persists >= 5 frames, accept it as a real teleport / scene cut.
                         if (s_camera_now.scaleX > 0.0f) {
                             const edpe::Vec3 predicted =
                                 edpe::cameraPosition(s_camera_now) +
                                 (s_last_valid_velocity * std::clamp(dtRatio, 0.25f, 4.0f));
                             jumpResidual =
                                 edpe::length(edpe::cameraPosition(parsed_camera) - predicted);
-                            if (jumpResidual > 15.0f && jumpResidual < 500.0f) {
+                            if (jumpResidual > 15.0f && jumpResidual < 2000.0f) {
                                 if (!(s_has_staged_camera && s_staged_camera_frame == cur_frame &&
                                       s_staged_from_in_scene) &&
                                     s_last_teleport_rejection_frame != cur_frame) {
@@ -7936,8 +7937,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         const bool canCheckRef =
                             (s_has_staged_camera && s_staged_camera_frame == cur_frame) ||
                             (s_camera_now.scaleX > 0.0f &&
-                             s_verified_ldr_tonemap_frame != cur_frame &&
-                             s_cut_rejection_streak == 0);
+                             s_verified_ldr_tonemap_frame != cur_frame);
                         const edpe::CameraProjection* nearRef = canCheckRef
                             ? pickNearestPoseRef(intraDist, intraTrace)
                             : nullptr;
@@ -7946,15 +7946,25 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                              std::fabs(parsed_camera.depthB - s_staged_camera.depthB) <= 1e-3f &&
                              std::fabs(parsed_camera.scaleX - s_staged_camera.scaleX) <= 0.02f * s_staged_camera.scaleX &&
                              std::fabs(parsed_camera.scaleY - s_staged_camera.scaleY) <= 0.02f * s_staged_camera.scaleY);
+                        // cb1[241].xyz equals the cam932 eye position only for the live frame's eye pass,
+                        // so a cb1[35..38]-confirmed sub-pass with this property is the viewmodel of the
+                        // CURRENT frame. Its jitter decision must not depend on pre-scene auxiliary rejections
+                        // or origin rebases, otherwise the early viewmodel Z-prepass (EID 3578/3599) is left
+                        // unjittered while the later G-buffer (EID 4087/4108) and late HDR display (EID 6671)
+                        // are jittered -> depth mismatch flicker.
+                        const bool cb1EyeConfirmed =
+                            is_cb1_subpass && cb1HasLiveEyePos;
                         const bool distinctSubpassProjection =
-                            nearRef != nullptr && !hasStagedSameProj &&
-                            ((std::fabs(parsed_camera.depthB - nearRef->depthB) > 1e-3f &&
-                              !(s_has_staged_camera && s_staged_camera_frame == cur_frame &&
-                                std::fabs(parsed_camera.depthB - s_staged_camera.depthB) <= 1e-3f)) ||
-                             (is_cb1_subpass &&
-                              (std::fabs(parsed_camera.scaleX - nearRef->scaleX) > 0.02f * nearRef->scaleX ||
-                               std::fabs(parsed_camera.scaleY - nearRef->scaleY) > 0.02f * nearRef->scaleY ||
-                               std::fabs(parsed_camera.depthB - nearRef->depthB) > 1e-3f)));
+                            !hasStagedSameProj &&
+                            ((nearRef != nullptr &&
+                              ((std::fabs(parsed_camera.depthB - nearRef->depthB) > 1e-3f &&
+                                !(s_has_staged_camera && s_staged_camera_frame == cur_frame &&
+                                  std::fabs(parsed_camera.depthB - s_staged_camera.depthB) <= 1e-3f)) ||
+                               (is_cb1_subpass &&
+                                (std::fabs(parsed_camera.scaleX - nearRef->scaleX) > 0.02f * nearRef->scaleX ||
+                                 std::fabs(parsed_camera.scaleY - nearRef->scaleY) > 0.02f * nearRef->scaleY ||
+                                 std::fabs(parsed_camera.depthB - nearRef->depthB) > 1e-3f)))) ||
+                             (nearRef == nullptr && cb1EyeConfirmed));
                         if (distinctSubpassProjection) {
                             const auto* existingSubpass = s_scene_subpasses.find(
                                 cur_frame, parsed_camera.scaleX, parsed_camera.scaleY, parsed_camera.depthB);
@@ -7971,9 +7981,37 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                     (nearRef == &s_camera_now && is_cb1_subpass)
                                         ? std::max(maxSubpassDist, 1.0f)
                                         : maxSubpassDist;
-                                const bool poseOk =
-                                    edpe::isSamePoseSceneSubpass(
+                                bool poseOk = false;
+                                float diagTrace = 0.0f;
+                                float diagDist = 0.0f;
+                                if (nearRef != nullptr) {
+                                    poseOk = edpe::isSamePoseSceneSubpass(
                                         parsed_camera, *nearRef, subpassMaxDist, dtRatio, subpassVel, is_cb1_subpass);
+                                    diagTrace = edpe::cameraRotationTrace(parsed_camera, *nearRef);
+                                    diagDist = edpe::length(
+                                        edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(*nearRef));
+                                    if (!poseOk && cb1EyeConfirmed && diagTrace > 2.40f &&
+                                        cameraRotationDeterminant(parsed_camera) >= 0.85f &&
+                                        cameraRotationDeterminant(parsed_camera) <= 1.15f) {
+                                        poseOk = true;
+                                    }
+                                } else {
+                                    poseOk = cb1EyeConfirmed;
+                                }
+                                {
+                                    static unsigned s_vm_tokens = 0;
+                                    static unsigned long long s_vm_refill_frame = ~0ull;
+                                    if (allowRefilledDiagLog(cur_frame, s_vm_refill_frame, s_vm_tokens, 12, 120)) {
+                                        wchar_t vmMsg[256];
+                                        swprintf_s(vmMsg,
+                                            L"EDPE DIAG: viewmodel subpass decision frame=%llu poseOk=%d cb1Eye=%d ref=%d staged=%d inScene=%d dist=%.3f trace=%.4f depthB=%.4f sx=%.4f",
+                                            cur_frame, (int)poseOk, (int)cb1EyeConfirmed, nearRef ? 1 : 0,
+                                            (int)(s_has_staged_camera && s_staged_camera_frame == cur_frame),
+                                            (int)in_main_scene, diagDist, diagTrace,
+                                            parsed_camera.depthB, parsed_camera.scaleX);
+                                        EdpeLog(vmMsg);
+                                    }
+                                }
                                 const bool lockJitter = s_scene_subpasses.recordOrGet(
                                     cur_frame, parsed_camera.scaleX, parsed_camera.scaleY,
                                     parsed_camera.depthB, poseOk);
@@ -8100,7 +8138,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             const float lateDet = cameraRotationDeterminant(parsed_camera);
                             const bool lateOriginRebase =
                                 (nearRef == &s_staged_camera && s_staged_from_in_scene &&
-                                 lateDist > 15.0f && lateDist < 500.0f &&
+                                 lateDist > 15.0f && lateDist < 2000.0f &&
                                  lateTrace > 2.985f &&
                                  sameRefFov &&
                                  isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH));

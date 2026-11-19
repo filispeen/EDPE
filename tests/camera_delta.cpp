@@ -392,6 +392,23 @@ int main() {
     auto rotatedJump = yawed(50.0f);
     rotatedJump.worldFromView[11] = -22.5333f;
     if (edpe::isTransientOriginRebaseHoldEligible(rotatedJump, identity(), rebaseJump, 1, true, false)) return 92;
+    // Planetary local-origin rebase (~425..520m) during smooth on-foot camera rotation (e.g. 20 deg)
+    // inside the 4-MRT G-buffer MUST hold continuous position & keep jitter enabled:
+    auto planetaryTurningRebase = yawed(20.0f);
+    planetaryTurningRebase.scaleX = worldBase.scaleX;
+    planetaryTurningRebase.scaleY = worldBase.scaleY;
+    planetaryTurningRebase.depthB = worldBase.depthB;
+    planetaryTurningRebase.worldFromView[3] = 260.494f;
+    planetaryTurningRebase.worldFromView[7] = -118.427f;
+    planetaryTurningRebase.worldFromView[11] = 373.924f;
+    if (!edpe::isTransientOriginRebaseHoldEligible(
+            planetaryTurningRebase, worldBase, 519.124f, 1, true, false)) {
+        return 100;
+    }
+    if (edpe::isTransientOriginRebaseHoldEligible(
+            planetaryTurningRebase, worldBase, 2500.0f, 1, true, false)) {
+        return 101;
+    }
 
     // 31. Persistent unpredicted teleport (>15m beyond velocity prediction) triggers scene cut,
     // while smooth high-speed continuous flight (residual <= 15m, step <= 50m) does not.
