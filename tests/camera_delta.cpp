@@ -403,5 +403,36 @@ int main() {
     const edpe::Vec3 over50Step{0.0f, 0.0f, 55.0f};
     if (!edpe::isUnpredictedPositionCut(over50Step, over50Step)) return 95;
 
+    // 32. Viewmodel sub-pass during fast camera turn (>12.8 deg, <=45 deg) and
+    // planetary origin-rebased sub-pass (cb1[35..38] verified, ~460m offset, same orientation).
+    auto flickViewmodel = [&]() {
+        auto base = yawed(25.0f);
+        base.scaleX = 1.2935f;
+        base.scaleY = 2.300f;
+        base.depthB = 0.0675f;
+        return base;
+    }();
+    if (!edpe::isSamePoseSceneSubpass(flickViewmodel, worldBase, 0.35f, 1.0f, {0.0f, 0.0f, 0.0f}, true)) {
+        return 96;
+    }
+    auto cube90Probe = flickViewmodel;
+    cube90Probe = yawed(90.0f);
+    cube90Probe.scaleX = 1.2935f;
+    cube90Probe.scaleY = 2.300f;
+    cube90Probe.depthB = 0.0675f;
+    if (edpe::isSamePoseSceneSubpass(cube90Probe, worldBase, 0.35f, 1.0f, {0.0f, 0.0f, 0.0f}, true)) {
+        return 97;
+    }
+    edpe::CameraProjection rebasedViewmodel = viewmodelSubpass;
+    rebasedViewmodel.worldFromView[3] = 260.494f;
+    rebasedViewmodel.worldFromView[7] = -118.427f;
+    rebasedViewmodel.worldFromView[11] = 373.924f;
+    if (!edpe::isSamePoseSceneSubpass(rebasedViewmodel, worldBase, 0.35f, 1.0f, {0.0f, 0.0f, 0.0f}, true)) {
+        return 98;
+    }
+    if (edpe::isSamePoseSceneSubpass(rebasedViewmodel, worldBase, 0.35f, 1.0f, {0.0f, 0.0f, 0.0f}, false)) {
+        return 99;
+    }
+
     return 0;
 }

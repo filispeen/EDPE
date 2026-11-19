@@ -160,21 +160,23 @@ float2 reprojectRel(float4 pixel, float4 rel0, float4 rel1, float4 rel2,
     float2 priorPixel = prior.xy * rcp(prior.z) * prevProjHalf.xy + prevProjHalf.zw;
     float2 worldMv = priorPixel - rawPixel;
 
-    // 4. Fast depth-validated cockpit vs. world geometry disambiguation:
+    // 4. Fast depth-validated cockpit / viewmodel vs. world geometry disambiguation:
     if (clampCockpit && z < 10.0) {
         if (z < 3.5 && translationStep > 0.35) {
             return 0.0;
         }
-        if (hasPrevDepth && translationStep > 0.001 && dot(worldMv, worldMv) > 0.0625) {
+        if (hasPrevDepth && dot(worldMv, worldMv) > 0.0625) {
             int2 maxCoord = int2(info.y - 1.0, info.z - 1.0);
             int2 pWorld = clamp(int2(priorPixel + jitterInfo.zw), int2(0, 0), maxCoord);
             int2 pStatic = clamp(int2(rawPixel + jitterInfo.zw), int2(0, 0), maxCoord);
             float dWorld = prevSceneDepth.Load(int3(pWorld, 0));
             float dStatic = prevSceneDepth.Load(int3(pStatic, 0));
+            float dStaticCenter = prevSceneDepth.Load(int3(pixCoord, 0));
             float expectedPriorDepth = depthB / prior.z;
             float tol = max(1e-5, 0.025 * depth);
             bool worldMatches = (dWorld > 0.0 && dWorld <= 1.0) && (abs(dWorld - expectedPriorDepth) <= tol);
-            bool staticMatches = (dStatic > 0.0 && dStatic <= 1.0) && (abs(dStatic - depth) <= tol);
+            bool staticMatches = ((dStatic > 0.0 && dStatic <= 1.0) && (abs(dStatic - depth) <= tol)) ||
+                                 ((dStaticCenter > 0.0 && dStaticCenter <= 1.0) && (abs(dStaticCenter - depth) <= tol));
             if (!worldMatches && staticMatches) {
                 return 0.0;
             }

@@ -7937,8 +7937,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             (s_has_staged_camera && s_staged_camera_frame == cur_frame) ||
                             (s_camera_now.scaleX > 0.0f &&
                              s_verified_ldr_tonemap_frame != cur_frame &&
-                             s_cut_rejection_streak == 0 &&
-                             s_teleport_rejection_streak == 0);
+                             s_cut_rejection_streak == 0);
                         const edpe::CameraProjection* nearRef = canCheckRef
                             ? pickNearestPoseRef(intraDist, intraTrace)
                             : nullptr;
@@ -7968,9 +7967,13 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             } else {
                                 const edpe::Vec3 subpassVel =
                                     (nearRef == &s_camera_now) ? s_last_valid_velocity : edpe::Vec3{0.0f, 0.0f, 0.0f};
+                                const float subpassMaxDist =
+                                    (nearRef == &s_camera_now && is_cb1_subpass)
+                                        ? std::max(maxSubpassDist, 1.0f)
+                                        : maxSubpassDist;
                                 const bool poseOk =
                                     edpe::isSamePoseSceneSubpass(
-                                        parsed_camera, *nearRef, maxSubpassDist, dtRatio, subpassVel, is_cb1_subpass);
+                                        parsed_camera, *nearRef, subpassMaxDist, dtRatio, subpassVel, is_cb1_subpass);
                                 const bool lockJitter = s_scene_subpasses.recordOrGet(
                                     cur_frame, parsed_camera.scaleX, parsed_camera.scaleY,
                                     parsed_camera.depthB, poseOk);
@@ -8095,8 +8098,14 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 std::fabs(parsed_camera.scaleY - nearRef->scaleY) <= 0.02f * nearRef->scaleY &&
                                 parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f;
                             const float lateDet = cameraRotationDeterminant(parsed_camera);
+                            const bool lateOriginRebase =
+                                (nearRef == &s_staged_camera && s_staged_from_in_scene &&
+                                 lateDist > 15.0f && lateDist < 500.0f &&
+                                 lateTrace > 2.985f &&
+                                 sameRefFov &&
+                                 isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH));
                             if (preTonemapScenePass &&
-                                (lateDist <= maxIntraDist || exactMainProjMatch) &&
+                                (lateDist <= maxIntraDist || exactMainProjMatch || lateOriginRebase) &&
                                 lateTrace > 2.95f &&
                                 lateDet >= 0.85f && lateDet <= 1.15f &&
                                 parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
