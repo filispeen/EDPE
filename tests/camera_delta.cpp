@@ -374,5 +374,34 @@ int main() {
     if (!edpe::isCommittedCameraDiscontinuity(yawed(50.0f), identity())) return 86;
     if (!edpe::isCommittedCameraDiscontinuity(planarReflection, identity())) return 87;
 
+    // 30. External on-foot local-origin rebase (~22.9m jump, 0 deg rotation, same FOV/depthB)
+    // inside 4-MRT G-buffer for <5 frames must hold continuous position & keep jitter enabled;
+    // >=5 frames or pre-G-buffer (!inMainScene) or large rotation/FOV cut must not hold.
+    edpe::CameraProjection originRebase = worldBase;
+    originRebase.worldFromView[3] = -0.0741f;
+    originRebase.worldFromView[7] = -4.1486f;
+    originRebase.worldFromView[11] = -22.5333f;
+    const float rebaseJump = 22.912f;
+    if (!edpe::isTransientOriginRebaseHoldEligible(originRebase, worldBase, rebaseJump, 1, true, false)) return 88;
+    if (!edpe::isTransientOriginRebaseHoldEligible(originRebase, worldBase, rebaseJump, 4, true, false)) return 89;
+    // Streak >= 5 accepts persistent teleport instead of holding forever:
+    if (edpe::isTransientOriginRebaseHoldEligible(originRebase, worldBase, rebaseJump, 5, true, false)) return 90;
+    // Pre-G-buffer (!inMainScene) hologram jumps must not stage:
+    if (edpe::isTransientOriginRebaseHoldEligible(originRebase, worldBase, rebaseJump, 1, false, false)) return 91;
+    // Real rotation cut (>45 deg) or projection cut at >15m must not hold as origin rebase:
+    auto rotatedJump = yawed(50.0f);
+    rotatedJump.worldFromView[11] = -22.5333f;
+    if (edpe::isTransientOriginRebaseHoldEligible(rotatedJump, identity(), rebaseJump, 1, true, false)) return 92;
+
+    // 31. Persistent unpredicted teleport (>15m beyond velocity prediction) triggers scene cut,
+    // while smooth high-speed continuous flight (residual <= 15m, step <= 50m) does not.
+    const edpe::Vec3 teleportDelta{-0.0741f, -4.1486f, -22.5333f};
+    const edpe::Vec3 walkingVel{0.0f, 0.0f, 0.08f};
+    if (!edpe::isUnpredictedPositionCut(teleportDelta, walkingVel)) return 93;
+    const edpe::Vec3 flightStep{0.0f, 0.0f, 30.0f};
+    if (edpe::isUnpredictedPositionCut(flightStep, flightStep)) return 94;
+    const edpe::Vec3 over50Step{0.0f, 0.0f, 55.0f};
+    if (!edpe::isUnpredictedPositionCut(over50Step, over50Step)) return 95;
+
     return 0;
 }

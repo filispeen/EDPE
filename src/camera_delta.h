@@ -251,6 +251,35 @@ inline CameraProjection preservePositionWithOrientation(
     return out;
 }
 
+// True when a large translation jump inside the main 4-MRT G-buffer has the same
+// orientation and projection as the committed camera for <5 consecutive frames
+// (external on-foot local-origin rebase that snaps back after 1-4 frames).
+inline bool isTransientOriginRebaseHoldEligible(
+    const CameraProjection& candidate,
+    const CameraProjection& committed,
+    float jumpResidual,
+    unsigned teleportStreak,
+    bool inMainScene,
+    bool cutStreakSatisfied)
+{
+    if (!inMainScene || cutStreakSatisfied || teleportStreak >= 5) return false;
+    if (jumpResidual <= 15.0f || jumpResidual >= 500.0f) return false;
+    if (isCameraProjectionCut(candidate, committed)) return false;
+    return cameraRotationTrace(candidate, committed) > 2.95f;
+}
+
+// True when a committed translation step exceeds normal camera bounds (>50m)
+// or jumps >15m beyond linear velocity prediction (persistent teleport/cut).
+inline bool isUnpredictedPositionCut(
+    const Vec3& stepDelta,
+    const Vec3& predictedDelta)
+{
+    const float dist = length(stepDelta);
+    if (dist > 50.0f) return true;
+    if (dist <= 15.0f) return false;
+    return length(stepDelta - predictedDelta) > 15.0f;
+}
+
 enum CameraDeltaFlag : unsigned {
     kCameraDeltaRotation = 1,     // rotation above the logging threshold
     kCameraDeltaTranslation = 2,  // translation above the logging threshold
