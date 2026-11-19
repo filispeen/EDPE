@@ -356,17 +356,12 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
     elif phase == "after_package":
         header_icon, status_text = "🛠️", "Publishing"
         build_line = (
-            else "- ✅ **Build EDPE (Release x64)**"
-        pkg_line = f"- ✅ **Package Archive** — `{archive_name}`"
-        rel_line = "- 🔄 **Publish GitHub Release** — uploading build & creating release..."
-=======
             "- ✅ **Build EDPE (Release x64)**: built by CI"
             if has_artifact
             else "- ✅ **Build EDPE (Release x64)**"
         )
         pkg_line = f"- ✅ **Package Archive**: `{archive_name}`"
         rel_line = "- 🔄 **Publish GitHub Release**: uploading build & creating release..."
->>>>>>> master
     else:
         outcomes = [
             configure_outcome,
