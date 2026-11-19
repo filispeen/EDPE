@@ -4831,11 +4831,26 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             s_post_ldr_backbuffer_bound &&
             count >= 3 && count <= 6 && instance_count == 1 &&
             scene_ldr_source && scene_ldr_frame == current_frame) {
-            Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> psSrv0;
-            context->PSGetShaderResources(0, 1, psSrv0.GetAddressOf());
-            Microsoft::WRL::ComPtr<ID3D11Resource> srv0Res;
-            if (psSrv0) psSrv0->GetResource(&srv0Res);
-            if (srv0Res && srv0Res.Get() == static_cast<ID3D11Resource*>(scene_ldr_source.Get())) {
+            ID3D11ShaderResourceView* pass53Srvs[8]{};
+            context->PSGetShaderResources(0, 8, pass53Srvs);
+            int matchedLdrSlot = -1;
+            ID3D11Resource* srv0ResPtr = nullptr;
+            ID3D11Resource* srv1ResPtr = nullptr;
+            ID3D11Resource* srv2ResPtr = nullptr;
+            ID3D11Resource* const targetSceneLdrRes = static_cast<ID3D11Resource*>(scene_ldr_source.Get());
+            for (int i = 0; i < 8; ++i) {
+                if (!pass53Srvs[i]) continue;
+                Microsoft::WRL::ComPtr<ID3D11Resource> res;
+                pass53Srvs[i]->GetResource(&res);
+                if (i == 0) srv0ResPtr = res.Get();
+                if (i == 1) srv1ResPtr = res.Get();
+                if (i == 2) srv2ResPtr = res.Get();
+                if (matchedLdrSlot < 0 && res && res.Get() == targetSceneLdrRes) {
+                    matchedLdrSlot = i;
+                }
+                pass53Srvs[i]->Release();
+            }
+            if (matchedLdrSlot >= 0) {
                 Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
                 Microsoft::WRL::ComPtr<ID3D11DepthStencilView> curDsv;
                 context->OMGetRenderTargets(1, curRtv.GetAddressOf(), curDsv.GetAddressOf());
@@ -4914,8 +4929,8 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                     ++s_pass53_srv_fail_logs;
                     wchar_t msg[256];
                     swprintf_s(msg,
-                        L"EDPE: Pass 53 srv0 mismatch frame=%llu kind=%c count=%u srv0=%p sceneLdr=%p",
-                        current_frame, kind, count, srv0Res.Get(),
+                        L"EDPE: Pass 53 srv mismatch frame=%llu kind=%c count=%u t0=%p t1=%p t2=%p sceneLdr=%p",
+                        current_frame, kind, count, srv0ResPtr, srv1ResPtr, srv2ResPtr,
                         static_cast<const void*>(scene_ldr_source.Get()));
                     EdpeLog(msg);
                 }
