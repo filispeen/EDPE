@@ -755,11 +755,19 @@ int main() {
         hPx[(1 * 4 + 3) * 4 + 1] = 1.0f;
         hPx[(1 * 4 + 3) * 4 + 3] = 0.0f; // T = 0.0 (opaque HUD)
         // Row 2, col 0: translucent panel T=0.25 with UI=(60, 40, 0), world=(120, 120, 120), visorDelta=0
-        // (g=1.0): 60 + 120*0.25 = 90, 40 + 120*0.25 = 70, 0 + 120*0.25 = 30
+        // Linear-light composite (g=1.0): ((60/255)^2.2 + (30/255)^2.2)^(1/2.2)*255 = (66, 48, 30)
         wPx[2 * 4 + 0] = packRgbaA(120, 120, 120, 255);
         uiPx[2 * 4 + 0] = packRgbaA(60, 40, 0, 255);
-        hPx[(2 * 4 + 0) * 4 + 0] = 0.25f;
+        hPx[(2 * 4 + 0) * 4 + 0] = 0.04145f;
+        hPx[(2 * 4 + 0) * 4 + 1] = 0.01688f;
         hPx[(2 * 4 + 0) * 4 + 3] = 0.25f;
+        // Row 2, col 1: dim orange HUD glow (LUT shadow-toe crushed ui=(55, 5, 0), true linear H=(0.04, 0.0048, 0))
+        // over world=(80, 80, 80) -> linear add + chromaticity preservation yields ~(94, 82, 80), NOT (135, 85, 80) red!
+        wPx[2 * 4 + 1] = packRgbaA(80, 80, 80, 255);
+        uiPx[2 * 4 + 1] = packRgbaA(55, 5, 0, 255);
+        hPx[(2 * 4 + 1) * 4 + 0] = 0.04f;
+        hPx[(2 * 4 + 1) * 4 + 1] = 0.0048f;
+        hPx[(2 * 4 + 1) * 4 + 3] = 1.0f;
 
         D3D11_TEXTURE2D_DESC hdrDesc = outDesc;
         hdrDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -828,10 +836,16 @@ int main() {
             return 109;
         }
         const auto* outRow2 = static_cast<const uint8_t*>(mapped.pData) + 2 * mapped.RowPitch;
-        // Row 2 Col 0: translucent panel EDVR composite (90, 70, 30)
-        if (std::abs(int(outRow2[0]) - 90) > 2 || std::abs(int(outRow2[1]) - 70) > 2 || std::abs(int(outRow2[2]) - 30) > 2) {
+        // Row 2 Col 0: translucent panel linear-light composite (66, 48, 30)
+        if (std::abs(int(outRow2[0]) - 66) > 2 || std::abs(int(outRow2[1]) - 48) > 2 || std::abs(int(outRow2[2]) - 30) > 2) {
             context->Unmap(staging.Get(), 0);
             return 110;
+        }
+        // Row 2 Col 1: dim orange HUD glow preserves chromaticity without red blowup (~(94, 82, 80))
+        if (std::abs(int(outRow2[4]) - 94) > 2 || std::abs(int(outRow2[5]) - 82) > 2 || std::abs(int(outRow2[6]) - 80) > 2 ||
+            int(outRow2[5]) <= int(outRow2[6])) {
+            context->Unmap(staging.Get(), 0);
+            return 113;
         }
         context->Unmap(staging.Get(), 0);
 
@@ -849,8 +863,8 @@ int main() {
         context->CopyResource(staging.Get(), csOutTex.Get());
         if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 111;
         const auto* tunedRow2 = static_cast<const uint8_t*>(mapped.pData) + 2 * mapped.RowPitch;
-        // UI=(60,40,0)*1.5=(90,60,0) + world=(120,120,120)*0.25*0.5=(15,15,15) -> (105, 75, 15)
-        if (std::abs(int(tunedRow2[0]) - 105) > 2 || std::abs(int(tunedRow2[1]) - 75) > 2 || std::abs(int(tunedRow2[2]) - 15) > 2) {
+        // UI=(90,60,0) + world=(15,15,15) in linear space -> (91, 61, 15)
+        if (std::abs(int(tunedRow2[0]) - 91) > 2 || std::abs(int(tunedRow2[1]) - 61) > 2 || std::abs(int(tunedRow2[2]) - 15) > 2) {
             context->Unmap(staging.Get(), 0);
             return 112;
         }
