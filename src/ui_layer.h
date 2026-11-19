@@ -174,6 +174,8 @@ private:
     // Збережений контекст для Tonemap Re-issue:
     D3D11_VIEWPORT savedToneViewport_{};
     UINT savedToneViewportCount_ = 0;
+    D3D11_RECT savedToneScissors_[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT savedToneScissorCount_ = 0;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> savedToneRtv_;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> savedToneDsv_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> savedToneSrvs_[5];

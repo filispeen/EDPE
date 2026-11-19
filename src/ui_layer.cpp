@@ -971,6 +971,8 @@ bool UiLayer::beginTonemapReissue(ID3D11DeviceContext* context,
     // Зберігаємо оригінальний стан шейдерних ресурсів (слоти t0..t4), RTV та в'юпорту гри
     savedToneViewportCount_ = 1;
     context->RSGetViewports(&savedToneViewportCount_, &savedToneViewport_);
+    savedToneScissorCount_ = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    context->RSGetScissorRects(&savedToneScissorCount_, savedToneScissors_);
     context->OMGetRenderTargets(1, savedToneRtv_.GetAddressOf(), savedToneDsv_.GetAddressOf());
     for (int i = 0; i < 5; ++i) {
         context->PSGetShaderResources(static_cast<UINT>(i), 1, savedToneSrvs_[i].GetAddressOf());
@@ -1015,6 +1017,8 @@ bool UiLayer::beginTonemapReissue(ID3D11DeviceContext* context,
 
     const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width_), static_cast<float>(height_), 0.0f, 1.0f};
     context->RSSetViewports(1, &vp);
+    const D3D11_RECT fullScissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    context->RSSetScissorRects(1, &fullScissor);
 
     const FLOAT blendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     context->OMSetBlendState(toneRgbOnlyBlend_.Get(), blendFactor, 0xFFFFFFFF);
@@ -1041,6 +1045,9 @@ void UiLayer::endTonemapReissue(ID3D11DeviceContext* context) {
     context->PSSetConstantBuffers(2, 1, &origExposureCb);
     context->OMSetBlendState(savedToneBlend_.Get(), savedToneBlendFactor_, savedToneSampleMask_);
     context->RSSetViewports(savedToneViewportCount_, &savedToneViewport_);
+    if (savedToneScissorCount_ > 0) {
+        context->RSSetScissorRects(savedToneScissorCount_, savedToneScissors_);
+    }
     context->OMSetRenderTargets(1, savedToneRtv_.GetAddressOf(), savedToneDsv_.Get());
 
     savedToneRtv_.Reset();

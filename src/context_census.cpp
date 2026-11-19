@@ -2370,11 +2370,57 @@ static void resetHudMaskResources(ID3D11Device* newDevice = nullptr) {
     s_hud_mask_device = newDevice;
 }
 
-void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
-    if (!device || width == 0 || height == 0) return;
+void ensureHudSharedUtilityStates(ID3D11Device* device) {
+    if (!device) return;
     if (s_hud_mask_device != device) {
         resetHudMaskResources(device);
     }
+    if (!s_hud_hdr_merge_vs || !s_hud_hdr_merge_ps) {
+        Microsoft::WRL::ComPtr<ID3DBlob> vsBlob, psBlob;
+        if (SUCCEEDED(D3DCompile(kHudHdrMergeShader, sizeof(kHudHdrMergeShader) - 1, nullptr, nullptr,
+                nullptr, "vs_main", "vs_5_0", 0, 0, &vsBlob, nullptr)) &&
+            SUCCEEDED(D3DCompile(kHudHdrMergeShader, sizeof(kHudHdrMergeShader) - 1, nullptr, nullptr,
+                nullptr, "ps_main", "ps_5_0", 0, 0, &psBlob, nullptr))) {
+            device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &s_hud_hdr_merge_vs);
+            device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &s_hud_hdr_merge_ps);
+        }
+    }
+    if (!s_hud_hdr_merge_sampler) {
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD = 0.0f;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        device->CreateSamplerState(&sd, &s_hud_hdr_merge_sampler);
+    }
+    if (!s_hud_mask_blend_add) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE; // Transmittance untouched: T' = T
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        device->CreateBlendState(&bd, &s_hud_mask_blend_add);
+    }
+    if (!s_hud_mask_ds_state_no_depth) {
+        D3D11_DEPTH_STENCIL_DESC dsdNoDepth{};
+        dsdNoDepth.DepthEnable = FALSE;
+        dsdNoDepth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        dsdNoDepth.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        dsdNoDepth.StencilEnable = FALSE;
+        device->CreateDepthStencilState(&dsdNoDepth, &s_hud_mask_ds_state_no_depth);
+    }
+}
+
+void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
+    if (!device || width == 0 || height == 0) return;
+    ensureHudSharedUtilityStates(device);
     if (s_hud_mask_texture && s_hud_mask_width == width && s_hud_mask_height == height) {
         return;
     }
@@ -2534,27 +2580,6 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
         }
     }
 
-    if (!s_hud_hdr_merge_vs || !s_hud_hdr_merge_ps) {
-        Microsoft::WRL::ComPtr<ID3DBlob> vsBlob, psBlob;
-        if (SUCCEEDED(D3DCompile(kHudHdrMergeShader, sizeof(kHudHdrMergeShader) - 1, nullptr, nullptr,
-                nullptr, "vs_main", "vs_5_0", 0, 0, &vsBlob, nullptr)) &&
-            SUCCEEDED(D3DCompile(kHudHdrMergeShader, sizeof(kHudHdrMergeShader) - 1, nullptr, nullptr,
-                nullptr, "ps_main", "ps_5_0", 0, 0, &psBlob, nullptr))) {
-            device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &s_hud_hdr_merge_vs);
-            device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &s_hud_hdr_merge_ps);
-        }
-    }
-    if (!s_hud_hdr_merge_sampler) {
-        D3D11_SAMPLER_DESC sd{};
-        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-        sd.MinLOD = 0.0f;
-        sd.MaxLOD = D3D11_FLOAT32_MAX;
-        device->CreateSamplerState(&sd, &s_hud_hdr_merge_sampler);
-    }
     if (!s_hud_hdr_merge_blend) {
         D3D11_BLEND_DESC mbd{};
         mbd.RenderTarget[0].BlendEnable = TRUE;
@@ -2579,18 +2604,6 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
     s_hud_mask_width = width;
     s_hud_mask_height = height;
 
-    if (!s_hud_mask_blend_add) {
-        D3D11_BLEND_DESC bd{};
-        bd.RenderTarget[0].BlendEnable = TRUE;
-        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
-        bd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
-        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
-        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE; // Transmittance untouched: T' = T
-        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-        device->CreateBlendState(&bd, &s_hud_mask_blend_add);
-    }
     if (!s_hud_mask_blend_scaled_add) {
         D3D11_BLEND_DESC bd{};
         bd.RenderTarget[0].BlendEnable = TRUE;
@@ -2695,14 +2708,6 @@ void ensureHudMaskResources(ID3D11Device* device, UINT width, UINT height) {
         dsd.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;   // Elite Dangerous reversed-Z
         dsd.StencilEnable = FALSE;
         device->CreateDepthStencilState(&dsd, &s_hud_mask_ds_state);
-    }
-    if (!s_hud_mask_ds_state_no_depth) {
-        D3D11_DEPTH_STENCIL_DESC dsdNoDepth{};
-        dsdNoDepth.DepthEnable = FALSE;
-        dsdNoDepth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-        dsdNoDepth.DepthFunc = D3D11_COMPARISON_ALWAYS;
-        dsdNoDepth.StencilEnable = FALSE;
-        device->CreateDepthStencilState(&dsdNoDepth, &s_hud_mask_ds_state_no_depth);
     }
     if (!s_hud_earlyz_texture || !s_hud_earlyz_dsv) {
         s_hud_earlyz_texture.Reset();
@@ -4114,11 +4119,7 @@ ID3D11ShaderResourceView* stabilizeFlareDepthForDraw(ID3D11DeviceContext* contex
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
     if (!device) return nullptr;
-    if (s_hud_mask_device != device.Get()) {
-        resetHudMaskResources(device.Get());
-    }
-
-    ensureHudMaskResources(device.Get(), sceneW, sceneH);
+    ensureHudSharedUtilityStates(device.Get());
     if (!ensureComputeShaderAndCb(device.Get(), kFlareStabilizeDepthCsHlsl,
             sizeof(kFlareStabilizeDepthCsHlsl) - 1, 96, L"flare depth",
             s_flare_depth_cs, s_flare_depth_cb) ||
@@ -4308,7 +4309,7 @@ bool issueAndStabilizeAdditiveFlareDraw(ID3D11DeviceContext* context,
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
     if (!device) return false;
-    ensureHudMaskResources(device.Get(), sceneW, sceneH);
+    ensureHudSharedUtilityStates(device.Get());
     if (!s_hud_hdr_merge_vs || !s_hud_mask_blend_add || !s_hud_mask_ds_state_no_depth) {
         return false;
     }
