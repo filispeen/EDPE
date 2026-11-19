@@ -4925,14 +4925,30 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                 }
             } else {
                 static unsigned s_pass53_srv_fail_logs = 0;
-                if (s_pass53_srv_fail_logs < 4) {
-                    ++s_pass53_srv_fail_logs;
-                    wchar_t msg[256];
-                    swprintf_s(msg,
-                        L"EDPE: Pass 53 srv mismatch frame=%llu kind=%c count=%u t0=%p t1=%p t2=%p sceneLdr=%p",
-                        current_frame, kind, count, srv0ResPtr, srv1ResPtr, srv2ResPtr,
-                        static_cast<const void*>(scene_ldr_source.Get()));
-                    EdpeLog(msg);
+                if (s_pass53_srv_fail_logs < 8) {
+                    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
+                    context->OMGetRenderTargets(1, curRtv.GetAddressOf(), nullptr);
+                    Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
+                    if (curRtv) curRtv->GetResource(&rtvRes);
+                    const bool rtvEqBb = (rtvRes && rtvRes.Get() == bbRes);
+                    if (rtvEqBb || count == 3) {
+                        ++s_pass53_srv_fail_logs;
+                        D3D11_TEXTURE2D_DESC t0Desc{};
+                        if (srv0ResPtr) {
+                            Microsoft::WRL::ComPtr<ID3D11Texture2D> t0Tex;
+                            if (SUCCEEDED(srv0ResPtr->QueryInterface(__uuidof(ID3D11Texture2D),
+                                    reinterpret_cast<void**>(t0Tex.GetAddressOf()))) && t0Tex) {
+                                t0Tex->GetDesc(&t0Desc);
+                            }
+                        }
+                        wchar_t msg[256];
+                        swprintf_s(msg,
+                            L"EDPE: Pass 53 srv mismatch frame=%llu kind=%c count=%u rtvEqBb=%d t0=%p (%ux%u fmt=%u) t1=%p sceneLdr=%p",
+                            current_frame, kind, count, rtvEqBb ? 1 : 0,
+                            srv0ResPtr, t0Desc.Width, t0Desc.Height, static_cast<unsigned>(t0Desc.Format),
+                            srv1ResPtr, static_cast<const void*>(scene_ldr_source.Get()));
+                        EdpeLog(msg);
+                    }
                 }
             }
         } else if (wantUpscale && !s_upscale_evaluated_this_frame &&
