@@ -4,9 +4,10 @@
 
 [![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version&style=for-the-badge)](https://github.com/filispeen/EDPE/releases/latest)
 ![CI](https://img.shields.io/github/actions/workflow/status/filispeen/EDPE/CI.yml?style=for-the-badge&label=CI)
-[![Status](https://img.shields.io/badge/status-v0.7.2%20Verified%20In--Game-success.svg?style=for-the-badge)](STATUS.md)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg?style=for-the-badge)]()
 [![Tests](https://img.shields.io/badge/tests-15%2F15%20Passing-brightgreen.svg?style=for-the-badge)]()
+
+[![Status](https://img.shields.io/badge/status-in%20development-yellow.svg?style=for-the-badge)](STATUS.md)
+[![Platforms](https://img.shields.io/badge/platform-Windows%20x64-blue.svg?style=for-the-badge)]()
 
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/KxDBRcKwMK)
 [![Support Elite Dangerous Performance Enchanced](https://img.shields.io/badge/Donate-donatr.ee-6C5CE7?style=for-the-badge)](https://donatr.ee/filispeen)
