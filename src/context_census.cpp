@@ -4894,8 +4894,44 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                                 return true;
                             }
                         }
+                    } else {
+                        static unsigned s_pass53_target_fail_logs = 0;
+                        if (s_pass53_target_fail_logs < 4) {
+                            ++s_pass53_target_fail_logs;
+                            wchar_t msg[256];
+                            swprintf_s(msg,
+                                L"EDPE: Pass 53 target rejected frame=%llu kind=%c count=%u rtv=%p bb=%p dim=%ux%u fmt=%u samples=%u dsvDepth=%d",
+                                current_frame, kind, count, rtvRes.Get(), bbRes,
+                                rtvDesc.Width, rtvDesc.Height, static_cast<unsigned>(rtvDesc.Format),
+                                rtvDesc.SampleDesc.Count, dsvIsSceneDepth ? 1 : 0);
+                            EdpeLog(msg);
+                        }
                     }
                 }
+            } else {
+                static unsigned s_pass53_srv_fail_logs = 0;
+                if (s_pass53_srv_fail_logs < 4) {
+                    ++s_pass53_srv_fail_logs;
+                    wchar_t msg[256];
+                    swprintf_s(msg,
+                        L"EDPE: Pass 53 srv0 mismatch frame=%llu kind=%c count=%u srv0=%p sceneLdr=%p",
+                        current_frame, kind, count, srv0Res.Get(),
+                        static_cast<const void*>(scene_ldr_source.Get()));
+                    EdpeLog(msg);
+                }
+            }
+        } else if (wantUpscale && !s_upscale_evaluated_this_frame &&
+                   count >= 3 && count <= 6 && instance_count == 1) {
+            static unsigned s_pass53_gate_fail_logs = 0;
+            if (s_pass53_gate_fail_logs < 4) {
+                ++s_pass53_gate_fail_logs;
+                wchar_t msg[256];
+                swprintf_s(msg,
+                    L"EDPE: Pass 53 gate missed frame=%llu kind=%c count=%u bb=%p allow=%d postLdrBb=%d sceneLdr=%d",
+                    current_frame, kind, count, bbRes, allowPass53Eval ? 1 : 0,
+                    s_post_ldr_backbuffer_bound ? 1 : 0,
+                    (scene_ldr_source && scene_ldr_frame == current_frame) ? 1 : 0);
+                EdpeLog(msg);
             }
         }
         return false;
