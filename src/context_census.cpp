@@ -4834,36 +4834,53 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             ID3D11ShaderResourceView* pass53Srvs[8]{};
             context->PSGetShaderResources(0, 8, pass53Srvs);
             int matchedLdrSlot = -1;
-            ID3D11Resource* srv0ResPtr = nullptr;
-            ID3D11Resource* srv1ResPtr = nullptr;
-            ID3D11Resource* srv2ResPtr = nullptr;
+            Microsoft::WRL::ComPtr<ID3D11Resource> srv0Res;
+            Microsoft::WRL::ComPtr<ID3D11Resource> srv1Res;
             ID3D11Resource* const targetSceneLdrRes = static_cast<ID3D11Resource*>(scene_ldr_source.Get());
             for (int i = 0; i < 8; ++i) {
                 if (!pass53Srvs[i]) continue;
                 Microsoft::WRL::ComPtr<ID3D11Resource> res;
                 pass53Srvs[i]->GetResource(&res);
-                if (i == 0) srv0ResPtr = res.Get();
-                if (i == 1) srv1ResPtr = res.Get();
-                if (i == 2) srv2ResPtr = res.Get();
+                if (i == 0) srv0Res = res;
+                if (i == 1) srv1Res = res;
                 if (matchedLdrSlot < 0 && res && res.Get() == targetSceneLdrRes) {
                     matchedLdrSlot = i;
                 }
                 pass53Srvs[i]->Release();
             }
+
+            Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
+            Microsoft::WRL::ComPtr<ID3D11DepthStencilView> curDsv;
+            context->OMGetRenderTargets(1, curRtv.GetAddressOf(), curDsv.GetAddressOf());
+            bool dsvIsSceneDepth = false;
+            if (curDsv && scene_depth_source) {
+                Microsoft::WRL::ComPtr<ID3D11Resource> dsvRes;
+                curDsv->GetResource(&dsvRes);
+                dsvIsSceneDepth = (dsvRes && dsvRes.Get() == static_cast<ID3D11Resource*>(scene_depth_source.Get()));
+            }
+            Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
+            if (curRtv && !dsvIsSceneDepth) {
+                curRtv->GetResource(&rtvRes);
+            }
+
+            // If an intermediate post-tonemap pass (e.g. SMAA/FXAA) wrote a new scene-sized LDR
+            // texture after Pass 52, Pass 53 blits that texture (t0, t1=null) to the backbuffer.
+            if (matchedLdrSlot < 0 && rtvRes && rtvRes.Get() == bbRes && srv0Res && !srv1Res) {
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> t0Tex;
+                if (SUCCEEDED(srv0Res.As(&t0Tex)) && t0Tex) {
+                    D3D11_TEXTURE2D_DESC t0Desc{};
+                    t0Tex->GetDesc(&t0Desc);
+                    const bool dimsMatch =
+                        (pass53SceneW > 0 && pass53SceneH > 0 && t0Desc.Width == pass53SceneW && t0Desc.Height == pass53SceneH) ||
+                        (pass53OutW > 0 && pass53OutH > 0 && t0Desc.Width == pass53OutW && t0Desc.Height == pass53OutH);
+                    if (t0Desc.SampleDesc.Count == 1 && isLdrSceneColorFormat(t0Desc.Format) && dimsMatch) {
+                        scene_ldr_source = t0Tex;
+                        matchedLdrSlot = 0;
+                    }
+                }
+            }
+
             if (matchedLdrSlot >= 0) {
-                Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
-                Microsoft::WRL::ComPtr<ID3D11DepthStencilView> curDsv;
-                context->OMGetRenderTargets(1, curRtv.GetAddressOf(), curDsv.GetAddressOf());
-                bool dsvIsSceneDepth = false;
-                if (curDsv && scene_depth_source) {
-                    Microsoft::WRL::ComPtr<ID3D11Resource> dsvRes;
-                    curDsv->GetResource(&dsvRes);
-                    dsvIsSceneDepth = (dsvRes && dsvRes.Get() == static_cast<ID3D11Resource*>(scene_depth_source.Get()));
-                }
-                Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
-                if (curRtv && !dsvIsSceneDepth) {
-                    curRtv->GetResource(&rtvRes);
-                }
                 Microsoft::WRL::ComPtr<ID3D11Texture2D> bbTex;
                 if (rtvRes && SUCCEEDED(rtvRes.As(&bbTex)) && bbTex) {
                     bool isValidPass53Target = (rtvRes.Get() == bbRes);
@@ -4926,18 +4943,13 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             } else {
                 static unsigned s_pass53_srv_fail_logs = 0;
                 if (s_pass53_srv_fail_logs < 8) {
-                    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> curRtv;
-                    context->OMGetRenderTargets(1, curRtv.GetAddressOf(), nullptr);
-                    Microsoft::WRL::ComPtr<ID3D11Resource> rtvRes;
-                    if (curRtv) curRtv->GetResource(&rtvRes);
                     const bool rtvEqBb = (rtvRes && rtvRes.Get() == bbRes);
                     if (rtvEqBb || count == 3) {
                         ++s_pass53_srv_fail_logs;
                         D3D11_TEXTURE2D_DESC t0Desc{};
-                        if (srv0ResPtr) {
+                        if (srv0Res) {
                             Microsoft::WRL::ComPtr<ID3D11Texture2D> t0Tex;
-                            if (SUCCEEDED(srv0ResPtr->QueryInterface(__uuidof(ID3D11Texture2D),
-                                    reinterpret_cast<void**>(t0Tex.GetAddressOf()))) && t0Tex) {
+                            if (SUCCEEDED(srv0Res.As(&t0Tex)) && t0Tex) {
                                 t0Tex->GetDesc(&t0Desc);
                             }
                         }
@@ -4945,8 +4957,8 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                         swprintf_s(msg,
                             L"EDPE: Pass 53 srv mismatch frame=%llu kind=%c count=%u rtvEqBb=%d t0=%p (%ux%u fmt=%u) t1=%p sceneLdr=%p",
                             current_frame, kind, count, rtvEqBb ? 1 : 0,
-                            srv0ResPtr, t0Desc.Width, t0Desc.Height, static_cast<unsigned>(t0Desc.Format),
-                            srv1ResPtr, static_cast<const void*>(scene_ldr_source.Get()));
+                            srv0Res.Get(), t0Desc.Width, t0Desc.Height, static_cast<unsigned>(t0Desc.Format),
+                            srv1Res.Get(), static_cast<const void*>(scene_ldr_source.Get()));
                         EdpeLog(msg);
                     }
                 }
