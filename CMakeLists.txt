@@ -69,6 +69,7 @@ add_library(EDPE_DXGI SHARED
     src/jitter_debug_pass.cpp
     src/jitter_view_recorder.cpp
     src/hud_debug_pass.cpp
+    src/renderdoc_support.cpp
     src/version.cpp
     src/dxgi_proxy.def
 )
@@ -151,7 +152,7 @@ if(EDPE_HAVE_FSR)
         "${FFX_SDK_DIR}/lib/ffx_backend_dx11_x64.lib")
 endif()
 add_test(NAME temporal_inputs COMMAND temporal_inputs_test)
-add_executable(motion_gpu_test tests/motion_gpu.cpp src/motion_pass.cpp)
+add_executable(motion_gpu_test tests/motion_gpu.cpp src/motion_pass.cpp src/renderdoc_support.cpp src/log.cpp)
 target_compile_features(motion_gpu_test PRIVATE cxx_std_20)
 target_compile_definitions(motion_gpu_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(motion_gpu_test PRIVATE src)
@@ -200,6 +201,13 @@ target_compile_features(vtable_hook_test PRIVATE cxx_std_20)
 target_compile_definitions(vtable_hook_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(vtable_hook_test PRIVATE src)
 add_test(NAME vtable_hook COMMAND vtable_hook_test)
+
+add_executable(renderdoc_support_test tests/renderdoc_support_test.cpp src/renderdoc_support.cpp src/log.cpp)
+target_compile_features(renderdoc_support_test PRIVATE cxx_std_20)
+target_compile_definitions(renderdoc_support_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(renderdoc_support_test PRIVATE src)
+target_link_libraries(renderdoc_support_test PRIVATE d3d11 dxgi)
+add_test(NAME renderdoc_support COMMAND renderdoc_support_test)
 
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)

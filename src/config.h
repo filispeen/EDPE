@@ -10,6 +10,7 @@
 #include <cwctype>
 #include <windows.h>
 #include "profiler.h"
+#include "renderdoc_support.h"
 
 namespace edpe {
 
@@ -128,6 +129,9 @@ public:
         devMode = (devVal > 0);
 
         debugViewActive = GetPrivateProfileIntW(L"Pipeline", L"DebugView", 0, path.c_str()) != 0;
+
+        renderDocAnnotations = GetPrivateProfileIntW(L"RenderDoc", L"EnableAnnotations", 1, path.c_str()) != 0;
+        RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
     }
 
     void save() {
@@ -201,6 +205,9 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
 
         WritePrivateProfileStringW(L"Pipeline", L"DebugView", debugViewActive ? L"1" : L"0", path.c_str());
+
+        WritePrivateProfileStringW(L"RenderDoc", L"EnableAnnotations", renderDocAnnotations ? L"1" : L"0", path.c_str());
+        RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -330,6 +337,8 @@ public:
     bool devMode = false;
 
     bool debugViewActive = false;
+
+    bool renderDocAnnotations = true;
 };
 
 } // namespace edpe
