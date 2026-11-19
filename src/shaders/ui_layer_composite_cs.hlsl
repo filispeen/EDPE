@@ -1,5 +1,5 @@
 Texture2D<float4>   tWorld    : register(t0); // Апскейлений 3D світ (після DLSS/FSR/TAA)
-Texture2D<float4>   tUi       : register(t1); // Тонемаплений колір UI (LdrLayer.rgb)
+Texture2D<float4>   tUi       : register(t1); // Тонемаплений колір UI (LdrLayer.rgb = T(H))
 Texture2D<float4>   tMult     : register(t2); // Шар мультиплікативного затемнення (vignette / drop shadow)
 Texture2D<float4>   tHdrUi    : register(t3); // Лінійний HDR-шар UI (RGB = емісія, A = Transmittance T = prod(1 - alpha))
 Texture2D<float4>   tVisorLdr : register(t4); // Тонемаплена сцена + наекранний шолом (для дельта-композиту)
@@ -8,26 +8,17 @@ SamplerState        sLinear   : register(s0);
 RWTexture2D<float4> uOut      : register(u0); // Вихідний буфер
 
 cbuffer CompositeParams : register(b0) {
-    uint2 outputSize;
-    uint  hasMultiply;
-    uint  debugView;
-    uint  hasVisorDelta;
-    uint3 _pad;
+    uint2  outputSize;
+    uint   hasMultiply;
+    uint   debugView;
+    uint   hasVisorDelta;
+    float  bgBrightness;
+    float  bgGamma;
+    float  uiBrightness;
+    float  uiGamma;
+    float  bgAttenGamma;
+    float2 _pad;
 };
-
-float3 srgbToLinear(float3 c) {
-    c = max(c, 0.0);
-    float3 lo = c / 12.92;
-    float3 hi = pow((c + 0.055) / 1.055, 2.4);
-    return lerp(hi, lo, step(c, 0.04045));
-}
-
-float3 linearToSrgb(float3 c) {
-    c = max(c, 0.0);
-    float3 lo = c * 12.92;
-    float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-    return lerp(hi, lo, step(c, 0.0031308));
-}
 
 [numthreads(32, 8, 1)]
 void cs_main(uint3 id : SV_DispatchThreadID) {
@@ -56,28 +47,68 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     }
 
     float4 ui = tUi.Load(p);
-    float4 corner0 = tUi.Load(int3(0, 0, 0));
-    float4 hdrCorner0 = tHdrUi.Load(int3(0, 0, 0));
-    float3 blackFloor = (hdrCorner0.a >= 0.999 && all(hdrCorner0.rgb <= 1e-5) && all(corner0.rgb < 0.08))
-        ? corner0.rgb : float3(0.0, 0.0, 0.0);
-    float3 uiRgb = max(ui.rgb - blackFloor * transmittance, 0.0);
+    int2 maxCoord = max(int2(outputSize) - int2(1, 1), int2(0, 0));
+    int3 corners[4] = {
+        int3(0, 0, 0),
+        int3(maxCoord.x, 0, 0),
+        int3(0, maxCoord.y, 0),
+        int3(maxCoord.x, maxCoord.y, 0)
+    };
+    float3 blackFloor = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int ci = 0; ci < 4; ++ci) {
+        float4 hc = tHdrUi.Load(corners[ci]);
+        float4 uc = tUi.Load(corners[ci]);
+        if (hc.a >= 0.999 && all(hc.rgb <= 1e-5) && all(uc.rgb < 0.08)) {
+            blackFloor = uc.rgb;
+            break;
+        }
+    }
+    float3 uiRaw = max(ui.rgb - blackFloor * transmittance, 0.0);
+
+    float effUiBrightness = (uiBrightness > 0.0) ? uiBrightness : 1.0;
+    float effUiGamma      = (uiGamma > 0.0) ? uiGamma : 1.0;
+    float effBgBrightness = (bgBrightness > 0.0) ? bgBrightness : 1.0;
+    float effBgGamma      = (bgGamma > 0.0) ? bgGamma : 1.0;
+    float g               = (bgAttenGamma > 0.0) ? max(bgAttenGamma, 0.1) : 2.2;
+
+    float3 uiPart = pow(max(uiRaw, 0.0), max(effUiGamma, 0.1)) * effUiBrightness;
 
     if (debugView != 0) {
         // Режим діагностики: UI поверх темно-синього фону
-        float3 dbg = uiRgb + float3(0.0, 0.05, 0.2) * (1.0 - transmittance);
+        float3 dbg = uiPart + float3(0.0, 0.05, 0.2) * (1.0 - transmittance);
         uOut[id.xy] = float4(saturate(dbg), 1.0);
         return;
     }
 
     float4 world = tWorld.Load(p);
     float3 cleanMult = all(mult >= 0.999) ? float3(1.0, 1.0, 1.0) : mult;
-
-    // Оскільки коефіцієнт пропускання T = prod(1 - alpha) накопичується у лінійному
-    // HDR-просторі до тонемапінгу (Pass 35), ослаблення фону виконується у лінійному
-    // світлі перед поверненням у гамма-простір sRGB:
-    float3 worldLin = srgbToLinear(world.rgb);
     float3 atten = transmittance * cleanMult;
-    float3 attenWorld = linearToSrgb(worldLin * atten);
-    float3 finalRgb = uiRgb + attenWorld + visorDelta * atten;
+    float  minAtten = min(atten.r, min(atten.g, atten.b));
+
+    float3 attenWorld = all(atten >= 0.999)
+        ? world.rgb
+        : pow(max(pow(max(world.rgb, 0.0), g) * atten, 0.0), 1.0 / g);
+    float backdropWeight = (minAtten < 0.999) ? saturate((1.0 - minAtten) * 4.0) : 0.0;
+    float3 backdropTuned = pow(max(attenWorld, 0.0), max(effBgGamma, 0.1)) * effBgBrightness;
+    float3 worldAndBackdrop = lerp(attenWorld, backdropTuned, backdropWeight);
+
+    // Додаємо UI та ослаблений 3D-фон у лінійному світлі (gamma 2.2 -> linear -> add -> gamma 2.2),
+    // щоб напівпрозорий/м'який помаранчевий glow HUD не підсилювався у гамма-просторі.
+    // Для низькояскравого HUD, який потрапляє у тіньову зону 3D LUT при тонемапінгу поверх чорного,
+    // зберігаємо лінійну хроматичність із tHdrUi, щоб уникнути червоних артефактів.
+    float3 uiLin = pow(max(uiPart, 0.0), 2.2);
+    float3 hdrPos = max(hdrUi.rgb, 0.0);
+    float  hPeak  = max(hdrPos.r, max(hdrPos.g, hdrPos.b));
+    float  uPeak  = max(uiLin.r, max(uiLin.g, uiLin.b));
+    if (hPeak > 1e-5 && uPeak > 1e-5) {
+        float3 uiChromaLin = hdrPos * (uPeak / hPeak);
+        float  uiRawPeak   = max(uiRaw.r, max(uiRaw.g, uiRaw.b));
+        float  toeMix      = 1.0 - smoothstep(0.25, 0.65, uiRawPeak);
+        uiLin = lerp(uiLin, max(uiLin, uiChromaLin), toeMix);
+    }
+    float3 worldAndBackdropLin = pow(max(worldAndBackdrop, 0.0), 2.2);
+    float3 finalSrgb = pow(max(uiLin + worldAndBackdropLin, 0.0), 1.0 / 2.2);
+    float3 finalRgb = finalSrgb + visorDelta * atten;
     uOut[id.xy] = float4(saturate(finalRgb), world.a);
 }

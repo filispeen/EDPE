@@ -2,26 +2,30 @@
 
 # EDPE<br><sub>(Elite Dangerous Performance Enhanced)</sub>
 
-[![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version)](https://github.com/filispeen/EDPE/releases/latest)
-[![CI](https://github.com/filispeen/EDPE/actions/workflows/CI.yml/badge.svg)](https://github.com/filispeen/EDPE/actions/workflows/CI.yml)
-[![Status](https://img.shields.io/badge/status-v0.7.1%20Verified%20In--Game-success.svg)](STATUS.md)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20|%20Direct3D%2011-lightgrey.svg)]()
-[![Tests](https://img.shields.io/badge/tests-15%2F15%20Passing-brightgreen.svg)]()
+[![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version&style=for-the-badge)](https://github.com/filispeen/EDPE/releases/latest)
+![CI](https://img.shields.io/github/actions/workflow/status/filispeen/EDPE/CI.yml?style=for-the-badge&label=CI)
+[![Tests](https://img.shields.io/badge/tests-15%2F15%20Passing-brightgreen.svg?style=for-the-badge)]()
+
+[![Status](https://img.shields.io/badge/status-in%20development-yellow.svg?style=for-the-badge)](STATUS.md)
+[![Platforms](https://img.shields.io/badge/platform-Windows%20x64-blue.svg?style=for-the-badge)]()
+
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/KxDBRcKwMK)
+[![Support Elite Dangerous Performance Enchanced](https://img.shields.io/badge/Donate-donatr.ee-6C5CE7?style=for-the-badge)](https://donatr.ee/filispeen)
 
 </div>
 
 EDPE is a `dxgi.dll` proxy for the 2D Direct3D 11 renderer in Elite Dangerous (Cobra engine). It intercepts DXGI and Direct3D 11 calls to add temporal anti-aliasing and upscaling, leaving game binaries, gameplay, and network code untouched.
 
-## Current status (`v0.7.1`)
+## Current status (`v0.7.2`)
 
-As of November 2026 (`v0.7.1`), the working pipeline covers:
+As of November 2026 (`v0.7.2`), the working pipeline covers:
 
 * `dxgi.dll` proxy forwarding system DXGI calls while hooking `IDXGIFactory::CreateSwapChain`, `IDXGISwapChain::Present`, and `D3D11CreateDevice` / `D3D11CreateDeviceAndSwapChain` via IAT. Constant buffer discovery stops once the scene camera is found, `Map()`/`Unmap()` and `OMSetRenderTargets()` use pre-filtered, per-frame memoized camera/jitter paths and a persistent 4-way RTV metadata cache, and `edpe.log` writes on a dedicated background worker thread.
 * Reversed-Z scene depth discovery (`DSV #2`, `DXGI_FORMAT_R32G8X24_TYPELESS`, $B=0.025$) and once-per-frame parsing of the 5376-byte `CB0` camera buffer, with a 2nd-order kinematic filter and projection fallback to reject auxiliary eye, mirror, canopy reflection, and sagittal probes.
-* Halton `(2,3)` subpixel projection jitter injected into `CB0` words `1080`-`1095` (standing down when reconstruction is off), paired with an optimized GPU pass (CPU precomputed relative camera transform) that renders current-to-previous motion vectors to `DXGI_FORMAT_R16G16_FLOAT`, including analytical rotational motion at infinity for the skybox and stars.
+* Halton `(2,3)` subpixel projection jitter injected into `CB0` words `1080`-`1095` (standing down when reconstruction is off), viewmodel sub-pass jitter coherence and scaled 208-byte `CB0` support for on-foot weapons/tools, paired with an optimized GPU pass (CPU precomputed relative camera transform) that renders current-to-previous motion vectors to `DXGI_FORMAT_R16G16_FLOAT`, including analytical rotational motion at infinity for the skybox and stars.
 * Backend-neutral `TemporalFrameInputs` feeding `IUpscalerBackend` implementations for NVIDIA DLAA and DLSS Super Resolution (NGX Project ID `48d353f3-d07b-4048-876b-09f8622f5a27`, presets `Auto`, `E`, `J`, `K`, `L`, `M`), AMD FSR 3.1.2 Native AA and Super Resolution (native D3D11 compute), and native D3D11 TAA. Render scale is detected from scene depth versus swapchain dimensions, and `Custom.4.4.fxcfg` / `Custom.4.0.fxcfg` `<SSAAMultiplier>` stays synced when enabled.
-* Native UI and cockpit HUD separation (`UiLayer` and `UiCompositePass`): pre-HUD clean scene color goes to the upscaler without redundant intermediate copies, cockpit holographic draws are redirected to `s_hud_mask_texture` (`R11G11B10_FLOAT`) with viewport unjittering, and native menus plus HUD are composited back over the reconstructed world.
-* Multi-device DXGI Keyed Mutex synchronization, color-source debouncing, crash minidump logging, DirectInput and `WndProc` input isolation when the menu is open (protecting flight controls and HOTAS), async GPU timestamp queries (zero overhead when the Performance HUD and profiler are disabled), and optional `EnableProfiler=1` QPC/GPU sub-pass profiling (`EDPE PROFILE` / `EDPE PROFILE_SUB`).
+* Native UI and cockpit HUD separation (`UiLayer` and `UiCompositePass`): pre-HUD clean scene color goes to the upscaler without redundant intermediate copies, cockpit holographic draws are redirected to `s_hud_mask_texture` (`R11G11B10_FLOAT`) with viewport unjittering, planetary rings and pre-sky atmosphere stay in the world buffer, the on-foot helmet visor overlay separates cleanly via post-upscale tonemapped delta, and native menus plus HUD are composited back over the reconstructed world.
+* Multi-device DXGI Keyed Mutex synchronization, Smooth Motion auxiliary device isolation, hardened context hook races, color-source debouncing, crash minidump logging, DirectInput and `WndProc` input isolation when the menu is open (protecting flight controls and HOTAS), async GPU timestamp queries (zero overhead when the Performance HUD and profiler are disabled), and optional `EnableProfiler=1` QPC/GPU sub-pass profiling (`EDPE PROFILE` / `EDPE PROFILE_SUB`).
 * Dear ImGui overlay (`F5`, ProggyForever vector font), toggleable Performance HUD (`F7`) with a 120-sample frametime graph (`8.3 ms` and `16.6 ms` reference lines, 15 Hz text refresh, background NVML GPU/VRAM polling), sequential comparison capture to `comparison/` (16-frame warmup, 5-second wait between backends), and `DEV=0` / `DEV=1` gating for developer panels and `F9` (`jitter_view.log`).
 
 ## Roadmap
@@ -289,4 +293,4 @@ EDPE/
 * [ocornut/imgui](https://github.com/ocornut/imgui): Dear ImGui overlay
 * NVIDIA NGX SDK and AMD FidelityFX SDK
 
-світла пам'ять соні, моїй любій кішці яка померла 24 січня 26-го року около 1:00 AM
+світла пам'ять соні, моїй любій кішці яка померла 24 січня 26-го року около 1:00 AM, день коли вона помирала і останній раз в своєму житті лежала у мене на ногах поки я працював над цим проєктом

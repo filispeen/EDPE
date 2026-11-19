@@ -46,12 +46,16 @@ jobs:
       - name: Determine Experimental Build Info
         id: build_info
         shell: pwsh
+        env:
+          BUILD_NUMBER_INPUT: ${{ inputs.build-number }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           git fetch --depth=1 -f origin '+refs/tags/*:refs/tags/*'
-          $customNum = "${{ inputs.build-number }}".Trim()
+          $customNum = "$env:BUILD_NUMBER_INPUT".Trim()
 
-          if ('${{ github.ref_type }}' -eq 'tag') {
-              $tag = '${{ github.ref_name }}'
+          if ($env:REF_TYPE -eq 'tag') {
+              $tag = $env:REF_NAME
               if ($tag -match '^(?:exp|experimental)-build-(\d+)$') {
                   $buildNum = $matches[1]
               } else {
@@ -175,9 +179,10 @@ jobs:
         id: configure
         if: ${{ !inputs.has-artifact }}
         shell: pwsh
+        env:
+          EDPE_VERSION: ${{ steps.build_info.outputs.tag_name }}
         run: |
-          $ver = '${{ steps.build_info.outputs.tag_name }}'
-          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$env:EDPE_VERSION" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build EDPE (Release)
         id: build
@@ -216,8 +221,10 @@ jobs:
       - name: Prepare Experimental Package
         id: package
         shell: pwsh
+        env:
+          TAG_NAME: ${{ steps.build_info.outputs.tag_name }}
         run: |
-          $tag = '${{ steps.build_info.outputs.tag_name }}'
+          $tag = $env:TAG_NAME
           $pkgDir = "EDPE-package"
           New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
 

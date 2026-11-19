@@ -61,6 +61,8 @@ jobs:
             $msg = "EDPE Release $tag"
           }
           if (-not $msg) { $msg = "EDPE Release $tag" }
+          $nexusNotice = "If you'd like to support me, please download the mod from [Nexus Mods](https://www.nexusmods.com/elitedangerous/mods/15?tab=files)."
+          $msg = "$nexusNotice`n`n$msg"
           Set-Content -Path "tag-message.md" -Value $msg -Encoding utf8
           Write-Host "Tag message:"
           Write-Host $msg
@@ -243,7 +245,7 @@ jobs:
           $color = if ($isPre) { 0xF39C12 } else { 0x2ECC71 }
 
           $downloadValue = "[GitHub Release]($($env:RELEASE_URL))"
-          if ($env:NEXUS_OUTCOME -eq "success" -and $env:NEXUS_MOD_ID) {
+          if (-not ([string]::IsNullOrEmpty($env:NEXUS_MOD_ID))) {
             $nexusUrl = "https://www.nexusmods.com/elitedangerous/mods/$($env:NEXUS_MOD_ID)?tab=files"
             $downloadValue += " | [Nexus Mods]($nexusUrl)"
           }

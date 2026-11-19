@@ -235,6 +235,50 @@ int main() {
     const float turned_x = DirectX::PackedVector::XMConvertHalfToFloat(valid[0]);
     const float turned_y = DirectX::PackedVector::XMConvertHalfToFloat(valid[1]);
     context->Unmap(readback.Get(), 0);
-    return std::fabs(turned_x - expected_x) < .01f &&
-        std::fabs(turned_y - expected_y) < .01f ? 0 : 33;
+    if (std::fabs(turned_x - expected_x) >= .01f ||
+        std::fabs(turned_y - expected_y) >= .01f) return 33;
+
+    // Pure camera rotation (translationStep == 0) must clamp camera-attached viewmodel
+    // geometry (disambiguated via static prevSceneDepth at z < 10m) to 0 MV
+    // while keeping non-zero rotational MV for world background pixels.
+    std::array<std::uint64_t, 16> vm_depths{};
+    vm_depths.fill(std::bit_cast<std::uint32_t>(0.0025f));
+    vm_depths[5] = std::bit_cast<std::uint32_t>(0.1676f); // pixel (1,1): z=0.149m viewmodel
+    vm_depths[6] = std::bit_cast<std::uint32_t>(0.0357f); // pixel (2,1): z=0.70m barrel/cockpit
+    D3D11_TEXTURE2D_DESC vm_depth_desc{};
+    vm_depth_desc.Width = vm_depth_desc.Height = 4;
+    vm_depth_desc.MipLevels = vm_depth_desc.ArraySize = 1;
+    vm_depth_desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    vm_depth_desc.SampleDesc.Count = 1;
+    vm_depth_desc.Usage = D3D11_USAGE_DEFAULT;
+    vm_depth_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DEPTH_STENCIL;
+    D3D11_SUBRESOURCE_DATA vm_init{vm_depths.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> vm_depth, prev_vm_depth;
+    ComPtr<ID3D11ShaderResourceView> vm_depth_view, prev_vm_depth_view;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &vm_init, &vm_depth)) ||
+        FAILED(device->CreateShaderResourceView(vm_depth.Get(), &view_desc, &vm_depth_view)) ||
+        FAILED(device->CreateTexture2D(&vm_depth_desc, &vm_init, &prev_vm_depth)) ||
+        FAILED(device->CreateShaderResourceView(prev_vm_depth.Get(), &view_desc, &prev_vm_depth_view))) {
+        return 34;
+    }
+    float bg_expected_x = 0.0f, bg_expected_y = 0.0f;
+    if (!edpe::cameraDepthMotion(now, previous, 4, 4, 3, 1, .0025f,
+            &bg_expected_x, &bg_expected_y)) return 38;
+    if (!pass.render(vm_depth_view.Get(), now, previous, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, prev_vm_depth_view.Get())) return 35;
+    context->CopyResource(readback.Get(), output.Get());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 36;
+    const auto* row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float vm_x = DirectX::PackedVector::XMConvertHalfToFloat(row1[2]);
+    const float vm_y = DirectX::PackedVector::XMConvertHalfToFloat(row1[3]);
+    const float bar_x = DirectX::PackedVector::XMConvertHalfToFloat(row1[4]);
+    const float bar_y = DirectX::PackedVector::XMConvertHalfToFloat(row1[5]);
+    const float bg_x = DirectX::PackedVector::XMConvertHalfToFloat(row1[6]);
+    const float bg_y = DirectX::PackedVector::XMConvertHalfToFloat(row1[7]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(vm_x) >= 1e-4f || std::fabs(vm_y) >= 1e-4f) return 37;
+    if (std::fabs(bar_x) >= 1e-4f || std::fabs(bar_y) >= 1e-4f) return 39;
+    if (std::fabs(bg_x - bg_expected_x) >= 0.05f || std::fabs(bg_y - bg_expected_y) >= 0.05f) return 40;
+    return 0;
 }

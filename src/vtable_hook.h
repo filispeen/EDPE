@@ -245,6 +245,7 @@ public:
     static constexpr size_t kTableSlots = 512;
     static constexpr size_t kStubSize = 16;
     static constexpr size_t kMaxSlotOwners = 256;
+    static constexpr size_t kMaxTrackedSlots = 32;
 
     VTableHook() = default;
     // Do NOT call unhookAll() in ~VTableHook(): static destruction runs during DLL_PROCESS_DETACH
@@ -354,8 +355,9 @@ public:
             if (originalOut) {
                 *originalOut = stubAddr;
             }
-            m_hookedSlots[slotIndex] = hookFunc;
+            m_hookedSlots[slotIndex].store(hookFunc, std::memory_order_release);
             m_forwardSlots[slotIndex] = originalOut;
+            trackHookedSlot(slotIndex);
             InterlockedExchangePointer(
                 reinterpret_cast<PVOID volatile*>(&m_privateTable[slotIndex]), hookFunc);
             void* curVptr = nullptr;
@@ -387,8 +389,9 @@ public:
         if (originalOut && m_originals[slotIndex]) {
             *originalOut = m_originals[slotIndex];
         }
-        m_hookedSlots[slotIndex] = hookFunc;
+        m_hookedSlots[slotIndex].store(hookFunc, std::memory_order_release);
         m_forwardSlots[slotIndex] = originalOut;
+        trackHookedSlot(slotIndex);
 
         DWORD oldProt = 0;
         if (!VirtualProtect(slotAddr, sizeof(void*), PAGE_READWRITE, &oldProt)) {
@@ -412,11 +415,16 @@ public:
     void notifySlotPatched(size_t slotIndex, void* replacement) {
         if (!m_initialized || slotIndex >= kTableSlots) return;
         std::lock_guard<std::mutex> lock(s_mutex());
+        void* nextFn = nullptr;
         if (m_mode == HookMode::LiveCopy && m_liveStubs) {
             void* stubAddr = m_liveStubs + slotIndex * kStubSize;
-            m_hookedSlots[slotIndex] = (replacement == stubAddr) ? nullptr : replacement;
+            nextFn = (replacement == stubAddr) ? nullptr : replacement;
         } else {
-            m_hookedSlots[slotIndex] = (replacement == m_originals[slotIndex]) ? nullptr : replacement;
+            nextFn = (replacement == m_originals[slotIndex]) ? nullptr : replacement;
+        }
+        m_hookedSlots[slotIndex].store(nextFn, std::memory_order_release);
+        if (nextFn) {
+            trackHookedSlot(slotIndex);
         }
     }
 
@@ -440,11 +448,11 @@ public:
         }
 
         if (!m_vtable) return false;
-        for (size_t i = 0; i < kTableSlots; ++i) {
-            void* hookFn = m_hookedSlots[i];
-            if (!hookFn) continue;
+        auto reclaimSlot = [&](size_t i) {
+            void* hookFn = m_hookedSlots[i].load(std::memory_order_relaxed);
+            if (!hookFn) return;
             void* current = nullptr;
-            if (!safeReadPtr(&m_vtable[i], &current)) continue;
+            if (!safeReadPtr(&m_vtable[i], &current)) return;
             if (current && current != hookFn) {
                 m_originals[i] = current;
                 if (m_forwardSlots[i]) {
@@ -459,6 +467,16 @@ public:
                     reclaimedAny = true;
                 }
             }
+        };
+        if (!m_hookedIndexOverflow) {
+            const size_t n = m_hookedIndexCount.load(std::memory_order_relaxed);
+            for (size_t k = 0; k < n; ++k) {
+                reclaimSlot(m_hookedIndices[k]);
+            }
+        } else {
+            for (size_t i = 0; i < kTableSlots; ++i) {
+                reclaimSlot(i);
+            }
         }
         return reclaimedAny;
     }
@@ -470,7 +488,7 @@ public:
         if (m_mode == HookMode::LiveCopy) {
             if (m_privateTable && m_liveStubs) {
                 for (size_t i = 0; i < kTableSlots; ++i) {
-                    if (m_hookedSlots[i]) {
+                    if (m_hookedSlots[i].load(std::memory_order_relaxed)) {
                         void* stubAddr = m_liveStubs + i * kStubSize;
                         InterlockedExchangePointer(
                             reinterpret_cast<PVOID volatile*>(&m_privateTable[i]), stubAddr);
@@ -490,14 +508,15 @@ public:
             // Any in-flight call or late table reference must never hit an unmapped page.
         } else if (m_vtable) {
             for (size_t i = 0; i < kTableSlots; ++i) {
-                if (m_hookedSlots[i] && m_originals[i]) {
+                void* hookFn = m_hookedSlots[i].load(std::memory_order_relaxed);
+                if (hookFn && m_originals[i]) {
                     void** slotAddr = &m_vtable[i];
                     DWORD oldProt = 0;
                     if (VirtualProtect(slotAddr, sizeof(void*), PAGE_READWRITE, &oldProt)) {
                         InterlockedCompareExchangePointer(
                             reinterpret_cast<PVOID volatile*>(slotAddr),
                             m_originals[i],
-                            m_hookedSlots[i]);
+                            hookFn);
                         DWORD ignored = 0;
                         VirtualProtect(slotAddr, sizeof(void*), oldProt, &ignored);
                     }
@@ -510,7 +529,11 @@ public:
             }
         }
 
-        std::memset(m_hookedSlots, 0, sizeof(m_hookedSlots));
+        for (auto& slot : m_hookedSlots) {
+            slot.store(nullptr, std::memory_order_relaxed);
+        }
+        m_hookedIndexCount.store(0, std::memory_order_release);
+        m_hookedIndexOverflow = false;
         std::memset(m_originals, 0, sizeof(m_originals));
         std::memset(m_forwardSlots, 0, sizeof(m_forwardSlots));
         m_instance = nullptr;
@@ -518,10 +541,10 @@ public:
         m_initialized = false;
     }
 
-    /// Fast lock-free/syscall-free check for LiveCopy mode on an actively invoked instance;
-    /// falls back to full reclaim() only if the instance's vptr drifted.
+    /// Fast lock-free/syscall-free check on an actively invoked instance;
+    /// falls back to full reclaim() only if the vptr or an InPlace slot drifted.
     bool reclaimLive(void* liveInstance) {
-        if (isLiveCopyVptrValid(liveInstance)) {
+        if (isLiveCopyVptrValid(liveInstance) || areInPlaceHooksIntactFast(liveInstance)) {
             return false;
         }
         return reclaim();
@@ -531,6 +554,31 @@ public:
         return m_initialized && m_mode == HookMode::LiveCopy &&
                m_privateTable && liveInstance && m_instance == liveInstance &&
                safeReadPtrFast(liveInstance) == m_privateTable;
+    }
+
+    bool isPrimaryVptrValidFast(const void* liveInstance) const noexcept {
+        if (!m_initialized || !liveInstance || m_instance != liveInstance) return false;
+        void** expected = (m_mode == HookMode::LiveCopy && m_privateTable) ? m_privateTable : m_vtable;
+        return expected && safeReadPtrFast(liveInstance) == expected;
+    }
+
+    bool areInPlaceHooksIntactFast(const void* liveInstance) const noexcept {
+        if (!m_initialized || m_mode != HookMode::InPlace || !m_vtable ||
+            !liveInstance || m_instance != liveInstance || m_hookedIndexOverflow ||
+            safeReadPtrFast(liveInstance) != m_vtable) {
+            return false;
+        }
+        const size_t n = m_hookedIndexCount.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n; ++i) {
+            const size_t slot = m_hookedIndices[i];
+            if (slot < kTableSlots) {
+                void* expected = m_hookedSlots[slot].load(std::memory_order_acquire);
+                if (expected && safeReadPtrFast(&m_vtable[slot]) != expected) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     bool isInitialized() const { return m_initialized; }
@@ -565,6 +613,19 @@ private:
         return owners;
     }
 
+    void trackHookedSlot(size_t slotIndex) {
+        const size_t n = m_hookedIndexCount.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < n; ++i) {
+            if (m_hookedIndices[i] == slotIndex) return;
+        }
+        if (n < kMaxTrackedSlots) {
+            m_hookedIndices[n] = slotIndex;
+            m_hookedIndexCount.store(n + 1, std::memory_order_release);
+        } else {
+            m_hookedIndexOverflow = true;
+        }
+    }
+
     void* m_instance = nullptr;
     void** m_vtable = nullptr;
     void** m_privateTable = nullptr;
@@ -574,7 +635,10 @@ private:
     HookMode m_mode = HookMode::InPlace;
     bool m_initialized = false;
     bool m_validStubSlot[kTableSlots]{};
-    void* m_hookedSlots[kTableSlots]{};
+    std::atomic<void*> m_hookedSlots[kTableSlots]{};
+    size_t m_hookedIndices[kMaxTrackedSlots]{};
+    std::atomic<size_t> m_hookedIndexCount{0};
+    bool m_hookedIndexOverflow = false;
     void* m_originals[kTableSlots]{};
     void** m_forwardSlots[kTableSlots]{};
 };

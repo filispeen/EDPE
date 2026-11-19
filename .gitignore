@@ -13,3 +13,5 @@ ngx_probe_log.txt
 *.patch
 *.rdc
 *.bat
+tag-msg.md
+*.obj

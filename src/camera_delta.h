@@ -104,6 +104,31 @@ inline bool isRearOrAuxiliaryProbe(
     return false;
 }
 
+inline bool matchesIpdOrCockpitProbeDisplacement(
+    const Vec3& delta,
+    float dist,
+    const Vec3& right,
+    const Vec3& up,
+    const Vec3& fwd)
+{
+    if (!isIpdHarmonicDistance(dist)) {
+        return false;
+    }
+    const float dRight = std::fabs(dot(delta, right));
+    const float dUp    = std::fabs(dot(delta, up));
+    const float dFwd   = std::fabs(dot(delta, fwd));
+
+    // Латеральний стерео-очний зонд (IPD 68.2 мм, 136.4 мм, 272.8 мм)
+    const bool isLateralIpd = (dRight >= 0.96f * dist && dUp < 0.015f && dFwd < 0.015f);
+
+    // Кабінний / наголовний зонд Cobra Odyssey (136.4 мм: +10.98 см Up, +8.09 см Fwd у системі корабля):
+    // При повороті/підйомі голови пілота проєкція на head-Right та head-Fwd змінюється, тоді як вертикальна
+    // складова (head-Up >= 0.40 * dist) зберігається у всьому діапазоні огляду в кабіні (yaw ±180°, pitch -30°..+65°).
+    const bool isCockpitHeadProbe = (dUp >= 0.40f * dist);
+
+    return isLateralIpd || isCockpitHeadProbe;
+}
+
 inline bool isStereoEyeOrIpdProbe(
     const CameraProjection& candidate,
     const CameraProjection& baseline,
@@ -119,10 +144,9 @@ inline bool isStereoEyeOrIpdProbe(
         return true;
     }
 
-    // 1. Стерео-очний зонд у межах одного кадру має ідентичну орієнтацію (rotTrace > 2.9995f).
-    // Будь-яке активне обертання камери (rotTrace <= 2.9995f) — це реальний рух голови/корабля.
+    // 1. Стерео-очний зонд у межах кадру має близьку орієнтацію (rotTrace > 2.995f, ~4° допуск під час обертання голови).
     const float rotTrace = cameraRotationTrace(candidate, baseline);
-    if (rotTrace <= 2.9995f) {
+    if (rotTrace <= 2.995f) {
         return false;
     }
 
@@ -143,21 +167,9 @@ inline bool isStereoEyeOrIpdProbe(
     // Спрацьовує лише при стаціонарній камері або при внутрішньокадровому порівнянні пасів (last_velocity == 0).
     const Vec3 rawDelta = candPos - prevPos;
     const float rawDist = length(rawDelta);
-    if (length(last_velocity) < 0.025f && isIpdHarmonicDistance(rawDist)) {
-        const float dRight = std::fabs(dot(rawDelta, right));
-        const float dUp    = std::fabs(dot(rawDelta, up));
-        const float dFwd   = std::fabs(dot(rawDelta, fwd));
-
-        // 3a. Латеральний стерео-очний зонд (IPD 68.2 мм, 136.4 мм, 272.8 мм)
-        const bool isLateralIpd = (dRight >= 0.80f * rawDist && dUp < 0.045f && dFwd < 0.045f);
-
-        // 3b. Кабінний / наголовний зонд Cobra Odyssey (136.4 мм: +10.98 см Up, +8.09 см Fwd, 0.00 см Right)
-        const bool isCockpitHeadProbe = (dRight < 0.025f &&
-            dUp >= 0.65f * rawDist && dFwd >= 0.45f * rawDist);
-
-        if (isLateralIpd || isCockpitHeadProbe) {
-            return true;
-        }
+    if (length(last_velocity) < 0.025f &&
+        matchesIpdOrCockpitProbeDisplacement(rawDelta, rawDist, right, up, fwd)) {
+        return true;
     }
 
     // 4. Перевірка 2: Кінематична нев'язка 2-го порядку (під час стрейфу Q/E та Supercruise).
@@ -166,19 +178,7 @@ inline bool isStereoEyeOrIpdProbe(
     const Vec3 residual = candPos - predictedPos;
     const float resDist = length(residual);
 
-    if (isIpdHarmonicDistance(resDist)) {
-        const float rRight   = std::fabs(dot(residual, right));
-        const float rUp      = std::fabs(dot(residual, up));
-        const float rForward = std::fabs(dot(residual, fwd));
-
-        const bool isResLateralIpd = (rRight >= 0.80f * resDist && rUp < 0.045f && rForward < 0.045f);
-        const bool isResCockpitHeadProbe = (rRight < 0.025f && rUp >= 0.65f * resDist && rForward >= 0.45f * resDist);
-
-        if (isResLateralIpd || isResCockpitHeadProbe) {
-            return true;
-        }
-    }
-    return false;
+    return matchesIpdOrCockpitProbeDisplacement(residual, resDist, right, up, fwd);
 }
 
 inline bool isReflectionOrAuxiliaryCamera(
@@ -212,6 +212,72 @@ inline bool isReflectionOrAuxiliaryCamera(
     }
 
     return false;
+}
+
+// True when near plane changes or projection scale jumps >25%
+// (real camera cut rather than smooth FOV / ADS zoom).
+inline bool isCameraProjectionCut(
+    const CameraProjection& current,
+    const CameraProjection& previous)
+{
+    if (previous.scaleX <= 0.0f || previous.scaleY <= 0.0f) return false;
+    return std::fabs(previous.depthB - current.depthB) > 1e-3f ||
+           std::fabs(previous.scaleX - current.scaleX) > 0.25f * previous.scaleX ||
+           std::fabs(previous.scaleY - current.scaleY) > 0.25f * previous.scaleY;
+}
+
+// True when two consecutive committed main-scene cameras represent a true
+// discontinuity (chirality flip, >41 deg rotation cut, or projection cut)
+// without triggering false resets on smooth FOV zoom or variable dt hitches.
+inline bool isCommittedCameraDiscontinuity(
+    const CameraProjection& current,
+    const CameraProjection& previous)
+{
+    const float det = cameraRotationDeterminant(current);
+    if (det < 0.85f || det > 1.15f) return true;
+    if (previous.scaleX <= 0.0f || previous.scaleY <= 0.0f) return false;
+    if (isCameraProjectionCut(current, previous)) return true;
+    return cameraRotationTrace(current, previous) < 2.414f;
+}
+
+// Preserves a continuous eye position while adopting an updated orientation/projection
+// (used when a frame carries only a single-frame ~1 Hz IPD/cockpit probe translation offset).
+inline CameraProjection preservePositionWithOrientation(
+    const CameraProjection& orientationSource,
+    const Vec3& continuousPosition)
+{
+    CameraProjection out = orientationSource;
+    cameraSetPosition(out, continuousPosition);
+    return out;
+}
+
+// True when a large translation jump inside the main 4-MRT G-buffer has the same
+// orientation and projection as the committed camera for <5 consecutive frames
+// (external on-foot local-origin rebase that snaps back after 1-4 frames).
+inline bool isTransientOriginRebaseHoldEligible(
+    const CameraProjection& candidate,
+    const CameraProjection& committed,
+    float jumpResidual,
+    unsigned teleportStreak,
+    bool inMainScene,
+    bool cutStreakSatisfied)
+{
+    if (!inMainScene || cutStreakSatisfied || teleportStreak >= 5) return false;
+    if (jumpResidual <= 15.0f || jumpResidual >= 2000.0f) return false;
+    if (isCameraProjectionCut(candidate, committed)) return false;
+    return cameraRotationTrace(candidate, committed) > 2.414f;
+}
+
+// True when a committed translation step exceeds normal camera bounds (>50m)
+// or jumps >15m beyond linear velocity prediction (persistent teleport/cut).
+inline bool isUnpredictedPositionCut(
+    const Vec3& stepDelta,
+    const Vec3& predictedDelta)
+{
+    const float dist = length(stepDelta);
+    if (dist > 50.0f) return true;
+    if (dist <= 15.0f) return false;
+    return length(stepDelta - predictedDelta) > 15.0f;
 }
 
 enum CameraDeltaFlag : unsigned {
@@ -394,16 +460,37 @@ private:
 inline bool isSamePoseSceneSubpass(const CameraProjection& candidate,
                                    const CameraProjection& ref,
                                    float maxIntraDist,
-                                   float dtRatio = 1.0f) {
+                                   float dtRatio = 1.0f,
+                                   const Vec3& last_velocity = {0.0f, 0.0f, 0.0f},
+                                   bool knownSubpassFromCb1 = false) {
     if (ref.scaleX <= 0.0f) return false;
+    // A scene sub-pass usually differs in near plane (e.g. viewmodel depthB=0.0675 vs world
+    // depthB=0.025), or shares world depthB=0.025 during ADS when cb1[35..38] confirms
+    // a distinct sub-pass FOV scale (e.g. viewmodel scaleX=3.1901 vs world scaleX=1.2634).
+    const bool distinctDepthB = std::fabs(candidate.depthB - ref.depthB) > 1e-3f;
+    const bool distinctScale =
+        std::fabs(candidate.scaleX - ref.scaleX) > 0.02f * ref.scaleX ||
+        std::fabs(candidate.scaleY - ref.scaleY) > 0.02f * ref.scaleY;
+    if (!distinctDepthB && !(knownSubpassFromCb1 && distinctScale)) return false;
     const float det = cameraRotationDeterminant(candidate);
     if (det < 0.85f || det > 1.15f) return false;
     if (candidate.depthB < 0.01f || candidate.depthB > 0.25f) return false;
-    const float dist = length(cameraPosition(candidate) - cameraPosition(ref));
-    if (dist > maxIntraDist) return false;
+    const Vec3 candPos = cameraPosition(candidate);
+    const Vec3 refPos = cameraPosition(ref);
+    const float rawDist = length(candPos - refPos);
+    const float clampedDtRatio = std::clamp(dtRatio, 0.25f, 4.0f);
+    const float predDist = length(candPos - (refPos + last_velocity * clampedDtRatio));
+    const float minDist = std::min(rawDist, predDist);
     const float trace = cameraRotationTrace(candidate, ref);
-    if (trace <= 2.95f) return false;
-    return !isRearOrAuxiliaryProbe(candidate, ref, {0.0f, 0.0f, 0.0f}, dtRatio);
+    // Planetary origin-rebased sub-passes (verified by cb1[35..38] world scales,
+    // e.g. (-0.30, 0.26, -0.40) vs planetary (-134.89, 331.26, 289.81), same orientation).
+    const bool originRebase =
+        knownSubpassFromCb1 && rawDist > 15.0f && rawDist < 500.0f && trace > 2.95f;
+    if (!originRebase && minDist > maxIntraDist) return false;
+    // Allow rapid camera flicks up to ~45 deg/frame (trace > 2.40, matching
+    // isAuthoritativeMainSceneCamera) while still rejecting 90/180 deg probes/cubemaps.
+    if (trace <= 2.40f) return false;
+    return !isRearOrAuxiliaryProbe(candidate, ref, last_velocity, dtRatio);
 }
 
 } // namespace edpe

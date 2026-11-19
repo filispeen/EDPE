@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "log.h"
 #include "context_census.h"
+#include "ui_layer.h"
 #include "upscaler_backend.h"
 #include "ngx_context.h"
 #include "capture_format.h"
@@ -9,6 +10,7 @@
 #include "input_hook.h"
 #include "jitter_logger.h"
 #include "jitter_view_recorder.h"
+#include "renderdoc_support.h"
 
 
 #include <d3d11_1.h>
@@ -1420,12 +1422,14 @@ void shutdownUi() {
 
 bool initializeUi(IDXGISwapChain* swap_chain) {
     edpe::PerfTracker::instance().initNvml();
+    edpe::RenderDocBridge::instance().refresh();
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(swap_chain->GetDesc(&desc)) || !desc.OutputWindow ||
         FAILED(swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&ui.device)))) return false;
     ui.device->GetImmediateContext(&ui.context);
     if (!ui.context) return false;
     ui.window = desc.OutputWindow;
+    edpe::RenderDocBridge::instance().setActiveWindow(ui.device, ui.window);
     ImGuiContext* previous = ImGui::GetCurrentContext();
     ui.imgui = ImGui::CreateContext();
     if (!ui.imgui) return false;
@@ -1958,6 +1962,23 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ImGui::EndDisabled();
         }
 
+        if (ImGui::CollapsingHeader("HUD Tonemapping Tuning")) {
+            auto tuning = edpe::UiLayer::instance().getTonemapTuning();
+            bool changed = false;
+            changed |= ImGui::SliderFloat("UI Brightness", &tuning.uiBrightness, 0.50f, 1.50f, "%.2f");
+            changed |= ImGui::SliderFloat("UI Contrast (Gamma)", &tuning.uiGamma, 0.60f, 1.60f, "%.2f");
+            changed |= ImGui::SliderFloat("Backdrop Brightness", &tuning.bgBrightness, 0.20f, 1.50f, "%.2f");
+            changed |= ImGui::SliderFloat("Backdrop Contrast (Gamma)", &tuning.bgGamma, 0.50f, 2.00f, "%.2f");
+            changed |= ImGui::SliderFloat("Backdrop Atten Gamma", &tuning.bgAttenGamma, 0.10f, 3.00f, "%.2f");
+            if (ImGui::Button("Reset HUD Tonemap Defaults")) {
+                tuning = edpe::UiLayer::TonemapTuning{};
+                changed = true;
+            }
+            if (changed) {
+                edpe::UiLayer::instance().setTonemapTuning(tuning);
+            }
+        }
+
         // Dev Mode Collapsible Sections (Collapsed by default)
         if (cfg.devMode) {
             // Section 1: Reconstruction Screenshot Comparison
@@ -2184,6 +2205,52 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
         } // if (cfg.devMode)
 
+        auto& rdoc = edpe::RenderDocBridge::instance();
+        rdoc.refresh();
+        if (rdoc.isAvailable() || cfg.devMode) {
+            if (ImGui::CollapsingHeader("RenderDoc")) {
+                if (rdoc.isAvailable()) {
+                    ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f),
+                        "RenderDoc attached (API v%d.%d.%d)",
+                        rdoc.apiMajor(), rdoc.apiMinor(), rdoc.apiPatch());
+                    const uint32_t captureCount = rdoc.getNumCaptures();
+                    ImGui::Text("Captures: %u | Target Control: %s%s",
+                        captureCount,
+                        rdoc.isTargetControlConnected() ? "Connected" : "Standby",
+                        rdoc.isFrameCapturing() ? " | CAPTURING" : "");
+                    if (ImGui::Button("Capture Next Frame")) {
+                        rdoc.triggerCapture(1);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Capture 3 Frames")) {
+                        rdoc.triggerCapture(3);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(rdoc.isTargetControlConnected() ? "Show Replay UI" : "Launch Replay UI")) {
+                        rdoc.launchOrShowReplayUI();
+                    }
+                    bool rdocAnnotations = cfg.renderDocAnnotations;
+                    if (ImGui::Checkbox("GPU Debug Annotations & Resource Names", &rdocAnnotations)) {
+                        cfg.renderDocAnnotations = rdocAnnotations;
+                        rdoc.setAnnotationsEnabled(rdocAnnotations);
+                        cfg.save();
+                    }
+                    bool rdocOverlay = rdoc.isOverlayVisible();
+                    if (ImGui::Checkbox("Show RenderDoc Corner Overlay", &rdocOverlay)) {
+                        rdoc.setOverlayVisible(rdocOverlay);
+                    }
+                    if (captureCount > 0) {
+                        std::string lastPath;
+                        if (rdoc.getCapturePath(captureCount - 1, lastPath) && !lastPath.empty()) {
+                            ImGui::TextDisabled("Last capture: %s", lastPath.c_str());
+                        }
+                    }
+                } else {
+                    ImGui::TextDisabled("RenderDoc: Not attached (launch via RenderDoc to capture frames & GPU markers)");
+                }
+            }
+        }
+
         if (ImGui::CollapsingHeader("Debug View")) {
             const char* debug_view_items[] = {
                 "None",
@@ -2365,7 +2432,10 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
     ID3D11Texture2D* copy_tex = ContextCensusGetBackbufferCopyTexture();
     ui.context->OMSetRenderTargets(1, &ui.backbuffer_rtv, nullptr);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    {
+        edpe::ScopedRenderDocEvent rdocImGuiEvent(ui.context, L"EDPE: ImGuiOverlay");
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    }
     flushOverlayCaptures(true);
 
     ui.context->OMSetRenderTargets(1, &previous_rtv, previous_dsv);

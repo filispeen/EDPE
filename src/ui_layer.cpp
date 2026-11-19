@@ -1,6 +1,7 @@
 #include "ui_layer.h"
 #include "context_census.h"
 #include "dxbc_fanout.h"
+#include "renderdoc_support.h"
 #include "shader_probe.h"
 
 #include <algorithm>
@@ -14,7 +15,7 @@ namespace {
 
 inline constexpr char kUiLayerCompositeCsHlsl[] = R"hlsl(
 Texture2D<float4>   tWorld    : register(t0); // Апскейлений 3D світ (після DLSS/FSR/TAA)
-Texture2D<float4>   tUi       : register(t1); // Тонемаплений колір UI (LdrLayer.rgb)
+Texture2D<float4>   tUi       : register(t1); // Тонемаплений колір UI (LdrLayer.rgb = T(H))
 Texture2D<float4>   tMult     : register(t2); // Шар мультиплікативного затемнення (vignette / drop shadow)
 Texture2D<float4>   tHdrUi    : register(t3); // Лінійний HDR-шар UI (RGB = емісія, A = Transmittance T = prod(1 - alpha))
 Texture2D<float4>   tVisorLdr : register(t4); // Тонемаплена сцена + наекранний шолом (для дельта-композиту)
@@ -23,26 +24,17 @@ SamplerState        sLinear   : register(s0);
 RWTexture2D<float4> uOut      : register(u0); // Вихідний буфер
 
 cbuffer CompositeParams : register(b0) {
-    uint2 outputSize;
-    uint  hasMultiply;
-    uint  debugView;
-    uint  hasVisorDelta;
-    uint3 _pad;
+    uint2  outputSize;
+    uint   hasMultiply;
+    uint   debugView;
+    uint   hasVisorDelta;
+    float  bgBrightness;
+    float  bgGamma;
+    float  uiBrightness;
+    float  uiGamma;
+    float  bgAttenGamma;
+    float2 _pad;
 };
-
-float3 srgbToLinear(float3 c) {
-    c = max(c, 0.0);
-    float3 lo = c / 12.92;
-    float3 hi = pow((c + 0.055) / 1.055, 2.4);
-    return lerp(hi, lo, step(c, 0.04045));
-}
-
-float3 linearToSrgb(float3 c) {
-    c = max(c, 0.0);
-    float3 lo = c * 12.92;
-    float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-    return lerp(hi, lo, step(c, 0.0031308));
-}
 
 [numthreads(32, 8, 1)]
 void cs_main(uint3 id : SV_DispatchThreadID) {
@@ -71,28 +63,65 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     }
 
     float4 ui = tUi.Load(p);
-    float4 corner0 = tUi.Load(int3(0, 0, 0));
-    float4 hdrCorner0 = tHdrUi.Load(int3(0, 0, 0));
-    float3 blackFloor = (hdrCorner0.a >= 0.999 && all(hdrCorner0.rgb <= 1e-5) && all(corner0.rgb < 0.08))
-        ? corner0.rgb : float3(0.0, 0.0, 0.0);
-    float3 uiRgb = max(ui.rgb - blackFloor * transmittance, 0.0);
+    int2 maxCoord = max(int2(outputSize) - int2(1, 1), int2(0, 0));
+    int3 corners[4] = {
+        int3(0, 0, 0),
+        int3(maxCoord.x, 0, 0),
+        int3(0, maxCoord.y, 0),
+        int3(maxCoord.x, maxCoord.y, 0)
+    };
+    float3 blackFloor = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int ci = 0; ci < 4; ++ci) {
+        float4 hc = tHdrUi.Load(corners[ci]);
+        float4 uc = tUi.Load(corners[ci]);
+        if (hc.a >= 0.999 && all(hc.rgb <= 1e-5) && all(uc.rgb < 0.08)) {
+            blackFloor = uc.rgb;
+            break;
+        }
+    }
+    float3 uiRaw = max(ui.rgb - blackFloor * transmittance, 0.0);
+
+    float effUiBrightness = (uiBrightness > 0.0) ? uiBrightness : 1.0;
+    float effUiGamma      = (uiGamma > 0.0) ? uiGamma : 1.0;
+    float effBgBrightness = (bgBrightness > 0.0) ? bgBrightness : 1.0;
+    float effBgGamma      = (bgGamma > 0.0) ? bgGamma : 1.0;
+    float g               = (bgAttenGamma > 0.0) ? max(bgAttenGamma, 0.1) : 2.2;
+
+    float3 uiPart = pow(max(uiRaw, 0.0), max(effUiGamma, 0.1)) * effUiBrightness;
 
     if (debugView != 0) {
         // Режим діагностики: UI поверх темно-синього фону
-        float3 dbg = uiRgb + float3(0.0, 0.05, 0.2) * (1.0 - transmittance);
+        float3 dbg = uiPart + float3(0.0, 0.05, 0.2) * (1.0 - transmittance);
         uOut[id.xy] = float4(saturate(dbg), 1.0);
         return;
     }
 
     float4 world = tWorld.Load(p);
     float3 cleanMult = all(mult >= 0.999) ? float3(1.0, 1.0, 1.0) : mult;
-
-    // Оскільки коефіцієнт пропускання T = prod(1 - alpha) накопичується у лінійному
-    // HDR-просторі до тонемапінгу (Pass 35), ослаблення фону виконується у лінійному
-    // світлі перед поверненням у гамма-простір sRGB; при atten == 1 пропускаємо pow(2.4):
     float3 atten = transmittance * cleanMult;
-    float3 attenWorld = all(atten >= 0.999) ? world.rgb : linearToSrgb(srgbToLinear(world.rgb) * atten);
-    float3 finalRgb = uiRgb + attenWorld + visorDelta * atten;
+    float  minAtten = min(atten.r, min(atten.g, atten.b));
+
+    float3 attenWorld = all(atten >= 0.999)
+        ? world.rgb
+        : pow(max(pow(max(world.rgb, 0.0), g) * atten, 0.0), 1.0 / g);
+    float backdropWeight = (minAtten < 0.999) ? saturate((1.0 - minAtten) * 4.0) : 0.0;
+    float3 backdropTuned = pow(max(attenWorld, 0.0), max(effBgGamma, 0.1)) * effBgBrightness;
+    float3 worldAndBackdrop = lerp(attenWorld, backdropTuned, backdropWeight);
+
+    float3 uiLin = pow(max(uiPart, 0.0), 2.2);
+    float3 hdrPos = max(hdrUi.rgb, 0.0);
+    float  hPeak  = max(hdrPos.r, max(hdrPos.g, hdrPos.b));
+    float  uPeak  = max(uiLin.r, max(uiLin.g, uiLin.b));
+    if (hPeak > 1e-5 && uPeak > 1e-5) {
+        float3 uiChromaLin = hdrPos * (uPeak / hPeak);
+        float  uiRawPeak   = max(uiRaw.r, max(uiRaw.g, uiRaw.b));
+        float  toeMix      = 1.0 - smoothstep(0.25, 0.65, uiRawPeak);
+        uiLin = lerp(uiLin, max(uiLin, uiChromaLin), toeMix);
+    }
+    float3 worldAndBackdropLin = pow(max(worldAndBackdrop, 0.0), 2.2);
+    float3 finalSrgb = pow(max(uiLin + worldAndBackdropLin, 0.0), 1.0 / 2.2);
+    float3 finalRgb = finalSrgb + visorDelta * atten;
     uOut[id.xy] = float4(saturate(finalRgb), world.a);
 }
 )hlsl";
@@ -107,11 +136,16 @@ Texture2D<float4> tCleanLdr : register(t5);
 SamplerState      sLinear   : register(s0);
 
 cbuffer CompositeParams : register(b0) {
-    uint2 outputSize;
-    uint  hasMultiply;
-    uint  debugView;
-    uint  hasVisorDelta;
-    uint3 _pad;
+    uint2  outputSize;
+    uint   hasMultiply;
+    uint   debugView;
+    uint   hasVisorDelta;
+    float  bgBrightness;
+    float  bgGamma;
+    float  uiBrightness;
+    float  uiGamma;
+    float  bgAttenGamma;
+    float2 _pad;
 };
 
 struct VSOut {
@@ -123,20 +157,6 @@ VSOut vs_main(uint id : SV_VertexID) {
     float2 uv = float2((id << 1) & 2, id & 2);
     o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
     return o;
-}
-
-float3 srgbToLinear(float3 c) {
-    c = max(c, 0.0);
-    float3 lo = c / 12.92;
-    float3 hi = pow((c + 0.055) / 1.055, 2.4);
-    return lerp(hi, lo, step(c, 0.04045));
-}
-
-float3 linearToSrgb(float3 c) {
-    c = max(c, 0.0);
-    float3 lo = c * 12.92;
-    float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-    return lerp(hi, lo, step(c, 0.0031308));
 }
 
 float4 ps_main(VSOut pin) : SV_Target {
@@ -161,23 +181,63 @@ float4 ps_main(VSOut pin) : SV_Target {
     }
 
     float4 ui = tUi.Load(p);
-    float4 corner0 = tUi.Load(int3(0, 0, 0));
-    float4 hdrCorner0 = tHdrUi.Load(int3(0, 0, 0));
-    float3 blackFloor = (hdrCorner0.a >= 0.999 && all(hdrCorner0.rgb <= 1e-5) && all(corner0.rgb < 0.08))
-        ? corner0.rgb : float3(0.0, 0.0, 0.0);
-    float3 uiRgb = max(ui.rgb - blackFloor * transmittance, 0.0);
+    int2 maxCoord = max(int2(outputSize) - int2(1, 1), int2(0, 0));
+    int3 corners[4] = {
+        int3(0, 0, 0),
+        int3(maxCoord.x, 0, 0),
+        int3(0, maxCoord.y, 0),
+        int3(maxCoord.x, maxCoord.y, 0)
+    };
+    float3 blackFloor = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int ci = 0; ci < 4; ++ci) {
+        float4 hc = tHdrUi.Load(corners[ci]);
+        float4 uc = tUi.Load(corners[ci]);
+        if (hc.a >= 0.999 && all(hc.rgb <= 1e-5) && all(uc.rgb < 0.08)) {
+            blackFloor = uc.rgb;
+            break;
+        }
+    }
+    float3 uiRaw = max(ui.rgb - blackFloor * transmittance, 0.0);
+
+    float effUiBrightness = (uiBrightness > 0.0) ? uiBrightness : 1.0;
+    float effUiGamma      = (uiGamma > 0.0) ? uiGamma : 1.0;
+    float effBgBrightness = (bgBrightness > 0.0) ? bgBrightness : 1.0;
+    float effBgGamma      = (bgGamma > 0.0) ? bgGamma : 1.0;
+    float g               = (bgAttenGamma > 0.0) ? max(bgAttenGamma, 0.1) : 2.2;
+
+    float3 uiPart = pow(max(uiRaw, 0.0), max(effUiGamma, 0.1)) * effUiBrightness;
 
     if (debugView != 0) {
-        float3 dbg = uiRgb + float3(0.0, 0.05, 0.2) * (1.0 - transmittance);
+        float3 dbg = uiPart + float3(0.0, 0.05, 0.2) * (1.0 - transmittance);
         return float4(saturate(dbg), 1.0);
     }
 
     float4 world = tWorld.Load(p);
     float3 cleanMult = all(mult >= 0.999) ? float3(1.0, 1.0, 1.0) : mult;
-
     float3 atten = transmittance * cleanMult;
-    float3 attenWorld = all(atten >= 0.999) ? world.rgb : linearToSrgb(srgbToLinear(world.rgb) * atten);
-    float3 finalRgb = uiRgb + attenWorld + visorDelta * atten;
+    float  minAtten = min(atten.r, min(atten.g, atten.b));
+
+    float3 attenWorld = all(atten >= 0.999)
+        ? world.rgb
+        : pow(max(pow(max(world.rgb, 0.0), g) * atten, 0.0), 1.0 / g);
+    float backdropWeight = (minAtten < 0.999) ? saturate((1.0 - minAtten) * 4.0) : 0.0;
+    float3 backdropTuned = pow(max(attenWorld, 0.0), max(effBgGamma, 0.1)) * effBgBrightness;
+    float3 worldAndBackdrop = lerp(attenWorld, backdropTuned, backdropWeight);
+
+    float3 uiLin = pow(max(uiPart, 0.0), 2.2);
+    float3 hdrPos = max(hdrUi.rgb, 0.0);
+    float  hPeak  = max(hdrPos.r, max(hdrPos.g, hdrPos.b));
+    float  uPeak  = max(uiLin.r, max(uiLin.g, uiLin.b));
+    if (hPeak > 1e-5 && uPeak > 1e-5) {
+        float3 uiChromaLin = hdrPos * (uPeak / hPeak);
+        float  uiRawPeak   = max(uiRaw.r, max(uiRaw.g, uiRaw.b));
+        float  toeMix      = 1.0 - smoothstep(0.25, 0.65, uiRawPeak);
+        uiLin = lerp(uiLin, max(uiLin, uiChromaLin), toeMix);
+    }
+    float3 worldAndBackdropLin = pow(max(worldAndBackdrop, 0.0), 2.2);
+    float3 finalSrgb = pow(max(uiLin + worldAndBackdropLin, 0.0), 1.0 / 2.2);
+    float3 finalRgb = finalSrgb + visorDelta * atten;
     return float4(saturate(finalRgb), world.a);
 }
 )hlsl";
@@ -344,7 +404,7 @@ bool UiLayer::initialize(ID3D11Device* device) {
         }
     }
     D3D11_BUFFER_DESC cbd{};
-    cbd.ByteWidth = sizeof(uint32_t) * 8;
+    cbd.ByteWidth = sizeof(uint32_t) * 12;
     cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -554,17 +614,20 @@ void UiLayer::resize(ID3D11Device* device, UINT width, UINT height) {
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     device->CreateTexture2D(&desc, nullptr, &hdrLayerTex_);
+    SetD3D11DebugName(hdrLayerTex_.Get(), "EDPE_UiLayer_HDR");
     device->CreateRenderTargetView(hdrLayerTex_.Get(), nullptr, &hdrLayerRtv_);
     device->CreateShaderResourceView(hdrLayerTex_.Get(), nullptr, &hdrLayerSrv_);
 
     // 2. Створюємо LDR шар для результату тонемапу
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     device->CreateTexture2D(&desc, nullptr, &ldrLayerTex_);
+    SetD3D11DebugName(ldrLayerTex_.Get(), "EDPE_UiLayer_LDR");
     device->CreateRenderTargetView(ldrLayerTex_.Get(), nullptr, &ldrLayerRtv_);
     device->CreateShaderResourceView(ldrLayerTex_.Get(), nullptr, &ldrLayerSrv_);
 
     // 3. Створюємо Mult шар для затемнення бекдропів
     device->CreateTexture2D(&desc, nullptr, &multLayerTex_);
+    SetD3D11DebugName(multLayerTex_.Get(), "EDPE_UiLayer_Mult");
     device->CreateRenderTargetView(multLayerTex_.Get(), nullptr, &multLayerRtv_);
     device->CreateShaderResourceView(multLayerTex_.Get(), nullptr, &multLayerSrv_);
 
@@ -643,6 +706,8 @@ bool UiLayer::shouldInterceptDraw(uint64_t vsHash, uint64_t psHash, bool isHdrTa
            (vsHash == 0x1989B75BF034ECC3ull && psHash == 0xDB79AE788E049DFDull) ||
            (vsHash == 0xC7FA0C0F5DD49180ull && psHash == 0x6EEF165A350DA30Full) ||
            (vsHash == 0xA47A3315FFF5E2E4ull && psHash == 0x869FFF43E875906Eull) ||
+           (vsHash == 0x27CC03C6B975C020ull && psHash == 0xE477BE9350D37DBBull) ||
+           (vsHash == 0x320587120A79EEC0ull && psHash == 0x5BEB7F1695E118C3ull) ||
            (vsHash == 0x9BFC7FD232328391ull && psHash == 0xDBF1725726018F52ull) ||
            (vsHash == 0xE904D334BC8B11EAull && psHash == 0x095030F27D2C362Aull) ||
            (vsHash == 0x1012E00B3CB44469ull && psHash == 0x666EF0C4C616F67Eull) ||
@@ -962,6 +1027,8 @@ bool UiLayer::beginTonemapReissue(ID3D11DeviceContext* context,
     // Зберігаємо оригінальний стан шейдерних ресурсів (слоти t0..t4), RTV та в'юпорту гри
     savedToneViewportCount_ = 1;
     context->RSGetViewports(&savedToneViewportCount_, &savedToneViewport_);
+    savedToneScissorCount_ = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    context->RSGetScissorRects(&savedToneScissorCount_, savedToneScissors_);
     context->OMGetRenderTargets(1, savedToneRtv_.GetAddressOf(), savedToneDsv_.GetAddressOf());
     for (int i = 0; i < 5; ++i) {
         context->PSGetShaderResources(static_cast<UINT>(i), 1, savedToneSrvs_[i].GetAddressOf());
@@ -976,14 +1043,14 @@ bool UiLayer::beginTonemapReissue(ID3D11DeviceContext* context,
     ID3D11ShaderResourceView* hudHdrSrv = hdrLayerSrv_.Get();
     ID3D11ShaderResourceView* zeroSrv = zeroBloomSrv_.Get();
 
+    // HUD тонемапиться ізольовано E = T(H), bloom-слоти обнулюються
+    // (світіння HUD уже додане в основний ланцюжок bloom сцени через Pass 36).
     if (hdrSlot == 0) {
         // Галактична/Системна карта (9270 / C89D) та Full System Scanner (6DE7):
-        // t0 = HDR-сцена, t1 = Bloom (обнулюємо Bloom, щоб не додавати його двічі)
         context->PSSetShaderResources(0, 1, &hudHdrSrv);
         context->PSSetShaderResources(1, 1, &zeroSrv);
     } else {
         // Кокпітний тонемап (E894 / 0D43 / 99C2 / DE65):
-        // t0 = 3D LUT, t1 = HDR-сцена (або DoF), t2..t4 = Bloom (обнулюємо слоти Bloom!)
         if (gameLut) {
             context->PSSetShaderResources(0, 1, &gameLut);
         }
@@ -991,10 +1058,8 @@ bool UiLayer::beginTonemapReissue(ID3D11DeviceContext* context,
         const bool isDofTonemap =
             (psHash == 0xDE65D1AC161643F4ull || psHash == 0xDE65BF04523B41F8ull || hdrSlot == 3);
         if (isDofTonemap) {
-            // У варіанті з DoF слот t1 читає розмиту сцену, а t3 — чітку HDR-сцену:
-            // подаємо HdrLayer в обидва слоти, а слоти Bloom t2 і t4 обнулюємо.
-            context->PSSetShaderResources(2, 1, &zeroSrv);
             context->PSSetShaderResources(3, 1, &hudHdrSrv);
+            context->PSSetShaderResources(2, 1, &zeroSrv);
             context->PSSetShaderResources(4, 1, &zeroSrv);
         } else {
             ID3D11ShaderResourceView* zeroSlots[3] = {zeroSrv, zeroSrv, zeroSrv};
@@ -1008,6 +1073,8 @@ bool UiLayer::beginTonemapReissue(ID3D11DeviceContext* context,
 
     const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width_), static_cast<float>(height_), 0.0f, 1.0f};
     context->RSSetViewports(1, &vp);
+    const D3D11_RECT fullScissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    context->RSSetScissorRects(1, &fullScissor);
 
     const FLOAT blendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     context->OMSetBlendState(toneRgbOnlyBlend_.Get(), blendFactor, 0xFFFFFFFF);
@@ -1034,6 +1101,9 @@ void UiLayer::endTonemapReissue(ID3D11DeviceContext* context) {
     context->PSSetConstantBuffers(2, 1, &origExposureCb);
     context->OMSetBlendState(savedToneBlend_.Get(), savedToneBlendFactor_, savedToneSampleMask_);
     context->RSSetViewports(savedToneViewportCount_, &savedToneViewport_);
+    if (savedToneScissorCount_ > 0) {
+        context->RSSetScissorRects(savedToneScissorCount_, savedToneScissors_);
+    }
     context->OMSetRenderTargets(1, savedToneRtv_.GetAddressOf(), savedToneDsv_.Get());
 
     savedToneRtv_.Reset();
@@ -1056,9 +1126,13 @@ bool matchesDevice(ID3D11DeviceChild* child, ID3D11Device* expectedDevice) {
 
 void UiLayer::updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView) {
     const bool hasVisorDelta = (visorLdrSrv_ != nullptr && cleanLdrSrv_ != nullptr);
+    const TonemapTuning t = tonemapTuning_;
     if (cbValid_ && cbWidth_ == outputWidth && cbHeight_ == outputHeight &&
         cbHasMult_ == hasMultiplyDraws_ && cbDebugView_ == debugView &&
-        cbHasVisorDelta_ == hasVisorDelta) {
+        cbHasVisorDelta_ == hasVisorDelta &&
+        cbUiBrightness_ == t.uiBrightness && cbUiGamma_ == t.uiGamma &&
+        cbBgBrightness_ == t.bgBrightness && cbBgGamma_ == t.bgGamma &&
+        cbBgAttenGamma_ == t.bgAttenGamma) {
         return;
     }
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -1069,15 +1143,25 @@ void UiLayer::updateCompositeConstants(ID3D11DeviceContext* context, UINT output
         data[2] = hasMultiplyDraws_ ? 1 : 0;
         data[3] = debugView ? 1 : 0;
         data[4] = hasVisorDelta ? 1 : 0;
-        data[5] = 0;
-        data[6] = 0;
-        data[7] = 0;
+        auto* fdata = reinterpret_cast<float*>(mapped.pData);
+        fdata[5] = t.bgBrightness;
+        fdata[6] = t.bgGamma;
+        fdata[7] = t.uiBrightness;
+        fdata[8] = t.uiGamma;
+        fdata[9] = t.bgAttenGamma;
+        fdata[10] = 0.0f;
+        fdata[11] = 0.0f;
         context->Unmap(constantBuffer_.Get(), 0);
         cbWidth_ = outputWidth;
         cbHeight_ = outputHeight;
         cbHasMult_ = hasMultiplyDraws_;
         cbDebugView_ = debugView;
         cbHasVisorDelta_ = hasVisorDelta;
+        cbUiBrightness_ = t.uiBrightness;
+        cbUiGamma_ = t.uiGamma;
+        cbBgBrightness_ = t.bgBrightness;
+        cbBgGamma_ = t.bgGamma;
+        cbBgAttenGamma_ = t.bgAttenGamma;
         cbValid_ = true;
     }
 }

@@ -1,5 +1,6 @@
 #include "motion_pass.h"
 #include "motion_shader.h"
+#include "renderdoc_support.h"
 
 #include <d3dcompiler.h>
 #include <cmath>
@@ -194,6 +195,7 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
         output_texture_ = output;
         output_rtv_ = rtv;
         output_srv_ = srv;
+        SetD3D11DebugName(output_texture_.Get(), "EDPE_MotionVectors");
         width_ = width;
         height_ = height;
     }

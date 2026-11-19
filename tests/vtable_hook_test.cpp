@@ -61,5 +61,33 @@ int main() {
     if (*reinterpret_cast<void***>(iface) != origTable) return 15;
     if (iface->first(5) != 6) return 16;
 
+    // Verify InPlace mode fast intact check and selective reclaimLive recovery.
+    g_hookCalls = 0;
+    edpe::VTableHook inPlaceHook;
+    void* inPlaceOrig = nullptr;
+    if (!inPlaceHook.hook(iface, 0, reinterpret_cast<void*>(&hookedFirst), &inPlaceOrig, edpe::HookMode::InPlace)) {
+        return 17;
+    }
+    g_origFirst = reinterpret_cast<MethodFn>(inPlaceOrig);
+    if (!inPlaceHook.isInitialized() || inPlaceHook.mode() != edpe::HookMode::InPlace) return 18;
+    if (!inPlaceHook.isPrimaryVptrValidFast(iface) || !inPlaceHook.areInPlaceHooksIntactFast(iface)) return 19;
+    if (inPlaceHook.reclaimLive(iface)) return 20;
+    if (iface->first(5) != 16 || g_hookCalls != 1) return 21;
+
+    // Simulate InPlace slot overwrite; reclaimLive must detect & restore the slot.
+    DWORD oldProt = 0;
+    if (!VirtualProtect(&origTable[0], sizeof(void*), PAGE_READWRITE, &oldProt)) return 22;
+    origTable[0] = inPlaceOrig;
+    DWORD ignored = 0;
+    VirtualProtect(&origTable[0], sizeof(void*), oldProt, &ignored);
+    if (inPlaceHook.areInPlaceHooksIntactFast(iface)) return 23;
+    if (!inPlaceHook.reclaimLive(iface)) return 24;
+    if (!inPlaceHook.areInPlaceHooksIntactFast(iface)) return 25;
+    if (iface->first(7) != 18 || g_hookCalls != 2) return 26;
+
+    inPlaceHook.unhookAll();
+    if (inPlaceHook.isInitialized()) return 27;
+    if (iface->first(5) != 6) return 28;
+
     return 0;
 }

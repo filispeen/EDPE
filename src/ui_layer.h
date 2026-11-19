@@ -51,13 +51,23 @@ public:
     void setVisorDeltaSrvs(ID3D11ShaderResourceView* visorLdr, ID3D11ShaderResourceView* cleanLdr);
     void resetVisorDelta();
 
-    // Повторний запуск тонемапу (Tonemap Re-issue):
+    // Повторний запуск тонемапу (Tonemap Re-issue, модель E = T(H)):
     bool beginTonemapReissue(ID3D11DeviceContext* context,
                              ID3D11ShaderResourceView* gameLut = nullptr,
                              ID3D11Buffer* gameExposureCb = nullptr,
                              int hdrSlot = 1,
                              uint64_t psHash = 0);
     void endTonemapReissue(ID3D11DeviceContext* context);
+
+    struct TonemapTuning {
+        float uiBrightness = 1.0f;
+        float uiGamma = 1.0f;
+        float bgBrightness = 1.0f;
+        float bgGamma = 1.0f;
+        float bgAttenGamma = 2.2f;
+    };
+    TonemapTuning getTonemapTuning() const { return tonemapTuning_; }
+    void setTonemapTuning(const TonemapTuning& t) { tonemapTuning_ = t; cbValid_ = false; }
 
     // Фінальний композитинг перед Pass 54 або Present (CS UAV або прямий PS RTV без проміжного копіювання):
     bool composite(ID3D11DeviceContext* context,
@@ -164,6 +174,8 @@ private:
     // Збережений контекст для Tonemap Re-issue:
     D3D11_VIEWPORT savedToneViewport_{};
     UINT savedToneViewportCount_ = 0;
+    D3D11_RECT savedToneScissors_[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    UINT savedToneScissorCount_ = 0;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> savedToneRtv_;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> savedToneDsv_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> savedToneSrvs_[5];
@@ -185,6 +197,12 @@ private:
     bool cbHasMult_ = false;
     bool cbDebugView_ = false;
     bool cbHasVisorDelta_ = false;
+    TonemapTuning tonemapTuning_{};
+    float cbUiBrightness_ = 1.0f;
+    float cbUiGamma_ = 1.0f;
+    float cbBgBrightness_ = 1.0f;
+    float cbBgGamma_ = 1.0f;
+    float cbBgAttenGamma_ = 1.0f;
     bool cbValid_ = false;
 };
 

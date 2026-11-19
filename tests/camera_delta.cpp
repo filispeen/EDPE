@@ -268,6 +268,188 @@ int main() {
     mirroredSubpass.worldFromView[4] = -mirroredSubpass.worldFromView[4];
     mirroredSubpass.worldFromView[8] = -mirroredSubpass.worldFromView[8];
     if (edpe::isSamePoseSceneSubpass(mirroredSubpass, worldBase, 0.05f)) return 66;
+    // Same-depthB camera (e.g. Camera Suite FOV change or world pass with depthB=0.025)
+    // must NOT be classified as a scene sub-pass so it never blocks camera-cut latching
+    // or poisons SceneSubpassTracker for late forward hair passes (EID 4379 / EID 4553).
+    edpe::CameraProjection cameraSuiteFov = worldBase;
+    cameraSuiteFov.scaleX = 1.428f;
+    cameraSuiteFov.scaleY = 2.539f;
+    cameraSuiteFov.depthB = 0.025f;
+    if (edpe::isSamePoseSceneSubpass(cameraSuiteFov, worldBase, 15.0f)) return 67;
+    // Viewmodel sub-pass before world staging while ship moves (predicted by velocity) must pass.
+    edpe::CameraProjection movingViewmodel = viewmodelSubpass;
+    movingViewmodel.worldFromView[11] = 2.5f;
+    if (!edpe::isSamePoseSceneSubpass(movingViewmodel, worldBase, 0.25f, 1.0f, {0.0f, 0.0f, 2.5f})) return 68;
+
+    // 25. Diagonal forward-right movement (e.g. 0.0506m right, 0.0293m fwd, |d|=0.0585m)
+    // MUST NOT be misclassified as a lateral IPD probe:
+    auto diagMove = identity();
+    diagMove.worldFromView[3] = 0.0506f;
+    diagMove.worldFromView[7] = 0.0001f;
+    diagMove.worldFromView[11] = 0.0293f;
+    if (edpe::isStereoEyeOrIpdProbe(diagMove, identity())) return 67;
+    if (edpe::isReflectionOrAuxiliaryCamera(diagMove, identity())) return 68;
+
+    // 26. Ship-frame cockpit head probe (+0.1098m ship-Up, +0.0809m ship-Fwd) MUST still be
+    // identified when pilot head is yawed left/right and pitched up (e.g. 20 deg yaw + 20 deg pitch):
+    auto pitchedYawedHead = [&]() {
+        auto c = identity();
+        const float y = 20.0f * 3.14159265f / 180.0f;
+        const float p = -20.0f * 3.14159265f / 180.0f; // pitch up
+        const float cy = std::cos(y), sy = std::sin(y);
+        const float cp = std::cos(p), sp = std::sin(p);
+        // R = Ry * Rx
+        c.worldFromView[0] = cy;       c.worldFromView[1] = sy * sp; c.worldFromView[2]  = sy * cp;
+        c.worldFromView[4] = 0.0f;     c.worldFromView[5] = cp;      c.worldFromView[6]  = -sp;
+        c.worldFromView[8] = -sy;      c.worldFromView[9] = cy * sp; c.worldFromView[10] = cy * cp;
+        return c;
+    };
+    auto turnedHeadBase = pitchedYawedHead();
+    auto turnedHeadProbe = turnedHeadBase;
+    turnedHeadProbe.worldFromView[7] += 0.1098f;
+    turnedHeadProbe.worldFromView[11] += 0.0809f;
+    if (!edpe::isStereoEyeOrIpdProbe(turnedHeadProbe, turnedHeadBase)) return 69;
+    if (!edpe::isReflectionOrAuxiliaryCamera(turnedHeadProbe, turnedHeadBase)) return 70;
+
+    // 27. preservePositionWithOrientation keeps rotated orientation + projection from a panning
+    // probe-offset frame while preserving continuous eye position (preventing fallback yaw stalls).
+    edpe::CameraProjection rotatedProbe = turnedHeadBase;
+    const float panAngle = 0.6f * 3.14159265f / 180.0f;
+    const float cp = std::cos(panAngle), sp = std::sin(panAngle);
+    for (int row = 0; row < 3; ++row) {
+        const float c0 = turnedHeadBase.worldFromView[row * 4 + 0];
+        const float c2 = turnedHeadBase.worldFromView[row * 4 + 2];
+        rotatedProbe.worldFromView[row * 4 + 0] = c0 * cp + c2 * sp;
+        rotatedProbe.worldFromView[row * 4 + 2] = -c0 * sp + c2 * cp;
+    }
+    rotatedProbe.worldFromView[7] += 0.1098f;
+    rotatedProbe.worldFromView[11] += 0.0809f;
+    const edpe::Vec3 basePos = edpe::cameraPosition(turnedHeadBase);
+    const edpe::CameraProjection recovered = edpe::preservePositionWithOrientation(rotatedProbe, basePos);
+    const auto recDelta = edpe::cameraDelta(turnedHeadBase, recovered);
+    if (recDelta.translation > 1e-5) return 71;
+    if (std::fabs(recDelta.rotationDeg - 0.6) > 0.1) return 72;
+
+    // 28. ADS viewmodel sub-pass shares depthB=0.025 with the ADS world camera
+    // (scaleX=3.1901, scaleY=5.6713 vs world scaleX=1.2634, scaleY=2.2460) and is
+    // accepted ONLY when knownSubpassFromCb1=true (preserving Camera Suite rejection when false).
+    edpe::CameraProjection adsWorld = identity();
+    adsWorld.scaleX = 1.2634f;
+    adsWorld.scaleY = 2.2460f;
+    adsWorld.depthB = 0.025f;
+    edpe::CameraProjection adsViewmodel = adsWorld;
+    adsViewmodel.scaleX = 3.1901f;
+    adsViewmodel.scaleY = 5.6713f;
+    adsViewmodel.depthB = 0.025f;
+    if (!edpe::isSamePoseSceneSubpass(adsViewmodel, adsWorld, 0.05f, 1.0f, {0.0f, 0.0f, 0.0f}, true)) return 73;
+    if (edpe::isSamePoseSceneSubpass(adsViewmodel, adsWorld, 0.05f, 1.0f, {0.0f, 0.0f, 0.0f}, false)) return 74;
+
+    edpe::SceneSubpassTracker adsTracker;
+    if (!adsTracker.recordOrGet(20, 1.2935f, 2.300f, 0.0675f, true)) return 75;
+    if (!adsTracker.recordOrGet(20, 3.1901f, 5.6713f, 0.025f, true)) return 76;
+    if (!adsTracker.findJittered(20, 1.2935f, 2.300f, 0.0675f)) return 77;
+    if (!adsTracker.findJittered(20, 3.1901f, 5.6713f, 0.025f)) return 78;
+    if (adsTracker.find(20, 1.2634f, 2.2460f, 0.025f)) return 79;
+
+    // 29. Smooth ADS / FOV zoom (>2% but <=25% per frame) MUST NOT trigger
+    // isCameraProjectionCut or isCommittedCameraDiscontinuity (so Debug View does
+    // not falsely reset history during zoom transitions), while >25% jumps,
+    // depthB changes, chirality flips, and >45 deg rotation cuts DO trigger.
+    edpe::CameraProjection smoothAdsStep = worldBase;
+    smoothAdsStep.scaleX = 1.2634f; // ~20% zoom step from 1.0525
+    smoothAdsStep.scaleY = 2.2460f;
+    if (edpe::isCameraProjectionCut(smoothAdsStep, worldBase)) return 80;
+    if (edpe::isCommittedCameraDiscontinuity(smoothAdsStep, worldBase)) return 81;
+
+    // Frame-time hitch + smooth movement must not falsely trigger Debug View reset:
+    auto movingStep = smoothAdsStep;
+    movingStep.worldFromView[3] = 0.0682f;
+    if (edpe::isCommittedCameraDiscontinuity(movingStep, worldBase)) return 82;
+
+    // True projection cut (>25% scale jump or depthB change):
+    if (!edpe::isCameraProjectionCut(adsViewmodel, worldBase)) return 83;
+    if (!edpe::isCommittedCameraDiscontinuity(adsViewmodel, worldBase)) return 84;
+    if (!edpe::isCameraProjectionCut(viewmodelSubpass, worldBase)) return 85;
+    // Large rotation cut (>45 deg, trace < 2.414) or mirrored reflection:
+    if (!edpe::isCommittedCameraDiscontinuity(yawed(50.0f), identity())) return 86;
+    if (!edpe::isCommittedCameraDiscontinuity(planarReflection, identity())) return 87;
+
+    // 30. External on-foot local-origin rebase (~22.9m jump, 0 deg rotation, same FOV/depthB)
+    // inside 4-MRT G-buffer for <5 frames must hold continuous position & keep jitter enabled;
+    // >=5 frames or pre-G-buffer (!inMainScene) or large rotation/FOV cut must not hold.
+    edpe::CameraProjection originRebase = worldBase;
+    originRebase.worldFromView[3] = -0.0741f;
+    originRebase.worldFromView[7] = -4.1486f;
+    originRebase.worldFromView[11] = -22.5333f;
+    const float rebaseJump = 22.912f;
+    if (!edpe::isTransientOriginRebaseHoldEligible(originRebase, worldBase, rebaseJump, 1, true, false)) return 88;
+    if (!edpe::isTransientOriginRebaseHoldEligible(originRebase, worldBase, rebaseJump, 4, true, false)) return 89;
+    // Streak >= 5 accepts persistent teleport instead of holding forever:
+    if (edpe::isTransientOriginRebaseHoldEligible(originRebase, worldBase, rebaseJump, 5, true, false)) return 90;
+    // Pre-G-buffer (!inMainScene) hologram jumps must not stage:
+    if (edpe::isTransientOriginRebaseHoldEligible(originRebase, worldBase, rebaseJump, 1, false, false)) return 91;
+    // Real rotation cut (>45 deg) or projection cut at >15m must not hold as origin rebase:
+    auto rotatedJump = yawed(50.0f);
+    rotatedJump.worldFromView[11] = -22.5333f;
+    if (edpe::isTransientOriginRebaseHoldEligible(rotatedJump, identity(), rebaseJump, 1, true, false)) return 92;
+    // Planetary local-origin rebase (~425..520m) during smooth on-foot camera rotation (e.g. 20 deg)
+    // inside the 4-MRT G-buffer MUST hold continuous position & keep jitter enabled:
+    auto planetaryTurningRebase = yawed(20.0f);
+    planetaryTurningRebase.scaleX = worldBase.scaleX;
+    planetaryTurningRebase.scaleY = worldBase.scaleY;
+    planetaryTurningRebase.depthB = worldBase.depthB;
+    planetaryTurningRebase.worldFromView[3] = 260.494f;
+    planetaryTurningRebase.worldFromView[7] = -118.427f;
+    planetaryTurningRebase.worldFromView[11] = 373.924f;
+    if (!edpe::isTransientOriginRebaseHoldEligible(
+            planetaryTurningRebase, worldBase, 519.124f, 1, true, false)) {
+        return 100;
+    }
+    if (edpe::isTransientOriginRebaseHoldEligible(
+            planetaryTurningRebase, worldBase, 2500.0f, 1, true, false)) {
+        return 101;
+    }
+
+    // 31. Persistent unpredicted teleport (>15m beyond velocity prediction) triggers scene cut,
+    // while smooth high-speed continuous flight (residual <= 15m, step <= 50m) does not.
+    const edpe::Vec3 teleportDelta{-0.0741f, -4.1486f, -22.5333f};
+    const edpe::Vec3 walkingVel{0.0f, 0.0f, 0.08f};
+    if (!edpe::isUnpredictedPositionCut(teleportDelta, walkingVel)) return 93;
+    const edpe::Vec3 flightStep{0.0f, 0.0f, 30.0f};
+    if (edpe::isUnpredictedPositionCut(flightStep, flightStep)) return 94;
+    const edpe::Vec3 over50Step{0.0f, 0.0f, 55.0f};
+    if (!edpe::isUnpredictedPositionCut(over50Step, over50Step)) return 95;
+
+    // 32. Viewmodel sub-pass during fast camera turn (>12.8 deg, <=45 deg) and
+    // planetary origin-rebased sub-pass (cb1[35..38] verified, ~460m offset, same orientation).
+    auto flickViewmodel = [&]() {
+        auto base = yawed(25.0f);
+        base.scaleX = 1.2935f;
+        base.scaleY = 2.300f;
+        base.depthB = 0.0675f;
+        return base;
+    }();
+    if (!edpe::isSamePoseSceneSubpass(flickViewmodel, worldBase, 0.35f, 1.0f, {0.0f, 0.0f, 0.0f}, true)) {
+        return 96;
+    }
+    auto cube90Probe = flickViewmodel;
+    cube90Probe = yawed(90.0f);
+    cube90Probe.scaleX = 1.2935f;
+    cube90Probe.scaleY = 2.300f;
+    cube90Probe.depthB = 0.0675f;
+    if (edpe::isSamePoseSceneSubpass(cube90Probe, worldBase, 0.35f, 1.0f, {0.0f, 0.0f, 0.0f}, true)) {
+        return 97;
+    }
+    edpe::CameraProjection rebasedViewmodel = viewmodelSubpass;
+    rebasedViewmodel.worldFromView[3] = 260.494f;
+    rebasedViewmodel.worldFromView[7] = -118.427f;
+    rebasedViewmodel.worldFromView[11] = 373.924f;
+    if (!edpe::isSamePoseSceneSubpass(rebasedViewmodel, worldBase, 0.35f, 1.0f, {0.0f, 0.0f, 0.0f}, true)) {
+        return 98;
+    }
+    if (edpe::isSamePoseSceneSubpass(rebasedViewmodel, worldBase, 0.35f, 1.0f, {0.0f, 0.0f, 0.0f}, false)) {
+        return 99;
+    }
 
     return 0;
 }
