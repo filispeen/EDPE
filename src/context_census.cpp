@@ -786,9 +786,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                     ? s_last_true_camera
                     : s_camera_now;
             const float rotTrace = edpe::cameraRotationTrace(committedCam, prevRef);
-            const bool projCut =
-                std::fabs(prevRef.depthB - committedCam.depthB) > 1e-3f ||
-                std::fabs(prevRef.scaleX - committedCam.scaleX) > 0.25f * prevRef.scaleX;
+            const bool projCut = edpe::isCameraProjectionCut(committedCam, prevRef);
 
             s_prev_valid_velocity = s_last_valid_velocity;
             if (!haveNormalStaged) {
@@ -10932,9 +10930,8 @@ void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rend
         jx = s_last_temporal_inputs.jitterX;
         jy = s_last_temporal_inputs.jitterY;
         reset = s_last_temporal_inputs.reset;
-        float debugDtRatio = (s_last_frame_dt > 1e-5f) ? (s_current_frame_dt / s_last_frame_dt) : 1.0f;
         if (s_camera_now.scaleX > 0.0f && s_camera_previous.scaleX > 0.0f &&
-            isReflectionOrAuxiliaryCamera(s_camera_now, s_camera_previous, s_prev_valid_velocity, debugDtRatio)) {
+            edpe::isCommittedCameraDiscontinuity(s_camera_now, s_camera_previous)) {
             reset = true;
         }
         isHdr = s_last_temporal_inputs.colorIsHdr;

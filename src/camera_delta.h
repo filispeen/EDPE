@@ -214,6 +214,32 @@ inline bool isReflectionOrAuxiliaryCamera(
     return false;
 }
 
+// True when near plane changes or projection scale jumps >25%
+// (real camera cut rather than smooth FOV / ADS zoom).
+inline bool isCameraProjectionCut(
+    const CameraProjection& current,
+    const CameraProjection& previous)
+{
+    if (previous.scaleX <= 0.0f || previous.scaleY <= 0.0f) return false;
+    return std::fabs(previous.depthB - current.depthB) > 1e-3f ||
+           std::fabs(previous.scaleX - current.scaleX) > 0.25f * previous.scaleX ||
+           std::fabs(previous.scaleY - current.scaleY) > 0.25f * previous.scaleY;
+}
+
+// True when two consecutive committed main-scene cameras represent a true
+// discontinuity (chirality flip, >41 deg rotation cut, or projection cut)
+// without triggering false resets on smooth FOV zoom or variable dt hitches.
+inline bool isCommittedCameraDiscontinuity(
+    const CameraProjection& current,
+    const CameraProjection& previous)
+{
+    const float det = cameraRotationDeterminant(current);
+    if (det < 0.85f || det > 1.15f) return true;
+    if (previous.scaleX <= 0.0f || previous.scaleY <= 0.0f) return false;
+    if (isCameraProjectionCut(current, previous)) return true;
+    return cameraRotationTrace(current, previous) < 2.414f;
+}
+
 // Preserves a continuous eye position while adopting an updated orientation/projection
 // (used when a frame carries only a single-frame ~1 Hz IPD/cockpit probe translation offset).
 inline CameraProjection preservePositionWithOrientation(

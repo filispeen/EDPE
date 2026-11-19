@@ -351,5 +351,28 @@ int main() {
     if (!adsTracker.findJittered(20, 3.1901f, 5.6713f, 0.025f)) return 78;
     if (adsTracker.find(20, 1.2634f, 2.2460f, 0.025f)) return 79;
 
+    // 29. Smooth ADS / FOV zoom (>2% but <=25% per frame) MUST NOT trigger
+    // isCameraProjectionCut or isCommittedCameraDiscontinuity (so Debug View does
+    // not falsely reset history during zoom transitions), while >25% jumps,
+    // depthB changes, chirality flips, and >45 deg rotation cuts DO trigger.
+    edpe::CameraProjection smoothAdsStep = worldBase;
+    smoothAdsStep.scaleX = 1.2634f; // ~20% zoom step from 1.0525
+    smoothAdsStep.scaleY = 2.2460f;
+    if (edpe::isCameraProjectionCut(smoothAdsStep, worldBase)) return 80;
+    if (edpe::isCommittedCameraDiscontinuity(smoothAdsStep, worldBase)) return 81;
+
+    // Frame-time hitch + smooth movement must not falsely trigger Debug View reset:
+    auto movingStep = smoothAdsStep;
+    movingStep.worldFromView[3] = 0.0682f;
+    if (edpe::isCommittedCameraDiscontinuity(movingStep, worldBase)) return 82;
+
+    // True projection cut (>25% scale jump or depthB change):
+    if (!edpe::isCameraProjectionCut(adsViewmodel, worldBase)) return 83;
+    if (!edpe::isCommittedCameraDiscontinuity(adsViewmodel, worldBase)) return 84;
+    if (!edpe::isCameraProjectionCut(viewmodelSubpass, worldBase)) return 85;
+    // Large rotation cut (>45 deg, trace < 2.414) or mirrored reflection:
+    if (!edpe::isCommittedCameraDiscontinuity(yawed(50.0f), identity())) return 86;
+    if (!edpe::isCommittedCameraDiscontinuity(planarReflection, identity())) return 87;
+
     return 0;
 }
