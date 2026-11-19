@@ -6313,12 +6313,13 @@ void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx);
 static inline bool areDrawAndOmHooksIntact(void** tbl, bool checkVsCb);
 
 inline void rearmHudDrawProbeFast(ID3D11DeviceContext* activeCtx) {
-    if (activeCtx &&
-        s_primary_live_mode.load(std::memory_order_relaxed) &&
-        activeCtx == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+    if (activeCtx && activeCtx == s_primary_hook_ctx.load(std::memory_order_acquire)) {
         void** primaryTbl = s_primary_live_table.load(std::memory_order_acquire);
+        const bool isLiveMode = s_primary_live_mode.load(std::memory_order_relaxed);
+        const bool checkVsCb = vs_buffer_probe_active.load(std::memory_order_relaxed) ||
+            (!isLiveMode && hud_draw_probe_active.load(std::memory_order_acquire));
         if (primaryTbl && *reinterpret_cast<void* const*>(activeCtx) == primaryTbl &&
-            areDrawAndOmHooksIntact(primaryTbl, vs_buffer_probe_active.load(std::memory_order_relaxed))) {
+            areDrawAndOmHooksIntact(primaryTbl, checkVsCb)) {
             return;
         }
     }
@@ -6420,13 +6421,16 @@ static inline bool areDrawAndOmHooksIntact(void** tbl, bool checkVsCb) {
 }
 
 void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
-    const bool vsProbeActive = vs_buffer_probe_active.load(std::memory_order_relaxed);
+    const bool vsProbeActive = vs_buffer_probe_active.load(std::memory_order_acquire);
+    const bool hudProbeActiveNow = hud_draw_probe_active.load(std::memory_order_acquire);
+    const bool primaryIsLive = s_primary_live_mode.load(std::memory_order_relaxed);
+    const bool primaryCheckVsCb = vsProbeActive || (!primaryIsLive && hudProbeActiveNow);
     if (activeCtx && activeCtx == s_primary_hook_ctx.load(std::memory_order_acquire)) {
         edpe::VTableHook* primaryHook = s_primary_vtable_hook.load(std::memory_order_acquire);
         void** primaryTbl = s_primary_live_table.load(std::memory_order_acquire);
         if (primaryHook && primaryTbl &&
-            primaryHook->isLiveCopyVptrValid(activeCtx) &&
-            areDrawAndOmHooksIntact(primaryTbl, vsProbeActive)) {
+            primaryHook->isPrimaryVptrValidFast(activeCtx) &&
+            areDrawAndOmHooksIntact(primaryTbl, primaryCheckVsCb)) {
             return;
         }
     }
@@ -6438,8 +6442,9 @@ void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
             if (s_hooked_tables[i].context == activeCtx &&
                 s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
                 s_context_vtable_hooks[i]->reclaimLive(activeCtx);
-                if (s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy &&
-                    areDrawAndOmHooksIntact(s_hooked_tables[i].table, vsProbeActive)) {
+                const bool entryIsLive = (s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy);
+                const bool entryCheckVsCb = vsProbeActive || (!entryIsLive && hudProbeActiveNow);
+                if (areDrawAndOmHooksIntact(s_hooked_tables[i].table, entryCheckVsCb)) {
                     return;
                 }
                 break;
@@ -12170,7 +12175,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
     if (s_in_om_detour) {
         if (forward) forward(context, count, targets, dsv);
-        if (immediate) rearmHudDrawProbe(context);
+        if (immediate) rearmHudDrawProbeFast(context);
         return;
     }
     struct DetourGuard {
@@ -12237,7 +12242,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
     }
     if (s_in_om_detour) {
         if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
-        if (immediate) rearmHudDrawProbe(context);
+        if (immediate) rearmHudDrawProbeFast(context);
         return;
     }
     struct DetourGuard {
@@ -12282,7 +12287,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
 
     if (numRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
         if (immediate) {
-            rearmHudDrawProbe(context);
+            rearmHudDrawProbeFast(context);
         }
         return;
     }
