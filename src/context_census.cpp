@@ -3824,6 +3824,10 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
 
     if (useReproj == 0) {
         float dPrev = loadDepth(tPrevDepth, p);
+        if (abs(dPrev - dCurr) > 0.12 * max(dCurr, 0.1)) {
+            uOutDepth[p] = dCurr;
+            return;
+        }
         uOutDepth[p] = lerp(dCurr, dPrev, historyWeight);
         return;
     }
@@ -3852,7 +3856,7 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
 
     float dPrev = tPrevDepth.SampleLevel(sLinear, priorUv, 0);
     float expectedZ = finiteZ ? priorPos.z : dCurr;
-    if (finiteZ && abs(dPrev - expectedZ) > 0.12 * max(expectedZ, 0.1)) {
+    if (abs(dPrev - expectedZ) > 0.12 * max(expectedZ, 0.1)) {
         uOutDepth[p] = dCurr;
         return;
     }
@@ -4135,9 +4139,9 @@ ID3D11ShaderResourceView* stabilizeFlareDepthForDraw(ID3D11DeviceContext* contex
         s_flare_depth_prev_cam, s_flare_depth_has_prev_cam);
 
     const bool cut = (!tm.consecutive || tm.projDelta >= 0.01f || tm.camRotDeg >= 15.0f || tm.camMoveDist >= 10.0f);
-    const bool moving = (tm.rotPx >= 0.15f || tm.camMoveDist >= 0.01f);
+    const bool moving = (tm.rotPx >= 0.10f || tm.camMoveDist >= 0.008f);
     const bool useReproj = (!cut && moving && tm.hasReproj && s_hud_hdr_merge_sampler != nullptr);
-    const float historyWeight = cut ? 0.0f : (moving ? (useReproj ? 0.78f : 0.0f) : 0.96875f);
+    const float historyWeight = cut ? 0.0f : (moving ? (useReproj ? 0.65f : 0.0f) : 0.90f);
 
     const int prevIdx = s_flare_depth_idx;
     const int curIdx = prevIdx ^ 1;
@@ -4203,14 +4207,39 @@ cbuffer FlareColorStabParams : register(b0) {
 void cs_main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= texSize.x || tid.y >= texSize.y) return;
     int2 p = int2(tid.xy);
+    int2 maxP = max(int2(texSize) - 1, int2(0, 0));
     float3 curr = max(tCurrFlare.Load(int3(p, 0)).rgb, 0.0.xxx);
     if (hasHistory == 0 || blendAlpha >= 0.999) {
         uOutFlare[p] = float4(curr, 1.0);
         return;
     }
 
+    float3 cMin = curr;
+    float3 cMax = curr;
+    [unroll]
+    for (int dy = -1; dy <= 1; ++dy) {
+        [unroll]
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int2 np = clamp(p + int2(dx, dy), int2(0, 0), maxP);
+            float3 nc = max(tCurrFlare.Load(int3(np, 0)).rgb, 0.0.xxx);
+            cMin = min(cMin, nc);
+            cMax = max(cMax, nc);
+        }
+    }
+    float3 margin = 0.15 * (cMax - cMin);
+    float3 clampLo = max(cMin - margin, 0.0.xxx);
+    float3 clampHi = cMax + margin;
+
     if (useReproj == 0) {
         float3 prev = max(tPrevFlare.Load(int3(p, 0)).rgb, 0.0.xxx);
+        float  dCurr = tCurrDepth.Load(int3(p, 0));
+        float  dPrev = tPrevDepth.Load(int3(p, 0));
+        if (abs(dPrev - dCurr) > 0.12 * max(dCurr, 0.1)) {
+            uOutFlare[p] = float4(curr, 1.0);
+            return;
+        }
+        prev = clamp(prev, clampLo, clampHi);
         uOutFlare[p] = float4(lerp(prev, curr, blendAlpha), 1.0);
         return;
     }
@@ -4238,15 +4267,15 @@ void cs_main(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
-    if (finiteZ) {
-        float dPrev = tPrevDepth.SampleLevel(sLinear, priorUv, 0);
-        if (abs(dPrev - priorPos.z) > 0.18 * max(priorPos.z, 0.1)) {
-            uOutFlare[p] = float4(curr, 1.0);
-            return;
-        }
+    float dPrev = tPrevDepth.SampleLevel(sLinear, priorUv, 0);
+    float expectedZ = finiteZ ? priorPos.z : dCurr;
+    if (abs(dPrev - expectedZ) > 0.15 * max(expectedZ, 0.1)) {
+        uOutFlare[p] = float4(curr, 1.0);
+        return;
     }
 
     float3 prev = max(tPrevFlare.SampleLevel(sLinear, priorUv, 0).rgb, 0.0.xxx);
+    prev = clamp(prev, clampLo, clampHi);
     uOutFlare[p] = float4(lerp(prev, curr, blendAlpha), 1.0);
 }
 )hlsl";
@@ -4376,14 +4405,12 @@ bool issueAndStabilizeAdditiveFlareDraw(ID3D11DeviceContext* context,
         s_flare_color_prev_cam, s_flare_color_has_prev_cam);
 
     const bool cut = (!tm.consecutive || tm.projDelta >= 0.01f || tm.camRotDeg >= 15.0f || tm.camMoveDist >= 10.0f);
-    const bool moving = (tm.rotPx >= 0.15f || tm.camMoveDist >= 0.01f);
+    const bool moving = (tm.rotPx >= 0.08f || tm.camMoveDist >= 0.005f);
     ID3D11ShaderResourceView* currDepthSrv = s_flare_depth_srv[s_flare_depth_idx].Get();
     ID3D11ShaderResourceView* prevDepthSrv = s_flare_depth_srv[s_flare_depth_idx ^ 1].Get();
-    const bool useReproj = (!cut && moving && tm.hasReproj &&
-                            s_hud_hdr_merge_sampler != nullptr &&
-                            currDepthSrv != nullptr && prevDepthSrv != nullptr);
-    const bool useHistory = !cut && (!moving || useReproj);
-    const float blendAlpha = !useHistory ? 1.0f : (moving ? 0.16f : 0.04f);
+    const bool useReproj = false;
+    const bool useHistory = (!cut && !moving && currDepthSrv != nullptr && prevDepthSrv != nullptr);
+    const float blendAlpha = useHistory ? 0.25f : 1.0f;
 
     const int prevIdx = s_flare_color_idx;
     const int curIdx = prevIdx ^ 1;
@@ -4490,14 +4517,46 @@ cbuffer BloomStabParams : register(b0) {
 void cs_main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= texSize.x || tid.y >= texSize.y) return;
     int2 p = int2(tid.xy);
+    int2 maxP = max(int2(texSize) - 1, int2(0, 0));
     uint count = max(sampleCount, 1u);
-    float3 accum = 0.0.xxx;
-    [loop]
-    for (uint i = 0; i < count; ++i) {
-        uint slice = (writeSlice + 32u - i) & 31u;
-        accum += max(tBloomRing.Load(int4(p, int(slice), 0)), 0.0.xxx);
+    float3 curr = max(tBloomRing.Load(int4(p, int(writeSlice), 0)), 0.0.xxx);
+    if (count <= 1u) {
+        uOutBloom[p] = float4(curr, 1.0);
+        return;
     }
-    uOutBloom[p] = float4(accum / float(count), 1.0);
+
+    float3 bMin = curr;
+    float3 bMax = curr;
+    [unroll]
+    for (int dy = -1; dy <= 1; ++dy) {
+        [unroll]
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int2 np = clamp(p + int2(dx, dy), int2(0, 0), maxP);
+            float3 nc = max(tBloomRing.Load(int4(np, int(writeSlice), 0)), 0.0.xxx);
+            bMin = min(bMin, nc);
+            bMax = max(bMax, nc);
+        }
+    }
+    float3 margin = 0.20 * (bMax - bMin) + 0.04 * bMax + 0.001;
+    float3 boxLo = max(bMin - margin, 0.0.xxx);
+    float3 boxHi = bMax + margin;
+    float  lumaEnv = max(dot(bMax, float3(0.299, 0.587, 0.114)), 0.005);
+
+    float3 accum = curr;
+    float  wSum = 1.0;
+    [loop]
+    for (uint i = 1u; i < count; ++i) {
+        uint slice = (writeSlice + 32u - i) & 31u;
+        float3 h = max(tBloomRing.Load(int4(p, int(slice), 0)), 0.0.xxx);
+        float3 hClamped = clamp(h, boxLo, boxHi);
+        float3 diff = max(boxLo - h, 0.0.xxx) + max(h - boxHi, 0.0.xxx);
+        float  diffLuma = dot(diff, float3(0.299, 0.587, 0.114));
+        float  w = 1.0 / (1.0 + 6.0 * (diffLuma / lumaEnv));
+        accum += hClamped * w;
+        wSum += w;
+    }
+    uOutBloom[p] = float4(accum / wSum, 1.0);
 }
 )hlsl";
 
@@ -4631,12 +4690,12 @@ ID3D11ShaderResourceView* stabilizeBloomForTonemap(ID3D11DeviceContext* context,
         s_bloom_stab_last_cam_block, s_bloom_stab_has_last_cam,
         s_bloom_stab_prev_cam, s_bloom_stab_has_prev_cam);
 
-    const UINT phaseCap = std::clamp(s_active_jitter_phases.load(std::memory_order_relaxed), 8u, 32u);
+    const UINT phaseCap = std::clamp(s_active_jitter_phases.load(std::memory_order_relaxed), 8u, 16u);
     UINT targetWindow = phaseCap;
-    if (!tm.consecutive || tm.projDelta >= 1e-4f || tm.rotPx >= 0.50f || tm.camMoveDist >= 0.04f) {
+    if (!tm.consecutive || tm.projDelta >= 1e-4f || tm.rotPx >= 0.20f || tm.camMoveDist >= 0.015f) {
         s_bloom_stab_count = 0;
         targetWindow = 1u;
-    } else if (tm.rotPx >= 0.15f || tm.camMoveDist >= 0.012f) {
+    } else if (tm.rotPx >= 0.05f || tm.camMoveDist >= 0.004f) {
         targetWindow = 4u;
     }
 
@@ -6164,6 +6223,7 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
         // Stabilize & unjitter VS depth buffer t0 so the 9-tap occlusion test never strobes
         // against jittered geometry edges, while preserving jitter cancellation for any 192/208 CB0.
         bool flareUnjittered = false;
+        bool isFlareShader = false;
         Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> flareOrigVsT0;
         ID3D11ShaderResourceView* flareStableVsT0 = nullptr;
         Microsoft::WRL::ComPtr<ID3D11Buffer> flareOrigCb1;
@@ -6175,6 +6235,7 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
             ContextCensusIsJitterActive()) {
             std::uint64_t fvs = 0, fps = 0;
             getFastBoundShaderHashes(context, fvs, fps);
+            isFlareShader = (fvs == 0xEA9C5A11E64E94F0ull);
             context->VSGetShaderResources(0, 1, flareOrigVsT0.GetAddressOf());
             if (flareOrigVsT0) {
                 flareStableVsT0 = stabilizeFlareDepthForDraw(context, flareOrigVsT0.Get(), motion_color_frame);
@@ -6192,7 +6253,7 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
                     }
                 }
             }
-            if (fvs == 0xEA9C5A11E64E94F0ull) {
+            if (isFlareShader) {
                 flareUnjittered = true;
                 Microsoft::WRL::ComPtr<ID3D11Buffer> flareOrigCb0;
                 bool flareCb0Jit = false;
@@ -6242,7 +6303,7 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
             }
         }
         bool flareColorHandled = false;
-        if (flareStableVsT0 && vertex_count == 6 && instance_count > 1 &&
+        if (isFlareShader && flareStableVsT0 && vertex_count == 6 && instance_count > 1 &&
             s_flare_color_captured_frame != motion_color_frame) {
             flareColorHandled = issueAndStabilizeAdditiveFlareDraw(
                 context, motion_color_frame, [&]() {
