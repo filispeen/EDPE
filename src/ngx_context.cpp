@@ -176,7 +176,13 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
         NVSDK_NGX_Version_API);
 
     if (r != NVSDK_NGX_Result_Success) {
-        swprintf_s(g_status_msg, L"NVSDK_NGX_D3D11_Init failed: 0x%08X", static_cast<unsigned>(r));
+        if (GetModuleHandleW(L"renderdoc.dll") != nullptr) {
+            swprintf_s(g_status_msg,
+                L"NVSDK_NGX_D3D11_Init failed: 0x%08X (blocked under RenderDoc; use FSR or TAA while capturing)",
+                static_cast<unsigned>(r));
+        } else {
+            swprintf_s(g_status_msg, L"NVSDK_NGX_D3D11_Init failed: 0x%08X", static_cast<unsigned>(r));
+        }
         EdpeLog(g_status_msg);
         return false;
     }

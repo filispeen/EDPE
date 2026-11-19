@@ -1,6 +1,7 @@
 #include "ui_layer.h"
 #include "context_census.h"
 #include "dxbc_fanout.h"
+#include "renderdoc_support.h"
 #include "shader_probe.h"
 
 #include <algorithm>
@@ -613,17 +614,20 @@ void UiLayer::resize(ID3D11Device* device, UINT width, UINT height) {
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     device->CreateTexture2D(&desc, nullptr, &hdrLayerTex_);
+    SetD3D11DebugName(hdrLayerTex_.Get(), "EDPE_UiLayer_HDR");
     device->CreateRenderTargetView(hdrLayerTex_.Get(), nullptr, &hdrLayerRtv_);
     device->CreateShaderResourceView(hdrLayerTex_.Get(), nullptr, &hdrLayerSrv_);
 
     // 2. Створюємо LDR шар для результату тонемапу
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     device->CreateTexture2D(&desc, nullptr, &ldrLayerTex_);
+    SetD3D11DebugName(ldrLayerTex_.Get(), "EDPE_UiLayer_LDR");
     device->CreateRenderTargetView(ldrLayerTex_.Get(), nullptr, &ldrLayerRtv_);
     device->CreateShaderResourceView(ldrLayerTex_.Get(), nullptr, &ldrLayerSrv_);
 
     // 3. Створюємо Mult шар для затемнення бекдропів
     device->CreateTexture2D(&desc, nullptr, &multLayerTex_);
+    SetD3D11DebugName(multLayerTex_.Get(), "EDPE_UiLayer_Mult");
     device->CreateRenderTargetView(multLayerTex_.Get(), nullptr, &multLayerRtv_);
     device->CreateShaderResourceView(multLayerTex_.Get(), nullptr, &multLayerSrv_);
 

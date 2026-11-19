@@ -2,6 +2,7 @@
 #include "config.h"
 #include "crash_logger.h"
 #include "log.h"
+#include "system_dll.h"
 #include "ui.h"
 #include "context_census.h"
 #include "perf_overlay.h"
@@ -12,6 +13,7 @@
 #include <cwchar>
 #include <d3d11.h>
 #include <dxgi1_6.h>
+#include <mutex>
 #include <new>
 #include <windows.h>
 
@@ -284,6 +286,118 @@ void observeSwapChain(IDXGISwapChain* swap_chain) {
 
 void ObserveDxgiSwapChain(IDXGISwapChain* swap_chain) {
     observeSwapChain(swap_chain);
+}
+
+namespace {
+std::atomic<CreateSwapChainFn> s_origWrappedCreateSwapChain{nullptr};
+std::atomic<CreateSwapChainForHwndFn> s_origWrappedCreateSwapChainForHwnd{nullptr};
+thread_local bool t_inRenderDocFactoryProbe = false;
+
+HRESULT STDMETHODCALLTYPE observedWrappedCreateSwapChain(IDXGIFactory* factory, IUnknown* device,
+    DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swap_chain) {
+    hookDeviceIfD3D11(device);
+    const auto original = s_origWrappedCreateSwapChain.load(std::memory_order_acquire);
+    const HRESULT result = original ? original(factory, device, desc, swap_chain) : E_FAIL;
+    if (SUCCEEDED(result) && swap_chain && *swap_chain) {
+        wchar_t scMsg[192];
+        swprintf_s(scMsg, L"EDPE: RenderDoc wrapped swapchain created swapchain=%p device=%p",
+            static_cast<void*>(*swap_chain), static_cast<void*>(device));
+        EdpeLog(scMsg);
+        observeSwapChain(*swap_chain);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE observedWrappedCreateSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* device, HWND hwnd,
+    const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc,
+    IDXGIOutput* restrict_to_output, IDXGISwapChain1** swap_chain) {
+    hookDeviceIfD3D11(device);
+    const auto original = s_origWrappedCreateSwapChainForHwnd.load(std::memory_order_acquire);
+    const HRESULT result = original
+        ? original(factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swap_chain)
+        : E_FAIL;
+    if (SUCCEEDED(result) && swap_chain && *swap_chain) {
+        wchar_t scMsg[192];
+        swprintf_s(scMsg, L"EDPE: RenderDoc wrapped swapchain created swapchain=%p device=%p",
+            static_cast<void*>(*swap_chain), static_cast<void*>(device));
+        EdpeLog(scMsg);
+        observeSwapChain(*swap_chain);
+    }
+    return result;
+}
+
+bool patchWrappedFactorySlot(void** table, size_t slot, void* replacement, void** outOriginal) {
+    if (!table || !replacement || !outOriginal) return false;
+    void* current = table[slot];
+    if (!current || current == replacement) return true;
+    *outOriginal = current;
+    DWORD oldProt = 0;
+    if (!VirtualProtect(table + slot, sizeof(void*), PAGE_READWRITE, &oldProt)) return false;
+    void* prev = InterlockedCompareExchangePointer(
+        reinterpret_cast<PVOID volatile*>(table + slot), replacement, current);
+    DWORD ignored = 0;
+    VirtualProtect(table + slot, sizeof(void*), oldProt, &ignored);
+    return prev == current;
+}
+} // namespace
+
+void EnsureRenderDocFactoryHooked() {
+    if (t_inRenderDocFactoryProbe || !GetModuleHandleW(L"renderdoc.dll")) return;
+    static std::once_flag s_once;
+    std::call_once(s_once, [] {
+        struct ProbeGuard {
+            bool& flag;
+            explicit ProbeGuard(bool& f) : flag(f) { flag = true; }
+            ~ProbeGuard() { flag = false; }
+        } guard(t_inRenderDocFactoryProbe);
+        HMODULE system_dxgi = nullptr;
+        wchar_t sysDxgiPath[MAX_PATH]{};
+        const UINT sysLen = GetSystemDirectoryW(sysDxgiPath, MAX_PATH);
+        if (sysLen > 0 && sysLen + 10 < MAX_PATH) {
+            wcscpy_s(sysDxgiPath + sysLen, MAX_PATH - sysLen, L"\\dxgi.dll");
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, sysDxgiPath, &system_dxgi);
+        }
+        if (!system_dxgi) {
+            system_dxgi = LoadSystemDll(L"dxgi.dll");
+        }
+        if (!system_dxgi) return;
+        const auto create_factory = reinterpret_cast<decltype(&CreateDXGIFactory1)>(
+            GetProcAddress(system_dxgi, "CreateDXGIFactory1"));
+        if (!create_factory) return;
+
+        IDXGIFactory1* probeFactory = nullptr;
+        if (FAILED(create_factory(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&probeFactory))) ||
+            !probeFactory) {
+            return;
+        }
+        void** vt = *reinterpret_cast<void***>(probeFactory);
+        if (vt && IsAddressInRenderDocModule(vt[kCreateSwapChain])) {
+            HMODULE self = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                    reinterpret_cast<LPCWSTR>(&observedWrappedCreateSwapChain), &self)) {
+                void* origCs = nullptr;
+                const bool okCs = patchWrappedFactorySlot(
+                    vt, kCreateSwapChain, reinterpret_cast<void*>(&observedWrappedCreateSwapChain), &origCs);
+                if (okCs && origCs) {
+                    s_origWrappedCreateSwapChain.store(
+                        reinterpret_cast<CreateSwapChainFn>(origCs), std::memory_order_release);
+                }
+                if (supportsSamePointer<IDXGIFactory2>(probeFactory)) {
+                    void* origCsHwnd = nullptr;
+                    const bool okHwnd = patchWrappedFactorySlot(
+                        vt, kCreateSwapChainForHwnd,
+                        reinterpret_cast<void*>(&observedWrappedCreateSwapChainForHwnd), &origCsHwnd);
+                    if (okHwnd && origCsHwnd) {
+                        s_origWrappedCreateSwapChainForHwnd.store(
+                            reinterpret_cast<CreateSwapChainForHwndFn>(origCsHwnd), std::memory_order_release);
+                    }
+                }
+                EdpeLog(okCs ? L"EDPE: RenderDoc WrappedIDXGIFactory CreateSwapChain hook armed"
+                             : L"EDPE: RenderDoc WrappedIDXGIFactory hook failed");
+            }
+        }
+        probeFactory->Release();
+    });
 }
 
 void ObserveDxgiFactory(REFIID iid, void* factory) {

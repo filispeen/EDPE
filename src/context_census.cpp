@@ -19,6 +19,7 @@
 #include "hud_debug_pass.h"
 #include "jitter_view_recorder.h"
 #include "profiler.h"
+#include "renderdoc_support.h"
 #include "d3d11_proxy.h"
 #include "vtable_hook.h"
 
@@ -3746,10 +3747,13 @@ ID3D11ShaderResourceView* buildHudMergedHdrScratchForBloom(
         srcSrvToUse = s_hud_bloom_src_srv.Get();
     }
 
-    s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::HudBloom);
-    context->CopyResource(s_hud_merged_hdr_texture.Get(), hdrTex.Get());
-    mergeHudIntoHdrTarget(context, s_hud_merged_hdr_rtv.Get(), targetW, targetH, srcSrvToUse);
-    s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::HudBloom);
+    {
+        edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: HudBloom");
+        s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::HudBloom);
+        context->CopyResource(s_hud_merged_hdr_texture.Get(), hdrTex.Get());
+        mergeHudIntoHdrTarget(context, s_hud_merged_hdr_rtv.Get(), targetW, targetH, srcSrvToUse);
+        s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::HudBloom);
+    }
     s_hud_merged_into_hdr_this_frame = true;
     s_hud_merged_hdr_source_res = hdrSourceRes;
     s_hud_merged_hdr_frame = current_frame;
@@ -6369,12 +6373,13 @@ void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx);
 static inline bool areDrawAndOmHooksIntact(void** tbl, bool checkVsCb);
 
 inline void rearmHudDrawProbeFast(ID3D11DeviceContext* activeCtx) {
-    if (activeCtx &&
-        s_primary_live_mode.load(std::memory_order_relaxed) &&
-        activeCtx == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+    if (activeCtx && activeCtx == s_primary_hook_ctx.load(std::memory_order_acquire)) {
         void** primaryTbl = s_primary_live_table.load(std::memory_order_acquire);
+        const bool isLiveMode = s_primary_live_mode.load(std::memory_order_relaxed);
+        const bool checkVsCb = vs_buffer_probe_active.load(std::memory_order_relaxed) ||
+            (!isLiveMode && hud_draw_probe_active.load(std::memory_order_acquire));
         if (primaryTbl && *reinterpret_cast<void* const*>(activeCtx) == primaryTbl &&
-            areDrawAndOmHooksIntact(primaryTbl, vs_buffer_probe_active.load(std::memory_order_relaxed))) {
+            areDrawAndOmHooksIntact(primaryTbl, checkVsCb)) {
             return;
         }
     }
@@ -6476,13 +6481,16 @@ static inline bool areDrawAndOmHooksIntact(void** tbl, bool checkVsCb) {
 }
 
 void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
-    const bool vsProbeActive = vs_buffer_probe_active.load(std::memory_order_relaxed);
+    const bool vsProbeActive = vs_buffer_probe_active.load(std::memory_order_acquire);
+    const bool hudProbeActiveNow = hud_draw_probe_active.load(std::memory_order_acquire);
+    const bool primaryIsLive = s_primary_live_mode.load(std::memory_order_relaxed);
+    const bool primaryCheckVsCb = vsProbeActive || (!primaryIsLive && hudProbeActiveNow);
     if (activeCtx && activeCtx == s_primary_hook_ctx.load(std::memory_order_acquire)) {
         edpe::VTableHook* primaryHook = s_primary_vtable_hook.load(std::memory_order_acquire);
         void** primaryTbl = s_primary_live_table.load(std::memory_order_acquire);
         if (primaryHook && primaryTbl &&
-            primaryHook->isLiveCopyVptrValid(activeCtx) &&
-            areDrawAndOmHooksIntact(primaryTbl, vsProbeActive)) {
+            primaryHook->isPrimaryVptrValidFast(activeCtx) &&
+            areDrawAndOmHooksIntact(primaryTbl, primaryCheckVsCb)) {
             return;
         }
     }
@@ -6494,8 +6502,9 @@ void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
             if (s_hooked_tables[i].context == activeCtx &&
                 s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
                 s_context_vtable_hooks[i]->reclaimLive(activeCtx);
-                if (s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy &&
-                    areDrawAndOmHooksIntact(s_hooked_tables[i].table, vsProbeActive)) {
+                const bool entryIsLive = (s_context_vtable_hooks[i]->mode() == edpe::HookMode::LiveCopy);
+                const bool entryCheckVsCb = vsProbeActive || (!entryIsLive && hudProbeActiveNow);
+                if (areDrawAndOmHooksIntact(s_hooked_tables[i].table, entryCheckVsCb)) {
                     return;
                 }
                 break;
@@ -10362,6 +10371,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             inDesc.Usage = D3D11_USAGE_DEFAULT;
             inDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             if (FAILED(device->CreateTexture2D(&inDesc, nullptr, &s_dlaa_input))) return;
+            edpe::SetD3D11DebugName(s_dlaa_input.Get(), "EDPE_ColorInput");
             device->CreateShaderResourceView(s_dlaa_input.Get(), nullptr, &s_dlaa_input_srv);
             s_camera_reset = true;
             wchar_t msg[160];
@@ -10377,9 +10387,12 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_dlaa_input_srv.Reset();
             return;
         }
-        s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::ColorPrep);
-        context->CopyResource(s_dlaa_input.Get(), colorSource);
-        s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::ColorPrep);
+        {
+            edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: ColorPrep");
+            s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::ColorPrep);
+            context->CopyResource(s_dlaa_input.Get(), colorSource);
+            s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::ColorPrep);
+        }
     }
     ID3D11Texture2D* activeColorInputTex = useDirectColorSrv ? colorSource : s_dlaa_input.Get();
     ID3D11ShaderResourceView* activeColorInputSrv = useDirectColorSrv ? s_direct_color_srv.Get() : s_dlaa_input_srv.Get();
@@ -10409,6 +10422,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
         if (!motion_depth) {
             if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &motion_depth))) return;
+            edpe::SetD3D11DebugName(motion_depth.Get(), "EDPE_MotionDepth");
             if (FAILED(device->CreateShaderResourceView(motion_depth.Get(), &srvDesc, &motion_depth_view))) return;
         }
         if (!s_motion_prev_depth) {
@@ -10417,6 +10431,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 s_motion_prev_depth.Reset();
                 s_motion_prev_depth_view.Reset();
                 s_has_motion_prev_depth = false;
+            } else {
+                edpe::SetD3D11DebugName(s_motion_prev_depth.Get(), "EDPE_MotionPrevDepth");
             }
         }
         s_has_motion_prev_depth = false;
@@ -10563,9 +10579,12 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             !sameD3D11Device(scene_depth_source.Get(), device.Get())) {
             return;
         }
-        s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::DepthCopy);
-        context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
-        s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::DepthCopy);
+        {
+            edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: DepthCopy");
+            s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::DepthCopy);
+            context->CopyResource(motion_depth.Get(), scene_depth_source.Get());
+            s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::DepthCopy);
+        }
         s_has_motion_prev_depth = (s_motion_prev_depth && s_motion_prev_depth_view);
 
         if (!motion_pass) {
@@ -10574,17 +10593,20 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             motion_pass = std::move(candidate);
         }
 
-        s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::MotionPass);
-        if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
-            motion_pass->clear(context);
-        } else {
-            // Render motion vectors at render resolution using current and previous camera projections and jitter phases
-            motion_pass->render(motion_depth_view.Get(),
-                s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
-                jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv, nullptr,
-                /*preserveContextState=*/false);
+        {
+            edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: MotionPass");
+            s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::MotionPass);
+            if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
+                motion_pass->clear(context);
+            } else {
+                // Render motion vectors at render resolution using current and previous camera projections and jitter phases
+                motion_pass->render(motion_depth_view.Get(),
+                    s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
+                    jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv, nullptr,
+                    /*preserveContextState=*/false);
+            }
+            s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
         }
-        s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
 
         if (!motion_pass->output()) return;
 
@@ -10666,6 +10688,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 FAILED(device->CreateShaderResourceView(s_dlss_output_texture.Get(), nullptr, &s_dlss_output_srv))) {
                 s_dlss_output_texture.Reset();
                 s_dlss_output_srv.Reset();
+            } else {
+                edpe::SetD3D11DebugName(s_dlss_output_texture.Get(), "EDPE_UpscalerOutput");
             }
         }
 
@@ -10708,6 +10732,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
                 td.CPUAccessFlags = td.MiscFlags = 0;
                 if (SUCCEEDED(device->CreateTexture2D(&td, nullptr, &s_comp_final_tex))) {
+                    edpe::SetD3D11DebugName(s_comp_final_tex.Get(), "EDPE_CompositeFinal");
                     device->CreateRenderTargetView(s_comp_final_tex.Get(), nullptr, &s_comp_final_rtv);
                     D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
                     uavDesc.Format = bbFormat;
@@ -10732,9 +10757,13 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
 
         bool compOk = false;
-        s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UpscaleEval);
-        const bool upscalerEvalOk = upscaler.evaluate(context, inputs, nullptr, evalDestination);
-        s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::UpscaleEval);
+        bool upscalerEvalOk = false;
+        {
+            edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: UpscaleEval");
+            s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UpscaleEval);
+            upscalerEvalOk = upscaler.evaluate(context, inputs, nullptr, evalDestination);
+            s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::UpscaleEval);
+        }
         rearmContextHooks();
         edpe::updateCrashUpscalerState(
             static_cast<int>(upscaler.getBackend()),
@@ -10778,7 +10807,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                                          ((allowBackbufferWrite && s_backbuffer_rtv) || s_backbuffer_uav || s_comp_final_uav) &&
                                          (hudWasDiverted || visorWasDiverted || colorSource != backbuffer));
             s_diag_composite_path = canCompositeUi ? 1 : 2;
-            s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UiComposite);
+            {
+                edpe::ScopedRenderDocEvent rdocUiEvent(context, L"EDPE: UiComposite");
+                s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UiComposite);
             if (canCompositeUi) {
                 if (edpe::UiLayer::instance().device() != device.Get() ||
                     edpe::UiLayer::instance().width() != backbufferDesc.Width ||
@@ -10837,6 +10868,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 compOk = true;
             }
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::UiComposite);
+            }
 
             if (s_cmp_seq.active && s_cmp_seq.phase == CmpPhase::Warmup &&
                 s_cmp_seq.idx < s_cmp_seq.list.size() &&
@@ -12251,7 +12283,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargets(ID3D11DeviceContext* context, 
     }
     if (s_in_om_detour) {
         if (forward) forward(context, count, targets, dsv);
-        if (immediate) rearmHudDrawProbe(context);
+        if (immediate) rearmHudDrawProbeFast(context);
         return;
     }
     struct DetourGuard {
@@ -12318,7 +12350,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
     }
     if (s_in_om_detour) {
         if (forward) forward(context, numRTVs, targets, dsv, uavStartSlot, numUAVs, uavs, initialCounts);
-        if (immediate) rearmHudDrawProbe(context);
+        if (immediate) rearmHudDrawProbeFast(context);
         return;
     }
     struct DetourGuard {
@@ -12363,7 +12395,7 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
 
     if (numRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
         if (immediate) {
-            rearmHudDrawProbe(context);
+            rearmHudDrawProbeFast(context);
         }
         return;
     }
@@ -13447,6 +13479,15 @@ void ContextCensusAfterPresent(IDXGISwapChain* swap_chain, UINT flags) {
     s_in_edpe_present.store(false, std::memory_order_release);
     if ((flags & DXGI_PRESENT_TEST) || observed_swap_chain != swap_chain || !patched_table) return;
     rearmContextHooks();
+    auto& mgr = edpe::UpscalerManager::instance();
+    edpe::RenderDocBridge::instance().onFramePresented(
+        edpe::kVersion,
+        static_cast<int>(mgr.getBackend()),
+        static_cast<int>(mgr.getMode()),
+        s_observed_scene_width.load(std::memory_order_relaxed),
+        s_observed_scene_height.load(std::memory_order_relaxed),
+        s_swapchain_width.load(std::memory_order_relaxed),
+        s_swapchain_height.load(std::memory_order_relaxed));
 }
 
 bool ContextCensusRequestBindSequence() {

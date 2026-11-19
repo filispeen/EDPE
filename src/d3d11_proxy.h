@@ -9,6 +9,7 @@ void SetPrimaryD3D11Device(ID3D11Device* device, ID3D11DeviceContext* context = 
 void ResetPrimaryD3D11Device();
 void ObserveDxgiFactory(REFIID iid, void* factory);
 void ObserveDxgiSwapChain(IDXGISwapChain* swap_chain);
+void EnsureRenderDocFactoryHooked();
 void syncConfigOnce();
 
 namespace edpe {

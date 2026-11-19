@@ -24,6 +24,7 @@
 #include <tlhelp32.h>
 #include <dxgi.h>
 #include <vector>
+#include <intrin.h>
 
 namespace {
 using CreateVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*,
@@ -493,7 +494,9 @@ void installD3D11Hooks() {
                     _wcsicmp(me.szModule, L"dxgi.dll") == 0 ||
                     _wcsicmp(me.szModule, L"ntdll.dll") == 0 ||
                     _wcsicmp(me.szModule, L"kernel32.dll") == 0 ||
-                    _wcsicmp(me.szModule, L"kernelbase.dll") == 0) {
+                    _wcsicmp(me.szModule, L"kernelbase.dll") == 0 ||
+                    _wcsicmp(me.szModule, L"renderdoc.dll") == 0 ||
+                    _wcsicmp(me.szModule, L"renderdocshim64.dll") == 0) {
                     continue;
                 }
                 void* origDev = nullptr;
@@ -517,6 +520,26 @@ void installD3D11Hooks() {
 }
 }
 
+namespace {
+thread_local int t_d3d11CreateDepth = 0;
+
+struct ScopedD3D11Depth {
+    int& depth;
+    explicit ScopedD3D11Depth(int& d) : depth(d) { ++depth; }
+    ~ScopedD3D11Depth() { --depth; }
+};
+
+template <typename Fn>
+Fn resolveD3D11CreateProc(HMODULE systemD3D11, const char* name, bool bypassHooks) {
+    if (bypassHooks) {
+        if (void* raw = ResolvePeExportRaw(systemD3D11, name)) {
+            return reinterpret_cast<Fn>(raw);
+        }
+    }
+    return reinterpret_cast<Fn>(GetProcAddress(systemD3D11, name));
+}
+} // namespace
+
 extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
     IDXGIAdapter* adapter,
     D3D_DRIVER_TYPE driver_type,
@@ -528,17 +551,27 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
     ID3D11Device** device,
     D3D_FEATURE_LEVEL* feature_level,
     ID3D11DeviceContext** context) {
-    syncConfigOnce();
+    const bool fromRenderDoc = (t_d3d11CreateDepth > 0) || IsAddressInRenderDocModule(_ReturnAddress());
+    if (t_d3d11CreateDepth == 0) {
+        syncConfigOnce();
+    }
     const HMODULE system_d3d11 = resolveRealSystemD3D11();
     if (!system_d3d11) return HRESULT_FROM_WIN32(GetLastError());
 
-    static const auto create_device = reinterpret_cast<decltype(&D3D11CreateDevice)>(
-        GetProcAddress(system_d3d11, "D3D11CreateDevice"));
+    const auto create_device = resolveD3D11CreateProc<decltype(&D3D11CreateDevice)>(
+        system_d3d11, "D3D11CreateDevice", fromRenderDoc);
     if (!create_device) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+
+    if (fromRenderDoc) {
+        ScopedD3D11Depth guard(t_d3d11CreateDepth);
+        return create_device(adapter, driver_type, software, flags,
+            feature_levels, feature_level_count, sdk_version, device, feature_level, context);
+    }
 
     logDeviceCreationCall(L"D3D11CreateDevice", adapter, driver_type, flags,
         feature_levels, feature_level_count, sdk_version);
 
+    ScopedD3D11Depth guard(t_d3d11CreateDepth);
     const HRESULT result = create_device(adapter, driver_type, software, flags,
         feature_levels, feature_level_count, sdk_version, device, feature_level, context);
     if (SUCCEEDED(result) && device && *device) {
@@ -552,6 +585,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDevice(
         hookShaderCreation(*device);
         processDeviceCreated(*device, (context && *context) ? *context : nullptr, flags,
             (feature_level && *feature_level) ? *feature_level : static_cast<D3D_FEATURE_LEVEL>(0));
+        EnsureRenderDocFactoryHooked();
     } else {
         edpe::setLastD3D11HResult(result);
         EdpeLog(SUCCEEDED(result) ? L"EDPE: D3D11 device created without output"
@@ -573,17 +607,27 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDeviceAndSwapChain(
     ID3D11Device** ppDevice,
     D3D_FEATURE_LEVEL* pFeatureLevel,
     ID3D11DeviceContext** ppImmediateContext) {
-    syncConfigOnce();
+    const bool fromRenderDoc = (t_d3d11CreateDepth > 0) || IsAddressInRenderDocModule(_ReturnAddress());
+    if (t_d3d11CreateDepth == 0) {
+        syncConfigOnce();
+    }
     const HMODULE system_d3d11 = resolveRealSystemD3D11();
     if (!system_d3d11) return HRESULT_FROM_WIN32(GetLastError());
 
-    static const auto create_device_and_swap_chain = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(
-        GetProcAddress(system_d3d11, "D3D11CreateDeviceAndSwapChain"));
+    const auto create_device_and_swap_chain = resolveD3D11CreateProc<decltype(&D3D11CreateDeviceAndSwapChain)>(
+        system_d3d11, "D3D11CreateDeviceAndSwapChain", fromRenderDoc);
     if (!create_device_and_swap_chain) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+
+    if (fromRenderDoc) {
+        ScopedD3D11Depth guard(t_d3d11CreateDepth);
+        return create_device_and_swap_chain(pAdapter, DriverType, Software, Flags,
+            pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+    }
 
     logDeviceCreationCall(L"D3D11CreateDeviceAndSwapChain", pAdapter, DriverType, Flags,
         pFeatureLevels, FeatureLevels, SDKVersion);
 
+    ScopedD3D11Depth guard(t_d3d11CreateDepth);
     const HRESULT result = create_device_and_swap_chain(pAdapter, DriverType, Software, Flags,
         pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
     if (SUCCEEDED(result)) {
@@ -599,6 +643,7 @@ extern "C" HRESULT WINAPI EdpeD3D11CreateDeviceAndSwapChain(
                 static_cast<void*>(*ppSwapChain), static_cast<void*>(ppDevice ? *ppDevice : nullptr));
             EdpeLog(scMsg);
         }
+        EnsureRenderDocFactoryHooked();
     } else {
         EdpeLog(L"EDPE: D3D11CreateDeviceAndSwapChain failed");
     }

@@ -485,7 +485,9 @@ static void writeCrashDump(EXCEPTION_POINTERS* ep) {
     writeFormat(file, "Upscaler Backend:   %s (%s)\r\n", getBackendName(backend), isFb ? "Fallback" : "Active");
     writeFormat(file, "Upscaler Mode:      %s\r\n", getModeName(mode));
     writeFormat(file, "Resolution:         %ux%u -> %ux%u\r\n", rW, rH, oW, oH);
-    writeFormat(file, "Frame Number:       %llu\r\n\r\n", frameNum);
+    writeFormat(file, "Frame Number:       %llu\r\n", frameNum);
+    writeFormat(file, "RenderDoc Attached: %s\r\n\r\n",
+                GetModuleHandleW(L"renderdoc.dll") ? "Yes" : "No");
 
     writeRaw(file, "--- Loaded Modules ---\r\n");
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
