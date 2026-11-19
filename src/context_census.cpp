@@ -758,6 +758,10 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
 
     const bool haveNormalStaged =
         (s_has_staged_camera && s_staged_camera_frame == rendered_frame);
+    const bool useProbePositionHold =
+        haveNormalStaged &&
+        s_staged_was_probe_vs_committed &&
+        s_camera_now.scaleX > 0.0f;
     const bool useProbeOrientationFallback =
         !haveNormalStaged &&
         s_has_probe_fallback_camera &&
@@ -768,9 +772,11 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
     out_scene_cut = false;
     if (haveNormalStaged || useProbeOrientationFallback) {
         const edpe::CameraProjection committedCam = [&]() {
-            if (haveNormalStaged) {
+            if (haveNormalStaged && !useProbePositionHold) {
                 return s_staged_camera;
             }
+            const edpe::CameraProjection& orientSrc =
+                haveNormalStaged ? s_staged_camera : s_probe_fallback_camera;
             const float fbDtRatio = (s_last_frame_dt > 1e-5f && s_current_frame_dt > 1e-5f)
                 ? std::clamp(s_current_frame_dt / s_last_frame_dt, 0.25f, 4.0f)
                 : 1.0f;
@@ -778,7 +784,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                 ((edpe::length(s_last_valid_velocity) <= 1.0f)
                     ? (s_last_valid_velocity * fbDtRatio)
                     : edpe::Vec3{0.0f, 0.0f, 0.0f});
-            return edpe::preservePositionWithOrientation(s_probe_fallback_camera, predictedPos);
+            return edpe::preservePositionWithOrientation(orientSrc, predictedPos);
         }();
         if (s_camera_now.scaleX > 0.0f) {
             const edpe::CameraProjection& prevRef =
@@ -789,7 +795,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
             const bool projCut = edpe::isCameraProjectionCut(committedCam, prevRef);
 
             s_prev_valid_velocity = s_last_valid_velocity;
-            if (!haveNormalStaged) {
+            if (!haveNormalStaged || useProbePositionHold) {
                 s_camera_previous = s_camera_now;
                 s_camera_previous_frame = s_camera_frame;
                 out_scene_cut = false;
@@ -859,7 +865,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         s_probe_fallback_from_in_scene = false;
         s_probe_fallback_parse_ok = false;
 
-        if (useProbeOrientationFallback) {
+        if (useProbeOrientationFallback || useProbePositionHold) {
             static unsigned s_probe_orient_tokens = 0;
             static unsigned long long s_probe_orient_refill_frame = ~0ull;
             if (ContextCensusIsJitterActive() &&
@@ -1652,6 +1658,7 @@ std::atomic<bool> s_zero_motion_vectors{false};
 
 static std::atomic<bool> s_scene_jitter_consumed{true};
 static std::atomic<unsigned> s_scene_writes_since_eval{0};
+static std::atomic<unsigned> s_cb1_writes_since_eval{0};
 static edpe::ProjectionJitter s_fast_active_jitter{};
 
 edpe::ProjectionJitter getOrUpdateSceneProjectionJitter() {
@@ -1688,6 +1695,7 @@ edpe::ProjectionJitter getOrUpdateSceneProjectionJitter() {
         s_fast_active_jitter = jitter;
         jitter_frame_index.store(scene_seq, std::memory_order_relaxed);
         s_scene_writes_since_eval.store(0, std::memory_order_relaxed);
+        s_cb1_writes_since_eval.store(0, std::memory_order_relaxed);
         s_scene_jitter_consumed.store(false, std::memory_order_release);
     }
     return active_projection_jitter;
@@ -7525,6 +7533,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     static bool s_cb1_flt_is_subpass = false;
                     static bool s_cb1_flt_is_cb1_subpass = false;
                     static bool s_cb1_flt_matches_world = false;
+                    static bool s_cb1_flt_staged_was_probe = false;
                     const bool hasStagedNow = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
                     const size_t curSubpassCnt = s_scene_subpasses.countForFrame(cur_frame);
                     const float curVpW = words[1328];
@@ -7537,6 +7546,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                          s_cb1_flt_had_staged == hasStagedNow &&
                          s_cb1_flt_staged_in_scene == s_staged_from_in_scene &&
                          s_cb1_flt_staged_parse_ok == s_staged_was_parse_ok &&
+                         s_cb1_flt_staged_was_probe == s_staged_was_probe_vs_committed &&
                          s_cb1_flt_outW == outW && s_cb1_flt_outH == outH &&
                          s_cb1_flt_vpW == curVpW && s_cb1_flt_vpH == curVpH &&
                          s_cb1_flt_subpass_cnt == curSubpassCnt &&
@@ -7590,6 +7600,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         !allow_fallback_recovery && !matches_staged && !promote_over_probe &&
                         (probe_vs_anchor || probe_vs_committed);
 
+                    bool stage_probe_in_scene = false;
                     if (is_probe) {
                         s_probe_seen_this_frame = true;
                         ++s_ustat.probe;
@@ -7615,10 +7626,18 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 s_probe_fallback_from_in_scene = in_main_scene;
                                 s_probe_fallback_parse_ok = parse_ok;
                             }
+                            if (in_main_scene) {
+                                // Provisionally stage and jitter the 4-MRT G-buffer camera even during
+                                // probe-offset frames so CB1 doesn't drop jitter while dot208 stays jittered;
+                                // a true non-probe in_scene pass still promotes over it via promote_over_probe,
+                                // and commitMainCamera holds continuous position via useProbePositionHold.
+                                stage_probe_in_scene = true;
+                            }
                         }
                     }
 
-                    bool passes_filter = !is_probe &&
+                    bool passes_filter = stage_probe_in_scene ||
+                        (!is_probe &&
                         ((!hasStagedForFrame &&
                           isAuthoritativeMainSceneCamera(
                               words, 5376 / sizeof(float), parsed_camera,
@@ -7634,7 +7653,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                            (!s_staged_from_in_scene && in_main_scene &&
                             isAuthoritativeMainSceneCamera(
                                 words, 5376 / sizeof(float), parsed_camera,
-                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, false, local_world140)))));
+                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, false, local_world140))))));
 
                     float spCheckDist = 0.0f;
                     float spCheckTrace = 0.0f;
@@ -7902,6 +7921,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         s_cb1_flt_is_subpass = is_subpass_camera;
                         s_cb1_flt_is_cb1_subpass = is_cb1_subpass;
                         s_cb1_flt_matches_world = matches_world_cb1;
+                        s_cb1_flt_staged_was_probe = s_staged_was_probe_vs_committed;
                     }
                     }
                 } else {
@@ -8087,6 +8107,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         jitter_applied_this_unmap = true;
                         s_injected_jitter = jitter;
                         s_last_rendered_jitter = jitter;
+                        s_cb1_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
                         s_scene_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
                         s_jitter_injected_frame = cur_frame;
                         const unsigned count = jittered_writes_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -10242,7 +10263,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     ScopedD3D11PipelineState stateGuard(context);
 
     const unsigned scene_writes_this_eval = s_scene_writes_since_eval.exchange(0, std::memory_order_acq_rel);
-    const bool has_fresh_scene_jitter = (scene_writes_this_eval > 0);
+    const unsigned cb1_writes_this_eval = s_cb1_writes_since_eval.exchange(0, std::memory_order_acq_rel);
+    const bool cb1_target_seen = (scene_map_target.load(std::memory_order_acquire) != nullptr);
+    const bool has_fresh_scene_jitter = cb1_target_seen ? (cb1_writes_this_eval > 0) : (scene_writes_this_eval > 0);
     {
         static unsigned long long s_zw_last_write_frame = 0;
         static unsigned s_zw_budget = 0; // Unmap-stats logging is off: EdpeLog opens the file per line and costs frame time.
@@ -10834,7 +10857,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         jlog.evalJy = inputs.jitterY;
         jlog.syncOk = has_fresh_scene_jitter;
         jlog.cameraValid = (s_camera_now.scaleX > 0.0f);
-        jlog.heldJitter = (scene_writes_this_eval == 0);
+        jlog.heldJitter = !has_fresh_scene_jitter;
         jlog.sceneCut = scene_cut || s_camera_reset;
         jlog.camMoveDist = moveDist;
         jlog.camRotDeg = std::acos(std::clamp((rotTrace - 1.0f) * 0.5f, -1.0f, 1.0f)) * 57.29578f;
