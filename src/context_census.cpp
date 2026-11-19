@@ -10786,7 +10786,28 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             if (!evaluatedAtPass53) {
                 s_diag_eval_stage = 2;
             }
-            const bool allowBackbufferWrite = evaluatedAtPass53 || chosenIsBackbuffer || (s_pause_menu_seen_frame != rendered);
+            // At Present (stage=2), never overwrite the backbuffer with a pre-UI offscreen target:
+            // Pass 54 2D UI (Main Menu, Starport Services, ESC Menu, On-Foot HUD) has already been
+            // drawn to the backbuffer, so copying pre-UI scene output over it wipes out all UI.
+            const bool allowBackbufferWrite = evaluatedAtPass53 || chosenIsBackbuffer;
+            if (!evaluatedAtPass53 && !chosenIsBackbuffer) {
+                static bool s_logged_pass53_miss = false;
+                if (!s_logged_pass53_miss) {
+                    s_logged_pass53_miss = true;
+                    wchar_t missMsg[256];
+                    swprintf_s(missMsg,
+                        L"EDPE: Pass 53 eval missed at frame=%llu (verifiedTonemap=%d postLdrBb=%d hdrSeen=%d ldrCand=%d sceneLdr=%d hdrSlot=%d pauseMenu=%d); preserving backbuffer UI",
+                        rendered,
+                        s_verified_ldr_tonemap_frame == rendered ? 1 : 0,
+                        s_post_ldr_backbuffer_bound ? 1 : 0,
+                        s_hdr_slot0_seen_frame == rendered ? 1 : 0,
+                        s_ldr_tonemap_candidate_bound ? 1 : 0,
+                        (scene_ldr_source && scene_ldr_frame == rendered) ? 1 : 0,
+                        isHdrColor ? 1 : 0,
+                        s_pause_menu_seen_frame == rendered ? 1 : 0);
+                    EdpeLog(missMsg);
+                }
+            }
             const bool hudWasDiverted = (s_hud_draws_replayed_frame > 0 && !isPauseOrModalMenuActive(rendered));
             const bool visorWasDiverted =
                 (s_visor_diverted_frame == rendered &&

@@ -25,6 +25,11 @@ inline bool isRunningInEliteProcess() {
     return filename.find(L"elitedangerous") != std::wstring::npos;
 }
 
+inline bool isRunningUnderWine() {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+}
+
 class Config {
 public:
     static Config& instance() {
@@ -134,7 +139,8 @@ public:
         RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
 
         wrapDirectInputMouse = GetPrivateProfileIntW(L"Input", L"WrapDirectInputMouse", 1, path.c_str()) != 0;
-        wrapDirectInputKeyboard = GetPrivateProfileIntW(L"Input", L"WrapDirectInputKeyboard", 1, path.c_str()) != 0;
+        const int defaultWrapKeyboard = isRunningUnderWine() ? 0 : 1;
+        wrapDirectInputKeyboard = GetPrivateProfileIntW(L"Input", L"WrapDirectInputKeyboard", defaultWrapKeyboard, path.c_str()) != 0;
     }
 
     void save() {
@@ -347,7 +353,7 @@ public:
     bool renderDocAnnotations = true;
 
     bool wrapDirectInputMouse = true;
-    bool wrapDirectInputKeyboard = true;
+    bool wrapDirectInputKeyboard = !isRunningUnderWine();
 };
 
 } // namespace edpe
