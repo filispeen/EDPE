@@ -128,7 +128,7 @@ private:
     void shutdownLocked();
     const wchar_t* backendUnavailableReasonLocked(FrameGenerationBackend backend) const;
 
-    mutable std::mutex mutex_;
+    mutable std::recursive_mutex mutex_;
     FrameGenerationBackend configuredBackend_ = FrameGenerationBackend::Off;
     FrameGenerationBackend failedBackend_ = FrameGenerationBackend::Off;
     uint32_t requestedMultiplier_ = 2;

@@ -32,6 +32,7 @@ struct HookTable {
     void** original;
     void* rtti[2];
     void* methods[kMaxMethods];
+    bool isSwapChain = false;
 };
 
 std::atomic<unsigned long long> present_count{0};
@@ -77,14 +78,17 @@ using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT,
 
 ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
     auto* table = tableOf(object);
+    const bool isSwapChain = table->isSwapChain;
     *reinterpret_cast<void***>(object) = table->original;
     const auto original = reinterpret_cast<ReleaseFn>(table->original[kRelease]);
     const ULONG remaining = original(object);
     if (remaining) *reinterpret_cast<void***>(object) = table->methods;
     else {
-        UiOnRelease(object);
-        edpe::FgRuntime::instance().onSwapChainRelease(object);
-        ContextCensusOnSwapChainRelease(object);
+        if (isSwapChain) {
+            UiOnRelease(object);
+            edpe::FgRuntime::instance().onSwapChainRelease(object);
+            ContextCensusOnSwapChainRelease(object);
+        }
         delete table;
     }
     return remaining;
@@ -288,7 +292,9 @@ void observeSwapChain(IDXGISwapChain* swap_chain) {
             reinterpret_cast<void*>(&observedPresent))) {
         OutputDebugStringW(L"EDPE: swapchain observation disabled (allocation failed)\n");
     } else {
-        tableOf(swap_chain)->methods[kResizeBuffers] = reinterpret_cast<void*>(&observedResizeBuffers);
+        auto* tbl = tableOf(swap_chain);
+        tbl->isSwapChain = true;
+        tbl->methods[kResizeBuffers] = reinterpret_cast<void*>(&observedResizeBuffers);
     }
 }
 } // namespace

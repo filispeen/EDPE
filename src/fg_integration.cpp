@@ -131,7 +131,7 @@ void FgRuntime::applyConfig(int backendInt,
                             bool dynamicMfg,
                             float dynamicTargetFps,
                             bool reflexBoost) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     const FrameGenerationBackend nextBackend = intToFgBackend(backendInt);
     if (nextBackend != configuredBackend_) {
         // Clear prior init-failure latch when user switches backend selection.
@@ -153,7 +153,7 @@ void FgRuntime::applyConfig(int backendInt,
 }
 
 bool FgRuntime::isMotionNeeded() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return configuredBackend_ != FrameGenerationBackend::Off &&
            configuredBackend_ != failedBackend_ &&
            !D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc();
@@ -449,12 +449,12 @@ void FgRuntime::shutdownLocked() {
 }
 
 void FgRuntime::shutdown() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     shutdownLocked();
 }
 
 void FgRuntime::onResize(IDXGISwapChain* gameSwapChain) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!trackedSwapChain_ || trackedSwapChain_ == gameSwapChain) {
         // Turn off & release FG + proxy swapchain before DXGI ResizeBuffers per SL/FSR docs.
         shutdownLocked();
@@ -462,18 +462,22 @@ void FgRuntime::onResize(IDXGISwapChain* gameSwapChain) {
 }
 
 void FgRuntime::onSwapChainRelease(IUnknown* object) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (trackedSwapChain_ && static_cast<IUnknown*>(trackedSwapChain_) == object) {
         shutdownLocked();
     }
 }
 
 void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (capabilitiesProbed_ || !d3d11Device) return;
-    capabilitiesProbed_ = true;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        if (capabilitiesProbed_ || !d3d11Device) return;
+        // Mark probed immediately under lock so concurrent/re-entrant calls cannot double-probe.
+        capabilitiesProbed_ = true;
+    }
 
     if (D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc()) {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
         amdDllAvailable_ = false;
         dlssgCapAvailable_ = false;
         std::wcsncpy(amdUnavailableReason_, L"Blocked while Windows renderdoc.dll is active.", 255);
@@ -481,10 +485,15 @@ void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
         return;
     }
 
-    if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
-        amdDllAvailable_ = b->isAvailable();
-        if (!amdDllAvailable_) {
-            std::wcsncpy(amdUnavailableReason_, b->unavailableReason(), 255);
+    bool localAmdAvail = false;
+    wchar_t localAmdReason[256]{};
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
+            localAmdAvail = b->isAvailable();
+            if (!localAmdAvail) {
+                std::wcsncpy(localAmdReason, b->unavailableReason(), 255);
+            }
         }
     }
 
@@ -496,29 +505,40 @@ void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
         adapter->GetDesc(&desc);
     }
 
+    bool localDlssgAvail = false;
+    wchar_t localDlssgReason[256]{};
     if (desc.VendorId != 0x10DE) {
-        dlssgCapAvailable_ = false;
-        std::wcsncpy(dlssgUnavailableReason_,
+        std::wcsncpy(localDlssgReason,
                      L"Requires an NVIDIA GeForce RTX 40+ / 50+ GPU.", 255);
-        return;
+    } else {
+#if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
+        // Perform D3D12 bridge & Streamline capability probe WITHOUT holding mutex_
+        // because D3D12CreateDevice creates & releases internal DXGI factories.
+        D3D11D3D12Bridge probeBridge;
+        if (probeBridge.initialize(d3d11Device)) {
+            StreamlineStatusSnapshot snap{};
+            localDlssgAvail = NvidiaStreamlineFgBackend::probeCapabilities(
+                probeBridge.d3d12Device(), &snap);
+            if (!localDlssgAvail && snap.unavailableReason[0] != L'\0') {
+                std::wcsncpy(localDlssgReason, snap.unavailableReason, 255);
+            }
+            probeBridge.shutdown();
+        }
+#else
+        std::wcsncpy(localDlssgReason,
+                     L"Built without NVIDIA Streamline SDK headers.", 255);
+#endif
     }
 
-#if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
-    D3D11D3D12Bridge probeBridge;
-    if (probeBridge.initialize(d3d11Device)) {
-        StreamlineStatusSnapshot snap{};
-        dlssgCapAvailable_ = NvidiaStreamlineFgBackend::probeCapabilities(
-            probeBridge.d3d12Device(), &snap);
-        if (!dlssgCapAvailable_ && snap.unavailableReason[0] != L'\0') {
-            std::wcsncpy(dlssgUnavailableReason_, snap.unavailableReason, 255);
-        }
-        probeBridge.shutdown();
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    amdDllAvailable_ = localAmdAvail;
+    if (!amdDllAvailable_ && localAmdReason[0]) {
+        std::wcsncpy(amdUnavailableReason_, localAmdReason, 255);
     }
-#else
-    dlssgCapAvailable_ = false;
-    std::wcsncpy(dlssgUnavailableReason_,
-                 L"Built without NVIDIA Streamline SDK headers.", 255);
-#endif
+    dlssgCapAvailable_ = localDlssgAvail;
+    if (!dlssgCapAvailable_ && localDlssgReason[0]) {
+        std::wcsncpy(dlssgUnavailableReason_, localDlssgReason, 255);
+    }
 }
 
 void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
@@ -528,7 +548,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     if (outPresentedViaProxy) *outPresentedViaProxy = false;
     if (!gameSwapChain || (flags & DXGI_PRESENT_TEST)) return;
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     telemetry_.configuredBackend = configuredBackend_;
     telemetry_.renderDocBlocked = D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc();
@@ -767,12 +787,12 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
 }
 
 FgRuntimeTelemetry FgRuntime::telemetry() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return telemetry_;
 }
 
 bool FgRuntime::isBackendAvailable(FrameGenerationBackend backend) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc()) return false;
     if (backend == FrameGenerationBackend::Off) return true;
     if (backend == FrameGenerationBackend::AmdFsrFg) return amdDllAvailable_;
@@ -781,7 +801,7 @@ bool FgRuntime::isBackendAvailable(FrameGenerationBackend backend) const {
 }
 
 const wchar_t* FgRuntime::backendUnavailableReason(FrameGenerationBackend backend) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return backendUnavailableReasonLocked(backend);
 }
 
