@@ -20,6 +20,7 @@ public:
     SafeDirectInputDeviceProxy(TDevice* real, REFIID iid)
         : m_real(real), m_iid(iid) {}
 
+    // Keep destructor non-virtual so COM vtable stays strictly 32 slots for Wine/Proton compatibility.
     ~SafeDirectInputDeviceProxy() = default;
 
     // --- IUnknown ---

@@ -164,6 +164,7 @@ void maybeWrapDirectInputDevice(REFGUID rguid, TDevice** lplpDevice, REFIID iid,
     if (!isMouse && !isKeyboard) return;
 
     const auto& cfg = edpe::Config::instance();
+    // Respect INI toggles so Proton/Wine on Linux can bypass SysKeyboard/SysMouse wrapping if needed.
     const bool enabled = isMouse ? cfg.wrapDirectInputMouse : cfg.wrapDirectInputKeyboard;
     if (!enabled) {
         EdpeLog(isMouse

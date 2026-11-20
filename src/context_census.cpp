@@ -4831,6 +4831,8 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
             s_post_ldr_backbuffer_bound &&
             count >= 3 && count <= 6 && instance_count == 1 &&
             scene_ldr_source && scene_ldr_frame == current_frame) {
+            // Scan all PS slots t0..t7 and accept post-tonemap backbuffer blits (e.g. Proton/Wine on Linux
+            // or in-game SMAA/FXAA) so Pass 53 runs before Pass 54 UI instead of falling back to stage=2.
             ID3D11ShaderResourceView* pass53Srvs[8]{};
             context->PSGetShaderResources(0, 8, pass53Srvs);
             int matchedLdrSlot = -1;
@@ -10867,7 +10869,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             }
             // At Present (stage=2), never overwrite the backbuffer with a pre-UI offscreen target:
             // Pass 54 2D UI (Main Menu, Starport Services, ESC Menu, On-Foot HUD) has already been
-            // drawn to the backbuffer, so copying pre-UI scene output over it wipes out all UI.
+            // drawn to the backbuffer (critical when Pass 53 is missed under Proton/Wine on Linux).
             const bool allowBackbufferWrite = evaluatedAtPass53 || chosenIsBackbuffer;
             if (!evaluatedAtPass53 && !chosenIsBackbuffer && edpe::Config::instance().devMode) {
                 static bool s_logged_pass53_miss = false;

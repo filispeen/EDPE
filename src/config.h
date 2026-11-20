@@ -25,6 +25,7 @@ inline bool isRunningInEliteProcess() {
     return filename.find(L"elitedangerous") != std::wstring::npos;
 }
 
+// Used to apply Proton/Wine on Linux compatibility defaults (e.g. DirectInput keyboard proxy).
 inline bool isRunningUnderWine() {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
@@ -139,6 +140,7 @@ public:
         RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
 
         wrapDirectInputMouse = GetPrivateProfileIntW(L"Input", L"WrapDirectInputMouse", 1, path.c_str()) != 0;
+        // Default SysKeyboard proxy off under Proton/Wine on Linux so remapped/virtual keys work reliably.
         const int defaultWrapKeyboard = isRunningUnderWine() ? 0 : 1;
         wrapDirectInputKeyboard = GetPrivateProfileIntW(L"Input", L"WrapDirectInputKeyboard", defaultWrapKeyboard, path.c_str()) != 0;
     }
