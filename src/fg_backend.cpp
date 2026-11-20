@@ -285,6 +285,12 @@ bool FrameGenerationManager::evaluate(ID3D12GraphicsCommandList* cmdList,
     }
 
     if (inputs.isPauseOrMenu) {
+        auto* backend = backends_[static_cast<size_t>(selected_)].get();
+        if (backend && backend->isAvailable() && cmdList) {
+            uint32_t dummyGen = 0;
+            backend->evaluate(cmdList, inputs, false, 0, &dummyGen);
+        }
+        hasLastFrameIndex_ = false;
         std::swprintf(diagnostics_.statusMessage, 256, L"Stand down (menu/loading)");
         diagnostics_.success = true;
         return true;

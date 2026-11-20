@@ -729,7 +729,8 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
         in.motionScaleY = snap.motionScaleY;
         in.cameraNow = snap.cameraNow;
         in.cameraPrevious = snap.cameraPrevious;
-        evalCtx.enabled = (in.depth != nullptr && in.motionVectors != nullptr);
+        in.isPauseOrMenu = !(in.depth != nullptr && in.motionVectors != nullptr);
+        evalCtx.enabled = true;
     } else {
         in.cameraNow.worldFromView[0] = 1.0f;
         in.cameraNow.worldFromView[5] = 1.0f;
@@ -738,7 +739,8 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
         in.cameraNow.scaleY = static_cast<float>(bbDesc.Width) / static_cast<float>((std::max)(1u, bbDesc.Height));
         in.cameraNow.depthB = 0.025f;
         in.cameraPrevious = in.cameraNow;
-        evalCtx.enabled = false;
+        in.isPauseOrMenu = true;
+        evalCtx.enabled = true;
     }
 
     const uint32_t requestedExtra =
@@ -759,7 +761,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     const auto& mgrDiag = manager_.diagnostics();
     telemetry_.active = presentedOk;
     telemetry_.activeBackend = manager_.selectedBackend();
-    telemetry_.pausedForMenu = !evalCtx.enabled;
+    telemetry_.pausedForMenu = in.isPauseOrMenu;
     telemetry_.generatedFramesThisCycle = mgrDiag.generatedFramesThisCycle;
     telemetry_.totalGeneratedFrames = mgrDiag.totalGeneratedFrames;
     telemetry_.renderedFps = mgrDiag.renderedFps;

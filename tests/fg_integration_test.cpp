@@ -218,6 +218,7 @@ int main() {
 
         const auto tel = fg.telemetry();
         REQUIRE(tel.active);
+        REQUIRE(!tel.pausedForMenu);
         REQUIRE(tel.activeBackend == edpe::FrameGenerationBackend::AmdFsrFg);
         std::printf("FgRuntime AMD FSR FG active: totalGen=%llu copyMs=%.3f status='%S'\n",
                     static_cast<unsigned long long>(tel.totalGeneratedFrames),
@@ -232,6 +233,7 @@ int main() {
         REQUIRE(viaProxyAfterResize);
         REQUIRE(fg.telemetry().active);
         REQUIRE(fg.telemetry().pausedForMenu);
+        REQUIRE(std::wcsstr(fg.telemetry().statusMessage, L"Stand down") != nullptr);
 
         // Toggle FG OFF dynamically back to parent D3D11 swapchain.
         fg.applyConfig(0, 2, false, 0.0f, false);
