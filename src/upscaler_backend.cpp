@@ -469,34 +469,14 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
         return;
     }
 
-    float3 cTone = toPerceptual(currRaw, isHdr);
-    float3 cMin = cTone;
-    float3 cMax = cTone;
-    [unroll]
-    for (int dy = -1; dy <= 1; ++dy) {
-        [unroll]
-        for (int dx = -1; dx <= 1; ++dx) {
-            if (dx == 0 && dy == 0) continue;
-            int2 np = clamp(p + int2(dx, dy), int2(0, 0), maxCoord);
-            float3 nRaw = tCurrColor.Load(int3(np, 0)).rgb;
-            if (all(isfinite(nRaw))) {
-                float3 nTone = toPerceptual(nRaw, isHdr);
-                cMin = min(cMin, nTone);
-                cMax = max(cMax, nTone);
-            }
-        }
-    }
-    float3 range3 = cMax - cMin;
-    float localContrast = max(range3.r, max(range3.g, range3.b));
-
     if (hasPrev < 0.5) {
-        uReactive[p] = saturate(localContrast * 0.35);
+        uReactive[p] = 0.0;
         return;
     }
 
     float2 mv = tMotion.Load(int3(p, 0)).xy * mvScale;
     if (!all(isfinite(mv))) {
-        uReactive[p] = 0.90;
+        uReactive[p] = 0.85;
         return;
     }
     float2 prevUv = (float2(p) + 0.5 + mv) * invRenderSize;
@@ -510,16 +490,32 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
         uReactive[p] = 1.0;
         return;
     }
+
+    float3 cTone = toPerceptual(currRaw, isHdr);
     float3 prevTone = toPerceptual(prevRaw, isHdr);
-    float colorDiff = length(cTone - prevTone);
+    float3 pMin = prevTone;
+    float3 pMax = prevTone;
+    int2 prevCenter = clamp(int2(prevUv * float2(renderSize)), int2(0, 0), maxCoord);
+    [unroll]
+    for (int dy = -1; dy <= 1; ++dy) {
+        [unroll]
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 np = clamp(prevCenter + int2(dx, dy), int2(0, 0), maxCoord);
+            float3 nRaw = tPrevColor.Load(int3(np, 0)).rgb;
+            if (all(isfinite(nRaw))) {
+                float3 nTone = toPerceptual(nRaw, isHdr);
+                pMin = min(pMin, nTone);
+                pMax = max(pMax, nTone);
+            }
+        }
+    }
 
-    float depth = tDepth.Load(int3(p, 0)).r;
-    float isSkyOrTranslucent = (depth <= 1e-6) ? 1.0 : 0.0;
-
-    float tempReact = saturate((colorDiff - 0.06) * 2.8);
-    float thinFeatureBoost = saturate((localContrast - 0.18) * 2.0) * saturate((colorDiff - 0.025) * 4.0);
-    float skyTrailBoost = isSkyOrTranslucent * saturate((colorDiff - 0.03) * 3.5);
-    uReactive[p] = min(0.90, max(tempReact, max(thinFeatureBoost, skyTrailBoost)));
+    // Compare against the reprojected 3x3 neighborhood box so static sub-pixel jitter
+    // on thin stripes/edges stays inside [pMin, pMax] (zero reactive rejection), while
+    // un-vectored moving/fading exhaust particles fall outside and trigger reactive.
+    float3 boxExcess = max(0.0.xxx, cTone - pMax) + max(0.0.xxx, pMin - cTone);
+    float boxDiff = length(boxExcess);
+    uReactive[p] = min(0.85, saturate((boxDiff - 0.075) * 3.2));
 }
 )";
 
