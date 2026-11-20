@@ -137,7 +137,12 @@ public:
         debugViewActive = GetPrivateProfileIntW(L"Pipeline", L"DebugView", 0, path.c_str()) != 0;
 
         renderDocAnnotations = GetPrivateProfileIntW(L"RenderDoc", L"EnableAnnotations", 1, path.c_str()) != 0;
+        // Allow forcing D3D11/D3D12 debug markers & object names when external tools (e.g., Linux
+        // RenderDoc via ENABLE_VULKAN_RENDERDOC_CAPTURE=1 + DXVK_DEBUG=markers) attach without
+        // loading Windows renderdoc.dll into the process.
+        renderDocForceAnnotations = GetPrivateProfileIntW(L"RenderDoc", L"ForceAnnotations", 0, path.c_str()) != 0;
         RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
+        RenderDocBridge::instance().setForceAnnotations(renderDocForceAnnotations);
 
         wrapDirectInputMouse = GetPrivateProfileIntW(L"Input", L"WrapDirectInputMouse", 1, path.c_str()) != 0;
         // Default SysKeyboard proxy off under Proton/Wine on Linux so remapped/virtual keys work reliably.
@@ -218,7 +223,9 @@ public:
         WritePrivateProfileStringW(L"Pipeline", L"DebugView", debugViewActive ? L"1" : L"0", path.c_str());
 
         WritePrivateProfileStringW(L"RenderDoc", L"EnableAnnotations", renderDocAnnotations ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"RenderDoc", L"ForceAnnotations", renderDocForceAnnotations ? L"1" : L"0", path.c_str());
         RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
+        RenderDocBridge::instance().setForceAnnotations(renderDocForceAnnotations);
 
         WritePrivateProfileStringW(L"Input", L"WrapDirectInputMouse", wrapDirectInputMouse ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Input", L"WrapDirectInputKeyboard", wrapDirectInputKeyboard ? L"1" : L"0", path.c_str());
@@ -353,6 +360,7 @@ public:
     bool debugViewActive = false;
 
     bool renderDocAnnotations = true;
+    bool renderDocForceAnnotations = false;
 
     bool wrapDirectInputMouse = true;
     bool wrapDirectInputKeyboard = !isRunningUnderWine();

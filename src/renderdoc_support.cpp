@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cwchar>
+#include <cwctype>
 #include <mutex>
 #include <windows.h>
 
@@ -12,9 +13,42 @@ namespace edpe {
 
 namespace {
 std::atomic<bool> g_available{false};
+std::atomic<bool> g_vulkanLayerActive{false};
 std::atomic<bool> g_annotationsEnabled{true};
+std::atomic<bool> g_forceAnnotations{false};
 std::atomic<bool> g_loggedInit{false};
+std::atomic<bool> g_loggedVulkanLayer{false};
 std::mutex g_rdocMutex;
+
+bool envVarIsTruthy(const wchar_t* name) {
+    wchar_t buf[64]{};
+    const DWORD len = GetEnvironmentVariableW(name, buf, 64);
+    if (len == 0 || len >= 64) return false;
+    return _wcsicmp(buf, L"0") != 0 && _wcsicmp(buf, L"false") != 0;
+}
+
+bool envVarContainsToken(const wchar_t* name, const wchar_t* needle) {
+    wchar_t buf[256]{};
+    const DWORD len = GetEnvironmentVariableW(name, buf, 256);
+    if (len == 0 || len >= 256) return false;
+    for (DWORD i = 0; i < len; ++i) {
+        buf[i] = static_cast<wchar_t>(towlower(buf[i]));
+    }
+    return std::wcsstr(buf, needle) != nullptr;
+}
+
+// Under Wine/Proton on Linux, RenderDoc attaches as a host Vulkan layer (librenderdoc.so)
+// rather than loading Windows renderdoc.dll into the PE process. Detecting the Proton/DXVK/vkd3d
+// capture env vars lets EDPE emit ID3DUserDefinedAnnotation / D3D12 markers so DXVK (with
+// DXVK_DEBUG=markers) and vkd3d-proton forward them to VK_EXT_debug_utils for Linux RenderDoc.
+bool detectProtonVulkanCaptureEnv() {
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll || !GetProcAddress(ntdll, "wine_get_version")) return false;
+    return envVarIsTruthy(L"ENABLE_VULKAN_RENDERDOC_CAPTURE") ||
+           envVarContainsToken(L"DXVK_DEBUG", L"markers") ||
+           envVarIsTruthy(L"VKD3D_AUTO_CAPTURE_COUNTS") ||
+           envVarIsTruthy(L"VKD3D_AUTO_CAPTURE_SHADER");
+}
 
 const char* backendLabel(int backend) {
     switch (backend) {
@@ -68,6 +102,12 @@ RenderDocBridge& RenderDocBridge::instance() {
 
 bool RenderDocBridge::refresh() {
     std::lock_guard<std::mutex> lock(g_rdocMutex);
+    const bool vulkanLayer = detectProtonVulkanCaptureEnv();
+    g_vulkanLayerActive.store(vulkanLayer, std::memory_order_release);
+    if (vulkanLayer && !g_loggedVulkanLayer.exchange(true, std::memory_order_acq_rel)) {
+        EdpeLog(L"EDPE: Proton/Wine Vulkan RenderDoc or marker env detected; enabling D3D debug annotations without renderdoc.dll");
+    }
+
     const HMODULE rdocMod = GetModuleHandleW(L"renderdoc.dll");
     if (!rdocMod) {
         api_ = nullptr;
@@ -100,6 +140,10 @@ bool RenderDocBridge::isAvailable() const {
     return g_available.load(std::memory_order_acquire);
 }
 
+bool RenderDocBridge::isVulkanLayerActive() const {
+    return g_vulkanLayerActive.load(std::memory_order_acquire);
+}
+
 bool RenderDocBridge::areAnnotationsEnabled() const {
     return g_annotationsEnabled.load(std::memory_order_relaxed);
 }
@@ -108,9 +152,21 @@ void RenderDocBridge::setAnnotationsEnabled(bool enabled) {
     g_annotationsEnabled.store(enabled, std::memory_order_relaxed);
 }
 
+bool RenderDocBridge::areAnnotationsForced() const {
+    return g_forceAnnotations.load(std::memory_order_relaxed);
+}
+
+void RenderDocBridge::setForceAnnotations(bool forced) {
+    g_forceAnnotations.store(forced, std::memory_order_relaxed);
+}
+
 bool RenderDocBridge::areAnnotationsActive() const {
-    return g_available.load(std::memory_order_acquire) &&
-           g_annotationsEnabled.load(std::memory_order_relaxed);
+    if (!g_annotationsEnabled.load(std::memory_order_relaxed)) return false;
+    // Emit annotations when Windows renderdoc.dll is injected, when Linux/Proton Vulkan
+    // RenderDoc/marker env vars are active, or when ForceAnnotations=1 is explicitly set.
+    return g_available.load(std::memory_order_acquire) ||
+           g_vulkanLayerActive.load(std::memory_order_acquire) ||
+           g_forceAnnotations.load(std::memory_order_relaxed);
 }
 
 void RenderDocBridge::setActiveWindow(ID3D11Device* device, void* hwnd) {
@@ -252,8 +308,11 @@ void RenderDocBridge::resetForTest() {
     apiMajor_ = apiMinor_ = apiPatch_ = 0;
     lastAnnotatedCaptureCount_ = 0;
     g_available.store(false, std::memory_order_release);
+    g_vulkanLayerActive.store(false, std::memory_order_release);
     g_annotationsEnabled.store(true, std::memory_order_relaxed);
+    g_forceAnnotations.store(false, std::memory_order_relaxed);
     g_loggedInit.store(false, std::memory_order_release);
+    g_loggedVulkanLayer.store(false, std::memory_order_release);
 }
 
 } // namespace edpe

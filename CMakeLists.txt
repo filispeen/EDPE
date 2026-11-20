@@ -213,7 +213,7 @@ target_include_directories(renderdoc_support_test PRIVATE src)
 target_link_libraries(renderdoc_support_test PRIVATE d3d11 dxgi)
 add_test(NAME renderdoc_support COMMAND renderdoc_support_test)
 
-add_executable(d3d11_d3d12_bridge_test tests/d3d11_d3d12_bridge_test.cpp src/d3d12_bridge.cpp src/log.cpp)
+add_executable(d3d11_d3d12_bridge_test tests/d3d11_d3d12_bridge_test.cpp src/d3d12_bridge.cpp src/renderdoc_support.cpp src/log.cpp)
 target_compile_features(d3d11_d3d12_bridge_test PRIVATE cxx_std_20)
 target_compile_definitions(d3d11_d3d12_bridge_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(d3d11_d3d12_bridge_test PRIVATE src)

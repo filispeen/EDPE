@@ -1,4 +1,5 @@
 #include "d3d12_bridge.h"
+#include "renderdoc_support.h"
 
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -368,7 +369,12 @@ int runCorrectnessTest(ID3D11Device* d3d11Dev, ID3D11DeviceContext* d3d11Ctx) {
     auto* cmdList = bridge.beginCommandList(slot);
     if (!cmdList) return 20;
 
-    edpe::D3D11D3D12Bridge::transitionResource(
+    // Exercise D3D12 debug naming & BeginEvent/EndEvent annotations safely on a live command list.
+    edpe::RenderDocBridge::instance().setForceAnnotations(true);
+    {
+        edpe::ScopedD3D12RenderDocEvent d12Event(cmdList, L"EDPE_BridgeTest: Roundtrip");
+        edpe::SetD3D12DebugName(shared.output.d3d12.Get(), "EDPE_BridgeTest_Output");
+        edpe::D3D11D3D12Bridge::transitionResource(
         cmdList, shared.color.d3d12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     edpe::D3D11D3D12Bridge::transitionResource(
         cmdList, shared.depth.d3d12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -396,6 +402,8 @@ int runCorrectnessTest(ID3D11Device* d3d11Dev, ID3D11DeviceContext* d3d11Ctx) {
         cmdList, shared.ui.d3d12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     edpe::D3D11D3D12Bridge::transitionResource(
         cmdList, shared.output.d3d12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    }
+    edpe::RenderDocBridge::instance().setForceAnnotations(false);
 
     const uint64_t d12Done = bridge.submitAfterD3D11Signal(ctx4.Get(), slot, true);
     if (d12Done == 0) return 21;

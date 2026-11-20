@@ -61,7 +61,7 @@ Used in production for adding D3D12 Frame Generation to D3D11 games by **`optisc
   2. **Breaks EDHM & 3Dmigoto (`VERIFIED` in `bo3b/3Dmigoto#183`):** 3Dmigoto hooks D3D11 devices and does not export/support `D3D11On12CreateDevice`.
   3. **Resource & Driver Instability:** Requires Agility SDK (`D3D12Core.dll`) workarounds for older Windows builds and risks `DXGI_ERROR_DEVICE_REMOVED` on Cobra's deferred contexts (`CreateDeferredContext`).
 
-**Decision (`PLAN.md` §32):** Adopt **Option A1** first (Phase 13A) for zero-swapchain-risk XeSS / DLSS-RR compute interop, then extend cleanly to **Option A2** (Phase 13B) behind an isolated `D3D11D3D12Bridge` + `ProxySwapChainD3D12` prototype.
+**Decision (`PLAN.md` §32):** Adopt **Option A1** first (**Phase 13A**) for zero-swapchain-risk XeSS / DLSS-RR compute interop, then extend cleanly to **Option A2** (**Phase 13B**) behind an isolated `D3D11D3D12Bridge` + `ProxySwapChainD3D12` prototype. (**Option B** `D3D11On12` is rejected.)
 
 ---
 

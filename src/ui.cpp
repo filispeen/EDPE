@@ -2207,7 +2207,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
         auto& rdoc = edpe::RenderDocBridge::instance();
         rdoc.refresh();
-        if (rdoc.isAvailable() || cfg.devMode) {
+        if (rdoc.isAvailable() || rdoc.isVulkanLayerActive() || cfg.devMode) {
             if (ImGui::CollapsingHeader("RenderDoc")) {
                 if (rdoc.isAvailable()) {
                     ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f),
@@ -2245,8 +2245,24 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                             ImGui::TextDisabled("Last capture: %s", lastPath.c_str());
                         }
                     }
+                } else if (rdoc.isVulkanLayerActive()) {
+                    ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f),
+                        "RenderDoc / Vulkan Markers Active (Wine/Proton layer)");
+                    bool rdocAnnotations = cfg.renderDocAnnotations;
+                    if (ImGui::Checkbox("GPU Debug Annotations & Resource Names", &rdocAnnotations)) {
+                        cfg.renderDocAnnotations = rdocAnnotations;
+                        rdoc.setAnnotationsEnabled(rdocAnnotations);
+                        cfg.save();
+                    }
+                    ImGui::TextWrapped("Capture via host RenderDoc hotkey (F12/PrintScreen) with DXVK_DEBUG=markers.");
                 } else {
-                    ImGui::TextDisabled("RenderDoc: Not attached (launch via RenderDoc to capture frames & GPU markers)");
+                    ImGui::TextDisabled("RenderDoc: Not attached (launch via RenderDoc or ENABLE_VULKAN_RENDERDOC_CAPTURE=1)");
+                    bool forceAnn = cfg.renderDocForceAnnotations;
+                    if (ImGui::Checkbox("Force GPU Debug Annotations (Proton / PIX / Vulkan)", &forceAnn)) {
+                        cfg.renderDocForceAnnotations = forceAnn;
+                        rdoc.setForceAnnotations(forceAnn);
+                        cfg.save();
+                    }
                 }
             }
         }

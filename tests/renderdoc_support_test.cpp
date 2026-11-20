@@ -67,6 +67,26 @@ int runUnitTests() {
     rdoc.setAnnotationsEnabled(true);
     if (!rdoc.areAnnotationsEnabled()) return fail("areAnnotationsEnabled() should be true");
 
+    if (!GetModuleHandleW(L"renderdoc.dll")) {
+        rdoc.setForceAnnotations(true);
+        if (!rdoc.areAnnotationsForced()) return fail("areAnnotationsForced() should be true");
+        if (!rdoc.areAnnotationsActive()) return fail("areAnnotationsActive() should be true when forced");
+        rdoc.setAnnotationsEnabled(false);
+        if (rdoc.areAnnotationsActive()) return fail("areAnnotationsActive() should respect disabled flag even when forced");
+        rdoc.setAnnotationsEnabled(true);
+        rdoc.setForceAnnotations(false);
+        if (rdoc.areAnnotationsActive() && !rdoc.isVulkanLayerActive()) {
+            return fail("areAnnotationsActive() should be false once unforced without RenderDoc");
+        }
+    }
+
+    // Verify D3D12 debug naming and event helpers are null-safe.
+    edpe::SetD3D12DebugName(nullptr, "NullObj");
+    edpe::EmitD3D12RenderDocMarker(nullptr, L"NullCmdList");
+    {
+        edpe::ScopedD3D12RenderDocEvent d12Ev(nullptr, L"NullCmdListEvent");
+    }
+
     // Verify debug naming and scoped event helpers are safe on a WARP device without RenderDoc.
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;

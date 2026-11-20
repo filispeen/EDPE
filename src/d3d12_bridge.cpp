@@ -1,6 +1,8 @@
 #include "d3d12_bridge.h"
 
 #include "log.h"
+#include "renderdoc_support.h"
+#include "system_dll.h"
 
 #include <cstdio>
 
@@ -18,11 +20,42 @@ using PFN_D3D12SerializeRootSignature = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNAT
                                                           ID3DBlob** ppBlob,
                                                           ID3DBlob** ppErrorBlob);
 
+const char* getWineVersionOrNull() {
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return nullptr;
+    using PFN_WineGetVersion = const char*(CDECL*)();
+    const auto fn = reinterpret_cast<PFN_WineGetVersion>(GetProcAddress(ntdll, "wine_get_version"));
+    return fn ? fn() : nullptr;
+}
+
 void logBridgeFailure(const wchar_t* stage, HRESULT hr) {
-    wchar_t buf[256]{};
-    std::swprintf(buf, 256, L"EDPE D3D12Bridge: %ls failed (hr=0x%08X)",
-                  stage, static_cast<unsigned>(hr));
+    wchar_t buf[384]{};
+    if (const char* wineVer = getWineVersionOrNull()) {
+        // Under Wine/Proton, DXVK <-> vkd3d-proton shared handles/fences require
+        // VK_KHR_external_memory_win32 and VK_KHR_external_semaphore_win32 host support.
+        std::swprintf(buf, 384,
+                      L"EDPE D3D12Bridge: %ls failed (hr=0x%08X, wine=%S; check DXVK/vkd3d-proton external memory/semaphore support)",
+                      stage, static_cast<unsigned>(hr), wineVer);
+    } else {
+        std::swprintf(buf, 384, L"EDPE D3D12Bridge: %ls failed (hr=0x%08X)",
+                      stage, static_cast<unsigned>(hr));
+    }
     EdpeLog(buf);
+}
+
+HMODULE loadPinnedSystemD3D12() {
+    // Load from System32 (Windows native d3d12.dll, or vkd3d-proton d3d12.dll under Wine/Proton)
+    // so a third-party d3d12.dll next to the game executable cannot hijack or recurse into the bridge.
+    HMODULE mod = LoadSystemDll(L"d3d12.dll");
+    if (!mod) return nullptr;
+    // Pin d3d12.dll for process lifetime so reinitializing the bridge never unloads D3D12Core/WDDM
+    // state while D3D11/DXGI still holds shared handles or adapters.
+    HMODULE pinned = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(mod),
+        &pinned);
+    return mod;
 }
 
 } // namespace
@@ -50,19 +83,18 @@ bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device) {
         return false;
     }
 
-    d3d12Module_ = LoadLibraryW(L"d3d12.dll");
+    if (GetModuleHandleW(L"renderdoc.dll") != nullptr) {
+        // Windows RenderDoc does not track mid-frame GPU updates across D3D11<->D3D12
+        // OpenSharedHandle/OpenSharedFence; Phase 13B+ FG should fail-open under renderdoc.dll.
+        EdpeLog(L"EDPE D3D12Bridge: WARNING: renderdoc.dll detected; cross-API shared handles are not tracked mid-frame by Windows RenderDoc");
+    }
+
+    d3d12Module_ = loadPinnedSystemD3D12();
     if (!d3d12Module_) {
-        logBridgeFailure(L"LoadLibraryW(d3d12.dll)", HRESULT_FROM_WIN32(GetLastError()));
+        logBridgeFailure(L"LoadSystemDll(d3d12.dll)", HRESULT_FROM_WIN32(GetLastError()));
         shutdown();
         return false;
     }
-    // Pin d3d12.dll in the process so unloading/reinitializing the bridge never tears down
-    // WDDM/D3D12Core runtime state while D3D11/DXGI remains active.
-    HMODULE pinned = nullptr;
-    GetModuleHandleExW(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-        reinterpret_cast<LPCWSTR>(d3d12Module_),
-        &pinned);
 
     auto createDevice = reinterpret_cast<PFN_D3D12CreateDevice>(
         GetProcAddress(d3d12Module_, "D3D12CreateDevice"));
@@ -145,6 +177,13 @@ bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device) {
         shutdown();
         return false;
     }
+
+    // Label core D3D12 bridge objects so both Windows RenderDoc and Proton vkd3d-proton
+    // (VK_EXT_debug_utils) display readable names when GPU annotations are active.
+    SetD3D12DebugName(device12_.Get(), "EDPE_D3D12Bridge_Device");
+    SetD3D12DebugName(queue_.Get(), "EDPE_D3D12Bridge_Queue");
+    SetD3D12DebugName(cmdList_.Get(), "EDPE_D3D12Bridge_CmdList");
+    SetD3D12DebugName(fence12_.Get(), "EDPE_D3D12Bridge_SharedFence");
 
     device11_ = d3d11Device;
     initialized_ = true;
@@ -234,6 +273,8 @@ bool D3D11D3D12Bridge::createSharedTexture(uint32_t width,
     out.width = width;
     out.height = height;
     out.format = format;
+    SetD3D11DebugName(out.d3d11.Get(), "EDPE_BridgeSharedTex_D3D11");
+    SetD3D12DebugName(out.d3d12.Get(), "EDPE_BridgeSharedTex_D3D12");
     return true;
 }
 
@@ -321,20 +362,15 @@ HRESULT D3D11D3D12Bridge::serializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC
                                                  D3D_ROOT_SIGNATURE_VERSION version,
                                                  ID3DBlob** blob,
                                                  ID3DBlob** errorBlob) {
-    HMODULE mod = GetModuleHandleW(L"d3d12.dll");
-    bool loadedHere = false;
-    if (!mod) {
-        mod = LoadLibraryW(L"d3d12.dll");
-        loadedHere = (mod != nullptr);
-    }
+    // Resolve from System32 and pin so root-signature serialization uses the same runtime
+    // (Windows d3d12.dll or Wine/Proton vkd3d-proton) as initialize().
+    HMODULE mod = loadPinnedSystemD3D12();
     if (!mod) return HRESULT_FROM_WIN32(GetLastError());
 
     auto fn = reinterpret_cast<PFN_D3D12SerializeRootSignature>(
         GetProcAddress(mod, "D3D12SerializeRootSignature"));
-    const HRESULT hr = fn ? fn(desc, version, blob, errorBlob)
-                          : HRESULT_FROM_WIN32(GetLastError());
-    if (loadedHere) FreeLibrary(mod);
-    return hr;
+    return fn ? fn(desc, version, blob, errorBlob)
+              : HRESULT_FROM_WIN32(GetLastError());
 }
 
 } // namespace edpe

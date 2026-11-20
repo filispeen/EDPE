@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <d3d11_1.h>
+#include <d3d12.h>
 #include <guiddef.h>
 #include <string>
 #include <wrl/client.h>
@@ -24,8 +25,11 @@ public:
     bool refresh();
 
     bool isAvailable() const;
+    bool isVulkanLayerActive() const;
     bool areAnnotationsEnabled() const;
     void setAnnotationsEnabled(bool enabled);
+    bool areAnnotationsForced() const;
+    void setForceAnnotations(bool forced);
     bool areAnnotationsActive() const;
 
     int apiMajor() const { return apiMajor_; }
@@ -107,6 +111,44 @@ public:
 
 private:
     Microsoft::WRL::ComPtr<ID3DUserDefinedAnnotation> annot_;
+};
+
+// Attaches WKPDID_D3DDebugObjectName to D3D12 objects (forwarded to VK_EXT_debug_utils by vkd3d-proton).
+inline void SetD3D12DebugName(ID3D12Object* obj, const char* name) {
+    if (!obj || !name || !name[0]) return;
+    if (!RenderDocBridge::instance().areAnnotationsActive()) return;
+    obj->SetPrivateData(kD3DDebugObjectNameGuid, static_cast<UINT>(std::strlen(name)), name);
+}
+
+// PIX_EVENT_UNICODE_VERSION (0) ABI used by D3D12 RenderDoc and vkd3d-proton VK_EXT_debug_utils markers.
+inline void EmitD3D12RenderDocMarker(ID3D12GraphicsCommandList* cmdList, const wchar_t* name) {
+    if (!cmdList || !name || !name[0]) return;
+    if (!RenderDocBridge::instance().areAnnotationsActive()) return;
+    const UINT bytes = static_cast<UINT>((std::wcslen(name) + 1) * sizeof(wchar_t));
+    cmdList->SetMarker(0, name, bytes);
+}
+
+class ScopedD3D12RenderDocEvent {
+public:
+    ScopedD3D12RenderDocEvent(ID3D12GraphicsCommandList* cmdList, const wchar_t* name) {
+        if (!cmdList || !name || !name[0]) return;
+        if (!RenderDocBridge::instance().areAnnotationsActive()) return;
+        const UINT bytes = static_cast<UINT>((std::wcslen(name) + 1) * sizeof(wchar_t));
+        cmdList->BeginEvent(0, name, bytes);
+        cmdList_ = cmdList;
+    }
+
+    ~ScopedD3D12RenderDocEvent() {
+        if (cmdList_) {
+            cmdList_->EndEvent();
+        }
+    }
+
+    ScopedD3D12RenderDocEvent(const ScopedD3D12RenderDocEvent&) = delete;
+    ScopedD3D12RenderDocEvent& operator=(const ScopedD3D12RenderDocEvent&) = delete;
+
+private:
+    ID3D12GraphicsCommandList* cmdList_ = nullptr;
 };
 
 } // namespace edpe
