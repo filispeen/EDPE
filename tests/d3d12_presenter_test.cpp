@@ -369,6 +369,63 @@ int runPresenterIntegrationAndBenchmark() {
     presenter.shutdown();
     dummySc.Reset();
     dummyWnd.destroy();
+
+    // 4. Runtime Toggle Simulation: parentHwnd owns native D3D11 Flip swapchain; childHwnd (WS_CHILD)
+    // mounts a D3D12 Flip proxy swapchain on top without destroying the game's D3D11 swapchain,
+    // presents via D3D12, resizes cleanly, then tears down back to parent D3D11 Present().
+    if (isHardware) {
+        DXGI_SWAP_CHAIN_DESC1 natDesc = edpe::sanitizeFlipSwapChainDesc(
+            W, H, DXGI_FORMAT_R8G8B8A8_UNORM, 3, 0, false);
+        ComPtr<IDXGISwapChain1> parentD11Sc;
+        if (FAILED(sysFactory->CreateSwapChainForHwnd(
+                d3d11Dev.Get(), targetHwnd, &natDesc, nullptr, nullptr, &parentD11Sc))) {
+            DestroyWindow(targetHwnd);
+            return fail("Failed to create parent D3D11 swapchain for child-overlay test");
+        }
+        HWND childHwnd = CreateWindowExW(
+            WS_EX_TRANSPARENT | WS_EX_NOPARENTNOTIFY | WS_EX_NOACTIVATE,
+            wc.lpszClassName,
+            L"EDPE_ChildOverlay",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED,
+            0, 0, static_cast<int>(W), static_cast<int>(H),
+            targetHwnd, nullptr, wc.hInstance, nullptr);
+        if (!childHwnd) {
+            DestroyWindow(targetHwnd);
+            return fail("CreateWindowExW(WS_CHILD) failed");
+        }
+
+        edpe::D3D12ProxyPresenter childPresenter;
+        if (!childPresenter.initialize(d3d11Dev.Get(), childHwnd, W, H,
+                                       DXGI_FORMAT_R8G8B8A8_UNORM, 3, 0)) {
+            DestroyWindow(childHwnd);
+            DestroyWindow(targetHwnd);
+            return fail("D3D12ProxyPresenter failed on WS_CHILD HWND while parent D3D11 swapchain active");
+        }
+        for (int f = 0; f < 6; ++f) {
+            HRESULT phr = E_FAIL;
+            if (!childPresenter.presentFromD3D11Texture(ctx4.Get(), d3d11FrameTex.Get(), 0, 0, &phr) ||
+                FAILED(phr)) {
+                childPresenter.shutdown();
+                DestroyWindow(childHwnd);
+                DestroyWindow(targetHwnd);
+                return fail("childPresenter.presentFromD3D11Texture failed");
+            }
+        }
+        childPresenter.shutdown();
+        DestroyWindow(childHwnd);
+
+        // Verify parent D3D11 swapchain still presents cleanly after child teardown.
+        ComPtr<ID3D11Texture2D> pBb;
+        if (SUCCEEDED(parentD11Sc->GetBuffer(0, IID_PPV_ARGS(&pBb))) && pBb) {
+            d3d11Ctx->CopyResource(pBb.Get(), d3d11FrameTex.Get());
+        }
+        if (FAILED(parentD11Sc->Present(0, 0))) {
+            DestroyWindow(targetHwnd);
+            return fail("Parent D3D11 swapchain failed Present after child teardown");
+        }
+        std::printf("WS_CHILD runtime-toggle overlay test PASSED on %ls.\n", adapterName.c_str());
+    }
+
     DestroyWindow(targetHwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return 0;

@@ -1,5 +1,6 @@
 #include "perf_overlay.h"
 #include "upscaler_backend.h"
+#include "fg_integration.h"
 #include "context_census.h"
 #include "ngx_context.h"
 #include "config.h"
@@ -251,6 +252,28 @@ void PerfTracker::updateCachedStats() {
                                                           ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
     snprintf(cachedStats_.fpsLine, sizeof(cachedStats_.fpsLine),
         "FPS: %5.1f | 1%% Low: %5.1f FPS", cachedStats_.fps, cachedStats_.onePercentLowFps);
+
+    const auto fgTel = FgRuntime::instance().telemetry();
+    cachedStats_.fgActive = fgTel.active;
+    if (fgTel.active) {
+        const float presented = (!fgTel.pausedForMenu && fgTel.generatedFramesThisCycle > 0)
+                                    ? cachedStats_.fps * static_cast<float>(1u + fgTel.generatedFramesThisCycle)
+                                    : cachedStats_.fps;
+        snprintf(cachedStats_.fgPresentedFpsLine, sizeof(cachedStats_.fgPresentedFpsLine),
+            "Presented FPS (+FG): %5.1f (x%u)", presented, 1u + fgTel.generatedFramesThisCycle);
+        const char* fgName = (fgTel.activeBackend == FrameGenerationBackend::NvidiaDlssG)
+                                 ? "NVIDIA DLSS-G"
+                                 : (fgTel.activeBackend == FrameGenerationBackend::AmdFsrFg ? "AMD FSR FG" : "Off");
+        if (fgTel.pausedForMenu) {
+            snprintf(cachedStats_.fgInfoLine, sizeof(cachedStats_.fgInfoLine), "%s (Paused/Menu)", fgName);
+        } else {
+            snprintf(cachedStats_.fgInfoLine, sizeof(cachedStats_.fgInfoLine),
+                "%s (x%u | Copy %.2f ms)", fgName, 1u + fgTel.generatedFramesThisCycle, fgTel.d3d12CopyMs);
+        }
+    } else {
+        cachedStats_.fgPresentedFpsLine[0] = '\0';
+        snprintf(cachedStats_.fgInfoLine, sizeof(cachedStats_.fgInfoLine), "Off");
+    }
 
     snprintf(cachedStats_.gameFtLine, sizeof(cachedStats_.gameFtLine),
         "%6.2f ms", cachedStats_.gameFrametimeMs);
@@ -661,6 +684,11 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
             ImGui::PushStyleColor(ImGuiCol_Text, cachedStats_.fpsColor);
             ImGui::TextUnformatted(cachedStats_.fpsLine);
             ImGui::PopStyleColor();
+            if (cachedStats_.fgActive && cachedStats_.fgPresentedFpsLine[0]) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.90f, 1.0f, 1.0f));
+                ImGui::TextUnformatted(cachedStats_.fgPresentedFpsLine);
+                ImGui::PopStyleColor();
+            }
         }
 
         // 2. Frametimes (pre-formatted at 66.67 ms, zero-overhead TextUnformatted)
@@ -725,6 +753,14 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
             ImGui::TextUnformatted("VRAM:");
             ImGui::TableSetColumnIndex(1);
             ImGui::TextUnformatted(cachedStats_.vramLine);
+
+            if (cachedStats_.fgActive) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted("Frame Gen:");
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(cachedStats_.fgInfoLine);
+            }
 
             ImGui::EndTable();
         }

@@ -54,6 +54,17 @@ public:
         sharpness = static_cast<float>(_wtof(sharpnessBuf));
         if (sharpness < 0.0f || sharpness > 1.0f) sharpness = 0.0f;
 
+        frameGenBackend = GetPrivateProfileIntW(L"FrameGeneration", L"Backend", 0, path.c_str());
+        if (frameGenBackend < 0 || frameGenBackend > 2) frameGenBackend = 0;
+        frameGenMultiplier = GetPrivateProfileIntW(L"FrameGeneration", L"Multiplier", 2, path.c_str());
+        if (frameGenMultiplier < 2 || frameGenMultiplier > 4) frameGenMultiplier = 2;
+        frameGenDynamicMfg = GetPrivateProfileIntW(L"FrameGeneration", L"DynamicMfg", 0, path.c_str()) != 0;
+        wchar_t fgTargetBuf[64]{};
+        GetPrivateProfileStringW(L"FrameGeneration", L"DynamicTargetFps", L"0.0", fgTargetBuf, 64, path.c_str());
+        frameGenDynamicTargetFps = static_cast<float>(_wtof(fgTargetBuf));
+        if (frameGenDynamicTargetFps < 0.0f || frameGenDynamicTargetFps > 1000.0f) frameGenDynamicTargetFps = 0.0f;
+        frameGenReflexBoost = GetPrivateProfileIntW(L"FrameGeneration", L"ReflexBoost", 0, path.c_str()) != 0;
+
         jitterEnabled = GetPrivateProfileIntW(L"Jitter", L"Enabled", 1, path.c_str()) != 0;
         jitterInvertX = GetPrivateProfileIntW(L"Jitter", L"InvertX", 0, path.c_str()) != 0;
         jitterInvertY = GetPrivateProfileIntW(L"Jitter", L"InvertY", 0, path.c_str()) != 0;
@@ -163,6 +174,14 @@ public:
         wchar_t sharpnessBuf[64]{};
         swprintf_s(sharpnessBuf, L"%.2f", sharpness);
         WritePrivateProfileStringW(L"Upscaler", L"Sharpness", sharpnessBuf, path.c_str());
+
+        WritePrivateProfileStringW(L"FrameGeneration", L"Backend", std::to_wstring(frameGenBackend).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"FrameGeneration", L"Multiplier", std::to_wstring(frameGenMultiplier).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"FrameGeneration", L"DynamicMfg", frameGenDynamicMfg ? L"1" : L"0", path.c_str());
+        wchar_t fgTargetBuf[64]{};
+        swprintf_s(fgTargetBuf, L"%.1f", frameGenDynamicTargetFps);
+        WritePrivateProfileStringW(L"FrameGeneration", L"DynamicTargetFps", fgTargetBuf, path.c_str());
+        WritePrivateProfileStringW(L"FrameGeneration", L"ReflexBoost", frameGenReflexBoost ? L"1" : L"0", path.c_str());
 
         WritePrivateProfileStringW(L"Jitter", L"Enabled", jitterEnabled ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"InvertX", jitterInvertX ? L"1" : L"0", path.c_str());
@@ -317,6 +336,12 @@ public:
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;
     bool hdrInput = false;
+
+    int frameGenBackend = 0; // 0=Off, 1=AMD FSR FG, 2=NVIDIA DLSS-G
+    int frameGenMultiplier = 2; // 2..4 (clamped by backend capability)
+    bool frameGenDynamicMfg = false;
+    float frameGenDynamicTargetFps = 0.0f;
+    bool frameGenReflexBoost = false;
 
     bool jitterEnabled = true;
     bool jitterInvertX = false;

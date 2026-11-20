@@ -93,6 +93,7 @@ add_library(EDPE_DXGI SHARED
     src/fg_ui_pack_pass.cpp
     src/amd_fsr_fg_backend.cpp
     src/nvidia_sl_fg_backend.cpp
+    src/fg_integration.cpp
     src/version.cpp
     src/dxgi_proxy.def
 )
@@ -332,6 +333,55 @@ if(EDPE_HAVE_STREAMLINE)
     endif()
 endif()
 add_test(NAME nvidia_sl_fg COMMAND nvidia_sl_fg_test)
+
+add_executable(fg_integration_test
+    tests/fg_integration_test.cpp
+    src/fg_integration.cpp
+    src/amd_fsr_fg_backend.cpp
+    src/nvidia_sl_fg_backend.cpp
+    src/fg_backend.cpp
+    src/fg_ui_pack_pass.cpp
+    src/d3d12_presenter.cpp
+    src/d3d12_bridge.cpp
+    src/renderdoc_support.cpp
+    src/log.cpp)
+target_compile_features(fg_integration_test PRIVATE cxx_std_20)
+target_compile_definitions(fg_integration_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(fg_integration_test PRIVATE src)
+target_link_libraries(fg_integration_test PRIVATE d3d11 dxgi d3dcompiler)
+if(EDPE_HAVE_FFX_FG)
+    target_include_directories(fg_integration_test PRIVATE
+        "${FFX_FG_SDK_DIR}/api/include"
+        "${FFX_FG_SDK_DIR}/framegeneration/include")
+    target_compile_definitions(fg_integration_test PRIVATE EDPE_ENABLE_FFX_FG=1)
+    if(EXISTS "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll")
+        add_custom_command(TARGET fg_integration_test POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll" "$<TARGET_FILE_DIR:fg_integration_test>/"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_framegeneration_dx12.dll" "$<TARGET_FILE_DIR:fg_integration_test>/")
+    endif()
+endif()
+if(EDPE_HAVE_STREAMLINE)
+    target_include_directories(fg_integration_test PRIVATE "${STREAMLINE_SDK_DIR}/include")
+    target_compile_definitions(fg_integration_test PRIVATE EDPE_ENABLE_STREAMLINE=1)
+    if(EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/sl.interposer.dll")
+        foreach(_sl_dll
+                sl.interposer.dll
+                sl.common.dll
+                sl.dlss_g.dll
+                sl.reflex.dll
+                sl.pcl.dll
+                nvngx_dlssg.dll)
+            if(EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}")
+                add_custom_command(TARGET fg_integration_test POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}" "$<TARGET_FILE_DIR:fg_integration_test>/")
+            endif()
+        endforeach()
+    endif()
+endif()
+add_test(NAME fg_integration COMMAND fg_integration_test)
 
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)

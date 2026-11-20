@@ -5,6 +5,7 @@
 #include "system_dll.h"
 #include "ui.h"
 #include "context_census.h"
+#include "fg_integration.h"
 #include "perf_overlay.h"
 #include "vtable_hook.h"
 
@@ -82,6 +83,7 @@ ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
     if (remaining) *reinterpret_cast<void***>(object) = table->methods;
     else {
         UiOnRelease(object);
+        edpe::FgRuntime::instance().onSwapChainRelease(object);
         ContextCensusOnSwapChainRelease(object);
         delete table;
     }
@@ -91,6 +93,7 @@ ULONG STDMETHODCALLTYPE observedRelease(IUnknown* object) {
 HRESULT STDMETHODCALLTYPE observedResizeBuffers(IDXGISwapChain* swap_chain, UINT buffer_count,
     UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
     UiOnResize(swap_chain);
+    edpe::FgRuntime::instance().onResize(swap_chain);
     ContextCensusOnResize(swap_chain);
     const auto original = reinterpret_cast<ResizeBuffersFn>(tableOf(swap_chain)->original[kResizeBuffers]);
     return original(swap_chain, buffer_count, width, height, format, flags);
@@ -266,7 +269,9 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
     ContextCensusOnPresent(swap_chain, frame, flags);
     UiOnPresent(swap_chain, flags);
     ContextCensusAfterOverlay(swap_chain, flags);
-    const HRESULT result = original(swap_chain, sync_interval, flags);
+    bool presentedViaFgProxy = false;
+    edpe::FgRuntime::instance().onPresent(swap_chain, sync_interval, flags, &presentedViaFgProxy);
+    const HRESULT result = presentedViaFgProxy ? S_OK : original(swap_chain, sync_interval, flags);
     edpe::setLastD3D11HResult(result);
     ContextCensusAfterPresent(swap_chain, flags);
     edpe::PerfTracker::instance().onPresentEnd();

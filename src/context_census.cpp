@@ -10,6 +10,7 @@
 #include "shader_probe.h"
 #include "temporal_math.h"
 #include "upscaler_backend.h"
+#include "fg_integration.h"
 #include "ngx_context.h"
 #include "config.h"
 #include "ui_layer.h"
@@ -9799,6 +9800,10 @@ static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_final_output_present;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_reconstructed_output;
 static edpe::TemporalFrameInputs s_last_temporal_inputs{};
 static unsigned long long s_last_temporal_inputs_frame = ~0ull;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_fg_hudless_texture;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_fg_motion_tex;
+static unsigned long long s_last_fg_motion_frame = ~0ull;
+static bool s_last_fg_pause_menu = false;
 
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_debounced_offscreen_color;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_pending_offscreen_color;
@@ -10159,9 +10164,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const auto frame = rendered;
     auto& upscaler = edpe::UpscalerManager::instance();
     const bool upscale_active = upscaler.isReconstructionActive();
+    const bool fg_active = edpe::FgRuntime::instance().isMotionNeeded();
     const bool debug_view_active = s_jitter_debug_view.load(std::memory_order_relaxed) ||
                                    s_hud_debug_view.load(std::memory_order_relaxed);
-    if ((!upscale_active && !debug_view_active) || !context || !backbuffer) return;
+    if ((!upscale_active && !debug_view_active && !fg_active) || !context || !backbuffer) return;
 
     if (s_upscale_evaluated_this_frame) {
         return;
@@ -10460,6 +10466,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         motion_pass.reset();
         s_dlss_output_texture.Reset();
         s_dlss_output_srv.Reset();
+        s_last_final_output_present.Reset();
+        s_last_reconstructed_output.Reset();
+        s_last_fg_hudless_texture.Reset();
+        s_last_fg_motion_tex.Reset();
         s_backbuffer_copy.Reset();
         s_backbuffer_copy_srv.Reset();
         s_backbuffer_copy_rtv.Reset();
@@ -10748,7 +10758,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const float prev_jx = eval_reset ? 0.0f : s_prev_eval_jitter_x;
     const float prev_jy = eval_reset ? 0.0f : s_prev_eval_jitter_y;
 
-    const bool need_motion = upscale_active || s_jitter_debug_view.load(std::memory_order_relaxed);
+    const bool need_motion = upscale_active ||
+                             s_jitter_debug_view.load(std::memory_order_relaxed) ||
+                             edpe::FgRuntime::instance().isMotionNeeded();
     Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
     ID3D11ShaderResourceView* prevDepthSrv = nullptr;
     if (need_motion) {
@@ -10834,6 +10846,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
     s_last_temporal_inputs = inputs;
     s_last_temporal_inputs_frame = rendered;
+    s_last_fg_motion_tex = motionTexture;
+    s_last_fg_motion_frame = rendered;
+    s_last_fg_pause_menu = isPauseOrModalMenuActive(rendered);
+    s_last_fg_hudless_texture = (!isHdrColor && colorSource != backbuffer) ? activeColorInputTex : nullptr;
 
     if (!upscale_active) {
         s_camera_reset = false;
@@ -11071,6 +11087,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 compOk = true;
             } else {
                 compOk = true;
+            }
+            if (!isHdrColor && evalDestination == s_dlss_output_texture.Get() && s_dlss_output_texture) {
+                s_last_fg_hudless_texture = s_dlss_output_texture;
             }
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::UiComposite);
             }
@@ -12939,6 +12958,12 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 upscaler.setMode(static_cast<edpe::UpscaleMode>(m));
             }
         }
+        edpe::FgRuntime::instance().applyConfig(
+            cfg.frameGenBackend,
+            cfg.frameGenMultiplier,
+            cfg.frameGenDynamicMfg,
+            cfg.frameGenDynamicTargetFps,
+            cfg.frameGenReflexBoost);
     }
     s_inside_main_scene.store(false, std::memory_order_release);
     struct PresentScopeGuard {
@@ -12952,7 +12977,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         finalizeHudMaskForFrame(context, cur_rendered);
         const bool rec_active = edpe::UpscalerManager::instance().isReconstructionActive() ||
                                 s_jitter_debug_view.load(std::memory_order_relaxed) ||
-                                s_hud_debug_view.load(std::memory_order_relaxed);
+                                s_hud_debug_view.load(std::memory_order_relaxed) ||
+                                edpe::FgRuntime::instance().isMotionNeeded();
         if (!rec_active && hud_draw_hook_mask) {
             endHudDrawProbe();
         }
@@ -13986,6 +14012,10 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_direct_color_fmt = DXGI_FORMAT_UNKNOWN;
         s_dlss_output_texture.Reset();
         s_dlss_output_srv.Reset();
+        s_last_final_output_present.Reset();
+        s_last_reconstructed_output.Reset();
+        s_last_fg_hudless_texture.Reset();
+        s_last_fg_motion_tex.Reset();
         s_backbuffer_copy.Reset();
         s_backbuffer_copy_srv.Reset();
         s_backbuffer_copy_rtv.Reset();
@@ -14688,4 +14718,40 @@ void ContextCensusLogPresentDevice(IDXGISwapChain* swapChain, ID3D11Device* pres
 
 unsigned long long ContextCensusGetDsvBinds() {
     return dsv_binds.load(std::memory_order_relaxed);
+}
+
+bool ContextCensusGetFgSnapshot(edpe::FgSceneSnapshot* outSnapshot) {
+    if (!outSnapshot) return false;
+    *outSnapshot = {};
+    const unsigned long long rendered = last_present_frame.load(std::memory_order_relaxed);
+    if (s_last_temporal_inputs_frame != rendered || s_last_fg_motion_frame != rendered) {
+        return false;
+    }
+    if (!s_last_temporal_inputs.depthSrv || !s_last_fg_motion_tex) {
+        return false;
+    }
+    outSnapshot->valid = true;
+    outSnapshot->hudlessColorTex = s_last_fg_hudless_texture.Get();
+    outSnapshot->depthSrv = s_last_temporal_inputs.depthSrv;
+    outSnapshot->motionVectorsTex = s_last_fg_motion_tex.Get();
+    auto& uiLayer = edpe::UiLayer::instance();
+    outSnapshot->uiHdrSrv = uiLayer.hdrLayerSrv();
+    outSnapshot->uiLdrSrv = uiLayer.ldrLayerSrv();
+    outSnapshot->uiMultSrv = uiLayer.multLayerSrv();
+    outSnapshot->renderWidth = s_last_temporal_inputs.renderWidth;
+    outSnapshot->renderHeight = s_last_temporal_inputs.renderHeight;
+    outSnapshot->outputWidth = s_last_temporal_inputs.outputWidth;
+    outSnapshot->outputHeight = s_last_temporal_inputs.outputHeight;
+    outSnapshot->jitterX = s_last_temporal_inputs.jitterX;
+    outSnapshot->jitterY = s_last_temporal_inputs.jitterY;
+    outSnapshot->motionScaleX = s_last_temporal_inputs.motionScaleX;
+    outSnapshot->motionScaleY = s_last_temporal_inputs.motionScaleY;
+    outSnapshot->frameTimeMs = s_last_temporal_inputs.frameTimeMs;
+    outSnapshot->frameIndex = rendered;
+    outSnapshot->reset = s_last_temporal_inputs.reset;
+    outSnapshot->colorIsHdr = s_last_temporal_inputs.colorIsHdr;
+    outSnapshot->isPauseOrMenu = s_last_fg_pause_menu;
+    outSnapshot->cameraNow = s_last_temporal_inputs.cameraNow;
+    outSnapshot->cameraPrevious = s_last_temporal_inputs.cameraPrevious;
+    return true;
 }

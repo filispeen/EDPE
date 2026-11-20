@@ -42,6 +42,9 @@ struct CachedTelemetryStats {
     char vramLine[64]{};
     char resLine[96]{};
     char reconStatusLine[96]{};
+    bool fgActive = false;
+    char fgPresentedFpsLine[64]{};
+    char fgInfoLine[96]{};
     ImVec4 fpsColor{0.2f, 1.0f, 0.2f, 1.0f};
     ImVec4 reconStatusColor{0.2f, 1.0f, 0.2f, 1.0f};
 };

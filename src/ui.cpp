@@ -3,6 +3,7 @@
 #include "context_census.h"
 #include "ui_layer.h"
 #include "upscaler_backend.h"
+#include "fg_integration.h"
 #include "ngx_context.h"
 #include "capture_format.h"
 #include "config.h"
@@ -241,6 +242,10 @@ bool UiProcessInput(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
 
 namespace {
 LRESULT CALLBACK edpeWndProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    LRESULT fgResult = 0;
+    if (edpe::FgRuntime::handleWindowMessage(window, message, wparam, lparam, &fgResult)) {
+        return fgResult;
+    }
     if (UiProcessInput(window, message, wparam, lparam)) {
         if (message == WM_SETCURSOR) return TRUE;
         if (message == WM_MOUSEACTIVATE) return MA_ACTIVATE;
@@ -1411,6 +1416,7 @@ void shutdownUi() {
     if (ui.depth_contrast_shader) ui.depth_contrast_shader->Release();
     if (ui.context) ui.context->Release();
     if (ui.device) ui.device->Release();
+    edpe::FgRuntime::instance().shutdown();
     edpe::UpscalerManager::instance().shutdown();
     edpe::PerfTracker::instance().shutdown();
     s_base_style_initialized = false;
@@ -1956,10 +1962,107 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 edpe::Config::instance().save();
             }
             TextDisabledWrapped("Composites native-resolution cockpit HUD & UI over reconstructed scene");
+        }
 
-            ImGui::BeginDisabled();
-            ImGui::TextUnformatted("Frame Generation: unavailable (temporal path pending)");
-            ImGui::EndDisabled();
+        // 2b. Frame Generation (Independent subsystem: Phases 13-15)
+        if (ImGui::CollapsingHeader("Frame Generation", ImGuiTreeNodeFlags_DefaultOpen)) {
+            auto& fgRt = edpe::FgRuntime::instance();
+            fgRt.ensureCapabilitiesProbed(ui.device);
+
+            const bool amdFgAvail = fgRt.isBackendAvailable(edpe::FrameGenerationBackend::AmdFsrFg);
+            const bool nvFgAvail = fgRt.isBackendAvailable(edpe::FrameGenerationBackend::NvidiaDlssG);
+            const auto fgTel = fgRt.telemetry();
+
+            const char* fgItems[] = {
+                "Off",
+                amdFgAvail ? "AMD FSR Frame Generation" : "AMD FSR Frame Generation (unavailable)",
+                nvFgAvail ? "NVIDIA DLSS Frame Generation" : "NVIDIA DLSS Frame Generation (unavailable)"
+            };
+            int fgIdx = cfg.frameGenBackend;
+            if (fgIdx < 0 || fgIdx > 2) fgIdx = 0;
+
+            if (ImGui::Combo("Frame Gen Backend", &fgIdx, fgItems, IM_ARRAYSIZE(fgItems))) {
+                const bool canSelect =
+                    (fgIdx == 0) ||
+                    (fgIdx == 1 && amdFgAvail) ||
+                    (fgIdx == 2 && nvFgAvail);
+                if (canSelect) {
+                    cfg.frameGenBackend = fgIdx;
+                    fgRt.applyConfig(cfg.frameGenBackend, cfg.frameGenMultiplier,
+                                     cfg.frameGenDynamicMfg, cfg.frameGenDynamicTargetFps,
+                                     cfg.frameGenReflexBoost);
+                    cfg.save();
+                    edpe::PerfTracker::instance().updateCachedStats();
+                }
+            }
+
+            if (!amdFgAvail) {
+                ImGui::TextDisabled("AMD FSR FG reason: %ls",
+                    fgRt.backendUnavailableReason(edpe::FrameGenerationBackend::AmdFsrFg));
+            }
+            if (!nvFgAvail) {
+                ImGui::TextDisabled("NVIDIA DLSS-G reason: %ls",
+                    fgRt.backendUnavailableReason(edpe::FrameGenerationBackend::NvidiaDlssG));
+            }
+
+            if (cfg.frameGenBackend == 2) {
+                const uint32_t maxExtra = fgTel.maxFramesToGenerate > 0 ? fgTel.maxFramesToGenerate : 1u;
+                if (maxExtra > 1) {
+                    int maxMult = static_cast<int>((std::min)(4u, 1u + maxExtra));
+                    if (ImGui::SliderInt("Frame Multiplier", &cfg.frameGenMultiplier, 2, maxMult, "%dx")) {
+                        fgRt.applyConfig(cfg.frameGenBackend, cfg.frameGenMultiplier,
+                                         cfg.frameGenDynamicMfg, cfg.frameGenDynamicTargetFps,
+                                         cfg.frameGenReflexBoost);
+                        cfg.save();
+                    }
+                } else {
+                    ImGui::BeginDisabled();
+                    int twoX = 2;
+                    ImGui::SliderInt("Frame Multiplier", &twoX, 2, 2, "2x (GPU max)");
+                    ImGui::EndDisabled();
+                }
+
+                if (!fgTel.dynamicMfgSupported) ImGui::BeginDisabled();
+                if (ImGui::Checkbox("Dynamic MFG", &cfg.frameGenDynamicMfg)) {
+                    fgRt.applyConfig(cfg.frameGenBackend, cfg.frameGenMultiplier,
+                                     cfg.frameGenDynamicMfg, cfg.frameGenDynamicTargetFps,
+                                     cfg.frameGenReflexBoost);
+                    cfg.save();
+                }
+                if (cfg.frameGenDynamicMfg && fgTel.dynamicMfgSupported) {
+                    if (ImGui::InputFloat("Dynamic Target FPS (0=Auto)", &cfg.frameGenDynamicTargetFps, 10.0f, 30.0f, "%.0f")) {
+                        if (cfg.frameGenDynamicTargetFps < 0.0f) cfg.frameGenDynamicTargetFps = 0.0f;
+                        fgRt.applyConfig(cfg.frameGenBackend, cfg.frameGenMultiplier,
+                                         cfg.frameGenDynamicMfg, cfg.frameGenDynamicTargetFps,
+                                         cfg.frameGenReflexBoost);
+                        cfg.save();
+                    }
+                }
+                if (!fgTel.dynamicMfgSupported) ImGui::EndDisabled();
+
+                if (ImGui::Checkbox("NVIDIA Reflex + Boost (Streamline)", &cfg.frameGenReflexBoost)) {
+                    fgRt.applyConfig(cfg.frameGenBackend, cfg.frameGenMultiplier,
+                                     cfg.frameGenDynamicMfg, cfg.frameGenDynamicTargetFps,
+                                     cfg.frameGenReflexBoost);
+                    cfg.save();
+                }
+            }
+
+            if (fgTel.active) {
+                const auto& cached_tel = edpe::PerfTracker::instance().getCachedTelemetry();
+                const ImVec4 col = fgTel.pausedForMenu ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f)
+                                                       : ImVec4(0.35f, 0.95f, 0.45f, 1.0f);
+                ImGui::TextColored(col, "Status: %ls", fgTel.statusMessage);
+                ImGui::Text("Rendered FPS: %.1f | Presented FPS: %.1f (+%u/cycle)",
+                            fgTel.renderedFps > 0.0f ? fgTel.renderedFps : cached_tel.fps,
+                            fgTel.presentedFps > 0.0f ? fgTel.presentedFps : cached_tel.fps,
+                            fgTel.generatedFramesThisCycle);
+                ImGui::Text("Total Generated: %llu | D3D12 Copy: %.2f ms",
+                            static_cast<unsigned long long>(fgTel.totalGeneratedFrames),
+                            fgTel.d3d12CopyMs);
+            } else if (fgTel.statusMessage[0] != L'\0' && wcscmp(fgTel.statusMessage, L"Off") != 0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.25f, 1.0f), "FG Notice: %ls", fgTel.statusMessage);
+            }
         }
 
         if (ImGui::CollapsingHeader("HUD Tonemapping Tuning")) {
