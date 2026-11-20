@@ -542,6 +542,7 @@ static bool s_staged_from_in_scene = false;
 static bool s_staged_was_probe_vs_committed = false;
 static bool s_staged_was_teleport_hold = false;
 static bool s_staged_was_parse_ok = false;
+static bool s_staged_was_cb1_subpass_fallback = false;
 // Orientation-only fallback when an entire frame carries a ~1 Hz IPD/cockpit probe translation offset:
 static edpe::CameraProjection s_probe_fallback_camera{};
 static unsigned long long s_probe_fallback_frame = ~0ull;
@@ -872,6 +873,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         s_staged_was_probe_vs_committed = false;
         s_staged_was_teleport_hold = false;
         s_staged_was_parse_ok = false;
+        s_staged_was_cb1_subpass_fallback = false;
         s_has_probe_fallback_camera = false;
         s_probe_fallback_from_in_scene = false;
         s_probe_fallback_parse_ok = false;
@@ -7959,7 +7961,13 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     // 3) Same-pose scene sub-passes (e.g. viewmodel Z-prepass before main world G-buffer)
                     //    must never increment s_cut_rejection_streak or pose-check as cuts.
                     bool cut_streak_satisfied = false;
-                    if (!passes_filter && !is_probe && !is_same_pose_subpass_cand && !is_cb1_subpass &&
+                    const bool allow_cb1_subpass_fallback_recovery =
+                        (s_consecutive_fallback_frames >= 2 &&
+                         !(s_has_staged_camera && s_staged_camera_frame == cur_frame) &&
+                         cb1HasLiveEyePos &&
+                         isSceneCameraAspect(parsed_camera.scaleX, parsed_camera.scaleY, outW, outH));
+                    if (!passes_filter && !is_probe && !is_same_pose_subpass_cand &&
+                        (!is_cb1_subpass || allow_cb1_subpass_fallback_recovery) &&
                         (in_main_scene || s_consecutive_fallback_frames >= 1 || cb1HasLiveEyePos) &&
                         cameraRotationDeterminant(parsed_camera) >= 0.85f &&
                         cameraRotationDeterminant(parsed_camera) <= 1.15f &&
@@ -8039,6 +8047,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         const bool promote_over_teleport =
                             hasStagedForFrame && s_staged_was_teleport_hold && in_main_scene &&
                             !is_teleport_hold_candidate && (jumpResidual <= 15.0f);
+                        const bool promote_over_subpass_fallback =
+                            hasStagedForFrame && s_staged_was_cb1_subpass_fallback && !is_cb1_subpass;
 
                         if (allow_stage && s_has_staged_camera && s_staged_camera_frame == cur_frame) {
                             const bool replaceBlockWithParsed =
@@ -8046,7 +8056,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             if (!parse_ok && s_staged_was_parse_ok) {
                                 allow_stage = false;
                             } else if ((in_main_scene && !s_staged_from_in_scene) || promote_over_probe ||
-                                       promote_over_teleport || replaceBlockWithParsed) {
+                                       promote_over_teleport || promote_over_subpass_fallback || replaceBlockWithParsed) {
                                 allow_stage = true;
                             } else if (!in_main_scene && s_staged_from_in_scene) {
                                 allow_stage = false;
@@ -8093,6 +8103,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             s_staged_was_probe_vs_committed = (probe_vs_anchor || probe_vs_committed);
                             s_staged_was_teleport_hold = is_teleport_hold_candidate;
                             s_staged_was_parse_ok = parse_ok;
+                            s_staged_was_cb1_subpass_fallback = (is_cb1_subpass && cut_streak_satisfied);
                             if (in_main_scene) {
                                 s_staged_from_in_scene = true;
                             }
@@ -13350,6 +13361,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_staged_was_probe_vs_committed = false;
         s_staged_was_teleport_hold = false;
         s_staged_was_parse_ok = false;
+        s_staged_was_cb1_subpass_fallback = false;
         s_has_probe_fallback_camera = false;
         s_probe_fallback_from_in_scene = false;
         s_probe_fallback_parse_ok = false;
@@ -14022,6 +14034,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_staged_was_probe_vs_committed = false;
         s_staged_was_teleport_hold = false;
         s_staged_was_parse_ok = false;
+        s_staged_was_cb1_subpass_fallback = false;
         s_staged_camera_frame = ~0ull;
         s_has_probe_fallback_camera = false;
         s_probe_fallback_from_in_scene = false;
