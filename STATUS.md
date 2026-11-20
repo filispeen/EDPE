@@ -1,6 +1,6 @@
 # EDPE Status — Elite Dangerous Performance Enhanced
 
-**Last updated:** 2026-11-16
+**Last updated:** 2026-11-20
 
 This file documents **verified facts only**. Unverified claims, hypotheses, or speculative results are not recorded here. See `AGENTS.md` and `PLAN.md` for project governance and roadmap.
 
@@ -8,10 +8,11 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Repository
 
-- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling), `v0.3.5` (verified in-game AMD FSR 3.1.2 Native AA & SR, Performance HUD, input leak isolation), `v0.4.0` (verified in-game native D3D11 TAA reconstruction backend, HUD scaling and mouse dragging), `v0.4.1` (verified in-game native TAA stabilization, subpixel de-jittering, Karis clipping, cockpit depth stabilization), `v0.4.4` (verified in-game analytical skybox/star rotational motion vectors at infinity, elimination of star erasure during ship maneuvers, star bloom/corona motion coherence and artifact resolution across all reconstruction backends), `v0.4.6` (verified in-game canopy reflection sub-camera filtering, elimination of TAA docked station pulsing, adaptive stationary variance scaling, Performance HUD mouse cursor isolation when overlay is closed), `v0.4.7` (HOTAS/DirectInput isolation), `v0.4.8` (hot-path CPU overhead elimination), `v0.4.9` (crash logger and diagnostics subsystem), `v0.4.10` (AMD driver 26.10.1 FSR fix & UI scale slider), `v0.5.0` (cross-device scene rendering & DXGI Keyed Mutex, native UI composite pass, auxiliary camera/eye probe filtering, 2nd-order kinematic probe filter, pilot camera projection fallback, sharpening control), `v0.6.0` (real-time frametime graph in Performance HUD, multi-backend automated comparison benchmark with warmup & HUD stamp, 66.66ms telemetry & profiler rate limiting, DEV mode toggle in edpe.ini gating F8/F9 binds, sticky window footer with interactive author link), `v0.7.0-rc1`–`v0.7.0-rc3` / `v0.7.0` (cockpit holographic HUD live draw redirection & compute composite `UiLayer`, HUD debug view in F8 debug window, ImGui overlay refactor with ProggyForever vector font, cross-device Keyed Mutex synchronization, color source debounce, `CodeHook`/`VTableHook` D3D11 hook hot-path CPU optimization, EDO row-major deferred lighting/shadow/clustered CB2 jitter fixes, distant decal & on-foot hangar camera/HUD fixes), `v0.7.1` (hot-path CPU/GPU optimization, Preset E, `EnableProfiler=1` sub-pass profiling), `v0.7.2` (on-foot tool/rifle viewmodel sub-pass jitter coherence and 208B scaled `cb0` support, planetary ring HUD-layer isolation, on-foot helmet visor post-upscale delta composition, Smooth Motion auxiliary device isolation and context hook race hardening)
+- **Target version:** `v0.8.0` (branch `feat/phases-13-15-frame-generation`; build version string injected by CI from Git tag when released)
+- **Git tags:** `v0.0.1` (initial roadmap), `v0.1.0` (verified in-game NVIDIA DLAA), `v0.2.1` (verified in-game DLSS SR, native UI protection, auto render scaling), `v0.3.5` (verified in-game AMD FSR 3.1.2 Native AA & SR, Performance HUD, input leak isolation), `v0.4.0` (verified in-game native D3D11 TAA reconstruction backend, HUD scaling and mouse dragging), `v0.4.1` (verified in-game native TAA stabilization, subpixel de-jittering, Karis clipping, cockpit depth stabilization), `v0.4.4` (verified in-game analytical skybox/star rotational motion vectors at infinity, elimination of star erasure during ship maneuvers, star bloom/corona motion coherence and artifact resolution across all reconstruction backends), `v0.4.6` (verified in-game canopy reflection sub-camera filtering, elimination of TAA docked station pulsing, adaptive stationary variance scaling, Performance HUD mouse cursor isolation when overlay is closed), `v0.4.7` (HOTAS/DirectInput isolation), `v0.4.8` (hot-path CPU overhead elimination), `v0.4.9` (crash logger and diagnostics subsystem), `v0.4.10` (AMD driver 26.10.1 FSR fix & UI scale slider), `v0.5.0` (cross-device scene rendering & DXGI Keyed Mutex, native UI composite pass, auxiliary camera/eye probe filtering, 2nd-order kinematic probe filter, pilot camera projection fallback, sharpening control), `v0.6.0` (real-time frametime graph in Performance HUD, multi-backend automated comparison benchmark with warmup & HUD stamp, 66.66ms telemetry & profiler rate limiting, DEV mode toggle in edpe.ini gating F8/F9 binds, sticky window footer with interactive author link), `v0.7.0-rc1`–`v0.7.0-rc3` / `v0.7.0` (cockpit holographic HUD live draw redirection & compute composite `UiLayer`, HUD debug view in F8 debug window, ImGui overlay refactor with ProggyForever vector font, cross-device Keyed Mutex synchronization, color source debounce, `CodeHook`/`VTableHook` D3D11 hook hot-path CPU optimization, EDO row-major deferred lighting/shadow/clustered CB2 jitter fixes, distant decal & on-foot hangar camera/HUD fixes), `v0.7.1` (hot-path CPU/GPU optimization, Preset E, `EnableProfiler=1` sub-pass profiling), `v0.7.2` (on-foot tool/rifle viewmodel sub-pass jitter coherence and 208B scaled `cb0` support, planetary ring HUD-layer isolation, on-foot helmet visor post-upscale delta composition, Smooth Motion auxiliary device isolation and context hook race hardening), `v0.7.3`–`v0.7.5-rc1` (Linux/Wine/Proton startup & ABI hardening, RenderDoc In-App API & debug annotations, linear-light HUD tonemapped composite `T(H) + F*T`, bloom/flare ghosting fixes, built-in FXAA/MLAA/SMAA blocking during reconstruction)
 - **Build artifacts:** Consolidated `dxgi.dll` deployed beside `EliteDangerous64.exe`; staged in `build/stage/`
-- **Source:** `src/` contains modular C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, `ui_layer.cpp`, `ui_composite_pass.cpp`, `vtable_hook.h`, `code_hook.h`, `crash_logger.cpp`, `version.cpp`, etc.); `tools/` contains standalone probes
-- **Test suite:** 15 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `hud_debug`, `dxbc_fanout`, `jitter_view_report`, `crash_logger`, `ui_menu_size`, `vtable_hook`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
+- **Source:** `src/` contains modular C++ modules (`capture_format.h`, `camera_delta.h`, `temporal_inputs.h`, `upscaler_backend.h/.cpp`, `motion_pass.cpp`, `ngx_context.cpp`, `ui_layer.cpp`, `ui_composite_pass.cpp`, `renderdoc_support.cpp`, `d3d12_bridge.cpp`, `d3d12_presenter.cpp`, `fg_backend.cpp`, `fg_ui_pack_pass.cpp`, `amd_fsr_fg_backend.cpp`, `nvidia_sl_fg_backend.cpp`, `fg_integration.cpp`, `vtable_hook.h`, `code_hook.h`, `crash_logger.cpp`, `version.cpp`, etc.); `tools/` contains standalone probes
+- **Test suite:** 22 automated tests passing in CTest (`temporal_math`, `camera_delta`, `capture_format`, `temporal_inputs`, `motion_gpu`, `ui_composite`, `hud_debug`, `dxbc_fanout`, `jitter_view_report`, `crash_logger`, `ui_menu_size`, `vtable_hook`, `renderdoc_support`, `d3d11_d3d12_bridge`, `d3d12_presenter`, `fg_backend`, `amd_fsr_fg`, `nvidia_sl_fg`, `fg_integration`, `proxy_smoke`, `proxy_shader_probe`, `proxy_alias_smoke`)
 
 ---
 
@@ -32,9 +33,9 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 10. True render-scale control | **Verified & working in-game** | Cobra's native Supersampling (SSAA < 1.0x) delivers true rendering workload reduction. Automatically detected via scene depth dimensions with zero manual configuration. |
 | 11. AMD FSR upscaling | **Verified & working in-game** | Native D3D11 FidelityFX FSR 3.1.2 backend integrated in `AmdUpscalerBackend`. Verified in-game: supports FSR Native AA (1.0x SSAA) and FSR Super Resolution (<1.0x SSAA) with auto-exposure, inverted reversed-Z, and fail-open lifecycle. |
 | 12. Native-resolution HUD | **Verified in-game (Stage 2)** | Clean pre-HUD 3D scene color (`s_clean_hdr_scene_texture`) fed to upscaler. Cockpit HUD draws redirected live at native swapchain resolution (`UiLayer` / `ui_layer_composite_cs.hlsl`) with viewport subpixel projection unjittering and composited cleanly onto the reconstructed world (`evalStage=1`, `composite=2` verified in-game). |
-| 13. D3D11/D3D12 interoperability | **Not started** | Research phase for Frame Generation bridge. |
-| 14. AMD Frame Generation | **Not started** | Awaits stable temporal upscaling and D3D12 presentation bridge. |
-| 15. NVIDIA Streamline / DLSS Frame Generation | **Not started** | Awaits stable temporal upscaling and Streamline integration. |
+| 13. D3D11/D3D12 interoperability | **Implemented & verified in-game (v0.8.0)** | `D3D11D3D12Bridge` (shared NT handles + `ID3D12Fence`/`ID3D11Fence` sync) and `D3D12ProxyPresenter` (child `WS_CHILD` Flip-model D3D12 swapchain overlay, resize recovery, RenderDoc safety guard). Measured in-game D3D12 copy overhead ~0.08 ms at 2560×1440. |
+| 14. AMD Frame Generation | **Verified & working in-game (v0.8.0)** | `AmdFsrFgBackend` integrates official AMD FidelityFX Frame Generation DX12 (`ffxConfigure` + `ffxDispatch` PrepareV2/FG), premultiplied `RGBA16F` UI packing (`FgUiPackPass`), and `FgRuntime`. Verified in Elite Dangerous Odyssey on RTX 3060 with `AMD FSR Frame Generation (2x)` and automatic pause/menu stand-down. |
+| 15. NVIDIA Streamline / DLSS Frame Generation | **Prototype implemented; capability-gated (v0.8.0)** | `NvidiaStreamlineFgBackend` integrates official Streamline v2.14.16 (`slInit`, `Reflex`, `PCL`, `DLSS-G`). Hardware capability probe verified on RTX 3060 (`Reflex=eOk`, `PCL=eOk`, `DLSS_G=eErrorNoSupportedAdapterFound`), failing open cleanly without black screens; live DLSS-G generation remains to be tested on RTX 40+ hardware. |
 | 16. Intel XeSS upscaling | **Planned / Research** | Intel XeSS 1.3+ temporal upscaling (XeSS Native AA and Super Resolution). Dual-model support: XMX matrix acceleration on Intel Arc GPUs and universal DP4a fallback on NVIDIA/AMD GPUs. Investigating D3D11-to-D3D12 interop bridge (via Phase 13) vs proxy wrapper execution. |
 | 17. Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag) | **Planned / Architecture defined** | Standalone and FG-coupled input latency minimization. NVIDIA Reflex SDK (Low Latency / Boost, marker insertion, sleep pacing) and AMD Anti-Lag / Anti-Lag 2 SDK. Pacing controls in edpe.ini and telemetry HUD integration. |
 | 18. NVIDIA DLSS-NR | **Planned** | Research phase for G-buffer normal/roughness extraction and NGX neural rendering integration. |
@@ -44,8 +45,8 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Available diagnostics and controls
 
-- **F5 Overlay:** Toggles the Dear ImGui menu. Exposes Upscaler Backend (`Native`, `NVIDIA DLSS / DLAA`, `AMD FSR (Native AA / SR)`), Quality Mode (`Native AA`, `Quality`, `Balanced`, `Performance`, `Ultra Performance`), NVIDIA DLSS Preset (`Auto`, `J`, `K`, `L`, `M`), Elite `Custom.4.4.fxcfg` `<SSAAMultiplier>` auto-sync, asynchronous GPU timings, projection jitter status/controls, runtime temporal tuning overrides, and snapshot previews. Features a sticky bottom footer with hotkey status and clickable author link (`by FILISPEEN`). When hidden, passes through all inputs to the game without interference.
-- **Performance Telemetry HUD (F7 / F5):** Real-time on-screen HUD displaying FPS, game frametime, upscaler frametime, total frametime, multi-curve rolling 120-sample frametime history graph (Game: White, Upscaler: Cyan, Total: Orange with 60 FPS / 30 FPS reference lines), current GPU adapter name, GPU usage %, and dedicated VRAM usage (GB & %). Numerical values are formatted with leading space padding for flicker-free reading, with 66.66 ms (~15 Hz) rate-limited display updates. Configurable corner position (Top-Left, Top-Right, Bottom-Left, Bottom-Right), toggleable in F5 menu or via F7 hotkey, persisted in `edpe.ini`.
+- **F5 Overlay:** Toggles the Dear ImGui menu. Exposes Upscaler Backend (`Native`, `NVIDIA DLSS / DLAA`, `AMD FSR (Native AA / SR)`, `TAA`), Quality Mode (`Native AA`, `Quality`, `Balanced`, `Performance`, `Ultra Performance`), NVIDIA DLSS Preset (`Auto`, `E`, `J`, `K`, `L`, `M`), Frame Generation (`Off`, `AMD FSR Frame Generation`, `NVIDIA DLSS-G` with capability-driven availability/multiplier, Rendered vs Presented FPS, Total Generated, D3D12 Copy ms), RenderDoc controls, Elite `Custom.4.4.fxcfg` `<SSAAMultiplier>` auto-sync, asynchronous GPU timings, projection jitter status/controls, runtime temporal tuning overrides, and snapshot previews. Features a sticky bottom footer with hotkey status and clickable author link (`by FILISPEEN`). When hidden, passes through all inputs to the game without interference.
+- **Performance Telemetry HUD (F7 / F5):** Real-time on-screen HUD displaying FPS, `Presented FPS (+FG)`, active Frame Gen backend/state, game frametime, upscaler frametime, total frametime, multi-curve rolling 120-sample frametime history graph (Game: White, Upscaler: Cyan, Total: Orange with 60 FPS / 30 FPS reference lines), current GPU adapter name, GPU usage %, and dedicated VRAM usage (GB & %). Numerical values are formatted with leading space padding for flicker-free reading, with 66.66 ms (~15 Hz) rate-limited display updates. Configurable anchor position (8 positions or manual drag), toggleable in F5 menu or via F7 hotkey, persisted in `edpe.ini`.
 - **Multi-Backend Comparison Benchmark:** Automated sequential capture across all upscaler backends with 5-second warmup per backend. Saves uncompressed comparison frames to `edpe-captures/comparison/` with optional HUD overlay & GPU reconstruction time stamp.
 - **Developer Mode Toggle (`DEV=0` / `DEV=1`):** Configurable in `edpe.ini`; defaults to `0` (clean gamer interface hiding diagnostic tools and gating F8/F9 binds).
 - **Non-blocking readback:** Staging textures mapped with `D3D11_MAP_FLAG_DO_NOT_WAIT`, completely preventing render thread stalls.
@@ -55,21 +56,21 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Next milestone
 
-Phase 11 (AMD FSR 3.1.2 Upscaling) is **Verified In-Game**:
-- `AmdUpscalerBackend` verified in Elite Dangerous Odyssey for both FSR Native AA (1.0x SSAA) and Super Resolution (< 1.0x SSAA).
-- UI composites native HUD over the reconstructed FSR image.
-- Performance telemetry HUD tracks frame pacing, engine/upscaler times, and GPU/VRAM load.
+Phases 13 & 14 (D3D11/D3D12 Interop & AMD FSR Frame Generation) are **Verified In-Game (`v0.8.0`)**:
+- `D3D11D3D12Bridge`, `D3D12ProxyPresenter`, and `FgRuntime` run live alongside `ContextCensusGetFgSnapshot()` on NVIDIA GeForce RTX 3060 (2560×1440, `0.08 ms` D3D12 bridge copy).
+- `AmdFsrFgBackend` verified in-game with `AMD FSR Frame Generation (2x)` and automatic pause/menu stand-down.
+- `NvidiaStreamlineFgBackend` initializes and reports hardware capabilities cleanly (`Reflex=eOk`, `PCL=eOk`, `DLSS-G` fails open with `eErrorNoSupportedAdapterFound` on RTX 3060).
 
 The immediate next steps are:
-1. **Validate `9-Add-Linux-Support` on real Linux/Proton distributions** for a follow-up `v0.7.3` release.
-
-2. Proceed to **Phase 13 (D3D11/D3D12 presentation bridge research for Frame Generation)**.
+1. Validate `NvidiaStreamlineFgBackend` live frame generation on **Ada Lovelace (RTX 40+) / Blackwell hardware** with HAGS / vkd3d-proton.
+2. Proceed to **Phase 16 (Intel XeSS via D3D12 interop)** and **Phase 17 (Low Latency — standalone NVAPI Reflex & AMD Anti-Lag 2)**.
 
 ---
 
 ## Not yet demonstrated
 
-EDPE has implemented Phases 9 & 10 (`render < output` DLSS Super Resolution and Cobra `<SSAAMultiplier>` render-scale integration); in-game verification of DLSS SR performance gains, AMD FSR reconstruction, native-resolution HUD separation, and Frame Generation remain to be demonstrated.
+- Live NVIDIA DLSS-G multi-frame generation on RTX 40+/50+ hardware (`eErrorNoSupportedAdapterFound` on RTX 3060 test GPU).
+- Intel XeSS (Phase 16), standalone NVAPI Reflex / AMD Anti-Lag 2 (Phase 17), DLSS-NR (Phase 18), and ReShade/EDHM/3Dmigoto proxy chaining (Phase 19).
 
 ---
 
@@ -180,9 +181,25 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 ---
 
+## D3D11/D3D12 Interop & Frame Generation — VERIFIED IN-GAME (Phases 13–15, `v0.8.0`)
+
+- **Phase 13 (Bridge & Child Flip Presenter):**
+  - `D3D11D3D12Bridge` shares D3D11 textures (depth, `R16G16_FLOAT` motion vectors, HUD-less color, packed UI) into D3D12 using shared NT handles (`CreateSharedHandle`) and shared fences (`ID3D12Fence`/`ID3D11Fence`).
+  - `D3D12ProxyPresenter` overlays a click-through `WS_CHILD` Flip-model D3D12 swapchain synced with the game's window (`DXGI_SWAP_EFFECT_FLIP_DISCARD`), recovering across `ResizeBuffers` and toggling cleanly back to native D3D11 `Present` when FG is off or bypassed.
+  - Safe failure guards: bypasses cleanly under in-process Windows `renderdoc.dll` (cross-API present risk) and exclusive fullscreen, while supporting Wine/vkd3d-proton system `d3d12.dll` + Vulkan debug markers (`VK_EXT_debug_utils`).
+- **Phase 14 (AMD FSR Frame Generation — Verified In-Game):**
+  - `AmdFsrFgBackend` integrates official AMD FidelityFX Frame Generation DX12 (`ffxConfigure` + `ffxDispatch` PrepareV2/FG), coupled with `FgUiPackPass` (`src/fg_ui_pack_pass.cpp`) packing HDR/LDR/multiply UI layers into premultiplied `R16G16B16A16_FLOAT`.
+  - `FgRuntime` (`src/fg_integration.cpp`) + `ContextCensusGetFgSnapshot()` synchronize completed rendered frames into `FrameGenerationManager` (`src/fg_backend.cpp`), resetting temporal FG history (`Stand down (menu/loading)`) during pause/menus/loading.
+  - Verified live in *Elite Dangerous Odyssey* (NVIDIA GeForce RTX 3060, 2560×1440, alongside NVIDIA DLAA): active `AMD FSR Frame Generation (2x)` output scaling with `0.08 ms` D3D12 copy time, no F5 menu crash, and working menu stand-down.
+- **Phase 15 (NVIDIA Streamline / DLSS-G — Capability-Gated Prototype):**
+  - `NvidiaStreamlineFgBackend` (`src/nvidia_sl_fg_backend.cpp`) loads official NVIDIA Streamline v2.14.16 (`slInit`, `Reflex`, `PCL`, `DLSS-G`), queries adapter capabilities dynamically without hardcoded GPU lists, and surfaces unsupported reasons directly in the F5 menu.
+  - Hardware capability probe verified on RTX 3060 (`Reflex=eOk`, `PCL=eOk`, `DLSS_G=eErrorNoSupportedAdapterFound (6)`), failing open cleanly.
+
+---
+
 ## Failure Behavior — IMPLEMENTED & TESTED
 
-- **Upscaler failure:** disable affected upscaler, disable jitter, restore original frame, Present normally
+- **Upscaler / Frame Generation failure:** disable affected backend, disable jitter/proxy swapchain, restore original frame, Present normally
 - **Never:** black-screen Elite because one EDPE subsystem fails
 - **Forbidden in hot path:** blocking GPU readback, `Map()` on full-resolution textures, blocking `GetData` loops, per-frame NGX feature recreation
 - **Async timing:** disjoint timestamp queries (`D3D11_QUERY_TIMESTAMP_DISJOINT` + start/end timestamps) measure GPU upscale cost without blocking the render thread
@@ -201,8 +218,17 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 | `temporal_inputs_test` | ✅ Unit test | Scaling calculations, input validation, NVIDIA/AMD convention translations, fail-open manager |
 | `ui_composite_test` | ✅ Unit test | Menu UI difference isolation and cockpit holographic HUD mask blending |
 | `hud_debug_test` | ✅ Unit test | Cockpit HUD & UI Debug View modes (0–4) and null fallback safety |
+| `jitter_view_report_test` | ✅ Unit test | Jitter diagnostics report generation |
+| `crash_logger_test` | ✅ Unit test | SEH crash minidump generation and stack capture |
 | `ui_menu_size_test` | ✅ Unit test | ImGui menu window size, auto-fit, and position persistence |
 | `vtable_hook_test` | ✅ Unit test | `LiveCopy` vtable hook initialization, drift detection (`reclaimLive`), and unhook restoration |
+| `renderdoc_support_test` | ✅ Unit test | RenderDoc In-App API loading, annotation state, and Wine/Vulkan debug markers |
+| `d3d11_d3d12_bridge_test` | ✅ Requires D3D11+D3D12 | Shared NT handle textures and shared D3D11/D3D12 fence synchronization |
+| `d3d12_presenter_test` | ✅ Requires D3D12 | Flip-model child HWND D3D12 proxy swapchain presentation and resize teardown |
+| `fg_backend_test` | ✅ Unit test | `FrameGenerationManager` contracts, camera matrix math, menu stand-down, fail-open behavior |
+| `amd_fsr_fg_test` | ✅ Requires D3D12+FFX | AMD FidelityFX Frame Generation DX12 lifecycle and evaluation |
+| `nvidia_sl_fg_test` | ✅ Requires Streamline | Streamline initialization and capability probe (`Reflex`/`PCL`/`DLSS-G`) |
+| `fg_integration_test` | ✅ Requires D3D11+D3D12 | End-to-end `FgRuntime` proxy swapchain, pause stand-down, and `ResizeBuffers` recovery |
 | `motion_gpu_test` | ✅ Requires D3D11 | GPU motion pass test (WARP / hardware) |
 | `dxbc_fanout_test` | ✅ DXBC fanout probe | Shader hash analysis |
 | `proxy_smoke` | ✅ Integration test | Verifies DLL load, Present hook, and input pass-through |
@@ -210,6 +236,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 | `proxy_alias_smoke` | ✅ Integration test | Verifies staged `dxgi.dll` loading |
 | In-game captures (2026-10-15) | ✅ MEASURED IN-GAME | Full 2560×1440 captures of depth (DSV #2), emissive (RTV3), motion, color, and clean frame |
 | In-game NVIDIA DLAA (2026-10-16) | ✅ VERIFIED IN-GAME | Stable 2560×1440 DLAA evaluation (~0.3 ms GPU time) with Halton (2,3) jitter, depth, and motion |
+| In-game AMD FSR FG (2026-11-20) | ✅ VERIFIED IN-GAME | Active `2x` Frame Generation on RTX 3060 + NVIDIA DLAA (2560×1440, `0.08 ms` D3D12 copy, clean F5 overlay & menu stand-down) |
 | Standalone NGX probe | ✅ MEASURED | `tools/ngx_probe/` V1-V5 clean, 2 runs each |
 | Overlay lifecycle in Elite | ✅ MEASURED | Clean init, non-interfering input, clean shutdown on swap chain destroy |
 
@@ -217,9 +244,10 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 ## Next Verified Milestones (per PLAN.md order)
 
-1. **Phase 12 — Native-Resolution HUD Separation:** Fine reactive mask generation and refinement for cockpit holographic elements and emissive UI.
-2. **Phase 13–15 — D3D11/D3D12 Interop & Frame Generation:** Presentation bridge prototyping for AMD FSR & NVIDIA DLSS Frame Generation.
-3. **Phase 19 — Low-Latency Framework:** Prototyping standalone and FG-coupled input lag minimization via NVIDIA Reflex (Low Latency / Boost) and AMD Anti-Lag / Anti-Lag 2 SDK integration.
+1. **Phase 15 (Hardware Validation) — NVIDIA DLSS-G on Ada RTX 40+ / Blackwell:** Verify live DLSS Frame Generation & Multi Frame Generation on supported GPUs.
+2. **Phase 16 — Intel XeSS:** Native AA and Super Resolution via Phase 13 D3D11/D3D12 interop.
+3. **Phase 17 — Low-Latency Framework:** Standalone and FG-coupled input lag minimization via NVIDIA Reflex (NVAPI / Streamline) and AMD Anti-Lag / Anti-Lag 2 SDK integration.
+4. **Phase 18–19 — NVIDIA DLSS-NR & Third-Party Mod Compatibility:** Neural rendering research and proxy DLL chaining for ReShade, EDHM, and 3Dmigoto.
 
 ---
 

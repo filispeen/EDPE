@@ -1601,7 +1601,7 @@ Elite's cockpit HUD, text, holograms, and menus are isolated from the scene LDR 
 
 ---
 
-# 36. Phase 13 — D3D11 / D3D12 interoperability research
+# 36. Phase 13 — D3D11 / D3D12 interoperability (`v0.8.0` Verified)
 
 Do not start FG before this point.
 
@@ -1638,7 +1638,7 @@ If interop cost removes the performance benefit, stop and document the result be
 
 ---
 
-# 37. Phase 14 — AMD Frame Generation prototype
+# 37. Phase 14 — AMD Frame Generation (`v0.8.0` Verified In-Game)
 
 AMD FG is a reasonable first FG research target because FSR Frame Generation is intentionally separated from the upscaler.
 
@@ -1672,7 +1672,7 @@ disocclusion artifacts
 
 ---
 
-# 38. Phase 15 — NVIDIA Streamline / DLSS Frame Generation
+# 38. Phase 15 — NVIDIA Streamline / DLSS Frame Generation (`v0.8.0` Prototype / Capability-Gated)
 
 Integrate Streamline only after D3D12 presentation/interop is understood.
 
@@ -2240,6 +2240,8 @@ The project has achieved the following verified milestones:
 * **`v0.5.0`**: DXGI Keyed Mutex cross-device rendering, native UI composite pass, auxiliary camera rejection, runtime sharpening.
 * **`v0.6.0`**: Real-time frametime graph in performance HUD, multi-backend automated benchmark, 66.66 ms telemetry rate limiting, DEV mode toggle.
 * **`v0.7.0`**: Cockpit holographic HUD mask & composite pass, HUD debug visualizer, ProggyForever vector font overlay, cross-device Keyed Mutex synchronization, color source debounce.
+* **`v0.7.1` – `v0.7.4`**: Hot-path CPU/GPU optimization, Preset E, `EnableProfiler=1`, viewmodel sub-pass jitter coherence, planetary ring & visor isolation, Linux/Wine/Proton hardening, RenderDoc In-App API & GPU annotations, linear-light HUD tonemapped composite (`T(H) + F*T`).
+* **`v0.8.0`**: D3D11/D3D12 shared NT handle texture & fence bridge (`D3D11D3D12Bridge`), Flip-model D3D12 child overlay swapchain (`D3D12ProxyPresenter`), vendor-neutral `IFrameGenerationBackend` & `FgRuntime`, live verified **AMD FSR Frame Generation** (`2x`, `0.08 ms` D3D12 bridge copy, premultiplied UI packing, menu stand-down), and capability-gated **NVIDIA Streamline DLSS-G** backend (`Reflex`/`PCL`/`DLSS-G`).
 
 ---
 
