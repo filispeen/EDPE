@@ -451,5 +451,21 @@ int main() {
         return 99;
     }
 
+    // 33. Cockpit 1 Hz reflection probe (~0.117m from pilot head, and ~4.35m from Camera Suite seat)
+    // must be rejected or held instead of corrupting continuous camera tracking.
+    edpe::CameraProjection cockpitProbe = identity();
+    cockpitProbe.worldFromView[3] = 0.117f;
+    if (!edpe::isStereoEyeOrIpdProbe(cockpitProbe, identity())) return 102;
+    if (!edpe::isReflectionOrAuxiliaryCamera(cockpitProbe, identity())) return 103;
+
+    edpe::CameraProjection seatProbeJump = worldBase;
+    seatProbeJump.worldFromView[3] = 1.5997f;
+    seatProbeJump.worldFromView[7] = 1.5107f;
+    seatProbeJump.worldFromView[11] = 3.7567f;
+    const float seatJump = 4.3536f;
+    if (!edpe::isTransientOriginRebaseHoldEligible(seatProbeJump, worldBase, seatJump, 1, true, false)) return 104;
+    if (edpe::isTransientOriginRebaseHoldEligible(seatProbeJump, worldBase, seatJump, 1, false, false)) return 105;
+    if (edpe::isTransientOriginRebaseHoldEligible(seatProbeJump, worldBase, seatJump, 5, true, false)) return 106;
+
     return 0;
 }

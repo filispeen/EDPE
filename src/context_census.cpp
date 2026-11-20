@@ -804,15 +804,15 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
             const bool projCut = edpe::isCameraProjectionCut(committedCam, prevRef);
 
             s_prev_valid_velocity = s_last_valid_velocity;
-            if (!haveNormalStaged || useOrientationOnlyHold) {
-                s_camera_previous = s_camera_now;
-                s_camera_previous_frame = s_camera_frame;
-                out_scene_cut = false;
-            } else if (rotTrace < 2.414f || projCut) {
+            if (rotTrace < 2.414f || projCut) {
                 out_scene_cut = true;
                 s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                 s_camera_previous = s_camera_now;
                 s_camera_previous_frame = s_camera_frame;
+            } else if (!haveNormalStaged || useOrientationOnlyHold) {
+                s_camera_previous = s_camera_now;
+                s_camera_previous_frame = s_camera_frame;
+                out_scene_cut = false;
             } else if (s_consecutive_fallback_frames > 0 && s_last_true_camera.scaleX > 0.0f) {
                 s_camera_previous = s_last_true_camera;
                 s_camera_previous_frame = s_last_true_camera_frame;
@@ -824,7 +824,8 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                         ? (rendered_frame - s_last_true_camera_frame)
                         : 1ull;
                 const edpe::Vec3 predictedTrueDelta = s_prev_valid_velocity * static_cast<float>(gap);
-                if (edpe::isUnpredictedPositionCut(trueDelta, predictedTrueDelta)) {
+                if (edpe::isUnpredictedPositionCut(trueDelta, predictedTrueDelta) ||
+                    edpe::length(trueDelta - predictedTrueDelta) > 2.0f) {
                     out_scene_cut = true;
                     s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                 } else {
@@ -838,7 +839,8 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                 s_camera_previous_frame = s_camera_frame;
                 const edpe::Vec3 newDelta =
                     edpe::cameraPosition(committedCam) - edpe::cameraPosition(s_camera_now);
-                if (edpe::isUnpredictedPositionCut(newDelta, s_prev_valid_velocity)) {
+                if (edpe::isUnpredictedPositionCut(newDelta, s_prev_valid_velocity) ||
+                    edpe::length(newDelta - s_prev_valid_velocity) > 2.0f) {
                     out_scene_cut = true;
                     s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                 } else {
@@ -8010,7 +8012,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 (s_last_valid_velocity * std::clamp(dtRatio, 0.25f, 4.0f));
                             jumpResidual =
                                 edpe::length(edpe::cameraPosition(parsed_camera) - predicted);
-                            if (jumpResidual > 15.0f && jumpResidual < 2000.0f) {
+                            if (jumpResidual > 1.0f && jumpResidual < 2000.0f) {
                                 if (!(s_has_staged_camera && s_staged_camera_frame == cur_frame &&
                                       s_staged_from_in_scene) &&
                                     s_last_teleport_rejection_frame != cur_frame) {
@@ -8019,11 +8021,11 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 }
                                 if (edpe::isTransientOriginRebaseHoldEligible(
                                         parsed_camera, s_camera_now, jumpResidual,
-                                        s_teleport_rejection_streak, allowPreSceneMainEye, cut_streak_satisfied)) {
+                                        s_teleport_rejection_streak, in_main_scene, cut_streak_satisfied)) {
                                     is_teleport_hold_candidate = true;
                                 } else {
                                     const bool persistentInSceneTeleport =
-                                        allowPreSceneMainEye && s_teleport_rejection_streak >= 5;
+                                        in_main_scene && s_teleport_rejection_streak >= 5;
                                     if (!cut_streak_satisfied &&
                                         !persistentInSceneTeleport &&
                                         (s_teleport_rejection_streak < 2 || s_consecutive_fallback_frames < 1)) {
@@ -8032,14 +8034,14 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                         s_anchor_valid = false;
                                     }
                                 }
-                            } else if (jumpResidual <= 15.0f) {
+                            } else if (jumpResidual <= 1.0f) {
                                 s_teleport_rejection_streak = 0;
                             }
                         }
 
                         const bool promote_over_teleport =
                             hasStagedForFrame && s_staged_was_teleport_hold && in_main_scene &&
-                            !is_teleport_hold_candidate && (jumpResidual <= 15.0f);
+                            !is_teleport_hold_candidate && (jumpResidual <= 1.0f);
 
                         if (allow_stage && s_has_staged_camera && s_staged_camera_frame == cur_frame) {
                             const bool replaceBlockWithParsed =

@@ -73,6 +73,7 @@ inline bool matchesAnchorPrediction(
 
 inline bool isIpdHarmonicDistance(float dist) {
     return std::fabs(dist - 0.0682f) < 0.010f ||
+           std::fabs(dist - 0.1170f) < 0.006f ||
            std::fabs(dist - 0.1364f) < 0.012f ||
            std::fabs(dist - 0.2728f) < 0.015f;
 }
@@ -263,7 +264,7 @@ inline bool isTransientOriginRebaseHoldEligible(
     bool cutStreakSatisfied)
 {
     if (!inMainScene || cutStreakSatisfied || teleportStreak >= 5) return false;
-    if (jumpResidual <= 15.0f || jumpResidual >= 2000.0f) return false;
+    if (jumpResidual <= 1.0f || jumpResidual >= 2000.0f) return false;
     if (isCameraProjectionCut(candidate, committed)) return false;
     return cameraRotationTrace(candidate, committed) > 2.414f;
 }

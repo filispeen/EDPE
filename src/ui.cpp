@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "log.h"
 #include "context_census.h"
+#include "d3d11_proxy.h"
 #include "ui_layer.h"
 #include "upscaler_backend.h"
 #include "fg_integration.h"
@@ -1488,7 +1489,23 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     if (motion_state) motion_state->Release();
     if (context1) context1->Release();
     if (device1) device1->Release();
-    edpe::UpscalerManager::instance().initialize(ui.device, ui.context);
+    ID3D11Device* upscalerDevice = ui.device;
+    ID3D11DeviceContext* upscalerContext = ui.context;
+    ID3D11DeviceContext* primaryUpscalerContext = nullptr;
+    if (ID3D11Device* primaryDev = GetPrimaryD3D11Device()) {
+        if (ContextCensusIsSmoothMotionDevice(ui.device) ||
+            (edpe::isSmoothMotionDetected() && ui.device != primaryDev)) {
+            primaryDev->GetImmediateContext(&primaryUpscalerContext);
+            if (primaryUpscalerContext) {
+                upscalerDevice = primaryDev;
+                upscalerContext = primaryUpscalerContext;
+            }
+        }
+    }
+    edpe::UpscalerManager::instance().initialize(upscalerDevice, upscalerContext);
+    if (primaryUpscalerContext) {
+        primaryUpscalerContext->Release();
+    }
     if (edpe::isRunningInEliteProcess()) {
         edpe::installInputHooks();
     }
