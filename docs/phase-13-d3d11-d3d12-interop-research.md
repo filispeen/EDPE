@@ -365,3 +365,24 @@ If Option A1/A2 interop overhead exceeds the framerate benefit of XeSS or Frame 
   * **GPU D3D11 return copy:** `0.0506 ms` mean (120/120 samples)
   * **Total round-trip GPU time:** `0.3755 ms` (`~0.24 ms` input-only for Phase 13B/FG where D3D12 presents directly without a return copy)
 * **Gate Decision:** Interop overhead (`~0.24–0.38 ms` GPU, `~0.22 ms` CPU, `75 MB` VRAM at 1440p native) is well within Frame Generation and XeSS budgets. Proceed to **Phase 13B** (`ProxySwapChainD3D12`) and **Phases 14–15**.
+
+---
+
+## 8. Phase 13B Measured Prototype Results (`MEASURED`)
+
+**Date:** 2026-11-20  
+**Implementation:** [`src/d3d12_presenter.h`](../src/d3d12_presenter.h), [`src/d3d12_presenter.cpp`](../src/d3d12_presenter.cpp), [`tests/d3d12_presenter_test.cpp`](../tests/d3d12_presenter_test.cpp)  
+**Test Hardware:** NVIDIA GeForce RTX 3060, 2560×1440 (3-buffer `FLIP_DISCARD`, `ALLOW_TEARING = 1`), 120 measured frames
+
+* **Correctness & Edge Cases (`VERIFIED`):**
+  * `sanitizeFlipSwapChainDesc` promotes `BufferCount < 2` to `3`, strips `GDI_COMPATIBLE`, maps sRGB formats (`R8G8B8A8_UNORM_SRGB` / `B8G8R8A8_UNORM_SRGB`) to `_UNORM`, and gates `ALLOW_TEARING` via `IDXGIFactory5::CheckFeatureSupport`.
+  * `HiddenDummyWindow` creates a non-activating `WS_POPUP | WS_DISABLED` hidden 1×1 `HWND` for the offscreen D3D11 swapchain while `D3D12ProxyPresenter` presents to the visible `HWND`.
+  * `CreateDXGIFactory2` resolves via `LoadSystemDll(L"dxgi.dll")`, avoiding proxy recursion into EDPE's `dxgi.dll`.
+  * Verified `ResizeBuffers` (2560×1440 → 1920×1080 → 2560×1440) with `presentResizeMutex_` + `waitGpuIdle()` + `SetColorSpace1(G22_NONE_P709)` and subsequent frame presentation without leaks.
+* **Measured 1440p Overhead (`MEASURED`):**
+  * **Swapchain + Shared Input VRAM delta:** `56.30 MB`
+  * **Native D3D11 Flip `Present` interval:** `mean = 0.0940 ms` (`stddev = 0.1111 ms`)
+  * **D3D12 Proxy `Present` interval:** `mean = 0.2839 ms` (`stddev = 0.0897 ms`, $\Delta\sigma = -0.0214\text{ ms}$ — well within `< 0.3 ms` pacing stability budget)
+  * **D3D12 Proxy `Present` CPU call cost:** `mean = 0.2874 ms` (`stddev = 0.1026 ms`)
+  * **D3D12 `CopyResource` GPU cost (120/120 samples):** `mean = 0.0772 ms`
+* **Gate Decision:** Phase 13B presentation pacing and overhead (`0.077 ms` D3D12 copy, `~0.28 ms` CPU present, `56.3 MB` VRAM at 1440p) pass all Phase 13 gates. Ready to wire into `IFrameGenerationBackend` (**Phases 14 & 15**).
