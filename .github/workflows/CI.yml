@@ -89,6 +89,54 @@ jobs:
         run: |
           python tools/fetch_ffx_dx11.py
 
+      - name: Cache FidelityFX FG SDK
+        id: cache-ffx-fg
+        uses: actions/cache@v4
+        with:
+          path: external/ffx-sdk
+          key: ffx-fg-sdk-${{ runner.os }}-v2.4.0
+          restore-keys: |
+            ffx-fg-sdk-${{ runner.os }}-
+
+      - name: Clone FidelityFX FG SDK
+        if: steps.cache-ffx-fg.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "external/ffx-sdk/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h")) {
+            Write-Host "Cloning official AMD FidelityFX SDK v2.4.0 (sparse)..."
+            git clone --depth 1 --branch v2.4.0 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/ffx-sdk
+            Push-Location external/ffx-sdk
+            git sparse-checkout set Kits/FidelityFX/api Kits/FidelityFX/framegeneration Kits/FidelityFX/signedbin LICENSE.txt
+            Pop-Location
+            Remove-Item -Recurse -Force external/ffx-sdk/.git
+          } else {
+            Write-Host "FidelityFX FG SDK found in cache."
+          }
+
+      - name: Cache NVIDIA Streamline SDK
+        id: cache-streamline
+        uses: actions/cache@v4
+        with:
+          path: external/streamline
+          key: streamline-sdk-${{ runner.os }}-v2.14.16
+          restore-keys: |
+            streamline-sdk-${{ runner.os }}-
+
+      - name: Clone NVIDIA Streamline SDK
+        if: steps.cache-streamline.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "external/streamline/include/sl_dlss_g.h")) {
+            Write-Host "Cloning official NVIDIA Streamline SDK v2.14.16 (sparse)..."
+            git clone --depth 1 --branch v2.14.16 --filter=blob:none --sparse https://github.com/NVIDIA-RTX/Streamline.git external/streamline
+            Push-Location external/streamline
+            git sparse-checkout set include bin/x64 LICENSE.txt
+            Pop-Location
+            Remove-Item -Recurse -Force external/streamline/.git
+          } else {
+            Write-Host "NVIDIA Streamline SDK found in cache."
+          }
+
       - name: Set up sccache
         uses: hendrikmuhs/ccache-action@v1
         with:

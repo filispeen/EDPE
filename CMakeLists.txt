@@ -401,6 +401,28 @@ if(EDPE_HAVE_NGX)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${NGX_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "${EDPE_STAGE}/nvngx_dlss.dll")
 endif()
+if(EDPE_HAVE_FFX_FG AND EXISTS "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll")
+    add_custom_command(TARGET proxy_stage POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll" "${EDPE_STAGE}/amd_fidelityfx_loader_dx12.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_framegeneration_dx12.dll" "${EDPE_STAGE}/amd_fidelityfx_framegeneration_dx12.dll")
+endif()
+if(EDPE_HAVE_STREAMLINE AND EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/sl.interposer.dll")
+    foreach(_sl_dll
+            sl.interposer.dll
+            sl.common.dll
+            sl.dlss_g.dll
+            sl.reflex.dll
+            sl.pcl.dll
+            nvngx_dlssg.dll)
+        if(EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}")
+            add_custom_command(TARGET proxy_stage POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}" "${EDPE_STAGE}/${_sl_dll}")
+        endif()
+    endforeach()
+endif()
 add_test(NAME proxy_alias_smoke COMMAND "${EDPE_STAGE}/proxy_smoke.exe"
     "${EDPE_STAGE}/dxgi.dll" "${EDPE_STAGE}/edpe.log")
 set_tests_properties(proxy_alias_smoke PROPERTIES RUN_SERIAL TRUE)
