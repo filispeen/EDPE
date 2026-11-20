@@ -4926,7 +4926,7 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                                 return true;
                             }
                         }
-                    } else {
+                    } else if (edpe::Config::instance().devMode) {
                         static unsigned s_pass53_target_fail_logs = 0;
                         if (s_pass53_target_fail_logs < 4) {
                             ++s_pass53_target_fail_logs;
@@ -4940,7 +4940,7 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                         }
                     }
                 }
-            } else {
+            } else if (edpe::Config::instance().devMode) {
                 static unsigned s_pass53_srv_fail_logs = 0;
                 if (s_pass53_srv_fail_logs < 8) {
                     const bool rtvEqBb = (rtvRes && rtvRes.Get() == bbRes);
@@ -4963,7 +4963,7 @@ bool observePostHudDrawAndTonemap(ID3D11DeviceContext* context, char kind, UINT 
                     }
                 }
             }
-        } else if (wantUpscale && !s_upscale_evaluated_this_frame &&
+        } else if (edpe::Config::instance().devMode && wantUpscale && !s_upscale_evaluated_this_frame &&
                    count >= 3 && count <= 6 && instance_count == 1) {
             static unsigned s_pass53_gate_fail_logs = 0;
             if (s_pass53_gate_fail_logs < 4) {
@@ -10869,7 +10869,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             // Pass 54 2D UI (Main Menu, Starport Services, ESC Menu, On-Foot HUD) has already been
             // drawn to the backbuffer, so copying pre-UI scene output over it wipes out all UI.
             const bool allowBackbufferWrite = evaluatedAtPass53 || chosenIsBackbuffer;
-            if (!evaluatedAtPass53 && !chosenIsBackbuffer) {
+            if (!evaluatedAtPass53 && !chosenIsBackbuffer && edpe::Config::instance().devMode) {
                 static bool s_logged_pass53_miss = false;
                 if (!s_logged_pass53_miss) {
                     s_logged_pass53_miss = true;
