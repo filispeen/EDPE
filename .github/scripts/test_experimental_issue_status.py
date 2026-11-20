@@ -169,8 +169,8 @@ class ExperimentalIssueStatusTests(unittest.TestCase):
             "release_outcome": "skipped",
         }
         body = MOD.render_comment_body("finish", ctx)
-        self.assertIn("❌ Experimental Build `exp-build-43` — Failed", body)
-        self.assertIn("❌ **Build EDPE (Release x64)** — failure", body)
+        self.assertIn("❌ Experimental Build `exp-build-43`: Failed", body)
+        self.assertIn("❌ **Build EDPE (Release x64)**: failure", body)
         self.assertIn("workflow run logs", body)
 
 

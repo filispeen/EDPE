@@ -146,6 +146,16 @@ def verify_is_issue(api_url: str, repo: str, token: str, number: int) -> bool:
     return isinstance(data, dict) and "pull_request" not in data
 
 
+def is_issue_closed(api_url: str, repo: str, token: str, number: int) -> bool:
+    url = f"{api_url}/repos/{repo}/issues/{number}"
+    try:
+        _, data = github_request(url, token)
+    except Exception as exc:
+        print(f"Warning: could not check state of issue #{number}: {exc}")
+        return False
+    return isinstance(data, dict) and data.get("state") == "closed"
+
+
 def query_linked_issues_graphql(
     graphql_url: str,
     repo: str,
@@ -252,15 +262,6 @@ def discover_linked_issues(
                 discovered.append(num)
 
         add_unique(pr_issues)
-
-        if not discovered:
-            try:
-                closed_linked, _ = query_linked_issues_graphql(
-                    graphql_url, repo, token, branch, ["CLOSED"], max_pages=1
-                )
-                add_unique(closed_linked)
-            except Exception as exc:
-                print(f"Warning: closed-issue GraphQL lookup failed for branch '{branch}': {exc}")
 
     return primary_branch, discovered
 
@@ -461,6 +462,9 @@ def post_comments(
 ) -> dict[str, int]:
     comment_ids: dict[str, int] = {}
     for issue_num in issue_numbers:
+        if is_issue_closed(api_url, repo, token, issue_num):
+            print(f"Skipping closed issue #{issue_num}.")
+            continue
         url = f"{api_url}/repos/{repo}/issues/{issue_num}/comments"
         try:
             _, resp = github_request(url, token, method="POST", payload={"body": body})
