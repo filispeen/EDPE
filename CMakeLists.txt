@@ -47,6 +47,13 @@ else()
     set(EDPE_HAVE_FSR FALSE)
 endif()
 
+set(FFX_FG_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/ffx-sdk/Kits/FidelityFX")
+if(EXISTS "${FFX_FG_SDK_DIR}/framegeneration/include/ffx_framegeneration.h")
+    set(EDPE_HAVE_FFX_FG TRUE)
+else()
+    set(EDPE_HAVE_FFX_FG FALSE)
+endif()
+
 add_library(EDPE_DXGI SHARED
     src/dllmain.cpp
     src/crash_logger.cpp
@@ -77,6 +84,7 @@ add_library(EDPE_DXGI SHARED
     src/d3d12_presenter.cpp
     src/fg_backend.cpp
     src/fg_ui_pack_pass.cpp
+    src/amd_fsr_fg_backend.cpp
     src/version.cpp
     src/dxgi_proxy.def
 )
@@ -123,6 +131,20 @@ if(EDPE_HAVE_FSR)
     target_link_libraries(EDPE_DXGI PRIVATE
         "${FFX_SDK_DIR}/lib/ffx_fsr3upscaler_x64.lib"
         "${FFX_SDK_DIR}/lib/ffx_backend_dx11_x64.lib")
+endif()
+
+if(EDPE_HAVE_FFX_FG)
+    target_include_directories(EDPE_DXGI PRIVATE
+        "${FFX_FG_SDK_DIR}/api/include"
+        "${FFX_FG_SDK_DIR}/framegeneration/include")
+    target_compile_definitions(EDPE_DXGI PRIVATE EDPE_ENABLE_FFX_FG=1)
+    if(EXISTS "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll")
+        add_custom_command(TARGET EDPE_DXGI POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll" "$<TARGET_FILE_DIR:EDPE_DXGI>/"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_framegeneration_dx12.dll" "$<TARGET_FILE_DIR:EDPE_DXGI>/")
+    endif()
 endif()
 
 enable_testing()
@@ -236,6 +258,26 @@ target_compile_definitions(fg_backend_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(fg_backend_test PRIVATE src)
 target_link_libraries(fg_backend_test PRIVATE d3d11 dxgi d3dcompiler)
 add_test(NAME fg_backend COMMAND fg_backend_test)
+
+add_executable(amd_fsr_fg_test tests/amd_fsr_fg_test.cpp src/amd_fsr_fg_backend.cpp src/fg_backend.cpp src/fg_ui_pack_pass.cpp src/d3d12_presenter.cpp src/d3d12_bridge.cpp src/renderdoc_support.cpp src/log.cpp)
+target_compile_features(amd_fsr_fg_test PRIVATE cxx_std_20)
+target_compile_definitions(amd_fsr_fg_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(amd_fsr_fg_test PRIVATE src)
+target_link_libraries(amd_fsr_fg_test PRIVATE d3d11 dxgi d3dcompiler)
+if(EDPE_HAVE_FFX_FG)
+    target_include_directories(amd_fsr_fg_test PRIVATE
+        "${FFX_FG_SDK_DIR}/api/include"
+        "${FFX_FG_SDK_DIR}/framegeneration/include")
+    target_compile_definitions(amd_fsr_fg_test PRIVATE EDPE_ENABLE_FFX_FG=1)
+    if(EXISTS "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll")
+        add_custom_command(TARGET amd_fsr_fg_test POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll" "$<TARGET_FILE_DIR:amd_fsr_fg_test>/"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_framegeneration_dx12.dll" "$<TARGET_FILE_DIR:amd_fsr_fg_test>/")
+    endif()
+endif()
+add_test(NAME amd_fsr_fg COMMAND amd_fsr_fg_test)
 
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)

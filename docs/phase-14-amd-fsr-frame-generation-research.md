@@ -149,3 +149,22 @@ Per `GPUOpen-LibrariesAndSDKs/AntiLag2-SDK` README and FSR SDK 2.4 (`SDK-DOCUMEN
   2. Port `kUiLayerCompositePsHlsl` (25 lines HLSL) to a D3D12 PSO invoked inside `presentCallback`.
   3. Wire `FrameGenerationInputs` from `ContextCensus` (`s_clean_hdr_scene_texture`, `DSV #2` `R32_FLOAT`, `MotionPass`, `CB0` camera vectors/FOV).
   4. Validate motion-vector polarity & tear-free pacing with `FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW` and `FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES`.
+
+---
+
+## 7. Phase 14 Measured Prototype Results (`MEASURED`)
+
+**Date:** 2026-11-20  
+**Implementation:** [`src/amd_fsr_fg_backend.h`](../src/amd_fsr_fg_backend.h), [`src/amd_fsr_fg_backend.cpp`](../src/amd_fsr_fg_backend.cpp), [`tests/amd_fsr_fg_test.cpp`](../tests/amd_fsr_fg_test.cpp)  
+**SDK:** Official `GPUOpen-LibrariesAndSDKs/FidelityFX-SDK` `v2.4.0` (`amd_fidelityfx_loader_dx12.dll` + `amd_fidelityfx_framegeneration_dx12.dll`, loaded dynamically with fail-open)  
+**Test Hardware:** NVIDIA GeForce RTX 3060 (cross-vendor proof), 2560×1440, 30 rendered + 30 generated frames
+
+* **Verified Lifecycle (`VERIFIED`):**
+  * `D3D12ProxyPresenter::detachSwapChainForWrap()` → `ffxCreateContext(SwapChainWrapDX12)` → `attachWrappedSwapChain()` wraps the D3D12 Flip-model swapchain cleanly with balanced refcounts.
+  * `FgUiPackPass` packs `UiLayer` (`hdr`/`ldr`/`mult`) into `R8G8B8A8_UNORM` premultiplied UI registered via `RegisterUiResourceDX12` (`USE_PREMUL_ALPHA | ENABLE_INTERNAL_UI_DOUBLE_BUFFERING`).
+  * `ffxConfigure(FrameGeneration)` → `ffxDispatch(PrepareV2)` → `FrameInterpolationSwapChain::Present` runs `3.1.6` provider cleanly and tears down (`frameGenerationEnabled=false` → `DestroyContext(FG)` → `DestroyContext(SwapChain)` → `recreatePlainSwapChain()`) with zero errors.
+* **Measured 1440p Resource & Execution Metrics (`MEASURED`):**
+  * **Active Provider:** `3.1.6`
+  * **FG Context VRAM:** `225.92 MB`
+  * **FG SwapChain VRAM:** `90.00 MB`
+  * **30-frame loop (30 rendered + 30 generated frames):** `920.58 ms` (`30.69 ms/frame` total including D3D11→D3D12→FG→Present at 1440p; `Rendered FPS = 60.0`, `Presented FPS = 120.0`)

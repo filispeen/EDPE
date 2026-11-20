@@ -139,6 +139,25 @@ public:
     IDXGISwapChain4* swapChain() const { return swapChain_.Get(); }
     ID3D12Resource* currentBackBuffer() const;
 
+    // Releases backbuffer refs and detaches swapChain_ ownership before an FG library
+    // (e.g., FidelityFX WrapDX12) consumes and replaces the swapchain pointer.
+    IDXGISwapChain4* detachSwapChainForWrap();
+
+    // Attaches ownership of a newly wrapped IDXGISwapChain4* (refcount already owned by caller)
+    // and re-acquires backbuffer references.
+    bool attachWrappedSwapChain(IDXGISwapChain4* wrappedSwapChain);
+
+    // Releases current swapchain and recreates a plain D3D12 Flip-model swapchain on targetHwnd_.
+    bool recreatePlainSwapChain();
+
+    // Optional pre-present callback executed inside presentFromD3D11Texture on the active
+    // D3D12 command list (before CopyResource to backbuffer & submit) for FG PrepareV2.
+    using PrePresentCmdCallback = bool (*)(ID3D12GraphicsCommandList* cmdList, void* userCtx);
+    void setPrePresentCallback(PrePresentCmdCallback cb, void* userCtx) {
+        prePresentCb_ = cb;
+        prePresentUserCtx_ = userCtx;
+    }
+
 private:
     bool acquireBackBuffers();
     void releaseBackBuffers();
@@ -165,6 +184,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> queryHeap_;
     Microsoft::WRL::ComPtr<ID3D12Resource> queryReadback_;
     std::array<bool, D3D11D3D12Bridge::kAllocatorCount> slotHasTimestamp_{};
+    PrePresentCmdCallback prePresentCb_ = nullptr;
+    void* prePresentUserCtx_ = nullptr;
 };
 
 } // namespace edpe

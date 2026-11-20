@@ -340,6 +340,42 @@ ID3D12Resource* D3D12ProxyPresenter::currentBackBuffer() const {
     return (idx < backBuffers_.size()) ? backBuffers_[idx].Get() : nullptr;
 }
 
+IDXGISwapChain4* D3D12ProxyPresenter::detachSwapChainForWrap() {
+    bridge_.waitGpuIdle();
+    releaseBackBuffers();
+    return swapChain_.Detach();
+}
+
+bool D3D12ProxyPresenter::attachWrappedSwapChain(IDXGISwapChain4* wrappedSwapChain) {
+    bridge_.waitGpuIdle();
+    releaseBackBuffers();
+    if (wrappedSwapChain) {
+        swapChain_.Attach(wrappedSwapChain);
+    }
+    return acquireBackBuffers();
+}
+
+bool D3D12ProxyPresenter::recreatePlainSwapChain() {
+    std::unique_lock lock(presentResizeMutex_);
+    if (!initialized_ || !factory_ || !targetHwnd_ || !bridge_.commandQueue()) return false;
+    bridge_.waitGpuIdle();
+    releaseBackBuffers();
+    swapChain_.Reset();
+
+    const DXGI_SWAP_CHAIN_DESC1 scDesc = sanitizeFlipSwapChainDesc(
+        width_, height_, format_, bufferCount_, swapChainFlags_, tearingSupported_);
+    Microsoft::WRL::ComPtr<IDXGISwapChain1> sc1;
+    const HRESULT hr = factory_->CreateSwapChainForHwnd(
+        bridge_.commandQueue(), targetHwnd_, &scDesc, nullptr, nullptr, &sc1);
+    if (FAILED(hr) || FAILED(sc1.As(&swapChain_))) {
+        return false;
+    }
+    factory_->MakeWindowAssociation(targetHwnd_, DXGI_MWA_NO_ALT_ENTER);
+    if (!acquireBackBuffers()) return false;
+    swapChain_->SetColorSpace1(colorSpace_);
+    return true;
+}
+
 bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
                                                   ID3D11Texture2D* srcD3D11,
                                                   UINT syncInterval,
@@ -388,6 +424,10 @@ bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
         ScopedD3D12RenderDocEvent ev(cmdList, L"EDPE: D3D12ProxyPresentBlit");
         if (queryHeap_ && queryReadback_) {
             cmdList->EndQuery(queryHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
+        }
+
+        if (prePresentCb_) {
+            prePresentCb_(cmdList, prePresentUserCtx_);
         }
 
         D3D11D3D12Bridge::transitionResource(
