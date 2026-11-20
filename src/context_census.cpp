@@ -6260,9 +6260,112 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
     }
 }
 
+namespace {
+enum class BuiltinAaAction : uint8_t {
+    Skip = 0,
+    CopyT0ToRtv0 = 1,
+};
+
+struct BuiltinAaShaderEntry {
+    std::uint64_t psHash;
+    std::uint64_t vsHash;
+    BuiltinAaAction action;
+    uint8_t logBit;
+    const wchar_t* label;
+};
+
+// Post-tonemap built-in AA passes verified from EDO-FXAA / MLAAx2 / MLAAx4 / SMAA captures.
+// All execute as DrawInstanced(3, 1, 0, 0) after Pass 52 Tonemap.
+constexpr BuiltinAaShaderEntry kBuiltinAaPasses[] = {
+    // FXAA: preceded by copy pass 5AA08A96E3C14B10 (6822 -> 40780); skipping FXAA preserves clean 40780.
+    {0x2375CCCCBBFE7A4Dull, 0x20F383BBAC05C031ull, BuiltinAaAction::Skip,         1u, L"FXAA"},
+    // MLAA (x2 / x4): edge detect + 1 or 3 blend-weight passes + final neighborhood blend (6822 -> 40780).
+    {0x2D3667A41465D28Eull, 0x9AB36264A9B58840ull, BuiltinAaAction::Skip,         2u, L"MLAA"},
+    {0x29AD3F78E953DFC2ull, 0x513E60933BF4B31Eull, BuiltinAaAction::Skip,         2u, L"MLAA"},
+    {0x93F517E5A5FDBEB5ull, 0x688A27A5DA388304ull, BuiltinAaAction::CopyT0ToRtv0, 2u, L"MLAA"},
+    // SMAA: edge detect + blend weights + final neighborhood blend (6822 -> 40780).
+    {0xEAFB41975DDBFDA2ull, 0x68842760565CC3BAull, BuiltinAaAction::Skip,         4u, L"SMAA"},
+    {0xBAB75803059C271Dull, 0x03D186CE0EC031E3ull, BuiltinAaAction::Skip,         4u, L"SMAA"},
+    {0x4168985B52C5D7C4ull, 0x98E6F9986FDC9A53ull, BuiltinAaAction::CopyT0ToRtv0, 4u, L"SMAA"},
+};
+} // namespace
+
+static bool tryBlockBuiltinAntiAliasingDraw(ID3D11DeviceContext* context,
+    UINT vertex_count, UINT instance_count) {
+    if (vertex_count != 3 || instance_count != 1 || motion_color_bound) {
+        return false;
+    }
+    if (!edpe::UpscalerManager::instance().isReconstructionActive()) {
+        return false;
+    }
+    const auto cur = last_present_frame.load(std::memory_order_relaxed);
+    if (s_hdr_slot0_seen_frame != cur) {
+        return false;
+    }
+    const std::uint64_t psHash = getFastBoundPsHash(context);
+    if (!psHash) {
+        return false;
+    }
+    const BuiltinAaShaderEntry* matched = nullptr;
+    for (const auto& entry : kBuiltinAaPasses) {
+        if (entry.psHash == psHash) {
+            matched = &entry;
+            break;
+        }
+    }
+    if (!matched) {
+        return false;
+    }
+    if (getFastBoundVsHash(context) != matched->vsHash) {
+        return false;
+    }
+
+    if (matched->action == BuiltinAaAction::CopyT0ToRtv0) {
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv0;
+        context->PSGetShaderResources(0, 1, srv0.GetAddressOf());
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv0;
+        context->OMGetRenderTargets(1, rtv0.GetAddressOf(), nullptr);
+        if (!srv0 || !rtv0) {
+            return false;
+        }
+        Microsoft::WRL::ComPtr<ID3D11Resource> srcRes, dstRes;
+        srv0->GetResource(srcRes.GetAddressOf());
+        rtv0->GetResource(dstRes.GetAddressOf());
+        if (!srcRes || !dstRes) {
+            return false;
+        }
+        if (srcRes.Get() != dstRes.Get()) {
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> srcTex, dstTex;
+            if (FAILED(srcRes.As(&srcTex)) || FAILED(dstRes.As(&dstTex)) || !srcTex || !dstTex) {
+                return false;
+            }
+            D3D11_TEXTURE2D_DESC sd{}, dd{};
+            srcTex->GetDesc(&sd);
+            dstTex->GetDesc(&dd);
+            if (sd.Width != dd.Width || sd.Height != dd.Height ||
+                sd.SampleDesc.Count != dd.SampleDesc.Count) {
+                return false;
+            }
+            context->CopyResource(dstRes.Get(), srcRes.Get());
+        }
+    }
+
+    static std::atomic<uint32_t> s_logged_aa_mask{0};
+    const uint32_t prevMask = s_logged_aa_mask.fetch_or(matched->logBit, std::memory_order_relaxed);
+    if ((prevMask & matched->logBit) == 0) {
+        wchar_t msg[128];
+        swprintf_s(msg, L"EDPE: blocked built-in %ls pass while temporal reconstruction is active", matched->label);
+        EdpeLog(msg);
+    }
+    return true;
+}
+
 void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     UINT vertex_count, UINT instance_count, UINT start_vertex, UINT start_instance) {
     const bool immediate = isObservedImmediateContext(context);
+    if (immediate && tryBlockBuiltinAntiAliasingDraw(context, vertex_count, instance_count)) {
+        return;
+    }
     if (!immediate || !isHudDrawInterceptWindowActive()) {
         if (const auto forward = resolveOriginalDrawInstanced(context)) {
             forward(context, vertex_count, instance_count, start_vertex, start_instance);
