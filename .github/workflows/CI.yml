@@ -118,21 +118,30 @@ jobs:
         uses: actions/cache@v4
         with:
           path: external/streamline
-          key: streamline-sdk-${{ runner.os }}-v2.14.16
-          restore-keys: |
-            streamline-sdk-${{ runner.os }}-
+          key: streamline-sdk-${{ runner.os }}-v2.14.16-bin-v2
 
-      - name: Clone NVIDIA Streamline SDK
-        if: steps.cache-streamline.outputs.cache-hit != 'true'
+      - name: Fetch NVIDIA Streamline SDK
         shell: pwsh
         run: |
-          if (-not (Test-Path "external/streamline/include/sl_dlss_g.h")) {
-            Write-Host "Cloning official NVIDIA Streamline SDK v2.14.16 (sparse)..."
-            git clone --depth 1 --branch v2.14.16 --filter=blob:none --sparse https://github.com/NVIDIA-RTX/Streamline.git external/streamline
-            Push-Location external/streamline
-            git sparse-checkout set include bin/x64 LICENSE.txt
-            Pop-Location
-            Remove-Item -Recurse -Force external/streamline/.git
+          if (-not (Test-Path "external/streamline/include/sl_dlss_g.h") -or -not (Test-Path "external/streamline/bin/x64/sl.interposer.dll")) {
+            Write-Host "Downloading official NVIDIA Streamline SDK v2.14.16..."
+            $tmpZip = Join-Path $env:RUNNER_TEMP "streamline-sdk-v2.14.16.zip"
+            $tmpDir = Join-Path $env:RUNNER_TEMP "streamline-unpack"
+            Invoke-WebRequest -Uri "https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.16/streamline-sdk-v2.14.16.zip" -OutFile $tmpZip
+            Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+            Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
+            $hdr = Get-ChildItem -Path $tmpDir -Recurse -Filter "sl_dlss_g.h" | Select-Object -First 1
+            if (-not $hdr) { throw "sl_dlss_g.h not found in streamline-sdk-v2.14.16.zip" }
+            $sdkRoot = Split-Path (Split-Path $hdr.FullName -Parent) -Parent
+            Remove-Item -Recurse -Force "external/streamline" -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path "external/streamline/bin/x64" -Force | Out-Null
+            Copy-Item (Join-Path $sdkRoot "include") -Destination "external/streamline/include" -Recurse -Force
+            Copy-Item (Join-Path $sdkRoot "bin/x64/*.dll") -Destination "external/streamline/bin/x64/" -Force
+            if (Test-Path (Join-Path $sdkRoot "license.txt")) {
+              Copy-Item (Join-Path $sdkRoot "license.txt") -Destination "external/streamline/" -Force
+            }
+            Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
           } else {
             Write-Host "NVIDIA Streamline SDK found in cache."
           }

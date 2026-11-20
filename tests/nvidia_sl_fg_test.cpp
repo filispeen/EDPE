@@ -92,6 +92,10 @@ int runUnitChecks() {
 int main() {
     if (runUnitChecks() != 0) return 1;
 
+#if !defined(EDPE_ENABLE_STREAMLINE) || !EDPE_ENABLE_STREAMLINE
+    std::printf("nvidia_sl_fg_test: skipped Streamline checks (EDPE_ENABLE_STREAMLINE=0).\n");
+    return 0;
+#else
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_1;
@@ -278,4 +282,5 @@ int main() {
     window.destroy();
     std::printf("nvidia_sl_fg_test passed.\n");
     return 0;
+#endif
 }
