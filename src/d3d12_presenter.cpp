@@ -467,7 +467,13 @@ bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
         presentFlags &= ~DXGI_PRESENT_ALLOW_TEARING;
     }
 
+    if (prePresentMarkerCb_) {
+        prePresentMarkerCb_(presentMarkerUserCtx_);
+    }
     const HRESULT presentHr = swapChain_->Present(syncInterval, presentFlags);
+    if (postPresentMarkerCb_) {
+        postPresentMarkerCb_(presentMarkerUserCtx_);
+    }
     if (outPresentHr) *outPresentHr = presentHr;
     if (FAILED(presentHr)) {
         logPresenterFailure(L"IDXGISwapChain4::Present", presentHr);

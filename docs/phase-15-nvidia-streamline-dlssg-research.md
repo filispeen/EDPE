@@ -146,3 +146,20 @@ Inspecting `include/sl_reflex.h` & `include/sl_pcl.h`:
   * `Presented FPS` = `Rendered FPS × (1 + numFramesToGenerate)` (verified via `state.numFramesActuallyPresented`)
   * Never report Presented FPS as game Simulation FPS.
 * **Fail-Open Rule:** If `slInit`, signature check, `slIsFeatureSupported(kFeatureDLSS_G)`, or `proxySwapchain->Present` fails, set `DLSSGMode::eOff`, keep active SR (`DLSS`/`FSR`/`XeSS`) running, and present real frames cleanly via the native swapchain interface.
+
+---
+
+## 6. Prototype Implementation & Live Verification (2026-11-20)
+
+- **SDK:** `NVIDIA-RTX/Streamline` `v2.14.16` staged in gitignored `external/streamline/` (`include`, `docs`, shipping `bin/x64/{sl.interposer,sl.common,sl.dlss_g,sl.reflex,sl.pcl,nvngx_dlssg}.dll`).
+- **Source Files:**
+  - [nvidia_sl_fg_backend.h](../src/nvidia_sl_fg_backend.h) & [nvidia_sl_fg_backend.cpp](../src/nvidia_sl_fg_backend.cpp): `NvidiaStreamlineFgBackend` implementing `IFrameGenerationBackend` (`FrameGenerationBackend::NvidiaDlssG`) with dynamic `sl.interposer.dll` loading, `sl::security::verifyEmbeddedSignature`, `eUseManualHooking | eUseFrameBasedResourceTagging`, factory + queue `slUpgradeInterface` swapchain replacement, mandatory `sl.reflex` + `sl.pcl` frame-token synchronization, `computeFgCameraMatrices` -> `sl::Constants` (`mvecScale = {motionScaleX / renderWidth, motionScaleY / renderHeight}`), mutually-exclusive `kBufferTypeHUDLessColor` + `kBufferTypeUIColorAndAlpha` tagging, `DLSSGStatus` decoding, and `recreatePlainSwapChain()` fail-open teardown.
+  - [d3d12_presenter.h](../src/d3d12_presenter.h) & [d3d12_presenter.cpp](../src/d3d12_presenter.cpp): added `swapChainFlags()` accessor and `setPresentMarkerHooks()` (`ePresentStart` / `ePresentEnd` + `slDLSSGGetState` directly bracketing `IDXGISwapChain4::Present`).
+  - [nvidia_sl_fg_test.cpp](../tests/nvidia_sl_fg_test.cpp): CTest target `nvidia_sl_fg` exercising unit/ABI checks, live `probeCapabilities()`, and hardware `D3D12ProxyPresenter` + `FrameGenerationManager` integration.
+- **Measured Verification on `NVIDIA GeForce RTX 3060` (`DeviceId=0x2504`, Windows 11, Release x64):**
+  - `sl::security::verifyEmbeddedSignature`: **PASSED** on `sl.interposer.dll`, `sl.common.dll`, `sl.dlss_g.dll`, `sl.pcl.dll`, `sl.reflex.dll`.
+  - `slInit` + `slSetD3DDevice`: **PASSED** (`slVersion = 2.14.16`).
+  - `slIsFeatureSupported(kFeatureReflex)`: **`eOk`** (`rc=0`, `ver=2.14.16`); `slIsFeatureSupported(kFeaturePCL)`: **`eOk`**.
+  - `slIsFeatureSupported(kFeatureDLSS_G)`: **`eErrorNoSupportedAdapterFound`** (`rc=6`, expected capability-driven rejection on Ampere RTX 3060; `maxGen=0`, `dynamicMfg=0`).
+  - `FrameGenerationManager::selectBackend(NvidiaDlssG)` failed open to `FrameGenerationBackend::Off` with descriptive `unavailableReason`, leaving the plain `D3D12ProxyPresenter` swapchain presenting frames at 2560×1440 without crash or frame drop.
+  - Full live `DLSS-G` frame-generation loop inside `nvidia_sl_fg_test` remains conditional on an Ada RTX 40+ / Blackwell RTX 50+ adapter where `probeCapabilities()` reports `dlssgSupported=true`.

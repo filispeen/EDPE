@@ -131,6 +131,7 @@ public:
     uint32_t height() const { return height_; }
     DXGI_FORMAT format() const { return format_; }
     uint32_t bufferCount() const { return bufferCount_; }
+    UINT swapChainFlags() const { return swapChainFlags_; }
     HWND targetHwnd() const { return targetHwnd_; }
 
     D3D11D3D12Bridge& bridge() { return bridge_; }
@@ -156,6 +157,17 @@ public:
     void setPrePresentCallback(PrePresentCmdCallback cb, void* userCtx) {
         prePresentCb_ = cb;
         prePresentUserCtx_ = userCtx;
+    }
+
+    // Optional hooks directly around IDXGISwapChain::Present (used by Streamline
+    // slPCLSetMarker(ePresentStart/ePresentEnd) + slDLSSGGetState telemetry).
+    using PresentMarkerCallback = void (*)(void* userCtx);
+    void setPresentMarkerHooks(PresentMarkerCallback prePresent,
+                               PresentMarkerCallback postPresent,
+                               void* userCtx) {
+        prePresentMarkerCb_ = prePresent;
+        postPresentMarkerCb_ = postPresent;
+        presentMarkerUserCtx_ = userCtx;
     }
 
 private:
@@ -186,6 +198,9 @@ private:
     std::array<bool, D3D11D3D12Bridge::kAllocatorCount> slotHasTimestamp_{};
     PrePresentCmdCallback prePresentCb_ = nullptr;
     void* prePresentUserCtx_ = nullptr;
+    PresentMarkerCallback prePresentMarkerCb_ = nullptr;
+    PresentMarkerCallback postPresentMarkerCb_ = nullptr;
+    void* presentMarkerUserCtx_ = nullptr;
 };
 
 } // namespace edpe

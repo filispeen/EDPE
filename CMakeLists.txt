@@ -54,6 +54,13 @@ else()
     set(EDPE_HAVE_FFX_FG FALSE)
 endif()
 
+set(STREAMLINE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/streamline")
+if(EXISTS "${STREAMLINE_SDK_DIR}/include/sl_dlss_g.h")
+    set(EDPE_HAVE_STREAMLINE TRUE)
+else()
+    set(EDPE_HAVE_STREAMLINE FALSE)
+endif()
+
 add_library(EDPE_DXGI SHARED
     src/dllmain.cpp
     src/crash_logger.cpp
@@ -85,6 +92,7 @@ add_library(EDPE_DXGI SHARED
     src/fg_backend.cpp
     src/fg_ui_pack_pass.cpp
     src/amd_fsr_fg_backend.cpp
+    src/nvidia_sl_fg_backend.cpp
     src/version.cpp
     src/dxgi_proxy.def
 )
@@ -144,6 +152,26 @@ if(EDPE_HAVE_FFX_FG)
                 "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll" "$<TARGET_FILE_DIR:EDPE_DXGI>/"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_framegeneration_dx12.dll" "$<TARGET_FILE_DIR:EDPE_DXGI>/")
+    endif()
+endif()
+
+if(EDPE_HAVE_STREAMLINE)
+    target_include_directories(EDPE_DXGI PRIVATE "${STREAMLINE_SDK_DIR}/include")
+    target_compile_definitions(EDPE_DXGI PRIVATE EDPE_ENABLE_STREAMLINE=1)
+    if(EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/sl.interposer.dll")
+        foreach(_sl_dll
+                sl.interposer.dll
+                sl.common.dll
+                sl.dlss_g.dll
+                sl.reflex.dll
+                sl.pcl.dll
+                nvngx_dlssg.dll)
+            if(EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}")
+                add_custom_command(TARGET EDPE_DXGI POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}" "$<TARGET_FILE_DIR:EDPE_DXGI>/")
+            endif()
+        endforeach()
     endif()
 endif()
 
@@ -278,6 +306,32 @@ if(EDPE_HAVE_FFX_FG)
     endif()
 endif()
 add_test(NAME amd_fsr_fg COMMAND amd_fsr_fg_test)
+
+add_executable(nvidia_sl_fg_test tests/nvidia_sl_fg_test.cpp src/nvidia_sl_fg_backend.cpp src/fg_backend.cpp src/fg_ui_pack_pass.cpp src/d3d12_presenter.cpp src/d3d12_bridge.cpp src/renderdoc_support.cpp src/log.cpp)
+target_compile_features(nvidia_sl_fg_test PRIVATE cxx_std_20)
+target_compile_definitions(nvidia_sl_fg_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(nvidia_sl_fg_test PRIVATE src)
+target_link_libraries(nvidia_sl_fg_test PRIVATE d3d11 dxgi d3dcompiler)
+if(EDPE_HAVE_STREAMLINE)
+    target_include_directories(nvidia_sl_fg_test PRIVATE "${STREAMLINE_SDK_DIR}/include")
+    target_compile_definitions(nvidia_sl_fg_test PRIVATE EDPE_ENABLE_STREAMLINE=1)
+    if(EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/sl.interposer.dll")
+        foreach(_sl_dll
+                sl.interposer.dll
+                sl.common.dll
+                sl.dlss_g.dll
+                sl.reflex.dll
+                sl.pcl.dll
+                nvngx_dlssg.dll)
+            if(EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}")
+                add_custom_command(TARGET nvidia_sl_fg_test POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}" "$<TARGET_FILE_DIR:nvidia_sl_fg_test>/")
+            endif()
+        endforeach()
+    endif()
+endif()
+add_test(NAME nvidia_sl_fg COMMAND nvidia_sl_fg_test)
 
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)
