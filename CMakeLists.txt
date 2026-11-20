@@ -73,6 +73,7 @@ add_library(EDPE_DXGI SHARED
     src/jitter_view_recorder.cpp
     src/hud_debug_pass.cpp
     src/renderdoc_support.cpp
+    src/d3d12_bridge.cpp
     src/version.cpp
     src/dxgi_proxy.def
 )
@@ -211,6 +212,13 @@ target_compile_definitions(renderdoc_support_test PRIVATE WIN32_LEAN_AND_MEAN NO
 target_include_directories(renderdoc_support_test PRIVATE src)
 target_link_libraries(renderdoc_support_test PRIVATE d3d11 dxgi)
 add_test(NAME renderdoc_support COMMAND renderdoc_support_test)
+
+add_executable(d3d11_d3d12_bridge_test tests/d3d11_d3d12_bridge_test.cpp src/d3d12_bridge.cpp src/log.cpp)
+target_compile_features(d3d11_d3d12_bridge_test PRIVATE cxx_std_20)
+target_compile_definitions(d3d11_d3d12_bridge_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(d3d11_d3d12_bridge_test PRIVATE src)
+target_link_libraries(d3d11_d3d12_bridge_test PRIVATE d3d11 dxgi d3dcompiler)
+add_test(NAME d3d11_d3d12_bridge COMMAND d3d11_d3d12_bridge_test)
 
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)

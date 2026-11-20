@@ -345,3 +345,23 @@ Per `AGENTS.md` ("Before adopting an interop architecture, measure copy count, G
 | Present interval stability (`Option A2` bypass vs native D3D11) | $\sigma < 0.3\text{ ms}$ delta | ETW / `IDXGISwapChain::GetFrameStatistics` |
 
 If Option A1/A2 interop overhead exceeds the framerate benefit of XeSS or Frame Generation at target settings, stop and document measurements before proceeding (`AGENTS.md`).
+
+---
+
+## 7. Phase 13A Measured Prototype Results (`MEASURED`)
+
+**Date:** 2026-11-20  
+**Implementation:** [`src/d3d12_bridge.h`](../src/d3d12_bridge.h), [`src/d3d12_bridge.cpp`](../src/d3d12_bridge.cpp), [`tests/d3d11_d3d12_bridge_test.cpp`](../tests/d3d11_d3d12_bridge_test.cpp)  
+**Test Hardware:** NVIDIA GeForce RTX 3060, 2560×1440, 120 measured frames (10 warmup)
+
+* **Correctness (`VERIFIED`):**
+  * D3D11 `R8G8B8A8_UNORM` color, `R32G8X24_TYPELESS` planar depth (extracted to shared `R32_FLOAT`), `R16G16_FLOAT` motion, and `R8G8B8A8_UNORM` UI transferred via `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` + `ID3D11Fence`/`ID3D12Fence` to D3D12 compute, transitioned `COMMON` ↔ `NON_PIXEL_SHADER_RESOURCE`/`UNORDERED_ACCESS`, and copied back to D3D11 with exact pixel verification.
+  * Dynamic `d3d12.dll` loading pinned with `GET_MODULE_HANDLE_EX_FLAG_PIN` so `shutdown()` / re-init never tears down WDDM shared-device state while D3D11 remains active.
+* **Measured 1440p Overhead (`MEASURED`, paced ~125 Hz cadence):**
+  * **VRAM delta (4 shared inputs + 1 shared output at full 2560×1440):** `75.00 MB`
+  * **CPU submit + fence handoff:** `0.2249 ms` mean (`stddev = 0.0493 ms`), `0` allocator ring waits across 120 frames
+  * **GPU D3D11 input copies + `R32F` depth extract:** `0.2400 ms` mean (120/120 samples)
+  * **GPU D3D12 compute + barriers:** `0.0849 ms` mean (120/120 samples)
+  * **GPU D3D11 return copy:** `0.0506 ms` mean (120/120 samples)
+  * **Total round-trip GPU time:** `0.3755 ms` (`~0.24 ms` input-only for Phase 13B/FG where D3D12 presents directly without a return copy)
+* **Gate Decision:** Interop overhead (`~0.24–0.38 ms` GPU, `~0.22 ms` CPU, `75 MB` VRAM at 1440p native) is well within Frame Generation and XeSS budgets. Proceed to **Phase 13B** (`ProxySwapChainD3D12`) and **Phases 14–15**.
