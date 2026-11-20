@@ -7880,6 +7880,11 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         !allow_fallback_recovery && !matches_staged && !promote_over_probe &&
                         (probe_vs_anchor || probe_vs_committed);
 
+                    const bool cb1HasLiveEyePos =
+                        edpe::hasMatchingEliteCb1CameraPosition(words, 5376 / sizeof(float), local_cam932);
+                    const bool allowPreSceneMainEye =
+                        in_main_scene || cb1HasLiveEyePos || matches_world_cb1;
+
                     bool stage_probe_in_scene = false;
                     if (is_probe) {
                         s_probe_seen_this_frame = true;
@@ -7906,11 +7911,11 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 s_probe_fallback_from_in_scene = in_main_scene;
                                 s_probe_fallback_parse_ok = parse_ok;
                             }
-                            if (in_main_scene) {
-                                // Provisionally stage and jitter the 4-MRT G-buffer camera even during
-                                // probe-offset frames so CB1 doesn't drop jitter while dot208 stays jittered;
-                                // a true non-probe in_scene pass still promotes over it via promote_over_probe,
-                                // and commitMainCamera holds continuous position via useProbePositionHold.
+                            if (allowPreSceneMainEye) {
+                                // Provisionally stage and jitter both pre-G-buffer Z-prepass and 4-MRT G-buffer
+                                // during probe-offset frames so Z-prepass and G-buffer (DepthFunc == EQUAL) keep
+                                // matching jitter phases; a true non-probe in_scene pass still promotes over it via
+                                // promote_over_probe, and commitMainCamera holds continuous position via useProbePositionHold.
                                 stage_probe_in_scene = true;
                             }
                         }
@@ -7954,8 +7959,6 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     //    Cobra unmaps VS cb1 before binding the 4-MRT G-buffer.
                     // 3) Same-pose scene sub-passes (e.g. viewmodel Z-prepass before main world G-buffer)
                     //    must never increment s_cut_rejection_streak or pose-check as cuts.
-                    const bool cb1HasLiveEyePos =
-                        edpe::hasMatchingEliteCb1CameraPosition(words, 5376 / sizeof(float), local_cam932);
                     bool cut_streak_satisfied = false;
                     if (!passes_filter && !is_probe && !is_same_pose_subpass_cand && !is_cb1_subpass &&
                         (in_main_scene || s_consecutive_fallback_frames >= 1 || cb1HasLiveEyePos) &&
@@ -8016,11 +8019,11 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 }
                                 if (edpe::isTransientOriginRebaseHoldEligible(
                                         parsed_camera, s_camera_now, jumpResidual,
-                                        s_teleport_rejection_streak, in_main_scene, cut_streak_satisfied)) {
+                                        s_teleport_rejection_streak, allowPreSceneMainEye, cut_streak_satisfied)) {
                                     is_teleport_hold_candidate = true;
                                 } else {
                                     const bool persistentInSceneTeleport =
-                                        in_main_scene && s_teleport_rejection_streak >= 5;
+                                        allowPreSceneMainEye && s_teleport_rejection_streak >= 5;
                                     if (!cut_streak_satisfied &&
                                         !persistentInSceneTeleport &&
                                         (s_teleport_rejection_streak < 2 || s_consecutive_fallback_frames < 1)) {
