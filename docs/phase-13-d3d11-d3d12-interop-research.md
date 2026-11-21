@@ -345,3 +345,13 @@ Per `AGENTS.md` ("Before adopting an interop architecture, measure copy count, G
 | Present interval stability (`Option A2` bypass vs native D3D11) | $\sigma < 0.3\text{ ms}$ delta | ETW / `IDXGISwapChain::GetFrameStatistics` |
 
 If Option A1/A2 interop overhead exceeds the framerate benefit of XeSS or Frame Generation at target settings, stop and document measurements before proceeding (`AGENTS.md`).
+
+---
+
+## 7. Linux / Proton (DXVK + vkd3d-proton) Interop Requirements
+
+When implementing the D3D11-to-D3D12 shared-resource bridge for future Frame Generation or D3D12 upscaler backends under Proton/Wine (DXVK for D3D11 + vkd3d-proton for D3D12), enforce the following verified constraints:
+
+1. **Shared Texture Creation Flags:** Create every cross-API bridge texture with both `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE` in `MiscFlags` and include `D3D11_BIND_RENDER_TARGET` in `BindFlags` (alongside `D3D11_BIND_SHADER_RESOURCE` and optional `D3D11_BIND_UNORDERED_ACCESS`).
+2. **Mandatory `IDXGIKeyedMutex::AcquireSync(0)` on D3D11 Accesses:** Always pair D3D11 reads/writes on shared textures with `AcquireSync(0, ...)` / `ReleaseSync(0)`. DXVK does not strictly enforce keyed-mutex acquisition on D3D11 copies, whereas native Windows 11 D3D11 silently drops copies and compute dispatches without it — testing on Proton alone can mask a Windows 11 failure.
+3. **Proton FSR 4 Discovery:** On AMD RDNA 4 / Proton builds that ship AMD's FSR 4 driver component, users must launch Elite Dangerous with `FSR4_UPGRADE=1 %command%` for Proton to expose FSR 4 upgrade discovery.
