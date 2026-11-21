@@ -35,14 +35,19 @@ VSOut vs_main(VSIn vin) {
 }
 
 float4 ps_main(VSOut pin) : SV_Target {
-    if (pin.curClip.w <= 1e-6 || pin.prevClip.w <= 1e-6) {
-        discard;
-    }
-    float2 curNdc  = pin.curClip.xy / pin.curClip.w;
-    float2 prevNdc = pin.prevClip.xy / pin.prevClip.w;
+    bool validW = (pin.curClip.w > 1e-6 && pin.prevClip.w > 1e-6);
+    float2 curNdc  = pin.curClip.xy / max(pin.curClip.w, 1e-6);
+    float2 prevNdc = pin.prevClip.xy / max(pin.prevClip.w, 1e-6);
 
     float2 curPx  = float2((curNdc.x  + 1.0) * 0.5 * viewport.x, (1.0 - curNdc.y)  * 0.5 * viewport.y);
     float2 prevPx = float2((prevNdc.x + 1.0) * 0.5 * viewport.x, (1.0 - prevNdc.y) * 0.5 * viewport.y);
+    // Reject mirrored left/right draw swaps (det < 0 or flipped X/Y axes) and extreme mesh distortion.
+    float2 dPrevX = ddx(prevPx);
+    float2 dPrevY = ddy(prevPx);
+    float det = dPrevX.x * dPrevY.y - dPrevX.y * dPrevY.x;
+    if (!validW || !isfinite(det) || det < 0.2 || det > 5.0 || dPrevX.x < 0.25 || dPrevY.y < 0.25) {
+        discard;
+    }
     float2 mv = prevPx - curPx;
     if (jitterDelta.z > 0.5) {
         mv += jitterDelta.xy;

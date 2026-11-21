@@ -25,6 +25,8 @@ struct WeaponDrawIdentity {
 
 inline constexpr uint32_t kWeaponSignatureMask = 0xFF00FFFFu;
 inline constexpr uint32_t kWeaponStencilBit = 0x10u;
+inline constexpr uint32_t kCockpitStencilBit = 0x80u;
+inline constexpr uint32_t kDynamicViewmodelStencilMask = kWeaponStencilBit | kCockpitStencilBit;
 inline constexpr float kDefaultWorldNearM = 0.025f;
 inline constexpr float kDefaultWeaponNearM = 0.0675f;
 inline constexpr uint32_t kWeaponSoPoolBytes = 24u * 1024u * 1024u; // 24 MiB bounded pool (16-32 MiB range)
@@ -97,13 +99,22 @@ public:
     // lazily cached D3D11_SO_NO_RASTERIZED_STREAM Geometry Shader (leaves G-buffer untouched).
     using DrawIndexedInstancedFn = void(STDMETHODCALLTYPE*)(
         ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
+    using DrawIndexedFn = void(STDMETHODCALLTYPE*)(
+        ID3D11DeviceContext*, UINT, UINT, INT);
     bool captureDrawIndexedInstanced(ID3D11DeviceContext* context,
+                                     ID3D11Texture2D* expectedDepthTex,
                                      UINT indexCount,
                                      UINT instanceCount,
                                      UINT startIndex,
                                      INT baseVertex,
                                      UINT startInstance,
                                      DrawIndexedInstancedFn origDraw);
+    bool captureDrawIndexed(ID3D11DeviceContext* context,
+                            ID3D11Texture2D* expectedDepthTex,
+                            UINT indexCount,
+                            UINT startIndex,
+                            INT baseVertex,
+                            DrawIndexedFn origDraw);
 
     // Rasterize all matched current/previous draws into WeaponMotion (R16G16B16A16_FLOAT).
     bool resolve(ID3D11DeviceContext* context,

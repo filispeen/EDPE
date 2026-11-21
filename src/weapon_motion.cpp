@@ -245,8 +245,35 @@ ID3D11GeometryShader* WeaponMotionTracker::getOrCreateStreamOutGs(
     return soGs.Get();
 }
 
+static bool isExpectedSceneDepthBound(ID3D11DeviceContext* context, ID3D11Texture2D* expectedDepthTex) {
+    if (!expectedDepthTex) return false;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> dsv;
+    context->OMGetRenderTargets(0, nullptr, &dsv);
+    if (!dsv) return false;
+    Microsoft::WRL::ComPtr<ID3D11Resource> res;
+    dsv->GetResource(&res);
+    return res.Get() == static_cast<ID3D11Resource*>(expectedDepthTex);
+}
+
+static uint32_t hashBufferIdentity(ID3D11DeviceContext* context, uint64_t vsHash) {
+    Microsoft::WRL::ComPtr<ID3D11Buffer> ib;
+    DXGI_FORMAT ibFmt = DXGI_FORMAT_UNKNOWN;
+    UINT ibOff = 0;
+    context->IAGetIndexBuffer(&ib, &ibFmt, &ibOff);
+    Microsoft::WRL::ComPtr<ID3D11Buffer> vb0;
+    UINT vbStride = 0, vbOff = 0;
+    context->IAGetVertexBuffers(0, 1, &vb0, &vbStride, &vbOff);
+    uint64_t h = vsHash;
+    h ^= reinterpret_cast<uintptr_t>(ib.Get()) * 11400714819323198485ull;
+    h ^= (static_cast<uint64_t>(ibOff) << 17);
+    h ^= reinterpret_cast<uintptr_t>(vb0.Get()) * 14029467366897019727ull;
+    h ^= (static_cast<uint64_t>(vbOff) << 7) ^ (static_cast<uint64_t>(vbStride) << 29);
+    return static_cast<uint32_t>(h ^ (h >> 32)) & kWeaponSignatureMask;
+}
+
 bool WeaponMotionTracker::captureDrawIndexedInstanced(
     ID3D11DeviceContext* context,
+    ID3D11Texture2D* expectedDepthTex,
     UINT indexCount,
     UINT instanceCount,
     UINT startIndex,
@@ -255,14 +282,15 @@ bool WeaponMotionTracker::captureDrawIndexedInstanced(
     DrawIndexedInstancedFn origDraw) {
     if (!device_ || !context || !origDraw || !soBuffers_[curSlot_]) return false;
     if (instanceCount != 1u || indexCount < 3u || indexCount > 250000u) return false;
+    if (!isExpectedSceneDepthBound(context, expectedDepthTex)) return false;
 
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> ds;
     UINT stencilRef = 0;
     context->OMGetDepthStencilState(&ds, &stencilRef);
-    if (!ds || (stencilRef & kWeaponStencilBit) == 0u) return false;
+    if (!ds || (stencilRef & kDynamicViewmodelStencilMask) == 0u) return false;
     D3D11_DEPTH_STENCIL_DESC dsDesc{};
     ds->GetDesc(&dsDesc);
-    if (!dsDesc.StencilEnable || (dsDesc.StencilWriteMask & kWeaponStencilBit) == 0u) return false;
+    if (!dsDesc.StencilEnable || (dsDesc.StencilWriteMask & kDynamicViewmodelStencilMask) == 0u) return false;
 
     D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     context->IAGetPrimitiveTopology(&topo);
@@ -288,9 +316,17 @@ bool WeaponMotionTracker::captureDrawIndexedInstanced(
 
     WeaponDrawIdentity id{};
     id.indexCount = indexCount;
-    id.instanceCount = instanceCount;
     id.boneBase = (startIndex & 0xFFFFu) | ((static_cast<uint32_t>(baseVertex) & 0xFFFFu) << 16);
-    id.signature = static_cast<uint32_t>(vsHash ^ (vsHash >> 32)) & kWeaponSignatureMask;
+    id.signature = hashBufferIdentity(context, vsHash);
+    uint32_t ordinal = 1u;
+    for (const auto& prevCap : draws_[curSlot_]) {
+        if (prevCap.identity.boneBase == id.boneBase &&
+            prevCap.identity.signature == id.signature &&
+            prevCap.identity.indexCount == id.indexCount) {
+            ++ordinal;
+        }
+    }
+    id.instanceCount = ordinal;
 
     uint32_t byteOffset = 0;
     if (!recordCapturedDraw(id, indexCount, &byteOffset)) return false;
@@ -305,6 +341,83 @@ bool WeaponMotionTracker::captureDrawIndexedInstanced(
     context->SOSetTargets(1u, &soBuf, &soOff);
 
     origDraw(context, indexCount, 1u, startIndex, baseVertex, startInstance);
+
+    ID3D11Buffer* nullSo = nullptr;
+    UINT zeroOff = 0;
+    context->SOSetTargets(1u, &nullSo, &zeroOff);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->PSSetShader(origPs.Get(), nullptr, 0);
+    return true;
+}
+
+bool WeaponMotionTracker::captureDrawIndexed(
+    ID3D11DeviceContext* context,
+    ID3D11Texture2D* expectedDepthTex,
+    UINT indexCount,
+    UINT startIndex,
+    INT baseVertex,
+    DrawIndexedFn origDraw) {
+    if (!device_ || !context || !origDraw || !soBuffers_[curSlot_]) return false;
+    if (indexCount < 3u || indexCount > 250000u) return false;
+    if (!isExpectedSceneDepthBound(context, expectedDepthTex)) return false;
+
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> ds;
+    UINT stencilRef = 0;
+    context->OMGetDepthStencilState(&ds, &stencilRef);
+    if (!ds || (stencilRef & kDynamicViewmodelStencilMask) == 0u) return false;
+    D3D11_DEPTH_STENCIL_DESC dsDesc{};
+    ds->GetDesc(&dsDesc);
+    if (!dsDesc.StencilEnable || (dsDesc.StencilWriteMask & kDynamicViewmodelStencilMask) == 0u) return false;
+
+    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    context->IAGetPrimitiveTopology(&topo);
+    if (topo != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) return false;
+
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> origGs;
+    context->GSGetShader(&origGs, nullptr, nullptr);
+    if (origGs) return false;
+
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
+    context->VSGetShader(&vs, nullptr, nullptr);
+    if (!vs) return false;
+
+    uint64_t vsHash = 0;
+    UINT hashSize = sizeof(vsHash);
+    if (FAILED(vs->GetPrivateData(kEdpeShaderHashGuid, &hashSize, &vsHash)) ||
+        hashSize != sizeof(vsHash)) {
+        return false;
+    }
+
+    ID3D11GeometryShader* soGs = getOrCreateStreamOutGs(vs.Get(), vsHash);
+    if (!soGs) return false;
+
+    WeaponDrawIdentity id{};
+    id.indexCount = indexCount;
+    id.boneBase = (startIndex & 0xFFFFu) | ((static_cast<uint32_t>(baseVertex) & 0xFFFFu) << 16);
+    id.signature = hashBufferIdentity(context, vsHash);
+    uint32_t ordinal = 1u;
+    for (const auto& prevCap : draws_[curSlot_]) {
+        if (prevCap.identity.boneBase == id.boneBase &&
+            prevCap.identity.signature == id.signature &&
+            prevCap.identity.indexCount == id.indexCount) {
+            ++ordinal;
+        }
+    }
+    id.instanceCount = ordinal;
+
+    uint32_t byteOffset = 0;
+    if (!recordCapturedDraw(id, indexCount, &byteOffset)) return false;
+
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> origPs;
+    context->PSGetShader(&origPs, nullptr, nullptr);
+
+    ID3D11Buffer* soBuf = soBuffers_[curSlot_].Get();
+    UINT soOff = byteOffset;
+    context->PSSetShader(nullptr, nullptr, 0);
+    context->GSSetShader(soGs, nullptr, 0);
+    context->SOSetTargets(1u, &soBuf, &soOff);
+
+    origDraw(context, indexCount, startIndex, baseVertex);
 
     ID3D11Buffer* nullSo = nullptr;
     UINT zeroOff = 0;
@@ -361,10 +474,14 @@ bool WeaponMotionTracker::resolve(ID3D11DeviceContext* context,
     ID3D11Buffer* vbs[2] = {soBuffers_[curSlot_].Get(), soBuffers_[curSlot_ ^ 1u].Get()};
     const UINT strides[2] = {16u, 16u};
 
+    std::vector<uint8_t> usedPrev(prevDraws.size(), 0u);
     for (const auto& cur : curDraws) {
-        for (const auto& prev : prevDraws) {
+        for (size_t j = 0; j < prevDraws.size(); ++j) {
+            if (usedPrev[j]) continue;
+            const auto& prev = prevDraws[j];
             if (sameWeaponIdentity(cur.identity, prev.identity) &&
                 cur.vertexCount == prev.vertexCount) {
+                usedPrev[j] = 1u;
                 const UINT offsets[2] = {cur.vertexOffsetBytes, prev.vertexOffsetBytes};
                 context->IASetVertexBuffers(0, 2, vbs, strides, offsets);
                 context->Draw(cur.vertexCount, 0);

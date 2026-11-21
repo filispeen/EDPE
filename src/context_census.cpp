@@ -6181,9 +6181,17 @@ static inline bool shouldInspectHudOrTonemapDraw(UINT count, UINT instances) {
     return false;
 }
 
+static void tryCaptureDynamicViewmodelDrawIndexed(ID3D11DeviceContext* context,
+    UINT index_count, UINT start_index, INT base_vertex, DrawIndexedFn forward);
+
 void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT count,
     UINT start, INT base) {
     const bool immediate = isObservedImmediateContext(context);
+    if (immediate) {
+        if (const auto forward = resolveOriginalDrawIndexed(context)) {
+            tryCaptureDynamicViewmodelDrawIndexed(context, count, start, base, forward);
+        }
+    }
     if (!immediate || !isHudDrawInterceptWindowActive()) {
         if (const auto forward = resolveOriginalDrawIndexed(context)) forward(context, count, start, base);
         return;
@@ -6264,17 +6272,7 @@ static edpe::WeaponMotionTracker s_weapon_motion;
 static unsigned long long s_weapon_motion_frame = ~0ull;
 static bool s_weapon_motion_logged_active = false;
 
-static void tryCaptureOnFootWeaponDraw(ID3D11DeviceContext* context,
-    UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
-    UINT start_instance, DrawIndexedInstancedFn forward) {
-    if (!context || !forward || g_is_evaluating_upscaler.load(std::memory_order_relaxed)) return;
-    if (s_upscale_evaluated_this_frame || instance_count != 1u || index_count < 3u || index_count > 250000u) return;
-    if (!edpe::cobra_camera::MapFocusPoller::isOnFootActive()) return;
-    if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
-        !edpe::FgRuntime::instance().isMotionNeeded()) return;
-
-    const auto cur = last_present_frame.load(std::memory_order_relaxed);
-    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+static void beginWeaponMotionFrameIfNeeded(ID3D11DeviceContext* context, unsigned long long cur) {
     if (!s_weapon_motion.isInitialized()) {
         Microsoft::WRL::ComPtr<ID3D11Device> dev;
         context->GetDevice(&dev);
@@ -6292,8 +6290,39 @@ static void tryCaptureOnFootWeaponDraw(ID3D11DeviceContext* context,
         s_weapon_motion.beginFrame(context, w, h, nearM, nearM);
         s_weapon_motion_frame = cur;
     }
+}
+
+static void tryCaptureDynamicViewmodelDrawInstanced(ID3D11DeviceContext* context,
+    UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
+    UINT start_instance, DrawIndexedInstancedFn forward) {
+    if (!context || !forward || g_is_evaluating_upscaler.load(std::memory_order_relaxed)) return;
+    if (s_upscale_evaluated_this_frame || instance_count != 1u || index_count < 3u || index_count > 250000u) return;
+    if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
+        !edpe::FgRuntime::instance().isMotionNeeded()) return;
+
+    const auto cur = last_present_frame.load(std::memory_order_relaxed);
+    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+    beginWeaponMotionFrameIfNeeded(context, cur);
+    if (scene_depth_source) {
     s_weapon_motion.captureDrawIndexedInstanced(
-        context, index_count, instance_count, start_index, base_vertex, start_instance, forward);
+            context, scene_depth_source.Get(), index_count, instance_count,
+            start_index, base_vertex, start_instance, forward);
+    }
+}
+
+static void tryCaptureDynamicViewmodelDrawIndexed(ID3D11DeviceContext* context,
+    UINT index_count, UINT start_index, INT base_vertex, DrawIndexedFn forward) {
+    if (!context || !forward || g_is_evaluating_upscaler.load(std::memory_order_relaxed)) return;
+    if (s_upscale_evaluated_this_frame || index_count < 3u || index_count > 250000u) return;
+    if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
+        !edpe::FgRuntime::instance().isMotionNeeded()) return;
+    const auto cur = last_present_frame.load(std::memory_order_relaxed);
+    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+    beginWeaponMotionFrameIfNeeded(context, cur);
+    if (scene_depth_source) {
+        s_weapon_motion.captureDrawIndexed(
+            context, scene_depth_source.Get(), index_count, start_index, base_vertex, forward);
+    }
 }
 
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
@@ -6302,7 +6331,7 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
     const bool immediate = isObservedImmediateContext(context);
     if (immediate) {
         if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
-            tryCaptureOnFootWeaponDraw(context, index_count, instance_count,
+            tryCaptureDynamicViewmodelDrawInstanced(context, index_count, instance_count,
                 start_index, base_vertex, start_instance, forward);
         }
     }
@@ -11008,7 +11037,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 // Render motion vectors at render resolution using current and previous camera projections and jitter phases
                 const bool clampCockpit = !edpe::cobra_camera::MapFocusPoller::isOnFootActive();
                 ID3D11ShaderResourceView* weaponMotionSrv = nullptr;
-                if (!clampCockpit && !eval_reset &&
+                if (!eval_reset &&
                     s_weapon_motion.isInitialized() &&
                     s_weapon_motion_frame == rendered &&
                     s_weapon_motion.capturedDrawCount() > 0u) {

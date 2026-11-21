@@ -97,14 +97,77 @@ bool prevDepthMatches(float2 prevRasterPx, float expectedDepth, int2 maxCoord, o
     return false;
 }
 
-bool tryWeaponOverride(int2 pixCoord, bool isReset, out MotionResult outRes) {
+bool sampleCockpitNeighborMotion(int2 pixCoord, int2 maxCoord, out float2 outMv) {
+    outMv = float2(0.0, 0.0);
+    static const int kRadii[5] = {8, 24, 64, 140, 260};
+    static const int2 kDirs[8] = {
+        int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1),
+        int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1)
+    };
+    [loop]
+    for (int ri = 0; ri < 5; ++ri) {
+        int r = kRadii[ri];
+        float2 sum = float2(0.0, 0.0);
+        int count = 0;
+        [unroll]
+        for (int di = 0; di < 8; ++di) {
+            int2 sc = clamp(pixCoord + kDirs[di] * r, int2(0, 0), maxCoord);
+            uint st = sceneStencil.Load(int3(sc, 0)).g;
+            if ((st & kCockpitStencilBit) == 0u) continue;
+            float4 nwm = weaponMotion.Load(int3(sc, 0));
+            if (nwm.w > 0.5 && all(isfinite(nwm.xy)) && dot(nwm.xy, nwm.xy) <= 90000.0) {
+                sum += nwm.xy;
+                ++count;
+            }
+        }
+        if (count > 0) {
+            outMv = sum / float(count);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool tryWeaponOverride(int2 pixCoord, bool isReset, bool clampCockpit, out MotionResult outRes) {
     outRes.mv = float2(0.0, 0.0);
     outRes.canonicalDepth = 0.0;
     outRes.pixelClass = kClassWeapon;
     uint stencil = sceneStencil.Load(int3(pixCoord, 0)).g;
-    if ((stencil & kWeaponStencilBit) == 0u) return false;
+    if ((stencil & (kWeaponStencilBit | kCockpitStencilBit)) == 0u) return false;
     float4 wm = weaponMotion.Load(int3(pixCoord, 0));
     if (wm.w <= 0.5 || !all(isfinite(wm.xyz))) return false;
+    if (clampCockpit && (stencil & kCockpitStencilBit) != 0u) {
+        float mv2 = dot(wm.xy, wm.xy);
+        // Reject impossible single-frame jumps (>300 px) from swapped symmetric ship draws.
+        if (mv2 > 90000.0) return false;
+        // For cockpit MVs > 6 px, verify consistency against nearby hull pixels.
+        // Fast path: if any +-24px cockpit neighbor agrees within 25 px, accept immediately.
+        // Slow path (isolated specks/slivers): compare against nearest cockpit hull.
+        if (mv2 > 36.0) {
+            int2 maxCoord = int2(info.y - 1.0, info.z - 1.0);
+            static const int2 kProbe[4] = {int2(24, 0), int2(-24, 0), int2(0, 24), int2(0, -24)};
+            bool localAgreed = false;
+            [unroll]
+            for (int i = 0; i < 4; ++i) {
+                int2 sc = clamp(pixCoord + kProbe[i], int2(0, 0), maxCoord);
+                if ((sceneStencil.Load(int3(sc, 0)).g & kCockpitStencilBit) == 0u) continue;
+                float4 nwm = weaponMotion.Load(int3(sc, 0));
+                if (nwm.w > 0.5 && all(isfinite(nwm.xy)) && dot(nwm.xy, nwm.xy) <= 90000.0) {
+                    if (length(wm.xy - nwm.xy) <= 25.0) {
+                        localAgreed = true;
+                        break;
+                    }
+                }
+            }
+            if (!localAgreed) {
+                float2 nAvg = float2(0.0, 0.0);
+                if (sampleCockpitNeighborMotion(pixCoord, maxCoord, nAvg) &&
+                    length(wm.xy - nAvg) > 25.0) {
+                    return false;
+                }
+            }
+        }
+    }
     outRes.mv = wm.xy;
     outRes.canonicalDepth = wm.z;
     outRes.pixelClass = isReset ? kClassReset : kClassWeapon;
@@ -141,9 +204,9 @@ bool tryCelestialOverride(float2 rawPixel, float depth, float3 view,
 }
 
 )" R"(
-MotionResult classifyAndFinishWorld(float2 pixelCenter, float2 rawPixel,
+MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 rawPixel,
     float2 priorPixel, float depth, float expectedPriorDepth, float z,
-    bool hasPrevDepth, bool isReset, bool clampCockpit) {
+    bool hasPrevDepth, bool isReset, bool clampCockpit, bool hasWeapon) {
     MotionResult res;
     res.canonicalDepth = depth;
     float2 worldMv = priorPixel - rawPixel;
@@ -163,43 +226,98 @@ MotionResult classifyAndFinishWorld(float2 pixelCenter, float2 rawPixel,
     // - On exterior ship hull / nose (1.5m <= z < 150m), clamp when world reprojection fails
     //   or when static depth matches strictly tighter than world reprojection.
     bool canClampDistance = (z < 10.0) || (z < 150.0 && !priorOffscreen);
-    if (clampCockpit && canClampDistance && hasPrevDepth && dot(worldMv, worldMv) > 0.0625) {
-        float staticErr = 1e30;
-        bool staticMatches = prevDepthMatches(rawPixel + jitterInfo.zw, depth, maxCoord, staticErr);
-        if (!staticMatches) {
-            int2 sc = clamp(int2(floor(rawPixel + jitterInfo.zw)), 0, maxCoord);
-            float staticTol = max(1e-5, 0.04 * depth);
-            [unroll]
-            for (int oy = -1; oy <= 1; ++oy) {
-                [unroll]
-                for (int ox = -1; ox <= 1; ++ox) {
-                    float pd = prevSceneDepth.Load(int3(clamp(sc + int2(ox, oy), 0, maxCoord), 0));
-                    if (pd > 0.0 && pd <= 1.0 && isfinite(pd)) {
-                        staticErr = min(staticErr, abs(pd - depth));
+    if (clampCockpit && canClampDistance && hasPrevDepth) {
+        // Un-stenciled exterior ship hull/wings/nacelles (e.g. Imperial Courier wings & nacelles):
+        // validate against prevSceneDepth using the nearest captured cockpit WeaponMotion MV.
+        // During Headlook + flight, worldMatches fails and staticMatches fails on thin nacelle edges,
+        // whereas rawPixel + shipMv lands directly on the same hull depth in the previous frame.
+        if (hasWeapon && (!worldMatches || z < 1.5 || worldErr > 1e-4 * depth)) {
+            float2 shipMv = float2(0.0, 0.0);
+            if (sampleCockpitNeighborMotion(pixCoord, maxCoord, shipMv)) {
+                float2 shipPrevPx = rawPixel + shipMv + jitterInfo.zw;
+                if (shipPrevPx.x >= 0.0 && shipPrevPx.x < info.y &&
+                    shipPrevPx.y >= 0.0 && shipPrevPx.y < info.z) {
+                    float shipErr = 1e30;
+                    bool shipMatches = prevDepthMatches(shipPrevPx, depth, maxCoord, shipErr);
+                    if (!shipMatches) {
+                        int2 scShip = clamp(int2(floor(shipPrevPx)), 0, maxCoord);
+                        float shipTol = max(1e-5, 0.06 * depth);
+                        [unroll]
+                        for (int oy = -2; oy <= 2; ++oy) {
+                            [unroll]
+                            for (int ox = -2; ox <= 2; ++ox) {
+                                float pd = prevSceneDepth.Load(int3(clamp(scShip + int2(ox, oy), 0, maxCoord), 0));
+                                if (pd > 0.0 && pd <= 1.0 && isfinite(pd)) {
+                                    shipErr = min(shipErr, abs(pd - depth));
+                                }
+                            }
+                        }
+                        if (shipErr > shipTol) {
+                            static const int2 kOuter[24] = {
+                                int2(3, 0), int2(-3, 0), int2(0, 3), int2(0, -3),
+                                int2(4, 0), int2(-4, 0), int2(0, 4), int2(0, -4),
+                                int2(5, 0), int2(-5, 0), int2(0, 5), int2(0, -5),
+                                int2(6, 0), int2(-6, 0), int2(0, 6), int2(0, -6),
+                                int2(3, 3), int2(-3, 3), int2(3, -3), int2(-3, -3),
+                                int2(5, 5), int2(-5, 5), int2(5, -5), int2(-5, -5)
+                            };
+                            [unroll]
+                            for (int oi = 0; oi < 24; ++oi) {
+                                float pd = prevSceneDepth.Load(int3(clamp(scShip + kOuter[oi], int2(0, 0), maxCoord), 0));
+                                if (pd > 0.0 && pd <= 1.0 && isfinite(pd)) {
+                                    shipErr = min(shipErr, abs(pd - depth));
+                                }
+                            }
+                        }
+                        shipMatches = (shipErr <= shipTol);
+                    }
+                    bool preferShip = !worldMatches || (z < 1.5) || (shipErr + 1e-5 * depth < worldErr * 0.5);
+                    if (shipMatches && preferShip) {
+                        res.mv = shipMv;
+                        res.pixelClass = isReset ? kClassReset : kClassWeapon;
+                        return res;
                     }
                 }
             }
-            // Inside close cockpit (z < 1.5m), also check +-2px cardinal neighbors to survive
-            // 1-2px cockpit jolt / head-sway at elevator start/stop without leaking world MVs.
-            if (z < 1.5 && staticErr > staticTol) {
-                float dL = prevSceneDepth.Load(int3(clamp(sc + int2(-2, 0), 0, maxCoord), 0));
-                float dR = prevSceneDepth.Load(int3(clamp(sc + int2(2, 0), 0, maxCoord), 0));
-                float dU = prevSceneDepth.Load(int3(clamp(sc + int2(0, -2), 0, maxCoord), 0));
-                float dD = prevSceneDepth.Load(int3(clamp(sc + int2(0, 2), 0, maxCoord), 0));
-                if (dL > 0.0 && dL <= 1.0 && isfinite(dL)) staticErr = min(staticErr, abs(dL - depth));
-                if (dR > 0.0 && dR <= 1.0 && isfinite(dR)) staticErr = min(staticErr, abs(dR - depth));
-                if (dU > 0.0 && dU <= 1.0 && isfinite(dU)) staticErr = min(staticErr, abs(dU - depth));
-                if (dD > 0.0 && dD <= 1.0 && isfinite(dD)) staticErr = min(staticErr, abs(dD - depth));
-            }
-            staticMatches = (staticErr <= staticTol);
         }
-        // Use depth-relative tie-breaker so exterior ship nose/hull (depth ~ 0.002-0.01) is not
-        // penalized by a fixed 1e-6 offset while flat world planes (worldErr == 0) stay World.
-        bool preferStatic = !worldMatches || (z < 1.5) || (staticErr + 1e-5 * depth < worldErr * 0.5);
-        if (staticMatches && preferStatic) {
-            res.mv = float2(0.0, 0.0);
-            res.pixelClass = isReset ? kClassReset : kClassCockpitStatic;
-            return res;
+        if (dot(worldMv, worldMv) > 0.0625) {
+            float staticErr = 1e30;
+            bool staticMatches = prevDepthMatches(rawPixel + jitterInfo.zw, depth, maxCoord, staticErr);
+            if (!staticMatches) {
+                int2 sc = clamp(int2(floor(rawPixel + jitterInfo.zw)), 0, maxCoord);
+                float staticTol = max(1e-5, 0.04 * depth);
+                [unroll]
+                for (int oy = -1; oy <= 1; ++oy) {
+                    [unroll]
+                    for (int ox = -1; ox <= 1; ++ox) {
+                        float pd = prevSceneDepth.Load(int3(clamp(sc + int2(ox, oy), 0, maxCoord), 0));
+                        if (pd > 0.0 && pd <= 1.0 && isfinite(pd)) {
+                            staticErr = min(staticErr, abs(pd - depth));
+                        }
+                    }
+                }
+                // Inside close cockpit (z < 1.5m), also check +-2px cardinal neighbors to survive
+                // 1-2px cockpit jolt / head-sway at elevator start/stop without leaking world MVs.
+                if (z < 1.5 && staticErr > staticTol) {
+                    float dL = prevSceneDepth.Load(int3(clamp(sc + int2(-2, 0), 0, maxCoord), 0));
+                    float dR = prevSceneDepth.Load(int3(clamp(sc + int2(2, 0), 0, maxCoord), 0));
+                    float dU = prevSceneDepth.Load(int3(clamp(sc + int2(0, -2), 0, maxCoord), 0));
+                    float dD = prevSceneDepth.Load(int3(clamp(sc + int2(0, 2), 0, maxCoord), 0));
+                    if (dL > 0.0 && dL <= 1.0 && isfinite(dL)) staticErr = min(staticErr, abs(dL - depth));
+                    if (dR > 0.0 && dR <= 1.0 && isfinite(dR)) staticErr = min(staticErr, abs(dR - depth));
+                    if (dU > 0.0 && dU <= 1.0 && isfinite(dU)) staticErr = min(staticErr, abs(dU - depth));
+                    if (dD > 0.0 && dD <= 1.0 && isfinite(dD)) staticErr = min(staticErr, abs(dD - depth));
+                }
+                staticMatches = (staticErr <= staticTol);
+            }
+            // Use depth-relative tie-breaker so exterior ship nose/hull (depth ~ 0.002-0.01) is not
+            // penalized by a fixed 1e-6 offset while flat world planes (worldErr == 0) stay World.
+            bool preferStatic = !worldMatches || (z < 1.5) || (staticErr + 1e-5 * depth < worldErr * 0.5);
+            if (staticMatches && preferStatic) {
+                res.mv = float2(0.0, 0.0);
+                res.pixelClass = isReset ? kClassReset : kClassCockpitStatic;
+                return res;
+            }
         }
     }
 
@@ -236,7 +354,7 @@ MotionResult reproject(float2 pixelCenter, int2 pixCoord,
 
     if (hasWeapon) {
         MotionResult wmRes;
-        if (tryWeaponOverride(pixCoord, isReset, wmRes)) return wmRes;
+        if (tryWeaponOverride(pixCoord, isReset, clampCockpit, wmRes)) return wmRes;
     }
 
     float2 rawPixel = pixelCenter - jitterInfo.xy;
@@ -288,10 +406,11 @@ MotionResult reproject(float2 pixelCenter, int2 pixCoord,
     float2 priorPixel = float2((priorNdc.x + 1.0) * info.y * 0.5,
                                (1.0 - priorNdc.y) * info.z * 0.5);
     float expectedPriorDepth = depthB / prior.z;
-    return classifyAndFinishWorld(pixelCenter, rawPixel, priorPixel,
-        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit);
+    return classifyAndFinishWorld(pixCoord, pixelCenter, rawPixel, priorPixel,
+        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit, hasWeapon);
 }
 
+)" R"(
 MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
     float4 rel0, float4 rel1, float4 rel2,
     float celestialDepthThresh, uint celestialCount,
@@ -314,19 +433,27 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
     // 0. First-person weapon / viewmodel override (stencil 0x10 + valid WeaponMotion):
     if (hasWeapon) {
         MotionResult wmRes;
-        if (tryWeaponOverride(pixCoord, isReset, wmRes)) return wmRes;
+        if (tryWeaponOverride(pixCoord, isReset, clampCockpit, wmRes)) return wmRes;
     }
 
     // 0b. Exact Cobra Engine stencil masks:
     //   - In ship/SRV (clampCockpit): bit 0x80 covers cockpit, canopy, dashboard, wings, hull.
-    //   - On foot (!clampCockpit, no WeaponMotion): bit 0x10/0x80 covers held weapon/arms so
-    //     they do not inherit full world camera rotation/translation MVs.
+    //     During normal flight/elevator, static depth matches at rawPixel -> mv = (0, 0).
+    //     During Headlook (free look inside cockpit), the cockpit rotates across the screen
+    //     with zero ship-relative translation -> pure-rotation reprojection (rotMv) matches
+    //     prevSceneDepth cleanly even while the ship is flying at high speed.
+    //     During external Camera Suite translation, falls back to worldMv if worldMatches.
+    //   - On foot (!clampCockpit): bit 0x10/0x80 or zView < 0.60m fallback when WeaponMotion
+    //     did not cover the pixel.
     if (hasSceneStencil && depth > 0.0 && depth <= 1.0) {
         uint st = sceneStencil.Load(int3(pixCoord, 0)).g;
         if (clampCockpit && (st & kCockpitStencilBit) != 0u) {
-            res.mv = float2(0.0, 0.0);
+            float2 fillMv = float2(0.0, 0.0);
+            int2 maxCoord = int2(info.y - 1.0, info.z - 1.0);
+            bool filled = hasWeapon && sampleCockpitNeighborMotion(pixCoord, maxCoord, fillMv);
+            res.mv = fillMv;
             res.canonicalDepth = depth;
-            res.pixelClass = isReset ? kClassReset : kClassCockpitStatic;
+            res.pixelClass = isReset ? kClassReset : (filled ? kClassWeapon : kClassCockpitStatic);
             return res;
         }
         if (!clampCockpit) {
@@ -386,8 +513,8 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
     }
     float2 priorPixel = prior.xy * rcp(prior.z) * prevProjHalf.xy + prevProjHalf.zw;
     float expectedPriorDepth = depthB / prior.z;
-    return classifyAndFinishWorld(pixelCenter, rawPixel, priorPixel,
-        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit);
+    return classifyAndFinishWorld(pixCoord, pixelCenter, rawPixel, priorPixel,
+        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit, hasWeapon);
 }
 
 void writeOutputs(int2 pixCoord, MotionResult res) {
