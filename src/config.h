@@ -10,6 +10,7 @@
 #include <cwctype>
 #include <windows.h>
 #include "profiler.h"
+#include "atomic_file.h"
 #include "renderdoc_support.h"
 
 namespace edpe {
@@ -39,7 +40,10 @@ public:
     }
 
     void load() {
-        const std::wstring path = getIniPath();
+        loadFrom(getIniPath());
+    }
+
+    void loadFrom(const std::wstring& path) {
         if (path.empty()) return;
 
         upscalerBackend = GetPrivateProfileIntW(L"Upscaler", L"Backend", 0, path.c_str());
@@ -152,84 +156,125 @@ public:
     }
 
     void save() {
-        const std::wstring path = getIniPath();
-        if (path.empty()) return;
+        saveTo(getIniPath());
+    }
 
-        WritePrivateProfileStringW(L"Upscaler", L"Backend", std::to_wstring(upscalerBackend).c_str(), path.c_str());
-        WritePrivateProfileStringW(L"Upscaler", L"Preset", std::to_wstring(dlssPreset).c_str(), path.c_str());
-        WritePrivateProfileStringW(L"Upscaler", L"AutoSyncEliteConfig", autoSyncEliteConfig ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Upscaler", L"PreserveNativeUi", preserveNativeUi ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Upscaler", L"HdrInput", hdrInput ? L"1" : L"0", path.c_str());
+    std::string serializeIni() const {
+        std::string out;
+        out.reserve(2048);
+        auto appendSection = [&](const char* name) {
+            if (!out.empty()) out += "\r\n";
+            out += '[';
+            out += name;
+            out += "]\r\n";
+        };
+        auto appendInt = [&](const char* key, int val) {
+            char line[96]{};
+            std::snprintf(line, sizeof(line), "%s=%d\r\n", key, val);
+            out += line;
+        };
+        auto appendUInt = [&](const char* key, unsigned val) {
+            char line[96]{};
+            std::snprintf(line, sizeof(line), "%s=%u\r\n", key, val);
+            out += line;
+        };
+        auto appendBool = [&](const char* key, bool val) {
+            out += key;
+            out += val ? "=1\r\n" : "=0\r\n";
+        };
+        auto appendFloat = [&](const char* key, const char* fmt, float val) {
+            char valBuf[64]{};
+            std::snprintf(valBuf, sizeof(valBuf), fmt, val);
+            out += key;
+            out += '=';
+            out += valBuf;
+            out += "\r\n";
+        };
+        auto appendWide = [&](const char* key, const wchar_t* val) {
+            out += key;
+            out += '=';
+            if (val && val[0]) {
+                const int needed = WideCharToMultiByte(CP_UTF8, 0, val, -1, nullptr, 0, nullptr, nullptr);
+                if (needed > 1) {
+                    std::string utf8(static_cast<size_t>(needed - 1), '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, val, -1, utf8.data(), needed, nullptr, nullptr);
+                    out += utf8;
+                }
+            }
+            out += "\r\n";
+        };
 
-        wchar_t sharpnessBuf[64]{};
-        swprintf_s(sharpnessBuf, L"%.2f", sharpness);
-        WritePrivateProfileStringW(L"Upscaler", L"Sharpness", sharpnessBuf, path.c_str());
+        appendSection("Upscaler");
+        appendInt("Backend", upscalerBackend);
+        appendInt("Mode", upscaleMode);
+        appendInt("Preset", dlssPreset);
+        appendBool("AutoSyncEliteConfig", autoSyncEliteConfig);
+        appendBool("PreserveNativeUi", preserveNativeUi);
+        appendBool("HdrInput", hdrInput);
+        appendFloat("Sharpness", "%.2f", sharpness);
 
-        WritePrivateProfileStringW(L"Jitter", L"Enabled", jitterEnabled ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Jitter", L"InvertX", jitterInvertX ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Jitter", L"InvertY", jitterInvertY ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Jitter", L"SwapXY", jitterSwapXY ? L"1" : L"0", path.c_str());
+        appendSection("Jitter");
+        appendBool("Enabled", jitterEnabled);
+        appendBool("InvertX", jitterInvertX);
+        appendBool("InvertY", jitterInvertY);
+        appendBool("SwapXY", jitterSwapXY);
+        appendFloat("Scale", "%.2f", jitterScale);
+        appendUInt("PhaseCount", jitterPhaseCount);
+        appendWide("Mode", jitterModeToString(jitterMode));
+        appendBool("LogEnabled", jitterLogEnabled);
+        appendUInt("LogInterval", jitterLogInterval);
+        appendUInt("LogFlushMs", jitterLogFlushMs);
+        appendBool("DebugView", jitterDebugView);
+        appendFloat("DebugSensitivity", "%.2f", jitterDebugSensitivity);
+        appendFloat("DebugThreshold", "%.3f", jitterDebugThreshold);
+        appendInt("DebugMode", jitterDebugMode);
 
-        wchar_t buf[64]{};
-        swprintf_s(buf, L"%.2f", jitterScale);
-        WritePrivateProfileStringW(L"Jitter", L"Scale", buf, path.c_str());
-        WritePrivateProfileStringW(L"Jitter", L"PhaseCount", std::to_wstring(jitterPhaseCount).c_str(), path.c_str());
-        WritePrivateProfileStringW(L"Jitter", L"Mode", jitterModeToString(jitterMode), path.c_str());
-        WritePrivateProfileStringW(L"Jitter", L"LogEnabled", jitterLogEnabled ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Jitter", L"LogInterval", std::to_wstring(jitterLogInterval).c_str(), path.c_str());
-        WritePrivateProfileStringW(L"Jitter", L"LogFlushMs", std::to_wstring(jitterLogFlushMs).c_str(), path.c_str());
+        appendSection("HUD");
+        appendBool("DebugView", hudDebugView);
+        appendFloat("DebugOpacity", "%.2f", hudDebugOpacity);
+        appendFloat("DebugThreshold", "%.3f", hudDebugThreshold);
+        appendInt("DebugMode", hudDebugMode);
 
-        WritePrivateProfileStringW(L"Jitter", L"DebugView", jitterDebugView ? L"1" : L"0", path.c_str());
-        swprintf_s(buf, L"%.2f", jitterDebugSensitivity);
-        WritePrivateProfileStringW(L"Jitter", L"DebugSensitivity", buf, path.c_str());
-        swprintf_s(buf, L"%.3f", jitterDebugThreshold);
-        WritePrivateProfileStringW(L"Jitter", L"DebugThreshold", buf, path.c_str());
-        WritePrivateProfileStringW(L"Jitter", L"DebugMode", std::to_wstring(jitterDebugMode).c_str(), path.c_str());
+        appendSection("Motion");
+        appendBool("ZeroMotion", zeroMotionVectors);
+        appendBool("InvertX", motionInvertX);
+        appendBool("InvertY", motionInvertY);
+        appendFloat("Scale", "%.2f", motionScale);
 
-        WritePrivateProfileStringW(L"HUD", L"DebugView", hudDebugView ? L"1" : L"0", path.c_str());
-        swprintf_s(buf, L"%.2f", hudDebugOpacity);
-        WritePrivateProfileStringW(L"HUD", L"DebugOpacity", buf, path.c_str());
-        swprintf_s(buf, L"%.3f", hudDebugThreshold);
-        WritePrivateProfileStringW(L"HUD", L"DebugThreshold", buf, path.c_str());
-        WritePrivateProfileStringW(L"HUD", L"DebugMode", std::to_wstring(hudDebugMode).c_str(), path.c_str());
+        appendSection("Overlay");
+        appendBool("ShowPerfOverlay", showPerfOverlay);
+        appendBool("CaptureOverlayInComparison", captureOverlayInComparison);
+        appendBool("EnableProfiler", enableProfiler);
+        appendInt("Corner", perfOverlayCorner);
+        appendFloat("Scale", "%.2f", perfOverlayScale);
+        appendFloat("UiScale", "%.2f", uiScale);
+        appendFloat("PosX", "%.1f", perfOverlayPosX);
+        appendFloat("PosY", "%.1f", perfOverlayPosY);
+        appendFloat("MenuPosX", "%.1f", menuPosX);
+        appendFloat("MenuPosY", "%.1f", menuPosY);
+        appendFloat("MenuWidth", "%.1f", menuWidth);
+        appendFloat("MenuHeight", "%.1f", menuHeight);
+        appendBool("DEV", devMode);
 
-        WritePrivateProfileStringW(L"Motion", L"ZeroMotion", zeroMotionVectors ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Motion", L"InvertX", motionInvertX ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Motion", L"InvertY", motionInvertY ? L"1" : L"0", path.c_str());
-        swprintf_s(buf, L"%.2f", motionScale);
-        WritePrivateProfileStringW(L"Motion", L"Scale", buf, path.c_str());
+        appendSection("Pipeline");
+        appendBool("DebugView", debugViewActive);
+        appendWide("MapBounceMode", mapBounceModeToString(mapBounceMode));
 
-        WritePrivateProfileStringW(L"Overlay", L"ShowPerfOverlay", showPerfOverlay ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Overlay", L"CaptureOverlayInComparison", captureOverlayInComparison ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Overlay", L"EnableProfiler", enableProfiler ? L"1" : L"0", path.c_str());
+        appendSection("RenderDoc");
+        appendBool("EnableAnnotations", renderDocAnnotations);
+
+        appendSection("Input");
+        appendBool("WrapDirectInputMouse", wrapDirectInputMouse);
+        appendBool("WrapDirectInputKeyboard", wrapDirectInputKeyboard);
+
+        return out;
+    }
+
+    bool saveTo(const std::wstring& path) {
+        if (path.empty()) return false;
         Profiler::instance().setEnabled(enableProfiler);
-        WritePrivateProfileStringW(L"Overlay", L"Corner", std::to_wstring(perfOverlayCorner).c_str(), path.c_str());
-        swprintf_s(buf, L"%.2f", perfOverlayScale);
-        WritePrivateProfileStringW(L"Overlay", L"Scale", buf, path.c_str());
-        swprintf_s(buf, L"%.2f", uiScale);
-        WritePrivateProfileStringW(L"Overlay", L"UiScale", buf, path.c_str());
-        swprintf_s(buf, L"%.1f", perfOverlayPosX);
-        WritePrivateProfileStringW(L"Overlay", L"PosX", buf, path.c_str());
-        swprintf_s(buf, L"%.1f", perfOverlayPosY);
-        WritePrivateProfileStringW(L"Overlay", L"PosY", buf, path.c_str());
-        swprintf_s(buf, L"%.1f", menuPosX);
-        WritePrivateProfileStringW(L"Overlay", L"MenuPosX", buf, path.c_str());
-        swprintf_s(buf, L"%.1f", menuPosY);
-        WritePrivateProfileStringW(L"Overlay", L"MenuPosY", buf, path.c_str());
-        swprintf_s(buf, L"%.1f", menuWidth);
-        WritePrivateProfileStringW(L"Overlay", L"MenuWidth", buf, path.c_str());
-        swprintf_s(buf, L"%.1f", menuHeight);
-        WritePrivateProfileStringW(L"Overlay", L"MenuHeight", buf, path.c_str());
-        WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
-
-        WritePrivateProfileStringW(L"Pipeline", L"DebugView", debugViewActive ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Pipeline", L"MapBounceMode", mapBounceModeToString(mapBounceMode), path.c_str());
-
-        WritePrivateProfileStringW(L"RenderDoc", L"EnableAnnotations", renderDocAnnotations ? L"1" : L"0", path.c_str());
         RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
-
-        WritePrivateProfileStringW(L"Input", L"WrapDirectInputMouse", wrapDirectInputMouse ? L"1" : L"0", path.c_str());
-        WritePrivateProfileStringW(L"Input", L"WrapDirectInputKeyboard", wrapDirectInputKeyboard ? L"1" : L"0", path.c_str());
+        return writeFileAtomic(path, serializeIni());
     }
 
     static float getTargetSsaaMultiplier(int backend, int mode) {
@@ -297,10 +342,7 @@ public:
 
         if (!modified) return true;
 
-        std::ofstream outFile(cfgPath, std::ios::binary | std::ios::trunc);
-        if (!outFile) return false;
-        outFile.write(content.data(), static_cast<std::streamsize>(content.size()));
-        return outFile.good();
+        return writeFileAtomic(cfgPath, content);
     }
 
     std::wstring getIniPath() const {
