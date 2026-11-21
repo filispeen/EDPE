@@ -86,6 +86,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> class_output_uav_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> class_output_srv_;
 
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cached_stencil_srv_[2];
+    int cached_stencil_next_ = 0;
+
     UINT width_ = 0;
     UINT height_ = 0;
 };

@@ -150,6 +150,24 @@ void FgRuntime::applyConfig(int backendInt,
         sl->setLowLatencyBoost(reflexBoost_);
         sl->setDynamicMfgMode(dynamicMfg_, dynamicTargetFps_);
     }
+    if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
+        auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
+        amd->setDebugFlags(false, false, fsrDebugView_);
+    }
+}
+
+void FgRuntime::setFsrDebugView(bool enabled) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    fsrDebugView_ = enabled;
+    if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
+        auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
+        amd->setDebugFlags(false, false, fsrDebugView_);
+    }
+}
+
+bool FgRuntime::fsrDebugView() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return fsrDebugView_;
 }
 
 bool FgRuntime::isMotionNeeded() const {
@@ -689,6 +707,10 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     in.isPauseOrMenu = !canGenerateThisFrame;
 
     if (canGenerateThisFrame) {
+        // Ensure D3D12 (PrepareV2 + FG Present) from the previous frame has finished reading
+        // shared bridge textures before D3D11 overwrites them for the current frame.
+        presenter_.waitForLastPresentOnD3D11(ctx4.Get());
+
         D3D11_TEXTURE2D_DESC mvDesc{};
         snap.motionVectorsTex->GetDesc(&mvDesc);
         if (mvDesc.Width == renderW && mvDesc.Height == renderH &&

@@ -534,5 +534,87 @@ int main() {
     context->Unmap(cls_rb.Get(), 0);
     if (cel_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Celestial)) return 85;
 
+    // Ship cockpit/hull stencil mask (0x80): pixel with 0x95 at z=10m clamps to (0,0) CockpitStatic
+    // even without prevDepth, while neighboring world pixel with 0x05 preserves world MV.
+    std::array<std::uint64_t, 16> ship_st_depths{};
+    ship_st_depths.fill(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.0025f)) |
+                        (static_cast<std::uint64_t>(0x05u) << 32)); // hangar wall (z=10m, stencil=0x05)
+    ship_st_depths[5] = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.0025f)) |
+                        (static_cast<std::uint64_t>(0x95u) << 32); // ship nose (z=10m, stencil=0x95)
+    D3D11_SUBRESOURCE_DATA ship_st_init{ship_st_depths.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> ship_st_tex;
+    ComPtr<ID3D11ShaderResourceView> ship_st_srv;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &ship_st_init, &ship_st_tex)) ||
+        FAILED(device->CreateShaderResourceView(ship_st_tex.Get(), &view_desc, &ship_st_srv))) return 86;
+
+    if (!pass.render(ship_st_srv.Get(), walkNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, nullptr, nullptr, nullptr, 0u,
+            /*clampCockpit=*/true)) return 87;
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 88;
+    const auto* ship_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float ship_nose_x = DirectX::PackedVector::XMConvertHalfToFloat(ship_row1[2]);
+    const float ship_nose_y = DirectX::PackedVector::XMConvertHalfToFloat(ship_row1[3]);
+    const float ship_wall_x = DirectX::PackedVector::XMConvertHalfToFloat(ship_row1[4]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(ship_nose_x) >= 1e-4f || std::fabs(ship_nose_y) >= 1e-4f) return 89;
+    if (std::fabs(ship_wall_x) < 0.1f) return 90;
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 91;
+    const auto* ship_cls_row1 = static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch;
+    const std::uint8_t ship_nose_cls = ship_cls_row1[1];
+    const std::uint8_t ship_wall_cls = ship_cls_row1[2];
+    context->Unmap(cls_rb.Get(), 0);
+    if (ship_nose_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::CockpitStatic)) return 92;
+    if (ship_wall_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::World)) return 93;
+
+    // On-foot weapon fallback (clampCockpit=false, weaponMotion=nullptr):
+    // stencil 0x14 barrel and un-stenciled z<0.60m muzzle clamp to (0,0) Weapon,
+    // while ground (z=2.74m, stencil=0x04) preserves world motion.
+    std::array<std::uint64_t, 16> foot_depths{};
+    foot_depths.fill(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.00912f)) |
+                     (static_cast<std::uint64_t>(0x04u) << 32)); // ground (z=2.74m, stencil=0x04)
+    foot_depths[5] = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.06485f)) |
+                     (static_cast<std::uint64_t>(0x14u) << 32); // barrel (z=0.385m, stencil=0x14)
+    foot_depths[6] = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.0625f)) |
+                     (static_cast<std::uint64_t>(0x04u) << 32); // un-stenciled muzzle (z=0.40m, stencil=0x04)
+    D3D11_SUBRESOURCE_DATA foot_init{foot_depths.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> foot_tex;
+    ComPtr<ID3D11ShaderResourceView> foot_srv;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &foot_init, &foot_tex)) ||
+        FAILED(device->CreateShaderResourceView(foot_tex.Get(), &view_desc, &foot_srv))) return 94;
+
+    if (!pass.render(foot_srv.Get(), walkNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, nullptr, nullptr, nullptr, 0u,
+            /*clampCockpit=*/false)) return 95;
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 96;
+    const auto* foot_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float barrel_x = DirectX::PackedVector::XMConvertHalfToFloat(foot_row1[2]);
+    const float barrel_y = DirectX::PackedVector::XMConvertHalfToFloat(foot_row1[3]);
+    const float muzzle_x = DirectX::PackedVector::XMConvertHalfToFloat(foot_row1[4]);
+    const float muzzle_y = DirectX::PackedVector::XMConvertHalfToFloat(foot_row1[5]);
+    const float ground_x = DirectX::PackedVector::XMConvertHalfToFloat(foot_row1[6]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(barrel_x) >= 1e-4f || std::fabs(barrel_y) >= 1e-4f) return 97;
+    if (std::fabs(muzzle_x) >= 1e-4f || std::fabs(muzzle_y) >= 1e-4f) return 98;
+    if (std::fabs(ground_x) < 0.1f) return 99;
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 100;
+    const auto* foot_cls_row1 = static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch;
+    const std::uint8_t barrel_cls = foot_cls_row1[1];
+    const std::uint8_t muzzle_cls = foot_cls_row1[2];
+    const std::uint8_t ground_cls = foot_cls_row1[3];
+    context->Unmap(cls_rb.Get(), 0);
+    if (barrel_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 101;
+    if (muzzle_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 102;
+    if (ground_cls == static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 103;
+
     return 0;
 }

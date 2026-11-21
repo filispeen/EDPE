@@ -2,6 +2,7 @@
 
 #include "log.h"
 
+#include <cfloat>
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
@@ -327,10 +328,13 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     if (!impl_->initialized || !impl_->presenter || !cmdList) return false;
     if (!impl_->ensureFgContext(inputs)) return false;
 
-    // Register optional premultiplied UI texture for crisp composition across real & interpolated frames.
+    // HUDLessColor and RegisterUiResourceDX12 are mutually exclusive UI paths in FSR FG.
+    // When HUDLessColor is supplied, the backbuffer already carries composited game UI + ImGui,
+    // so let FSR FG extract UI via (backbuffer - HUDLessColor) and avoid double-compositing UI.
+    const bool usePackedUi = (!inputs.hudlessColor && inputs.packedUiColorAndAlpha != nullptr);
     ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 uiCfg{};
     uiCfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12;
-    if (inputs.packedUiColorAndAlpha) {
+    if (usePackedUi) {
         uiCfg.uiResource = ffxApiGetResourceDX12(
             inputs.packedUiColorAndAlpha, FFX_API_RESOURCE_STATE_COMMON);
         uiCfg.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
@@ -402,8 +406,10 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     prep.motionVectorScale = {inputs.motionScaleX, inputs.motionScaleY};
     prep.frameTimeDelta = inputs.frameTimeMs;
     prep.reset = inputs.reset || impl_->forceResetNext;
-    prep.cameraNear = camMats.nearPlane;
-    prep.cameraFar = 0.0f; // Infinite reversed-Z
+    // FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED | FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE:
+    // FidelityFX swaps near/far for reversed-infinite depth (cameraNear=FLT_MAX, cameraFar=nearPlane).
+    prep.cameraNear = FLT_MAX;
+    prep.cameraFar = camMats.nearPlane;
     prep.cameraFovAngleVertical = camMats.verticalFovRad;
     prep.viewSpaceToMetersFactor = inputs.viewSpaceToMeters;
     prep.depth = ffxApiGetResourceDX12(inputs.depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);

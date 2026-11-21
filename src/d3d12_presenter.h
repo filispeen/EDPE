@@ -140,6 +140,10 @@ public:
     IDXGISwapChain4* swapChain() const { return swapChain_.Get(); }
     ID3D12Resource* currentBackBuffer() const;
 
+    // Queues a GPU-side D3D11 wait for the previous D3D12 Present + FG workload to finish
+    // reading shared bridge textures before D3D11 overwrites them on the next frame.
+    bool waitForLastPresentOnD3D11(ID3D11DeviceContext4* ctx4) const;
+
     // Releases backbuffer refs and detaches swapChain_ ownership before an FG library
     // (e.g., FidelityFX WrapDX12) consumes and replaces the swapchain pointer.
     IDXGISwapChain4* detachSwapChainForWrap();
@@ -201,6 +205,7 @@ private:
     PresentMarkerCallback prePresentMarkerCb_ = nullptr;
     PresentMarkerCallback postPresentMarkerCb_ = nullptr;
     void* presentMarkerUserCtx_ = nullptr;
+    uint64_t lastPresentDoneFence_ = 0;
 };
 
 } // namespace edpe

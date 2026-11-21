@@ -338,6 +338,13 @@ uint64_t D3D11D3D12Bridge::submitAfterD3D11Signal(ID3D11DeviceContext4* ctx4,
     return d12Done;
 }
 
+uint64_t D3D11D3D12Bridge::signalD3D12Queue() {
+    if (!initialized_ || !queue_ || !fence12_) return 0;
+    const uint64_t val = ++fenceValue_;
+    if (FAILED(queue_->Signal(fence12_.Get(), val))) return 0;
+    return val;
+}
+
 bool D3D11D3D12Bridge::waitOnD3D11(ID3D11DeviceContext4* ctx4, uint64_t d12DoneFence) const {
     if (!initialized_ || !ctx4 || !fence11_ || d12DoneFence == 0) return false;
     return SUCCEEDED(ctx4->Wait(fence11_.Get(), d12DoneFence));

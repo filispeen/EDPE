@@ -207,6 +207,7 @@ void D3D12ProxyPresenter::shutdown() {
     bufferCount_ = 0;
     swapChainFlags_ = 0;
     tearingSupported_ = false;
+    lastPresentDoneFence_ = 0;
     initialized_ = false;
 }
 
@@ -291,6 +292,7 @@ bool D3D12ProxyPresenter::resizeBuffers(uint32_t bufferCount,
     if (!initialized_ || !swapChain_ || !width || !height) return false;
 
     bridge_.waitGpuIdle();
+    lastPresentDoneFence_ = 0;
     releaseBackBuffers();
     sharedInput_.reset();
     slotHasTimestamp_.fill(false);
@@ -338,6 +340,11 @@ ID3D12Resource* D3D12ProxyPresenter::currentBackBuffer() const {
     if (!initialized_ || !swapChain_) return nullptr;
     const UINT idx = swapChain_->GetCurrentBackBufferIndex();
     return (idx < backBuffers_.size()) ? backBuffers_[idx].Get() : nullptr;
+}
+
+bool D3D12ProxyPresenter::waitForLastPresentOnD3D11(ID3D11DeviceContext4* ctx4) const {
+    if (!initialized_ || !ctx4 || lastPresentDoneFence_ == 0) return true;
+    return bridge_.waitOnD3D11(ctx4, lastPresentDoneFence_);
 }
 
 IDXGISwapChain4* D3D12ProxyPresenter::detachSwapChainForWrap() {
@@ -394,7 +401,10 @@ bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
     if (bbIdx >= backBuffers_.size() || !backBuffers_[bbIdx]) return false;
     ID3D12Resource* backBuffer = backBuffers_[bbIdx].Get();
 
-    // 1. Copy D3D11 frame into the shared NT-handle texture.
+    // 1. Wait on GPU for prior D3D12 Present/FG reads before overwriting sharedInput_.
+    if (lastPresentDoneFence_ != 0) {
+        bridge_.waitOnD3D11(ctx4, lastPresentDoneFence_);
+    }
     ctx4->CopyResource(sharedInput_.d3d11.Get(), srcD3D11);
 
     // 2. Open D3D12 command list and read prior timestamp for this allocator ring slot non-blockingly.
@@ -473,6 +483,10 @@ bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
     const HRESULT presentHr = swapChain_->Present(syncInterval, presentFlags);
     if (postPresentMarkerCb_) {
         postPresentMarkerCb_(presentMarkerUserCtx_);
+    }
+    const uint64_t postPresentFence = bridge_.signalD3D12Queue();
+    if (postPresentFence != 0) {
+        lastPresentDoneFence_ = postPresentFence;
     }
     if (outPresentHr) *outPresentHr = presentHr;
     if (FAILED(presentHr)) {

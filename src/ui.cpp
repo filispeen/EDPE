@@ -2388,6 +2388,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 "None",
                 "Subpixel Jitter",
                 "Motion Class (DEV)",
+                "FSR FG Debug View (DEV)",
                 "Feet pictures" // will not be implemented, you can check thoose in google
             };
             const char* debug_view_items_user[] = {
@@ -2398,17 +2399,22 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             int current_debug_view = 0;
             if (ContextCensusGetJitterDebugView()) current_debug_view = 1;
             else if (cfg.devMode && ContextCensusGetMotionClassDebugView()) current_debug_view = 2;
+            else if (cfg.devMode && edpe::FgRuntime::instance().fsrDebugView()) current_debug_view = 3;
 
             const char* const* items = cfg.devMode ? debug_view_items_dev : debug_view_items_user;
             const int item_count = cfg.devMode ? IM_ARRAYSIZE(debug_view_items_dev) : IM_ARRAYSIZE(debug_view_items_user);
             if (ImGui::Combo("Debug view", &current_debug_view, items, item_count)) {
                 const bool enable_jitter_debug = (current_debug_view == 1);
                 const bool enable_mc_debug = cfg.devMode && (current_debug_view == 2);
+                const bool enable_fsr_fg_debug = cfg.devMode && (current_debug_view == 3);
                 ContextCensusSetHudDebugView(false);
                 ContextCensusSetJitterDebugView(enable_jitter_debug);
                 ContextCensusSetMotionClassDebugView(enable_mc_debug);
+                edpe::FgRuntime::instance().setFsrDebugView(enable_fsr_fg_debug);
             }
-            if (cfg.devMode && ContextCensusGetMotionClassDebugView()) {
+            if (cfg.devMode && edpe::FgRuntime::instance().fsrDebugView()) {
+                TextDisabledWrapped("Displays AMD FSR Frame Generation internal 4-quadrant debug view (Dilated Game MVs, Optical Flow, Disocclusion/Inpainting Mask, Interpolated Output). Requires AMD FSR FG active.");
+            } else if (cfg.devMode && ContextCensusGetMotionClassDebugView()) {
                 TextDisabledWrapped("Color-codes MotionPass OutClass: Sky (blue), World (green), CockpitStatic (amber), Disoccluded (red), Weapon (cyan), Celestial (violet), OffscreenFG (magenta), Reset (white).");
                 uint32_t counts[8]{};
                 uint32_t total = 0;

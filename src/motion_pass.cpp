@@ -271,26 +271,44 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
 
     if (!ensureOutputs(width, height, enableClassOutput)) return false;
 
-    // If weaponMotion is provided without an explicit stencil SRV, create a view
-    // on the R32G8X24_TYPELESS scene depth resource directly.
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> autoStencilSrv;
-    ID3D11ShaderResourceView* activeStencilSrv = sceneStencil;
-    if (weaponMotion && !activeStencilSrv) {
-        D3D11_SHADER_RESOURCE_VIEW_DESC stDesc{};
-        stDesc.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
-        stDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        stDesc.Texture2D.MipLevels = 1;
-        if (SUCCEEDED(device_->CreateShaderResourceView(texture.Get(), &stDesc, &autoStencilSrv))) {
-            activeStencilSrv = autoStencilSrv.Get();
-        }
-    }
-
     float patched[36];
     for (int i = 0; i < 36; ++i) patched[i] = values[i];
     int flags = static_cast<int>(patched[31] + 0.1f);
+
+    // Bind a cached X32_TYPELESS_G8X24_UINT stencil view on the R32G8X24_TYPELESS scene depth
+    // for both ship cockpit (0x80) and on-foot weapon/viewmodel (0x10) stencil masking.
+    ID3D11ShaderResourceView* activeStencilSrv = sceneStencil;
+    if (!activeStencilSrv) {
+        for (int i = 0; i < 2; ++i) {
+            if (cached_stencil_srv_[i]) {
+                Microsoft::WRL::ComPtr<ID3D11Resource> cachedRes;
+                cached_stencil_srv_[i]->GetResource(&cachedRes);
+                if (cachedRes.Get() == texture.Get()) {
+                    activeStencilSrv = cached_stencil_srv_[i].Get();
+                    break;
+                }
+            }
+        }
+        if (!activeStencilSrv) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC stDesc{};
+            stDesc.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+            stDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            stDesc.Texture2D.MipLevels = 1;
+            Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> createdSrv;
+            if (SUCCEEDED(device_->CreateShaderResourceView(texture.Get(), &stDesc, &createdSrv))) {
+                const int slot = cached_stencil_next_ & 1;
+                cached_stencil_srv_[slot] = createdSrv;
+                cached_stencil_next_ = slot ^ 1;
+                activeStencilSrv = createdSrv.Get();
+            }
+        }
+    }
+
     if (enableClassOutput && !class_output_uav_) flags &= ~4;
     if (!weaponMotion || !activeStencilSrv) flags &= ~16;
     if (!celestialRecords) flags &= ~32;
+    if (activeStencilSrv) flags |= 128;
+    else flags &= ~128;
     patched[31] = static_cast<float>(flags);
     context_->UpdateSubresource(constants_.Get(), 0, nullptr, patched, 0, 0);
 

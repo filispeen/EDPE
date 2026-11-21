@@ -66,6 +66,9 @@ public:
     // Signals D3D11 fence, submits D3D12 command list after GPU wait on that fence, and signals completion.
     uint64_t submitAfterD3D11Signal(ID3D11DeviceContext4* ctx4, uint32_t slot, bool flushD11 = true);
 
+    // Signals the shared fence on the D3D12 command queue and returns the signaled value (0 on failure).
+    uint64_t signalD3D12Queue();
+
     // Enqueues a pure GPU-side wait on D3D11 for a prior D3D12 submission fence value.
     bool waitOnD3D11(ID3D11DeviceContext4* ctx4, uint64_t d12DoneFence) const;
 
