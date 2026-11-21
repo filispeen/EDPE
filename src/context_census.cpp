@@ -12287,10 +12287,6 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         if (motion_color_bound && !bound) {
             // Main scene G-buffer or Pass 35 HDR pass has completed and unbound!
             s_inside_main_scene.store(false, std::memory_order_release);
-    if (!(flags & DXGI_PRESENT_TEST)) {
-        s_cb_map_bounce.onPresent(frame);
-        logCbMapBounceEvents();
-    }
             s_hud_mask_active_pass = false;
             if (motion_pair_active && !motion_color_first_exit_logged) {
                 motion_color_first_exit_logged = true;
@@ -13408,6 +13404,10 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             cfg.frameGenReflexBoost);
     }
     s_inside_main_scene.store(false, std::memory_order_release);
+    if (!(flags & DXGI_PRESENT_TEST)) {
+        s_cb_map_bounce.onPresent(frame);
+        logCbMapBounceEvents();
+    }
     struct PresentScopeGuard {
         PresentScopeGuard() { s_in_edpe_present.store(true, std::memory_order_release); }
         ~PresentScopeGuard() { s_in_edpe_present.store(false, std::memory_order_release); }
