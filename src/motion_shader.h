@@ -2,42 +2,202 @@
 
 namespace edpe {
 
-// Current-to-previous motion in render pixels, +Y downward.
+// Current-to-previous motion in render pixels, +Y downward, unjittered.
 // Camera rows match CameraProjection; depth is reversed Z: depthB / viewZ.
-// Optional t2 binds Cobra's MRT6 per-object velocity G-buffer (R16G16B16A16_FLOAT).
+// Compute shader [numthreads(8,8,1)] writes:
+//   u0 OutMotion (R16G16_FLOAT): prev - cur in render pixels, +Y down, no jitter (fp16-safe)
+//   u1 OutDepth  (R32_FLOAT):    canonical reversed-Z depth in world near-plane scale
+//   u2 OutClass  (R8_UINT):      optional pixel class (when modeFlags bit 2 is set)
 inline constexpr char kMotionShader[] = R"(
+static const uint kClassSky           = 0u;
+static const uint kClassWorld         = 1u;
+static const uint kClassCockpitStatic = 2u;
+static const uint kClassDisoccluded   = 3u;
+static const uint kClassWeapon        = 4u;
+static const uint kClassCelestial     = 5u;
+static const uint kClassOffscreenFG   = 6u;
+static const uint kClassReset         = 7u;
+
+static const uint kWeaponStencilBit   = 0x10u;
+static const float kFp16Max           = 65504.0;
+
+struct CelestialRecord {
+    float4 relRow0; // view-space [R_rel_0 | t_rel_x] cur -> prev
+    float4 relRow1; // view-space [R_rel_1 | t_rel_y]
+    float4 relRow2; // view-space [R_rel_2 | t_rel_z]
+    float4 box;     // screen AABB [minX, minY, maxX, maxY] (render px)
+    float4 span;    // x=depthMin, y=depthMax, z=rMinPx, w=rMaxPx
+    float4 center;  // xy=screen center (px), z=valid (>0.5), w=0
+};
+
 cbuffer Camera : register(b0) {
     float4 now0, now1, now2;
-    float4 prev0, prev1, prev2;
+    float4 prev0, prev1, prev2; // prev0.x=translationStep, prev0.y=celestialDepthThresh, prev0.z=celestialCount
     float4 scales;     // current X/Y, previous X/Y
-    float4 info;       // depthB, width, height, flags (bit0 = hasPrevDepth, bit1 = hasEngineVelocity)
+    float4 info;       // depthB, width, height, flags (bit0=hasPrevDepth, bit2=writeClass, bit3=reset, bit4=hasWeapon, bit5=hasCelestial)
     float4 jitterInfo; // jitterX, jitterY, prevJitterX, prevJitterY (render pixels)
 };
 Texture2D<float> sceneDepth : register(t0);
 Texture2D<float> prevSceneDepth : register(t1);
-Texture2D<float4> engineVelocity : register(t2);
+Texture2D<float4> weaponMotion : register(t2);
+Texture2D<uint2> sceneStencil : register(t3);
+StructuredBuffer<CelestialRecord> celestialRecords : register(t4);
+
+RWTexture2D<float2> OutMotion : register(u0);
+RWTexture2D<float> OutDepth : register(u1);
+RWTexture2D<uint> OutClass : register(u2);
 cbuffer EliteNow : register(b1) { float4 currentWords[336]; };
 cbuffer ElitePrevious : register(b2) { float4 previousWords[336]; };
 
-float4 vs(uint id : SV_VertexID) : SV_POSITION {
-    float2 corner = float2((id << 1) & 2, id & 2);
-    return float4(corner * float2(2, -2) + float2(-1, 1), 0, 1);
+struct MotionResult {
+    float2 mv;
+    float canonicalDepth;
+    uint pixelClass;
+};
+
+float2 sanitizeMotion(float2 mv) {
+    return all(isfinite(mv)) ? clamp(mv, -kFp16Max, kFp16Max) : float2(0.0, 0.0);
 }
 
-float2 reproject(float4 pixel, float4 current0, float4 current1,
-    float4 current2, float4 prior0, float4 prior1, float4 prior2,
+// Two-level history depth validation:
+//   1. 2x2 best-of-4 around (prevRasterPx - 0.5) with 1% relative tolerance.
+//   2. Planar bilinear footprint when all 4 texels are in-bounds, finite, and > 0:
+//      verifies planarity |d00 + d11 - d10 - d01| <= tol and |bilinear - expected| <= tol.
+bool prevDepthMatches(float2 prevRasterPx, float expectedDepth, int2 maxCoord) {
+    if (!(expectedDepth > 0.0) || !isfinite(expectedDepth)) return false;
+    float2 raster = prevRasterPx - 0.5;
+    int2 base = int2(floor(raster));
+    float tol = max(1e-6, 0.01 * expectedDepth);
+
+    float d00 = prevSceneDepth.Load(int3(clamp(base + int2(0, 0), 0, maxCoord), 0));
+    float d10 = prevSceneDepth.Load(int3(clamp(base + int2(1, 0), 0, maxCoord), 0));
+    float d01 = prevSceneDepth.Load(int3(clamp(base + int2(0, 1), 0, maxCoord), 0));
+    float d11 = prevSceneDepth.Load(int3(clamp(base + int2(1, 1), 0, maxCoord), 0));
+
+    float e00 = (d00 > 0.0 && d00 <= 1.0 && isfinite(d00)) ? abs(d00 - expectedDepth) : 1e30;
+    float e10 = (d10 > 0.0 && d10 <= 1.0 && isfinite(d10)) ? abs(d10 - expectedDepth) : 1e30;
+    float e01 = (d01 > 0.0 && d01 <= 1.0 && isfinite(d01)) ? abs(d01 - expectedDepth) : 1e30;
+    float e11 = (d11 > 0.0 && d11 <= 1.0 && isfinite(d11)) ? abs(d11 - expectedDepth) : 1e30;
+    float best = min(min(e00, e10), min(e01, e11));
+    if (best <= tol) return true;
+
+    if (any(base < 0) || any(base >= maxCoord)) return false;
+    float4 quad = float4(d00, d10, d01, d11);
+    if (!all(isfinite(quad)) || !all(quad > 0.0) || !all(quad <= 1.0)) return false;
+    float2 f = raster - float2(base);
+    float bilinear = lerp(lerp(d00, d10, f.x), lerp(d01, d11, f.x), f.y);
+    return (abs(bilinear - expectedDepth) <= tol) &&
+           (abs(d00 + d11 - d10 - d01) <= tol);
+}
+
+bool tryWeaponOverride(int2 pixCoord, bool isReset, out MotionResult outRes) {
+    outRes.mv = float2(0.0, 0.0);
+    outRes.canonicalDepth = 0.0;
+    outRes.pixelClass = kClassWeapon;
+    uint stencil = sceneStencil.Load(int3(pixCoord, 0)).g;
+    if ((stencil & kWeaponStencilBit) == 0u) return false;
+    float4 wm = weaponMotion.Load(int3(pixCoord, 0));
+    if (wm.w <= 0.5 || !all(isfinite(wm.xyz))) return false;
+    outRes.mv = wm.xy;
+    outRes.canonicalDepth = wm.z;
+    outRes.pixelClass = isReset ? kClassReset : kClassWeapon;
+    return true;
+}
+
+bool tryCelestialOverride(float2 rawPixel, float depth, float3 view,
+    float4 prevProjHalf, uint celestialCount, bool isReset, out MotionResult outRes) {
+    outRes.mv = float2(0.0, 0.0);
+    outRes.canonicalDepth = depth;
+    outRes.pixelClass = kClassCelestial;
+    uint count = min(celestialCount, 16u);
+    [loop]
+    for (uint i = 0u; i < count; ++i) {
+        CelestialRecord rec = celestialRecords[i];
+        if (rec.center.z <= 0.5) continue;
+        if (rawPixel.x < rec.box.x || rawPixel.x > rec.box.z ||
+            rawPixel.y < rec.box.y || rawPixel.y > rec.box.w) continue;
+        if (depth < rec.span.x || depth > rec.span.y) continue;
+        float r = length(rawPixel - rec.center.xy);
+        if (r < rec.span.z || r > rec.span.w) continue;
+
+        float3 prior = float3(dot(rec.relRow0.xyz, view) + rec.relRow0.w,
+                              dot(rec.relRow1.xyz, view) + rec.relRow1.w,
+                              dot(rec.relRow2.xyz, view) + rec.relRow2.w);
+        if (prior.z <= 0.0) continue;
+        float2 priorPixel = prior.xy * rcp(prior.z) * prevProjHalf.xy + prevProjHalf.zw;
+        outRes.mv = priorPixel - rawPixel;
+        outRes.canonicalDepth = depth;
+        outRes.pixelClass = isReset ? kClassReset : kClassCelestial;
+        return true;
+    }
+    return false;
+}
+
+)" R"(
+MotionResult classifyAndFinishWorld(float2 pixelCenter, float2 rawPixel,
+    float2 priorPixel, float depth, float expectedPriorDepth, float z,
+    bool hasPrevDepth, bool isReset, bool clampCockpit) {
+    MotionResult res;
+    res.canonicalDepth = depth;
+    float2 worldMv = priorPixel - rawPixel;
+    int2 maxCoord = int2(info.y - 1.0, info.z - 1.0);
+    bool priorOffscreen = (priorPixel.x < 0.0 || priorPixel.x >= info.y ||
+                           priorPixel.y < 0.0 || priorPixel.y >= info.z);
+
+    bool worldMatches = false;
+    if (hasPrevDepth && !priorOffscreen) {
+        worldMatches = prevDepthMatches(priorPixel + jitterInfo.zw, expectedPriorDepth, maxCoord);
+    }
+
+    // Depth-validated cockpit / static-attached geometry vs. world geometry disambiguation.
+    if (clampCockpit && z < 10.0 && hasPrevDepth && dot(worldMv, worldMv) > 0.0625) {
+        bool staticMatches =
+            prevDepthMatches(rawPixel + jitterInfo.zw, depth, maxCoord) ||
+            prevDepthMatches(pixelCenter, depth, maxCoord);
+        if (!worldMatches && staticMatches) {
+            res.mv = float2(0.0, 0.0);
+            res.pixelClass = isReset ? kClassReset : kClassCockpitStatic;
+            return res;
+        }
+    }
+
+    // Preserve real physical off-screen motion vectors for newly-revealed edges (FG policy).
+    res.mv = worldMv;
+    if (isReset) {
+        res.pixelClass = kClassReset;
+    } else if (priorOffscreen) {
+        res.pixelClass = kClassOffscreenFG;
+    } else if (hasPrevDepth && !worldMatches) {
+        res.pixelClass = kClassDisoccluded;
+    } else {
+        res.pixelClass = kClassWorld;
+    }
+    return res;
+}
+
+MotionResult reproject(float2 pixelCenter, int2 pixCoord,
+    float4 current0, float4 current1, float4 current2,
+    float4 prior0, float4 prior1, float4 prior2,
     float4 projection, float depthB, bool clampCockpit) {
-    if (info.y <= 0 || info.z <= 0 || projection.x <= 0 || projection.y <= 0) return 0;
-    float hudScale = 1.0;
-    int2 pixCoord = int2(pixel.xy);
+    MotionResult res;
+    res.mv = float2(0.0, 0.0);
+    res.canonicalDepth = 0.0;
+    res.pixelClass = kClassSky;
+
+    if (info.y <= 0 || info.z <= 0 || projection.x <= 0 || projection.y <= 0) return res;
     float depth = sceneDepth.Load(int3(pixCoord, 0));
+    res.canonicalDepth = depth;
     int modeFlags = int(info.w + 0.1);
     bool hasPrevDepth = (modeFlags & 1) != 0;
-    bool hasEngineVel = (modeFlags & 2) != 0;
+    bool isReset = (modeFlags & 8) != 0;
+    bool hasWeapon = (modeFlags & 16) != 0;
 
-    // Subtract current raster subpixel jitter phase so camera reprojection operates
-    // on true unjittered screen coordinates and outputs jitter-free motion vectors.
-    float2 rawPixel = pixel.xy - jitterInfo.xy;
+    if (hasWeapon) {
+        MotionResult wmRes;
+        if (tryWeaponOverride(pixCoord, isReset, wmRes)) return wmRes;
+    }
+
+    float2 rawPixel = pixelCenter - jitterInfo.xy;
 
     // 1. Skybox, distant stars, nebula, celestial background, and star bloom:
     float celestialDepthThresh = (depthB > 0.0) ? (depthB / 50000.0) : 1e-6;
@@ -50,29 +210,18 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
         float3 priorRay = float3(prior0.x * worldRay.x + prior1.x * worldRay.y + prior2.x * worldRay.z,
                                  prior0.y * worldRay.x + prior1.y * worldRay.y + prior2.y * worldRay.z,
                                  prior0.z * worldRay.x + prior1.z * worldRay.y + prior2.z * worldRay.z);
-        if (priorRay.z <= 0.0) return 0.0;
+        res.pixelClass = isReset ? kClassReset : kClassSky;
+        if (priorRay.z <= 0.0) return res;
         float2 priorNdc = projection.zw * priorRay.xy / priorRay.z;
         float2 priorPixel = float2((priorNdc.x + 1.0) * info.y * 0.5,
                                    (1.0 - priorNdc.y) * info.z * 0.5);
-        return (priorPixel - rawPixel) * hudScale;
-    }
-
-    // 2. Per-object velocity from G-buffer MRT6 (when bound and valid):
-    // Dynamic ships, rotating stations, and animated geometry write velocity into MRT6.
-    if (hasEngineVel) {
-        float4 engVel = engineVelocity.Load(int3(pixCoord, 0));
-        if (all(isfinite(engVel.xy)) && engVel.w > 0.0 &&
-            (abs(engVel.x) > 1e-5 || abs(engVel.y) > 1e-5) &&
-            abs(engVel.x) < 2.0 && abs(engVel.y) < 2.0) {
-            float2 jitterDeltaPx = jitterInfo.zw - jitterInfo.xy;
-            float2 objMvPx = float2(-engVel.x * info.y * 0.5, engVel.y * info.z * 0.5) - jitterDeltaPx;
-            return objMvPx * hudScale;
-        }
+        res.mv = priorPixel - rawPixel;
+        return res;
     }
 
     float z = depthB / depth;
 
-    // 3. Static/world geometry camera-depth reprojection from the unjittered pixel coordinate:
+    // 2. Static/world geometry camera-depth reprojection from the unjittered pixel coordinate:
     float2 ndc = float2(2.0 * rawPixel.x / info.y - 1.0, 1.0 - 2.0 * rawPixel.y / info.z);
     float3 view = float3(ndc.x * z / projection.x, ndc.y * z / projection.y, z);
     float3 world = float3(dot(current0.xyz, view) + current0.w,
@@ -82,49 +231,41 @@ float2 reproject(float4 pixel, float4 current0, float4 current1,
     float3 prior = float3(prior0.x * world.x + prior1.x * world.y + prior2.x * world.z,
                           prior0.y * world.x + prior1.y * world.y + prior2.y * world.z,
                           prior0.z * world.x + prior1.z * world.y + prior2.z * world.z);
-    if (prior.z <= 0.0) return 0.0;
+    res.pixelClass = isReset ? kClassReset : kClassWorld;
+    if (prior.z <= 0.0) return res;
     float2 priorNdc = projection.zw * prior.xy / prior.z;
     float2 priorPixel = float2((priorNdc.x + 1.0) * info.y * 0.5,
                                (1.0 - priorNdc.y) * info.z * 0.5);
-    float2 worldMv = (priorPixel - rawPixel) * hudScale;
-
-    // 4. Fast depth-validated cockpit vs. world geometry disambiguation:
-    if (clampCockpit && z < 10.0) {
-        float3 camDelta = float3(current0.w - prior0.w, current1.w - prior1.w, current2.w - prior2.w);
-        float translationStep = length(camDelta);
-        if (z < 3.5 && translationStep > 0.35) {
-            return 0.0;
-        }
-        if (hasPrevDepth && translationStep > 0.001 && length(worldMv) > 0.25) {
-            int2 maxCoord = int2(info.y - 1.0, info.z - 1.0);
-            int2 pWorld = clamp(int2(priorPixel + jitterInfo.zw), int2(0, 0), maxCoord);
-            int2 pStatic = clamp(int2(rawPixel + jitterInfo.zw), int2(0, 0), maxCoord);
-            float dWorld = prevSceneDepth.Load(int3(pWorld, 0));
-            float dStatic = prevSceneDepth.Load(int3(pStatic, 0));
-            float expectedPriorDepth = depthB / prior.z;
-            float tol = max(1e-5, 0.025 * depth);
-            bool worldMatches = (dWorld > 0.0 && dWorld <= 1.0) && (abs(dWorld - expectedPriorDepth) <= tol);
-            bool staticMatches = (dStatic > 0.0 && dStatic <= 1.0) && (abs(dStatic - depth) <= tol);
-            if (!worldMatches && staticMatches) {
-                return 0.0;
-            }
-        }
-    }
-
-    return worldMv;
+    float expectedPriorDepth = depthB / prior.z;
+    return classifyAndFinishWorld(pixelCenter, rawPixel, priorPixel,
+        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit);
 }
 
-float2 reprojectRel(float4 pixel, float4 rel0, float4 rel1, float4 rel2,
-    float translationStep, float celestialDepthThresh,
+MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
+    float4 rel0, float4 rel1, float4 rel2,
+    float celestialDepthThresh, uint celestialCount,
     float4 invProj, float4 prevProjHalf, float depthB, bool clampCockpit) {
-    if (info.y <= 0 || info.z <= 0 || scales.x <= 0 || scales.y <= 0) return 0;
-    int2 pixCoord = int2(pixel.xy);
+    MotionResult res;
+    res.mv = float2(0.0, 0.0);
+    res.canonicalDepth = 0.0;
+    res.pixelClass = kClassSky;
+
+    if (info.y <= 0 || info.z <= 0 || scales.x <= 0 || scales.y <= 0) return res;
     float depth = sceneDepth.Load(int3(pixCoord, 0));
+    res.canonicalDepth = depth;
     int modeFlags = int(info.w + 0.1);
     bool hasPrevDepth = (modeFlags & 1) != 0;
-    bool hasEngineVel = (modeFlags & 2) != 0;
+    bool isReset = (modeFlags & 8) != 0;
+    bool hasWeapon = (modeFlags & 16) != 0;
+    bool hasCelestial = (modeFlags & 32) != 0;
 
-    float2 rawPixel = pixel.xy - jitterInfo.xy;
+    // 0. First-person weapon / viewmodel override (stencil 0x10 + valid WeaponMotion):
+    if (hasWeapon) {
+        MotionResult wmRes;
+        if (tryWeaponOverride(pixCoord, isReset, wmRes)) return wmRes;
+    }
+
+    float2 rawPixel = pixelCenter - jitterInfo.xy;
     float2 ndc = rawPixel * invProj.xy + float2(-1.0, 1.0);
 
     // 1. Skybox, distant stars, nebula, celestial background, and star bloom:
@@ -133,64 +274,67 @@ float2 reprojectRel(float4 pixel, float4 rel0, float4 rel1, float4 rel2,
         float3 priorRay = float3(dot(rel0.xyz, viewRay),
                                  dot(rel1.xyz, viewRay),
                                  dot(rel2.xyz, viewRay));
-        if (priorRay.z <= 0.0) return 0.0;
+        res.pixelClass = isReset ? kClassReset : kClassSky;
+        if (priorRay.z <= 0.0) return res;
         float2 priorPixel = priorRay.xy * rcp(priorRay.z) * prevProjHalf.xy + prevProjHalf.zw;
-        return priorPixel - rawPixel;
-    }
-
-    // 2. Per-object velocity from G-buffer MRT6 (when bound and valid):
-    if (hasEngineVel) {
-        float4 engVel = engineVelocity.Load(int3(pixCoord, 0));
-        if (all(isfinite(engVel.xy)) && engVel.w > 0.0 &&
-            (abs(engVel.x) > 1e-5 || abs(engVel.y) > 1e-5) &&
-            abs(engVel.x) < 2.0 && abs(engVel.y) < 2.0) {
-            float2 jitterDeltaPx = jitterInfo.zw - jitterInfo.xy;
-            return float2(-engVel.x * prevProjHalf.z, engVel.y * prevProjHalf.w) - jitterDeltaPx;
-        }
+        res.mv = priorPixel - rawPixel;
+        return res;
     }
 
     float z = depthB / depth;
-
-    // 3. Static/world geometry camera-depth reprojection via CPU-composed relative transform:
     float3 view = float3(ndc * invProj.zw * z, z);
-    float3 prior = float3(dot(rel0.xyz, view) + rel0.w,
-                          dot(rel1.xyz, view) + rel1.w,
-                          dot(rel2.xyz, view) + rel2.w);
-    if (prior.z <= 0.0) return 0.0;
-    float2 priorPixel = prior.xy * rcp(prior.z) * prevProjHalf.xy + prevProjHalf.zw;
-    float2 worldMv = priorPixel - rawPixel;
 
-    // 4. Fast depth-validated cockpit / viewmodel vs. world geometry disambiguation:
-    if (clampCockpit && z < 10.0) {
-        if (z < 3.5 && translationStep > 0.35) {
-            return 0.0;
-        }
-        if (hasPrevDepth && dot(worldMv, worldMv) > 0.0625) {
-            int2 maxCoord = int2(info.y - 1.0, info.z - 1.0);
-            int2 pWorld = clamp(int2(priorPixel + jitterInfo.zw), int2(0, 0), maxCoord);
-            int2 pStatic = clamp(int2(rawPixel + jitterInfo.zw), int2(0, 0), maxCoord);
-            float dWorld = prevSceneDepth.Load(int3(pWorld, 0));
-            float dStatic = prevSceneDepth.Load(int3(pStatic, 0));
-            float dStaticCenter = prevSceneDepth.Load(int3(pixCoord, 0));
-            float expectedPriorDepth = depthB / prior.z;
-            float tol = max(1e-5, 0.025 * depth);
-            bool worldMatches = (dWorld > 0.0 && dWorld <= 1.0) && (abs(dWorld - expectedPriorDepth) <= tol);
-            bool staticMatches = ((dStatic > 0.0 && dStatic <= 1.0) && (abs(dStatic - depth) <= tol)) ||
-                                 ((dStaticCenter > 0.0 && dStaticCenter <= 1.0) && (abs(dStaticCenter - depth) <= tol));
-            if (!worldMatches && staticMatches) {
-                return 0.0;
-            }
+    // 2. Supercruise planetary body motion override (CelestialRecords):
+    if (hasCelestial && celestialCount > 0u) {
+        MotionResult celRes;
+        if (tryCelestialOverride(rawPixel, depth, view, prevProjHalf, celestialCount, isReset, celRes)) {
+            return celRes;
         }
     }
 
-    return worldMv;
+    // 3. Static/world geometry camera-depth reprojection via CPU-composed relative transform:
+    float3 prior = float3(dot(rel0.xyz, view) + rel0.w,
+                          dot(rel1.xyz, view) + rel1.w,
+                          dot(rel2.xyz, view) + rel2.w);
+    res.pixelClass = isReset ? kClassReset : kClassWorld;
+    if (prior.z <= 0.0) return res;
+    float2 priorPixel = prior.xy * rcp(prior.z) * prevProjHalf.xy + prevProjHalf.zw;
+    float expectedPriorDepth = depthB / prior.z;
+    return classifyAndFinishWorld(pixelCenter, rawPixel, priorPixel,
+        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit);
 }
 
-float2 ps(float4 pixel : SV_POSITION) : SV_Target {
-    return reprojectRel(pixel, now0, now1, now2, prev0.x, prev0.y, prev1, prev2, info.x, true);
+void writeOutputs(int2 pixCoord, MotionResult res) {
+    OutMotion[pixCoord] = sanitizeMotion(res.mv);
+    OutDepth[pixCoord] = isfinite(res.canonicalDepth) ? res.canonicalDepth : 0.0;
+    int modeFlags = int(info.w + 0.1);
+    if ((modeFlags & 4) != 0) {
+        OutClass[pixCoord] = res.pixelClass;
+    }
 }
 
-float2 ps_gpu(float4 pixel : SV_POSITION) : SV_Target {
+[numthreads(8, 8, 1)]
+void cs(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= uint(info.y) || tid.y >= uint(info.z)) return;
+    int2 pixCoord = int2(tid.xy);
+    float2 pixelCenter = float2(tid.xy) + 0.5;
+    uint celestialCount = uint(prev0.z + 0.1);
+    MotionResult res = reprojectRel(pixelCenter, pixCoord,
+        now0, now1, now2, prev0.y, celestialCount, prev1, prev2, info.x, true);
+    writeOutputs(pixCoord, res);
+}
+
+[numthreads(8, 8, 1)]
+void cs_gpu(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= uint(info.y) || tid.y >= uint(info.z)) return;
+    int2 pixCoord = int2(tid.xy);
+    float2 pixelCenter = float2(tid.xy) + 0.5;
+
+    MotionResult res;
+    res.mv = float2(0.0, 0.0);
+    res.canonicalDepth = sceneDepth.Load(int3(pixCoord, 0));
+    res.pixelClass = kClassSky;
+
     float3 currentW = float3(currentWords[270].w, currentWords[271].w, currentWords[272].w);
     float3 previousW = float3(previousWords[270].w, previousWords[271].w, previousWords[272].w);
     float curWW = max(dot(currentW, currentW), 1e-12);
@@ -210,7 +354,10 @@ float2 ps_gpu(float4 pixel : SV_POSITION) : SV_Target {
     float4 projection = float4(length(currentX), length(currentY),
         length(previousX), length(previousY));
     float depthB = currentWords[273].z;
-    if (any(projection <= 0) || depthB <= 0 || depthB > 1) return 0;
+    if (any(projection <= 0) || depthB <= 0 || depthB > 1) {
+        writeOutputs(pixCoord, res);
+        return;
+    }
     float4 current0 = float4(currentX.x / projection.x,
         currentY.x / projection.y, currentW.x, currentWords[233].w);
     float4 current1 = float4(currentX.y / projection.x,
@@ -223,8 +370,9 @@ float2 ps_gpu(float4 pixel : SV_POSITION) : SV_Target {
         previousY.y / projection.w, previousW.y, previousWords[234].w);
     float4 prior2 = float4(previousX.z / projection.z,
         previousY.z / projection.w, previousW.z, previousWords[235].w);
-    return reproject(pixel, current0, current1, current2, prior0, prior1,
-        prior2, projection, depthB, false);
+    res = reproject(pixelCenter, pixCoord, current0, current1, current2,
+        prior0, prior1, prior2, projection, depthB, false);
+    writeOutputs(pixCoord, res);
 }
 )";
 

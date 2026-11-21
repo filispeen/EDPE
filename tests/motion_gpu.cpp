@@ -1,4 +1,5 @@
 #include "motion_pass.h"
+#include "celestial_motion.h"
 
 #include <DirectXPackedVector.h>
 #include <d3dcompiler.h>
@@ -280,5 +281,258 @@ int main() {
     if (std::fabs(vm_x) >= 1e-4f || std::fabs(vm_y) >= 1e-4f) return 37;
     if (std::fabs(bar_x) >= 1e-4f || std::fabs(bar_y) >= 1e-4f) return 39;
     if (std::fabs(bg_x - bg_expected_x) >= 0.05f || std::fabs(bg_y - bg_expected_y) >= 0.05f) return 40;
+
+    // Verify canonical OutDepth and OutClass outputs from Compute Shader MotionPass.
+    if (!pass.canonicalDepth()) return 41;
+    if (!pass.render(vm_depth_view.Get(), now, previous, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, prev_vm_depth_view.Get(),
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true)) return 42;
+    if (!pass.pixelClass()) return 43;
+
+    D3D11_TEXTURE2D_DESC depth_rb_desc{};
+    depth_rb_desc.Width = depth_rb_desc.Height = 4;
+    depth_rb_desc.MipLevels = depth_rb_desc.ArraySize = 1;
+    depth_rb_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    depth_rb_desc.SampleDesc.Count = 1;
+    depth_rb_desc.Usage = D3D11_USAGE_STAGING;
+    depth_rb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> depth_rb;
+    if (FAILED(device->CreateTexture2D(&depth_rb_desc, nullptr, &depth_rb))) return 44;
+    context->CopyResource(depth_rb.Get(), pass.canonicalDepthTexture());
+    if (FAILED(context->Map(depth_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 45;
+    const auto* drow1 = reinterpret_cast<const float*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float canonical_vm_d = drow1[1];
+    context->Unmap(depth_rb.Get(), 0);
+    if (std::fabs(canonical_vm_d - 0.1676f) >= 1e-4f) return 46;
+
+    D3D11_TEXTURE2D_DESC cls_rb_desc = depth_rb_desc;
+    cls_rb_desc.Format = DXGI_FORMAT_R8_UINT;
+    ComPtr<ID3D11Texture2D> cls_rb;
+    if (FAILED(device->CreateTexture2D(&cls_rb_desc, nullptr, &cls_rb))) return 47;
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 48;
+    const auto* crow1 = static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch;
+    const std::uint8_t vm_cls = crow1[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (vm_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::CockpitStatic)) return 49;
+
+    // Near world wall (z = 2.0m < 3.5m) during fast lateral translation (translationStep = 1.0m > 0.35m)
+    // must NOT be zeroed when prevSceneDepth matches the reprojected world position.
+    std::array<std::uint64_t, 16> near_cur{}, near_prev{};
+    near_cur.fill(std::bit_cast<std::uint32_t>(0.0125f));  // z = 0.025 / 0.0125 = 2.0m
+    near_prev.fill(std::bit_cast<std::uint32_t>(0.0125f)); // same plane at z = 2.0m
+    D3D11_SUBRESOURCE_DATA near_cur_init{near_cur.data(), 4 * sizeof(std::uint64_t), 0};
+    D3D11_SUBRESOURCE_DATA near_prev_init{near_prev.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> near_cur_tex, near_prev_tex;
+    ComPtr<ID3D11ShaderResourceView> near_cur_srv, near_prev_srv;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &near_cur_init, &near_cur_tex)) ||
+        FAILED(device->CreateShaderResourceView(near_cur_tex.Get(), &view_desc, &near_cur_srv)) ||
+        FAILED(device->CreateTexture2D(&vm_depth_desc, &near_prev_init, &near_prev_tex)) ||
+        FAILED(device->CreateShaderResourceView(near_prev_tex.Get(), &view_desc, &near_prev_srv))) {
+        return 50;
+    }
+    edpe::CameraProjection walkPrev{{1,0,0,0, 0,1,0,0, 0,0,1,0}, 1, 1, 0.025f};
+    auto walkNow = walkPrev;
+    walkNow.worldFromView[3] = 1.0f; // 1.0m lateral step (> 0.35m), pixel (1,1) reprojects to (2.5, 1.5) -> mv.x = +1.0
+    if (!pass.render(near_cur_srv.Get(), walkNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, near_prev_srv.Get(),
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true)) return 51;
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 52;
+    const auto* walk_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float walk_mv_x = DirectX::PackedVector::XMConvertHalfToFloat(walk_row1[2]);
+    const float walk_mv_y = DirectX::PackedVector::XMConvertHalfToFloat(walk_row1[3]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(walk_mv_x - 1.0f) >= 0.05f || std::fabs(walk_mv_y) >= 0.05f) return 53;
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 54;
+    const std::uint8_t walk_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (walk_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::World)) return 55;
+
+    // Planar bilinear prevDepthMatches: sloped floor where depth varies linearly across 2x2 quad
+    // by > 1% per texel, yet exact bilinear matches expected depth within 1% and twist == 0.
+    std::array<std::uint64_t, 16> slope_prev{}, slope_cur{};
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            const float d = 0.010f + 0.002f * static_cast<float>(x) + 0.002f * static_cast<float>(y);
+            slope_prev[y * 4 + x] = std::bit_cast<std::uint32_t>(d);
+            slope_cur[y * 4 + x] = std::bit_cast<std::uint32_t>(d);
+        }
+    }
+    // Pixel (1,1) has priorPixel shifted by (+0.5, +0.5) via jitter-free small camera shift:
+    // bilinear at (2.0, 2.0) -> raster (1.5, 1.5) -> midpoint of (1,1),(2,1),(1,2),(2,2) = 0.010 + 0.003 + 0.003 = 0.016.
+    // Nearest texels are 0.014, 0.016, 0.016, 0.018; use shift (+0.5, 0) where midpoint of (1,1)=0.014 and (2,1)=0.016 is 0.015 (6.7% from both!).
+    slope_cur[5] = std::bit_cast<std::uint32_t>(0.015f);
+    D3D11_SUBRESOURCE_DATA slope_cur_init{slope_cur.data(), 4 * sizeof(std::uint64_t), 0};
+    D3D11_SUBRESOURCE_DATA slope_prev_init{slope_prev.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> slope_cur_tex, slope_prev_tex;
+    ComPtr<ID3D11ShaderResourceView> slope_cur_srv, slope_prev_srv;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &slope_cur_init, &slope_cur_tex)) ||
+        FAILED(device->CreateShaderResourceView(slope_cur_tex.Get(), &view_desc, &slope_cur_srv)) ||
+        FAILED(device->CreateTexture2D(&vm_depth_desc, &slope_prev_init, &slope_prev_tex)) ||
+        FAILED(device->CreateShaderResourceView(slope_prev_tex.Get(), &view_desc, &slope_prev_srv))) {
+        return 56;
+    }
+    // For z = 0.025 / 0.015 = 1.66667m, scaleX = 1, width = 4: dx = 0.5 * z / (0.5 * 4) = 0.416667m shifts priorPixel.x by +0.5.
+    auto slopeNow = walkPrev;
+    slopeNow.worldFromView[3] = (0.025f / 0.015f) * 0.25f;
+    if (!pass.render(slope_cur_srv.Get(), slopeNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, slope_prev_srv.Get(),
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true)) return 57;
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 58;
+    const std::uint8_t slope_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (slope_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::World)) return 59;
+
+    // Offscreen FG vector preservation & fp16 clamp:
+    // Large lateral shift moves priorPixel well outside [0, 4) -> MV must stay physical (not zero),
+    // finite, clamped to <= 65504, and tagged OffscreenFG.
+    auto offscreenNow = walkPrev;
+    offscreenNow.worldFromView[3] = 20.0f; // at z = 10m, priorPixel.x = 1.5 + 4.0 = 5.5 (offscreen), mv.x = +4.0
+    if (!pass.render(depth_view.Get(), offscreenNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true)) return 60;
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 61;
+    const auto* off_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float off_mv_x = DirectX::PackedVector::XMConvertHalfToFloat(off_row1[2]);
+    context->Unmap(readback.Get(), 0);
+    if (!std::isfinite(off_mv_x) || std::fabs(off_mv_x - 4.0f) >= 0.05f) return 62;
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 63;
+    const std::uint8_t off_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (off_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::OffscreenFG)) return 64;
+
+    // Extreme huge translation must clamp cleanly to fp16 max (65504), never producing Inf/NaN.
+    auto hugeNow = walkPrev;
+    hugeNow.worldFromView[3] = 1e7f;
+    if (!pass.render(depth_view.Get(), hugeNow, walkPrev, 4, 4)) return 65;
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 66;
+    const auto* huge_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float huge_mv_x = DirectX::PackedVector::XMConvertHalfToFloat(huge_row1[2]);
+    context->Unmap(readback.Get(), 0);
+    if (!std::isfinite(huge_mv_x) || std::fabs(huge_mv_x - 65504.0f) >= 64.0f) return 67;
+
+    // Floating-origin re-anchor (zeroTranslation = true): 5000m jump with zero rotation -> 0 MV.
+    auto rebaseNow = walkPrev;
+    rebaseNow.worldFromView[3] = 5000.0f;
+    if (!pass.render(depth_view.Get(), rebaseNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/true)) return 68;
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 69;
+    const auto* reb_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float reb_mv_x = DirectX::PackedVector::XMConvertHalfToFloat(reb_row1[2]);
+    const float reb_mv_y = DirectX::PackedVector::XMConvertHalfToFloat(reb_row1[3]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(reb_mv_x) >= 1e-4f || std::fabs(reb_mv_y) >= 1e-4f) return 70;
+
+    // Stage 2.1 GPU test: stencil 0x10 pixel covered by valid WeaponMotion overrides
+    // OutMotion, rescales OutDepth to canonicalDepth, and classifies pixel as Weapon (4).
+    std::array<std::uint64_t, 16> st_depths{};
+    st_depths.fill(std::bit_cast<std::uint32_t>(0.0025f));
+    // Pixel (1,1): depth=0.27f, stencil=0x10 (upper 32-bit word low byte in R32G8X24_TYPELESS).
+    st_depths[5] = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.27f)) |
+                   (static_cast<std::uint64_t>(0x10u) << 32);
+    D3D11_SUBRESOURCE_DATA st_init{st_depths.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> st_depth_tex;
+    ComPtr<ID3D11ShaderResourceView> st_depth_srv;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &st_init, &st_depth_tex)) ||
+        FAILED(device->CreateShaderResourceView(st_depth_tex.Get(), &view_desc, &st_depth_srv))) return 71;
+
+    std::array<std::uint16_t, 16 * 4> wm_pixels{};
+    wm_pixels[5 * 4 + 0] = DirectX::PackedVector::XMConvertFloatToHalf(3.25f);
+    wm_pixels[5 * 4 + 1] = DirectX::PackedVector::XMConvertFloatToHalf(-1.5f);
+    wm_pixels[5 * 4 + 2] = DirectX::PackedVector::XMConvertFloatToHalf(0.10f); // canonicalDepth
+    wm_pixels[5 * 4 + 3] = DirectX::PackedVector::XMConvertFloatToHalf(1.0f);  // valid
+    D3D11_TEXTURE2D_DESC wm_desc{};
+    wm_desc.Width = wm_desc.Height = 4;
+    wm_desc.MipLevels = wm_desc.ArraySize = 1;
+    wm_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    wm_desc.SampleDesc.Count = 1;
+    wm_desc.Usage = D3D11_USAGE_DEFAULT;
+    wm_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA wm_sub{wm_pixels.data(), 4 * 4 * sizeof(std::uint16_t), 0};
+    ComPtr<ID3D11Texture2D> wm_tex;
+    ComPtr<ID3D11ShaderResourceView> wm_srv;
+    if (FAILED(device->CreateTexture2D(&wm_desc, &wm_sub, &wm_tex)) ||
+        FAILED(device->CreateShaderResourceView(wm_tex.Get(), nullptr, &wm_srv))) return 72;
+
+    if (!pass.render(st_depth_srv.Get(), walkPrev, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, wm_srv.Get(), nullptr)) return 73;
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(depth_rb.Get(), pass.canonicalDepthTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 74;
+    const auto* wm_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float w_out_x = DirectX::PackedVector::XMConvertHalfToFloat(wm_row1[2]);
+    const float w_out_y = DirectX::PackedVector::XMConvertHalfToFloat(wm_row1[3]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(w_out_x - 3.25f) >= 0.02f || std::fabs(w_out_y - (-1.5f)) >= 0.02f) return 75;
+    if (FAILED(context->Map(depth_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 76;
+    const float w_out_d = reinterpret_cast<const float*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(depth_rb.Get(), 0);
+    if (std::fabs(w_out_d - 0.10f) >= 1e-3f) return 77;
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 78;
+    const std::uint8_t w_out_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (w_out_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 79;
+
+    // Stage 2.2 GPU test: Supercruise CelestialRecord overrides world reprojection
+    // for pixels inside the body's screen box, depth span, and radial shell.
+    const float celCur[12] = {1,0,0,0, 0,1,0,0, 0,0,1,10.0f};
+    const float celPrev[12] = {1,0,0,5.0f, 0,1,0,0, 0,0,1,10.0f}; // +5m X shift -> +1.0px at z=10m
+    edpe::CelestialRecord celRec = edpe::buildCelestialRecord(
+        celCur, celPrev, 0.0f, 0.0f, 4.0f, 4.0f, 0.001f, 0.01f, 1.5f, 1.5f, 0.0f, 4.0f);
+    D3D11_BUFFER_DESC cel_desc{};
+    cel_desc.ByteWidth = sizeof(edpe::CelestialRecord);
+    cel_desc.Usage = D3D11_USAGE_DEFAULT;
+    cel_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    cel_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    cel_desc.StructureByteStride = sizeof(edpe::CelestialRecord);
+    D3D11_SUBRESOURCE_DATA cel_init{&celRec, 0, 0};
+    ComPtr<ID3D11Buffer> cel_buf;
+    ComPtr<ID3D11ShaderResourceView> cel_srv;
+    D3D11_SHADER_RESOURCE_VIEW_DESC cel_srv_desc{};
+    cel_srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+    cel_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    cel_srv_desc.Buffer.NumElements = 1;
+    if (FAILED(device->CreateBuffer(&cel_desc, &cel_init, &cel_buf)) ||
+        FAILED(device->CreateShaderResourceView(cel_buf.Get(), &cel_srv_desc, &cel_srv))) return 80;
+
+    if (!pass.render(depth_view.Get(), walkPrev, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, nullptr, nullptr, cel_srv.Get(), 1u)) return 81;
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 82;
+    const auto* cel_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float cel_mv_x = DirectX::PackedVector::XMConvertHalfToFloat(cel_row1[2]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(cel_mv_x - 1.0f) >= 0.05f) return 83;
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 84;
+    const std::uint8_t cel_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (cel_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Celestial)) return 85;
+
     return 0;
 }

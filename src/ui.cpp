@@ -2265,18 +2265,49 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         }
 
         if (ImGui::CollapsingHeader("Debug View")) {
-            const char* debug_view_items[] = {
+            const char* debug_view_items_dev[] = {
+                "None",
+                "Subpixel Jitter",
+                "Motion Class (DEV)",
+                "Feet pictures" // will not be implemented, you can check thoose in google
+            };
+            const char* debug_view_items_user[] = {
                 "None",
                 "Subpixel Jitter",
                 "Feet pictures" // will not be implemented, you can check thoose in google
             };
-            int current_debug_view = ContextCensusGetJitterDebugView() ? 1 : 0;
-            if (ImGui::Combo("Debug view", &current_debug_view, debug_view_items, IM_ARRAYSIZE(debug_view_items))) {
+            int current_debug_view = 0;
+            if (ContextCensusGetJitterDebugView()) current_debug_view = 1;
+            else if (cfg.devMode && ContextCensusGetMotionClassDebugView()) current_debug_view = 2;
+
+            const char* const* items = cfg.devMode ? debug_view_items_dev : debug_view_items_user;
+            const int item_count = cfg.devMode ? IM_ARRAYSIZE(debug_view_items_dev) : IM_ARRAYSIZE(debug_view_items_user);
+            if (ImGui::Combo("Debug view", &current_debug_view, items, item_count)) {
                 const bool enable_jitter_debug = (current_debug_view == 1);
+                const bool enable_mc_debug = cfg.devMode && (current_debug_view == 2);
                 ContextCensusSetHudDebugView(false);
                 ContextCensusSetJitterDebugView(enable_jitter_debug);
+                ContextCensusSetMotionClassDebugView(enable_mc_debug);
             }
-            TextDisabledWrapped("Dims and desaturates the game view while highlighting subpixel jitter pixels in green.");
+            if (cfg.devMode && ContextCensusGetMotionClassDebugView()) {
+                TextDisabledWrapped("Color-codes MotionPass OutClass: Sky (blue), World (green), CockpitStatic (amber), Disoccluded (red), Weapon (cyan), Celestial (violet), OffscreenFG (magenta), Reset (white).");
+                uint32_t counts[8]{};
+                uint32_t total = 0;
+                if (ContextCensusGetMotionClassStats(counts, &total) && total > 0) {
+                    static const char* const kClassNames[8] = {
+                        "Sky", "World", "CockpitStatic", "Disoccluded",
+                        "Weapon", "Celestial", "OffscreenFG", "Reset"
+                    };
+                    const float inv = 100.0f / static_cast<float>(total);
+                    for (int i = 0; i < 8; ++i) {
+                        ImGui::Text("%s: %.1f%% (%u)", kClassNames[i], counts[i] * inv, counts[i]);
+                    }
+                    const uint32_t refusals = counts[2] + counts[3] + counts[7];
+                    ImGui::TextDisabled("Refusals (CockpitStatic+Disoccluded+Reset): %.1f%%", refusals * inv);
+                }
+            } else {
+                TextDisabledWrapped("Dims and desaturates the game view while highlighting subpixel jitter pixels in green.");
+            }
         }
 
         ImGui::Spacing();

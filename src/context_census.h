@@ -3,6 +3,7 @@
 #include <dxgi.h>
 #include <d3d11.h>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 
 extern std::atomic<bool> g_is_evaluating_upscaler;
@@ -115,6 +116,9 @@ int ContextCensusGetJitterDebugMode();
 // Cockpit HUD & UI Mask Debug View (Full-screen grayscale game scene + amber HUD & cyan UI mask pixels)
 void ContextCensusSetHudDebugView(bool enable);
 bool ContextCensusGetHudDebugView();
+void ContextCensusSetMotionClassDebugView(bool enable);
+bool ContextCensusGetMotionClassDebugView();
+bool ContextCensusGetMotionClassStats(uint32_t outCounts[8], uint32_t* outTotalSamples);
 void ContextCensusToggleHudDebugView();
 void ContextCensusSetHudDebugOpacity(float opacity);
 float ContextCensusGetHudDebugOpacity();

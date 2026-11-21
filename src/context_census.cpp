@@ -16,6 +16,7 @@
 #include "ui.h"
 #include "jitter_logger.h"
 #include "jitter_debug_pass.h"
+#include "motion_class_debug_pass.h"
 #include "hud_debug_pass.h"
 #include "jitter_view_recorder.h"
 #include "profiler.h"
@@ -549,6 +550,7 @@ static bool s_has_probe_fallback_camera = false;
 static bool s_probe_fallback_from_in_scene = false;
 static bool s_probe_fallback_parse_ok = false;
 static bool s_last_committed_scene_cut = false;
+static bool s_last_committed_origin_reanchor = false;
 static unsigned s_teleport_rejection_streak = 0;
 static unsigned long long s_last_teleport_rejection_frame = ~0ull;
 static unsigned s_cut_rejection_streak = 0;
@@ -778,6 +780,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         s_consecutive_fallback_frames == 0;
 
     out_scene_cut = false;
+    s_last_committed_origin_reanchor = false;
     if (haveNormalStaged || useProbeOrientationFallback) {
         const edpe::CameraProjection committedCam = [&]() {
             if (haveNormalStaged && !useOrientationOnlyHold) {
@@ -823,7 +826,11 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                         ? (rendered_frame - s_last_true_camera_frame)
                         : 1ull;
                 const edpe::Vec3 predictedTrueDelta = s_prev_valid_velocity * static_cast<float>(gap);
-                if (edpe::isUnpredictedPositionCut(trueDelta, predictedTrueDelta)) {
+                if (edpe::isFloatingOriginReanchor(s_last_true_camera, committedCam)) {
+                    out_scene_cut = false;
+                    s_last_committed_origin_reanchor = true;
+                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                } else if (edpe::isUnpredictedPositionCut(trueDelta, predictedTrueDelta)) {
                     out_scene_cut = true;
                     s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                 } else {
@@ -837,7 +844,11 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                 s_camera_previous_frame = s_camera_frame;
                 const edpe::Vec3 newDelta =
                     edpe::cameraPosition(committedCam) - edpe::cameraPosition(s_camera_now);
-                if (edpe::isUnpredictedPositionCut(newDelta, s_prev_valid_velocity)) {
+                if (edpe::isFloatingOriginReanchor(s_camera_now, committedCam)) {
+                    out_scene_cut = false;
+                    s_last_committed_origin_reanchor = true;
+                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                } else if (edpe::isUnpredictedPositionCut(newDelta, s_prev_valid_velocity)) {
                     out_scene_cut = true;
                     s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                 } else {
@@ -1706,6 +1717,8 @@ std::atomic<bool> s_preserve_native_ui{true};
 std::atomic<float> s_sharpness{0.0f};
 
 std::atomic<bool> s_jitter_debug_view{false};
+std::atomic<bool> s_motion_class_debug_view{false};
+edpe::MotionClassStats s_motion_class_stats{};
 std::atomic<float> s_jitter_debug_sensitivity{1.5f};
 std::atomic<float> s_jitter_debug_threshold{0.02f};
 std::atomic<int> s_jitter_debug_mode{0};
@@ -1773,6 +1786,7 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud);
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void renderHudDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
+void renderMotionClassDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void rearmContextHooks();
 
 static ID3D11RenderTargetView* s_cached_hdr_rtv0 = nullptr;
@@ -10865,7 +10879,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const float dz = c[11] - p[11];
     const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
     const float rotTrace = edpe::cameraRotationTrace(s_camera_now, s_camera_previous);
-    const bool teleport_cut = (moveDist > 5000.0f);
+    const bool origin_reanchor = s_last_committed_origin_reanchor ||
+        edpe::isFloatingOriginReanchor(s_camera_previous, s_camera_now);
+    const bool teleport_cut = !origin_reanchor && (moveDist > 5000.0f);
     const bool phase_count_reset = s_phase_count_changed_reset.exchange(false, std::memory_order_acq_rel);
     scene_cut = scene_cut || (s_camera_previous_frame == ~0ull) || teleport_cut || phase_count_reset;
 
@@ -10876,7 +10892,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const float prev_jx = eval_reset ? 0.0f : s_prev_eval_jitter_x;
     const float prev_jy = eval_reset ? 0.0f : s_prev_eval_jitter_y;
 
-    const bool need_motion = upscale_active || s_jitter_debug_view.load(std::memory_order_relaxed);
+    const bool want_motion_class_debug = edpe::Config::instance().devMode && s_motion_class_debug_view.load(std::memory_order_relaxed);
+    const bool need_motion = upscale_active || s_jitter_debug_view.load(std::memory_order_relaxed) || want_motion_class_debug;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
     ID3D11ShaderResourceView* prevDepthSrv = nullptr;
     if (need_motion) {
@@ -10914,8 +10931,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 // Render motion vectors at render resolution using current and previous camera projections and jitter phases
                 motion_pass->render(motion_depth_view.Get(),
                     s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
-                    jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv, nullptr,
-                    /*preserveContextState=*/false);
+                    jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv,
+                    /*preserveContextState=*/false,
+                    /*zeroTranslation=*/origin_reanchor,
+                    /*enableClassOutput=*/want_motion_class_debug);
             }
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
         }
@@ -11397,6 +11416,79 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         edpe::JitterLogger::instance().pushFrame(jlog);
     }
 
+    rearmContextHooks();
+}
+
+void renderMotionClassDebugView(ID3D11DeviceContext* context, unsigned long long rendered,
+    ID3D11Texture2D* backbuffer) {
+    (void)rendered;
+    if (!context || !backbuffer || !motion_pass || !motion_pass->pixelClass()) return;
+    std::lock_guard<std::recursive_mutex> sceneLock(g_scene_ctx_mutex);
+
+    D3D11_TEXTURE2D_DESC bbDesc{};
+    backbuffer->GetDesc(&bbDesc);
+    if (!bbDesc.Width || !bbDesc.Height || bbDesc.SampleDesc.Count != 1) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return;
+
+    static ID3D11Device* s_mc_device = nullptr;
+    static std::unique_ptr<edpe::MotionClassDebugPass> s_mc_pass;
+    static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_mc_input_copy;
+    static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_mc_input_srv;
+    static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_mc_rtv;
+    static ID3D11Texture2D* s_mc_cached_bb = nullptr;
+
+    if (s_mc_device != device.Get()) {
+        s_mc_pass.reset();
+        s_mc_input_copy.Reset();
+        s_mc_input_srv.Reset();
+        s_mc_rtv.Reset();
+        s_mc_cached_bb = nullptr;
+        s_mc_device = device.Get();
+    }
+    if (!s_mc_pass) {
+        auto pass = std::make_unique<edpe::MotionClassDebugPass>();
+        if (!pass->initialize(device.Get(), context)) return;
+        s_mc_pass = std::move(pass);
+    }
+    if (s_mc_cached_bb != backbuffer || !s_mc_rtv) {
+        s_mc_cached_bb = backbuffer;
+        s_mc_rtv.Reset();
+        if (FAILED(device->CreateRenderTargetView(backbuffer, nullptr, &s_mc_rtv))) return;
+    }
+    const DXGI_FORMAT typedFormat = concreteLdrColorFormat(bbDesc.Format);
+    if (s_mc_input_copy) {
+        D3D11_TEXTURE2D_DESC cur{};
+        s_mc_input_copy->GetDesc(&cur);
+        if (cur.Width != bbDesc.Width || cur.Height != bbDesc.Height || cur.Format != typedFormat) {
+            s_mc_input_copy.Reset();
+            s_mc_input_srv.Reset();
+        }
+    }
+    if (!s_mc_input_copy) {
+        D3D11_TEXTURE2D_DESC td = bbDesc;
+        td.Format = typedFormat;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = td.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&td, nullptr, &s_mc_input_copy)) ||
+            FAILED(device->CreateShaderResourceView(s_mc_input_copy.Get(), nullptr, &s_mc_input_srv))) {
+            s_mc_input_copy.Reset();
+            s_mc_input_srv.Reset();
+            return;
+        }
+    }
+    context->CopyResource(s_mc_input_copy.Get(), backbuffer);
+
+    D3D11_TEXTURE2D_DESC clsDesc{};
+    motion_pass->pixelClassTexture()->GetDesc(&clsDesc);
+    if (s_mc_pass->render(context, s_mc_input_srv.Get(), motion_pass->pixelClass(),
+            s_mc_rtv.Get(), bbDesc.Width, bbDesc.Height,
+            clsDesc.Width, clsDesc.Height, 0.65f, false)) {
+        s_motion_class_stats = s_mc_pass->lastStats();
+    }
     rearmContextHooks();
 }
 
@@ -13250,7 +13342,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 const bool hud_debug_active = s_hud_debug_view.load(std::memory_order_relaxed);
                 advanceComparisonSequence();
                 if (!s_upscale_evaluated_this_frame &&
-                    (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active || hud_debug_active)) {
+                    (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active || hud_debug_active || (edpe::Config::instance().devMode && s_motion_class_debug_view.load(std::memory_order_relaxed)))) {
                     tryTemporalUpscale(context, rendered_frame, backbuffer.Get());
                 }
                 if (debug_view_active) {
@@ -13258,6 +13350,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 }
                 if (hud_debug_active) {
                     renderHudDebugView(context, rendered_frame, backbuffer.Get());
+                }
+                if (edpe::Config::instance().devMode && s_motion_class_debug_view.load(std::memory_order_relaxed)) {
+                    renderMotionClassDebugView(context, rendered_frame, backbuffer.Get());
                 }
                 s_hud_mask_latest_draws.store(s_hud_draws_replayed_frame, std::memory_order_relaxed);
                 if (s_hud_draws_replayed_frame == 0) {
@@ -14604,6 +14699,24 @@ ID3D11RenderTargetView* ContextCensusGetBackbufferCopyRtv() {
 void ContextCensusSetJitterDebugView(bool enable) {
     s_jitter_debug_view.store(enable, std::memory_order_relaxed);
     edpe::Config::instance().jitterDebugView = enable;
+}
+
+void ContextCensusSetMotionClassDebugView(bool enable) {
+    s_motion_class_debug_view.store(enable, std::memory_order_relaxed);
+}
+
+bool ContextCensusGetMotionClassDebugView() {
+    return s_motion_class_debug_view.load(std::memory_order_relaxed);
+}
+
+bool ContextCensusGetMotionClassStats(uint32_t outCounts[8], uint32_t* outTotalSamples) {
+    std::lock_guard<std::recursive_mutex> sceneLock(g_scene_ctx_mutex);
+    if (!s_motion_class_stats.valid) return false;
+    if (outCounts) {
+        for (int i = 0; i < 8; ++i) outCounts[i] = s_motion_class_stats.counts[i];
+    }
+    if (outTotalSamples) *outTotalSamples = s_motion_class_stats.totalSamples;
+    return true;
 }
 
 bool ContextCensusGetJitterDebugView() {
