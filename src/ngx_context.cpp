@@ -404,9 +404,10 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
         // On the linear HDR route H is pre-tonemap radiance that the game's own tone pass exposes
         // after the resolve. Do NOT enable AutoExposure when supplying fixed 1.0f HDR exposure.
         cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
-    } else {
-        cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     }
+    // On the LDR route the input is already tonemapped and auto-exposed by the game; enabling
+    // AutoExposure on LDR causes DLSS to re-estimate exposure on dark/bright transitions (e.g.
+    // night settlement interiors) and blow out lighting.
 
     NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &slot.handle, g_ngx_params, &cp);
     if (r != NVSDK_NGX_Result_Success || !slot.handle) {

@@ -451,5 +451,53 @@ int main() {
         return 99;
     }
 
+    // 33. Small-angle rotation precision via atan2(s, c) (< 0.02 deg where acos collapses).
+    for (float smallDeg : {0.001f, 0.005f, 0.01f, 0.02f}) {
+        const auto smallDelta = edpe::cameraDelta(identity(), yawed(smallDeg));
+        if (std::fabs(smallDelta.rotationDeg - smallDeg) > 1e-4) return 102;
+    }
+
+    // 34. Floating-origin re-anchor (~5 km rebase pulling camera back near origin)
+    // must be detected without requiring a full temporal history reset.
+    auto prevFar = identity();
+    prevFar.worldFromView[3] = 5000.0f;
+    prevFar.worldFromView[11] = -250.0f;
+    auto nowReanchored = yawed(0.5f); // < 1.15 deg turn during rebase
+    nowReanchored.worldFromView[3] = 4.5f;
+    nowReanchored.worldFromView[11] = -1.2f;
+    double rebaseStep = 0.0;
+    if (!edpe::isFloatingOriginReanchor(prevFar, nowReanchored, &rebaseStep)) return 103;
+    if (rebaseStep < 4900.0) return 104;
+
+    // Small step (< 50 m) is normal flight, not an origin re-anchor.
+    auto normalStep = identity();
+    normalStep.worldFromView[3] = 30.0f;
+    auto normalPrev = identity();
+    normalPrev.worldFromView[3] = 45.0f;
+    if (edpe::isFloatingOriginReanchor(normalPrev, normalStep)) return 105;
+
+    // Moving away from origin (nowLen >= prevLen) is not an origin re-anchor.
+    if (edpe::isFloatingOriginReanchor(nowReanchored, prevFar)) return 106;
+
+    // Large rotation (> ~1.15 deg, trace < 2.9996) rejects re-anchor.
+    auto turnedReanchor = yawed(5.0f);
+    turnedReanchor.worldFromView[3] = 4.5f;
+    if (edpe::isFloatingOriginReanchor(prevFar, turnedReanchor)) return 107;
+
+    // Projection cut (depthB or FOV jump > 25%) rejects re-anchor.
+    auto cutReanchor = nowReanchored;
+    cutReanchor.depthB = 0.0675f;
+    if (edpe::isFloatingOriginReanchor(prevFar, cutReanchor)) return 108;
+
+    // 35. Slope/stair walking at ~68.2mm/frame and vertical jetpack/thrust at ~272.8mm/frame
+    // MUST NOT be misclassified as the 136.4mm cockpit head probe.
+    auto slopeWalk = identity();
+    slopeWalk.worldFromView[7] = 0.045f;
+    slopeWalk.worldFromView[11] = 0.051f; // |d| ~= 0.0680m, dUp >= 0.40 * dist
+    if (edpe::isStereoEyeOrIpdProbe(slopeWalk, identity())) return 109;
+    auto verticalThrust = identity();
+    verticalThrust.worldFromView[7] = 0.2728f;
+    if (edpe::isStereoEyeOrIpdProbe(verticalThrust, identity())) return 110;
+
     return 0;
 }

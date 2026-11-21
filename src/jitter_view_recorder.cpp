@@ -503,6 +503,9 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                 slot.sceneW = passInfo.inW;
                 slot.sceneH = passInfo.inH;
                 slot.hasLuma = (inputColorSrv != nullptr && passInfo.inW > 0 && passInfo.inH > 0);
+                slot.pairCheckValid = jl.pairCheckValid;
+                slot.pairCheckOk = jl.pairCheckOk;
+                slot.pairErrNdc = jl.pairErrNdc;
                 slot.inFlight = true;
 
                 writeSlot_ = (writeSlot_ + 1) % kRingSize;
@@ -546,6 +549,9 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                     frameData.meta.mode = s.mode;
                     frameData.meta.sceneW = s.sceneW;
                     frameData.meta.sceneH = s.sceneH;
+                    frameData.meta.pairCheckValid = s.pairCheckValid;
+                    frameData.meta.pairCheckOk = s.pairCheckOk;
+                    frameData.meta.pairErrNdc = s.pairErrNdc;
 
                     const uint32_t* mappedData = static_cast<const uint32_t*>(mapped.pData);
                     std::memcpy(frameData.tiles.data(), mappedData, kJitterViewGridTiles * sizeof(uint32_t));
@@ -613,6 +619,9 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                 frameData.meta.mode = s.mode;
                 frameData.meta.sceneW = s.sceneW;
                 frameData.meta.sceneH = s.sceneH;
+                frameData.meta.pairCheckValid = s.pairCheckValid;
+                frameData.meta.pairCheckOk = s.pairCheckOk;
+                frameData.meta.pairErrNdc = s.pairErrNdc;
 
                 const uint32_t* mappedData = static_cast<const uint32_t*>(mapped.pData);
                 std::memcpy(frameData.tiles.data(), mappedData, kJitterViewGridTiles * sizeof(uint32_t));

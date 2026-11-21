@@ -74,6 +74,8 @@ add_library(EDPE_DXGI SHARED
     src/perf_overlay.cpp
     src/input_hook.cpp
     src/motion_pass.cpp
+    src/weapon_motion.cpp
+    src/celestial_motion.cpp
     src/ui_layer.cpp
     src/ui_layer.h
     src/shaders/ui_layer_composite_cs.hlsl
@@ -84,6 +86,7 @@ add_library(EDPE_DXGI SHARED
     src/sharpen_pass.cpp
     src/jitter_logger.cpp
     src/jitter_debug_pass.cpp
+    src/motion_class_debug_pass.cpp
     src/jitter_view_recorder.cpp
     src/hud_debug_pass.cpp
     src/renderdoc_support.cpp
@@ -185,6 +188,11 @@ add_executable(camera_delta_test tests/camera_delta.cpp)
 target_compile_features(camera_delta_test PRIVATE cxx_std_20)
 target_include_directories(camera_delta_test PRIVATE src)
 add_test(NAME camera_delta COMMAND camera_delta_test)
+add_executable(motion_stage2_test tests/motion_stage2.cpp)
+target_compile_features(motion_stage2_test PRIVATE cxx_std_20)
+target_compile_definitions(motion_stage2_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(motion_stage2_test PRIVATE src)
+add_test(NAME motion_stage2 COMMAND motion_stage2_test)
 add_executable(capture_format_test tests/capture_format.cpp)
 target_compile_features(capture_format_test PRIVATE cxx_std_20)
 target_include_directories(capture_format_test PRIVATE src)

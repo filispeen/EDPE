@@ -4,7 +4,7 @@
 
 [![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version&style=for-the-badge)](https://github.com/filispeen/EDPE/releases/latest)
 ![CI](https://img.shields.io/github/actions/workflow/status/filispeen/EDPE/CI.yml?style=for-the-badge&label=CI)
-[![Tests](https://img.shields.io/badge/tests-22%2F22%20Passing-brightgreen.svg?style=for-the-badge)]()
+[![Tests](https://img.shields.io/badge/tests-23%2F23%20Passing-brightgreen.svg?style=for-the-badge)]()
 
 [![Status](https://img.shields.io/badge/status-in%20development-yellow.svg?style=for-the-badge)](STATUS.md)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20x64-blue.svg?style=for-the-badge)]()
@@ -150,6 +150,7 @@ SwapXY=0
 Scale=1.00
 ; Repo edpe.ini defaults to 8; config.h fallback is 32 if omitted
 PhaseCount=8
+Mode=auto
 
 [Motion]
 ZeroMotion=0
@@ -212,7 +213,7 @@ Build outputs:
 * `build/Release/dxgi.dll`: compiled proxy DLL
 * `build/stage/`: staged runtime files (`dxgi.dll`, plus `nvngx_dlss.dll`, `amd_fidelityfx_framegeneration_dx12.dll` / FFX loader DLLs, and `sl.*.dll` when the optional vendor SDKs are present)
 
-Run the 22 automated tests with CTest:
+Run the 23 automated tests with CTest:
 
 ```powershell
 ctest --test-dir build -C Release --output-on-failure
@@ -221,6 +222,7 @@ ctest --test-dir build -C Release --output-on-failure
 Test targets in `CMakeLists.txt`:
 
 * `temporal_math`: Halton sequence generation, projection blocks, matrix rejection invariants
+* `motion_stage2`: Stage 2 weapon/celestial motion and pixel classification checks
 * `camera_delta`: camera delta math, event flags, scene reset detection
 * `capture_format`: half-float, float11/10 unpackers, depth contrast, Reinhard tone mapping
 * `temporal_inputs`: scaling math, input validation, NVIDIA/AMD conventions, fail-open behavior
@@ -302,7 +304,7 @@ EDPE/
 │   ├── ui_composite_pass.cpp / .h      # Native UI and HUD mask composite pass
 │   ├── ui_layer.cpp / .h               # Live cockpit HUD draw redirection layer
 │   └── upscaler_backend.cpp / .h       # IUpscalerBackend implementations (DLSS, FSR 3.1.2, TAA)
-├── tests/                              # 20 source files producing 22 CTest targets
+├── tests/                              # 21 source files producing 23 CTest targets
 ├── tools/
 │   ├── fetch_ffx_dx11.py               # Fetches and builds FidelityFX DX11 SDK
 │   └── ngx_probe/                      # Standalone hardware NGX diagnostic probe
