@@ -65,6 +65,9 @@ public:
         if (jitterScale < 0.0f || jitterScale > 2.0f) jitterScale = 1.0f;
 
         jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 32, path.c_str());
+        wchar_t modeBuf[64]{};
+        GetPrivateProfileStringW(L"Jitter", L"Mode", L"auto", modeBuf, 64, path.c_str());
+        jitterMode = parseJitterModeString(modeBuf);
         jitterLogEnabled = GetPrivateProfileIntW(L"Jitter", L"LogEnabled", 0, path.c_str()) != 0;
         int logIntVal = GetPrivateProfileIntW(L"Jitter", L"LogInterval", 10, path.c_str());
         jitterLogInterval = (logIntVal < 1) ? 1u : (logIntVal > 600 ? 600u : static_cast<unsigned>(logIntVal));
@@ -168,6 +171,7 @@ public:
         swprintf_s(buf, L"%.2f", jitterScale);
         WritePrivateProfileStringW(L"Jitter", L"Scale", buf, path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"PhaseCount", std::to_wstring(jitterPhaseCount).c_str(), path.c_str());
+        WritePrivateProfileStringW(L"Jitter", L"Mode", jitterModeToString(jitterMode), path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"LogEnabled", jitterLogEnabled ? L"1" : L"0", path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"LogInterval", std::to_wstring(jitterLogInterval).c_str(), path.c_str());
         WritePrivateProfileStringW(L"Jitter", L"LogFlushMs", std::to_wstring(jitterLogFlushMs).c_str(), path.c_str());
@@ -311,12 +315,28 @@ public:
     bool preserveNativeUi = true;
     bool hdrInput = false;
 
+    static int parseJitterModeString(const wchar_t* s) {
+        if (!s || !s[0]) return 0;
+        if (_wcsicmp(s, L"d3d11") == 0 || wcscmp(s, L"1") == 0) return 1;
+        if (_wcsicmp(s, L"upstream") == 0 || wcscmp(s, L"2") == 0) return 2;
+        return 0; // auto
+    }
+
+    static const wchar_t* jitterModeToString(int mode) {
+        switch (mode) {
+        case 1: return L"d3d11";
+        case 2: return L"upstream";
+        default: return L"auto";
+        }
+    }
+
     bool jitterEnabled = true;
     bool jitterInvertX = false;
     bool jitterInvertY = false;
     bool jitterSwapXY = false;
     float jitterScale = 1.0f;
     unsigned jitterPhaseCount = 32;
+    int jitterMode = 0; // 0=auto (upstream->d3d11 fallback), 1=d3d11, 2=upstream
     bool jitterLogEnabled = false;
     unsigned jitterLogInterval = 10;
     unsigned jitterLogFlushMs = 1000;

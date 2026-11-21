@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace edpe {
 
@@ -126,6 +128,32 @@ struct ProjectionJitter {
     float ndcX, ndcY;
 };
 
+// Computes effective Halton (2, 3) phase count from base_phases and render/output dimensions.
+// Industry baseline (NVIDIA/AMD/Intel): min_phases = ceil(8 * scale^2), where scale = max(scW/rW, scH/rH).
+// Avoids multiplying base_phases=32 by scale^2 (which produced 128/256 phases and slowed convergence).
+// Clamps to [8, max(64, min_phases)] so 3x UltraPerformance reaches 72 phases while <=2x stays <=64.
+inline unsigned computeEffectiveJitterPhaseCount(
+    unsigned basePhases,
+    unsigned renderWidth,
+    unsigned renderHeight,
+    unsigned outputWidth,
+    unsigned outputHeight) {
+    const unsigned base = basePhases ? basePhases : 32u;
+    unsigned minPhases = 8u;
+    if (renderWidth > 0 && renderHeight > 0 &&
+        outputWidth > 0 && outputHeight > 0) {
+        const double ratioX = static_cast<double>(outputWidth) / static_cast<double>(renderWidth);
+        const double ratioY = static_cast<double>(outputHeight) / static_cast<double>(renderHeight);
+        const double upscaleRatio = (ratioX > ratioY) ? ratioX : ratioY;
+        if (upscaleRatio > 1.0) {
+            minPhases = static_cast<unsigned>(std::ceil(8.0 * upscaleRatio * upscaleRatio));
+        }
+    }
+    const unsigned upperBound = (minPhases > 64u) ? minPhases : 64u;
+    const unsigned raw = (base > minPhases) ? base : minPhases;
+    return std::clamp(raw, 8u, upperBound);
+}
+
 // Halton 2,3 in pixel units; D3D viewport maps positive NDC Y upward.
 // Math only: applying this to Elite's projection requires a verified pass and
 // a working temporal reconstruction path that can always disable the offset.
@@ -142,9 +170,14 @@ inline ProjectionJitter projectionJitter(std::uint64_t frame, unsigned width, un
         return value;
     };
     const auto index = (phaseCount > 0) ? ((frame % phaseCount) + 1) : (frame + 1);
-    const float x = static_cast<float>(halton(index, 2) - 0.5);
-    const float y = static_cast<float>(halton(index, 3) - 0.5);
-    return {x, y, 2 * x / width, -2 * y / height};
+    const double x = halton(index, 2) - 0.5;
+    const double y = halton(index, 3) - 0.5;
+    return {
+        static_cast<float>(x),
+        static_cast<float>(y),
+        static_cast<float>(2.0 * x / static_cast<double>(width)),
+        static_cast<float>(-2.0 * y / static_cast<double>(height))
+    };
 }
 
 // CPU-only: the observed vertex shaders form clip position as
@@ -212,5 +245,93 @@ inline bool estimateEliteBlockNdcOffset(const float* block, NdcOffset* out) {
     out->y = static_cast<float>(yw / ww);
     return true;
 }
+
+// Per-frame phase consistency audit between two consecutive projection blocks.
+// Compares measured NDC delta (estimateEliteBlockNdcOffset(cur) - estimateEliteBlockNdcOffset(prev))
+// against expected (jitterNow.ndc - jitterPrev.ndc) within toleranceNdc (default 2e-6 NDC).
+struct RowPairCheckResult {
+    bool valid = false;
+    bool matched = false;
+    float measuredDeltaX = 0.0f;
+    float measuredDeltaY = 0.0f;
+    float expectedDeltaX = 0.0f;
+    float expectedDeltaY = 0.0f;
+    float errorX = 0.0f;
+    float errorY = 0.0f;
+    float maxAbsError = 0.0f;
+};
+
+inline RowPairCheckResult checkRowPair(
+    const float* curBlock16,
+    const float* prevBlock16,
+    const ProjectionJitter& jitterNow,
+    const ProjectionJitter& jitterPrev,
+    float toleranceNdc = 2.0e-6f) {
+    RowPairCheckResult res{};
+    NdcOffset curNdc{}, prevNdc{};
+    if (!estimateEliteBlockNdcOffset(curBlock16, &curNdc) ||
+        !estimateEliteBlockNdcOffset(prevBlock16, &prevNdc)) {
+        return res;
+    }
+    if (!std::isfinite(jitterNow.ndcX) || !std::isfinite(jitterNow.ndcY) ||
+        !std::isfinite(jitterPrev.ndcX) || !std::isfinite(jitterPrev.ndcY) ||
+        !std::isfinite(toleranceNdc) || toleranceNdc < 0.0f) {
+        return res;
+    }
+    res.valid = true;
+    res.measuredDeltaX = curNdc.x - prevNdc.x;
+    res.measuredDeltaY = curNdc.y - prevNdc.y;
+    res.expectedDeltaX = jitterNow.ndcX - jitterPrev.ndcX;
+    res.expectedDeltaY = jitterNow.ndcY - jitterPrev.ndcY;
+    res.errorX = res.measuredDeltaX - res.expectedDeltaX;
+    res.errorY = res.measuredDeltaY - res.expectedDeltaY;
+    res.maxAbsError = (std::max)(std::fabs(res.errorX), std::fabs(res.errorY));
+    res.matched = (res.maxAbsError <= toleranceNdc);
+    return res;
+}
+
+class PhasePairAuditor {
+public:
+    void reset() {
+        m_hasPrev = false;
+        m_lastResult = {};
+    }
+
+    RowPairCheckResult recordFrame(const float* curBlock16, const ProjectionJitter& curJitter,
+        float toleranceNdc = 2.0e-6f) {
+        RowPairCheckResult res{};
+        if (!curBlock16) {
+            m_hasPrev = false;
+            m_lastResult = res;
+            return res;
+        }
+        if (m_hasPrev) {
+            res = checkRowPair(curBlock16, m_prevBlock, curJitter, m_prevJitter, toleranceNdc);
+            if (res.valid) {
+                ++m_checked;
+                if (!res.matched) {
+                    ++m_mismatched;
+                }
+            }
+        }
+        std::memcpy(m_prevBlock, curBlock16, sizeof(m_prevBlock));
+        m_prevJitter = curJitter;
+        m_hasPrev = true;
+        m_lastResult = res;
+        return res;
+    }
+
+    uint64_t checkedCount() const { return m_checked; }
+    uint64_t mismatchedCount() const { return m_mismatched; }
+    RowPairCheckResult lastResult() const { return m_lastResult; }
+
+private:
+    bool m_hasPrev = false;
+    float m_prevBlock[16]{};
+    ProjectionJitter m_prevJitter{};
+    RowPairCheckResult m_lastResult{};
+    uint64_t m_checked = 0;
+    uint64_t m_mismatched = 0;
+};
 
 } // namespace edpe

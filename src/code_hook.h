@@ -12,10 +12,18 @@ namespace edpe {
 class CodeHook {
 public:
     CodeHook() = default;
-    ~CodeHook() { remove(); }
+    ~CodeHook() {
+        if (!m_holdOpen) {
+            remove();
+        }
+    }
 
     CodeHook(const CodeHook&) = delete;
     CodeHook& operator=(const CodeHook&) = delete;
+
+    // Prevents destructor from freeing executable trampoline memory (hold-open for process lifetime).
+    void setHoldOpen(bool holdOpen) { m_holdOpen = holdOpen; }
+    bool isHoldOpen() const { return m_holdOpen; }
 
     static void* allocateNear(void* target, size_t size = 64) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(target);
@@ -128,8 +136,11 @@ public:
         return i + immBytes;
     }
 
-    bool install(void* target, void* detour, void** originalOut) {
-        if (!target || !detour || m_installed) return false;
+    // Phase 1 of race-free installation: allocates and finalizes the relocated prologue
+    // trampoline (switching it to PAGE_EXECUTE_READ + FlushInstructionCache) WITHOUT
+    // patching `target` yet, so callers can embed `trampolineOut` into relay/stubs first.
+    bool prepareTrampoline(void* target, void** trampolineOut) {
+        if (!target || m_installed || m_trampoline) return false;
 
         auto* src = static_cast<uint8_t*>(target);
         size_t stolen = 0;
@@ -174,18 +185,44 @@ public:
         tramp[stolen + 4] = 0x00;
         tramp[stolen + 5] = 0x00;
         std::memcpy(tramp + stolen + 6, &resumeAddr, sizeof(resumeAddr));
+
+        DWORD oldProt = 0;
+        VirtualProtect(tramp, 64, PAGE_EXECUTE_READ, &oldProt);
         FlushInstructionCache(GetCurrentProcess(), tramp, 64);
 
+        m_target = src;
+        m_trampoline = tramp;
+        m_stolenLen = stolen;
+        if (trampolineOut) *trampolineOut = tramp;
+        return true;
+    }
+
+    // Cancels a prepared (uncommitted) trampoline before commitPatch() has been called.
+    void discardPrepared() {
+        if (m_installed) return;
+        if (m_trampoline) {
+            VirtualFree(m_trampoline, 0, MEM_RELEASE);
+            m_trampoline = nullptr;
+        }
+        m_target = nullptr;
+        m_stolenLen = 0;
+    }
+
+    // Phase 2 of race-free installation: atomically patches `target` to jump to `detour`.
+    bool commitPatch(void* detour) {
+        if (!m_target || !m_trampoline || !detour || m_installed) return false;
+
+        auto* src = m_target;
         const intptr_t jmpDelta =
             reinterpret_cast<intptr_t>(detour) - reinterpret_cast<intptr_t>(src + 5);
         if (jmpDelta < INT32_MIN || jmpDelta > INT32_MAX) {
-            VirtualFree(tramp, 0, MEM_RELEASE);
+            discardPrepared();
             return false;
         }
 
         DWORD oldProt = 0;
         if (!VirtualProtect(src, 8, PAGE_EXECUTE_READWRITE, &oldProt)) {
-            VirtualFree(tramp, 0, MEM_RELEASE);
+            discardPrepared();
             return false;
         }
 
@@ -195,7 +232,7 @@ public:
         patched8[0] = 0xE9;
         const int32_t rel32 = static_cast<int32_t>(jmpDelta);
         std::memcpy(patched8 + 1, &rel32, sizeof(rel32));
-        for (size_t k = 5; k < stolen && k < 8; ++k) {
+        for (size_t k = 5; k < m_stolenLen && k < 8; ++k) {
             patched8[k] = 0x90; // NOP padding
         }
 
@@ -208,17 +245,18 @@ public:
         DWORD ignored = 0;
         VirtualProtect(src, 8, oldProt, &ignored);
         if (prev != expected64) {
-            VirtualFree(tramp, 0, MEM_RELEASE);
+            discardPrepared();
             return false;
         }
 
         FlushInstructionCache(GetCurrentProcess(), src, 8);
-        m_target = src;
-        m_trampoline = tramp;
-        m_stolenLen = stolen;
         m_installed = true;
-        if (originalOut) *originalOut = tramp;
         return true;
+    }
+
+    bool install(void* target, void* detour, void** originalOut) {
+        if (!prepareTrampoline(target, originalOut)) return false;
+        return commitPatch(detour);
     }
 
     void remove() {
@@ -234,7 +272,7 @@ public:
             VirtualProtect(m_target, 8, oldProt, &ignored);
             FlushInstructionCache(GetCurrentProcess(), m_target, 8);
         }
-        if (m_trampoline) {
+        if (m_trampoline && !m_holdOpen) {
             VirtualFree(m_trampoline, 0, MEM_RELEASE);
             m_trampoline = nullptr;
         }
@@ -252,6 +290,7 @@ private:
     uint64_t m_savedBytes8 = 0;
     size_t m_stolenLen = 0;
     bool m_installed = false;
+    bool m_holdOpen = false;
 };
 
 } // namespace edpe

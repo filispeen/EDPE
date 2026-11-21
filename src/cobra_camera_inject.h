@@ -1,20 +1,24 @@
 #pragma once
 
-#include "code_hook.h"
 #include "elite_camera.h"
-#include "log.h"
 #include "temporal_math.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+
+#ifdef _WIN32
+#include "code_hook.h"
+#include "log.h"
 #include <d3d11.h>
 #include <shlobj.h>
 #include <windows.h>
+#endif
 
 namespace edpe::cobra_camera {
 
@@ -35,235 +39,278 @@ constexpr uint64_t kMapCanvasVsHash = 0x12382D2EA45E9632ull;
 constexpr uint64_t kMapCanvasPsHash = 0x855C469156AB997Full;
 constexpr uint64_t kMapSpriteVsHash = 0xC31238331D8AC3D4ull;
 
-// Thread-local state for ABI-safe stubA / stubB return-address interception.
-// `realRet` MUST remain at offset 0 for stubB's `mov rcx, [rax+0]` instruction.
-struct RefreshTls {
-    void* realRet = nullptr;       // offset 0
-    uint8_t* camera = nullptr;     // offset 8
-    float savedBoundX = 0.0f;      // offset 16
-    float savedBoundY = 0.0f;      // offset 20
-    uint32_t savedFlags = 0;       // offset 24
-    uint32_t layoutVariant = 0;    // offset 28 (1 = +0x28C/+0x290, 2 = +0x228/+0x22C)
+// ============================================================================
+// Portable State Machines (Unit-Testable on both Windows and Linux)
+// ============================================================================
+
+// Tracks write faults within a sliding 5-second window; >= 8 faults triggers
+// permanent stand-down (g_gate = 0) and automatic fallback to the D3D11 CB path.
+class WriteFaultTracker {
+public:
+    static constexpr size_t kThreshold = 8;
+    static constexpr uint64_t kWindowMs = 5000;
+
+    bool recordFault(uint64_t nowMs) noexcept {
+        m_timestamps[m_head] = nowMs;
+        m_head = (m_head + 1) % kThreshold;
+        if (m_count < kThreshold) ++m_count;
+
+        size_t recent = 0;
+        for (size_t i = 0; i < m_count; ++i) {
+            if (nowMs >= m_timestamps[i] && (nowMs - m_timestamps[i]) <= kWindowMs) {
+                ++recent;
+            }
+        }
+        if (recent >= kThreshold) {
+            m_stoodDown = true;
+        }
+        return m_stoodDown;
+    }
+
+    bool isStoodDown() const noexcept { return m_stoodDown; }
+
+    void reset() noexcept {
+        m_timestamps.fill(0);
+        m_head = 0;
+        m_count = 0;
+        m_stoodDown = false;
+    }
+
+private:
+    std::array<uint64_t, kThreshold> m_timestamps{};
+    size_t m_head = 0;
+    size_t m_count = 0;
+    bool m_stoodDown = false;
 };
 
-inline __declspec(thread) RefreshTls t_refreshTls{};
+// Compact zero-allocation set of camera pointers that received transient upstream
+// jitter. On the first non-injected refresh call for a tracked camera (jitter off,
+// stand-down, mapModeActive / GuiFocus 6..9), consumeForFlush() returns true once
+// so dirty bits (0x4 | 0x8) at camera + 0x250 are raised and Cobra recomputes a
+// clean unjittered projection matrix.
+class InjectedCameraSet {
+public:
+    static constexpr size_t kCapacity = 16;
 
-struct FrameJitterWindow {
-    std::atomic<DWORD> renderThreadId{0};
-    std::atomic<bool> windowOpen{false};
-    std::atomic<bool> mapModeActive{false};
-    std::atomic<uint32_t> renderWidth{0};
-    std::atomic<uint32_t> renderHeight{0};
-    std::atomic<float> jitterPxX{0.0f};
-    std::atomic<float> jitterPxY{0.0f};
-    std::atomic<uint64_t> injectedFrameCount{0};
-    std::atomic<uint32_t> injectedDrawsThisFrame{0};
-};
+    void recordInjected(const void* camera) noexcept {
+        if (!camera) return;
+        const uintptr_t key = reinterpret_cast<uintptr_t>(camera);
+        for (size_t i = 0; i < m_count; ++i) {
+            if (m_slots[i] == key) return;
+        }
+        if (m_count < kCapacity) {
+            m_slots[m_count++] = key;
+        } else {
+            // Bounded overwrite of oldest entry to avoid unbounded growth or heap allocation.
+            for (size_t i = 1; i < kCapacity; ++i) {
+                m_slots[i - 1] = m_slots[i];
+            }
+            m_slots[kCapacity - 1] = key;
+        }
+        m_pendingAtomic.store(static_cast<uint32_t>(m_count), std::memory_order_release);
+    }
 
-inline FrameJitterWindow& frameWindow() {
-    static FrameJitterWindow w;
-    return w;
-}
-
-inline RefreshTls* __fastcall getRefreshTls() {
-    return &t_refreshTls;
-}
-
-// Modifies the camera frustum tangent bounds (boundX, boundY) and raises the dirty flags
-// (4 | 8) right before the engine's own matrix finalizers (FUN_1404f2ff0, FUN_1404f49f0,
-// FUN_140596830) compute all forward/inverse matrices and inverse frustum rays.
-inline bool applyTransientCameraBoundJitter(uint8_t* camera, RefreshTls& tls) {
-    if (!camera) return false;
-    auto& win = frameWindow();
-    if (!win.windowOpen.load(std::memory_order_acquire)) return false;
-    if (win.mapModeActive.load(std::memory_order_relaxed)) return false;
-
-    const DWORD tid = win.renderThreadId.load(std::memory_order_relaxed);
-    if (tid != 0 && GetCurrentThreadId() != tid) return false;
-
-    const uint32_t rw = win.renderWidth.load(std::memory_order_relaxed);
-    const uint32_t rh = win.renderHeight.load(std::memory_order_relaxed);
-    if (rw == 0 || rh == 0) return false;
-
-    const float jx = win.jitterPxX.load(std::memory_order_relaxed);
-    const float jy = win.jitterPxY.load(std::memory_order_relaxed);
-    if (std::fabs(jx) < 1e-6f && std::fabs(jy) < 1e-6f) return false;
-
-    // Check layout variant 1 (+0x264 kind, +0x28C/+0x290 bounds, +0x250 flags)
-    // and layout variant 2 (+0x240/+0x244 kind, +0x228/+0x22C bounds, +0x250 flags).
-    uint32_t kind1 = 0;
-    std::memcpy(&kind1, camera + 0x264, sizeof(kind1));
-    float bx1 = 0.0f, by1 = 0.0f;
-    std::memcpy(&bx1, camera + 0x28C, sizeof(bx1));
-    std::memcpy(&by1, camera + 0x290, sizeof(by1));
-
-    uint32_t kind2a = 0, kind2b = 0;
-    std::memcpy(&kind2a, camera + 0x240, sizeof(kind2a));
-    std::memcpy(&kind2b, camera + 0x244, sizeof(kind2b));
-    float bx2 = 0.0f, by2 = 0.0f;
-    std::memcpy(&bx2, camera + 0x228, sizeof(bx2));
-    std::memcpy(&by2, camera + 0x22C, sizeof(by2));
-
-    auto validBounds = [&](float bx, float by) -> bool {
-        if (!std::isfinite(bx) || !std::isfinite(by)) return false;
-        if (std::fabs(bx) < 0.05f || std::fabs(bx) > 5.0f) return false;
-        if (std::fabs(by) < 0.05f || std::fabs(by) > 5.0f) return false;
-        const float camAspect = std::fabs(bx / by);
-        const float targetAspect = static_cast<float>(rw) / static_cast<float>(rh);
-        return std::fabs(camAspect - targetAspect) <= 0.12f * targetAspect;
-    };
-
-    size_t offBx = 0, offBy = 0;
-    uint32_t variant = 0;
-    if (kind1 == 3 && validBounds(bx1, by1)) {
-        offBx = 0x28C;
-        offBy = 0x290;
-        variant = 1;
-        tls.savedBoundX = bx1;
-        tls.savedBoundY = by1;
-    } else if ((kind2a == 3 || kind2b == 3) && validBounds(bx2, by2)) {
-        offBx = 0x228;
-        offBy = 0x22C;
-        variant = 2;
-        tls.savedBoundX = bx2;
-        tls.savedBoundY = by2;
-    } else {
+    bool consumeForFlush(const void* camera) noexcept {
+        if (!camera || m_count == 0) return false;
+        const uintptr_t key = reinterpret_cast<uintptr_t>(camera);
+        for (size_t i = 0; i < m_count; ++i) {
+            if (m_slots[i] == key) {
+                m_slots[i] = m_slots[m_count - 1];
+                m_slots[m_count - 1] = 0;
+                --m_count;
+                m_pendingAtomic.store(static_cast<uint32_t>(m_count), std::memory_order_release);
+                return true;
+            }
+        }
         return false;
     }
 
-    uint32_t flags = 0;
-    std::memcpy(&flags, camera + 0x250, sizeof(flags));
-    tls.camera = camera;
-    tls.savedFlags = flags;
-    tls.layoutVariant = variant;
-
-    const float newBx = tls.savedBoundX + jx / static_cast<float>(rw);
-    const float newBy = tls.savedBoundY - jy / static_cast<float>(rh);
-    const uint32_t newFlags = flags | 0x4u | 0x8u;
-
-    std::memcpy(camera + offBx, &newBx, sizeof(newBx));
-    std::memcpy(camera + offBy, &newBy, sizeof(newBy));
-    std::memcpy(camera + 0x250, &newFlags, sizeof(newFlags));
-
-    win.injectedDrawsThisFrame.fetch_add(1, std::memory_order_relaxed);
-    win.injectedFrameCount.fetch_add(1, std::memory_order_relaxed);
-    return true;
-}
-
-inline void __fastcall refreshPost() {
-    RefreshTls& tls = t_refreshTls;
-    if (tls.camera && tls.layoutVariant != 0) {
-        const size_t offBx = (tls.layoutVariant == 1) ? 0x28Cu : 0x228u;
-        const size_t offBy = (tls.layoutVariant == 1) ? 0x290u : 0x22Cu;
-        std::memcpy(tls.camera + offBx, &tls.savedBoundX, sizeof(tls.savedBoundX));
-        std::memcpy(tls.camera + offBy, &tls.savedBoundY, sizeof(tls.savedBoundY));
-        std::memcpy(tls.camera + 0x250, &tls.savedFlags, sizeof(tls.savedFlags));
+    bool contains(const void* camera) const noexcept {
+        if (!camera) return false;
+        const uintptr_t key = reinterpret_cast<uintptr_t>(camera);
+        for (size_t i = 0; i < m_count; ++i) {
+            if (m_slots[i] == key) return true;
+        }
+        return false;
     }
-    tls.camera = nullptr;
-    tls.layoutVariant = 0;
-}
 
-inline void* g_stubBAddr = nullptr;
-
-inline void* __fastcall refreshPre(uint8_t* camera, void* realRet) {
-    RefreshTls& tls = t_refreshTls;
-    tls.realRet = realRet;
-    tls.camera = nullptr;
-    tls.layoutVariant = 0;
-    if (g_stubBAddr && applyTransientCameraBoundJitter(camera, tls)) {
-        return g_stubBAddr;
+    bool empty() const noexcept {
+        return m_pendingAtomic.load(std::memory_order_acquire) == 0;
     }
-    return realRet;
+
+    size_t size() const noexcept {
+        return static_cast<size_t>(m_pendingAtomic.load(std::memory_order_acquire));
+    }
+
+    void clear() noexcept {
+        m_slots.fill(0);
+        m_count = 0;
+        m_pendingAtomic.store(0, std::memory_order_release);
+    }
+
+private:
+    std::array<uintptr_t, kCapacity> m_slots{};
+    size_t m_count = 0;
+    std::atomic<uint32_t> m_pendingAtomic{0};
+};
+
+// Verifies x64 prologue bytes AND camera field offset witnesses (+0x250 dirty flags
+// and at least one frustum/camera bound offset witness: +0x28C/+0x290/+0x228/+0x22C/+0x264)
+// before patching FUN_1405921f0. Prevents hooking across incompatible game binary updates.
+inline bool verifyRefreshFunctionBytes(const uint8_t* code, size_t maxBytes) noexcept {
+    if (!code || maxBytes < 32) return false;
+    const uint8_t b0 = code[0];
+    const uint8_t b1 = code[1];
+    const bool validPrologue =
+        (b0 == 0x48 && (b1 == 0x89 || b1 == 0x83 || b1 == 0x8B || b1 == 0x81)) ||
+        (b0 == 0x40 && (b1 >= 0x50 && b1 <= 0x57)) ||
+        (b0 == 0x4C && (b1 == 0x8B || b1 == 0x89));
+    if (!validPrologue) return false;
+
+    const size_t scanLimit = (std::min)(maxBytes, static_cast<size_t>(1024));
+    bool hasFlagsWitness = false;  // +0x250
+    bool hasBoundsWitness = false; // +0x28C / +0x290 / +0x228 / +0x22C / +0x264
+    for (size_t i = 0; i + 4 <= scanLimit; ++i) {
+        uint32_t disp = 0;
+        std::memcpy(&disp, code + i, sizeof(disp));
+        if (disp == 0x00000250u) {
+            hasFlagsWitness = true;
+        } else if (disp == 0x0000028Cu || disp == 0x00000290u ||
+                   disp == 0x00000228u || disp == 0x0000022Cu ||
+                   disp == 0x00000264u) {
+            hasBoundsWitness = true;
+        }
+        if (hasFlagsWitness && hasBoundsWitness) {
+            return true;
+        }
+    }
+    return false;
 }
 
-// Emits ABI-safe stubA (entry trampoline with 32-byte Win64 shadow space) and
-// stubB (return epilogue trampoline that preserves RAX and XMM0 and restores camera bounds).
-inline bool buildRefreshStubs(uint8_t* page, void* resumeTrampoline, uint8_t** outStubA, uint8_t** outStubB) {
-    if (!page || !resumeTrampoline) return false;
-    uint8_t* stubA = page;
-    uint8_t* stubB = page + 128;
+// ============================================================================
+// Float32 Higham Error Bound & Deferred CB2 UV->Clip Non-Degeneracy Certification
+// ============================================================================
+// Higham rounding bound gamma(n) = (n * u) / (1 - n * u) with binary32 unit roundoff u = 2^-24.
+inline float float32Gamma(unsigned n) noexcept {
+    constexpr double u = 5.960464477539063e-8; // 2^-24
+    const double nu = static_cast<double>(n) * u;
+    if (nu >= 0.5) return 1.0f;
+    return static_cast<float>(nu / (1.0 - nu));
+}
 
-    // stubA:
-    //   Save volatile argument registers RCX, RDX, R8, R9 into caller's home space:
-    //   [rsp+8]  = rcx (camera)
-    //   [rsp+16] = rdx
-    //   [rsp+24] = r8
-    //   [rsp+32] = r9
-    //   mov rdx, [rsp]      (realRet)
-    //   sub rsp, 0x20       (32-byte shadow space for refreshPre, 16B-aligned)
-    //   mov rax, &refreshPre
-    //   call rax            (returns either realRet or stubB in RAX)
-    //   add rsp, 0x20
-    //   mov [rsp], rax      (replace return address on stack)
-    //   restore rcx, rdx, r8, r9
-    //   jmp resumeTrampoline
-    size_t a = 0;
-    auto emitA = [&](std::initializer_list<uint8_t> bytes) {
-        for (uint8_t b : bytes) stubA[a++] = b;
+// Strict float32 row bound for 4x4 projection/view cascade (~32 FP ops).
+inline float flatDeferredFloatBound(const float* row4) noexcept {
+    const float ax = std::fabs(row4[0]);
+    const float ay = std::fabs(row4[1]);
+    const float az = std::fabs(row4[2]);
+    const float aw = std::fabs(row4[3]);
+    const float m = (std::max)((std::max)(ax, ay), (std::max)(az, aw));
+    return (std::max)(m * float32Gamma(32) * 8.0f, 2.0e-6f);
+}
+
+inline float flatDeferredFrustumScale(const float* b2Rows10to16) noexcept {
+    const float* dX = b2Rows10to16 + 4 * 4; // row 14
+    const float* dY = b2Rows10to16 + 5 * 4; // row 15
+    const float lenX = std::sqrt(dX[0] * dX[0] + dX[1] * dX[1] + dX[2] * dX[2]);
+    const float lenY = std::sqrt(dY[0] * dY[0] + dY[1] * dY[1] + dY[2] * dY[2]);
+    return (std::max)({lenX, lenY, 1.0f});
+}
+
+inline float flatDeferredWorldAllowance(const float* b2Rows10to16) noexcept {
+    const float* orig = b2Rows10to16 + 6 * 4; // row 16
+    const float mag = std::sqrt(orig[0] * orig[0] + orig[1] * orig[1] + orig[2] * orig[2]);
+    return (std::max)(flatDeferredFrustumScale(b2Rows10to16) * float32Gamma(64) * 64.0f,
+                      mag * float32Gamma(32) * 16.0f);
+}
+
+// Certifies that the UV->Clip composite map A * B inside Deferred CB2 rows 10..16 is
+// mathematically non-degenerate via the Banach/Neumann bound: ||(A*B - T) * T^-1||_inf < 1,
+// where T maps UV (u, v, 1) -> NDC (2u - 1, 1 - 2v, 1).
+// Prevents false-positive patching of unrelated constant buffers.
+inline bool certifyDeferredUvToClipNonDegenerate(
+    const float* rows10to16,
+    bool rowMajor,
+    float* outNormInf = nullptr) noexcept {
+    if (!rows10to16) return false;
+    for (int i = 0; i < 28; ++i) {
+        if (!std::isfinite(rows10to16[i])) return false;
+    }
+
+    double A[3][3]{};
+    double B[3][3]{};
+    if (rowMajor) {
+        // Row-major forward: b2[10] = clipX, b2[11] = clipY, b2[13] = clipW
+        for (int j = 0; j < 3; ++j) {
+            A[0][j] = static_cast<double>(rows10to16[0 * 4 + j]);
+            A[1][j] = static_cast<double>(rows10to16[1 * 4 + j]);
+            A[2][j] = static_cast<double>(rows10to16[3 * 4 + j]);
+        }
+        // Row-major inverse UV rays: rows 14..16 hold (dX_c, dY_c, 0, orig_c)
+        for (int i = 0; i < 3; ++i) {
+            const float* r = rows10to16 + (4 + i) * 4;
+            B[i][0] = static_cast<double>(r[0]); // dX
+            B[i][1] = static_cast<double>(r[1]); // dY
+            B[i][2] = static_cast<double>(r[3]); // origin
+        }
+    } else {
+        // Column-major forward: rows 0..2 are world basis, cols 0, 1, 3 are clip X, Y, W
+        for (int j = 0; j < 3; ++j) {
+            A[0][j] = static_cast<double>(rows10to16[j * 4 + 0]);
+            A[1][j] = static_cast<double>(rows10to16[j * 4 + 1]);
+            A[2][j] = static_cast<double>(rows10to16[j * 4 + 3]);
+        }
+        // Column-major inverse UV rays: row 14 = dX.xyz, row 15 = dY.xyz, row 16 = origin.xyz
+        const float* dX = rows10to16 + 4 * 4;
+        const float* dY = rows10to16 + 5 * 4;
+        const float* orig = rows10to16 + 6 * 4;
+        for (int i = 0; i < 3; ++i) {
+            B[i][0] = static_cast<double>(dX[i]);
+            B[i][1] = static_cast<double>(dY[i]);
+            B[i][2] = static_cast<double>(orig[i]);
+        }
+    }
+
+    // C = A * B
+    double C[3][3]{};
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            C[i][j] = A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j];
+        }
+    }
+
+    // Target T: UV -> NDC
+    constexpr double T[3][3] = {
+        {2.0,  0.0, -1.0},
+        {0.0, -2.0,  1.0},
+        {0.0,  0.0,  1.0}
     };
-    emitA({0x48, 0x89, 0x4C, 0x24, 0x08}); // mov [rsp+0x08], rcx
-    emitA({0x48, 0x89, 0x54, 0x24, 0x10}); // mov [rsp+0x10], rdx
-    emitA({0x4C, 0x89, 0x44, 0x24, 0x18}); // mov [rsp+0x18], r8
-    emitA({0x4C, 0x89, 0x4C, 0x24, 0x20}); // mov [rsp+0x20], r9
-    emitA({0x48, 0x8B, 0x14, 0x24});       // mov rdx, [rsp]
-    emitA({0x48, 0x83, 0xEC, 0x20});       // sub rsp, 0x20
-    emitA({0x48, 0xB8});                   // mov rax, imm64 (&refreshPre)
-    const uintptr_t preAddr = reinterpret_cast<uintptr_t>(&refreshPre);
-    std::memcpy(stubA + a, &preAddr, sizeof(preAddr));
-    a += 8;
-    emitA({0xFF, 0xD0});                   // call rax
-    emitA({0x48, 0x83, 0xC4, 0x20});       // add rsp, 0x20
-    emitA({0x48, 0x89, 0x04, 0x24});       // mov [rsp], rax
-    emitA({0x48, 0x8B, 0x4C, 0x24, 0x08}); // mov rcx, [rsp+0x08]
-    emitA({0x48, 0x8B, 0x54, 0x24, 0x10}); // mov rdx, [rsp+0x10]
-    emitA({0x4C, 0x8B, 0x44, 0x24, 0x18}); // mov r8,  [rsp+0x18]
-    emitA({0x4C, 0x8B, 0x4C, 0x24, 0x20}); // mov r9,  [rsp+0x20]
-    emitA({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00}); // jmp qword ptr [rip+0]
-    const uintptr_t resumeVal = reinterpret_cast<uintptr_t>(resumeTrampoline);
-    std::memcpy(stubA + a, &resumeVal, sizeof(resumeVal));
-    a += 8;
-
-    // stubB (entered via `ret` from FUN_1405921f0, so RSP % 16 == 8):
-    //   sub rsp, 0x38                    (aligns RSP to 16B, reserves 0x20 shadow + 0x18 save area)
-    //   mov [rsp+0x30], rax              (preserve integer return value)
-    //   movaps [rsp+0x20], xmm0          (preserve float return value)
-    //   mov rax, &refreshPost
-    //   call rax
-    //   mov rax, &getRefreshTls
-    //   call rax
-    //   mov rcx, [rax]                   (realRet at offset 0 of RefreshTls)
-    //   movaps xmm0, [rsp+0x20]
-    //   mov rax, [rsp+0x30]
-    //   add rsp, 0x38
-    //   jmp rcx
-    size_t b = 0;
-    auto emitB = [&](std::initializer_list<uint8_t> bytes) {
-        for (uint8_t by : bytes) stubB[b++] = by;
+    // T^-1: NDC -> UV
+    constexpr double Tinv[3][3] = {
+        {0.5,  0.0, 0.5},
+        {0.0, -0.5, 0.5},
+        {0.0,  0.0, 1.0}
     };
-    emitB({0x48, 0x83, 0xEC, 0x38});             // sub rsp, 0x38
-    emitB({0x48, 0x89, 0x44, 0x24, 0x30});       // mov [rsp+0x30], rax
-    emitB({0x0F, 0x29, 0x44, 0x24, 0x20});       // movaps [rsp+0x20], xmm0
-    emitB({0x48, 0xB8});                         // mov rax, imm64 (&refreshPost)
-    const uintptr_t postAddr = reinterpret_cast<uintptr_t>(&refreshPost);
-    std::memcpy(stubB + b, &postAddr, sizeof(postAddr));
-    b += 8;
-    emitB({0xFF, 0xD0});                         // call rax
-    emitB({0x48, 0xB8});                         // mov rax, imm64 (&getRefreshTls)
-    const uintptr_t tlsAddr = reinterpret_cast<uintptr_t>(&getRefreshTls);
-    std::memcpy(stubB + b, &tlsAddr, sizeof(tlsAddr));
-    b += 8;
-    emitB({0xFF, 0xD0});                         // call rax
-    emitB({0x48, 0x8B, 0x08});                   // mov rcx, [rax]
-    emitB({0x0F, 0x28, 0x44, 0x24, 0x20});       // movaps xmm0, [rsp+0x20]
-    emitB({0x48, 0x8B, 0x44, 0x24, 0x30});       // mov rax, [rsp+0x30]
-    emitB({0x48, 0x83, 0xC4, 0x38});             // add rsp, 0x38
-    emitB({0xFF, 0xE1});                         // jmp rcx
 
-    g_stubBAddr = stubB;
-    if (outStubA) *outStubA = stubA;
-    if (outStubB) *outStubB = stubB;
-    FlushInstructionCache(GetCurrentProcess(), page, 256);
-    return true;
+    double D[3][3]{};
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            D[i][j] = C[i][j] - T[i][j];
+        }
+    }
+
+    // E = (A*B - T) * T^-1
+    double normInf = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        double rowSum = 0.0;
+        for (int j = 0; j < 3; ++j) {
+            const double eij = D[i][0] * Tinv[0][j] + D[i][1] * Tinv[1][j] + D[i][2] * Tinv[2][j];
+            rowSum += std::fabs(eij);
+        }
+        if (rowSum > normInf) normInf = rowSum;
+    }
+
+    if (outNormInf) *outNormInf = static_cast<float>(normInf);
+    return std::isfinite(normInf) && normInf < 1.0;
 }
 
 // ============================================================================
@@ -295,34 +342,6 @@ inline void jitterInverseClip(float* rows4x4, float ndcX, float ndcY) {
     }
 }
 
-// ============================================================================
-// Deferred Lighting CB2 Jitter Phase Verification & Repair
-// (VS 0x7E38A6AA1269C901 / PS 0x7CECABDE34FFBE9E, slot 2, b2[10..16])
-// ============================================================================
-// Allowances for float32 rounding at 2560x1440 (28-row cascade):
-inline float flatDeferredFloatBound(const float* row4) {
-    const float ax = std::fabs(row4[0]);
-    const float ay = std::fabs(row4[1]);
-    const float az = std::fabs(row4[2]);
-    const float aw = std::fabs(row4[3]);
-    const float m = std::max(std::max(ax, ay), std::max(az, aw));
-    return std::max(m * 1.5e-5f, 2.0e-6f);
-}
-
-inline float flatDeferredFrustumScale(const float* b2Rows10to16) {
-    const float* dX = b2Rows10to16 + 4 * 4; // row 14
-    const float* dY = b2Rows10to16 + 5 * 4; // row 15
-    const float lenX = std::sqrt(dX[0] * dX[0] + dX[1] * dX[1] + dX[2] * dX[2]);
-    const float lenY = std::sqrt(dY[0] * dY[0] + dY[1] * dY[1] + dY[2] * dY[2]);
-    return std::max({lenX, lenY, 1.0f});
-}
-
-inline float flatDeferredWorldAllowance(const float* b2Rows10to16) {
-    const float* orig = b2Rows10to16 + 6 * 4; // row 16
-    const float mag = std::sqrt(orig[0] * orig[0] + orig[1] * orig[1] + orig[2] * orig[2]);
-    return std::max(flatDeferredFrustumScale(b2Rows10to16) * 2.5e-4f, mag * 5.0e-5f);
-}
-
 // Case A: Forward rows b2[10..13] already carry the jittered view-projection matrix,
 //         while inverse frustum rays b2[14..16] were populated from an unjittered copy.
 inline bool repairDeferredMissingPhase(
@@ -339,13 +358,16 @@ inline bool repairDeferredMissingPhase(
         return false;
     }
     float* rows10to16 = b2Floats + 10 * 4;
-    // Verify rows 10..13 match jitteredForward16 within float32 bound
+    if (!certifyDeferredUvToClipNonDegenerate(rows10to16, false)) {
+        return false;
+    }
+    // Verify rows 10..13 match jitteredForward16 within strict float32 gamma bound
     for (int r = 0; r < 4; ++r) {
         const float* actual = rows10to16 + r * 4;
         const float* expected = jitteredForward16 + r * 4;
         const float tol = flatDeferredFloatBound(expected);
         for (int c = 0; c < 4; ++c) {
-            if (std::fabs(actual[c] - expected[c]) > tol * 8.0f) {
+            if (!std::isfinite(actual[c]) || std::fabs(actual[c] - expected[c]) > tol) {
                 return false;
             }
         }
@@ -359,9 +381,9 @@ inline bool repairDeferredMissingPhase(
     float diffUnjittered = 0.0f;
     float diffJittered = 0.0f;
     for (int i = 0; i < 12; ++i) {
-        diffUnjittered = std::max(diffUnjittered,
+        diffUnjittered = (std::max)(diffUnjittered,
             std::fabs(rows10to16[16 + i] - unjitteredInverseRays12[i]));
-        diffJittered = std::max(diffJittered,
+        diffJittered = (std::max)(diffJittered,
             std::fabs(rows10to16[16 + i] - expectedJittered12[i]));
     }
     if (diffUnjittered > allow || !(diffUnjittered < diffJittered * 0.5f)) {
@@ -384,12 +406,15 @@ inline bool repairDeferredWholeOmission(
         return false;
     }
     float* rows10to16 = b2Floats + 10 * 4;
+    if (!certifyDeferredUvToClipNonDegenerate(rows10to16, false)) {
+        return false;
+    }
     for (int r = 0; r < 4; ++r) {
         const float* actual = rows10to16 + r * 4;
         const float* expected = unjitteredForward16 + r * 4;
         const float tol = flatDeferredFloatBound(expected);
         for (int c = 0; c < 4; ++c) {
-            if (std::fabs(actual[c] - expected[c]) > tol * 8.0f) {
+            if (!std::isfinite(actual[c]) || std::fabs(actual[c] - expected[c]) > tol) {
                 return false;
             }
         }
@@ -405,15 +430,6 @@ inline bool repairDeferredWholeOmission(
 
 // ============================================================================
 // EDO Row-Major & Inverse Projection Jitter Repair Helpers
-// Verified against Elite Dangerous Odyssey D3D11 constant buffers:
-//   - Deferred lighting & shadowed local lights CB2 (752..784B):
-//       b2[10..13] = row-major Proj*View (depthB at float index 51)
-//       b2[14..16] = row-major world-space inverse UV rays (origin in .w)
-//   - Cascade shadow mask CB2 (592B):
-//       b2[0]      = (W, H, 1/W, 1/H)
-//       b2[1..4]   = column-major InvProj (ndcX * cb2[1] + ndcY * cb2[2] + cb2[4])
-//   - Clustered lighting CS cb0 (480B) & Main CB1[237..240]:
-//       row-major UvToView (origin in .w)
 // ============================================================================
 inline void jitterRowMajorInverseUvRay(float* rows3x4, float dxUv, float dyUv) {
     if (!rows3x4) return;
@@ -499,7 +515,7 @@ inline bool extractWorldCamPosFromDeferredCb2(
             std::fabs(static_cast<double>(row[0]) * cand.x) +
             std::fabs(static_cast<double>(row[1]) * cand.y) +
             std::fabs(static_cast<double>(row[2]) * cand.z);
-        const double tol = std::max(absTerms * 5.0e-5, 1.0e-3);
+        const double tol = (std::max)(absTerms * static_cast<double>(float32Gamma(64) * 12.0f), 1.0e-3);
         if (std::fabs(dotPos + static_cast<double>(row[3])) > tol) {
             return false;
         }
@@ -513,7 +529,7 @@ inline bool matchRowMajorCols0to2(const float* actual16, const float* expected16
     for (int r = 0; r < 4; ++r) {
         const float* a = actual16 + r * 4;
         const float* e = expected16 + r * 4;
-        const float tol = flatDeferredFloatBound(e) * 8.0f;
+        const float tol = flatDeferredFloatBound(e);
         for (int c = 0; c < 3; ++c) {
             if (!std::isfinite(a[c]) || std::fabs(a[c] - e[c]) > tol) {
                 return false;
@@ -532,7 +548,7 @@ inline bool matchMatrix4x4(
     for (int r = 0; r < 4; ++r) {
         const float* a = actual16 + r * 4;
         const float* e = expected16 + r * 4;
-        const float tol = flatDeferredFloatBound(e) * 8.0f;
+        const float tol = flatDeferredFloatBound(e);
         for (int c = 0; c < 3; ++c) {
             if (!std::isfinite(a[c]) || std::fabs(a[c] - e[c]) > tol) {
                 return false;
@@ -559,7 +575,7 @@ inline bool matchMatrix4x4(
     for (int r = 0; r < 4; ++r) {
         const float* a = actual16 + r * 4;
         const float* e = expected16 + r * 4;
-        const float tol = flatDeferredFloatBound(e) * 8.0f;
+        const float tol = flatDeferredFloatBound(e);
         const double dotPos =
             static_cast<double>(a[0]) * worldCamPos->x +
             static_cast<double>(a[1]) * worldCamPos->y +
@@ -568,7 +584,7 @@ inline bool matchMatrix4x4(
             std::fabs(static_cast<double>(a[0]) * worldCamPos->x) +
             std::fabs(static_cast<double>(a[1]) * worldCamPos->y) +
             std::fabs(static_cast<double>(a[2]) * worldCamPos->z);
-        const float worldTol = std::max({tol, static_cast<float>(absTerms) * 5.0e-5f, 1.0e-4f});
+        const float worldTol = (std::max)({tol, static_cast<float>(absTerms) * float32Gamma(64) * 10.0f, 1.0e-4f});
         const double expectedWorldW = static_cast<double>(e[3]) - dotPos;
         if (std::fabs(static_cast<double>(a[3]) - expectedWorldW) > worldTol) {
             return false;
@@ -598,16 +614,16 @@ inline bool rowMajorInverseRaysNeedJitter(const float* rows10to16, float dxUv, f
         lenY2 += rows[c][1] * rows[c][1];
     }
     if (lenX2 < 1e-4f || lenY2 < 1e-4f) return false;
-    const float scale = std::max({std::sqrt(lenX2), std::sqrt(lenY2), 1.0f});
-    const float allow = std::max(scale * 2.5e-4f, 1e-4f);
+    const float scale = (std::max)({std::sqrt(lenX2), std::sqrt(lenY2), 1.0f});
+    const float allow = (std::max)(scale * float32Gamma(64) * 64.0f, 1e-4f);
 
     float diffUnjittered = 0.0f;
     float diffJittered = 0.0f;
     for (int c = 0; c < 3; ++c) {
         const float unjitOrig = forwardVec[c] - 0.5f * rows[c][0] - 0.5f * rows[c][1];
         const float jitOrig = unjitOrig - dxUv * rows[c][0] - dyUv * rows[c][1];
-        diffUnjittered = std::max(diffUnjittered, std::fabs(rows[c][3] - unjitOrig));
-        diffJittered = std::max(diffJittered, std::fabs(rows[c][3] - jitOrig));
+        diffUnjittered = (std::max)(diffUnjittered, std::fabs(rows[c][3] - unjitOrig));
+        diffJittered = (std::max)(diffJittered, std::fabs(rows[c][3] - jitOrig));
     }
     return diffUnjittered <= allow && diffUnjittered < diffJittered * 0.5f;
 }
@@ -622,9 +638,11 @@ inline bool repairRowMajorDeferredMissingPhase(
     if (!b2Floats || floatCount < 17 * 4 || !colMajorJitteredForward16) return false;
     if (std::fabs(dxUv) <= 1e-7f && std::fabs(dyUv) <= 1e-7f) return false;
 
+    float* rows10to16 = b2Floats + 10 * 4;
+    if (!certifyDeferredUvToClipNonDegenerate(rows10to16, true)) return false;
+
     float expectedRowMajor[16]{};
     transposeBlock4x4(colMajorJitteredForward16, expectedRowMajor);
-    float* rows10to16 = b2Floats + 10 * 4;
     edpe::Vec3 cb2CamPos{};
     const bool hasCb2Pos = extractWorldCamPosFromDeferredCb2(b2Floats, floatCount, &cb2CamPos);
     const bool matched =
@@ -649,9 +667,11 @@ inline bool repairRowMajorDeferredWholeOmission(
     if (std::fabs(dxUv) <= 1e-7f && std::fabs(dyUv) <= 1e-7f &&
         std::fabs(jitter.ndcX) <= 1e-7f && std::fabs(jitter.ndcY) <= 1e-7f) return false;
 
+    float* rows10to16 = b2Floats + 10 * 4;
+    if (!certifyDeferredUvToClipNonDegenerate(rows10to16, true)) return false;
+
     float expectedRowMajor[16]{};
     transposeBlock4x4(colMajorUnjitteredForward16, expectedRowMajor);
-    float* rows10to16 = b2Floats + 10 * 4;
     edpe::Vec3 cb2CamPos{};
     const bool hasCb2Pos = extractWorldCamPosFromDeferredCb2(b2Floats, floatCount, &cb2CamPos);
     const bool matched =
@@ -764,6 +784,443 @@ inline bool unjitterRowMajorUvToViewBlock(
     return true;
 }
 
+#ifdef _WIN32
+
+// ============================================================================
+// SEH-Protected Memory Helpers (no C++ destructors in __try frames)
+// ============================================================================
+inline bool sehReadU32(const void* addr, uint32_t* out) noexcept {
+    if (!addr || !out) return false;
+#if defined(_MSC_VER)
+    __try {
+        uint32_t v = 0;
+        std::memcpy(&v, addr, sizeof(v));
+        *out = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    std::memcpy(out, addr, sizeof(uint32_t));
+    return true;
+#endif
+}
+
+inline bool sehReadF32(const void* addr, float* out) noexcept {
+    if (!addr || !out) return false;
+#if defined(_MSC_VER)
+    __try {
+        float v = 0.0f;
+        std::memcpy(&v, addr, sizeof(v));
+        *out = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    std::memcpy(out, addr, sizeof(float));
+    return true;
+#endif
+}
+
+inline bool sehReadU64(const void* addr, uint64_t* out) noexcept {
+    if (!addr || !out) return false;
+#if defined(_MSC_VER)
+    __try {
+        uint64_t v = 0;
+        std::memcpy(&v, addr, sizeof(v));
+        *out = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    std::memcpy(out, addr, sizeof(uint64_t));
+    return true;
+#endif
+}
+
+inline bool sehWriteU32(void* addr, uint32_t val) noexcept {
+    if (!addr) return false;
+#if defined(_MSC_VER)
+    __try {
+        std::memcpy(addr, &val, sizeof(val));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    std::memcpy(addr, &val, sizeof(val));
+    return true;
+#endif
+}
+
+inline bool sehWriteF32(void* addr, float val) noexcept {
+    if (!addr) return false;
+#if defined(_MSC_VER)
+    __try {
+        std::memcpy(addr, &val, sizeof(val));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    std::memcpy(addr, &val, sizeof(val));
+    return true;
+#endif
+}
+
+inline bool sehWriteU64(void* addr, uint64_t val) noexcept {
+    if (!addr) return false;
+#if defined(_MSC_VER)
+    __try {
+        std::memcpy(addr, &val, sizeof(val));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    std::memcpy(addr, &val, sizeof(val));
+    return true;
+#endif
+}
+
+// ============================================================================
+// Gate-First Relay & Thread-Local State (Zero I/O, Zero Allocations on Hot Path)
+// ============================================================================
+// When g_gate == 0, relay transparently jumps to resumeTrampoline without
+// clobbering any general-purpose or XMM register.
+inline std::atomic<uintptr_t> g_gate{0};
+
+// Thread-local state for ABI-safe stubA / stubB return-address interception.
+// `realRet` MUST remain at offset 0 for stubB's `mov rcx, [rax+0]` instruction.
+struct RefreshTls {
+    void* realRet = nullptr;       // offset 0
+    uint8_t* camera = nullptr;     // offset 8
+    float savedBoundX = 0.0f;      // offset 16
+    float savedBoundY = 0.0f;      // offset 20
+    uint32_t savedFlags = 0;       // offset 24
+    uint32_t layoutVariant = 0;    // offset 28 (1 = +0x28C/+0x290, 2 = +0x228/+0x22C)
+};
+
+inline __declspec(thread) RefreshTls t_refreshTls{};
+
+struct FrameJitterWindow {
+    std::atomic<DWORD> renderThreadId{0};
+    std::atomic<bool> windowOpen{false};
+    std::atomic<bool> pauseRequested{false};
+    std::atomic<bool> mapModeActive{false};
+    std::atomic<bool> stoodDown{false};
+    std::atomic<uint32_t> renderWidth{0};
+    std::atomic<uint32_t> renderHeight{0};
+    std::atomic<float> jitterPxX{0.0f};
+    std::atomic<float> jitterPxY{0.0f};
+    std::atomic<uint64_t> injectedFrameCount{0};
+    std::atomic<uint32_t> injectedDrawsThisFrame{0};
+    std::atomic<uint64_t> flushedCamerasTotal{0};
+    std::atomic<uint64_t> readFaultsTotal{0};
+    std::atomic<uint64_t> writeFaultsTotal{0};
+    std::atomic<uint64_t> rollbacksTotal{0};
+};
+
+inline FrameJitterWindow& frameWindow() noexcept {
+    static FrameJitterWindow w;
+    return w;
+}
+
+inline InjectedCameraSet& injectedCameras() noexcept {
+    static InjectedCameraSet s;
+    return s;
+}
+
+inline WriteFaultTracker& writeFaultTracker() noexcept {
+    static WriteFaultTracker t;
+    return t;
+}
+
+inline void recordHookWriteFault() noexcept {
+    auto& win = frameWindow();
+    win.writeFaultsTotal.fetch_add(1, std::memory_order_relaxed);
+    if (writeFaultTracker().recordFault(GetTickCount64())) {
+        win.stoodDown.store(true, std::memory_order_release);
+        win.windowOpen.store(false, std::memory_order_release);
+        g_gate.store(0, std::memory_order_release);
+    }
+}
+
+inline RefreshTls* __fastcall getRefreshTls() noexcept {
+    return &t_refreshTls;
+}
+
+// Modifies the camera frustum tangent bounds (boundX, boundY) and raises the dirty flags
+// (0x4 | 0x8) right before the engine's own matrix finalizers compute all forward/inverse
+// matrices and inverse frustum rays. All memory accesses are SEH-protected with rollback.
+inline bool applyTransientCameraBoundJitter(uint8_t* camera, RefreshTls& tls) noexcept {
+    if (!camera) return false;
+    auto& win = frameWindow();
+    if (win.stoodDown.load(std::memory_order_acquire)) return false;
+    if (!win.windowOpen.load(std::memory_order_acquire)) return false;
+    if (win.mapModeActive.load(std::memory_order_relaxed)) return false;
+
+    const DWORD tid = win.renderThreadId.load(std::memory_order_relaxed);
+    if (tid != 0 && GetCurrentThreadId() != tid) return false;
+
+    const uint32_t rw = win.renderWidth.load(std::memory_order_relaxed);
+    const uint32_t rh = win.renderHeight.load(std::memory_order_relaxed);
+    if (rw == 0 || rh == 0) return false;
+
+    const float jx = win.jitterPxX.load(std::memory_order_relaxed);
+    const float jy = win.jitterPxY.load(std::memory_order_relaxed);
+    if (std::fabs(jx) < 1e-6f && std::fabs(jy) < 1e-6f) return false;
+
+    // SEH-protected reads for layout variant 1 (+0x264 kind, +0x28C/+0x290 bounds, +0x250 flags)
+    // and layout variant 2 (+0x240/+0x244 kind, +0x228/+0x22C bounds, +0x250 flags).
+    uint32_t kind1 = 0;
+    float bx1 = 0.0f, by1 = 0.0f;
+    uint32_t kind2a = 0, kind2b = 0;
+    float bx2 = 0.0f, by2 = 0.0f;
+    if (!sehReadU32(camera + 0x264, &kind1) ||
+        !sehReadF32(camera + 0x28C, &bx1) ||
+        !sehReadF32(camera + 0x290, &by1) ||
+        !sehReadU32(camera + 0x240, &kind2a) ||
+        !sehReadU32(camera + 0x244, &kind2b) ||
+        !sehReadF32(camera + 0x228, &bx2) ||
+        !sehReadF32(camera + 0x22C, &by2)) {
+        win.readFaultsTotal.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    auto validBounds = [&](float bx, float by) -> bool {
+        if (!std::isfinite(bx) || !std::isfinite(by)) return false;
+        if (std::fabs(bx) < 0.05f || std::fabs(bx) > 5.0f) return false;
+        if (std::fabs(by) < 0.05f || std::fabs(by) > 5.0f) return false;
+        const float camAspect = std::fabs(bx / by);
+        const float targetAspect = static_cast<float>(rw) / static_cast<float>(rh);
+        return std::fabs(camAspect - targetAspect) <= 0.12f * targetAspect;
+    };
+
+    size_t offBx = 0, offBy = 0;
+    uint32_t variant = 0;
+    if (kind1 == 3 && validBounds(bx1, by1)) {
+        offBx = 0x28C;
+        offBy = 0x290;
+        variant = 1;
+        tls.savedBoundX = bx1;
+        tls.savedBoundY = by1;
+    } else if ((kind2a == 3 || kind2b == 3) && validBounds(bx2, by2)) {
+        offBx = 0x228;
+        offBy = 0x22C;
+        variant = 2;
+        tls.savedBoundX = bx2;
+        tls.savedBoundY = by2;
+    } else {
+        return false;
+    }
+
+    uint32_t flags = 0;
+    if (!sehReadU32(camera + 0x250, &flags)) {
+        win.readFaultsTotal.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    const float newBx = tls.savedBoundX + jx / static_cast<float>(rw);
+    const float newBy = tls.savedBoundY - jy / static_cast<float>(rh);
+    const uint32_t newFlags = flags | 0x4u | 0x8u;
+
+    if (!sehWriteF32(camera + offBx, newBx)) {
+        recordHookWriteFault();
+        return false;
+    }
+    if (!sehWriteF32(camera + offBy, newBy)) {
+        sehWriteF32(camera + offBx, tls.savedBoundX);
+        win.rollbacksTotal.fetch_add(1, std::memory_order_relaxed);
+        recordHookWriteFault();
+        return false;
+    }
+    if (!sehWriteU32(camera + 0x250, newFlags)) {
+        sehWriteF32(camera + offBx, tls.savedBoundX);
+        sehWriteF32(camera + offBy, tls.savedBoundY);
+        win.rollbacksTotal.fetch_add(1, std::memory_order_relaxed);
+        recordHookWriteFault();
+        return false;
+    }
+
+    tls.camera = camera;
+    tls.savedFlags = flags;
+    tls.layoutVariant = variant;
+
+    injectedCameras().recordInjected(camera);
+    win.injectedDrawsThisFrame.fetch_add(1, std::memory_order_relaxed);
+    win.injectedFrameCount.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+inline void __fastcall refreshPost() noexcept {
+    RefreshTls& tls = t_refreshTls;
+    if (tls.camera && tls.layoutVariant != 0) {
+        const size_t offBx = (tls.layoutVariant == 1) ? 0x28Cu : 0x228u;
+        const size_t offBy = (tls.layoutVariant == 1) ? 0x290u : 0x22Cu;
+        const bool okX = sehWriteF32(tls.camera + offBx, tls.savedBoundX);
+        const bool okY = sehWriteF32(tls.camera + offBy, tls.savedBoundY);
+        const bool okF = sehWriteU32(tls.camera + 0x250, tls.savedFlags);
+        if (!okX || !okY || !okF) {
+            recordHookWriteFault();
+        }
+    }
+    tls.camera = nullptr;
+    tls.layoutVariant = 0;
+}
+
+inline void* g_stubBAddr = nullptr;
+
+inline void* __fastcall refreshPre(uint8_t* camera, void* realRet) noexcept {
+    RefreshTls& tls = t_refreshTls;
+    tls.realRet = realRet;
+    tls.camera = nullptr;
+    tls.layoutVariant = 0;
+
+    if (g_stubBAddr && applyTransientCameraBoundJitter(camera, tls)) {
+        return g_stubBAddr;
+    }
+
+    // flushCamera: on the first non-injected call for a previously injected camera
+    // (jitter disabled, stand-down, mapModeActive / GuiFocus 6..9), raise dirty bits
+    // 0x4 | 0x8 once so Cobra recomputes a clean unjittered projection matrix.
+    auto& win = frameWindow();
+    const DWORD tid = win.renderThreadId.load(std::memory_order_relaxed);
+    if (camera && (tid == 0 || GetCurrentThreadId() == tid)) {
+        if (injectedCameras().consumeForFlush(camera)) {
+            uint32_t flags = 0;
+            if (sehReadU32(camera + 0x250, &flags)) {
+                if (sehWriteU32(camera + 0x250, flags | 0x4u | 0x8u)) {
+                    win.flushedCamerasTotal.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    recordHookWriteFault();
+                }
+            } else {
+                win.readFaultsTotal.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Only close g_gate on pause once all previously injected cameras have been flushed.
+        if (win.pauseRequested.load(std::memory_order_acquire) && injectedCameras().empty()) {
+            g_gate.store(0, std::memory_order_release);
+        }
+    }
+
+    return realRet;
+}
+
+// Emits gate-first relay + ABI-safe stubA (16B-aligned with 32B Win64 shadow space) +
+// stubB (16B-aligned return epilogue preserving RAX & XMM0), switches the stub page
+// to PAGE_EXECUTE_READ, and flushes the instruction cache BEFORE any hook is committed.
+inline bool buildRefreshStubs(
+    uint8_t* page,
+    size_t pageSize,
+    void* resumeTrampoline,
+    uint8_t** outRelay,
+    uint8_t** outStubA,
+    uint8_t** outStubB) {
+    if (!page || pageSize < 384 || !resumeTrampoline) return false;
+    std::memset(page, 0xCC, pageSize);
+
+    uint8_t* relay = page + 0;
+    uint8_t* stubA = page + 64;
+    uint8_t* stubB = page + 192;
+
+    // relay (entered via JMP from FUN_1405921f0 prologue):
+    //   If g_gate == 0: transparently jumps to resumeTrampoline with zero GPR/XMM clobber.
+    //   If g_gate != 0: jumps to stubA.
+    size_t r = 0;
+    auto emitR = [&](std::initializer_list<uint8_t> bytes) {
+        for (uint8_t by : bytes) relay[r++] = by;
+    };
+    emitR({0x50});                               // push rax
+    emitR({0x48, 0xB8});                         // mov rax, imm64 (&g_gate)
+    const uintptr_t gateAddr = reinterpret_cast<uintptr_t>(&g_gate);
+    std::memcpy(relay + r, &gateAddr, sizeof(gateAddr));
+    r += 8;
+    emitR({0x48, 0x8B, 0x00});                   // mov rax, [rax]
+    emitR({0x48, 0x85, 0xC0});                   // test rax, rax
+    emitR({0x58});                               // pop rax (does not modify RFLAGS)
+    emitR({0x0F, 0x85});                         // jnz rel32 (stubA)
+    const int32_t jnzDisp = static_cast<int32_t>(stubA - (relay + r + 4));
+    std::memcpy(relay + r, &jnzDisp, sizeof(jnzDisp));
+    r += 4;
+    emitR({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00}); // jmp qword ptr [rip+0]
+    const uintptr_t resumeVal = reinterpret_cast<uintptr_t>(resumeTrampoline);
+    std::memcpy(relay + r, &resumeVal, sizeof(resumeVal));
+    r += 8;
+    if (r > 64) return false;
+
+    // stubA (entered with RSP % 16 == 8 from caller's CALL):
+    //   Saves RCX/RDX/R8/R9 in caller's home space, aligns RSP with sub rsp, 0x28
+    //   (32B shadow space + 8B alignment -> RSP % 16 == 0 before call refreshPre).
+    size_t a = 0;
+    auto emitA = [&](std::initializer_list<uint8_t> bytes) {
+        for (uint8_t by : bytes) stubA[a++] = by;
+    };
+    emitA({0x48, 0x89, 0x4C, 0x24, 0x08});       // mov [rsp+0x08], rcx
+    emitA({0x48, 0x89, 0x54, 0x24, 0x10});       // mov [rsp+0x10], rdx
+    emitA({0x4C, 0x89, 0x44, 0x24, 0x18});       // mov [rsp+0x18], r8
+    emitA({0x4C, 0x89, 0x4C, 0x24, 0x20});       // mov [rsp+0x20], r9
+    emitA({0x48, 0x8B, 0x14, 0x24});             // mov rdx, [rsp] (realRet)
+    emitA({0x48, 0x83, 0xEC, 0x28});             // sub rsp, 0x28 (32B shadow + 16B align)
+    emitA({0x48, 0xB8});                         // mov rax, imm64 (&refreshPre)
+    const uintptr_t preAddr = reinterpret_cast<uintptr_t>(&refreshPre);
+    std::memcpy(stubA + a, &preAddr, sizeof(preAddr));
+    a += 8;
+    emitA({0xFF, 0xD0});                         // call rax
+    emitA({0x48, 0x83, 0xC4, 0x28});             // add rsp, 0x28
+    emitA({0x48, 0x89, 0x04, 0x24});             // mov [rsp], rax
+    emitA({0x48, 0x8B, 0x4C, 0x24, 0x08});       // mov rcx, [rsp+0x08]
+    emitA({0x48, 0x8B, 0x54, 0x24, 0x10});       // mov rdx, [rsp+0x10]
+    emitA({0x4C, 0x8B, 0x44, 0x24, 0x18});       // mov r8,  [rsp+0x18]
+    emitA({0x4C, 0x8B, 0x4C, 0x24, 0x20});       // mov r9,  [rsp+0x20]
+    emitA({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00}); // jmp qword ptr [rip+0]
+    std::memcpy(stubA + a, &resumeVal, sizeof(resumeVal));
+    a += 8;
+    if (a > 128) return false;
+
+    // stubB (entered via `ret` from FUN_1405921f0, so RSP % 16 == 0):
+    //   sub rsp, 0x40 keeps RSP % 16 == 0 and provides 32B shadow space [0x00..0x1F],
+    //   16B-aligned XMM0 save [0x20..0x2F], and RAX save [0x30..0x37].
+    size_t b = 0;
+    auto emitB = [&](std::initializer_list<uint8_t> bytes) {
+        for (uint8_t by : bytes) stubB[b++] = by;
+    };
+    emitB({0x48, 0x83, 0xEC, 0x40});             // sub rsp, 0x40
+    emitB({0x48, 0x89, 0x44, 0x24, 0x30});       // mov [rsp+0x30], rax
+    emitB({0x0F, 0x29, 0x44, 0x24, 0x20});       // movaps [rsp+0x20], xmm0
+    emitB({0x48, 0xB8});                         // mov rax, imm64 (&refreshPost)
+    const uintptr_t postAddr = reinterpret_cast<uintptr_t>(&refreshPost);
+    std::memcpy(stubB + b, &postAddr, sizeof(postAddr));
+    b += 8;
+    emitB({0xFF, 0xD0});                         // call rax
+    emitB({0x48, 0xB8});                         // mov rax, imm64 (&getRefreshTls)
+    const uintptr_t tlsAddr = reinterpret_cast<uintptr_t>(&getRefreshTls);
+    std::memcpy(stubB + b, &tlsAddr, sizeof(tlsAddr));
+    b += 8;
+    emitB({0xFF, 0xD0});                         // call rax
+    emitB({0x48, 0x8B, 0x08});                   // mov rcx, [rax]
+    emitB({0x0F, 0x28, 0x44, 0x24, 0x20});       // movaps xmm0, [rsp+0x20]
+    emitB({0x48, 0x8B, 0x44, 0x24, 0x30});       // mov rax, [rsp+0x30]
+    emitB({0x48, 0x83, 0xC4, 0x40});             // add rsp, 0x40
+    emitB({0xFF, 0xE1});                         // jmp rcx
+    if (b > 128) return false;
+
+    g_stubBAddr = stubB;
+    if (outRelay) *outRelay = relay;
+    if (outStubA) *outStubA = stubA;
+    if (outStubB) *outStubB = stubB;
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(page, pageSize, PAGE_EXECUTE_READ, &oldProt)) {
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), page, pageSize);
+    return true;
+}
+
 // ============================================================================
 // Cockpit Vehicle Rig Tracker (ICameraTargetShip::SetTarget RVA 0x1096640)
 // ============================================================================
@@ -854,7 +1311,7 @@ private:
 };
 
 // ============================================================================
-// Engine Hook Manager (Installs FUN_1405921f0 + VehicleRig hooks when in Elite)
+// Engine Hook Manager (Race-Free Gate-First Installation + Hold-Open Lifetime)
 // ============================================================================
 class EngineHookManager {
 public:
@@ -865,7 +1322,7 @@ public:
 
     bool ensureInstalled() {
         if (m_attempted.exchange(true, std::memory_order_acq_rel)) {
-            return m_viewRefreshHooked.load(std::memory_order_acquire);
+            return isViewRefreshUsable();
         }
 
         wchar_t exePath[MAX_PATH]{};
@@ -878,40 +1335,50 @@ public:
 
         HMODULE exeMod = GetModuleHandleW(nullptr);
         if (!exeMod) return false;
-        const auto baseAddr = reinterpret_cast< uintptr_t >(exeMod);
+        const auto baseAddr = reinterpret_cast<uintptr_t>(exeMod);
 
-        // Verify and hook view-constant refresh FUN_1405921f0
+        // 1. Verify prologue AND camera field offset witnesses before touching executable memory.
         auto* refreshTarget = reinterpret_cast<uint8_t*>(baseAddr + kViewConstRefreshEntryRva);
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(refreshTarget, &mbi, sizeof(mbi)) &&
             mbi.State == MEM_COMMIT &&
             (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
-            // Check standard x64 function prologue bytes (48 89 / 48 83 / 40 53 / 48 8B / 4C 8B)
-            const uint8_t b0 = refreshTarget[0];
-            const uint8_t b1 = refreshTarget[1];
-            const bool validPrologue =
-                (b0 == 0x48 && (b1 == 0x89 || b1 == 0x83 || b1 == 0x8B || b1 == 0x81)) ||
-                (b0 == 0x40 && (b1 >= 0x50 && b1 <= 0x57)) ||
-                (b0 == 0x4C && (b1 == 0x8B || b1 == 0x89));
-            if (validPrologue) {
-                m_stubPage = static_cast<uint8_t*>(CodeHook::allocateNear(refreshTarget, 256));
+            const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            const size_t availBytes = (regionEnd > reinterpret_cast<uintptr_t>(refreshTarget))
+                ? static_cast<size_t>(regionEnd - reinterpret_cast<uintptr_t>(refreshTarget))
+                : 0;
+            if (verifyRefreshFunctionBytes(refreshTarget, availBytes)) {
+                g_gate.store(0, std::memory_order_release);
+                constexpr size_t kStubPageSize = 512;
+                m_stubPage = static_cast<uint8_t*>(CodeHook::allocateNear(refreshTarget, kStubPageSize));
                 if (m_stubPage) {
                     void* resumeTramp = nullptr;
-                    uint8_t* stubA = m_stubPage;
-                    uint8_t* stubB = m_stubPage + 128;
-                    if (m_refreshHook.install(refreshTarget, stubA, &resumeTramp)) {
-                        buildRefreshStubs(m_stubPage, resumeTramp, &stubA, &stubB);
-                        m_viewRefreshHooked.store(true, std::memory_order_release);
-                        EdpeLog(L"EDPE: Cobra view-constant refresh hook installed (RVA 0x5921F0)");
+                    uint8_t* relay = nullptr;
+                    uint8_t* stubA = nullptr;
+                    uint8_t* stubB = nullptr;
+                    m_refreshHook.setHoldOpen(true);
+                    if (m_refreshHook.prepareTrampoline(refreshTarget, &resumeTramp)) {
+                        if (buildRefreshStubs(m_stubPage, kStubPageSize, resumeTramp, &relay, &stubA, &stubB) &&
+                            m_refreshHook.commitPatch(relay)) {
+                            m_viewRefreshHooked.store(true, std::memory_order_release);
+                            g_gate.store(1, std::memory_order_release);
+                            EdpeLog(L"EDPE: Cobra view-constant refresh hook installed (gate-first, RVA 0x5921F0)");
+                        } else {
+                            m_refreshHook.discardPrepared();
+                            VirtualFree(m_stubPage, 0, MEM_RELEASE);
+                            m_stubPage = nullptr;
+                        }
                     } else {
                         VirtualFree(m_stubPage, 0, MEM_RELEASE);
                         m_stubPage = nullptr;
                     }
                 }
+            } else {
+                EdpeLog(L"EDPE: Cobra view-constant refresh prologue/witness mismatch; using D3D11 CB fallback");
             }
         }
 
-        // Optional vehicle rig hook at RVA 0x1096640
+        // 2. Optional vehicle rig hook at RVA 0x1096640 (hold-open for process lifetime).
         auto* rigTarget = reinterpret_cast<uint8_t*>(baseAddr + kShipSetTargetRva);
         if (VirtualQuery(rigTarget, &mbi, sizeof(mbi)) &&
             mbi.State == MEM_COMMIT &&
@@ -921,27 +1388,40 @@ public:
             if ((b0 == 0x48 && (b1 == 0x89 || b1 == 0x83 || b1 == 0x8B)) ||
                 (b0 == 0x40 && (b1 >= 0x50 && b1 <= 0x57))) {
                 void* origRig = nullptr;
-                if (m_rigHook.install(rigTarget, reinterpret_cast<void*>(&detourShipSetTarget), &origRig)) {
+                m_rigHook.setHoldOpen(true);
+                if (m_rigHook.prepareTrampoline(rigTarget, &origRig)) {
                     g_origShipSetTarget = reinterpret_cast<ShipSetTargetFn>(origRig);
-                    EdpeLog(L"EDPE: Cockpit vehicle rig target hook installed (RVA 0x1096640)");
+                    if (m_rigHook.commitPatch(reinterpret_cast<void*>(&detourShipSetTarget))) {
+                        EdpeLog(L"EDPE: Cockpit vehicle rig target hook installed (RVA 0x1096640)");
+                    } else {
+                        g_origShipSetTarget = nullptr;
+                    }
                 }
             }
         }
 
+        return isViewRefreshUsable();
+    }
+
+    bool isViewRefreshHooked() const noexcept {
         return m_viewRefreshHooked.load(std::memory_order_acquire);
     }
 
-    bool isViewRefreshHooked() const {
-        return m_viewRefreshHooked.load(std::memory_order_acquire);
+    bool isStoodDown() const noexcept {
+        return frameWindow().stoodDown.load(std::memory_order_acquire);
     }
 
-    void shutdown() {
-        m_rigHook.remove();
-        m_refreshHook.remove();
-        if (m_stubPage) {
-            VirtualFree(m_stubPage, 0, MEM_RELEASE);
-            m_stubPage = nullptr;
-        }
+    bool isViewRefreshUsable() const noexcept {
+        return m_viewRefreshHooked.load(std::memory_order_acquire) &&
+               !frameWindow().stoodDown.load(std::memory_order_acquire);
+    }
+
+    // Hold-open for process lifetime: NEVER call VirtualFree(m_stubPage) or unmap
+    // executable trampolines while game threads could still execute inside them.
+    void shutdown() noexcept {
+        frameWindow().windowOpen.store(false, std::memory_order_release);
+        frameWindow().pauseRequested.store(true, std::memory_order_release);
+        g_gate.store(0, std::memory_order_release);
         m_viewRefreshHooked.store(false, std::memory_order_release);
     }
 
@@ -952,5 +1432,7 @@ private:
     CodeHook m_rigHook;
     uint8_t* m_stubPage = nullptr;
 };
+
+#endif // _WIN32
 
 } // namespace edpe::cobra_camera

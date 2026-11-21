@@ -76,6 +76,10 @@ void ContextCensusSetJitterScale(float scale);
 float ContextCensusGetJitterScale();
 void ContextCensusSetJitterPhaseCount(unsigned count);
 unsigned ContextCensusGetJitterPhaseCount();
+void ContextCensusSetJitterMode(int mode);
+int ContextCensusGetJitterMode();
+const char* ContextCensusGetActiveJitterRouteName();
+void ContextCensusGetPhaseAuditStats(unsigned long long* outChecked, unsigned long long* outMismatched, float* outLastErrNdc);
 
 void ContextCensusSetZeroMotion(bool zero);
 bool ContextCensusGetZeroMotion();

@@ -238,10 +238,16 @@ int main() {
     const auto inv_jitter = edpe::projectionJitter(3, kRw, kRh, 32);
     const float dxUv = inv_jitter.pixelX / static_cast<float>(kRw);
     const float dyUv = inv_jitter.pixelY / static_cast<float>(kRh);
+    // Physically consistent inverse UV frustum rays for turning_block (A * B == T)
+    const float tbRight[3]{turning_block[0] / parsed.scaleX, turning_block[4] / parsed.scaleX, turning_block[8] / parsed.scaleX};
+    const float tbUp[3]{turning_block[1] / parsed.scaleY, turning_block[5] / parsed.scaleY, turning_block[9] / parsed.scaleY};
+    const float tbFwd[3]{turning_block[3], turning_block[7], turning_block[11]};
     const std::array<float, 12> base_inv_rays{
-         2.0f,  0.1f,  0.2f, 0.0f, // dX
-        -0.1f, -1.2f,  0.15f, 0.0f, // dY
-        -0.95f, 0.55f, -1.0f, 0.0f  // originCorner
+         2.0f * tbRight[0] / parsed.scaleX,  2.0f * tbRight[1] / parsed.scaleX,  2.0f * tbRight[2] / parsed.scaleX, 0.0f, // dX
+        -2.0f * tbUp[0] / parsed.scaleY,    -2.0f * tbUp[1] / parsed.scaleY,    -2.0f * tbUp[2] / parsed.scaleY,    0.0f, // dY
+        tbFwd[0] - tbRight[0] / parsed.scaleX + tbUp[0] / parsed.scaleY,
+        tbFwd[1] - tbRight[1] / parsed.scaleX + tbUp[1] / parsed.scaleY,
+        tbFwd[2] - tbRight[2] / parsed.scaleX + tbUp[2] / parsed.scaleY, 0.0f // originCorner
     };
     auto evalRay = [](const float* rays, float u, float v, int c) {
         return rays[8 + c] + u * rays[c] + v * rays[4 + c];
@@ -354,9 +360,9 @@ int main() {
     float rm_jittered_fwd[16]{};
     if (!edpe::jitterEliteDotProjectionBlock(rm_unjit_fwd, rm_jittered_fwd, inv_jitter)) return 55;
     std::array<float, 12> rm_base_rays{
-         1.8f,  0.2f, 0.0f, rm_unjit_fwd[12] - 0.5f * 1.8f - 0.5f * 0.2f,
-        -0.1f, -1.1f, 0.0f, rm_unjit_fwd[13] - 0.5f * (-0.1f) - 0.5f * (-1.1f),
-         0.3f, -0.2f, 0.0f, rm_unjit_fwd[14] - 0.5f * 0.3f - 0.5f * (-0.2f)
+        base_inv_rays[0], base_inv_rays[4], 0.0f, base_inv_rays[8],
+        base_inv_rays[1], base_inv_rays[5], 0.0f, base_inv_rays[9],
+        base_inv_rays[2], base_inv_rays[6], 0.0f, base_inv_rays[10]
     };
     std::array<float, 68> rm_cb2_whole{};
     std::memcpy(&rm_cb2_whole[40], rm_unjit_fwd, sizeof(rm_unjit_fwd));
@@ -662,6 +668,147 @@ int main() {
     squareCubemap.scaleX = 1.0f;
     squareCubemap.scaleY = 1.0f;
     if (edpe::isEliteSubpassVersusWorldCb1(planetCb1.data(), planetCb1.size(), squareCubemap)) return 97;
+
+    // -------------------------------------------------------------------------
+    // Stage 1: Halton (2,3) phase scaling formula (computeEffectiveJitterPhaseCount)
+    // -------------------------------------------------------------------------
+    // Base = 8 (edpe.ini default): scales strictly with ceil(8 * scale^2)
+    if (edpe::computeEffectiveJitterPhaseCount(8, 2560, 1440, 2560, 1440) != 8u) return 110;   // 1.0x DLAA
+    if (edpe::computeEffectiveJitterPhaseCount(8, 1707, 960, 2560, 1440) != 18u) return 111;   // 1.5x Quality
+    if (edpe::computeEffectiveJitterPhaseCount(8, 1506, 847, 2560, 1440) != 24u) return 112;   // 1.7x Balanced
+    if (edpe::computeEffectiveJitterPhaseCount(8, 1280, 720, 2560, 1440) != 32u) return 113;   // 2.0x Performance
+    if (edpe::computeEffectiveJitterPhaseCount(8, 1280, 720, 3840, 2160) != 72u) return 114;   // 3.0x UltraPerformance
+
+    // Base = 32: does NOT multiply 32 * scale^2 (avoids 128/256 phases!)
+    if (edpe::computeEffectiveJitterPhaseCount(32, 2560, 1440, 2560, 1440) != 32u) return 115; // 1.0x DLAA
+    if (edpe::computeEffectiveJitterPhaseCount(32, 1707, 960, 2560, 1440) != 32u) return 116;  // 1.5x Quality
+    if (edpe::computeEffectiveJitterPhaseCount(32, 1506, 847, 2560, 1440) != 32u) return 117;  // 1.7x Balanced
+    if (edpe::computeEffectiveJitterPhaseCount(32, 1280, 720, 2560, 1440) != 32u) return 118;  // 2.0x Performance
+    if (edpe::computeEffectiveJitterPhaseCount(32, 1280, 720, 3840, 2160) != 72u) return 119;  // 3.0x UltraPerformance
+
+    // Asymmetric axis ratio uses max(scW/rW, scH/rH) and clamps [8, max(64, min_phases)]
+    if (edpe::computeEffectiveJitterPhaseCount(8, 1280, 1440, 2560, 1440) != 32u) return 120;
+    if (edpe::computeEffectiveJitterPhaseCount(4, 2560, 1440, 2560, 1440) != 8u) return 121;
+    if (edpe::computeEffectiveJitterPhaseCount(128, 2560, 1440, 2560, 1440) != 64u) return 122;
+
+    // -------------------------------------------------------------------------
+    // Stage 3: Per-frame phase consistency audit (checkRowPair & PhasePairAuditor)
+    // -------------------------------------------------------------------------
+    {
+        const auto j0 = edpe::projectionJitter(0, 2560, 1440, 32);
+        const auto j1 = edpe::projectionJitter(1, 2560, 1440, 32);
+        const auto j2 = edpe::projectionJitter(2, 2560, 1440, 32);
+        float blk0[16]{}, blk1[16]{}, blk2[16]{}, blk1Double[16]{};
+        if (!edpe::jitterEliteProjectionBlock(turning_block, blk0, j0)) return 123;
+        if (!edpe::jitterEliteProjectionBlock(turning_block, blk1, j1)) return 124;
+        if (!edpe::jitterEliteProjectionBlock(turning_block, blk2, j2)) return 125;
+        if (!edpe::jitterEliteProjectionBlock(blk1, blk1Double, j1)) return 126;
+
+        // 1. Consistent consecutive phases: must match within 2e-6 NDC
+        const auto okRes = edpe::checkRowPair(blk1, blk0, j1, j0, 2.0e-6f);
+        if (!okRes.valid || !okRes.matched || okRes.maxAbsError > 2.0e-6f) return 127;
+
+        // 2. Double jitter on current frame: must fail
+        const auto dblRes = edpe::checkRowPair(blk1Double, blk0, j1, j0, 2.0e-6f);
+        if (!dblRes.valid || dblRes.matched) return 128;
+
+        // 3. Missed phase (unjittered turning_block when j1 expected): must fail
+        const auto missRes = edpe::checkRowPair(turning_block, blk0, j1, j0, 2.0e-6f);
+        if (!missRes.valid || missRes.matched) return 129;
+
+        // 4. Stateful PhasePairAuditor tracking + reset
+        edpe::PhasePairAuditor auditor;
+        const auto r0 = auditor.recordFrame(blk0, j0);
+        if (r0.valid || auditor.checkedCount() != 0 || auditor.mismatchedCount() != 0) return 130;
+        const auto r1 = auditor.recordFrame(blk1, j1);
+        if (!r1.valid || !r1.matched || auditor.checkedCount() != 1 || auditor.mismatchedCount() != 0) return 131;
+        const auto r2 = auditor.recordFrame(blk1Double, j2);
+        if (!r2.valid || r2.matched || auditor.checkedCount() != 2 || auditor.mismatchedCount() != 1) return 132;
+        auditor.reset();
+        const auto r3 = auditor.recordFrame(blk2, j2);
+        if (r3.valid || auditor.checkedCount() != 2 || auditor.mismatchedCount() != 1) return 133;
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 3: Deferred CB2 float32Gamma & UV->Clip non-degeneracy certification
+    // -------------------------------------------------------------------------
+    {
+        const double u32 = 5.960464477539063e-8;
+        const double expectedGamma32 = (32.0 * u32) / (1.0 - 32.0 * u32);
+        if (std::fabs(static_cast<double>(edpe::cobra_camera::float32Gamma(32)) - expectedGamma32) > 1e-9) {
+            return 134;
+        }
+        float normInf = 99.0f;
+        if (!edpe::cobra_camera::certifyDeferredUvToClipNonDegenerate(ws_rows10to16, true, &normInf) ||
+            normInf >= 0.01f) {
+            return 135;
+        }
+        // Degenerate CB2 (zeroed dY column) must be rejected without patching
+        std::array<float, 68> degen_cb2 = ws_cb2;
+        degen_cb2[57] = 0.0f;
+        degen_cb2[61] = 0.0f;
+        degen_cb2[65] = 0.0f;
+        float degenNorm = 0.0f;
+        if (edpe::cobra_camera::certifyDeferredUvToClipNonDegenerate(&degen_cb2[40], true, &degenNorm) ||
+            degenNorm < 1.0f) {
+            return 136;
+        }
+        if (edpe::cobra_camera::repairRowMajorDeferredWholeOmission(
+                degen_cb2.data(), degen_cb2.size(), ws_cb1_col_major, inv_jitter, dxUv, dyUv, &ws_cam_pos)) {
+            return 137;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 2: flushCamera state machine, WriteFaultTracker & prologue witness check
+    // -------------------------------------------------------------------------
+    {
+        edpe::cobra_camera::InjectedCameraSet camSet;
+        int dummyCamA = 0, dummyCamB = 0;
+        if (!camSet.empty() || camSet.size() != 0) return 138;
+        camSet.recordInjected(&dummyCamA);
+        camSet.recordInjected(&dummyCamA); // duplicate must not double-count
+        if (camSet.empty() || camSet.size() != 1 || !camSet.contains(&dummyCamA)) return 139;
+        camSet.recordInjected(&dummyCamB);
+        if (camSet.size() != 2) return 140;
+        if (!camSet.consumeForFlush(&dummyCamA)) return 141; // one-shot flush for camA
+        if (camSet.consumeForFlush(&dummyCamA)) return 142;  // second call must be no-op
+        if (camSet.empty() || camSet.size() != 1) return 143; // gate stays open until camB flushes
+        if (!camSet.consumeForFlush(&dummyCamB)) return 144;
+        if (!camSet.empty() || camSet.size() != 0) return 145; // safe to close g_gate now
+
+        edpe::cobra_camera::WriteFaultTracker tracker;
+        // 7 faults within 5s must NOT stand down
+        for (uint64_t i = 0; i < 7; ++i) {
+            if (tracker.recordFault(10000 + i * 500)) return 146;
+        }
+        // Fault after >5s window expires old entries -> still NOT stood down
+        if (tracker.recordFault(20000)) return 147;
+        tracker.reset();
+        // 8 faults within 5000ms -> permanent stand-down
+        for (uint64_t i = 0; i < 7; ++i) {
+            if (tracker.recordFault(50000 + i * 100)) return 148;
+        }
+        if (!tracker.recordFault(50700) || !tracker.isStoodDown()) return 149;
+
+        // Prologue + camera field offset witnesses (+0x250 & +0x28C)
+        uint8_t validCode[64]{};
+        validCode[0] = 0x48; validCode[1] = 0x89; validCode[2] = 0x5C; validCode[3] = 0x24; validCode[4] = 0x08;
+        const uint32_t offFlags = 0x250u, offBound = 0x28Cu;
+        std::memcpy(validCode + 16, &offFlags, sizeof(offFlags));
+        std::memcpy(validCode + 32, &offBound, sizeof(offBound));
+        if (!edpe::cobra_camera::verifyRefreshFunctionBytes(validCode, sizeof(validCode))) return 150;
+
+        uint8_t missingWitness[64]{};
+        missingWitness[0] = 0x48; missingWitness[1] = 0x89; missingWitness[2] = 0x5C;
+        if (edpe::cobra_camera::verifyRefreshFunctionBytes(missingWitness, sizeof(missingWitness))) return 151;
+
+        uint8_t badPrologue[64]{};
+        badPrologue[0] = 0xCC; badPrologue[1] = 0xCC;
+        std::memcpy(badPrologue + 16, &offFlags, sizeof(offFlags));
+        std::memcpy(badPrologue + 32, &offBound, sizeof(offBound));
+        if (edpe::cobra_camera::verifyRefreshFunctionBytes(badPrologue, sizeof(badPrologue))) return 152;
+    }
 
     return 0; // All temporal math tests passed
 }

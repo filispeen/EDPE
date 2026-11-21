@@ -49,6 +49,9 @@ struct JitterViewRingSlot {
     uint32_t sceneH = 0;
     uint64_t lumaSumQ10 = 0;
     bool hasLuma = false;
+    bool pairCheckValid = false;
+    bool pairCheckOk = true;
+    float pairErrNdc = 0.0f;
 };
 
 class JitterViewRecorder {

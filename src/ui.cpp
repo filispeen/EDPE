@@ -2110,7 +2110,20 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 if (ImGui::IsItemDeactivatedAfterEdit()) {
                     edpe::Config::instance().save();
                 }
-                ImGui::SetItemTooltip("default: 8, standard Halton");
+                ImGui::SetItemTooltip("Base Halton (2,3) cycle (effective phases = clamp(max(base, ceil(8*scale^2)), 8, max(64, min))).");
+
+                const char* jitter_mode_items[] = { "Auto (Upstream -> D3D11)", "D3D11 CB Only", "Upstream Cobra Hook" };
+                int j_mode = ContextCensusGetJitterMode();
+                if (ImGui::Combo("Jitter Route", &j_mode, jitter_mode_items, 3)) {
+                    ContextCensusSetJitterMode(j_mode);
+                    edpe::Config::instance().jitterMode = j_mode;
+                    edpe::Config::instance().save();
+                }
+                unsigned long long auditChecked = 0, auditMismatched = 0;
+                float auditErrNdc = 0.0f;
+                ContextCensusGetPhaseAuditStats(&auditChecked, &auditMismatched, &auditErrNdc);
+                ImGui::TextDisabled("Active route: %s | Phase audit: %llu checked, %llu mismatched (err=%.2e)",
+                    ContextCensusGetActiveJitterRouteName(), auditChecked, auditMismatched, auditErrNdc);
 
                 ImGui::Separator();
                 ImGui::Text("Jitter Telemetry (jitter.log)");
