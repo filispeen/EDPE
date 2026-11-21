@@ -2,6 +2,8 @@
 
 #include <cstring>
 #include <cwchar>
+#include <filesystem>
+#include <string>
 #include <windows.h>
 
 inline HMODULE LoadSystemDll(const wchar_t* name) {
@@ -21,6 +23,41 @@ inline HMODULE LoadSystemDll(const wchar_t* name) {
         return nullptr;
     }
     return mod;
+}
+
+inline HMODULE LoadChainedOrSystemDll(const wchar_t* systemName,
+                                      const wchar_t* chainPath,
+                                      std::wstring* outChainedPath = nullptr) {
+    if (outChainedPath) outChainedPath->clear();
+    if (chainPath && chainPath[0] != L'\0') {
+        std::filesystem::path target(chainPath);
+        if (!target.is_absolute()) {
+            wchar_t exePath[MAX_PATH]{};
+            const DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            if (len > 0 && len < MAX_PATH) {
+                target = std::filesystem::path(exePath).parent_path() / target;
+            }
+        }
+        const std::wstring resolved = target.wstring();
+        HMODULE mod = LoadLibraryExW(resolved.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!mod) {
+            mod = LoadLibraryW(resolved.c_str());
+        }
+        if (mod) {
+            HMODULE selfMod = nullptr;
+            if (GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(&LoadSystemDll), &selfMod) &&
+                selfMod && mod == selfMod) {
+                FreeLibrary(mod);
+                mod = nullptr;
+            } else {
+                if (outChainedPath) *outChainedPath = resolved;
+                return mod;
+            }
+        }
+    }
+    return LoadSystemDll(systemName);
 }
 
 inline void* ResolvePeExportRaw(HMODULE module, const char* procName) {

@@ -209,6 +209,10 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
     float speedFactor = saturate(speed * 0.35);
     float historyConfidence = lerp(1.0, 1.0 / (1.0 + clampDistance * 6.0), speedFactor) * depthConfidence;
+    float lumaRange = max(finalMax.x - finalMin.x, 0.08);
+    float lumaDelta = abs(currentY.x - clampedHistY.x);
+    float relLumaShift = saturate((lumaDelta / lumaRange - 0.60) * 1.25) * saturate((speed - 0.75) * 0.45);
+    historyConfidence *= (1.0 - 0.45 * relLumaShift);
 
     // Base blend weight: 0.90 for static/smooth, lower when high speed
     float blendWeight = clamp(params.z, 0.0, 0.95);

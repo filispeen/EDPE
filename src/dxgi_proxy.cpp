@@ -31,22 +31,42 @@ Fn resolveDxgiFactoryProc(HMODULE systemDxgi, const char* name, bool bypassHooks
     }
     return reinterpret_cast<Fn>(GetProcAddress(systemDxgi, name));
 }
+
+HMODULE resolveBackendDxgi() {
+    static const HMODULE s_backendDxgi = []() -> HMODULE {
+        const auto& chainPath = edpe::Config::instance().chainDxgiDll;
+        if (!chainPath.empty()) {
+            std::wstring resolvedPath;
+            HMODULE mod = LoadChainedOrSystemDll(L"dxgi.dll", chainPath.c_str(), &resolvedPath);
+            if (mod && !resolvedPath.empty()) {
+                std::wstring msg = L"EDPE: chained dxgi.dll -> " + resolvedPath;
+                EdpeLog(msg.c_str());
+                return mod;
+            }
+            std::wstring warn = L"EDPE: failed to chain dxgi.dll (" + chainPath + L"); falling back to system dxgi.dll";
+            EdpeLog(warn.c_str());
+            return mod;
+        }
+        return LoadSystemDll(L"dxgi.dll");
+    }();
+    return s_backendDxgi;
+}
 } // namespace
 
 void syncConfigOnce() {
     static std::once_flag s_once;
     std::call_once(s_once, [] {
+        auto& cfg = edpe::Config::instance();
+        cfg.load();
         edpe::RenderDocBridge::instance().refresh();
-        // Preload system DLLs before patching IATs so RenderDoc's LoadLibrary hook
+        // Preload backend/system DLLs before patching IATs so RenderDoc's LoadLibrary hook
         // does not immediately overwrite EDPE's D3D11 IAT entries.
-        LoadSystemDll(L"dxgi.dll");
+        resolveBackendDxgi();
         LoadSystemDll(L"d3d11.dll");
         if (edpe::isRunningInEliteProcess()) {
             edpe::installInputHooks();
         }
         edpe::installD3D11Hooks();
-        auto& cfg = edpe::Config::instance();
-        cfg.load();
         if (cfg.syncEliteGraphicsConfig()) {
             wchar_t msg[160]{};
             swprintf_s(msg, L"EDPE: synced Elite graphics config (SSAAMultiplier=%.6f)",
@@ -63,7 +83,7 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory(REFIID iid, void** factory) {
         ScopedDepth probeGuard(t_dxgiFactoryDepth);
         EnsureRenderDocFactoryHooked();
     }
-    static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
+    const HMODULE system_dxgi = resolveBackendDxgi();
     if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());
 
     const auto create_factory = resolveDxgiFactoryProc<decltype(&CreateDXGIFactory)>(
@@ -88,7 +108,7 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory1(REFIID iid, void** factory) {
         ScopedDepth probeGuard(t_dxgiFactoryDepth);
         EnsureRenderDocFactoryHooked();
     }
-    static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
+    const HMODULE system_dxgi = resolveBackendDxgi();
     if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());
 
     const auto create_factory = resolveDxgiFactoryProc<decltype(&CreateDXGIFactory1)>(
@@ -113,7 +133,7 @@ extern "C" HRESULT WINAPI EdpeCreateDXGIFactory2(UINT flags, REFIID iid, void** 
         ScopedDepth probeGuard(t_dxgiFactoryDepth);
         EnsureRenderDocFactoryHooked();
     }
-    static const HMODULE system_dxgi = LoadSystemDll(L"dxgi.dll");
+    const HMODULE system_dxgi = resolveBackendDxgi();
     if (!system_dxgi) return HRESULT_FROM_WIN32(GetLastError());
 
     const auto create_factory = resolveDxgiFactoryProc<decltype(&CreateDXGIFactory2)>(

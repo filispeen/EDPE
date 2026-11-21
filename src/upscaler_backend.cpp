@@ -15,6 +15,7 @@ std::recursive_mutex g_scene_ctx_mutex;
 #include <vector>
 
 #if defined(EDPE_ENABLE_FSR)
+#include <d3dcompiler.h>
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
 #include <FidelityFX/host/backends/dx11/ffx_dx11.h>
 #endif
@@ -241,6 +242,19 @@ struct AmdUpscalerBackend::Impl {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> dilatedMotionVectorsTexture;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> reconstructedPrevNearestDepthTexture;
 
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> reactiveCs;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> reactiveCb;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> reactiveLinearSampler;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> reactiveTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> reactiveSrv;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> reactiveUav;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> prevColorTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> prevColorSrv;
+    uint32_t reactiveWidth = 0;
+    uint32_t reactiveHeight = 0;
+    DXGI_FORMAT prevColorFormat = DXGI_FORMAT_UNKNOWN;
+    bool prevColorValid = false;
+
     uint32_t maxRenderWidth = 0;
     uint32_t maxRenderHeight = 0;
     uint32_t maxOutputWidth = 0;
@@ -378,17 +392,306 @@ struct AmdUpscalerBackend::Impl {
         return true;
     }
 
+    void resetReactiveResources() {
+        reactiveCs.Reset();
+        reactiveCb.Reset();
+        reactiveLinearSampler.Reset();
+        reactiveTexture.Reset();
+        reactiveSrv.Reset();
+        reactiveUav.Reset();
+        prevColorTexture.Reset();
+        prevColorSrv.Reset();
+        reactiveWidth = 0;
+        reactiveHeight = 0;
+        prevColorFormat = DXGI_FORMAT_UNKNOWN;
+        prevColorValid = false;
+    }
+
     void destroyFsrContext() {
 #if defined(EDPE_ENABLE_FSR)
         dilatedDepthTexture.Reset();
         dilatedMotionVectorsTexture.Reset();
         reconstructedPrevNearestDepthTexture.Reset();
+        resetReactiveResources();
         if (contextCreated) {
             ffxFsr3UpscalerContextDestroy(&fsrContext);
             contextCreated = false;
         }
 #endif
     }
+
+#if defined(EDPE_ENABLE_FSR)
+    struct alignas(16) ReactiveParams {
+        uint32_t renderWidth;
+        uint32_t renderHeight;
+        float invRenderWidth;
+        float invRenderHeight;
+        float mvScaleX;
+        float mvScaleY;
+        float hasPrev;
+        float isHdr;
+    };
+
+    bool ensureReactivePipeline(ID3D11Device* device) {
+        if (reactiveCs && reactiveCb && reactiveLinearSampler) return true;
+        if (!device) return false;
+
+        static constexpr char kFsrReactiveCsHlsl[] = R"(
+Texture2D<float4> tCurrColor : register(t0);
+Texture2D<float4> tPrevColor : register(t1);
+Texture2D<float2> tMotion    : register(t2);
+Texture2D<float>  tDepth     : register(t3);
+SamplerState      sLinear    : register(s0);
+RWTexture2D<float> uReactive : register(u0);
+
+cbuffer ReactiveParams : register(b0) {
+    uint2  renderSize;
+    float2 invRenderSize;
+    float2 mvScale;
+    float  hasPrev;
+    float  isHdr;
+};
+
+float3 toPerceptual(float3 c, float hdrFlag) {
+    float3 pos = max(c, 0.0.xxx);
+    return (hdrFlag > 0.5) ? (pos / (1.0.xxx + pos)) : saturate(pos);
+}
+
+[numthreads(16, 16, 1)]
+void cs_main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= renderSize.x || id.y >= renderSize.y) return;
+    int2 p = int2(id.xy);
+    int2 maxCoord = int2(renderSize) - int2(1, 1);
+
+    float3 currRaw = tCurrColor.Load(int3(p, 0)).rgb;
+    if (!all(isfinite(currRaw)) || any(currRaw < -1e-4)) {
+        uReactive[p] = 1.0;
+        return;
+    }
+
+    if (hasPrev < 0.5) {
+        uReactive[p] = 0.0;
+        return;
+    }
+
+    float2 mv = tMotion.Load(int3(p, 0)).xy * mvScale;
+    if (!all(isfinite(mv))) {
+        uReactive[p] = 0.85;
+        return;
+    }
+    float2 prevUv = (float2(p) + 0.5 + mv) * invRenderSize;
+    if (any(prevUv < 0.0) || any(prevUv > 1.0)) {
+        uReactive[p] = 0.0;
+        return;
+    }
+
+    float3 prevRaw = tPrevColor.SampleLevel(sLinear, prevUv, 0).rgb;
+    if (!all(isfinite(prevRaw))) {
+        uReactive[p] = 1.0;
+        return;
+    }
+
+    float3 cTone = toPerceptual(currRaw, isHdr);
+    float3 prevTone = toPerceptual(prevRaw, isHdr);
+    float3 pMin = prevTone;
+    float3 pMax = prevTone;
+    int2 prevCenter = clamp(int2(prevUv * float2(renderSize)), int2(0, 0), maxCoord);
+    [unroll]
+    for (int dy = -1; dy <= 1; ++dy) {
+        [unroll]
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 np = clamp(prevCenter + int2(dx, dy), int2(0, 0), maxCoord);
+            float3 nRaw = tPrevColor.Load(int3(np, 0)).rgb;
+            if (all(isfinite(nRaw))) {
+                float3 nTone = toPerceptual(nRaw, isHdr);
+                pMin = min(pMin, nTone);
+                pMax = max(pMax, nTone);
+            }
+        }
+    }
+
+    // Compare against the reprojected 3x3 neighborhood box so static sub-pixel jitter
+    // on thin stripes/edges stays inside [pMin, pMax] (zero reactive rejection), while
+    // un-vectored moving/fading exhaust particles fall outside and trigger reactive.
+    float3 boxExcess = max(0.0.xxx, cTone - pMax) + max(0.0.xxx, pMin - cTone);
+    float boxDiff = length(boxExcess);
+    uReactive[p] = min(0.85, saturate((boxDiff - 0.075) * 3.2));
+}
+)";
+
+        if (!reactiveCs) {
+            Microsoft::WRL::ComPtr<ID3DBlob> csBlob, errBlob;
+            if (FAILED(D3DCompile(kFsrReactiveCsHlsl, sizeof(kFsrReactiveCsHlsl) - 1,
+                    nullptr, nullptr, nullptr, "cs_main", "cs_5_0", 0, 0, &csBlob, &errBlob)) ||
+                !csBlob ||
+                FAILED(device->CreateComputeShader(csBlob->GetBufferPointer(), csBlob->GetBufferSize(),
+                    nullptr, &reactiveCs))) {
+                return false;
+            }
+        }
+        if (!reactiveCb) {
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = sizeof(ReactiveParams);
+            bd.Usage = D3D11_USAGE_DYNAMIC;
+            bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (FAILED(device->CreateBuffer(&bd, nullptr, &reactiveCb))) return false;
+        }
+        if (!reactiveLinearSampler) {
+            D3D11_SAMPLER_DESC sd{};
+            sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.MaxLOD = D3D11_FLOAT32_MAX;
+            if (FAILED(device->CreateSamplerState(&sd, &reactiveLinearSampler))) return false;
+        }
+        return true;
+    }
+
+    bool ensureReactiveTargets(ID3D11Device* device, uint32_t width, uint32_t height, DXGI_FORMAT colorFmt) {
+        if (!device || !width || !height) return false;
+        if (reactiveTexture && reactiveUav && prevColorTexture && prevColorSrv &&
+            reactiveWidth == width && reactiveHeight == height && prevColorFormat == colorFmt) {
+            return true;
+        }
+
+        reactiveTexture.Reset();
+        reactiveSrv.Reset();
+        reactiveUav.Reset();
+        prevColorTexture.Reset();
+        prevColorSrv.Reset();
+        reactiveWidth = 0;
+        reactiveHeight = 0;
+        prevColorFormat = DXGI_FORMAT_UNKNOWN;
+        prevColorValid = false;
+
+        D3D11_TEXTURE2D_DESC rDesc{};
+        rDesc.Width = width;
+        rDesc.Height = height;
+        rDesc.MipLevels = 1;
+        rDesc.ArraySize = 1;
+        rDesc.Format = DXGI_FORMAT_R8_UNORM;
+        rDesc.SampleDesc.Count = 1;
+        rDesc.Usage = D3D11_USAGE_DEFAULT;
+        rDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        if (FAILED(device->CreateTexture2D(&rDesc, nullptr, &reactiveTexture))) return false;
+        if (FAILED(device->CreateShaderResourceView(reactiveTexture.Get(), nullptr, &reactiveSrv))) return false;
+        if (FAILED(device->CreateUnorderedAccessView(reactiveTexture.Get(), nullptr, &reactiveUav))) return false;
+
+        D3D11_TEXTURE2D_DESC pDesc{};
+        pDesc.Width = width;
+        pDesc.Height = height;
+        pDesc.MipLevels = 1;
+        pDesc.ArraySize = 1;
+        pDesc.Format = colorFmt;
+        pDesc.SampleDesc.Count = 1;
+        pDesc.Usage = D3D11_USAGE_DEFAULT;
+        pDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(device->CreateTexture2D(&pDesc, nullptr, &prevColorTexture))) return false;
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = sanitizeConcreteUavFormat(colorFmt);
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        if (FAILED(device->CreateShaderResourceView(prevColorTexture.Get(), &srvDesc, &prevColorSrv))) return false;
+
+        reactiveWidth = width;
+        reactiveHeight = height;
+        prevColorFormat = colorFmt;
+        return true;
+    }
+
+    ID3D11Texture2D* generateReactiveMask(ID3D11DeviceContext* context, ID3D11Device* device,
+                                          const TemporalFrameInputs& inputs,
+                                          float mvScaleX, float mvScaleY, bool reset) {
+        if (!context || !device || !inputs.color || !inputs.colorSrv ||
+            !inputs.motionSrv || !inputs.depthSrv) {
+            return nullptr;
+        }
+        D3D11_TEXTURE2D_DESC cDesc{};
+        inputs.color->GetDesc(&cDesc);
+        if (cDesc.Width != inputs.renderWidth || cDesc.Height != inputs.renderHeight) {
+            return nullptr;
+        }
+        if (!ensureReactivePipeline(device) ||
+            !ensureReactiveTargets(device, inputs.renderWidth, inputs.renderHeight, cDesc.Format)) {
+            return nullptr;
+        }
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context->Map(reactiveCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            return nullptr;
+        }
+        auto* params = static_cast<ReactiveParams*>(mapped.pData);
+        params->renderWidth = inputs.renderWidth;
+        params->renderHeight = inputs.renderHeight;
+        params->invRenderWidth = 1.0f / static_cast<float>(inputs.renderWidth);
+        params->invRenderHeight = 1.0f / static_cast<float>(inputs.renderHeight);
+        params->mvScaleX = mvScaleX;
+        params->mvScaleY = mvScaleY;
+        params->hasPrev = (prevColorValid && !reset) ? 1.0f : 0.0f;
+        params->isHdr = inputs.colorIsHdr ? 1.0f : 0.0f;
+        context->Unmap(reactiveCb.Get(), 0);
+
+        Microsoft::WRL::ComPtr<ID3D11ComputeShader> oldCs;
+        Microsoft::WRL::ComPtr<ID3D11Buffer> oldCb;
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> oldSamp;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> oldSrvs[4];
+        Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> oldUav;
+        context->CSGetShader(&oldCs, nullptr, nullptr);
+        context->CSGetConstantBuffers(0, 1, &oldCb);
+        context->CSGetSamplers(0, 1, &oldSamp);
+        context->CSGetShaderResources(0, 4, oldSrvs[0].GetAddressOf());
+        context->CSGetUnorderedAccessViews(0, 1, &oldUav);
+
+        ID3D11ShaderResourceView* srvs[4] = {
+            inputs.colorSrv,
+            prevColorSrv.Get(),
+            inputs.motionSrv,
+            inputs.depthSrv
+        };
+        ID3D11UnorderedAccessView* uav = reactiveUav.Get();
+        ID3D11Buffer* cb = reactiveCb.Get();
+        ID3D11SamplerState* samp = reactiveLinearSampler.Get();
+
+        context->CSSetShader(reactiveCs.Get(), nullptr, 0);
+        context->CSSetConstantBuffers(0, 1, &cb);
+        context->CSSetSamplers(0, 1, &samp);
+        context->CSSetShaderResources(0, 4, srvs);
+        context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        context->Dispatch((inputs.renderWidth + 15) / 16, (inputs.renderHeight + 15) / 16, 1);
+
+        ID3D11ShaderResourceView* nullSrvs[4] = {nullptr, nullptr, nullptr, nullptr};
+        ID3D11UnorderedAccessView* nullUav = nullptr;
+        context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+        context->CSSetShaderResources(0, 4, nullSrvs);
+
+        ID3D11ShaderResourceView* restoreSrvs[4] = {
+            oldSrvs[0].Get(), oldSrvs[1].Get(), oldSrvs[2].Get(), oldSrvs[3].Get()
+        };
+        ID3D11UnorderedAccessView* restoreUav = oldUav.Get();
+        ID3D11Buffer* restoreCb = oldCb.Get();
+        ID3D11SamplerState* restoreSamp = oldSamp.Get();
+        context->CSSetShaderResources(0, 4, restoreSrvs);
+        context->CSSetUnorderedAccessViews(0, 1, &restoreUav, nullptr);
+        context->CSSetConstantBuffers(0, 1, &restoreCb);
+        context->CSSetSamplers(0, 1, &restoreSamp);
+        context->CSSetShader(oldCs.Get(), nullptr, 0);
+
+        return reactiveTexture.Get();
+    }
+
+    void capturePrevColor(ID3D11DeviceContext* context, ID3D11Texture2D* colorTex,
+                          uint32_t width, uint32_t height) {
+        if (!context || !colorTex || !prevColorTexture ||
+            reactiveWidth != width || reactiveHeight != height) {
+            return;
+        }
+        context->CopyResource(prevColorTexture.Get(), colorTex);
+        prevColorValid = true;
+    }
+#endif
 
     bool ensureFsrContext(ID3D11Device* device, uint32_t renderW, uint32_t renderH,
                           uint32_t outputW, uint32_t outputH, bool isHdr) {
@@ -608,7 +911,12 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.reconstructedPrevNearestDepth = ffxGetResourceDX11_Fsr31(impl_->reconstructedPrevNearestDepthTexture.Get(),
         GetFfxResourceDescriptionDX11(impl_->reconstructedPrevNearestDepthTexture.Get()), L"FSR3_ReconstructedPrevNearestDepth", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    // Reactive mask removed: HUD and UI are composited via separate native layer.
+    if (ID3D11Texture2D* reactiveTex = impl_->generateReactiveMask(
+            context, device.Get(), inputs, params.motionVectorScaleX, params.motionVectorScaleY,
+            params.reset || impl_->resetRequested)) {
+        dispatchDesc.reactive = ffxGetResourceDX11_Fsr31(reactiveTex,
+            GetFfxResourceDescriptionDX11(reactiveTex), L"FSR3_Reactive", FFX_RESOURCE_STATE_COMPUTE_READ);
+    }
 
     ID3D11Texture2D* evalOut = directDest ? destinationTexture : impl_->outputTexture.Get();
     dispatchDesc.output = ffxGetResourceDX11_Fsr31(evalOut,
@@ -659,6 +967,8 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         return false;
     }
 
+    impl_->capturePrevColor(context, inputs.color, inputs.renderWidth, inputs.renderHeight);
+
     if (!directDest) {
         ID3D11Texture2D* dest = destinationTexture ? destinationTexture : inputs.color;
         if (dest) {
@@ -674,6 +984,7 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
 void AmdUpscalerBackend::resetHistory() {
     if (impl_) {
         impl_->resetRequested = true;
+        impl_->prevColorValid = false;
     }
 }
 

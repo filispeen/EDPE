@@ -50,7 +50,7 @@ HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
         // Always retain VS bytecode (<= 64 KiB, same as PS) so WeaponMotionTracker can
         // lazily build Stream-Output geometry shaders for stencil-0x10 weapon draws.
-            (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
+        (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
         const auto hash = EdpeShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
     }
@@ -76,23 +76,6 @@ HRESULT STDMETHODCALLTYPE observedCreateSamplerState(ID3D11Device* device,
         return original_create_sampler_state.load(std::memory_order_acquire)(device, desc, sampler);
     }
 
-    static std::set<std::tuple<UINT, int, int, int>> s_seen_samplers;
-    static std::mutex s_sampler_mutex;
-    {
-        const auto key = std::make_tuple(
-            static_cast<UINT>(desc->Filter),
-            static_cast<int>(std::lround(desc->MipLODBias * 100.0f)),
-            static_cast<int>(std::lround(desc->MinLOD * 100.0f)),
-            static_cast<int>(std::lround(std::min(desc->MaxLOD, 1000.0f) * 100.0f)));
-        std::lock_guard<std::mutex> lock(s_sampler_mutex);
-        if (s_seen_samplers.size() < 128 && s_seen_samplers.insert(key).second) {
-            wchar_t msg[160];
-            swprintf_s(msg, L"EDPE: CreateSamplerState filter=%u mipBias=%.2f minLOD=%.2f maxLOD=%.2f",
-                desc->Filter, desc->MipLODBias, desc->MinLOD, desc->MaxLOD);
-            EdpeLog(msg);
-        }
-    }
-
     D3D11_SAMPLER_DESC mod_desc = *desc;
     const bool is_comparison = D3D11_DECODE_IS_COMPARISON_FILTER(desc->Filter);
     const bool is_linear_mip = (D3D11_DECODE_MIP_FILTER(desc->Filter) == D3D11_FILTER_TYPE_LINEAR) ||
@@ -103,8 +86,25 @@ HRESULT STDMETHODCALLTYPE observedCreateSamplerState(ID3D11Device* device,
         auto& cfg = edpe::Config::instance();
         const float ratio = edpe::Config::getTargetSsaaMultiplier(cfg.upscalerBackend, cfg.upscaleMode);
         if (ratio > 0.0f && ratio < 1.0f) {
-            const float bias = std::log2(ratio) - 1.0f;
+            const float bias = std::log2(ratio);
             mod_desc.MipLODBias = std::clamp(desc->MipLODBias + bias, -15.99f, 15.99f);
+        }
+    }
+
+    static std::set<std::tuple<UINT, int, int, int>> s_seen_samplers;
+    static std::mutex s_sampler_mutex;
+    {
+        const auto key = std::make_tuple(
+            static_cast<UINT>(mod_desc.Filter),
+            static_cast<int>(std::lround(mod_desc.MipLODBias * 100.0f)),
+            static_cast<int>(std::lround(mod_desc.MinLOD * 100.0f)),
+            static_cast<int>(std::lround(std::min(mod_desc.MaxLOD, 1000.0f) * 100.0f)));
+        std::lock_guard<std::mutex> lock(s_sampler_mutex);
+        if (s_seen_samplers.size() < 128 && s_seen_samplers.insert(key).second) {
+            wchar_t msg[160];
+            swprintf_s(msg, L"EDPE: CreateSamplerState filter=%u mipBias=%.2f minLOD=%.2f maxLOD=%.2f",
+                mod_desc.Filter, mod_desc.MipLODBias, mod_desc.MinLOD, mod_desc.MaxLOD);
+            EdpeLog(msg);
         }
     }
 

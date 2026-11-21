@@ -4,7 +4,7 @@
 
 [![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version&style=for-the-badge)](https://github.com/filispeen/EDPE/releases/latest)
 ![CI](https://img.shields.io/github/actions/workflow/status/filispeen/EDPE/CI.yml?style=for-the-badge&label=CI)
-[![Tests](https://img.shields.io/badge/tests-23%2F23%20Passing-brightgreen.svg?style=for-the-badge)]()
+[![Tests](https://img.shields.io/badge/tests-26%2F26%20Passing-brightgreen.svg?style=for-the-badge)]()
 
 [![Status](https://img.shields.io/badge/status-in%20development-yellow.svg?style=for-the-badge)](STATUS.md)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20x64-blue.svg?style=for-the-badge)]()
@@ -213,7 +213,7 @@ Build outputs:
 * `build/Release/dxgi.dll`: compiled proxy DLL
 * `build/stage/`: staged runtime files (`dxgi.dll`, plus `nvngx_dlss.dll`, `amd_fidelityfx_framegeneration_dx12.dll` / FFX loader DLLs, and `sl.*.dll` when the optional vendor SDKs are present)
 
-Run the 23 automated tests with CTest:
+Run the 26 automated tests with CTest:
 
 ```powershell
 ctest --test-dir build -C Release --output-on-failure

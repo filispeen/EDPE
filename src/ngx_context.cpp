@@ -1,5 +1,7 @@
 #include "ngx_context.h"
+#include "config.h"
 #include "context_census.h"
+#include "gpu_vendor.h"
 #include "temporal_inputs.h"
 #include "log.h"
 
@@ -8,8 +10,10 @@
 #include <cstdio>
 #include <cwchar>
 #include <d3d11.h>
+#include <dxgi.h>
 #include <string>
 #include <windows.h>
+#include <wrl/client.h>
 
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
 #include "nvsdk_ngx.h"
@@ -150,6 +154,27 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
         return false;
     }
 
+    const bool underWine = isRunningUnderWine();
+    {
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) &&
+            SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
+            DXGI_ADAPTER_DESC desc{};
+            if (SUCCEEDED(adapter->GetDesc(&desc))) {
+                const GpuVendor vendor = classifyGpuVendor(
+                    desc.VendorId, desc.DeviceId, desc.Description, underWine);
+                if (vendor != GpuVendor::Nvidia && vendor != GpuVendor::Unknown) {
+                    swprintf_s(g_status_msg,
+                        L"NVIDIA DLSS unavailable: detected %ls GPU (%ls); skipping NGX init",
+                        gpuVendorNameW(vendor), desc.Description);
+                    EdpeLog(g_status_msg);
+                    return false;
+                }
+            }
+        }
+    }
+
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     if (g_ngx_state.initialized) {
         if (g_ngx_device == device) return true;
@@ -180,6 +205,10 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
             swprintf_s(g_status_msg,
                 L"NVSDK_NGX_D3D11_Init failed: 0x%08X (blocked under RenderDoc; use FSR or TAA while capturing)",
                 static_cast<unsigned>(r));
+        } else if (underWine) {
+            swprintf_s(g_status_msg,
+                L"NVSDK_NGX_D3D11_Init failed: 0x%08X (Proton: launch with PROTON_ENABLE_NVAPI=1 WINEDLLOVERRIDES=\"dxgi=n,b\" %%command%%)",
+                static_cast<unsigned>(r));
         } else {
             swprintf_s(g_status_msg, L"NVSDK_NGX_D3D11_Init failed: 0x%08X", static_cast<unsigned>(r));
         }
@@ -199,7 +228,13 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     NVSDK_NGX_Parameter_GetI(g_ngx_params, NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &init_result);
 
     if (available != 1) {
-        swprintf_s(g_status_msg, L"NGX SuperSampling unavailable (result=0x%08X)", static_cast<unsigned>(init_result));
+        if (underWine) {
+            swprintf_s(g_status_msg,
+                L"NGX SuperSampling unavailable (result=0x%08X; Proton: launch with PROTON_ENABLE_NVAPI=1 WINEDLLOVERRIDES=\"dxgi=n,b\" %%command%%)",
+                static_cast<unsigned>(init_result));
+        } else {
+            swprintf_s(g_status_msg, L"NGX SuperSampling unavailable (result=0x%08X)", static_cast<unsigned>(init_result));
+        }
         EdpeLog(g_status_msg);
         return false;
     }
