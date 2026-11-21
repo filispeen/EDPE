@@ -7,7 +7,7 @@
 [![Tests](https://img.shields.io/badge/tests-26%2F26%20Passing-brightgreen.svg?style=for-the-badge)]()
 
 [![Status](https://img.shields.io/badge/status-in%20development-yellow.svg?style=for-the-badge)](STATUS.md)
-[![Platforms](https://img.shields.io/badge/platform-Windows%20x64-blue.svg?style=for-the-badge)]()
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20|%20LINUX-blue.svg?style=for-the-badge)](#installation)
 
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white&style=for-the-badge)](https://discord.gg/KxDBRcKwMK)
 [![Support Elite Dangerous Performance Enchanced](https://img.shields.io/badge/Donate-donatr.ee-6C5CE7?style=for-the-badge)](https://donatr.ee/filispeen)
