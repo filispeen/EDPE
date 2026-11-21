@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -92,6 +93,18 @@ public:
                             uint32_t vertexCount,
                             uint32_t* outByteOffset);
 
+    // Captures a live stencil-0x10 DrawIndexedInstanced call into the current SO pool using a
+    // lazily cached D3D11_SO_NO_RASTERIZED_STREAM Geometry Shader (leaves G-buffer untouched).
+    using DrawIndexedInstancedFn = void(STDMETHODCALLTYPE*)(
+        ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
+    bool captureDrawIndexedInstanced(ID3D11DeviceContext* context,
+                                     UINT indexCount,
+                                     UINT instanceCount,
+                                     UINT startIndex,
+                                     INT baseVertex,
+                                     UINT startInstance,
+                                     DrawIndexedInstancedFn origDraw);
+
     // Rasterize all matched current/previous draws into WeaponMotion (R16G16B16A16_FLOAT).
     bool resolve(ID3D11DeviceContext* context,
                  float jitterNowX, float jitterNowY,
@@ -103,6 +116,8 @@ public:
     ID3D11Texture2D* weaponMotionTexture() const { return motionTex_.Get(); }
     bool hasResolvedMotion() const { return hasResolvedMotion_; }
     uint32_t matchedDrawCount() const { return matchedDraws_; }
+    uint32_t capturedDrawCount() const { return static_cast<uint32_t>(draws_[curSlot_].size()); }
+    bool isInitialized() const { return device_ != nullptr; }
 
 private:
     bool ensureTargets(UINT width, UINT height);
@@ -123,6 +138,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> depthTex_;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depthDsv_;
 
+    ID3D11GeometryShader* getOrCreateStreamOutGs(ID3D11VertexShader* vs, uint64_t vsHash);
+    std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D11GeometryShader>> soGsCache_;
     std::vector<CapturedDraw> draws_[2];
     uint32_t curSlot_ = 0;
     uint32_t writeCursorBytes_ = 0;

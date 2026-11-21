@@ -48,8 +48,8 @@ HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     const HRESULT result = original_create_vertex_shader.load(std::memory_order_acquire)(
         device, bytecode, size, linkage, shader);
     if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
-        if (retain_vertex_bytecode.load(std::memory_order_relaxed) ||
-            edpe::isVisorVertexShaderBytecode(bytecode, size))
+        // Always retain VS bytecode (<= 64 KiB, same as PS) so WeaponMotionTracker can
+        // lazily build Stream-Output geometry shaders for stencil-0x10 weapon draws.
             (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
         const auto hash = EdpeShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);

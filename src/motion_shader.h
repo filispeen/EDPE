@@ -329,7 +329,7 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
             res.pixelClass = isReset ? kClassReset : kClassCockpitStatic;
             return res;
         }
-        if (!clampCockpit && !hasWeapon) {
+        if (!clampCockpit) {
             // Cover both stencil-tagged weapon/arms (0x10/0x80) and near-camera un-stenciled
             // weapon parts (muzzle tip / scope rim / glass at z < 0.60m; ground is ~2.7m+).
             float zView = (depthB > 0.0) ? (depthB / depth) : 1e30;

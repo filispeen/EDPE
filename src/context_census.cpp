@@ -7,6 +7,7 @@
 #include "cobra_camera_inject.h"
 #include "log.h"
 #include "motion_pass.h"
+#include "weapon_motion.h"
 #include "shader_probe.h"
 #include "temporal_math.h"
 #include "upscaler_backend.h"
@@ -6259,10 +6260,52 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
     }
 }
 
+static edpe::WeaponMotionTracker s_weapon_motion;
+static unsigned long long s_weapon_motion_frame = ~0ull;
+static bool s_weapon_motion_logged_active = false;
+
+static void tryCaptureOnFootWeaponDraw(ID3D11DeviceContext* context,
+    UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
+    UINT start_instance, DrawIndexedInstancedFn forward) {
+    if (!context || !forward || g_is_evaluating_upscaler.load(std::memory_order_relaxed)) return;
+    if (s_upscale_evaluated_this_frame || instance_count != 1u || index_count < 3u || index_count > 250000u) return;
+    if (!edpe::cobra_camera::MapFocusPoller::isOnFootActive()) return;
+    if (!edpe::UpscalerManager::instance().isReconstructionActive() &&
+        !edpe::FgRuntime::instance().isMotionNeeded()) return;
+
+    const auto cur = last_present_frame.load(std::memory_order_relaxed);
+    std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
+    if (!s_weapon_motion.isInitialized()) {
+        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+        context->GetDevice(&dev);
+        if (!dev || !s_weapon_motion.initialize(dev.Get())) return;
+    }
+    if (s_weapon_motion_frame != cur) {
+        UINT w = 0, h = 0;
+        if (scene_depth_source) {
+            D3D11_TEXTURE2D_DESC dd{};
+            scene_depth_source->GetDesc(&dd);
+            w = dd.Width;
+            h = dd.Height;
+        }
+        const float nearM = (s_camera_now.depthB > 0.0f) ? s_camera_now.depthB : edpe::kDefaultWorldNearM;
+        s_weapon_motion.beginFrame(context, w, h, nearM, nearM);
+        s_weapon_motion_frame = cur;
+    }
+    s_weapon_motion.captureDrawIndexedInstanced(
+        context, index_count, instance_count, start_index, base_vertex, start_instance, forward);
+}
+
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
     UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
     UINT start_instance) {
     const bool immediate = isObservedImmediateContext(context);
+    if (immediate) {
+        if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
+            tryCaptureOnFootWeaponDraw(context, index_count, instance_count,
+                start_index, base_vertex, start_instance, forward);
+        }
+    }
     if (!immediate || !isHudDrawInterceptWindowActive()) {
         if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
             forward(context, index_count, instance_count, start_index, base_vertex, start_instance);
@@ -9699,6 +9742,8 @@ void tryMotionPair(ID3D11DeviceContext* fallback_context, unsigned long long fra
     static ID3D11Device* s_motion_pass_device = nullptr;
     if (motion_pass && s_motion_pass_device != device.Get()) {
         motion_pass.reset();
+        s_weapon_motion.shutdown();
+        s_weapon_motion_frame = ~0ull;
     }
     if (!motion_pass) {
         auto candidate = std::make_unique<edpe::MotionPass>();
@@ -10619,6 +10664,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_has_motion_prev_depth = false;
         s_cached_hdr_rtv0 = nullptr;
         motion_pass.reset();
+        s_weapon_motion.shutdown();
+        s_weapon_motion_frame = ~0ull;
         s_dlss_output_texture.Reset();
         s_dlss_output_srv.Reset();
         s_last_final_output_present.Reset();
@@ -10960,13 +11007,30 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             } else {
                 // Render motion vectors at render resolution using current and previous camera projections and jitter phases
                 const bool clampCockpit = !edpe::cobra_camera::MapFocusPoller::isOnFootActive();
+                ID3D11ShaderResourceView* weaponMotionSrv = nullptr;
+                if (!clampCockpit && !eval_reset &&
+                    s_weapon_motion.isInitialized() &&
+                    s_weapon_motion_frame == rendered &&
+                    s_weapon_motion.capturedDrawCount() > 0u) {
+                    const bool vmJittered = (jx != 0.0f || jy != 0.0f || prev_jx != 0.0f || prev_jy != 0.0f);
+                    if (s_weapon_motion.resolve(context, jx, jy, prev_jx, prev_jy, vmJittered)) {
+                        weaponMotionSrv = s_weapon_motion.weaponMotionSrv();
+                        if (!s_weapon_motion_logged_active) {
+                            s_weapon_motion_logged_active = true;
+                            wchar_t wmLog[160];
+                            swprintf_s(wmLog, L"EDPE: WeaponMotion active matched=%u captured=%u",
+                                s_weapon_motion.matchedDrawCount(), s_weapon_motion.capturedDrawCount());
+                            EdpeLog(wmLog);
+                        }
+                    }
+                }
                 motion_pass->render(motion_depth_view.Get(),
                     s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
                     jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv,
                     /*preserveContextState=*/false,
                     /*zeroTranslation=*/origin_reanchor,
                     /*enableClassOutput=*/want_motion_class_debug,
-                    /*weaponMotion=*/nullptr,
+                    /*weaponMotion=*/weaponMotionSrv,
                     /*sceneStencil=*/nullptr,
                     /*celestialRecords=*/nullptr,
                     /*celestialCount=*/0u,
@@ -14414,6 +14478,8 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_hud_mask_snapshot.Reset();
         resetVisorJitterAlign();
         motion_pass.reset();
+        s_weapon_motion.shutdown();
+        s_weapon_motion_frame = ~0ull;
         motion_camera_frames = {~0ull, ~0ull};
         camera_pair_sample_frames = {~0ull, ~0ull};
         gpu_camera_pair = {};

@@ -1,8 +1,10 @@
 #include "weapon_motion.h"
 #include "weapon_motion_shader.h"
 #include "renderdoc_support.h"
+#include "shader_probe.h"
 
 #include <d3dcompiler.h>
+#include <d3d11shader.h>
 
 namespace edpe {
 
@@ -97,6 +99,7 @@ void WeaponMotionTracker::shutdown() {
     motionSrv_.Reset();
     depthTex_.Reset();
     depthDsv_.Reset();
+    soGsCache_.clear();
     device_.Reset();
     draws_[0].clear();
     draws_[1].clear();
@@ -182,6 +185,135 @@ bool WeaponMotionTracker::recordCapturedDraw(const WeaponDrawIdentity& identity,
     return true;
 }
 
+ID3D11GeometryShader* WeaponMotionTracker::getOrCreateStreamOutGs(
+    ID3D11VertexShader* vs, uint64_t vsHash) {
+    if (!device_ || !vs) return nullptr;
+    auto it = soGsCache_.find(vsHash);
+    if (it != soGsCache_.end()) {
+        return it->second.Get();
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> soGs;
+    UINT bcSize = 0;
+    if (SUCCEEDED(vs->GetPrivateData(kEdpeVertexBytecodeGuid, &bcSize, nullptr)) &&
+        bcSize > 0 && bcSize <= 65536u) {
+        std::vector<uint8_t> bytecode(bcSize);
+        if (SUCCEEDED(vs->GetPrivateData(kEdpeVertexBytecodeGuid, &bcSize, bytecode.data()))) {
+            const char* semName = "SV_Position";
+            UINT semIndex = 0;
+            std::string reflectedName;
+            Microsoft::WRL::ComPtr<ID3D11ShaderReflection> refl;
+            if (SUCCEEDED(D3DReflect(bytecode.data(), bytecode.size(),
+                    __uuidof(ID3D11ShaderReflection), reinterpret_cast<void**>(refl.GetAddressOf()))) &&
+                refl) {
+                D3D11_SHADER_DESC sd{};
+                if (SUCCEEDED(refl->GetDesc(&sd))) {
+                    for (UINT i = 0; i < sd.OutputParameters; ++i) {
+                        D3D11_SIGNATURE_PARAMETER_DESC pd{};
+                        if (SUCCEEDED(refl->GetOutputParameterDesc(i, &pd)) &&
+                            pd.SystemValueType == D3D_NAME_POSITION && pd.SemanticName) {
+                            reflectedName = pd.SemanticName;
+                            semName = reflectedName.c_str();
+                            semIndex = pd.SemanticIndex;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            const UINT stride = 16u;
+            D3D11_SO_DECLARATION_ENTRY decl{};
+            decl.Stream = 0;
+            decl.SemanticName = semName;
+            decl.SemanticIndex = semIndex;
+            decl.StartComponent = 0;
+            decl.ComponentCount = 4;
+            decl.OutputSlot = 0;
+            if (FAILED(device_->CreateGeometryShaderWithStreamOutput(
+                    bytecode.data(), bytecode.size(), &decl, 1u, &stride, 1u,
+                    D3D11_SO_NO_RASTERIZED_STREAM, nullptr, &soGs))) {
+                decl.SemanticName = "SV_POSITION";
+                decl.SemanticIndex = 0;
+                device_->CreateGeometryShaderWithStreamOutput(
+                    bytecode.data(), bytecode.size(), &decl, 1u, &stride, 1u,
+                    D3D11_SO_NO_RASTERIZED_STREAM, nullptr, &soGs);
+            }
+        }
+    }
+
+    soGsCache_.emplace(vsHash, soGs);
+    return soGs.Get();
+}
+
+bool WeaponMotionTracker::captureDrawIndexedInstanced(
+    ID3D11DeviceContext* context,
+    UINT indexCount,
+    UINT instanceCount,
+    UINT startIndex,
+    INT baseVertex,
+    UINT startInstance,
+    DrawIndexedInstancedFn origDraw) {
+    if (!device_ || !context || !origDraw || !soBuffers_[curSlot_]) return false;
+    if (instanceCount != 1u || indexCount < 3u || indexCount > 250000u) return false;
+
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> ds;
+    UINT stencilRef = 0;
+    context->OMGetDepthStencilState(&ds, &stencilRef);
+    if (!ds || (stencilRef & kWeaponStencilBit) == 0u) return false;
+    D3D11_DEPTH_STENCIL_DESC dsDesc{};
+    ds->GetDesc(&dsDesc);
+    if (!dsDesc.StencilEnable || (dsDesc.StencilWriteMask & kWeaponStencilBit) == 0u) return false;
+
+    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    context->IAGetPrimitiveTopology(&topo);
+    if (topo != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) return false;
+
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> origGs;
+    context->GSGetShader(&origGs, nullptr, nullptr);
+    if (origGs) return false;
+
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
+    context->VSGetShader(&vs, nullptr, nullptr);
+    if (!vs) return false;
+
+    uint64_t vsHash = 0;
+    UINT hashSize = sizeof(vsHash);
+    if (FAILED(vs->GetPrivateData(kEdpeShaderHashGuid, &hashSize, &vsHash)) ||
+        hashSize != sizeof(vsHash)) {
+        return false;
+    }
+
+    ID3D11GeometryShader* soGs = getOrCreateStreamOutGs(vs.Get(), vsHash);
+    if (!soGs) return false;
+
+    WeaponDrawIdentity id{};
+    id.indexCount = indexCount;
+    id.instanceCount = instanceCount;
+    id.boneBase = (startIndex & 0xFFFFu) | ((static_cast<uint32_t>(baseVertex) & 0xFFFFu) << 16);
+    id.signature = static_cast<uint32_t>(vsHash ^ (vsHash >> 32)) & kWeaponSignatureMask;
+
+    uint32_t byteOffset = 0;
+    if (!recordCapturedDraw(id, indexCount, &byteOffset)) return false;
+
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> origPs;
+    context->PSGetShader(&origPs, nullptr, nullptr);
+
+    ID3D11Buffer* soBuf = soBuffers_[curSlot_].Get();
+    UINT soOff = byteOffset;
+    context->PSSetShader(nullptr, nullptr, 0);
+    context->GSSetShader(soGs, nullptr, 0);
+    context->SOSetTargets(1u, &soBuf, &soOff);
+
+    origDraw(context, indexCount, 1u, startIndex, baseVertex, startInstance);
+
+    ID3D11Buffer* nullSo = nullptr;
+    UINT zeroOff = 0;
+    context->SOSetTargets(1u, &nullSo, &zeroOff);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->PSSetShader(origPs.Get(), nullptr, 0);
+    return true;
+}
+
 bool WeaponMotionTracker::resolve(ID3D11DeviceContext* context,
                                   float jitterNowX, float jitterNowY,
                                   float jitterPrevX, float jitterPrevY,
@@ -242,6 +374,12 @@ bool WeaponMotionTracker::resolve(ID3D11DeviceContext* context,
         }
     }
 
+    ID3D11Buffer* nullVbs[2] = {nullptr, nullptr};
+    const UINT zeroArr[2] = {0u, 0u};
+    context->IASetVertexBuffers(0, 2, nullVbs, zeroArr, zeroArr);
+    context->VSSetShader(nullptr, nullptr, 0);
+    context->PSSetShader(nullptr, nullptr, 0);
+    context->OMSetDepthStencilState(nullptr, 0);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     hasResolvedMotion_ = (matchedDraws_ > 0);
     return hasResolvedMotion_;
