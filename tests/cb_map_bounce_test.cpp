@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 
 namespace {
 
@@ -19,7 +20,8 @@ int main() {
 
     // 1. Mode::Off never bounces, even under Wine.
     {
-        CbMapBounce bounce;
+        auto bouncePtr = std::make_unique<CbMapBounce>();
+        CbMapBounce& bounce = *bouncePtr;
         bounce.configure(MapBounceMode::Off, true);
         if (bounce.isActive()) return fail(1, "Mode::Off should not be active");
 
@@ -32,7 +34,8 @@ int main() {
 
     // 2. Mode::Auto under Wine activates immediately; non-discard and ineligible widths pass through.
     {
-        CbMapBounce bounce;
+        auto bouncePtr = std::make_unique<CbMapBounce>();
+        CbMapBounce& bounce = *bouncePtr;
         bounce.configure(MapBounceMode::Auto, true);
         if (!bounce.isActive()) return fail(5, "Mode::Auto under Wine should be active immediately");
 
@@ -74,7 +77,8 @@ int main() {
 
     // 3. Mode::Auto on native Windows: fast reads disable bouncing; slow WC reads enable bouncing.
     {
-        CbMapBounce fastBounce;
+        auto fastBouncePtr = std::make_unique<CbMapBounce>();
+        CbMapBounce& fastBounce = *fastBouncePtr;
         fastBounce.configure(MapBounceMode::Auto, false);
         if (fastBounce.isActive() || !fastBounce.needsAutoProbe()) {
             return fail(16, "Auto non-Wine should start in Probing state");
@@ -88,7 +92,8 @@ int main() {
             return fail(18, "Fast reads should transition AutoState to Disabled");
         }
 
-        CbMapBounce slowBounce;
+        auto slowBouncePtr = std::make_unique<CbMapBounce>();
+        CbMapBounce& slowBounce = *slowBouncePtr;
         slowBounce.configure(MapBounceMode::Auto, false);
         bool activated = false;
         for (uint32_t i = 0; i < CbMapBounce::kAutoSampleCount; ++i) {
@@ -111,7 +116,8 @@ int main() {
 
     // 4. Mode::On bounces unconditionally (non-Wine) and supports 8 concurrent slots.
     {
-        CbMapBounce bounce;
+        auto bouncePtr = std::make_unique<CbMapBounce>();
+        CbMapBounce& bounce = *bouncePtr;
         bounce.configure(MapBounceMode::On, false);
         if (!bounce.isActive()) return fail(22, "Mode::On should be active");
 
@@ -134,7 +140,8 @@ int main() {
 
     // 5. Fail-safe trip: Remap (mapping a resource already open in bounce pool).
     {
-        CbMapBounce bounce;
+        auto bouncePtr = std::make_unique<CbMapBounce>();
+        CbMapBounce& bounce = *bouncePtr;
         bounce.configure(MapBounceMode::On, true);
         std::array<unsigned char, 5376> realBuf{};
         void* bounced = bounce.onMap(0x4001, 0xC001, realBuf.data(), 5376, true, 3);
@@ -161,7 +168,8 @@ int main() {
 
     // 6. Fail-safe trip: Present (slot still open at Present).
     {
-        CbMapBounce bounce;
+        auto bouncePtr = std::make_unique<CbMapBounce>();
+        CbMapBounce& bounce = *bouncePtr;
         bounce.configure(MapBounceMode::On, true);
         std::array<unsigned char, 272> realBuf{};
         void* bounced = bounce.onMap(0x5001, 0xD001, realBuf.data(), 272, true, 4);
@@ -179,7 +187,8 @@ int main() {
 
     // 7. Fail-safe trip: Context (Unmap called on a different context than Map).
     {
-        CbMapBounce bounce;
+        auto bouncePtr = std::make_unique<CbMapBounce>();
+        CbMapBounce& bounce = *bouncePtr;
         bounce.configure(MapBounceMode::On, true);
         std::array<unsigned char, 1024> realBuf{};
         void* bounced = bounce.onMap(0x6001, 0xE001, realBuf.data(), 1024, true, 5);
