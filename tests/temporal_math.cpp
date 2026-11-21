@@ -90,6 +90,15 @@ int main() {
     if (!edpe::parseEliteCamera(scene.data(), scene.size(), &parsed) ||
         std::fabs(parsed.worldFromView[9] - turning_block[9] / parsed.scaleY) > .0001f)
         return 10;
+    // When cb1[275].xyz (words 1100..1102) is populated, parseEliteCamera prefers it over lagged cam932 translation.
+    scene[1100] = 5.125f;
+    scene[1101] = 4.500f;
+    scene[1102] = 25.250f;
+    if (!edpe::parseEliteCamera(scene.data(), scene.size(), &parsed) ||
+        std::fabs(parsed.worldFromView[3] - 5.125f) > 1e-6f ||
+        std::fabs(parsed.worldFromView[7] - 4.500f) > 1e-6f ||
+        std::fabs(parsed.worldFromView[11] - 25.250f) > 1e-6f)
+        return 109;
 
     const auto first = edpe::projectionJitter(0, 100, 50);
     const auto second = edpe::projectionJitter(1, 100, 50);

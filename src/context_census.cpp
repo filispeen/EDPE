@@ -7589,6 +7589,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             alignas(16) static float s_cb1_memo_cam932[12]{};
             alignas(16) static float s_cb1_memo_proj1080[16]{};
             alignas(16) static float s_cb1_memo_world140[16]{};
+            alignas(16) static float s_cb1_memo_origin1100[4]{};
             static bool s_cb1_memo_parse_ok = false;
             static int s_cb1_memo_fail_reason = 0;
             static bool s_cb1_memo_is_subpass = false;
@@ -7598,9 +7599,11 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             alignas(16) float local_cam932[12];
             alignas(16) float local_proj1080[16];
             alignas(16) float local_world140[16];
+            alignas(16) float local_origin1100[4];
             std::memcpy(local_cam932, &mutable_unmap_words[932], sizeof(local_cam932));
             std::memcpy(local_proj1080, &mutable_unmap_words[1080], sizeof(local_proj1080));
             std::memcpy(local_world140, &mutable_unmap_words[140], sizeof(local_world140));
+            std::memcpy(local_origin1100, &mutable_unmap_words[1100], sizeof(local_origin1100));
             const bool memoSameProj =
                 (s_cb1_memo_frame == cur_frame &&
                  std::memcmp(local_proj1080, s_cb1_memo_proj1080, sizeof(local_proj1080)) == 0);
@@ -7666,7 +7669,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             int parse_fail_reason = 0;
             const bool memoSameCamProj =
                 (memoSameProj &&
-                 std::memcmp(local_cam932, s_cb1_memo_cam932, sizeof(local_cam932)) == 0);
+                 std::memcmp(local_cam932, s_cb1_memo_cam932, sizeof(local_cam932)) == 0 &&
+                 std::memcmp(local_origin1100, s_cb1_memo_origin1100, 3 * sizeof(float)) == 0);
             const bool memoSameWorld140 =
                 (memoSameCamProj &&
                  std::memcmp(local_world140, s_cb1_memo_world140, sizeof(local_world140)) == 0);
@@ -7678,11 +7682,12 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             } else {
                 parse_ok = edpe::parseEliteCameraWithCb1Fallback(
                     local_cam932, local_proj1080, words, 5376 / sizeof(float),
-                    &parsed_camera, &parse_fail_reason);
+                    &parsed_camera, &parse_fail_reason, local_origin1100);
                 s_cb1_memo_frame = cur_frame;
                 std::memcpy(s_cb1_memo_cam932, local_cam932, sizeof(local_cam932));
                 std::memcpy(s_cb1_memo_proj1080, local_proj1080, sizeof(local_proj1080));
                 std::memcpy(s_cb1_memo_world140, local_world140, sizeof(local_world140));
+                std::memcpy(s_cb1_memo_origin1100, local_origin1100, sizeof(local_origin1100));
                 s_cb1_memo_parse_ok = parse_ok;
                 s_cb1_memo_fail_reason = parse_fail_reason;
                 s_cb1_memo_cam = parsed_camera;
@@ -7786,8 +7791,13 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 (rowTrace > 2.85) ||
                                 edpe::hasMatchingEliteCb1CameraPosition(words, 5376 / sizeof(float), local_cam932);
                         }
+                        float originX = 0.0f, originY = 0.0f, originZ = 0.0f;
+                        const bool hasRenderOrigin =
+                            edpe::extractEliteRenderOrigin(local_origin1100, &originX, &originY, &originZ);
                         const bool hasStagedPos = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
-                        if (row932ValidPos) {
+                        if (hasRenderOrigin) {
+                            edpe::cameraSetPosition(bc, {originX, originY, originZ});
+                        } else if (row932ValidPos) {
                             edpe::cameraSetPosition(bc, {local_cam932[3], local_cam932[7], local_cam932[11]});
                         } else if (hasStagedPos) {
                             edpe::cameraSetPosition(bc, edpe::cameraPosition(s_staged_camera));
@@ -7795,7 +7805,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             edpe::cameraSetPosition(bc, edpe::cameraPosition(s_camera_now) + s_last_valid_velocity);
                         }
 
-                        if ((row932ValidPos || hasStagedPos || s_consecutive_fallback_frames <= 2) &&
+                        if ((hasRenderOrigin || row932ValidPos || hasStagedPos || s_consecutive_fallback_frames <= 2) &&
                             edpe::cameraRotationTrace(bc, blockRef) > 2.90f) {
                             parsed_camera = bc;
                             block_cam_ok = true;
@@ -7940,10 +7950,16 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const bool matches_anchor = anchor_fresh &&
                         edpe::matchesAnchorPrediction(parsed_camera, s_anchor_camera, s_last_valid_velocity, anchorDtRatio);
 
-                    const bool probe_vs_anchor = anchor_fresh && (cur_frame <= s_anchor_frame + 1) && !matches_anchor &&
+                    const bool cb1HasLiveEyePosPre =
+                        edpe::hasMatchingEliteCb1CameraPosition(words, 5376 / sizeof(float), local_cam932);
+                    const bool skipOnFootIpdProbe =
+                        cb1HasLiveEyePosPre && edpe::cobra_camera::MapFocusPoller::isOnFootActive();
+                    const bool probe_vs_anchor = !skipOnFootIpdProbe &&
+                        anchor_fresh && (cur_frame <= s_anchor_frame + 1) && !matches_anchor &&
                         isStereoEyeOrIpdProbe(parsed_camera, s_anchor_camera, s_last_valid_velocity, anchorDtRatio);
 
-                    const bool probe_vs_committed = (s_camera_now.scaleX > 0.0f) && !matches_anchor &&
+                    const bool probe_vs_committed = !skipOnFootIpdProbe &&
+                        (s_camera_now.scaleX > 0.0f) && !matches_anchor &&
                         isStereoEyeOrIpdProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio);
 
                     const bool hasStagedForFrame =
@@ -7960,8 +7976,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         !allow_fallback_recovery && !matches_staged && !promote_over_probe &&
                         (probe_vs_anchor || probe_vs_committed);
 
-                    const bool cb1HasLiveEyePos =
-                        edpe::hasMatchingEliteCb1CameraPosition(words, 5376 / sizeof(float), local_cam932);
+                    const bool cb1HasLiveEyePos = cb1HasLiveEyePosPre;
                     const bool allowPreSceneMainEye =
                         in_main_scene || cb1HasLiveEyePos || matches_world_cb1;
 
@@ -10929,12 +10944,18 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 motion_pass->clear(context);
             } else {
                 // Render motion vectors at render resolution using current and previous camera projections and jitter phases
+                const bool clampCockpit = !edpe::cobra_camera::MapFocusPoller::isOnFootActive();
                 motion_pass->render(motion_depth_view.Get(),
                     s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
                     jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv,
                     /*preserveContextState=*/false,
                     /*zeroTranslation=*/origin_reanchor,
-                    /*enableClassOutput=*/want_motion_class_debug);
+                    /*enableClassOutput=*/want_motion_class_debug,
+                    /*weaponMotion=*/nullptr,
+                    /*sceneStencil=*/nullptr,
+                    /*celestialRecords=*/nullptr,
+                    /*celestialCount=*/0u,
+                    /*clampCockpit=*/clampCockpit);
             }
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
         }

@@ -1252,11 +1252,23 @@ inline void* __fastcall detourShipSetTarget(void* thisPtr, const void* targetEnt
 class MapFocusPoller {
 public:
     static bool isMapGuiFocusActive() {
-        static MapFocusPoller s_poller;
-        return s_poller.poll();
+        auto& poller = instance();
+        poller.poll();
+        return poller.m_cachedMapOpen;
+    }
+
+    static bool isOnFootActive() {
+        auto& poller = instance();
+        poller.poll();
+        return poller.m_cachedOnFoot;
     }
 
 private:
+    static MapFocusPoller& instance() {
+        static MapFocusPoller s_poller;
+        return s_poller;
+    }
+
     MapFocusPoller() {
         PWSTR savedGames = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_SavedGames, 0, nullptr, &savedGames)) && savedGames) {
@@ -1265,25 +1277,25 @@ private:
         }
     }
 
-    bool poll() {
+    void poll() {
         const ULONGLONG now = GetTickCount64();
         if (now - m_lastPollTick < 250) {
-            return m_cachedMapOpen;
+            return;
         }
         m_lastPollTick = now;
-        if (!m_statusPath[0]) return false;
+        if (!m_statusPath[0]) return;
 
         HANDLE h = CreateFileW(m_statusPath, GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return m_cachedMapOpen;
+        if (h == INVALID_HANDLE_VALUE) return;
 
         FILETIME ftWrite{};
         if (GetFileTime(h, nullptr, nullptr, &ftWrite)) {
             if (ftWrite.dwLowDateTime == m_lastWriteTime.dwLowDateTime &&
                 ftWrite.dwHighDateTime == m_lastWriteTime.dwHighDateTime) {
                 CloseHandle(h);
-                return m_cachedMapOpen;
+                return;
             }
             m_lastWriteTime = ftWrite;
         }
@@ -1299,15 +1311,24 @@ private:
                 // GuiFocus: 6 = GalaxyMap, 7 = SystemMap, 8 = Orrery, 9 = FSS
                 m_cachedMapOpen = (guiFocus >= 6 && guiFocus <= 9);
             }
+            if (const char* f2 = std::strstr(buf, "\"Flags2\"")) {
+                f2 += 8;
+                while (*f2 == ' ' || *f2 == '\t' || *f2 == ':') ++f2;
+                const unsigned long flags2 = std::strtoul(f2, nullptr, 10);
+                // Flags2 bit 0 (0x1) = OnFoot
+                m_cachedOnFoot = (flags2 & 0x1u) != 0;
+            } else {
+                m_cachedOnFoot = false;
+            }
         }
         CloseHandle(h);
-        return m_cachedMapOpen;
     }
 
     wchar_t m_statusPath[MAX_PATH]{};
     ULONGLONG m_lastPollTick = 0;
     FILETIME m_lastWriteTime{};
     bool m_cachedMapOpen = false;
+    bool m_cachedOnFoot = false;
 };
 
 // ============================================================================

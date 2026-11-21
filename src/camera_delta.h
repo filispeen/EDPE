@@ -137,10 +137,11 @@ inline bool matchesIpdOrCockpitProbeDisplacement(
     // Латеральний стерео-очний зонд (IPD 68.2 мм, 136.4 мм, 272.8 мм)
     const bool isLateralIpd = (dRight >= 0.96f * dist && dUp < 0.015f && dFwd < 0.015f);
 
-    // Кабінний / наголовний зонд Cobra Odyssey (136.4 мм: +10.98 см Up, +8.09 см Fwd у системі корабля):
-    // При повороті/підйомі голови пілота проєкція на head-Right та head-Fwd змінюється, тоді як вертикальна
-    // складова (head-Up >= 0.40 * dist) зберігається у всьому діапазоні огляду в кабіні (yaw ±180°, pitch -30°..+65°).
-    const bool isCockpitHeadProbe = (dUp >= 0.40f * dist);
+    // Кабінний / наголовний зонд Cobra Odyssey (строго 2x IPD = 136.4 мм: +10.98 см Up, +8.09 см Fwd у системі корабля):
+    // Обмежуємо перевірку лише гармонікою 136.4 мм, щоб звичайний рух по схилах/сходах (~68.2 мм/кадр)
+    // або вертикальний тяг/джетпак (~272.8 мм/кадр) не класифікувались як зонд.
+    const bool isCockpitHeadProbe =
+        (std::fabs(dist - 0.1364f) < 0.012f) && (dUp >= 0.40f * dist);
 
     return isLateralIpd || isCockpitHeadProbe;
 }

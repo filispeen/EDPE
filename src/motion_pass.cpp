@@ -127,7 +127,8 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     ID3D11ShaderResourceView* weaponMotion,
     ID3D11ShaderResourceView* sceneStencil,
     ID3D11ShaderResourceView* celestialRecords,
-    uint32_t celestialCount) {
+    uint32_t celestialCount,
+    bool clampCockpit) {
     if (!device_ || !depth || !width || !height ||
         !(now.scaleX > 0 && now.scaleY > 0 && now.depthB > 0 &&
           previous.scaleX > 0 && previous.scaleY > 0) ||
@@ -145,28 +146,33 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
         (enableClassOutput ? 4 : 0) |
         (reset ? 8 : 0) |
         (useWeapon ? 16 : 0) |
-        (useCelestial ? 32 : 0);
+        (useCelestial ? 32 : 0) |
+        (clampCockpit ? 64 : 0);
     // Precompute relative view-space transform M_rel = R_prev^T * R_now,
-    // t_rel = R_prev^T * (t_now - t_prev) once on CPU to halve per-pixel ALU.
-    const float dx = zeroTranslation ? 0.0f : (now.worldFromView[3] - previous.worldFromView[3]);
-    const float dy = zeroTranslation ? 0.0f : (now.worldFromView[7] - previous.worldFromView[7]);
-    const float dz = zeroTranslation ? 0.0f : (now.worldFromView[11] - previous.worldFromView[11]);
+    // t_rel = R_prev^T * (t_now - t_prev) in double precision on CPU to avoid
+    // float32 cancellation during translation and halve per-pixel ALU.
+    const double dx = zeroTranslation ? 0.0
+        : (static_cast<double>(now.worldFromView[3]) - static_cast<double>(previous.worldFromView[3]));
+    const double dy = zeroTranslation ? 0.0
+        : (static_cast<double>(now.worldFromView[7]) - static_cast<double>(previous.worldFromView[7]));
+    const double dz = zeroTranslation ? 0.0
+        : (static_cast<double>(now.worldFromView[11]) - static_cast<double>(previous.worldFromView[11]));
     float values[36]{};
     for (unsigned r = 0; r < 3; ++r) {
-        const float p0 = previous.worldFromView[0 * 4 + r];
-        const float p1 = previous.worldFromView[1 * 4 + r];
-        const float p2 = previous.worldFromView[2 * 4 + r];
+        const double p0 = static_cast<double>(previous.worldFromView[0 * 4 + r]);
+        const double p1 = static_cast<double>(previous.worldFromView[1 * 4 + r]);
+        const double p2 = static_cast<double>(previous.worldFromView[2 * 4 + r]);
         for (unsigned c = 0; c < 3; ++c) {
-            values[r * 4 + c] =
-                p0 * now.worldFromView[0 * 4 + c] +
-                p1 * now.worldFromView[1 * 4 + c] +
-                p2 * now.worldFromView[2 * 4 + c];
+            values[r * 4 + c] = static_cast<float>(
+                p0 * static_cast<double>(now.worldFromView[0 * 4 + c]) +
+                p1 * static_cast<double>(now.worldFromView[1 * 4 + c]) +
+                p2 * static_cast<double>(now.worldFromView[2 * 4 + c]));
         }
-        values[r * 4 + 3] = p0 * dx + p1 * dy + p2 * dz;
+        values[r * 4 + 3] = static_cast<float>(p0 * dx + p1 * dy + p2 * dz);
     }
     const float wf = static_cast<float>(width);
     const float hf = static_cast<float>(height);
-    values[12] = std::sqrt(dx * dx + dy * dy + dz * dz); // prev0.x = translationStep
+    values[12] = static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz)); // prev0.x = translationStep
     values[13] = (now.depthB > 0.0f) ? (now.depthB / 50000.0f) : 1e-6f; // prev0.y = celestialDepthThresh
     values[14] = static_cast<float>(useCelestial ? (celestialCount > 16u ? 16u : celestialCount) : 0u); // prev0.z
     values[16] = 2.0f / wf;          // prev1.x

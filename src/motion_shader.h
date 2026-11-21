@@ -34,7 +34,7 @@ cbuffer Camera : register(b0) {
     float4 now0, now1, now2;
     float4 prev0, prev1, prev2; // prev0.x=translationStep, prev0.y=celestialDepthThresh, prev0.z=celestialCount
     float4 scales;     // current X/Y, previous X/Y
-    float4 info;       // depthB, width, height, flags (bit0=hasPrevDepth, bit2=writeClass, bit3=reset, bit4=hasWeapon, bit5=hasCelestial)
+    float4 info;       // depthB, width, height, flags (bit0=hasPrevDepth, bit2=writeClass, bit3=reset, bit4=hasWeapon, bit5=hasCelestial, bit6=clampCockpit)
     float4 jitterInfo; // jitterX, jitterY, prevJitterX, prevJitterY (render pixels)
 };
 Texture2D<float> sceneDepth : register(t0);
@@ -150,10 +150,10 @@ MotionResult classifyAndFinishWorld(float2 pixelCenter, float2 rawPixel,
     }
 
     // Depth-validated cockpit / static-attached geometry vs. world geometry disambiguation.
+    // Uses the exact previous-frame jittered raster coordinate (rawPixel + prevJitter) so
+    // moving nearby world planes (floors/walls) are not falsely clamped to zero motion.
     if (clampCockpit && z < 10.0 && hasPrevDepth && dot(worldMv, worldMv) > 0.0625) {
-        bool staticMatches =
-            prevDepthMatches(rawPixel + jitterInfo.zw, depth, maxCoord) ||
-            prevDepthMatches(pixelCenter, depth, maxCoord);
+        bool staticMatches = prevDepthMatches(rawPixel + jitterInfo.zw, depth, maxCoord);
         if (!worldMatches && staticMatches) {
             res.mv = float2(0.0, 0.0);
             res.pixelClass = isReset ? kClassReset : kClassCockpitStatic;
@@ -319,8 +319,9 @@ void cs(uint3 tid : SV_DispatchThreadID) {
     int2 pixCoord = int2(tid.xy);
     float2 pixelCenter = float2(tid.xy) + 0.5;
     uint celestialCount = uint(prev0.z + 0.1);
+    bool clampCockpit = (int(info.w + 0.1) & 64) != 0;
     MotionResult res = reprojectRel(pixelCenter, pixCoord,
-        now0, now1, now2, prev0.y, celestialCount, prev1, prev2, info.x, true);
+        now0, now1, now2, prev0.y, celestialCount, prev1, prev2, info.x, clampCockpit);
     writeOutputs(pixCoord, res);
 }
 
@@ -358,18 +359,24 @@ void cs_gpu(uint3 tid : SV_DispatchThreadID) {
         writeOutputs(pixCoord, res);
         return;
     }
+    float3 curOrig = currentWords[275].xyz;
+    float3 prevOrig = previousWords[275].xyz;
+    bool useCurOrig = all(isfinite(curOrig)) && any(abs(curOrig) > 1e-6);
+    bool usePrevOrig = all(isfinite(prevOrig)) && any(abs(prevOrig) > 1e-6);
+    float3 curPos = useCurOrig ? curOrig : float3(currentWords[233].w, currentWords[234].w, currentWords[235].w);
+    float3 prevPos = usePrevOrig ? prevOrig : float3(previousWords[233].w, previousWords[234].w, previousWords[235].w);
     float4 current0 = float4(currentX.x / projection.x,
-        currentY.x / projection.y, currentW.x, currentWords[233].w);
+        currentY.x / projection.y, currentW.x, curPos.x);
     float4 current1 = float4(currentX.y / projection.x,
-        currentY.y / projection.y, currentW.y, currentWords[234].w);
+        currentY.y / projection.y, currentW.y, curPos.y);
     float4 current2 = float4(currentX.z / projection.x,
-        currentY.z / projection.y, currentW.z, currentWords[235].w);
+        currentY.z / projection.y, currentW.z, curPos.z);
     float4 prior0 = float4(previousX.x / projection.z,
-        previousY.x / projection.w, previousW.x, previousWords[233].w);
+        previousY.x / projection.w, previousW.x, prevPos.x);
     float4 prior1 = float4(previousX.y / projection.z,
-        previousY.y / projection.w, previousW.y, previousWords[234].w);
+        previousY.y / projection.w, previousW.y, prevPos.y);
     float4 prior2 = float4(previousX.z / projection.z,
-        previousY.z / projection.w, previousW.z, previousWords[235].w);
+        previousY.z / projection.w, previousW.z, prevPos.z);
     res = reproject(pixelCenter, pixCoord, current0, current1, current2,
         prior0, prior1, prior2, projection, depthB, false);
     writeOutputs(pixCoord, res);

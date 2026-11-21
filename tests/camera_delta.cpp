@@ -489,5 +489,15 @@ int main() {
     cutReanchor.depthB = 0.0675f;
     if (edpe::isFloatingOriginReanchor(prevFar, cutReanchor)) return 108;
 
+    // 35. Slope/stair walking at ~68.2mm/frame and vertical jetpack/thrust at ~272.8mm/frame
+    // MUST NOT be misclassified as the 136.4mm cockpit head probe.
+    auto slopeWalk = identity();
+    slopeWalk.worldFromView[7] = 0.045f;
+    slopeWalk.worldFromView[11] = 0.051f; // |d| ~= 0.0680m, dUp >= 0.40 * dist
+    if (edpe::isStereoEyeOrIpdProbe(slopeWalk, identity())) return 109;
+    auto verticalThrust = identity();
+    verticalThrust.worldFromView[7] = 0.2728f;
+    if (edpe::isStereoEyeOrIpdProbe(verticalThrust, identity())) return 110;
+
     return 0;
 }

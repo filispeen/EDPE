@@ -91,10 +91,42 @@ inline bool hasMatchingEliteCb1CameraPosition(const float* words, size_t count,
     return true;
 }
 
+// Extracts the vertex-shader scene render origin from cb1[275].xyz (words 1100..1102).
+// Cobra's geometry shaders subtract cb1[275].xyz before multiplying by cb1[270..273],
+// so this origin is always synchronous with proj1080 even when cam932 lags during motion.
+inline bool extractEliteRenderOrigin(const float* origin1100,
+    float* outX, float* outY, float* outZ) {
+    if (!origin1100 || !outX || !outY || !outZ) return false;
+    const float x = origin1100[0];
+    const float y = origin1100[1];
+    const float z = origin1100[2];
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+    if (std::fabs(x) <= 1e-6f && std::fabs(y) <= 1e-6f && std::fabs(z) <= 1e-6f) {
+        return false;
+    }
+    *outX = x;
+    *outY = y;
+    *outZ = z;
+    return true;
+}
+
 inline bool parseEliteCameraWithCb1Fallback(const float* cam932, const float* proj1080,
-    const float* words, size_t count, CameraProjection* camera, int* failReason = nullptr) {
+    const float* words, size_t count, CameraProjection* camera, int* failReason = nullptr,
+    const float* origin1100 = nullptr) {
+    auto applyRenderOrigin = [&]() {
+        const float* originSrc = origin1100
+            ? origin1100
+            : ((words && count == 5376 / sizeof(float)) ? &words[1100] : nullptr);
+        float ox = 0.0f, oy = 0.0f, oz = 0.0f;
+        if (extractEliteRenderOrigin(originSrc, &ox, &oy, &oz)) {
+            camera->worldFromView[3] = ox;
+            camera->worldFromView[7] = oy;
+            camera->worldFromView[11] = oz;
+        }
+    };
     int primaryReason = 0;
     if (parseEliteCameraBlocks(cam932, proj1080, camera, &primaryReason)) {
+        applyRenderOrigin();
         if (failReason) *failReason = 0;
         return true;
     }
@@ -122,6 +154,7 @@ inline bool parseEliteCameraWithCb1Fallback(const float* cam932, const float* pr
                 rot277[2], rot277[6], rot277[10], cam932[11]
             };
             if (parseEliteCameraBlocks(camFrom277, proj1080, camera, nullptr)) {
+                applyRenderOrigin();
                 if (failReason) *failReason = 0;
                 return true;
             }

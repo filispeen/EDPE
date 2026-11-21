@@ -38,7 +38,8 @@ public:
         ID3D11ShaderResourceView* weaponMotion = nullptr,
         ID3D11ShaderResourceView* sceneStencil = nullptr,
         ID3D11ShaderResourceView* celestialRecords = nullptr,
-        uint32_t celestialCount = 0);
+        uint32_t celestialCount = 0,
+        bool clampCockpit = true);
     bool renderGpuCameras(ID3D11ShaderResourceView* depth, ID3D11Buffer* now,
         ID3D11Buffer* previous, UINT width, UINT height,
         float jitterX = 0.0f, float jitterY = 0.0f,
