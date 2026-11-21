@@ -153,6 +153,13 @@ public:
         // Default SysKeyboard proxy off under Proton/Wine on Linux so remapped/virtual keys work reliably.
         const int defaultWrapKeyboard = isRunningUnderWine() ? 0 : 1;
         wrapDirectInputKeyboard = GetPrivateProfileIntW(L"Input", L"WrapDirectInputKeyboard", defaultWrapKeyboard, path.c_str()) != 0;
+
+        wchar_t chainBuf[MAX_PATH]{};
+        GetPrivateProfileStringW(L"Proxy", L"ChainDxgiDll", L"", chainBuf, MAX_PATH, path.c_str());
+        std::wstring chainVal(chainBuf);
+        while (!chainVal.empty() && std::iswspace(chainVal.front())) chainVal.erase(chainVal.begin());
+        while (!chainVal.empty() && std::iswspace(chainVal.back())) chainVal.pop_back();
+        chainDxgiDll = std::move(chainVal);
     }
 
     void save() {
@@ -266,6 +273,9 @@ public:
         appendSection("Input");
         appendBool("WrapDirectInputMouse", wrapDirectInputMouse);
         appendBool("WrapDirectInputKeyboard", wrapDirectInputKeyboard);
+
+        appendSection("Proxy");
+        appendWide("ChainDxgiDll", chainDxgiDll.c_str());
 
         return out;
     }
@@ -438,6 +448,8 @@ public:
 
     bool wrapDirectInputMouse = true;
     bool wrapDirectInputKeyboard = !isRunningUnderWine();
+
+    std::wstring chainDxgiDll;
 };
 
 } // namespace edpe
