@@ -12,6 +12,7 @@
 #include "upscaler_backend.h"
 #include "ngx_context.h"
 #include "config.h"
+#include "cb_map_bounce.h"
 #include "ui_layer.h"
 #include "ui.h"
 #include "jitter_logger.h"
@@ -7252,6 +7253,31 @@ private:
     bool active_{false};
 };
 
+static edpe::CbMapBounce s_cb_map_bounce;
+static std::atomic<bool> s_cb_map_bounce_configured{false};
+
+static void ensureCbMapBounceConfigured() {
+    if (!s_cb_map_bounce_configured.exchange(true, std::memory_order_acq_rel)) {
+        const auto& cfg = edpe::Config::instance();
+        s_cb_map_bounce.configure(
+            static_cast<edpe::MapBounceMode>(cfg.mapBounceMode),
+            edpe::isRunningUnderWine());
+    }
+}
+
+static void logCbMapBounceEvents() {
+    edpe::MapBounceTrip reason = edpe::MapBounceTrip::None;
+    if (s_cb_map_bounce.consumeTripLogPending(&reason)) {
+        wchar_t msg[192]{};
+        swprintf_s(msg, L"EDPE: CB map-bounce fail-safe tripped (%ls); disabled for session",
+                   edpe::mapBounceTripNameW(reason));
+        EdpeLog(msg);
+    }
+    if (s_cb_map_bounce.consumeAutoActivatedLogPending()) {
+        EdpeLog(L"EDPE: CB map-bounce auto-enabled (slow write-combined CB reads detected)");
+    }
+}
+
 HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) {
     const MapFn forward = resolveOriginalMap(context);
@@ -7314,9 +7340,20 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
         }
     }
     if (is_scene_cb) {
-        trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, 5376);
+        ensureCbMapBounceConfigured();
+        void* effectivePtr = mapped ? mapped->pData : nullptr;
+        if (mapped && mapped->pData) {
+            const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
+            effectivePtr = s_cb_map_bounce.onMap(
+                reinterpret_cast<uintptr_t>(resource),
+                reinterpret_cast<uintptr_t>(context),
+                mapped->pData, 5376u, type == D3D11_MAP_WRITE_DISCARD, cur_frame);
+            mapped->pData = effectivePtr;
+            logCbMapBounceEvents();
+        }
+        trackMappedBuffer(resource, effectivePtr, 5376);
         scene_maps.fetch_add(1, std::memory_order_relaxed);
-        scene_mapped_data.store(mapped ? mapped->pData : nullptr, std::memory_order_release);
+        scene_mapped_data.store(effectivePtr, std::memory_order_release);
         if (draw_indexed_calls.load(std::memory_order_relaxed) ||
             draw_calls.load(std::memory_order_relaxed) ||
             draw_indexed_instanced_calls.load(std::memory_order_relaxed) ||
@@ -7326,7 +7363,17 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
         const auto cur_frame = last_present_frame.load(std::memory_order_relaxed);
         if (isTransposeProjectionCbWidth(dot_cb_bytes) ||
             s_scene_window_closed_frame.load(std::memory_order_acquire) != cur_frame) {
-            trackMappedBuffer(resource, mapped ? mapped->pData : nullptr, dot_cb_bytes);
+            ensureCbMapBounceConfigured();
+            void* effectivePtr = mapped ? mapped->pData : nullptr;
+            if (mapped && mapped->pData) {
+                effectivePtr = s_cb_map_bounce.onMap(
+                    reinterpret_cast<uintptr_t>(resource),
+                    reinterpret_cast<uintptr_t>(context),
+                    mapped->pData, dot_cb_bytes, type == D3D11_MAP_WRITE_DISCARD, cur_frame);
+                mapped->pData = effectivePtr;
+                logCbMapBounceEvents();
+            }
+            trackMappedBuffer(resource, effectivePtr, dot_cb_bytes);
         }
     }
     return result;
@@ -7335,6 +7382,15 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
 void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource) {
     const UnmapFn forward = resolveOriginalUnmap(context);
+    auto forwardUnmap = [&]() {
+        if (resource) {
+            s_cb_map_bounce.onUnmap(
+                reinterpret_cast<uintptr_t>(resource),
+                reinterpret_cast<uintptr_t>(context));
+            logCbMapBounceEvents();
+        }
+        if (forward) forward(context, resource, subresource);
+    };
     if (!s_in_edpe_present.load(std::memory_order_acquire) &&
         unmap_hook_active.load(std::memory_order_acquire) &&
         resource &&
@@ -7347,13 +7403,13 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
         } else if (resource != target) {
             const auto lastJitterFrame = s_last_jitter_active_frame.load(std::memory_order_relaxed);
             if (lastJitterFrame == ~0ull || cur_frame > lastJitterFrame + 4ull) {
-                if (forward) forward(context, resource, subresource);
+                forwardUnmap();
                 rearmHudDrawProbeFast(context);
                 return;
             }
         }
         if (resource != target && isResourceCachedRejected(resource)) {
-            if (forward) forward(context, resource, subresource);
+            forwardUnmap();
             rearmHudDrawProbeFast(context);
             return;
         }
@@ -7368,13 +7424,32 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
                 ++s_ustat.noMapped;
             }
-            if (forward) forward(context, resource, subresource);
+            forwardUnmap();
             rearmHudDrawProbeFast(context);
             return;
         }
+        if (s_cb_map_bounce.needsAutoProbe() &&
+            edpe::CbMapBounce::isEligibleByteWidth(mapped_byte_width)) {
+            static LARGE_INTEGER s_qpc_freq{};
+            if (s_qpc_freq.QuadPart == 0) QueryPerformanceFrequency(&s_qpc_freq);
+            LARGE_INTEGER t0{}, t1{};
+            QueryPerformanceCounter(&t0);
+            const auto* probeBytes = static_cast<const volatile uint64_t*>(mapped_ptr);
+            const size_t qwords = static_cast<size_t>(mapped_byte_width) / sizeof(uint64_t);
+            uint64_t sink = 0;
+            for (size_t i = 0; i < qwords; ++i) sink ^= probeBytes[i];
+            (void)sink;
+            QueryPerformanceCounter(&t1);
+            if (s_qpc_freq.QuadPart > 0 && t1.QuadPart >= t0.QuadPart) {
+                const uint64_t elapsedNs = static_cast<uint64_t>(
+                    ((t1.QuadPart - t0.QuadPart) * 1000000000LL) / s_qpc_freq.QuadPart);
+                s_cb_map_bounce.recordDirectReadSample(mapped_byte_width, elapsedNs);
+                logCbMapBounceEvents();
+            }
+        }
         if (isTransposeProjectionCbWidth(mapped_byte_width) &&
             !couldBeTransposeProjection208(static_cast<const float*>(mapped_ptr))) {
-            if (forward) forward(context, resource, subresource);
+            forwardUnmap();
             rearmHudDrawProbeFast(context);
             return;
         }
@@ -7383,7 +7458,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
              s_scene_window_closed_frame.load(std::memory_order_acquire) == cur_frame ||
              !couldBeAuxiliaryCameraCb(static_cast<const float*>(mapped_ptr),
                                        static_cast<size_t>(mapped_byte_width) / sizeof(float)))) {
-            if (forward) forward(context, resource, subresource);
+            forwardUnmap();
             rearmHudDrawProbeFast(context);
             return;
         }
@@ -7531,7 +7606,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             }
             {
                 SubProfScope subProfDrv(SubZone::UnmapDrv);
-                if (forward) forward(context, resource, subresource);
+                forwardUnmap();
                 rearmHudDrawProbeFast(context);
             }
             return;
@@ -7546,7 +7621,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             }
             {
                 SubProfScope subProfDrv(SubZone::UnmapDrv);
-                if (forward) forward(context, resource, subresource);
+                forwardUnmap();
                 rearmHudDrawProbeFast(context);
             }
             return;
@@ -8659,7 +8734,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             }
         }
     }
-    if (forward) forward(context, resource, subresource);
+    forwardUnmap();
     if (!s_in_edpe_present.load(std::memory_order_acquire) && isObservedImmediateContext(context)) {
         rearmHudDrawProbeFast(context);
     }
@@ -12093,6 +12168,10 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
         if (motion_color_bound && !bound) {
             // Main scene G-buffer or Pass 35 HDR pass has completed and unbound!
             s_inside_main_scene.store(false, std::memory_order_release);
+    if (!(flags & DXGI_PRESENT_TEST)) {
+        s_cb_map_bounce.onPresent(frame);
+        logCbMapBounceEvents();
+    }
             s_hud_mask_active_pass = false;
             if (motion_pair_active && !motion_color_first_exit_logged) {
                 motion_color_first_exit_logged = true;
@@ -13182,6 +13261,10 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_motion_invert_x.store(cfg.motionInvertX, std::memory_order_relaxed);
         s_motion_invert_y.store(cfg.motionInvertY, std::memory_order_relaxed);
         s_motion_scale.store(cfg.motionScale, std::memory_order_relaxed);
+        s_cb_map_bounce.configure(
+            static_cast<edpe::MapBounceMode>(cfg.mapBounceMode),
+            edpe::isRunningUnderWine());
+        s_cb_map_bounce_configured.store(true, std::memory_order_release);
         edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
         edpe::JitterLogger::instance().setSampleInterval(cfg.jitterLogInterval);
         edpe::JitterLogger::instance().setFlushIntervalMs(cfg.jitterLogFlushMs);

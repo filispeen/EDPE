@@ -138,6 +138,9 @@ public:
         devMode = (devVal > 0);
 
         debugViewActive = GetPrivateProfileIntW(L"Pipeline", L"DebugView", 0, path.c_str()) != 0;
+        wchar_t bounceBuf[64]{};
+        GetPrivateProfileStringW(L"Pipeline", L"MapBounceMode", L"auto", bounceBuf, 64, path.c_str());
+        mapBounceMode = parseMapBounceModeString(bounceBuf);
 
         renderDocAnnotations = GetPrivateProfileIntW(L"RenderDoc", L"EnableAnnotations", 1, path.c_str()) != 0;
         RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
@@ -220,6 +223,7 @@ public:
         WritePrivateProfileStringW(L"Overlay", L"DEV", devMode ? L"1" : L"0", path.c_str());
 
         WritePrivateProfileStringW(L"Pipeline", L"DebugView", debugViewActive ? L"1" : L"0", path.c_str());
+        WritePrivateProfileStringW(L"Pipeline", L"MapBounceMode", mapBounceModeToString(mapBounceMode), path.c_str());
 
         WritePrivateProfileStringW(L"RenderDoc", L"EnableAnnotations", renderDocAnnotations ? L"1" : L"0", path.c_str());
         RenderDocBridge::instance().setAnnotationsEnabled(renderDocAnnotations);
@@ -371,6 +375,22 @@ public:
     bool devMode = false;
 
     bool debugViewActive = false;
+    int mapBounceMode = 0; // 0=auto, 1=on, 2=off
+
+    static int parseMapBounceModeString(const wchar_t* s) {
+        if (!s || !s[0]) return 0;
+        if (_wcsicmp(s, L"on") == 0 || wcscmp(s, L"1") == 0) return 1;
+        if (_wcsicmp(s, L"off") == 0 || wcscmp(s, L"2") == 0) return 2;
+        return 0; // auto
+    }
+
+    static const wchar_t* mapBounceModeToString(int mode) {
+        switch (mode) {
+        case 1: return L"on";
+        case 2: return L"off";
+        default: return L"auto";
+        }
+    }
 
     bool renderDocAnnotations = true;
 
