@@ -98,7 +98,8 @@ bool JitterLogger::shouldSampleFrame(unsigned long long frame, bool forceOnAnoma
 }
 
 void JitterLogger::pushFrame(const JitterFrameLog& log) {
-    if (!shouldSampleFrame(log.frame, log.sceneCut)) {
+    const bool anomaly = log.sceneCut || (log.pairCheckValid && !log.pairCheckOk);
+    if (!shouldSampleFrame(log.frame, anomaly)) {
         return;
     }
 
@@ -153,7 +154,7 @@ void JitterLogger::clearFile() {
     FILE* f = nullptr;
     if (_wfopen_s(&f, path.c_str(), L"w") == 0 && f) {
         std::fprintf(f, "# EDPE Jitter Stability Log\n");
-        std::fprintf(f, "# Frame, Time_ms, Delta_ms, Phase, TotalPhases, PixelX, PixelY, NdcX, NdcY, Writes, Rejections, EvalJx, EvalJy, Synced, CamValid, HeldJitter, SceneCut, CamMove_m, CamRot_deg\n");
+        std::fprintf(f, "# Frame, Time_ms, Delta_ms, Phase, TotalPhases, PixelX, PixelY, NdcX, NdcY, Writes, Rejections, EvalJx, EvalJy, Synced, CamValid, HeldJitter, SceneCut, CamMove_m, CamRot_deg, PairOk, PairErrNdc\n");
         std::fclose(f);
     }
     writtenRows_.store(0, std::memory_order_relaxed);
@@ -211,7 +212,7 @@ void JitterLogger::workerThreadLoop() {
             FILE* f = nullptr;
             if (_wfopen_s(&f, path.c_str(), L"w") == 0 && f) {
                 std::fprintf(f, "# EDPE Jitter Stability Log\n");
-                std::fprintf(f, "# Frame, Time_ms, Delta_ms, Phase, TotalPhases, PixelX, PixelY, NdcX, NdcY, Writes, Rejections, EvalJx, EvalJy, Synced, CamValid, HeldJitter, SceneCut, CamMove_m, CamRot_deg\n");
+                std::fprintf(f, "# Frame, Time_ms, Delta_ms, Phase, TotalPhases, PixelX, PixelY, NdcX, NdcY, Writes, Rejections, EvalJx, EvalJy, Synced, CamValid, HeldJitter, SceneCut, CamMove_m, CamRot_deg, PairOk, PairErrNdc\n");
                 std::fclose(f);
             }
         }
@@ -254,15 +255,16 @@ void JitterLogger::workerThreadLoop() {
 
         while (r != w) {
             const JitterFrameLog& entry = ring_[r % kRingSize];
-            char line[256];
+            char line[288];
+            const int pairState = entry.pairCheckValid ? (entry.pairCheckOk ? 1 : 0) : -1;
             const int lineLen = std::snprintf(line, sizeof(line),
-                "%llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6g, %.6g, %u, %u, %.4f, %.4f, %d, %d, %d, %d, %.4f, %.3f\n",
+                "%llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6g, %.6g, %u, %u, %.4f, %.4f, %d, %d, %d, %d, %.4f, %.3f, %d, %.3e\n",
                 entry.frame, entry.timeMs, entry.deltaMs, entry.phase, entry.totalPhases,
                 entry.pixelX, entry.pixelY, entry.ndcX, entry.ndcY,
                 entry.injectedWrites, entry.rejections,
                 entry.evalJx, entry.evalJy, entry.syncOk ? 1 : 0,
                 entry.cameraValid ? 1 : 0, entry.heldJitter ? 1 : 0, entry.sceneCut ? 1 : 0,
-                entry.camMoveDist, entry.camRotDeg);
+                entry.camMoveDist, entry.camRotDeg, pairState, entry.pairErrNdc);
 
             if (lineLen > 0) {
                 if (bufUsed + lineLen >= kChunkSize) {
@@ -302,14 +304,15 @@ void JitterLogger::workerThreadLoop() {
         if (_wfopen_s(&f, path.c_str(), L"a") == 0 && f) {
             while (r != w) {
                 const JitterFrameLog& entry = ring_[r % kRingSize];
+                const int pairState = entry.pairCheckValid ? (entry.pairCheckOk ? 1 : 0) : -1;
                 std::fprintf(f,
-                    "%llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6g, %.6g, %u, %u, %.4f, %.4f, %d, %d, %d, %d, %.4f, %.3f\n",
+                    "%llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6g, %.6g, %u, %u, %.4f, %.4f, %d, %d, %d, %d, %.4f, %.3f, %d, %.3e\n",
                     entry.frame, entry.timeMs, entry.deltaMs, entry.phase, entry.totalPhases,
                     entry.pixelX, entry.pixelY, entry.ndcX, entry.ndcY,
                     entry.injectedWrites, entry.rejections,
                     entry.evalJx, entry.evalJy, entry.syncOk ? 1 : 0,
                     entry.cameraValid ? 1 : 0, entry.heldJitter ? 1 : 0, entry.sceneCut ? 1 : 0,
-                    entry.camMoveDist, entry.camRotDeg);
+                    entry.camMoveDist, entry.camRotDeg, pairState, entry.pairErrNdc);
                 ++r;
             }
             std::fclose(f);

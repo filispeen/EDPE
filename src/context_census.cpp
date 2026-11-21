@@ -16,6 +16,7 @@
 #include "ui.h"
 #include "jitter_logger.h"
 #include "jitter_debug_pass.h"
+#include "motion_class_debug_pass.h"
 #include "hud_debug_pass.h"
 #include "jitter_view_recorder.h"
 #include "profiler.h"
@@ -550,6 +551,7 @@ static bool s_has_probe_fallback_camera = false;
 static bool s_probe_fallback_from_in_scene = false;
 static bool s_probe_fallback_parse_ok = false;
 static bool s_last_committed_scene_cut = false;
+static bool s_last_committed_origin_reanchor = false;
 static unsigned s_teleport_rejection_streak = 0;
 static unsigned long long s_last_teleport_rejection_frame = ~0ull;
 static unsigned s_cut_rejection_streak = 0;
@@ -779,6 +781,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         s_consecutive_fallback_frames == 0;
 
     out_scene_cut = false;
+    s_last_committed_origin_reanchor = false;
     if (haveNormalStaged || useProbeOrientationFallback) {
         const edpe::CameraProjection committedCam = [&]() {
             if (haveNormalStaged && !useOrientationOnlyHold) {
@@ -824,7 +827,11 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                         ? (rendered_frame - s_last_true_camera_frame)
                         : 1ull;
                 const edpe::Vec3 predictedTrueDelta = s_prev_valid_velocity * static_cast<float>(gap);
-                if (edpe::isUnpredictedPositionCut(trueDelta, predictedTrueDelta)) {
+                if (edpe::isFloatingOriginReanchor(s_last_true_camera, committedCam)) {
+                    out_scene_cut = false;
+                    s_last_committed_origin_reanchor = true;
+                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                } else if (edpe::isUnpredictedPositionCut(trueDelta, predictedTrueDelta)) {
                     out_scene_cut = true;
                     s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                 } else {
@@ -838,7 +845,11 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                 s_camera_previous_frame = s_camera_frame;
                 const edpe::Vec3 newDelta =
                     edpe::cameraPosition(committedCam) - edpe::cameraPosition(s_camera_now);
-                if (edpe::isUnpredictedPositionCut(newDelta, s_prev_valid_velocity)) {
+                if (edpe::isFloatingOriginReanchor(s_camera_now, committedCam)) {
+                    out_scene_cut = false;
+                    s_last_committed_origin_reanchor = true;
+                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                } else if (edpe::isUnpredictedPositionCut(newDelta, s_prev_valid_velocity)) {
                     out_scene_cut = true;
                     s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                 } else {
@@ -1664,10 +1675,52 @@ std::atomic<bool> s_jitter_swap_xy{false};
 std::atomic<float> s_jitter_scale{1.0f};
 std::atomic<unsigned> s_jitter_phase_count{32};
 std::atomic<unsigned> s_active_jitter_phases{32};
+std::atomic<int> s_jitter_mode{0}; // 0=auto (upstream->d3d11), 1=d3d11, 2=upstream
+static std::atomic<bool> s_phase_count_changed_reset{false};
+
+static edpe::PhasePairAuditor s_phase_pair_auditor{};
+static unsigned long long s_phase_audit_last_frame = ~0ull;
+static std::atomic<unsigned long long> s_phase_audit_checked{0};
+static std::atomic<unsigned long long> s_phase_audit_mismatched{0};
+static std::atomic<bool> s_phase_audit_last_valid{false};
+static std::atomic<bool> s_phase_audit_last_ok{true};
+static std::atomic<float> s_phase_audit_last_err_ndc{0.0f};
+
+static inline bool isUpstreamJitterRouteActive() {
+    const int mode = s_jitter_mode.load(std::memory_order_relaxed);
+    if (mode == 1) return false; // d3d11 forced
+    return edpe::cobra_camera::EngineHookManager::instance().isViewRefreshUsable();
+}
+
+static inline void recordPhaseAuditLocked(const float* jitteredProj16, const edpe::ProjectionJitter& jitter, unsigned long long cur_frame) {
+    if (s_phase_audit_last_frame == cur_frame) return;
+    s_phase_audit_last_frame = cur_frame;
+    const auto res = s_phase_pair_auditor.recordFrame(jitteredProj16, jitter, 2.0e-6f);
+    s_phase_audit_checked.store(s_phase_pair_auditor.checkedCount(), std::memory_order_relaxed);
+    s_phase_audit_mismatched.store(s_phase_pair_auditor.mismatchedCount(), std::memory_order_relaxed);
+    s_phase_audit_last_valid.store(res.valid, std::memory_order_relaxed);
+    s_phase_audit_last_ok.store(res.matched, std::memory_order_relaxed);
+    s_phase_audit_last_err_ndc.store(res.maxAbsError, std::memory_order_relaxed);
+    if (res.valid && !res.matched && edpe::Config::instance().devMode) {
+        static std::atomic<unsigned> s_mismatch_log_budget{16};
+        if (s_mismatch_log_budget.load(std::memory_order_relaxed) > 0 &&
+            s_mismatch_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+            wchar_t msg[256];
+            swprintf_s(msg,
+                L"EDPE PHASE AUDIT MISMATCH frame=%llu err=(%.3e, %.3e) meas=(%.3e, %.3e) exp=(%.3e, %.3e)",
+                cur_frame, res.errorX, res.errorY,
+                res.measuredDeltaX, res.measuredDeltaY,
+                res.expectedDeltaX, res.expectedDeltaY);
+            EdpeLog(msg);
+        }
+    }
+}
 std::atomic<bool> s_preserve_native_ui{true};
 std::atomic<float> s_sharpness{0.0f};
 
 std::atomic<bool> s_jitter_debug_view{false};
+std::atomic<bool> s_motion_class_debug_view{false};
+edpe::MotionClassStats s_motion_class_stats{};
 std::atomic<float> s_jitter_debug_sensitivity{1.5f};
 std::atomic<float> s_jitter_debug_threshold{0.02f};
 std::atomic<int> s_jitter_debug_mode{0};
@@ -1703,15 +1756,13 @@ edpe::ProjectionJitter getOrUpdateSceneProjectionJitter() {
         const UINT rH = (sceneH > 0 && (!scH || sceneH <= scH)) ? sceneH : scH;
 
         const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
-        unsigned phases = base_phases ? base_phases : 32;
-        if (scW > rW && rW > 0) {
-            const float upscaleRatio = static_cast<float>(scW) / static_cast<float>(rW);
-            phases = static_cast<unsigned>(std::clamp(
-                std::lround(static_cast<float>(phases) * upscaleRatio * upscaleRatio), 8l, 256l));
+        const unsigned phases = edpe::computeEffectiveJitterPhaseCount(base_phases, rW, rH, scW, scH);
+        const unsigned prev_phases = s_active_jitter_phases.exchange(phases, std::memory_order_relaxed);
+        if (prev_phases != 0 && phases != prev_phases && jitter_frame_index.load(std::memory_order_relaxed) > 0) {
+            s_phase_count_changed_reset.store(true, std::memory_order_release);
         }
-        s_active_jitter_phases.store(phases ? phases : 32, std::memory_order_relaxed);
 
-        auto jitter = edpe::projectionJitter(scene_seq, rW ? rW : 2560, rH ? rH : 1440, phases ? phases : 32);
+        auto jitter = edpe::projectionJitter(scene_seq, rW ? rW : 2560, rH ? rH : 1440, phases);
         const float scale = s_jitter_scale.load(std::memory_order_relaxed);
         jitter.pixelX *= scale;
         jitter.pixelY *= scale;
@@ -1737,6 +1788,7 @@ void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud);
 void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void renderJitterDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void renderHudDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
+void renderMotionClassDebugView(ID3D11DeviceContext* context, unsigned long long rendered, ID3D11Texture2D* backbuffer);
 void rearmContextHooks();
 
 static ID3D11RenderTargetView* s_cached_hdr_rtv0 = nullptr;
@@ -7422,11 +7474,25 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     s_dot208_jit_ok = false;
                     if (s_dot208_matched) {
                         bool dot_modified = false;
+                        bool dot_already_upstream = false;
                         edpe::NdcOffset existing_ndc_offset{};
-                        if (edpe::estimateEliteTransposeBlockNdcOffset(local_dot16, &existing_ndc_offset) &&
+                        const bool has_existing_dot_ndc =
+                            edpe::estimateEliteTransposeBlockNdcOffset(local_dot16, &existing_ndc_offset) &&
                             std::isfinite(existing_ndc_offset.x) && std::isfinite(existing_ndc_offset.y) &&
                             (std::fabs(existing_ndc_offset.x) > 1e-6f || std::fabs(existing_ndc_offset.y) > 1e-6f) &&
-                            std::fabs(existing_ndc_offset.x) <= 0.05f && std::fabs(existing_ndc_offset.y) <= 0.05f) {
+                            std::fabs(existing_ndc_offset.x) <= 0.05f && std::fabs(existing_ndc_offset.y) <= 0.05f;
+                        if (winJitActive && isUpstreamJitterRouteActive() && has_existing_dot_ndc &&
+                            std::fabs(existing_ndc_offset.x - curDotJit.ndcX) <= 5e-5f &&
+                            std::fabs(existing_ndc_offset.y - curDotJit.ndcY) <= 5e-5f) {
+                            dot_already_upstream = true;
+                            s_dot208_jit_ok = true;
+                            s_injected_jitter = curDotJit;
+                            s_last_rendered_jitter = curDotJit;
+                            s_scene_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
+                            s_jitter_injected_frame = cur_frame;
+                            s_cb0_jittered_frame.store(cur_frame, std::memory_order_release);
+                            jittered_writes_count.fetch_add(1, std::memory_order_relaxed);
+                        } else if (has_existing_dot_ndc) {
                             float unjittered_block[16]{};
                             const edpe::ProjectionJitter unjitter{0.0f, 0.0f, -existing_ndc_offset.x, -existing_ndc_offset.y};
                             if (edpe::jitterEliteDotProjectionBlock(local_dot16, unjittered_block, unjitter)) {
@@ -7434,7 +7500,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 dot_modified = true;
                             }
                         }
-                        if (winJitActive) {
+                        if (winJitActive && !dot_already_upstream) {
                             float jittered_block[16]{};
                             if (edpe::jitterEliteDotProjectionBlock(local_dot16, jittered_block, curDotJit)) {
                                 std::memcpy(local_dot16, jittered_block, sizeof(jittered_block));
@@ -7525,6 +7591,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             alignas(16) static float s_cb1_memo_cam932[12]{};
             alignas(16) static float s_cb1_memo_proj1080[16]{};
             alignas(16) static float s_cb1_memo_world140[16]{};
+            alignas(16) static float s_cb1_memo_origin1100[4]{};
             static bool s_cb1_memo_parse_ok = false;
             static int s_cb1_memo_fail_reason = 0;
             static bool s_cb1_memo_is_subpass = false;
@@ -7534,12 +7601,20 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             alignas(16) float local_cam932[12];
             alignas(16) float local_proj1080[16];
             alignas(16) float local_world140[16];
+            alignas(16) float local_origin1100[4];
             std::memcpy(local_cam932, &mutable_unmap_words[932], sizeof(local_cam932));
             std::memcpy(local_proj1080, &mutable_unmap_words[1080], sizeof(local_proj1080));
             std::memcpy(local_world140, &mutable_unmap_words[140], sizeof(local_world140));
+            std::memcpy(local_origin1100, &mutable_unmap_words[1100], sizeof(local_origin1100));
             const bool memoSameProj =
                 (s_cb1_memo_frame == cur_frame &&
                  std::memcmp(local_proj1080, s_cb1_memo_proj1080, sizeof(local_proj1080)) == 0);
+            const bool upstream_cb1_active =
+                isUpstreamJitterRouteActive() &&
+                jitterActive &&
+                !edpe::cobra_camera::frameWindow().mapModeActive.load(std::memory_order_relaxed);
+            bool upstream_cb1_had_jitter = false;
+            alignas(16) float local_upstream_jittered_proj1080[16]{};
             edpe::NdcOffset existing_ndc_offset{};
             if (!memoSameProj &&
                 edpe::estimateEliteBlockNdcOffset(local_proj1080, &existing_ndc_offset) &&
@@ -7549,35 +7624,44 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 float unjittered_block[16]{};
                 const edpe::ProjectionJitter unjitter{0.0f, 0.0f, -existing_ndc_offset.x, -existing_ndc_offset.y};
                 if (edpe::jitterEliteProjectionBlock(local_proj1080, unjittered_block, unjitter)) {
-                    std::memcpy(local_proj1080, unjittered_block, sizeof(unjittered_block));
-                    std::memcpy(&mutable_unmap_words[1080], unjittered_block, sizeof(unjittered_block));
-                    const float invR0 = mutable_unmap_words[98 * 4 + 0];
-                    const float invR5 = mutable_unmap_words[98 * 4 + 5];
-                    if (std::isfinite(invR0) && std::isfinite(invR5) &&
-                        (std::fabs(invR0) > 1e-4f || std::fabs(invR5) > 1e-4f)) {
-                        alignas(16) float local_inv_rays[12];
-                        std::memcpy(local_inv_rays, &mutable_unmap_words[98 * 4], sizeof(local_inv_rays));
-                        if (areFiniteFloats(local_inv_rays, 12)) {
-                            edpe::cobra_camera::jitterInverseUvRay(
-                                local_inv_rays,
-                                -existing_ndc_offset.x * 0.5f,
-                                existing_ndc_offset.y * 0.5f);
-                            std::memcpy(&mutable_unmap_words[98 * 4], local_inv_rays, sizeof(local_inv_rays));
+                    if (upstream_cb1_active) {
+                        // Upstream Cobra hook already injected subpixel jitter into CB1.
+                        // Keep GPU CB1 untouched (no double-jitter, no extra WC writes) and
+                        // strip the offset only from our local copy for clean camera parsing.
+                        std::memcpy(local_upstream_jittered_proj1080, local_proj1080, sizeof(local_proj1080));
+                        std::memcpy(local_proj1080, unjittered_block, sizeof(unjittered_block));
+                        upstream_cb1_had_jitter = true;
+                    } else {
+                        std::memcpy(local_proj1080, unjittered_block, sizeof(unjittered_block));
+                        std::memcpy(&mutable_unmap_words[1080], unjittered_block, sizeof(unjittered_block));
+                        const float invR0 = mutable_unmap_words[98 * 4 + 0];
+                        const float invR5 = mutable_unmap_words[98 * 4 + 5];
+                        if (std::isfinite(invR0) && std::isfinite(invR5) &&
+                            (std::fabs(invR0) > 1e-4f || std::fabs(invR5) > 1e-4f)) {
+                            alignas(16) float local_inv_rays[12];
+                            std::memcpy(local_inv_rays, &mutable_unmap_words[98 * 4], sizeof(local_inv_rays));
+                            if (areFiniteFloats(local_inv_rays, 12)) {
+                                edpe::cobra_camera::jitterInverseUvRay(
+                                    local_inv_rays,
+                                    -existing_ndc_offset.x * 0.5f,
+                                    existing_ndc_offset.y * 0.5f);
+                                std::memcpy(&mutable_unmap_words[98 * 4], local_inv_rays, sizeof(local_inv_rays));
+                            }
                         }
-                    }
-                    const edpe::CameraProjection& unjitRefCam =
-                        (s_has_staged_camera && s_staged_camera_frame == cur_frame)
-                            ? s_staged_camera
-                            : s_camera_now;
-                    if (unjitRefCam.scaleX > 0.1f) {
-                        const float expectedUv0 = 2.0f / unjitRefCam.scaleX;
-                        const float uv0 = mutable_unmap_words[237 * 4];
-                        if (std::isfinite(uv0) && std::fabs(uv0 - expectedUv0) <= 0.02f * expectedUv0) {
-                            alignas(16) float local_uv2view[16];
-                            std::memcpy(local_uv2view, &mutable_unmap_words[237 * 4], sizeof(local_uv2view));
-                            if (edpe::cobra_camera::unjitterRowMajorUvToViewBlock(local_uv2view, unjitRefCam)) {
-                                mutable_unmap_words[237 * 4 + 3] = local_uv2view[3];
-                                mutable_unmap_words[237 * 4 + 7] = local_uv2view[7];
+                        const edpe::CameraProjection& unjitRefCam =
+                            (s_has_staged_camera && s_staged_camera_frame == cur_frame)
+                                ? s_staged_camera
+                                : s_camera_now;
+                        if (unjitRefCam.scaleX > 0.1f) {
+                            const float expectedUv0 = 2.0f / unjitRefCam.scaleX;
+                            const float uv0 = mutable_unmap_words[237 * 4];
+                            if (std::isfinite(uv0) && std::fabs(uv0 - expectedUv0) <= 0.02f * expectedUv0) {
+                                alignas(16) float local_uv2view[16];
+                                std::memcpy(local_uv2view, &mutable_unmap_words[237 * 4], sizeof(local_uv2view));
+                                if (edpe::cobra_camera::unjitterRowMajorUvToViewBlock(local_uv2view, unjitRefCam)) {
+                                    mutable_unmap_words[237 * 4 + 3] = local_uv2view[3];
+                                    mutable_unmap_words[237 * 4 + 7] = local_uv2view[7];
+                                }
                             }
                         }
                     }
@@ -7587,7 +7671,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             int parse_fail_reason = 0;
             const bool memoSameCamProj =
                 (memoSameProj &&
-                 std::memcmp(local_cam932, s_cb1_memo_cam932, sizeof(local_cam932)) == 0);
+                 std::memcmp(local_cam932, s_cb1_memo_cam932, sizeof(local_cam932)) == 0 &&
+                 std::memcmp(local_origin1100, s_cb1_memo_origin1100, 3 * sizeof(float)) == 0);
             const bool memoSameWorld140 =
                 (memoSameCamProj &&
                  std::memcmp(local_world140, s_cb1_memo_world140, sizeof(local_world140)) == 0);
@@ -7599,11 +7684,12 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             } else {
                 parse_ok = edpe::parseEliteCameraWithCb1Fallback(
                     local_cam932, local_proj1080, words, 5376 / sizeof(float),
-                    &parsed_camera, &parse_fail_reason);
+                    &parsed_camera, &parse_fail_reason, local_origin1100);
                 s_cb1_memo_frame = cur_frame;
                 std::memcpy(s_cb1_memo_cam932, local_cam932, sizeof(local_cam932));
                 std::memcpy(s_cb1_memo_proj1080, local_proj1080, sizeof(local_proj1080));
                 std::memcpy(s_cb1_memo_world140, local_world140, sizeof(local_world140));
+                std::memcpy(s_cb1_memo_origin1100, local_origin1100, sizeof(local_origin1100));
                 s_cb1_memo_parse_ok = parse_ok;
                 s_cb1_memo_fail_reason = parse_fail_reason;
                 s_cb1_memo_cam = parsed_camera;
@@ -7707,8 +7793,13 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 (rowTrace > 2.85) ||
                                 edpe::hasMatchingEliteCb1CameraPosition(words, 5376 / sizeof(float), local_cam932);
                         }
+                        float originX = 0.0f, originY = 0.0f, originZ = 0.0f;
+                        const bool hasRenderOrigin =
+                            edpe::extractEliteRenderOrigin(local_origin1100, &originX, &originY, &originZ);
                         const bool hasStagedPos = (s_has_staged_camera && s_staged_camera_frame == cur_frame);
-                        if (row932ValidPos) {
+                        if (hasRenderOrigin) {
+                            edpe::cameraSetPosition(bc, {originX, originY, originZ});
+                        } else if (row932ValidPos) {
                             edpe::cameraSetPosition(bc, {local_cam932[3], local_cam932[7], local_cam932[11]});
                         } else if (hasStagedPos) {
                             edpe::cameraSetPosition(bc, edpe::cameraPosition(s_staged_camera));
@@ -7716,7 +7807,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             edpe::cameraSetPosition(bc, edpe::cameraPosition(s_camera_now) + s_last_valid_velocity);
                         }
 
-                        if ((row932ValidPos || hasStagedPos || s_consecutive_fallback_frames <= 2) &&
+                        if ((hasRenderOrigin || row932ValidPos || hasStagedPos || s_consecutive_fallback_frames <= 2) &&
                             edpe::cameraRotationTrace(bc, blockRef) > 2.90f) {
                             parsed_camera = bc;
                             block_cam_ok = true;
@@ -7861,10 +7952,16 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const bool matches_anchor = anchor_fresh &&
                         edpe::matchesAnchorPrediction(parsed_camera, s_anchor_camera, s_last_valid_velocity, anchorDtRatio);
 
-                    const bool probe_vs_anchor = anchor_fresh && (cur_frame <= s_anchor_frame + 1) && !matches_anchor &&
+                    const bool cb1HasLiveEyePosPre =
+                        edpe::hasMatchingEliteCb1CameraPosition(words, 5376 / sizeof(float), local_cam932);
+                    const bool skipOnFootIpdProbe =
+                        cb1HasLiveEyePosPre && edpe::cobra_camera::MapFocusPoller::isOnFootActive();
+                    const bool probe_vs_anchor = !skipOnFootIpdProbe &&
+                        anchor_fresh && (cur_frame <= s_anchor_frame + 1) && !matches_anchor &&
                         isStereoEyeOrIpdProbe(parsed_camera, s_anchor_camera, s_last_valid_velocity, anchorDtRatio);
 
-                    const bool probe_vs_committed = (s_camera_now.scaleX > 0.0f) && !matches_anchor &&
+                    const bool probe_vs_committed = !skipOnFootIpdProbe &&
+                        (s_camera_now.scaleX > 0.0f) && !matches_anchor &&
                         isStereoEyeOrIpdProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio);
 
                     const bool hasStagedForFrame =
@@ -7881,8 +7978,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         !allow_fallback_recovery && !matches_staged && !promote_over_probe &&
                         (probe_vs_anchor || probe_vs_committed);
 
-                    const bool cb1HasLiveEyePos =
-                        edpe::hasMatchingEliteCb1CameraPosition(words, 5376 / sizeof(float), local_cam932);
+                    const bool cb1HasLiveEyePos = cb1HasLiveEyePosPre;
                     const bool allowPreSceneMainEye =
                         in_main_scene || cb1HasLiveEyePos || matches_world_cb1;
 
@@ -8391,6 +8487,56 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 }
                 const edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
+                if (upstream_cb1_active && upstream_cb1_had_jitter) {
+                    // Upstream route: do NOT double-jitter CB1. Strip known NDC phase into
+                    // s_last_clean_cb1_data for native HUD preservation and update reference blocks
+                    // so repairAuxiliarySceneConstantBuffer stays active for Deferred CB2.
+                    if (!is_subpass_camera && s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                        (s_clean_camera_frame != cur_frame ||
+                         (in_main_scene && s_clean_camera_in_scene_frame != cur_frame))) {
+                        std::memcpy(s_last_clean_cb1_data, mutable_words, 5376);
+                        std::memcpy(&s_last_clean_cb1_data[1080], local_proj1080, 16 * sizeof(float));
+                        const float invR0 = s_last_clean_cb1_data[98 * 4 + 0];
+                        const float invR5 = s_last_clean_cb1_data[98 * 4 + 5];
+                        if (std::isfinite(invR0) && std::isfinite(invR5) &&
+                            (std::fabs(invR0) > 1e-4f || std::fabs(invR5) > 1e-4f) &&
+                            areFiniteFloats(&s_last_clean_cb1_data[98 * 4], 12)) {
+                            edpe::cobra_camera::jitterInverseUvRay(
+                                &s_last_clean_cb1_data[98 * 4],
+                                -existing_ndc_offset.x * 0.5f,
+                                existing_ndc_offset.y * 0.5f);
+                        }
+                        if (parsed_camera.scaleX > 0.1f) {
+                            edpe::cobra_camera::unjitterRowMajorUvToViewBlock(
+                                &s_last_clean_cb1_data[237 * 4], parsed_camera);
+                        }
+                        s_has_clean_cb1_data = true;
+                        s_clean_camera_cb_dirty = true;
+                        s_clean_camera_frame = cur_frame;
+                        if (in_main_scene) {
+                            s_clean_camera_in_scene_frame = cur_frame;
+                        }
+                    }
+                    if (!is_subpass_camera) {
+                        std::memcpy(s_last_unjittered_forward_block, local_proj1080, 16 * sizeof(float));
+                        std::memcpy(s_last_jittered_forward_block, local_upstream_jittered_proj1080, 16 * sizeof(float));
+                        s_reference_cb0_blocks_frame = cur_frame;
+                        if (s_has_clean_cb1_data && areFiniteFloats(&s_last_clean_cb1_data[98 * 4], 12) &&
+                            (std::fabs(s_last_clean_cb1_data[98 * 4 + 0]) > 1e-4f ||
+                             std::fabs(s_last_clean_cb1_data[98 * 4 + 5]) > 1e-4f)) {
+                            std::memcpy(s_last_unjittered_inv_rays, &s_last_clean_cb1_data[98 * 4], sizeof(s_last_unjittered_inv_rays));
+                        }
+                        recordPhaseAuditLocked(local_upstream_jittered_proj1080, jitter, cur_frame);
+                    }
+                    s_jittered_cb1_buffer.store(resource, std::memory_order_release);
+                    jitter_applied_this_unmap = true;
+                    s_injected_jitter = jitter;
+                    s_last_rendered_jitter = jitter;
+                    s_cb1_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
+                    s_scene_writes_since_eval.fetch_add(1, std::memory_order_relaxed);
+                    s_jitter_injected_frame = cur_frame;
+                    jittered_writes_count.fetch_add(1, std::memory_order_relaxed);
+                } else {
                 const bool forwardCached =
                     (s_reference_cb0_blocks_frame == cur_frame &&
                      jitter.pixelX == s_injected_jitter.pixelX &&
@@ -8472,6 +8618,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 }
                             }
                         }
+                        if (!is_subpass_camera) {
+                            recordPhaseAuditLocked(jitteredSrc, jitter, cur_frame);
+                        }
                         s_jittered_cb1_buffer.store(resource, std::memory_order_release);
                         jitter_applied_this_unmap = true;
                         s_injected_jitter = jitter;
@@ -8496,6 +8645,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 } else {
                     jitter_rejection_count.fetch_add(1, std::memory_order_relaxed);
+                }
                 }
             }
             if (!jitter_applied_this_unmap) {
@@ -10755,14 +10905,21 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     const float dz = c[11] - p[11];
     const float moveDist = std::sqrt(dx * dx + dy * dy + dz * dz);
     const float rotTrace = edpe::cameraRotationTrace(s_camera_now, s_camera_previous);
-    const bool teleport_cut = (moveDist > 5000.0f);
-    scene_cut = scene_cut || (s_camera_previous_frame == ~0ull) || teleport_cut;
+    const bool origin_reanchor = s_last_committed_origin_reanchor ||
+        edpe::isFloatingOriginReanchor(s_camera_previous, s_camera_now);
+    const bool teleport_cut = !origin_reanchor && (moveDist > 5000.0f);
+    const bool phase_count_reset = s_phase_count_changed_reset.exchange(false, std::memory_order_acq_rel);
+    scene_cut = scene_cut || (s_camera_previous_frame == ~0ull) || teleport_cut || phase_count_reset;
 
     const bool eval_reset = s_camera_reset || scene_cut;
+    if (eval_reset || !has_fresh_scene_jitter || !ContextCensusIsJitterActive()) {
+        s_phase_pair_auditor.reset();
+    }
     const float prev_jx = eval_reset ? 0.0f : s_prev_eval_jitter_x;
     const float prev_jy = eval_reset ? 0.0f : s_prev_eval_jitter_y;
 
-    const bool need_motion = upscale_active || s_jitter_debug_view.load(std::memory_order_relaxed);
+    const bool want_motion_class_debug = edpe::Config::instance().devMode && s_motion_class_debug_view.load(std::memory_order_relaxed);
+    const bool need_motion = upscale_active || s_jitter_debug_view.load(std::memory_order_relaxed) || want_motion_class_debug;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
     ID3D11ShaderResourceView* prevDepthSrv = nullptr;
     if (need_motion) {
@@ -10798,10 +10955,18 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 motion_pass->clear(context);
             } else {
                 // Render motion vectors at render resolution using current and previous camera projections and jitter phases
+                const bool clampCockpit = !edpe::cobra_camera::MapFocusPoller::isOnFootActive();
                 motion_pass->render(motion_depth_view.Get(),
                     s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
-                    jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv, nullptr,
-                    /*preserveContextState=*/false);
+                    jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv,
+                    /*preserveContextState=*/false,
+                    /*zeroTranslation=*/origin_reanchor,
+                    /*enableClassOutput=*/want_motion_class_debug,
+                    /*weaponMotion=*/nullptr,
+                    /*sceneStencil=*/nullptr,
+                    /*celestialRecords=*/nullptr,
+                    /*celestialCount=*/0u,
+                    /*clampCockpit=*/clampCockpit);
             }
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
         }
@@ -11250,7 +11415,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     }
 
     // Push frame jitter diagnostics and log entry to asynchronous JitterLogger (only when DEV=1 and enabled)
-    if (edpe::JitterLogger::instance().shouldSampleFrame(rendered, scene_cut || s_camera_reset)) {
+    const bool pairValidNow = s_phase_audit_last_valid.load(std::memory_order_relaxed);
+    const bool pairOkNow = s_phase_audit_last_ok.load(std::memory_order_relaxed);
+    const float pairErrNow = s_phase_audit_last_err_ndc.load(std::memory_order_relaxed);
+    if (edpe::JitterLogger::instance().shouldSampleFrame(rendered, scene_cut || s_camera_reset || (pairValidNow && !pairOkNow))) {
         const unsigned phases = s_active_jitter_phases.load(std::memory_order_relaxed);
         const unsigned long long scene_seq = jitter_frame_index.load(std::memory_order_relaxed);
 
@@ -11274,9 +11442,85 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         jlog.sceneCut = scene_cut || s_camera_reset;
         jlog.camMoveDist = moveDist;
         jlog.camRotDeg = std::acos(std::clamp((rotTrace - 1.0f) * 0.5f, -1.0f, 1.0f)) * 57.29578f;
+        jlog.pairCheckValid = pairValidNow;
+        jlog.pairCheckOk = pairOkNow;
+        jlog.pairErrNdc = pairErrNow;
         edpe::JitterLogger::instance().pushFrame(jlog);
     }
 
+    rearmContextHooks();
+}
+
+void renderMotionClassDebugView(ID3D11DeviceContext* context, unsigned long long rendered,
+    ID3D11Texture2D* backbuffer) {
+    (void)rendered;
+    if (!context || !backbuffer || !motion_pass || !motion_pass->pixelClass()) return;
+    std::lock_guard<std::recursive_mutex> sceneLock(g_scene_ctx_mutex);
+
+    D3D11_TEXTURE2D_DESC bbDesc{};
+    backbuffer->GetDesc(&bbDesc);
+    if (!bbDesc.Width || !bbDesc.Height || bbDesc.SampleDesc.Count != 1) return;
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device) return;
+
+    static ID3D11Device* s_mc_device = nullptr;
+    static std::unique_ptr<edpe::MotionClassDebugPass> s_mc_pass;
+    static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_mc_input_copy;
+    static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_mc_input_srv;
+    static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> s_mc_rtv;
+    static ID3D11Texture2D* s_mc_cached_bb = nullptr;
+
+    if (s_mc_device != device.Get()) {
+        s_mc_pass.reset();
+        s_mc_input_copy.Reset();
+        s_mc_input_srv.Reset();
+        s_mc_rtv.Reset();
+        s_mc_cached_bb = nullptr;
+        s_mc_device = device.Get();
+    }
+    if (!s_mc_pass) {
+        auto pass = std::make_unique<edpe::MotionClassDebugPass>();
+        if (!pass->initialize(device.Get(), context)) return;
+        s_mc_pass = std::move(pass);
+    }
+    if (s_mc_cached_bb != backbuffer || !s_mc_rtv) {
+        s_mc_cached_bb = backbuffer;
+        s_mc_rtv.Reset();
+        if (FAILED(device->CreateRenderTargetView(backbuffer, nullptr, &s_mc_rtv))) return;
+    }
+    const DXGI_FORMAT typedFormat = concreteLdrColorFormat(bbDesc.Format);
+    if (s_mc_input_copy) {
+        D3D11_TEXTURE2D_DESC cur{};
+        s_mc_input_copy->GetDesc(&cur);
+        if (cur.Width != bbDesc.Width || cur.Height != bbDesc.Height || cur.Format != typedFormat) {
+            s_mc_input_copy.Reset();
+            s_mc_input_srv.Reset();
+        }
+    }
+    if (!s_mc_input_copy) {
+        D3D11_TEXTURE2D_DESC td = bbDesc;
+        td.Format = typedFormat;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = td.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&td, nullptr, &s_mc_input_copy)) ||
+            FAILED(device->CreateShaderResourceView(s_mc_input_copy.Get(), nullptr, &s_mc_input_srv))) {
+            s_mc_input_copy.Reset();
+            s_mc_input_srv.Reset();
+            return;
+        }
+    }
+    context->CopyResource(s_mc_input_copy.Get(), backbuffer);
+
+    D3D11_TEXTURE2D_DESC clsDesc{};
+    motion_pass->pixelClassTexture()->GetDesc(&clsDesc);
+    if (s_mc_pass->render(context, s_mc_input_srv.Get(), motion_pass->pixelClass(),
+            s_mc_rtv.Get(), bbDesc.Width, bbDesc.Height,
+            clsDesc.Width, clsDesc.Height, 0.65f, false)) {
+        s_motion_class_stats = s_mc_pass->lastStats();
+    }
     rearmContextHooks();
 }
 
@@ -12923,6 +13167,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_jitter_swap_xy.store(cfg.jitterSwapXY, std::memory_order_relaxed);
         s_jitter_scale.store(cfg.jitterScale, std::memory_order_relaxed);
         s_jitter_phase_count.store(cfg.jitterPhaseCount, std::memory_order_relaxed);
+        s_jitter_mode.store(cfg.jitterMode, std::memory_order_relaxed);
         s_preserve_native_ui.store(cfg.preserveNativeUi, std::memory_order_relaxed);
         s_sharpness.store(cfg.sharpness, std::memory_order_relaxed);
         s_jitter_debug_view.store(false, std::memory_order_relaxed);
@@ -13129,7 +13374,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 const bool hud_debug_active = s_hud_debug_view.load(std::memory_order_relaxed);
                 advanceComparisonSequence();
                 if (!s_upscale_evaluated_this_frame &&
-                    (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active || hud_debug_active)) {
+                    (edpe::UpscalerManager::instance().isReconstructionActive() || debug_view_active || hud_debug_active || (edpe::Config::instance().devMode && s_motion_class_debug_view.load(std::memory_order_relaxed)))) {
                     tryTemporalUpscale(context, rendered_frame, backbuffer.Get());
                 }
                 if (debug_view_active) {
@@ -13137,6 +13382,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 }
                 if (hud_debug_active) {
                     renderHudDebugView(context, rendered_frame, backbuffer.Get());
+                }
+                if (edpe::Config::instance().devMode && s_motion_class_debug_view.load(std::memory_order_relaxed)) {
+                    renderMotionClassDebugView(context, rendered_frame, backbuffer.Get());
                 }
                 s_hud_mask_latest_draws.store(s_hud_draws_replayed_frame, std::memory_order_relaxed);
                 if (s_hud_draws_replayed_frame == 0) {
@@ -13422,13 +13670,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         if (active_render_width && active_render_height && jitter_frame_index.load(std::memory_order_relaxed) == 0) {
             std::lock_guard lock(jitter_mutex);
             const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
-            unsigned phases = base_phases;
-            if (outW > active_render_width && active_render_width > 0) {
-                const float upscaleRatio = static_cast<float>(outW) / static_cast<float>(active_render_width);
-                phases = static_cast<unsigned>(std::clamp(
-                    std::lround(static_cast<float>(base_phases) * upscaleRatio * upscaleRatio), 8l, 256l));
-            }
-            s_active_jitter_phases.store(phases ? phases : 32, std::memory_order_relaxed);
+            const unsigned phases = edpe::computeEffectiveJitterPhaseCount(
+                base_phases, active_render_width, active_render_height, outW, outH);
+            s_active_jitter_phases.store(phases, std::memory_order_relaxed);
             auto jitter = edpe::projectionJitter(0, active_render_width, active_render_height, phases);
             const float scale = s_jitter_scale.load(std::memory_order_relaxed);
             jitter.pixelX *= scale;
@@ -13437,6 +13681,72 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             jitter.ndcY *= scale;
             active_projection_jitter = jitter;
             s_fast_active_jitter = jitter;
+        }
+
+        // Stage 2: Synchronize Upstream Cobra hook window & drain atomic telemetry (zero I/O in hooks)
+        {
+            const int jMode = s_jitter_mode.load(std::memory_order_relaxed);
+            auto& hookMgr = edpe::cobra_camera::EngineHookManager::instance();
+            auto& win = edpe::cobra_camera::frameWindow();
+            if (jMode != 1 && edpe::isRunningInEliteProcess()) {
+                hookMgr.ensureInstalled();
+            }
+            win.renderThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+            win.renderWidth.store(active_render_width, std::memory_order_relaxed);
+            win.renderHeight.store(active_render_height, std::memory_order_relaxed);
+            const bool mapActive = edpe::cobra_camera::MapFocusPoller::isMapGuiFocusActive();
+            win.mapModeActive.store(mapActive, std::memory_order_relaxed);
+            win.injectedDrawsThisFrame.store(0, std::memory_order_relaxed);
+
+            const bool wantUpstream = (jMode != 1) && hookMgr.isViewRefreshUsable() &&
+                                      ContextCensusIsJitterActive() && !mapActive &&
+                                      active_render_width > 0 && active_render_height > 0;
+            if (wantUpstream) {
+                const edpe::ProjectionJitter nextJit = getOrUpdateSceneProjectionJitter();
+                win.jitterPxX.store(nextJit.pixelX, std::memory_order_relaxed);
+                win.jitterPxY.store(nextJit.pixelY, std::memory_order_relaxed);
+                win.pauseRequested.store(false, std::memory_order_release);
+                win.windowOpen.store(true, std::memory_order_release);
+                edpe::cobra_camera::g_gate.store(1, std::memory_order_release);
+            } else {
+                win.windowOpen.store(false, std::memory_order_release);
+                win.jitterPxX.store(0.0f, std::memory_order_relaxed);
+                win.jitterPxY.store(0.0f, std::memory_order_relaxed);
+                win.pauseRequested.store(true, std::memory_order_release);
+                if (hookMgr.isStoodDown() || edpe::cobra_camera::injectedCameras().empty()) {
+                    edpe::cobra_camera::g_gate.store(0, std::memory_order_release);
+                }
+            }
+
+            static std::atomic<bool> s_logged_standdown{false};
+            if (hookMgr.isStoodDown() && !s_logged_standdown.exchange(true, std::memory_order_relaxed)) {
+                wchar_t sdMsg[256];
+                swprintf_s(sdMsg,
+                    L"EDPE: Cobra upstream hook entered permanent stand-down (writeFaults=%llu rollbacks=%llu); switched to D3D11 CB fallback",
+                    static_cast<unsigned long long>(win.writeFaultsTotal.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(win.rollbacksTotal.load(std::memory_order_relaxed)));
+                EdpeLog(sdMsg);
+            }
+            static ULONGLONG s_last_hook_diag_ms = 0;
+            const ULONGLONG nowTick = GetTickCount64();
+            if (edpe::Config::instance().devMode && hookMgr.isViewRefreshHooked() &&
+                nowTick - s_last_hook_diag_ms >= 5000ull) {
+                s_last_hook_diag_ms = nowTick;
+                const uint64_t rFaults = win.readFaultsTotal.load(std::memory_order_relaxed);
+                const uint64_t wFaults = win.writeFaultsTotal.load(std::memory_order_relaxed);
+                const uint64_t flushes = win.flushedCamerasTotal.load(std::memory_order_relaxed);
+                if (rFaults > 0 || wFaults > 0 || flushes > 0) {
+                    wchar_t diagMsg[256];
+                    swprintf_s(diagMsg,
+                        L"EDPE: Cobra upstream hook telemetry injected=%llu flushes=%llu readFaults=%llu writeFaults=%llu rollbacks=%llu",
+                        static_cast<unsigned long long>(win.injectedFrameCount.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(flushes),
+                        static_cast<unsigned long long>(rFaults),
+                        static_cast<unsigned long long>(wFaults),
+                        static_cast<unsigned long long>(win.rollbacksTotal.load(std::memory_order_relaxed)));
+                    EdpeLog(diagMsg);
+                }
+            }
         }
 
         if (edpe::JitterLogger::instance().shouldSampleFrame(frame, false) &&
@@ -13459,14 +13769,14 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             const unsigned writes_this_frame = cur_writes - s_last_writes;
             s_last_writes = cur_writes;
 
-            const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
+            const unsigned active_phases = s_active_jitter_phases.load(std::memory_order_relaxed);
             const unsigned long long scene_seq = jitter_frame_index.load(std::memory_order_relaxed);
             edpe::JitterFrameLog jlog{};
             jlog.frame = frame;
             jlog.timeMs = getJitterLogTimeMs();
             jlog.deltaMs = dt_ms;
-            jlog.phase = static_cast<unsigned>(scene_seq % (base_phases ? base_phases : 32));
-            jlog.totalPhases = base_phases ? base_phases : 32;
+            jlog.phase = static_cast<unsigned>(scene_seq % (active_phases ? active_phases : 32));
+            jlog.totalPhases = active_phases ? active_phases : 32;
             jlog.pixelX = s_injected_jitter.pixelX;
             jlog.pixelY = s_injected_jitter.pixelY;
             jlog.ndcX = s_injected_jitter.ndcX;
@@ -13479,6 +13789,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             jlog.cameraValid = (s_camera_now.scaleX > 0.0f);
             jlog.heldJitter = (writes_this_frame == 0);
             jlog.sceneCut = false;
+            jlog.pairCheckValid = s_phase_audit_last_valid.load(std::memory_order_relaxed);
+            jlog.pairCheckOk = s_phase_audit_last_ok.load(std::memory_order_relaxed);
+            jlog.pairErrNdc = s_phase_audit_last_err_ndc.load(std::memory_order_relaxed);
             edpe::JitterLogger::instance().pushFrame(jlog);
         }
     }
@@ -14312,6 +14625,28 @@ void ContextCensusSetJitterPhaseCount(unsigned count) {
 unsigned ContextCensusGetJitterPhaseCount() {
     return s_jitter_phase_count.load(std::memory_order_relaxed);
 }
+void ContextCensusSetJitterMode(int mode) {
+    const int clamped = (mode < 0 || mode > 2) ? 0 : mode;
+    s_jitter_mode.store(clamped, std::memory_order_relaxed);
+    edpe::Config::instance().jitterMode = clamped;
+    s_phase_count_changed_reset.store(true, std::memory_order_release);
+}
+int ContextCensusGetJitterMode() {
+    return s_jitter_mode.load(std::memory_order_relaxed);
+}
+const char* ContextCensusGetActiveJitterRouteName() {
+    const int mode = s_jitter_mode.load(std::memory_order_relaxed);
+    auto& hookMgr = edpe::cobra_camera::EngineHookManager::instance();
+    if (mode == 1) return "D3D11 CB (forced)";
+    if (hookMgr.isViewRefreshUsable()) return "Upstream Cobra Hook";
+    if (hookMgr.isStoodDown()) return "D3D11 CB (stand-down fallback)";
+    return "D3D11 CB (auto fallback)";
+}
+void ContextCensusGetPhaseAuditStats(unsigned long long* outChecked, unsigned long long* outMismatched, float* outLastErrNdc) {
+    if (outChecked) *outChecked = s_phase_audit_checked.load(std::memory_order_relaxed);
+    if (outMismatched) *outMismatched = s_phase_audit_mismatched.load(std::memory_order_relaxed);
+    if (outLastErrNdc) *outLastErrNdc = s_phase_audit_last_err_ndc.load(std::memory_order_relaxed);
+}
 
 void ContextCensusSetPreserveNativeUi(bool preserve) {
     s_preserve_native_ui.store(preserve, std::memory_order_relaxed);
@@ -14398,6 +14733,24 @@ ID3D11RenderTargetView* ContextCensusGetBackbufferCopyRtv() {
 void ContextCensusSetJitterDebugView(bool enable) {
     s_jitter_debug_view.store(enable, std::memory_order_relaxed);
     edpe::Config::instance().jitterDebugView = enable;
+}
+
+void ContextCensusSetMotionClassDebugView(bool enable) {
+    s_motion_class_debug_view.store(enable, std::memory_order_relaxed);
+}
+
+bool ContextCensusGetMotionClassDebugView() {
+    return s_motion_class_debug_view.load(std::memory_order_relaxed);
+}
+
+bool ContextCensusGetMotionClassStats(uint32_t outCounts[8], uint32_t* outTotalSamples) {
+    std::lock_guard<std::recursive_mutex> sceneLock(g_scene_ctx_mutex);
+    if (!s_motion_class_stats.valid) return false;
+    if (outCounts) {
+        for (int i = 0; i < 8; ++i) outCounts[i] = s_motion_class_stats.counts[i];
+    }
+    if (outTotalSamples) *outTotalSamples = s_motion_class_stats.totalSamples;
+    return true;
 }
 
 bool ContextCensusGetJitterDebugView() {

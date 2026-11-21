@@ -31,6 +31,9 @@ struct JitterFrameLog {
     bool sceneCut = false;
     float camMoveDist = 0.0f;
     float camRotDeg = 0.0f;
+    bool pairCheckValid = false;
+    bool pairCheckOk = true;
+    float pairErrNdc = 0.0f;
 };
 
 class JitterLogger {

@@ -17,18 +17,34 @@ struct CameraDelta {
     double depthB;       // |depthB change|
 };
 
+inline double relativeRotationAngleDeg(const float* p, const float* n) {
+    // R_rel = R_prev^T * R_now in double precision; atan2(s, c) avoids acos
+    // precision collapse for small camera turns (< 0.02 deg).
+    double r[9]{};
+    for (unsigned i = 0; i < 3; ++i) {
+        for (unsigned j = 0; j < 3; ++j) {
+            r[i * 3 + j] = static_cast<double>(p[0 * 4 + i]) * n[0 * 4 + j] +
+                           static_cast<double>(p[1 * 4 + i]) * n[1 * 4 + j] +
+                           static_cast<double>(p[2 * 4 + i]) * n[2 * 4 + j];
+        }
+    }
+    const double c = 0.5 * (r[0] + r[4] + r[8] - 1.0);
+    const double sx = r[7] - r[5];
+    const double sy = r[2] - r[6];
+    const double sz = r[3] - r[1];
+    const double s = 0.5 * std::sqrt(sx * sx + sy * sy + sz * sz);
+    return std::atan2(s, c) * 57.29577951308232;
+}
+
 inline CameraDelta cameraDelta(const CameraProjection& previous, const CameraProjection& now) {
     const float* p = previous.worldFromView;
     const float* n = now.worldFromView;
-    double moved = 0, trace = 0;
+    double moved = 0;
     for (unsigned row = 0; row < 3; ++row) {
         const double d = static_cast<double>(n[row * 4 + 3]) - p[row * 4 + 3];
         moved += d * d;
-        for (unsigned column = 0; column < 3; ++column)
-            trace += static_cast<double>(p[row * 4 + column]) * n[row * 4 + column];
     }
-    const double cosine = std::clamp((trace - 1.0) * 0.5, -1.0, 1.0);
-    return {std::sqrt(moved), std::acos(cosine) * 57.29577951308232,
+    return {std::sqrt(moved), relativeRotationAngleDeg(p, n),
         std::max(std::fabs(static_cast<double>(now.scaleX) - previous.scaleX),
                  std::fabs(static_cast<double>(now.scaleY) - previous.scaleY)),
         std::fabs(static_cast<double>(now.depthB) - previous.depthB)};
@@ -121,10 +137,11 @@ inline bool matchesIpdOrCockpitProbeDisplacement(
     // Латеральний стерео-очний зонд (IPD 68.2 мм, 136.4 мм, 272.8 мм)
     const bool isLateralIpd = (dRight >= 0.96f * dist && dUp < 0.015f && dFwd < 0.015f);
 
-    // Кабінний / наголовний зонд Cobra Odyssey (136.4 мм: +10.98 см Up, +8.09 см Fwd у системі корабля):
-    // При повороті/підйомі голови пілота проєкція на head-Right та head-Fwd змінюється, тоді як вертикальна
-    // складова (head-Up >= 0.40 * dist) зберігається у всьому діапазоні огляду в кабіні (yaw ±180°, pitch -30°..+65°).
-    const bool isCockpitHeadProbe = (dUp >= 0.40f * dist);
+    // Кабінний / наголовний зонд Cobra Odyssey (строго 2x IPD = 136.4 мм: +10.98 см Up, +8.09 см Fwd у системі корабля):
+    // Обмежуємо перевірку лише гармонікою 136.4 мм, щоб звичайний рух по схилах/сходах (~68.2 мм/кадр)
+    // або вертикальний тяг/джетпак (~272.8 мм/кадр) не класифікувались як зонд.
+    const bool isCockpitHeadProbe =
+        (std::fabs(dist - 0.1364f) < 0.012f) && (dUp >= 0.40f * dist);
 
     return isLateralIpd || isCockpitHeadProbe;
 }
@@ -278,6 +295,34 @@ inline bool isUnpredictedPositionCut(
     if (dist > 50.0f) return true;
     if (dist <= 15.0f) return false;
     return length(stepDelta - predictedDelta) > 15.0f;
+}
+
+// True when Cobra Engine re-anchors the local floating origin (~5 km rebase):
+// large translation jump (>= 50 m) with unchanged projection, near-identical
+// orientation (trace >= 2.9996, ~1.15 deg), and the new position pulled closer
+// to the local origin than both the previous position and the step length.
+inline bool isFloatingOriginReanchor(
+    const CameraProjection& prev,
+    const CameraProjection& now,
+    double* outStepM = nullptr)
+{
+    const double px = static_cast<double>(prev.worldFromView[3]);
+    const double py = static_cast<double>(prev.worldFromView[7]);
+    const double pz = static_cast<double>(prev.worldFromView[11]);
+    const double nx = static_cast<double>(now.worldFromView[3]);
+    const double ny = static_cast<double>(now.worldFromView[7]);
+    const double nz = static_cast<double>(now.worldFromView[11]);
+    const double dx = nx - px;
+    const double dy = ny - py;
+    const double dz = nz - pz;
+    const double stepM = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (outStepM) *outStepM = stepM;
+    if (stepM < 50.0) return false;
+    if (isCameraProjectionCut(now, prev)) return false;
+    if (cameraRotationTrace(now, prev) < 2.9996f) return false;
+    const double prevLen = std::sqrt(px * px + py * py + pz * pz);
+    const double nowLen = std::sqrt(nx * nx + ny * ny + nz * nz);
+    return nowLen < prevLen && nowLen < stepM;
 }
 
 enum CameraDeltaFlag : unsigned {

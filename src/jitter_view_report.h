@@ -66,6 +66,9 @@ struct JitterViewFrameMeta {
     uint32_t sceneH = 0;
     uint64_t lumaSumQ10 = 0;
     double lumaMean = -1.0;
+    bool pairCheckValid = false;
+    bool pairCheckOk = true;
+    float pairErrNdc = 0.0f;
 };
 
 struct JitterViewFrameData {
@@ -325,7 +328,7 @@ inline std::string generateJitterViewReport(
         kJitterViewGridRows);
     out.append(buf);
 
-    out.append("# frame, rendered_frame_id, t_ms, delta_ms, phase, phases, jx, jy, green_pct, green_px, centroid_x, centroid_y, bbox_x0, bbox_y0, bbox_x1, bbox_y1, tiles_active, tiles_flip, cam_move_m, cam_rot_deg, cam_valid, held, scene_cut, luma_mean, in_fmt, scene_w, scene_h, mv_null, depth_null, hist_realloc, sens, thr, mode\n");
+    out.append("# frame, rendered_frame_id, t_ms, delta_ms, phase, phases, jx, jy, green_pct, green_px, centroid_x, centroid_y, bbox_x0, bbox_y0, bbox_x1, bbox_y1, tiles_active, tiles_flip, cam_move_m, cam_rot_deg, cam_valid, held, scene_cut, luma_mean, in_fmt, scene_w, scene_h, mv_null, depth_null, hist_realloc, sens, thr, mode, pair_ok, pair_err_ndc\n");
 
     std::vector<JitterViewFrameStats> allStats;
     allStats.reserve(frames.size());
@@ -357,8 +360,9 @@ inline std::string generateJitterViewReport(
         }
 
         const auto& m = frames[i].meta;
+        const int pairState = m.pairCheckValid ? (m.pairCheckOk ? 1 : 0) : -1;
         std::snprintf(buf, sizeof(buf),
-            "%llu, %llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6f, %u, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %u, %u, %.4f, %.3f, %d, %d, %d, %.6f, %u, %u, %u, %d, %d, %d, %.2f, %.3f, %d\n",
+            "%llu, %llu, %.2f, %.2f, %u, %u, %.4f, %.4f, %.6f, %u, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %u, %u, %.4f, %.3f, %d, %d, %d, %.6f, %u, %u, %u, %d, %d, %d, %.2f, %.3f, %d, %d, %.3e\n",
             m.frame, m.renderedFrameId, m.timeMs, m.deltaMs, m.phase, m.totalPhases, m.pixelX, m.pixelY,
             s.greenPct, s.greenPx, s.centroidX, s.centroidY,
             s.bboxX0, s.bboxY0, s.bboxX1, s.bboxY1,
@@ -367,7 +371,7 @@ inline std::string generateJitterViewReport(
             m.cameraValid ? 1 : 0, m.heldJitter ? 1 : 0, m.sceneCut ? 1 : 0,
             m.lumaMean, m.inputFormat, m.sceneW, m.sceneH,
             m.motionNull ? 1 : 0, m.depthNull ? 1 : 0, m.historyRecreated ? 1 : 0,
-            m.sensitivity, m.threshold, m.mode);
+            m.sensitivity, m.threshold, m.mode, pairState, m.pairErrNdc);
         out.append(buf);
     }
 
@@ -603,6 +607,8 @@ inline std::string generateJitterViewReport(
     size_t mvNullCount = 0;
     size_t depthNullCount = 0;
     size_t histReallocCount = 0;
+    size_t pairAuditChecked = 0;
+    size_t pairAuditMismatched = 0;
     std::set<uint32_t> uniqueFormats;
 
     std::vector<double> validGreen;
@@ -615,6 +621,10 @@ inline std::string generateJitterViewReport(
         if (m.motionNull) mvNullCount++;
         if (m.depthNull) depthNullCount++;
         if (m.historyRecreated) histReallocCount++;
+        if (m.pairCheckValid) {
+            pairAuditChecked++;
+            if (!m.pairCheckOk) pairAuditMismatched++;
+        }
         uniqueFormats.insert(m.inputFormat);
 
         if (m.lumaMean >= 0.0) {
@@ -680,7 +690,9 @@ inline std::string generateJitterViewReport(
         "# luma_dominant_period_frames: %u\n"
         "# luma_dominant_freq_hz: %.2f\n"
         "# pearson_green_vs_luma: %.4f\n"
-        "# pearson_green_vs_abs_dluma: %.4f\n",
+        "# pearson_green_vs_abs_dluma: %.4f\n"
+        "# phase_audit_checked: %zu\n"
+        "# phase_audit_mismatched: %zu\n",
         resetCount,
         sceneCutCount,
         heldCount,
@@ -694,7 +706,9 @@ inline std::string generateJitterViewReport(
         lumaDominantPeriodFrames,
         lumaDominantFreqHz,
         pearsonGreenLuma,
-        pearsonGreenAbsDluma);
+        pearsonGreenAbsDluma,
+        pairAuditChecked,
+        pairAuditMismatched);
     out.append(buf);
 
     return out;
