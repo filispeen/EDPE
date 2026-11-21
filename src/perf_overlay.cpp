@@ -52,6 +52,17 @@ void PerfTracker::shutdown() {
     nvmlDevice_ = nullptr;
     nvmlGetUtil_ = nullptr;
     nvmlGetMem_ = nullptr;
+    resetAdapterCache();
+}
+
+void PerfTracker::resetAdapterCache() {
+    cachedAdapter3_.Reset();
+    cachedSwapChain_ = nullptr;
+    adapter3Unavailable_ = false;
+    gpuInfoCached_ = false;
+    telemetry_.vramUsedBytes = 0;
+    telemetry_.vramBudgetBytes = 0;
+    telemetry_.vramBudgetAvailable = false;
 }
 
 void PerfTracker::initNvml() {
@@ -244,6 +255,8 @@ void PerfTracker::updateCachedStats() {
     cachedStats_.gpuLoadAvailable = telemetry_.gpuLoadAvailable;
     cachedStats_.vramUsedBytes = telemetry_.vramUsedBytes;
     cachedStats_.vramTotalBytes = telemetry_.vramTotalBytes;
+    cachedStats_.vramBudgetBytes = telemetry_.vramBudgetBytes;
+    cachedStats_.vramBudgetAvailable = telemetry_.vramBudgetAvailable;
 
     // Pre-format all telemetry strings at 15 Hz / 66.67 ms for zero per-frame UI formatting overhead
     cachedStats_.fpsColor = (cachedStats_.fps >= 58.0f) ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f) :
@@ -394,40 +407,63 @@ void PerfTracker::updateTelemetry(IDXGISwapChain* swapChain) {
         cachedOutputHeight_ = scDesc.BufferDesc.Height;
     }
 
-    // 1. Static GPU adapter information
-    if (!gpuInfoCached_) {
+    if (swapChain != cachedSwapChain_) {
+        resetAdapterCache();
+        cachedSwapChain_ = swapChain;
+    }
+
+    // 1. Static GPU adapter information & cached IDXGIAdapter3 acquisition
+    if (!gpuInfoCached_ || (!cachedAdapter3_ && !adapter3Unavailable_)) {
         Microsoft::WRL::ComPtr<ID3D11Device> device;
-        if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&device)))) {
-            Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
-            if (SUCCEEDED(device.As(&dxgiDevice))) {
-                Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
-                if (SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
-                    DXGI_ADAPTER_DESC desc{};
-                    if (SUCCEEDED(adapter->GetDesc(&desc))) {
-                        telemetry_.gpuName = desc.Description;
-                        telemetry_.vramTotalBytes = desc.DedicatedVideoMemory;
-                        gpuInfoCached_ = true;
-                    }
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&device))) &&
+            SUCCEEDED(device.As(&dxgiDevice)) &&
+            SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
+            if (!gpuInfoCached_) {
+                DXGI_ADAPTER_DESC desc{};
+                if (SUCCEEDED(adapter->GetDesc(&desc))) {
+                    telemetry_.gpuName = desc.Description;
+                    telemetry_.vramTotalBytes = desc.DedicatedVideoMemory;
+                    gpuInfoCached_ = true;
                 }
             }
+            if (!cachedAdapter3_ && !adapter3Unavailable_) {
+                if (FAILED(adapter.As(&cachedAdapter3_)) || !cachedAdapter3_) {
+                    cachedAdapter3_.Reset();
+                    adapter3Unavailable_ = true;
+                }
+            }
+        } else if (!cachedAdapter3_) {
+            adapter3Unavailable_ = true;
         }
     }
 
-    // 2. Video Memory (VRAM) Usage
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&device)))) {
-        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
-        if (SUCCEEDED(device.As(&dxgiDevice))) {
-            Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
-            if (SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
-                Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
-                if (SUCCEEDED(adapter.As(&adapter3))) {
-                    DXGI_QUERY_VIDEO_MEMORY_INFO memInfo{};
-                    if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo))) {
-                        telemetry_.vramUsedBytes = memInfo.CurrentUsage;
-                    }
-                }
+    // 2. Video Memory (VRAM) Usage via cached IDXGIAdapter3
+    if (cachedAdapter3_ && !adapter3Unavailable_) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO memInfo{};
+        if (SUCCEEDED(cachedAdapter3_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo))) {
+            telemetry_.vramUsedBytes = memInfo.CurrentUsage;
+            // Under Wine/DXVK without VK_EXT_memory_budget, Budget is reported as
+            // DedicatedVideoMemory (synthetic); treat it as unavailable rather than misleading.
+            const bool syntheticWineBudget =
+                isRunningUnderWine() &&
+                telemetry_.vramTotalBytes > 0 &&
+                memInfo.Budget >= telemetry_.vramTotalBytes;
+            if (syntheticWineBudget || memInfo.Budget == 0) {
+                telemetry_.vramBudgetBytes = 0;
+                telemetry_.vramBudgetAvailable = false;
+            } else {
+                telemetry_.vramBudgetBytes = memInfo.Budget;
+                telemetry_.vramBudgetAvailable = true;
             }
+        } else {
+            // Latch unavailability so older DXVK/Wine builds do not re-query every tick.
+            cachedAdapter3_.Reset();
+            adapter3Unavailable_ = true;
+            telemetry_.vramUsedBytes = 0;
+            telemetry_.vramBudgetBytes = 0;
+            telemetry_.vramBudgetAvailable = false;
         }
     }
 

@@ -2,6 +2,7 @@
 
 #include <d3d11.h>
 #include <dxgi1_4.h>
+#include <wrl/client.h>
 #include <string>
 #include <cstdint>
 #include <array>
@@ -31,6 +32,8 @@ struct CachedTelemetryStats {
 
     uint64_t vramUsedBytes = 0;
     uint64_t vramTotalBytes = 0;
+    uint64_t vramBudgetBytes = 0;
+    bool vramBudgetAvailable = false;
 
     // Pre-formatted strings (updated at 15 Hz / 66.67 ms) for zero-overhead per-frame rendering
     char fpsLine[64]{};
@@ -63,6 +66,8 @@ struct PerfTelemetry {
 
     uint64_t vramUsedBytes = 0;
     uint64_t vramTotalBytes = 0;
+    uint64_t vramBudgetBytes = 0;
+    bool vramBudgetAvailable = false;
 };
 
 // Replaces the live upscaler information in the HUD (used when stamping comparison images).
@@ -137,8 +142,13 @@ private:
     size_t historyIndex_ = 0;
     size_t historyCount_ = 0;
 
+    void resetAdapterCache();
+
     // Hardware telemetry handles
     bool gpuInfoCached_ = false;
+    IDXGISwapChain* cachedSwapChain_ = nullptr;
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> cachedAdapter3_;
+    bool adapter3Unavailable_ = false;
     HMODULE nvmlModule_ = nullptr;
     void* nvmlDevice_ = nullptr;
     bool nvmlAvailable_ = false;
