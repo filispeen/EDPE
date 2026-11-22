@@ -78,10 +78,14 @@ public:
     // Queries completed D3D12 fence value without blocking.
     uint64_t completedFenceValue() const;
 
+    // Overrides the active D3D12 command queue (e.g., with a Streamline-wrapped queue).
+    // Passing nullptr restores the native queue created by initialize().
+    bool setOverrideCommandQueue(ID3D12CommandQueue* overrideQueue);
+
     ID3D11Device* d3d11Device() const { return device11_; }
     ID3D11Device5* d3d11Device5() const { return device11_5_.Get(); }
     ID3D12Device* d3d12Device() const { return device12_.Get(); }
-    ID3D12CommandQueue* commandQueue() const { return queue_.Get(); }
+    ID3D12CommandQueue* commandQueue() const { return activeQueue(); }
     ID3D12Fence* d3d12Fence() const { return fence12_.Get(); }
     ID3D11Fence* d3d11Fence() const { return fence11_.Get(); }
     uint64_t timestampFrequency() const { return timestampFrequency_; }
@@ -93,12 +97,17 @@ public:
                                           ID3DBlob** errorBlob);
 
 private:
+    ID3D12CommandQueue* activeQueue() const {
+        return overrideQueue_ ? overrideQueue_.Get() : queue_.Get();
+    }
+
     bool initialized_ = false;
     HMODULE d3d12Module_ = nullptr;
     ID3D11Device* device11_ = nullptr; // Non-owning
     Microsoft::WRL::ComPtr<ID3D11Device5> device11_5_;
     Microsoft::WRL::ComPtr<ID3D12Device> device12_;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> overrideQueue_;
     std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>, kAllocatorCount> allocators_;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmdList_;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence12_;

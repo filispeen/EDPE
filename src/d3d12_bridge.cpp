@@ -206,6 +206,7 @@ void D3D11D3D12Bridge::shutdown() {
         alloc.Reset();
     }
     allocatorFence_.fill(0);
+    overrideQueue_.Reset();
     queue_.Reset();
     device12_.Reset();
     device11_5_.Reset();
@@ -214,6 +215,17 @@ void D3D11D3D12Bridge::shutdown() {
     frameCounter_ = 0;
     timestampFrequency_ = 0;
     d3d12Module_ = nullptr;
+}
+
+bool D3D11D3D12Bridge::setOverrideCommandQueue(ID3D12CommandQueue* overrideQueue) {
+    if (!initialized_) return false;
+    waitGpuIdle();
+    overrideQueue_ = overrideQueue;
+    timestampFrequency_ = 0;
+    if (auto* q = activeQueue()) {
+        q->GetTimestampFrequency(&timestampFrequency_);
+    }
+    return true;
 }
 
 bool D3D11D3D12Bridge::createSharedTexture(uint32_t width,
@@ -317,6 +329,12 @@ uint64_t D3D11D3D12Bridge::submitAfterD3D11Signal(ID3D11DeviceContext4* ctx4,
                                                   bool flushD11) {
     if (!initialized_ || !ctx4 || slot >= kAllocatorCount) return 0;
 
+    ID3D12CommandQueue* q = activeQueue();
+    if (!q) {
+        cmdList_->Close();
+        return 0;
+    }
+
     const uint64_t d11Done = ++fenceValue_;
     if (FAILED(ctx4->Signal(fence11_.Get(), d11Done))) {
         cmdList_->Close();
@@ -328,20 +346,21 @@ uint64_t D3D11D3D12Bridge::submitAfterD3D11Signal(ID3D11DeviceContext4* ctx4,
 
     if (FAILED(cmdList_->Close())) return 0;
 
-    if (FAILED(queue_->Wait(fence12_.Get(), d11Done))) return 0;
+    if (FAILED(q->Wait(fence12_.Get(), d11Done))) return 0;
     ID3D12CommandList* lists[] = {cmdList_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
+    q->ExecuteCommandLists(1, lists);
 
     const uint64_t d12Done = ++fenceValue_;
-    if (FAILED(queue_->Signal(fence12_.Get(), d12Done))) return 0;
+    if (FAILED(q->Signal(fence12_.Get(), d12Done))) return 0;
     allocatorFence_[slot] = d12Done;
     return d12Done;
 }
 
 uint64_t D3D11D3D12Bridge::signalD3D12Queue() {
-    if (!initialized_ || !queue_ || !fence12_) return 0;
+    ID3D12CommandQueue* q = activeQueue();
+    if (!initialized_ || !q || !fence12_) return 0;
     const uint64_t val = ++fenceValue_;
-    if (FAILED(queue_->Signal(fence12_.Get(), val))) return 0;
+    if (FAILED(q->Signal(fence12_.Get(), val))) return 0;
     return val;
 }
 
@@ -351,9 +370,10 @@ bool D3D11D3D12Bridge::waitOnD3D11(ID3D11DeviceContext4* ctx4, uint64_t d12DoneF
 }
 
 void D3D11D3D12Bridge::waitGpuIdle() {
-    if (!queue_ || !fence12_ || !fenceEvent_) return;
+    ID3D12CommandQueue* q = activeQueue();
+    if (!q || !fence12_ || !fenceEvent_) return;
     const uint64_t target = ++fenceValue_;
-    if (SUCCEEDED(queue_->Signal(fence12_.Get(), target)) &&
+    if (SUCCEEDED(q->Signal(fence12_.Get(), target)) &&
         fence12_->GetCompletedValue() < target) {
         if (SUCCEEDED(fence12_->SetEventOnCompletion(target, fenceEvent_))) {
             WaitForSingleObject(fenceEvent_, 5000);

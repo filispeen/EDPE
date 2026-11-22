@@ -5,6 +5,7 @@
 #if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
 #include <sl.h>
 #include <sl_consts.h>
+#include <sl_core_api.h>
 #include <sl_dlss_g.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
+#include <string>
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
@@ -87,6 +89,189 @@ int runUnitChecks() {
     return 0;
 }
 
+#if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
+int runManualHookingProxyTest(ID3D11Device* dev,
+                              ID3D11DeviceContext4* ctx4,
+                              edpe::D3D12ProxyPresenter& presenter) {
+    wchar_t exePath[MAX_PATH]{};
+    const DWORD pathLen = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    REQUIRE(pathLen > 0 && pathLen < MAX_PATH);
+    std::wstring exeDir(exePath, pathLen);
+    const size_t slash = exeDir.find_last_of(L"\\/");
+    REQUIRE(slash != std::wstring::npos);
+    exeDir.resize(slash);
+
+    const std::wstring slPath = exeDir + L"\\sl.interposer.dll";
+    REQUIRE(GetFileAttributesW(slPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+    HMODULE slMod = LoadLibraryW(slPath.c_str());
+    REQUIRE(slMod != nullptr);
+
+    auto slInit = reinterpret_cast<PFun_slInit*>(GetProcAddress(slMod, "slInit"));
+    auto slShutdown = reinterpret_cast<PFun_slShutdown*>(GetProcAddress(slMod, "slShutdown"));
+    auto slSetD3DDevice = reinterpret_cast<PFun_slSetD3DDevice*>(GetProcAddress(slMod, "slSetD3DDevice"));
+    auto slUpgradeInterface =
+        reinterpret_cast<PFun_slUpgradeInterface*>(GetProcAddress(slMod, "slUpgradeInterface"));
+    auto slGetNewFrameToken =
+        reinterpret_cast<PFun_slGetNewFrameToken*>(GetProcAddress(slMod, "slGetNewFrameToken"));
+    auto slGetFeatureFunction =
+        reinterpret_cast<PFun_slGetFeatureFunction*>(GetProcAddress(slMod, "slGetFeatureFunction"));
+    REQUIRE(slInit && slShutdown && slSetD3DDevice && slUpgradeInterface &&
+            slGetNewFrameToken && slGetFeatureFunction);
+
+    const wchar_t* pluginPaths[] = {exeDir.c_str()};
+    const sl::Feature features[] = {sl::kFeatureReflex, sl::kFeaturePCL};
+    sl::Preferences pref{};
+    pref.showConsole = false;
+    pref.logLevel = sl::LogLevel::eDefault;
+    pref.pathsToPlugins = pluginPaths;
+    pref.numPathsToPlugins = 1u;
+    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
+                 sl::PreferenceFlags::eDisableDebugText |
+                 sl::PreferenceFlags::eUseManualHooking |
+                 sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+    pref.featuresToLoad = features;
+    pref.numFeaturesToLoad = static_cast<uint32_t>(std::size(features));
+    pref.engine = sl::EngineType::eCustom;
+    pref.engineVersion = "1.0";
+    pref.projectId = "48d353f3-d07b-4048-876b-09f8622f5a27";
+    pref.renderAPI = sl::RenderAPI::eD3D12;
+
+    REQUIRE(slInit(pref, sl::kSDKVersion) == sl::Result::eOk);
+    REQUIRE(slSetD3DDevice(presenter.bridge().d3d12Device()) == sl::Result::eOk);
+
+    void* fn = nullptr;
+    PFun_slReflexSetOptions* slReflexSetOptions = nullptr;
+    PFun_slReflexSleep* slReflexSleep = nullptr;
+    PFun_slPCLSetMarker* slPCLSetMarker = nullptr;
+    if (slGetFeatureFunction(sl::kFeatureReflex, "slReflexSetOptions", fn) == sl::Result::eOk) {
+        slReflexSetOptions = reinterpret_cast<PFun_slReflexSetOptions*>(fn);
+    }
+    if (slGetFeatureFunction(sl::kFeatureReflex, "slReflexSleep", fn) == sl::Result::eOk) {
+        slReflexSleep = reinterpret_cast<PFun_slReflexSleep*>(fn);
+    }
+    if (slGetFeatureFunction(sl::kFeaturePCL, "slPCLSetMarker", fn) == sl::Result::eOk) {
+        slPCLSetMarker = reinterpret_cast<PFun_slPCLSetMarker*>(fn);
+    }
+    if (slReflexSetOptions) {
+        sl::ReflexOptions ro{};
+        ro.mode = sl::ReflexMode::eLowLatency;
+        REQUIRE(slReflexSetOptions(ro) == sl::Result::eOk);
+    }
+
+    // Regression check for GitHub Issue #23: slUpgradeInterface does not accept ID3D12CommandQueue*.
+    void* rawQueuePtr = presenter.bridge().commandQueue();
+    REQUIRE(slUpgradeInterface(&rawQueuePtr) == sl::Result::eErrorUnsupportedInterface);
+
+    // Correct ManualHooking path: upgrade ID3D12Device + IDXGIFactory, then CreateCommandQueue.
+    void* devPtr = presenter.bridge().d3d12Device();
+    REQUIRE(slUpgradeInterface(&devPtr) == sl::Result::eOk);
+    REQUIRE(devPtr != nullptr);
+    ComPtr<ID3D12Device> slProxyDevice;
+    slProxyDevice.Attach(static_cast<ID3D12Device*>(devPtr));
+
+    void* factoryPtr = presenter.dxgiFactory();
+    REQUIRE(slUpgradeInterface(&factoryPtr) == sl::Result::eOk);
+    REQUIRE(factoryPtr != nullptr);
+    ComPtr<IDXGIFactory4> slProxyFactory;
+    slProxyFactory.Attach(static_cast<IDXGIFactory4*>(factoryPtr));
+
+    D3D12_COMMAND_QUEUE_DESC qDesc{};
+    qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    qDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    ComPtr<ID3D12CommandQueue> slProxyQueue;
+    REQUIRE(SUCCEEDED(slProxyDevice->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&slProxyQueue))));
+    REQUIRE(slProxyQueue != nullptr);
+
+    IDXGISwapChain4* rawSc = presenter.detachSwapChainForWrap();
+    if (rawSc) rawSc->Release();
+    REQUIRE(presenter.bridge().setOverrideCommandQueue(slProxyQueue.Get()));
+
+    const UINT cleanFlags =
+        presenter.swapChainFlags() & ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    const DXGI_SWAP_CHAIN_DESC1 scDesc = edpe::sanitizeFlipSwapChainDesc(
+        presenter.width(), presenter.height(),
+        presenter.format(), presenter.bufferCount(),
+        cleanFlags, presenter.isTearingSupported());
+    ComPtr<IDXGISwapChain1> proxySc1;
+    REQUIRE(SUCCEEDED(slProxyFactory->CreateSwapChainForHwnd(
+        slProxyQueue.Get(), presenter.targetHwnd(), &scDesc, nullptr, nullptr, &proxySc1)));
+    ComPtr<IDXGISwapChain4> proxySc4;
+    REQUIRE(SUCCEEDED(proxySc1.As(&proxySc4)));
+    proxySc1.Reset();
+    REQUIRE(presenter.attachWrappedSwapChain(proxySc4.Detach()));
+
+    ComPtr<ID3D11Texture2D> colorTex;
+    REQUIRE(createTestTexture2D(dev, presenter.width(), presenter.height(),
+                                DXGI_FORMAT_R8G8B8A8_UNORM,
+                                D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+                                nullptr, 0, &colorTex));
+
+    struct MarkerCtx {
+        PFun_slPCLSetMarker* setMarker = nullptr;
+        sl::FrameToken* token = nullptr;
+    } markerCtx{slPCLSetMarker, nullptr};
+
+    presenter.setPresentMarkerHooks(
+        [](void* p) {
+            auto* mc = static_cast<MarkerCtx*>(p);
+            if (mc && mc->setMarker && mc->token) {
+                mc->setMarker(sl::PCLMarker::ePresentStart, *mc->token);
+            }
+        },
+        [](void* p) {
+            auto* mc = static_cast<MarkerCtx*>(p);
+            if (mc && mc->setMarker && mc->token) {
+                mc->setMarker(sl::PCLMarker::ePresentEnd, *mc->token);
+            }
+        },
+        &markerCtx);
+
+    for (uint32_t frameIdx = 1; frameIdx <= 3; ++frameIdx) {
+        sl::FrameToken* token = nullptr;
+        REQUIRE(slGetNewFrameToken(token, &frameIdx) == sl::Result::eOk);
+        REQUIRE(token != nullptr);
+        markerCtx.token = token;
+        if (slReflexSleep) REQUIRE(slReflexSleep(*token) == sl::Result::eOk);
+        if (slPCLSetMarker) {
+            slPCLSetMarker(sl::PCLMarker::eSimulationStart, *token);
+            slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *token);
+            slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *token);
+            slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *token);
+        }
+        HRESULT phr = S_OK;
+        REQUIRE(presenter.presentFromD3D11Texture(ctx4, colorTex.Get(), 0, 0, &phr));
+        REQUIRE(SUCCEEDED(phr));
+    }
+
+    presenter.setPresentMarkerHooks(nullptr, nullptr, nullptr);
+    presenter.bridge().waitGpuIdle();
+    if (slReflexSetOptions) {
+        sl::ReflexOptions offOpts{};
+        offOpts.mode = sl::ReflexMode::eOff;
+        slReflexSetOptions(offOpts);
+    }
+    IDXGISwapChain4* proxySc = presenter.detachSwapChainForWrap();
+    if (proxySc) proxySc->Release();
+    REQUIRE(presenter.bridge().setOverrideCommandQueue(nullptr));
+    slProxyQueue.Reset();
+    slProxyDevice.Reset();
+    slProxyFactory.Reset();
+    REQUIRE(slShutdown() == sl::Result::eOk);
+    FreeLibrary(slMod);
+    REQUIRE(presenter.recreatePlainSwapChain());
+
+    HRESULT plainHr = S_OK;
+    REQUIRE(presenter.presentFromD3D11Texture(ctx4, colorTex.Get(), 0, 0, &plainHr));
+    REQUIRE(SUCCEEDED(plainHr));
+
+    std::printf(
+        "Streamline ManualHooking proxy regression test PASSED "
+        "(rawQueue=eErrorUnsupportedInterface, slProxyDevice::CreateCommandQueue + 3 proxy presents + plain restore).\n");
+    return 0;
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -156,6 +341,9 @@ int main() {
         if (adapterDesc.VendorId == 0x10DE) {
             REQUIRE(snap.reflexSupported);
             REQUIRE(snap.pclSupported);
+            if (runManualHookingProxyTest(dev.Get(), ctx4.Get(), presenter) != 0) {
+                return 1;
+            }
         }
     }
 
