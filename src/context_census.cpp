@@ -11162,11 +11162,19 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (!motionRes || FAILED(motionRes.As(&motionTexture))) return;
     }
 
+    const bool useCanonicalDepth =
+        need_motion &&
+        !s_zero_motion_vectors.load(std::memory_order_relaxed) &&
+        motion_pass &&
+        motion_pass->canonicalDepthTexture() &&
+        motion_pass->canonicalDepth() &&
+        upscaler.getBackend() != edpe::UpscalerBackend::Taa;
+
     edpe::TemporalFrameInputs inputs{};
     inputs.color = activeColorInputTex;
     inputs.colorSrv = activeColorInputSrv;
-    inputs.depth = motion_depth.Get();
-    inputs.depthSrv = motion_depth_view.Get();
+    inputs.depth = useCanonicalDepth ? motion_pass->canonicalDepthTexture() : motion_depth.Get();
+    inputs.depthSrv = useCanonicalDepth ? motion_pass->canonicalDepth() : motion_depth_view.Get();
     inputs.prevDepthSrv = prevDepthSrv;
     inputs.motionVectors = motionTexture ? motionTexture.Get() : nullptr;
     inputs.motionSrv = (motion_pass && need_motion) ? motion_pass->output() : nullptr;

@@ -557,8 +557,8 @@ struct PanningThinLineMetrics {
 PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                                   uint32_t renderW, uint32_t renderH,
                                                   uint32_t outputW, uint32_t outputH) {
-    constexpr int kFrames = 48;
-    constexpr int kWarmup = 16;
+    constexpr int kFrames = 64;
+    constexpr int kWarmup = 32;
 
     const float scaleX = static_cast<float>(outputW) / static_cast<float>(renderW);
     const float scaleY = static_cast<float>(outputH) / static_cast<float>(renderH);
@@ -853,6 +853,105 @@ bool runSuiteForBackend(const char* label, GpuHarness& gpu, edpe::IUpscalerBacke
     return ok;
 }
 
+#if defined(EDPE_ENABLE_FSR)
+struct WalkShimmerMetrics {
+    float rmsDelta = 0.0f;
+    float p99Jump = 0.0f;
+};
+
+WalkShimmerMetrics measurePerfSrWalkingShimmer(GpuHarness& gpu, edpe::AmdUpscalerBackend& backend, float velocityFactor) {
+    constexpr uint32_t kRw = 1280;
+    constexpr uint32_t kRh = 64;
+    constexpr uint32_t kOw = 2560;
+    constexpr uint32_t kOh = 128;
+    constexpr int kFrames = 48;
+    constexpr int kWarmup = 16;
+    constexpr float kWalkSpeed = 1.50f; // render px/f = 3.0 display px/f -> f4KVelocity = 4.5
+
+    if (!gpu.allocateSurfaces(kRw, kRh, kOw, kOh)) {
+        return {999.0f, 999.0f};
+    }
+
+    backend.setVelocityFactor(velocityFactor);
+    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, kRw, kRh, kOw, kOh);
+    const uint32_t mvPacked = packHalf2(-kWalkSpeed, 0.0f);
+    const uint32_t bgPacked = packRgba8(0.04f, 0.04f, 0.04f);
+
+    FrameBuffers fb;
+    std::vector<uint32_t> outPixels;
+    std::vector<uint32_t> prevPixels;
+    std::vector<float> deltas;
+    double sqSum = 0.0;
+    edpe::ProjectionJitter prevJ{};
+
+    for (int t = 0; t < kFrames; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), kRw, kRh, phaseCount);
+        fb.renderW = kRw;
+        fb.renderH = kRh;
+        const size_t n = static_cast<size_t>(kRw) * kRh;
+        fb.color.assign(n, bgPacked);
+        fb.depth.assign(n, kFgDepth);
+        fb.motion.assign(n, mvPacked);
+
+        const float lobeX = static_cast<float>(kRw) * 0.45f + 0.90f * static_cast<float>(t);
+        const int ix0 = std::max(0, static_cast<int>(std::floor(static_cast<float>(kRw) * 0.30f)));
+        const int ix1 = std::min(static_cast<int>(kRw) - 1, static_cast<int>(std::ceil(static_cast<float>(kRw) * 0.70f)));
+        for (uint32_t iy = 0; iy < kRh; ++iy) {
+            const float uy = static_cast<float>(iy) + 0.5f - j.pixelY;
+            for (int ix = ix0; ix <= ix1; ++ix) {
+                const float ux = static_cast<float>(ix) + 0.5f - j.pixelX;
+                const float wx = ux - kWalkSpeed * static_cast<float>(t);
+
+                const float ribCoord = (wx + 0.15f * uy) / 3.5f;
+                const float ribFrac = ribCoord - std::floor(ribCoord);
+                const float ribDist = std::min(ribFrac, 1.0f - ribFrac) * 3.5f;
+                const float ribVal = (ribDist <= 0.325f) ? 0.85f : 0.04f;
+
+                const float micro = 0.5f + 0.5f * std::sin(wx * 2.7f + 0.4f * std::sin(uy * 3.1f)) *
+                                                  std::cos(uy * 2.3f - 0.5f * std::cos(wx * 1.9f));
+                const float env = std::exp(-((ux - lobeX) * (ux - lobeX)) / (2.0f * 40.0f * 40.0f));
+                const float glint = std::pow(std::clamp((micro - 0.55f) / 0.45f, 0.0f, 1.0f), 2.5f);
+                const float v = std::max(ribVal, 0.04f + 0.91f * env * glint);
+
+                fb.color[static_cast<size_t>(iy) * kRw + ix] = packRgba8(v, v, v);
+            }
+        }
+
+        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
+                                   t > 0 ? prevJ.pixelX : 0.0f,
+                                   t > 0 ? prevJ.pixelY : 0.0f,
+                                   t == 0, outPixels)) {
+            return {999.0f, 999.0f};
+        }
+        prevJ = j;
+
+        if (t >= kWarmup + 1) {
+            constexpr uint32_t x0 = 960;
+            constexpr uint32_t x1 = 1600;
+            constexpr uint32_t y0 = 32;
+            constexpr uint32_t y1 = 96;
+            for (uint32_t y = y0; y < y1; ++y) {
+                for (uint32_t x = x0; x < x1; ++x) {
+                    const float cur = pixelLuma(outPixels[static_cast<size_t>(y) * kOw + x]);
+                    const float prev = pixelLuma(prevPixels[static_cast<size_t>(y) * kOw + (x - 3u)]);
+                    const float ad = std::fabs(cur - prev);
+                    deltas.push_back(ad);
+                    sqSum += static_cast<double>(ad) * ad;
+                }
+            }
+        }
+        prevPixels = outPixels;
+    }
+
+    WalkShimmerMetrics m{};
+    m.rmsDelta = static_cast<float>(std::sqrt(sqSum / deltas.size()));
+    const size_t p99Idx = static_cast<size_t>(0.99 * static_cast<double>(deltas.size() - 1));
+    std::nth_element(deltas.begin(), deltas.begin() + p99Idx, deltas.end());
+    m.p99Jump = deltas[p99Idx];
+    return m;
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -906,21 +1005,34 @@ int main() {
         const PanningThinLineMetrics panVf100 = measureRealisticSlowPan(gpu, fsrBackend, 1.00f);
         const PanningThinLineMetrics panVf020 = measureRealisticSlowPan(gpu, fsrBackend, 0.20f);
         const PanningThinLineMetrics panVf000 = measureRealisticSlowPan(gpu, fsrBackend, 0.00f);
-        fsrBackend.setVelocityFactor(edpe::AmdUpscalerBackend::kDefaultVelocityFactor);
         std::printf(
             "[AMD_FSR_RealisticSlowPan 1920x64 0.55px @ +0.35px/f]\n"
             "  vf=1.00 (SDK default): peakSpan=%.4f rmsDelta=%.4f meanPeak=%.4f\n"
-            "  vf=0.20 (EDPE def):    peakSpan=%.4f rmsDelta=%.4f meanPeak=%.4f\n"
-            "  vf=0.00 (min drop):    peakSpan=%.4f rmsDelta=%.4f meanPeak=%.4f\n",
+            "  vf=0.20:               peakSpan=%.4f rmsDelta=%.4f meanPeak=%.4f\n"
+            "  vf=0.00 (EDPE def):    peakSpan=%.4f rmsDelta=%.4f meanPeak=%.4f\n",
             panVf100.peakSpan, panVf100.rmsStepDelta, panVf100.meanPeak,
             panVf020.peakSpan, panVf020.rmsStepDelta, panVf020.meanPeak,
             panVf000.peakSpan, panVf000.rmsStepDelta, panVf000.meanPeak);
-        const bool strictlyBetter = (panVf020.rmsStepDelta < panVf100.rmsStepDelta) ||
-                                    (panVf020.peakSpan < panVf100.peakSpan);
-        const bool noRegression = (panVf020.rmsStepDelta <= panVf100.rmsStepDelta + 1e-4f) &&
-                                  (panVf020.peakSpan <= panVf100.peakSpan + 1e-4f);
-        if (!(strictlyBetter && noRegression)) {
-            std::printf("  -> FAIL: vf=0.20 did not cleanly improve slow-pan stability over vf=1.00\n");
+        if (!(panVf000.rmsStepDelta < panVf100.rmsStepDelta && panVf000.peakSpan < panVf100.peakSpan)) {
+            std::printf("  -> FAIL: vf=0.00 did not improve slow-pan stability over vf=1.00\n");
+            allOk = false;
+        }
+
+        const WalkShimmerMetrics walkVf100 = measurePerfSrWalkingShimmer(gpu, fsrBackend, 1.00f);
+        const WalkShimmerMetrics walkVf020 = measurePerfSrWalkingShimmer(gpu, fsrBackend, 0.20f);
+        const WalkShimmerMetrics walkVf000 = measurePerfSrWalkingShimmer(gpu, fsrBackend, 0.00f);
+        fsrBackend.setVelocityFactor(edpe::AmdUpscalerBackend::kDefaultVelocityFactor);
+        std::printf(
+            "[AMD_FSR_PerfSR_0.5x_Walk 1280x64->2560x128 @ +1.50px/f]\n"
+            "  vf=1.00 (SDK default): rmsDelta=%.4f p99Jump=%.4f\n"
+            "  vf=0.20:               rmsDelta=%.4f p99Jump=%.4f\n"
+            "  vf=0.00 (EDPE def):    rmsDelta=%.4f p99Jump=%.4f\n",
+            walkVf100.rmsDelta, walkVf100.p99Jump,
+            walkVf020.rmsDelta, walkVf020.p99Jump,
+            walkVf000.rmsDelta, walkVf000.p99Jump);
+        if (!(walkVf000.rmsDelta < walkVf020.rmsDelta && walkVf000.rmsDelta < walkVf100.rmsDelta &&
+              walkVf000.p99Jump < walkVf020.p99Jump && walkVf000.p99Jump < walkVf100.p99Jump)) {
+            std::printf("  -> FAIL: vf=0.00 did not strictly reduce 0.5x walking shimmer vs vf=0.20 and vf=1.00\n");
             allOk = false;
         }
         fsrBackend.shutdown();
