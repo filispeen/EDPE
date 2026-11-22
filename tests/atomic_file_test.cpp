@@ -147,6 +147,7 @@ int main() {
         saved.hdrInput = true;
         saved.sharpness = 0.65f;
         saved.fsrVelocityFactor = 0.35f;
+        saved.mipLodBiasOffset = 0.35f;
         saved.jitterEnabled = true;
         saved.jitterInvertX = true;
         saved.jitterInvertY = false;
@@ -202,6 +203,7 @@ int main() {
         if (loaded.hdrInput != saved.hdrInput) return fail(29, "hdrInput mismatch");
         if (std::fabs(loaded.sharpness - saved.sharpness) > 0.01f) return fail(30, "sharpness mismatch");
         if (std::fabs(loaded.fsrVelocityFactor - saved.fsrVelocityFactor) > 0.01f) return fail(38, "fsrVelocityFactor mismatch");
+        if (std::fabs(loaded.mipLodBiasOffset - saved.mipLodBiasOffset) > 0.01f) return fail(39, "mipLodBiasOffset mismatch");
         if (loaded.jitterMode != saved.jitterMode) return fail(31, "jitterMode mismatch");
         if (loaded.jitterPhaseCount != saved.jitterPhaseCount) return fail(32, "jitterPhaseCount mismatch");
         if (loaded.mapBounceMode != saved.mapBounceMode) return fail(33, "mapBounceMode mismatch");
@@ -209,6 +211,31 @@ int main() {
         if (loaded.renderDocAnnotations != saved.renderDocAnnotations) return fail(35, "renderDocAnnotations mismatch");
         if (loaded.wrapDirectInputMouse != saved.wrapDirectInputMouse) return fail(36, "wrapDirectInputMouse mismatch");
         if (loaded.wrapDirectInputKeyboard != saved.wrapDirectInputKeyboard) return fail(37, "wrapDirectInputKeyboard mismatch");
+    }
+
+    // 7. SSAA XML parser and effective MipLODBias calculation tests.
+    {
+        if (std::fabs(Config::parseEliteSsaaMultiplierXml("<Graphics><SSAAMultiplier>0.500000</SSAAMultiplier></Graphics>") - 0.5f) > 1e-5f) {
+            return fail(40, "parseEliteSsaaMultiplierXml 0.5 mismatch");
+        }
+        if (Config::parseEliteSsaaMultiplierXml("<Graphics></Graphics>") != 0.0f) {
+            return fail(41, "parseEliteSsaaMultiplierXml missing tag != 0");
+        }
+        if (Config::parseEliteSsaaMultiplierXml("<SSAAMultiplier>invalid</SSAAMultiplier>") != 0.0f) {
+            return fail(42, "parseEliteSsaaMultiplierXml invalid != 0");
+        }
+        if (Config::computeEffectiveMipLodBias(0, 4, 0.5f, 0.25f) != 0.0f) {
+            return fail(43, "bypass MipLODBias != 0");
+        }
+        if (std::fabs(Config::computeEffectiveMipLodBias(2, 1, 0.5f, 0.0f) - (-1.0f)) > 1e-5f) {
+            return fail(44, "eliteSsaa=0.5 override mode=1 MipLODBias != -1.0");
+        }
+        if (std::fabs(Config::computeEffectiveMipLodBias(2, 1, 0.5f, 0.5f) - (-0.5f)) > 1e-5f) {
+            return fail(45, "offset=+0.5 MipLODBias != -0.5");
+        }
+        if (std::fabs(Config::computeEffectiveMipLodBias(2, 4, 0.0f, 0.0f) - (-1.0f)) > 1e-5f) {
+            return fail(46, "fallback mode=4 MipLODBias != -1.0");
+        }
     }
 #endif
 

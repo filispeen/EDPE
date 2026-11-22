@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <filesystem>
 #include <fstream>
@@ -63,6 +65,13 @@ public:
         fsrVelocityFactor = static_cast<float>(_wtof(fsrVelBuf));
         if (!std::isfinite(fsrVelocityFactor) || fsrVelocityFactor < 0.0f || fsrVelocityFactor > 1.0f) {
             fsrVelocityFactor = 0.00f;
+        }
+
+        wchar_t mipBuf[64]{};
+        GetPrivateProfileStringW(L"Upscaler", L"MipLodBiasOffset", L"0.00", mipBuf, 64, path.c_str());
+        mipLodBiasOffset = static_cast<float>(_wtof(mipBuf));
+        if (!std::isfinite(mipLodBiasOffset) || mipLodBiasOffset < -2.0f || mipLodBiasOffset > 2.0f) {
+            mipLodBiasOffset = 0.0f;
         }
 
         frameGenBackend = GetPrivateProfileIntW(L"FrameGeneration", L"Backend", 0, path.c_str());
@@ -244,6 +253,7 @@ public:
         appendBool("HdrInput", hdrInput);
         appendFloat("Sharpness", "%.2f", sharpness);
         appendFloat("FsrVelocityFactor", "%.2f", fsrVelocityFactor);
+        appendFloat("MipLodBiasOffset", "%.2f", mipLodBiasOffset);
 
         appendSection("FrameGeneration");
         appendInt("Backend", frameGenBackend);
@@ -331,6 +341,59 @@ public:
         }
     }
 
+    static std::filesystem::path resolveEliteGraphicsConfigPath() {
+        wchar_t localAppData[MAX_PATH]{};
+        const DWORD envLen = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+        if (!envLen || envLen >= MAX_PATH) return {};
+
+        std::filesystem::path gfxDir = std::filesystem::path(localAppData) /
+            L"Frontier Developments" / L"Elite Dangerous" / L"Options" / L"Graphics";
+        std::filesystem::path cfgPath = gfxDir / L"Custom.4.4.fxcfg";
+        std::error_code ec;
+        if (!std::filesystem::exists(cfgPath, ec)) {
+            cfgPath = gfxDir / L"Custom.4.0.fxcfg";
+            if (!std::filesystem::exists(cfgPath, ec)) return {};
+        }
+        return cfgPath;
+    }
+
+    static float parseEliteSsaaMultiplierXml(const std::string& content) {
+        constexpr char kOpenTag[] = "<SSAAMultiplier>";
+        constexpr char kCloseTag[] = "</SSAAMultiplier>";
+        const size_t start = content.find(kOpenTag);
+        if (start == std::string::npos) return 0.0f;
+        const size_t valStart = start + sizeof(kOpenTag) - 1;
+        const size_t end = content.find(kCloseTag, valStart);
+        if (end == std::string::npos || end <= valStart) return 0.0f;
+        const std::string numStr = content.substr(valStart, end - valStart);
+        char* parseEnd = nullptr;
+        const float val = std::strtof(numStr.c_str(), &parseEnd);
+        if (parseEnd == numStr.c_str() || !std::isfinite(val) || val <= 0.0f || val > 4.0f) {
+            return 0.0f;
+        }
+        return val;
+    }
+
+    static float readEliteSsaaMultiplier() {
+        if (!edpe::isRunningInEliteProcess()) return 0.0f;
+        const std::filesystem::path cfgPath = resolveEliteGraphicsConfigPath();
+        if (cfgPath.empty()) return 0.0f;
+        std::ifstream inFile(cfgPath, std::ios::binary);
+        if (!inFile) return 0.0f;
+        std::string content((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
+        return parseEliteSsaaMultiplierXml(content);
+    }
+
+    static float computeEffectiveMipLodBias(int backend, int mode, float eliteSsaaMultiplier, float userOffset) {
+        if (backend == 0) return 0.0f;
+        const float ratio = (std::isfinite(eliteSsaaMultiplier) && eliteSsaaMultiplier > 0.0f && eliteSsaaMultiplier < 1.0f)
+            ? eliteSsaaMultiplier
+            : getTargetSsaaMultiplier(backend, mode);
+        const float baseBias = (ratio > 0.0f && ratio < 1.0f) ? std::log2(ratio) : 0.0f;
+        const float cleanOffset = std::isfinite(userOffset) ? std::clamp(userOffset, -2.0f, 2.0f) : 0.0f;
+        return std::clamp(baseBias + cleanOffset, -3.0f, 2.0f);
+    }
+
     bool isRunningInEliteProcess() const {
         return edpe::isRunningInEliteProcess();
     }
@@ -340,18 +403,8 @@ public:
     bool syncEliteGraphicsConfig() const {
         if (!autoSyncEliteConfig || !isRunningInEliteProcess()) return false;
 
-        wchar_t localAppData[MAX_PATH]{};
-        const DWORD envLen = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
-        if (!envLen || envLen >= MAX_PATH) return false;
-
-        std::filesystem::path gfxDir = std::filesystem::path(localAppData) /
-            L"Frontier Developments" / L"Elite Dangerous" / L"Options" / L"Graphics";
-        std::filesystem::path cfgPath = gfxDir / L"Custom.4.4.fxcfg";
-        std::error_code ec;
-        if (!std::filesystem::exists(cfgPath, ec)) {
-            cfgPath = gfxDir / L"Custom.4.0.fxcfg";
-            if (!std::filesystem::exists(cfgPath, ec)) return false;
-        }
+        const std::filesystem::path cfgPath = resolveEliteGraphicsConfigPath();
+        if (cfgPath.empty()) return false;
 
         std::ifstream inFile(cfgPath, std::ios::binary);
         if (!inFile) return false;
@@ -401,6 +454,7 @@ public:
     int dlssPreset = 0; // 0=Auto(K), 5=E(CNN Fast), 10=J, 11=K, 12=L, 13=M
     float sharpness = 0.0f;
     float fsrVelocityFactor = 0.00f;
+    float mipLodBiasOffset = 0.0f;
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;
     bool hdrInput = false;

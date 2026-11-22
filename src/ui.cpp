@@ -1969,6 +1969,24 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 TextDisabledWrapped("(TAA uses Catmull-Rom reconstruction; vendor sharpening applies to DLSS and FSR)");
             }
 
+            if (!backend_active) ImGui::BeginDisabled();
+            float curMipOffset = cfg.mipLodBiasOffset;
+            if (ImGui::SliderFloat("Texture MIP Bias Offset", &curMipOffset, -2.0f, 2.0f, "%.2f")) {
+                cfg.mipLodBiasOffset = curMipOffset;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                cfg.save();
+            }
+            if (backend_active && std::fabs(cfg.mipLodBiasOffset) > 0.005f) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset##MipBias")) {
+                    cfg.mipLodBiasOffset = 0.0f;
+                    cfg.save();
+                }
+            }
+            if (!backend_active) ImGui::EndDisabled();
+            ImGui::SetItemTooltip("Offsets sampler MipLODBias on next game launch (base = log2(in-game SSAA)). Positive (+0.25..+0.75) reduces specular shimmer on rough floors; negative sharpens textures.");
+
             if (!nvidia_available) {
                 ImGui::TextDisabled("NVIDIA DLSS/DLAA reason: %ls",
                     upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));

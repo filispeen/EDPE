@@ -86,9 +86,10 @@ HRESULT STDMETHODCALLTYPE observedCreateSamplerState(ID3D11Device* device,
 
     if (!is_comparison && is_linear_mip && has_mipmaps) {
         auto& cfg = edpe::Config::instance();
-        const float ratio = edpe::Config::getTargetSsaaMultiplier(cfg.upscalerBackend, cfg.upscaleMode);
-        if (ratio > 0.0f && ratio < 1.0f) {
-            const float bias = std::log2(ratio);
+        static const float s_elite_ssaa = edpe::Config::readEliteSsaaMultiplier();
+        const float bias = edpe::Config::computeEffectiveMipLodBias(
+            cfg.upscalerBackend, cfg.upscaleMode, s_elite_ssaa, cfg.mipLodBiasOffset);
+        if (std::fabs(bias) > 1e-4f) {
             mod_desc.MipLODBias = std::clamp(desc->MipLODBias + bias, -15.99f, 15.99f);
         }
     }

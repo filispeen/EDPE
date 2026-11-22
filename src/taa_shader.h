@@ -208,7 +208,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
                 }
             }
         }
-        if (speed < 0.25) {
+        if (speed < 1.5) {
             int2 maxCoord = int2(renderResolution.xy) - int2(1, 1);
             int2 base = int2(floor((priorUv + prevJitterUv) * renderResolution.xy - 0.5));
             float envMin = minDepth * 0.95 - 1e-4;
@@ -228,7 +228,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
         }
     }
 
-    // 6. Brian Karis Ray-to-AABB Clipping + stationary thin-feature ridge retention
+    // 6. Brian Karis Ray-to-AABB Clipping + stationary & slow-pan thin-feature ridge retention
     float3 clampedHistY = ClipToAABB(histY, currentY, finalMin, finalMax);
     float2 histTexel = resolution.zw;
     float hL = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(-histTexel.x, 0.0), 0).rgb).x;
@@ -239,8 +239,10 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float ridgeX = max(0.0, abs(histY.x - 0.5 * (hL + hR)) - 0.5 * abs(hL - hR));
     float ridgeY = max(0.0, abs(histY.x - 0.5 * (hU + hD)) - 0.5 * abs(hU - hD));
     float histThinness = saturate((max(ridgeX, ridgeY) - 0.012) * 24.0);
-    float thinLock = stationaryBoost * staticDepthConsistent * histThinness;
-    clampedHistY = lerp(clampedHistY, histY, 0.96 * thinLock);
+    float staticThinLock = stationaryBoost * staticDepthConsistent * histThinness;
+    float panThinWeight = saturate(1.0 - speed / 1.5) * (1.0 - stationaryBoost) * staticDepthConsistent * depthConfidence * histThinness;
+    float ridgeRetention = max(0.96 * staticThinLock, 0.72 * panThinWeight);
+    clampedHistY = lerp(clampedHistY, histY, ridgeRetention);
 
     // 7. Velocity / Disocclusion / UI Confidence
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
@@ -251,9 +253,10 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float relLumaShift = saturate((lumaDelta / lumaRange - 0.60) * 1.25) * saturate((speed - 0.75) * 0.45);
     historyConfidence *= (1.0 - 0.45 * relLumaShift);
 
-    // Base blend weight: 0.90 for static/smooth, higher on stationary thin ridges, lower at high speed
+    // Base blend weight: 0.90 for static/smooth, higher on depth-verified thin ridges, lower at high speed
     float blendWeight = clamp(params.z, 0.0, 0.95);
-    blendWeight = lerp(blendWeight, 0.96, thinLock);
+    blendWeight = lerp(blendWeight, 0.96, staticThinLock);
+    blendWeight = lerp(blendWeight, 0.92, panThinWeight);
     blendWeight = lerp(blendWeight, 0.65, saturate(speed * 0.08));
 
     // Dynamic blend weight
