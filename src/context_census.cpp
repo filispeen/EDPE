@@ -1759,7 +1759,8 @@ edpe::ProjectionJitter getOrUpdateSceneProjectionJitter() {
         const UINT rH = (sceneH > 0 && (!scH || sceneH <= scH)) ? sceneH : scH;
 
         const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
-        const unsigned phases = edpe::computeEffectiveJitterPhaseCount(base_phases, rW, rH, scW, scH);
+        const unsigned phases = edpe::UpscalerManager::instance().getRecommendedJitterPhaseCount(
+            base_phases, rW, rH, scW, scH);
         const unsigned prev_phases = s_active_jitter_phases.exchange(phases, std::memory_order_relaxed);
         if (prev_phases != 0 && phases != prev_phases && jitter_frame_index.load(std::memory_order_relaxed) > 0) {
             s_phase_count_changed_reset.store(true, std::memory_order_release);
@@ -13381,6 +13382,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             edpe::isRunningUnderWine());
         s_cb_map_bounce_configured.store(true, std::memory_order_release);
         edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
+        edpe::UpscalerManager::instance().setFsrVelocityFactor(cfg.fsrVelocityFactor);
         edpe::JitterLogger::instance().setSampleInterval(cfg.jitterLogInterval);
         edpe::JitterLogger::instance().setFlushIntervalMs(cfg.jitterLogFlushMs);
         edpe::JitterLogger::instance().setLoggingEnabled(cfg.devMode && cfg.jitterLogEnabled);
@@ -13883,7 +13885,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         if (active_render_width && active_render_height && jitter_frame_index.load(std::memory_order_relaxed) == 0) {
             std::lock_guard lock(jitter_mutex);
             const unsigned base_phases = s_jitter_phase_count.load(std::memory_order_relaxed);
-            const unsigned phases = edpe::computeEffectiveJitterPhaseCount(
+            const unsigned phases = edpe::UpscalerManager::instance().getRecommendedJitterPhaseCount(
                 base_phases, active_render_width, active_render_height, outW, outH);
             s_active_jitter_phases.store(phases, std::memory_order_relaxed);
             auto jitter = edpe::projectionJitter(0, active_render_width, active_render_height, phases);
@@ -14847,6 +14849,9 @@ void ContextCensusSetJitterPhaseCount(unsigned count) {
 }
 unsigned ContextCensusGetJitterPhaseCount() {
     return s_jitter_phase_count.load(std::memory_order_relaxed);
+}
+unsigned ContextCensusGetActiveJitterPhaseCount() {
+    return s_active_jitter_phases.load(std::memory_order_relaxed);
 }
 void ContextCensusSetJitterMode(int mode) {
     const int clamped = (mode < 0 || mode > 2) ? 0 : mode;

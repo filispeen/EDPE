@@ -36,7 +36,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 13. D3D11/D3D12 interoperability | **Implemented & verified in-game (v0.8.0)** | `D3D11D3D12Bridge` (shared NT handles + `ID3D12Fence`/`ID3D11Fence` sync) and `D3D12ProxyPresenter` (child `WS_CHILD` Flip-model D3D12 swapchain overlay, resize recovery, RenderDoc safety guard). Measured in-game D3D12 copy overhead ~0.08 ms at 2560×1440. |
 | 14. AMD Frame Generation | **Verified & working in-game (v0.8.0)** | `AmdFsrFgBackend` integrates official AMD FidelityFX Frame Generation DX12 (`ffxConfigure` + `ffxDispatch` PrepareV2/FG), premultiplied `RGBA16F` UI packing (`FgUiPackPass`), and `FgRuntime`. Verified in Elite Dangerous Odyssey on RTX 3060 with `AMD FSR Frame Generation (2x)` and automatic pause/menu stand-down. |
 | 15. NVIDIA Streamline / DLSS Frame Generation | **Prototype implemented; capability-gated (v0.8.0)** | `NvidiaStreamlineFgBackend` integrates official Streamline v2.14.16 (`slInit`, `Reflex`, `PCL`, `DLSS-G`). Hardware capability probe verified on RTX 3060 (`Reflex=eOk`, `PCL=eOk`, `DLSS_G=eErrorNoSupportedAdapterFound`), failing open cleanly without black screens; live DLSS-G generation remains to be tested on RTX 40+ hardware. |
-| 16. Intel XeSS upscaling | **Planned / Research** | Intel XeSS 1.3+ temporal upscaling (XeSS Native AA and Super Resolution). Dual-model support: XMX matrix acceleration on Intel Arc GPUs and universal DP4a fallback on NVIDIA/AMD GPUs. Investigating D3D11-to-D3D12 interop bridge (via Phase 13) vs proxy wrapper execution. |
+| 16. Intel XeSS, AMD FSR 4 & DittoSR upscaling | **Planned / Research** | Intel XeSS 1.3+ (XMX on Intel Arc, DP4a fallback on NVIDIA/AMD), AMD FSR 4 (4.1.2 on Radeon RX 7000/9000 via AMD signed DX12 DLLs, optional Agility SDK `D3D12Core.dll` with system runtime fallback; requested in [#27](https://github.com/filispeen/EDPE/issues/27)), and [DittoSR](https://github.com/Vancete/DittoSR) (MIT-licensed lightweight temporal upscaler built on GSR 2 as a DX12 FidelityFX API provider, evaluated against FSR 3.1.2). All run Native AA and Super Resolution over the Phase 13 D3D11/D3D12 interop bridge as separate upscaler options (greyed out when unsupported). |
 | 17. Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag) | **Planned / Architecture defined** | Standalone and FG-coupled input latency minimization. NVIDIA Reflex SDK (Low Latency / Boost, marker insertion, sleep pacing) and AMD Anti-Lag / Anti-Lag 2 SDK. Pacing controls in edpe.ini and telemetry HUD integration. |
 | 18. NVIDIA DLSS-NR | **Planned** | Research phase for G-buffer normal/roughness extraction and NGX neural rendering integration. |
 | 19. Third-party mod compatibility (ReShade, EDHM, 3Dmigoto) | **Planned / Architecture defined** | Proxy DLL chaining architecture for transparent co-existence with ReShade and EDHM (3Dmigoto). Non-destructive HUD heuristics resilient to shader overrides, post-upscale ReShade injection order, and depth buffer alignment. |
@@ -63,14 +63,14 @@ Phases 13 & 14 (D3D11/D3D12 Interop & AMD FSR Frame Generation) are **Verified I
 
 The immediate next steps are:
 1. Validate `NvidiaStreamlineFgBackend` live frame generation on **Ada Lovelace (RTX 40+) / Blackwell hardware** with HAGS / vkd3d-proton.
-2. Proceed to **Phase 16 (Intel XeSS via D3D12 interop)** and **Phase 17 (Low Latency — standalone NVAPI Reflex & AMD Anti-Lag 2)**.
+2. Proceed to **Phase 16 (Intel XeSS, AMD FSR 4, and DittoSR via D3D12 interop)** and **Phase 17 (Low Latency — standalone NVAPI Reflex & AMD Anti-Lag 2)**.
 
 ---
 
 ## Not yet demonstrated
 
 - Live NVIDIA DLSS-G multi-frame generation on RTX 40+/50+ hardware (`eErrorNoSupportedAdapterFound` on RTX 3060 test GPU).
-- Intel XeSS (Phase 16), standalone NVAPI Reflex / AMD Anti-Lag 2 (Phase 17), DLSS-NR (Phase 18), and ReShade/EDHM/3Dmigoto proxy chaining (Phase 19).
+- Intel XeSS, AMD FSR 4, and DittoSR (Phase 16), standalone NVAPI Reflex / AMD Anti-Lag 2 (Phase 17), DLSS-NR (Phase 18), and ReShade/EDHM/3Dmigoto proxy chaining (Phase 19).
 
 ---
 
@@ -245,7 +245,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 ## Next Verified Milestones (per PLAN.md order)
 
 1. **Phase 15 (Hardware Validation) — NVIDIA DLSS-G on Ada RTX 40+ / Blackwell:** Verify live DLSS Frame Generation & Multi Frame Generation on supported GPUs.
-2. **Phase 16 — Intel XeSS:** Native AA and Super Resolution via Phase 13 D3D11/D3D12 interop.
+2. **Phase 16 — Intel XeSS, AMD FSR 4 & DittoSR:** Native AA and Super Resolution via Phase 13 D3D11/D3D12 interop (XeSS XMX/DP4a, FSR 4.1.2 for RX 7000/9000 per [#27](https://github.com/filispeen/EDPE/issues/27), and [DittoSR](https://github.com/Vancete/DittoSR) evaluated against FSR 3.1.2).
 3. **Phase 17 — Low-Latency Framework:** Standalone and FG-coupled input lag minimization via NVIDIA Reflex (NVAPI / Streamline) and AMD Anti-Lag / Anti-Lag 2 SDK integration.
 4. **Phase 18–19 — NVIDIA DLSS-NR & Third-Party Mod Compatibility:** Neural rendering research and proxy DLL chaining for ReShade, EDHM, and 3Dmigoto.
 

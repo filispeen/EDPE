@@ -456,7 +456,7 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                 context->CopyResource(stagingBuffers_[writeSlot_].Get(), gpuBuffer_.Get());
 
                 const auto jl = JitterLogger::instance().getLatest();
-                unsigned totalPhases = ContextCensusGetJitterPhaseCount();
+                unsigned totalPhases = ContextCensusGetActiveJitterPhaseCount();
                 if (totalPhases == 0) totalPhases = 32;
                 unsigned phase = 0;
                 float camMove = jl.camMoveDist;

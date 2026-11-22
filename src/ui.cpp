@@ -1843,6 +1843,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         // 2. Upscaler & Image Quality (Open by default)
         bool backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
         bool nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
+        bool amd_active = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
         bool taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
 
         if (ImGui::CollapsingHeader("Upscaler & Image Quality", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1894,6 +1895,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 }
                 backend_active = (upscaler.getBackend() != edpe::UpscalerBackend::None);
                 nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
+                amd_active = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
                 taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
                 edpe::PerfTracker::instance().updateCachedStats();
             }
@@ -1923,6 +1925,26 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 edpe::PerfTracker::instance().updateCachedStats();
             }
             if (!nvidia_active) ImGui::EndDisabled();
+
+            if (!amd_active) ImGui::BeginDisabled();
+            float curFsrVel = upscaler.getFsrVelocityFactor();
+            if (ImGui::SliderFloat("AMD FSR Velocity Factor", &curFsrVel, 0.0f, 1.0f, "%.2f")) {
+                upscaler.setFsrVelocityFactor(curFsrVel);
+                cfg.fsrVelocityFactor = upscaler.getFsrVelocityFactor();
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                cfg.save();
+            }
+            if (amd_active && std::fabs(curFsrVel - edpe::AmdUpscalerBackend::kDefaultVelocityFactor) > 0.005f) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset##FsrVel")) {
+                    upscaler.setFsrVelocityFactor(edpe::AmdUpscalerBackend::kDefaultVelocityFactor);
+                    cfg.fsrVelocityFactor = upscaler.getFsrVelocityFactor();
+                    cfg.save();
+                }
+            }
+            if (!amd_active) ImGui::EndDisabled();
+            ImGui::SetItemTooltip("Controls FSR history weight drop during camera motion. Lower (0.00-0.25) keeps thin lines steadier on slow pans; 1.00 = FSR SDK default.");
 
             // Sharpening
             if (!backend_active) ImGui::BeginDisabled();
@@ -2213,7 +2235,8 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 if (ImGui::IsItemDeactivatedAfterEdit()) {
                     edpe::Config::instance().save();
                 }
-                ImGui::SetItemTooltip("Base Halton (2,3) cycle (effective phases = clamp(max(base, ceil(8*scale^2)), 8, max(64, min))).");
+                ImGui::SetItemTooltip("Base Halton (2,3) cycle (effective phases = clamp(max(base, ceil(8*scale^2)), 8, max(64, min))). AMD FSR automatically uses ffxFsr3UpscalerGetJitterPhaseCount (8*scale^2) to match FSR 3.1.2's internal sequence length.");
+                ImGui::TextDisabled("Active jitter cycle: %u phases", ContextCensusGetActiveJitterPhaseCount());
 
                 const char* jitter_mode_items[] = { "Auto (Upstream -> D3D11)", "D3D11 CB Only", "Upstream Cobra Hook" };
                 int j_mode = ContextCensusGetJitterMode();

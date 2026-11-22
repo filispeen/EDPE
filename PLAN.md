@@ -1717,7 +1717,7 @@ MFG multiplier
 
 ---
 
-# 39. Phase 16 — Intel XeSS (Xe Super Sampling) temporal upscaling & Native AA
+# 39. Phase 16 — Intel XeSS, AMD FSR 4 & DittoSR temporal upscaling & Native AA
 
 Implement Intel XeSS (Xe Super Sampling) temporal upscaling and XeSS Native AA as a first-class reconstruction backend within the EDPE multi-upscaler architecture.
 
@@ -1750,6 +1750,29 @@ Requirements and execution:
    Query `xessGetProperties` to report active model (XMX vs DP4a) and driver status in Dear ImGui and `edpe.log`.
 6. **Fail-Open Fallback:**
    If XeSS initialization, model loading, or D3D12 bridge dispatch fails, gracefully stand down, disable jitter, and fall back to native rendering or Native TAA without game disruption.
+
+## AMD FSR 4 (4.1.2) via D3D11/D3D12 interop
+
+Added per [#27](https://github.com/filispeen/EDPE/issues/27) for Radeon RX 7000 and 9000 GPUs. AMD's driver-level FSR 3.1 to FSR 4 override only covers D3D12 titles, so Elite Dangerous (D3D11) needs an in-process bridge to run FSR 4 Native AA and Super Resolution.
+
+Requirements and execution:
+
+1. Copy color, depth, and motion vectors into shared textures over the Phase 13 D3D11/D3D12 bridge, dispatch FSR 4 on a D3D12 queue through AMD's signed loader and upscaler DLLs, wait on a shared fence in D3D11, and copy the result back.
+2. Support an optional Agility SDK `D3D12Core.dll` beside `dxgi.dll`, falling back to the system D3D12 runtime when it is absent.
+3. Keep AMD's signed DLLs out of the repository and fetch them at build time (matching the existing `external/ffx-sdk` flow); review the FidelityFX SDK license terms before deciding release packaging.
+4. Pick the highest 4.x provider AMD's runtime offers and refuse to run a 3.x provider under the FSR 4 label.
+5. Keep `AMD FSR 4.1.2` as a separate upscaler option alongside `AMD FSR 3.1.2`, greying it out with a reason when unsupported and failing open to native rendering if initialization or dispatch fails.
+
+## DittoSR (compared with FSR 3.1.2)
+
+Maintainer initiative to integrate [DittoSR](https://github.com/Vancete/DittoSR), an MIT-licensed lightweight temporal upscaler derived from Qualcomm Snapdragon GSR 2 and shipped as a DirectX 12 FidelityFX API provider, and compare its image quality and GPU cost against EDPE's existing AMD FSR 3.1.2 backend.
+
+Requirements and execution:
+
+1. Dispatch DittoSR over the Phase 13 D3D11/D3D12 interop bridge through its DX12 FidelityFX API provider, or evaluate a native D3D11 port of its four HLSL compute passes if interop overhead outweighs the lighter shader cost.
+2. Feed EDPE's shared `TemporalFrameInputs` (scene color, reversed-Z depth, render-resolution motion vectors, Halton jitter, and history reset) behind `IUpscalerBackend`.
+3. Expose DittoSR as a separate upscaler option alongside `AMD FSR 3.1.2`, with fail-open fallback to native rendering if initialization or dispatch fails.
+4. Compare GPU frame time and visual stability (shimmering, fine geometry, high upscale ratios) directly against FSR 3.1.2 using EDPE's comparison capture workflow.
 
 ---
 
