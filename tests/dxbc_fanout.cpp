@@ -305,5 +305,66 @@ Out main(In i) {
             streakAt2, dropAt2, worldAt2);
         return 19;
     }
+
+    // Verify DXBC vertex shader projection CB classification (Issue #24).
+    const char* vs_cb0_proj_src = R"hlsl(
+cbuffer cb0 : register(b0) { float4 c0[8]; };
+cbuffer cb1 : register(b1) { float4 c1[276]; };
+float4 main(float3 pos : POSITION) : SV_Position {
+    float4 p = float4(pos + c1[275].xyz, 1.0f);
+    return float4(dot(c0[4], p), dot(c0[5], p), dot(c0[6], p), dot(c0[7], p));
+}
+)hlsl";
+    const char* vs_cb1_proj_src = R"hlsl(
+cbuffer cb0 : register(b0) { float4 c0[12]; };
+cbuffer cb1 : register(b1) { float4 c1[279]; };
+float4 main(float4 pos : POSITION) : SV_Position {
+    float3 w = float3(dot(pos, c0[9]), dot(pos, c0[10]), dot(pos, c0[11]));
+    return w.x * c1[270] + w.y * c1[271] + w.z * c1[272] + c1[273];
+}
+)hlsl";
+    const char* vs_none_proj_src = R"hlsl(
+cbuffer cb0 : register(b0) { float4 c0[12]; };
+float4 main(float4 pos : POSITION) : SV_Position {
+    return float4(dot(pos, c0[0]), dot(pos, c0[1]), dot(pos, c0[2]), dot(pos, c0[3]));
+}
+)hlsl";
+    const char* vs_both_proj_src = R"hlsl(
+cbuffer cb0 : register(b0) { float4 c0[8]; };
+cbuffer cb1 : register(b1) { float4 c1[274]; };
+float4 main(float4 pos : POSITION) : SV_Position {
+    float4 a = float4(dot(c0[4], pos), dot(c0[5], pos), dot(c0[6], pos), dot(c0[7], pos));
+    float4 b = pos.x * c1[270] + pos.y * c1[271] + pos.z * c1[272] + c1[273];
+    return a + b;
+}
+)hlsl";
+    ComPtr<ID3DBlob> bCb0Proj, bCb1Proj, bNoneProj, bBothProj, bErr;
+    if (FAILED(D3DCompile(vs_cb0_proj_src, std::strlen(vs_cb0_proj_src), nullptr, nullptr,
+            nullptr, "main", "vs_5_0", 0, 0, &bCb0Proj, &bErr)) ||
+        FAILED(D3DCompile(vs_cb1_proj_src, std::strlen(vs_cb1_proj_src), nullptr, nullptr,
+            nullptr, "main", "vs_5_0", 0, 0, &bCb1Proj, &bErr)) ||
+        FAILED(D3DCompile(vs_none_proj_src, std::strlen(vs_none_proj_src), nullptr, nullptr,
+            nullptr, "main", "vs_5_0", 0, 0, &bNoneProj, &bErr)) ||
+        FAILED(D3DCompile(vs_both_proj_src, std::strlen(vs_both_proj_src), nullptr, nullptr,
+            nullptr, "main", "vs_5_0", 0, 0, &bBothProj, &bErr))) {
+        std::fprintf(stderr, "projection classifier test compile failed: %s\n",
+            bErr ? static_cast<const char*>(bErr->GetBufferPointer()) : "");
+        return 20;
+    }
+    if (edpe::classifyVsProjectionCb(bCb0Proj->GetBufferPointer(), bCb0Proj->GetBufferSize()) !=
+        edpe::VsProjectionCb::Cb0Dot4To7) return 21;
+    if (edpe::classifyVsProjectionCb(bCb1Proj->GetBufferPointer(), bCb1Proj->GetBufferSize()) !=
+        edpe::VsProjectionCb::Cb1Proj270To273) return 22;
+    if (edpe::classifyVsProjectionCb(vs_code->GetBufferPointer(), vs_code->GetBufferSize()) !=
+            edpe::VsProjectionCb::None ||
+        edpe::classifyVsProjectionCb(bNoneProj->GetBufferPointer(), bNoneProj->GetBufferSize()) !=
+            edpe::VsProjectionCb::None) return 23;
+    if (edpe::classifyVsProjectionCb(bBothProj->GetBufferPointer(), bBothProj->GetBufferSize()) !=
+        edpe::VsProjectionCb::Both) return 24;
+    if (edpe::classifyVsProjectionCb(nullptr, 0) != edpe::VsProjectionCb::Unknown ||
+        edpe::classifyVsProjectionCb(bCb0Proj->GetBufferPointer(), 16) != edpe::VsProjectionCb::Unknown ||
+        edpe::classifyVsProjectionCb(ps_code->GetBufferPointer(), ps_code->GetBufferSize()) !=
+            edpe::VsProjectionCb::Unknown) return 25;
+
     return 0;
 }

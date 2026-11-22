@@ -659,4 +659,185 @@ inline bool patchHoloPixelShader(const void* data, size_t bytes, uint64_t psHash
         return false;
     }
 }
+
+enum class VsProjectionCb : uint8_t {
+    Unknown = 0,
+    None = 1,
+    Cb0Dot4To7 = 2,
+    Cb1Proj270To273 = 3,
+    Both = 4,
+};
+
+namespace dxbc_fanout_detail {
+inline uint32_t readU32Unaligned(const BYTE* p) noexcept {
+    uint32_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+inline bool parseVsProjOperand(const BYTE* chunkBase, size_t chunkWords,
+                               size_t& q, size_t end, int depth,
+                               bool& readsCb0Proj, bool& readsCb1Proj) noexcept {
+    if (depth > 3 || q >= end || end > chunkWords) return false;
+    const uint32_t tok = readU32Unaligned(chunkBase + q * 4);
+    ++q;
+    const uint32_t numComp = tok & 3u;
+    const uint32_t opType = (tok >> 12) & 0xFFu;
+    const uint32_t idxDim = (tok >> 20) & 3u;
+    bool ext = (tok & 0x80000000u) != 0;
+    while (ext) {
+        if (q >= end) return false;
+        const uint32_t extTok = readU32Unaligned(chunkBase + q * 4);
+        ++q;
+        ext = (extTok & 0x80000000u) != 0;
+    }
+    if (idxDim == 0u) {
+        if (opType == 4u) { // D3D10_SB_OPERAND_TYPE_IMMEDIATE32
+            const size_t immWords = (numComp == 2u) ? 4u : 1u;
+            if (q + immWords > end) return false;
+            q += immWords;
+            return true;
+        }
+        if (opType == 5u) { // D3D10_SB_OPERAND_TYPE_IMMEDIATE64
+            const size_t immWords = (numComp == 2u) ? 4u : 2u;
+            if (q + immWords > end) return false;
+            q += immWords;
+            return true;
+        }
+        return true;
+    }
+    uint32_t imm[3]{};
+    uint32_t reps[3]{};
+    for (uint32_t d = 0; d < idxDim; ++d) {
+        const uint32_t rep = (tok >> (22u + d * 3u)) & 7u;
+        reps[d] = rep;
+        if (rep == 0u) { // IMMEDIATE32
+            if (q >= end) return false;
+            imm[d] = readU32Unaligned(chunkBase + q * 4);
+            ++q;
+        } else if (rep == 1u) { // IMMEDIATE64
+            if (q + 2 > end) return false;
+            imm[d] = readU32Unaligned(chunkBase + q * 4);
+            q += 2;
+        } else if (rep == 2u) { // RELATIVE
+            if (!parseVsProjOperand(chunkBase, chunkWords, q, end, depth + 1, readsCb0Proj, readsCb1Proj)) {
+                return false;
+            }
+        } else if (rep == 3u) { // IMMEDIATE32_PLUS_RELATIVE
+            if (q >= end) return false;
+            imm[d] = readU32Unaligned(chunkBase + q * 4);
+            ++q;
+            if (!parseVsProjOperand(chunkBase, chunkWords, q, end, depth + 1, readsCb0Proj, readsCb1Proj)) {
+                return false;
+            }
+        } else if (rep == 4u) { // IMMEDIATE64_PLUS_RELATIVE
+            if (q + 2 > end) return false;
+            imm[d] = readU32Unaligned(chunkBase + q * 4);
+            q += 2;
+            if (!parseVsProjOperand(chunkBase, chunkWords, q, end, depth + 1, readsCb0Proj, readsCb1Proj)) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    if (opType == 8u && idxDim == 2u) { // D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER
+        const uint32_t slotRep = reps[0];
+        const uint32_t vecRep = reps[1];
+        if (slotRep == 0u && (vecRep == 0u || vecRep == 3u)) {
+            if (imm[0] == 0u && imm[1] >= 4u && imm[1] <= 7u) {
+                readsCb0Proj = true;
+            } else if (imm[0] == 1u && imm[1] >= 270u && imm[1] <= 273u) {
+                readsCb1Proj = true;
+            }
+        }
+    }
+    return true;
+}
+} // namespace dxbc_fanout_detail
+
+// Inspects executable instructions in an SM4/SM5 vertex shader DXBC container to
+// determine whether clip projection reads cb0[4..7], cb1[270..273], both, or neither.
+inline VsProjectionCb classifyVsProjectionCb(const void* bytecode, size_t size) noexcept {
+    if (!bytecode || size < 32u || size > 1024u * 1024u) {
+        return VsProjectionCb::Unknown;
+    }
+    const auto* bytes = static_cast<const BYTE*>(bytecode);
+    if (std::memcmp(bytes, "DXBC", 4) != 0) {
+        return VsProjectionCb::Unknown;
+    }
+    const uint32_t totalSize = dxbc_fanout_detail::readU32Unaligned(bytes + 24u);
+    const uint32_t chunkCount = dxbc_fanout_detail::readU32Unaligned(bytes + 28u);
+    if (totalSize != size || chunkCount == 0u || chunkCount > 128u) {
+        return VsProjectionCb::Unknown;
+    }
+    if (32u + static_cast<size_t>(chunkCount) * 4u > size) {
+        return VsProjectionCb::Unknown;
+    }
+
+    const BYTE* progBase = nullptr;
+    size_t progWords = 0;
+    for (uint32_t i = 0; i < chunkCount; ++i) {
+        const uint32_t off = dxbc_fanout_detail::readU32Unaligned(bytes + 32u + static_cast<size_t>(i) * 4u);
+        if (off > size || size - off < 8u) return VsProjectionCb::Unknown;
+        const uint32_t tag = dxbc_fanout_detail::readU32Unaligned(bytes + off);
+        const uint32_t chunkSize = dxbc_fanout_detail::readU32Unaligned(bytes + off + 4u);
+        if (chunkSize > size - off - 8u) return VsProjectionCb::Unknown;
+        if (tag == 0x58454853u || tag == 0x52444853u) { // SHEX or SHDR
+            if (chunkSize < 8u || (chunkSize % 4u) != 0u) return VsProjectionCb::Unknown;
+            progBase = bytes + off + 8u;
+            progWords = chunkSize / 4u;
+            break;
+        }
+    }
+    if (!progBase || progWords < 2u) {
+        return VsProjectionCb::Unknown;
+    }
+
+    const uint32_t version = dxbc_fanout_detail::readU32Unaligned(progBase);
+    const uint32_t declaredWords = dxbc_fanout_detail::readU32Unaligned(progBase + 4u);
+    if ((version >> 16u) != 1u || declaredWords != progWords) {
+        return VsProjectionCb::Unknown;
+    }
+
+    bool readsCb0Proj = false;
+    bool readsCb1Proj = false;
+    for (size_t p = 2; p < progWords;) {
+        const uint32_t opTok = dxbc_fanout_detail::readU32Unaligned(progBase + p * 4u);
+        const uint32_t op = opTok & 0x7FFu;
+        uint32_t len = 0u;
+        if (op == 53u) { // CUSTOMDATA
+            if (p + 1u >= progWords) return VsProjectionCb::Unknown;
+            len = dxbc_fanout_detail::readU32Unaligned(progBase + (p + 1u) * 4u);
+            if (len < 2u || len > progWords - p) return VsProjectionCb::Unknown;
+            p += len;
+            continue;
+        }
+        len = (opTok >> 24u) & 127u;
+        if (len == 0u || len > progWords - p) {
+            return VsProjectionCb::Unknown;
+        }
+        const bool isDecl = (op >= 88u && op <= 107u) || (op >= 143u && op <= 160u);
+        if (!isDecl) {
+            const size_t instrEnd = p + len;
+            size_t q = p + 1u;
+            while (q < instrEnd &&
+                   (dxbc_fanout_detail::readU32Unaligned(progBase + (q - 1u) * 4u) & 0x80000000u) != 0u) {
+                ++q;
+            }
+            while (q < instrEnd) {
+                if (!dxbc_fanout_detail::parseVsProjOperand(
+                        progBase, progWords, q, instrEnd, 0, readsCb0Proj, readsCb1Proj)) {
+                    return VsProjectionCb::Unknown;
+                }
+            }
+        }
+        p += len;
+    }
+
+    if (readsCb0Proj && readsCb1Proj) return VsProjectionCb::Both;
+    if (readsCb0Proj) return VsProjectionCb::Cb0Dot4To7;
+    if (readsCb1Proj) return VsProjectionCb::Cb1Proj270To273;
+    return VsProjectionCb::None;
+}
 } // namespace edpe

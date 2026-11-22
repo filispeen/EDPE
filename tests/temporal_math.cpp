@@ -819,5 +819,76 @@ int main() {
         if (edpe::cobra_camera::verifyRefreshFunctionBytes(badPrologue, sizeof(badPrologue))) return 152;
     }
 
+    // -------------------------------------------------------------------------
+    // Issue #24: System Map stale cb1[35..38] orientation & large cb0 translation
+    // -------------------------------------------------------------------------
+    {
+        // System Map telephoto camera from sysmap_upscaled.rdc (EID 1356):
+        // right=(1,0,0), up=(0, 0.087156, 0.996195), forward=(0, -0.996195, 0.087156)
+        std::array<float, 1344> sysCb1{};
+        const float sysRot[3][3]{
+            {1.0f, 0.0f, 0.0f},
+            {0.0f, 0.087156f, -0.996195f},
+            {0.0f, 0.996195f, 0.087156f}};
+        const float sysSx = 4.476538f, sysSy = 7.958291f, sysDb = 0.025f;
+        for (size_t row = 0; row < 3; ++row) {
+            sysCb1[932 + row * 4 + 0] = sysRot[row][0];
+            sysCb1[932 + row * 4 + 1] = sysRot[row][1];
+            sysCb1[932 + row * 4 + 2] = sysRot[row][2];
+            sysCb1[932 + row * 4 + 3] = 0.0f;
+            sysCb1[1080 + row * 4 + 0] = sysRot[row][0] * sysSx;
+            sysCb1[1080 + row * 4 + 1] = sysRot[row][1] * sysSy;
+            sysCb1[1080 + row * 4 + 2] = 0.0f;
+            sysCb1[1080 + row * 4 + 3] = sysRot[row][2];
+        }
+        sysCb1[1080 + 14] = sysDb;
+
+        // Stale space/cockpit camera left in cb1[35..38] (words 140..155), ~133 deg rotated away:
+        const float stalePitch = 2.3f;
+        const float cp = std::cos(stalePitch), sp = std::sin(stalePitch);
+        const float staleRot[3][3]{
+            {1.0f, 0.0f, 0.0f},
+            {0.0f, cp, -sp},
+            {0.0f, sp, cp}};
+        auto writeStaleWorld140 = [&](float wsx, float wsy, float wdb) {
+            for (size_t row = 0; row < 3; ++row) {
+                sysCb1[140 + row] = staleRot[row][0] / wsx;
+                sysCb1[144 + row] = staleRot[row][1] / wsy;
+                sysCb1[152 + row] = staleRot[row][2];
+            }
+            sysCb1[151] = 1.0f / wdb;
+        };
+        writeStaleWorld140(0.9865f, 1.7538f, 0.025f);
+
+        edpe::CameraProjection sysCam{};
+        if (!edpe::parseEliteCamera(sysCb1.data(), sysCb1.size(), &sysCam)) return 153;
+        if (edpe::isEliteSubpassVersusWorldCb1(sysCb1.data(), sysCb1.size(), sysCam)) return 154;
+
+        // Stale rotated cb1[35..38] whose zoom matches sysCam must not match as world projection.
+        writeStaleWorld140(sysSx, sysSy, sysDb);
+        if (edpe::matchesEliteWorldProjectionScales(sysCb1.data(), sysCb1.size(), sysCam)) return 155;
+
+        // Galaxy Map stars/lines cb0[4..7] (large translation) vs camera-relative grid (small).
+        const float galStarsDot16[16]{
+            -0.785879f, 0.000178f, -0.699936f, 56146.945312f,
+             0.654531f, 1.591353f, -0.734494f, -80047.601562f,
+             0.0f,      0.0f,       0.0f,       0.025f,
+             0.565788f, -0.526092f, -0.63491f,  8569.803711f};
+        const float galGridDot16[16]{
+            -0.785879f, 0.000178f, -0.699936f, 0.0f,
+             0.654531f, 1.591353f, -0.734494f, -0.007812f,
+             0.0f,      0.0f,       0.0f,       0.025f,
+             0.565788f, -0.526092f, -0.63491f,  0.0f};
+        const float smallSceneDot16[16]{
+            -0.785879f, 0.000178f, -0.699936f, 12.0f,
+             0.654531f, 1.591353f, -0.734494f, -8.0f,
+             0.0f,      0.0f,       0.0f,       0.025f,
+             0.565788f, -0.526092f, -0.63491f,  22.0f};
+        if (!edpe::hasLargeEliteTransposeTranslation(galStarsDot16) ||
+            edpe::hasLargeEliteTransposeTranslation(galGridDot16) ||
+            edpe::hasLargeEliteTransposeTranslation(smallSceneDot16) ||
+            edpe::hasLargeEliteTransposeTranslation(nullptr)) return 156;
+    }
+
     return 0; // All temporal math tests passed
 }

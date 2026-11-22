@@ -228,6 +228,17 @@ inline bool extractEliteWorldProjectionScales(const float* words, size_t count,
         local16, outWorldScaleX, outWorldScaleY, outWorldDepthB);
 }
 
+inline float eliteWorldBlock16RotationTrace(const float* block16,
+    float worldScaleX, float worldScaleY, const CameraProjection& parsedCam) {
+    double trace = 0.0;
+    for (size_t row = 0; row < 3; ++row) {
+        trace += (static_cast<double>(block16[row]) * worldScaleX) * parsedCam.worldFromView[row * 4 + 0];
+        trace += (static_cast<double>(block16[4 + row]) * worldScaleY) * parsedCam.worldFromView[row * 4 + 1];
+        trace += static_cast<double>(block16[12 + row]) * parsedCam.worldFromView[row * 4 + 2];
+    }
+    return static_cast<float>(trace);
+}
+
 inline bool matchesEliteWorldProjectionScalesFromBlock16(const float* block16,
     const CameraProjection& parsedCam) {
     float wsx = 0.0f, wsy = 0.0f, wdb = 0.0f;
@@ -235,6 +246,9 @@ inline bool matchesEliteWorldProjectionScalesFromBlock16(const float* block16,
         return false;
     }
     if (!(parsedCam.scaleX > 0.0f && parsedCam.scaleY > 0.0f)) return false;
+    if (eliteWorldBlock16RotationTrace(block16, wsx, wsy, parsedCam) < 2.50f) {
+        return false;
+    }
     return std::fabs(parsedCam.scaleX - wsx) <= 0.02f * wsx &&
            std::fabs(parsedCam.scaleY - wsy) <= 0.02f * wsy &&
            std::fabs(parsedCam.depthB - wdb) <= 1e-3f;
@@ -256,6 +270,12 @@ inline bool isEliteSubpassVersusWorldBlock16(const float* block16,
     }
     if (!(parsedCam.scaleX > 0.0f && parsedCam.scaleY > 0.0f) ||
         parsedCam.depthB < 0.01f || parsedCam.depthB > 0.25f) {
+        return false;
+    }
+    // A viewmodel/ADS sub-pass shares the active world camera orientation (trace ~3.0).
+    // On System Map / Galaxy Map, Cobra leaves the stale space/cockpit camera in cb1[35..38]
+    // with an unrelated orientation (e.g. trace = -0.965, ~133 deg apart).
+    if (eliteWorldBlock16RotationTrace(block16, wsx, wsy, parsedCam) < 2.50f) {
         return false;
     }
     const float worldAspect = wsy / wsx;
@@ -348,6 +368,16 @@ inline bool matchesEliteTransposeProjectionBlock(const float* block16,
     const double cz = r0[0] * r1[1] - r0[1] * r1[0];
     const double det = (cx * w0 + cy * w1 + cz * w2) / (len0 * len1 * lenW);
     return det > 0.85 && det < 1.15;
+}
+
+// Returns true when cb0[4..7] carries large world-origin translation terms (e.g. Galaxy Map
+// absolute ~50,000 LY coords where cb0[4..5].w ~ 56k..80k). Injecting subpixel jitter into
+// float32 cb0[4..7] then causes 1/256..1/128 clip quantization (±0.5..2.0 px jitter at w=5..20).
+inline bool hasLargeEliteTransposeTranslation(const float* block16, float threshold = 1024.0f) {
+    if (!block16) return false;
+    return std::fabs(block16[3]) > threshold ||
+           std::fabs(block16[7]) > threshold ||
+           std::fabs(block16[15]) > threshold;
 }
 
 } // namespace edpe

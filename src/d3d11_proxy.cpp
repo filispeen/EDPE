@@ -53,6 +53,8 @@ HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
         (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
         const auto hash = EdpeShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
+        const auto projCb = edpe::classifyVsProjectionCb(bytecode, size);
+        (*shader)->SetPrivateData(kEdpeVsProjCbGuid, sizeof(projCb), &projCb);
     }
     return result;
 }
