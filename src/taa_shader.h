@@ -108,8 +108,8 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float2 jitterUv = float2(params.x * renderResolution.z, params.y * renderResolution.w);
     float2 centerUv = clamp(uv + jitterUv, 0.0, 1.0);
 
-    // Hardware bilinear sample at de-jittered center (clamped to 3x3 neighborhood box below)
-    float4 centerSample = currentFrame.SampleLevel(linearSampler, centerUv, 0);
+    // 5-tap Catmull-Rom de-jittered sample (preserves sub-pixel thin-line peaks unlike bilinear).
+    float4 centerSample = SampleCatmullRom5(currentFrame, linearSampler, centerUv, renderResolution.xy, renderResolution.zw);
     float3 current = max(centerSample.rgb, 0.0);
     float3 currentY = RGBToYCoCg(current);
 
@@ -138,6 +138,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // 5-tap cross/corner nearest-depth dilation (Reversed-Z: larger depth = closer to camera)
     float centerDepth = sceneDepth.SampleLevel(pointSampler, uv, 0).r;
     float nearestDepth = centerDepth;
+    float minDepth = centerDepth;
     float2 nearestUv = uv;
 
     float2 d00 = uv + float2(-1.0, -1.0) * renderResolution.zw;
@@ -147,12 +148,16 @@ float4 ps_main(VSOutput pin) : SV_Target {
 
     float z00 = sceneDepth.SampleLevel(pointSampler, d00, 0).r;
     if (z00 > nearestDepth) { nearestDepth = z00; nearestUv = d00; }
+    minDepth = min(minDepth, z00);
     float z10 = sceneDepth.SampleLevel(pointSampler, d10, 0).r;
     if (z10 > nearestDepth) { nearestDepth = z10; nearestUv = d10; }
+    minDepth = min(minDepth, z10);
     float z01 = sceneDepth.SampleLevel(pointSampler, d01, 0).r;
     if (z01 > nearestDepth) { nearestDepth = z01; nearestUv = d01; }
+    minDepth = min(minDepth, z01);
     float z11 = sceneDepth.SampleLevel(pointSampler, d11, 0).r;
     if (z11 > nearestDepth) { nearestDepth = z11; nearestUv = d11; }
+    minDepth = min(minDepth, z11);
 
     currentY = clamp(currentY, boxMin, boxMax);
     current = YCoCgToRGB(currentY);
@@ -171,9 +176,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float3 varMin = mean - gamma * sigma;
     float3 varMax = mean + gamma * sigma;
 
-    float3 finalMin = max(boxMin, varMin);
     float stationaryBoost = saturate(1.0 - speed * 2.0);
-    float3 finalMax = min(boxMax, lerp(varMax, boxMax, stationaryBoost * 0.5));
+    float3 finalMin = max(boxMin, lerp(varMin, boxMin, stationaryBoost));
+    float3 finalMax = min(boxMax, lerp(varMax, boxMax, stationaryBoost));
 
     float2 priorUv = uv + mvPixels * renderResolution.zw;
     bool isOffscreen = (priorUv.x < 0.0 || priorUv.x > 1.0 || priorUv.y < 0.0 || priorUv.y > 1.0);
@@ -187,23 +192,55 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float4 histSample = SampleCatmullRom5(historyFrame, linearSampler, priorUv, resolution.xy, resolution.zw);
     float3 histY = RGBToYCoCg(histSample.rgb);
 
-    // 5. Fast disocclusion check against previous frame depth buffer
+    // 5. Fast disocclusion & stationary depth-envelope check against previous frame depth buffer
     float depthConfidence = 1.0;
-    if (jitterHistory.w > 0.5 && speed > 0.5 && centerDepth > 0.0) {
-        float2 prevJitterUv = jitterHistory.xy * renderResolution.zw;
-        float pd = prevSceneDepth.SampleLevel(pointSampler, priorUv + prevJitterUv, 0).r;
-        if (pd > max(centerDepth * 1.06, centerDepth + 0.0003)) {
-            depthConfidence = 0.0;
-        } else {
-            float relDiff = abs(pd - centerDepth) / max(centerDepth, 1e-6);
-            if (relDiff > 0.06) {
-                depthConfidence = saturate(1.0 - (relDiff - 0.06) * 8.0);
+    float staticDepthConsistent = (speed < 0.15) ? 0.5 : 0.0;
+    float2 prevJitterUv = jitterHistory.xy * renderResolution.zw;
+    if (jitterHistory.w > 0.5 && centerDepth > 0.0) {
+        if (speed > 0.5) {
+            float pd = prevSceneDepth.SampleLevel(pointSampler, priorUv + prevJitterUv, 0).r;
+            if (pd > max(centerDepth * 1.06, centerDepth + 0.0003)) {
+                depthConfidence = 0.0;
+            } else {
+                float relDiff = abs(pd - centerDepth) / max(centerDepth, 1e-6);
+                if (relDiff > 0.06) {
+                    depthConfidence = saturate(1.0 - (relDiff - 0.06) * 8.0);
+                }
             }
+        }
+        if (speed < 0.25) {
+            int2 maxCoord = int2(renderResolution.xy) - int2(1, 1);
+            int2 base = int2(floor((priorUv + prevJitterUv) * renderResolution.xy - 0.5));
+            float envMin = minDepth * 0.95 - 1e-4;
+            float envMax = nearestDepth * 1.05 + 1e-4;
+            bool matchedEnv = false;
+            [unroll]
+            for (int oy = 0; oy <= 1; ++oy) {
+                [unroll]
+                for (int ox = 0; ox <= 1; ++ox) {
+                    float pd2 = prevSceneDepth.Load(int3(clamp(base + int2(ox, oy), int2(0, 0), maxCoord), 0));
+                    if (pd2 >= envMin && pd2 <= envMax) {
+                        matchedEnv = true;
+                    }
+                }
+            }
+            staticDepthConsistent = matchedEnv ? 1.0 : 0.0;
         }
     }
 
-    // 6. Brian Karis Ray-to-AABB Clipping
+    // 6. Brian Karis Ray-to-AABB Clipping + stationary thin-feature ridge retention
     float3 clampedHistY = ClipToAABB(histY, currentY, finalMin, finalMax);
+    float2 histTexel = resolution.zw;
+    float hL = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(-histTexel.x, 0.0), 0).rgb).x;
+    float hR = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2( histTexel.x, 0.0), 0).rgb).x;
+    float hU = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0, -histTexel.y), 0).rgb).x;
+    float hD = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0,  histTexel.y), 0).rgb).x;
+    // Detect isolated 1-pixel ridges/lines (zero on monotonic step edges and flat/bordered blobs).
+    float ridgeX = max(0.0, abs(histY.x - 0.5 * (hL + hR)) - 0.5 * abs(hL - hR));
+    float ridgeY = max(0.0, abs(histY.x - 0.5 * (hU + hD)) - 0.5 * abs(hU - hD));
+    float histThinness = saturate((max(ridgeX, ridgeY) - 0.012) * 24.0);
+    float thinLock = stationaryBoost * staticDepthConsistent * histThinness;
+    clampedHistY = lerp(clampedHistY, histY, 0.96 * thinLock);
 
     // 7. Velocity / Disocclusion / UI Confidence
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
@@ -214,8 +251,9 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float relLumaShift = saturate((lumaDelta / lumaRange - 0.60) * 1.25) * saturate((speed - 0.75) * 0.45);
     historyConfidence *= (1.0 - 0.45 * relLumaShift);
 
-    // Base blend weight: 0.90 for static/smooth, lower when high speed
+    // Base blend weight: 0.90 for static/smooth, higher on stationary thin ridges, lower at high speed
     float blendWeight = clamp(params.z, 0.0, 0.95);
+    blendWeight = lerp(blendWeight, 0.96, thinLock);
     blendWeight = lerp(blendWeight, 0.65, saturate(speed * 0.08));
 
     // Dynamic blend weight

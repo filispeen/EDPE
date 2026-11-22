@@ -53,6 +53,10 @@ public:
         ID3D11Texture2D* destinationTexture) = 0;
 
     virtual void resetHistory() = 0;
+
+    virtual unsigned recommendedJitterPhaseCount(unsigned configuredBasePhases,
+        uint32_t renderWidth, uint32_t renderHeight,
+        uint32_t outputWidth, uint32_t outputHeight) const;
 };
 
 // Null / Bypass backend: performs original game output without temporal reconstruction.
@@ -142,6 +146,14 @@ public:
 
     void resetHistory() override;
 
+    unsigned recommendedJitterPhaseCount(unsigned configuredBasePhases,
+        uint32_t renderWidth, uint32_t renderHeight,
+        uint32_t outputWidth, uint32_t outputHeight) const override;
+
+    static constexpr float kDefaultVelocityFactor = 0.00f;
+    void setVelocityFactor(float factor);
+    float getVelocityFactor() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -214,6 +226,12 @@ public:
 
     bool isBackendModeSupported(UpscalerBackend backendType) const;
     void resetBackendHistory(UpscalerBackend backendType);
+    unsigned getRecommendedJitterPhaseCount(unsigned configuredBasePhases,
+        uint32_t renderWidth, uint32_t renderHeight,
+        uint32_t outputWidth, uint32_t outputHeight) const;
+
+    void setFsrVelocityFactor(float factor);
+    float getFsrVelocityFactor() const;
 
     void requestReset() { pendingReset_ = true; }
 
@@ -237,6 +255,7 @@ private:
     ~UpscalerManager() = default;
 
     IUpscalerBackend* getBackendInstance(UpscalerBackend backend);
+    const IUpscalerBackend* getBackendInstance(UpscalerBackend backend) const;
 
     ID3D11Device* device_ = nullptr;
     ID3D11DeviceContext* context_ = nullptr;

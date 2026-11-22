@@ -146,6 +146,7 @@ int main() {
         saved.preserveNativeUi = true;
         saved.hdrInput = true;
         saved.sharpness = 0.65f;
+        saved.fsrVelocityFactor = 0.35f;
         saved.jitterEnabled = true;
         saved.jitterInvertX = true;
         saved.jitterInvertY = false;
@@ -200,6 +201,7 @@ int main() {
         if (loaded.preserveNativeUi != saved.preserveNativeUi) return fail(28, "preserveNativeUi mismatch");
         if (loaded.hdrInput != saved.hdrInput) return fail(29, "hdrInput mismatch");
         if (std::fabs(loaded.sharpness - saved.sharpness) > 0.01f) return fail(30, "sharpness mismatch");
+        if (std::fabs(loaded.fsrVelocityFactor - saved.fsrVelocityFactor) > 0.01f) return fail(38, "fsrVelocityFactor mismatch");
         if (loaded.jitterMode != saved.jitterMode) return fail(31, "jitterMode mismatch");
         if (loaded.jitterPhaseCount != saved.jitterPhaseCount) return fail(32, "jitterPhaseCount mismatch");
         if (loaded.mapBounceMode != saved.mapBounceMode) return fail(33, "mapBounceMode mismatch");

@@ -58,6 +58,13 @@ public:
         sharpness = static_cast<float>(_wtof(sharpnessBuf));
         if (sharpness < 0.0f || sharpness > 1.0f) sharpness = 0.0f;
 
+        wchar_t fsrVelBuf[64]{};
+        GetPrivateProfileStringW(L"Upscaler", L"FsrVelocityFactor", L"0.00", fsrVelBuf, 64, path.c_str());
+        fsrVelocityFactor = static_cast<float>(_wtof(fsrVelBuf));
+        if (!std::isfinite(fsrVelocityFactor) || fsrVelocityFactor < 0.0f || fsrVelocityFactor > 1.0f) {
+            fsrVelocityFactor = 0.00f;
+        }
+
         frameGenBackend = GetPrivateProfileIntW(L"FrameGeneration", L"Backend", 0, path.c_str());
         if (frameGenBackend < 0 || frameGenBackend > 2) frameGenBackend = 0;
         frameGenMultiplier = GetPrivateProfileIntW(L"FrameGeneration", L"Multiplier", 2, path.c_str());
@@ -236,6 +243,7 @@ public:
         appendBool("PreserveNativeUi", preserveNativeUi);
         appendBool("HdrInput", hdrInput);
         appendFloat("Sharpness", "%.2f", sharpness);
+        appendFloat("FsrVelocityFactor", "%.2f", fsrVelocityFactor);
 
         appendSection("FrameGeneration");
         appendInt("Backend", frameGenBackend);
@@ -392,6 +400,7 @@ public:
     int upscaleMode = 0;
     int dlssPreset = 0; // 0=Auto(K), 5=E(CNN Fast), 10=J, 11=K, 12=L, 13=M
     float sharpness = 0.0f;
+    float fsrVelocityFactor = 0.00f;
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;
     bool hdrInput = false;

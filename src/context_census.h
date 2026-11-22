@@ -77,6 +77,7 @@ void ContextCensusSetJitterScale(float scale);
 float ContextCensusGetJitterScale();
 void ContextCensusSetJitterPhaseCount(unsigned count);
 unsigned ContextCensusGetJitterPhaseCount();
+unsigned ContextCensusGetActiveJitterPhaseCount();
 void ContextCensusSetJitterMode(int mode);
 int ContextCensusGetJitterMode();
 const char* ContextCensusGetActiveJitterRouteName();
