@@ -133,13 +133,14 @@ bool tryWeaponOverride(int2 pixCoord, bool isReset, bool clampCockpit, out Motio
     outRes.canonicalDepth = 0.0;
     outRes.pixelClass = kClassWeapon;
     uint stencil = sceneStencil.Load(int3(pixCoord, 0)).g;
-    if ((stencil & (kWeaponStencilBit | kCockpitStencilBit)) == 0u) return false;
+    uint masked = stencil & (kWeaponStencilBit | kCockpitStencilBit);
+    if (clampCockpit ? (masked == 0u) : (masked != kWeaponStencilBit)) return false;
     float4 wm = weaponMotion.Load(int3(pixCoord, 0));
     if (wm.w <= 0.5 || !all(isfinite(wm.xyz))) return false;
+    float mv2 = dot(wm.xy, wm.xy);
+    // Reject impossible single-frame jumps (>300 px) from swapped or mismatched draws.
+    if (mv2 > 90000.0) return false;
     if (clampCockpit && (stencil & kCockpitStencilBit) != 0u) {
-        float mv2 = dot(wm.xy, wm.xy);
-        // Reject impossible single-frame jumps (>300 px) from swapped symmetric ship draws.
-        if (mv2 > 90000.0) return false;
         // For cockpit MVs > 6 px, verify consistency against nearby hull pixels.
         // Fast path: if any +-24px cockpit neighbor agrees within 25 px, accept immediately.
         // Slow path (isolated specks/slivers): compare against nearest cockpit hull.
@@ -165,6 +166,36 @@ bool tryWeaponOverride(int2 pixCoord, bool isReset, bool clampCockpit, out Motio
                     length(wm.xy - nAvg) > 25.0) {
                     return false;
                 }
+            }
+        }
+    } else {
+        // On foot: heal isolated 1-2 px silhouette/depth-tie contour seams where an
+        // overlapping mesh leaked a bogus MV against mutually consistent surrounding weapon MVs.
+        int2 dims = int2(info.y, info.z);
+        static const int2 kWeaponProbe[4] = {int2(6, 0), int2(-6, 0), int2(0, 6), int2(0, -6)};
+        float2 nSamples[4];
+        float2 nSum = float2(0.0, 0.0);
+        int nCount = 0;
+        [unroll]
+        for (int i = 0; i < 4; ++i) {
+            int2 sc = pixCoord + kWeaponProbe[i];
+            if (sc.x < 0 || sc.x >= dims.x || sc.y < 0 || sc.y >= dims.y) continue;
+            if ((sceneStencil.Load(int3(sc, 0)).g & (kWeaponStencilBit | kCockpitStencilBit)) != kWeaponStencilBit) continue;
+            float4 nwm = weaponMotion.Load(int3(sc, 0));
+            if (nwm.w > 0.5 && all(isfinite(nwm.xyz)) && dot(nwm.xy, nwm.xy) <= 90000.0) {
+                nSamples[nCount] = nwm.xy;
+                nSum += nwm.xy;
+                nCount++;
+            }
+        }
+        if (nCount >= 3) {
+            float2 nAvg = nSum / float(nCount);
+            float maxDev = 0.0;
+            for (int j = 0; j < nCount; ++j) {
+                maxDev = max(maxDev, length(nSamples[j] - nAvg));
+            }
+            if (maxDev <= 8.0 && length(wm.xy - nAvg) > 12.0) {
+                wm.xy = nAvg;
             }
         }
     }
@@ -457,16 +488,19 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
             return res;
         }
         if (!clampCockpit) {
-            // Cover both stencil-tagged weapon/arms (0x10/0x80) and near-camera un-stenciled
-            // weapon parts (muzzle tip / scope rim / glass at z < 0.60m; ground is ~2.7m+).
+            // Cover both stencil-tagged weapon/arms (0x10 with 0x80 clear) and near-camera
+            // un-stenciled weapon parts (muzzle tip / scope rim / glass at z < 0.60m),
+            // while excluding 0x80 parked SRV/ship pixels even when approached closely.
             float zView = (depthB > 0.0) ? (depthB / depth) : 1e30;
-            if ((st & (kWeaponStencilBit | kCockpitStencilBit)) != 0u || zView < 0.60) {
-            res.mv = float2(0.0, 0.0);
-            res.canonicalDepth = depth;
-            res.pixelClass = isReset ? kClassReset : kClassWeapon;
-            return res;
+            bool isOnFootWeaponStencil = ((st & (kWeaponStencilBit | kCockpitStencilBit)) == kWeaponStencilBit);
+            bool isNearUnstenciledWeapon = ((st & kCockpitStencilBit) == 0u) && (zView < 0.60);
+            if (isOnFootWeaponStencil || isNearUnstenciledWeapon) {
+                res.mv = float2(0.0, 0.0);
+                res.canonicalDepth = depth;
+                res.pixelClass = isReset ? kClassReset : kClassWeapon;
+                return res;
+            }
         }
-    }
     }
 
     float2 rawPixel = pixelCenter - jitterInfo.xy;

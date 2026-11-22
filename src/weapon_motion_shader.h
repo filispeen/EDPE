@@ -12,8 +12,9 @@ namespace edpe {
 inline constexpr char kWeaponMotionRasterShader[] = R"(
 cbuffer WeaponMotionConstants : register(b0) {
     float4 viewport;      // x: width, y: height, z: worldNear, w: weaponNear
-    float4 jitterDelta;   // x: jitterNowX - jitterPrevX, y: jitterNowY - jitterPrevY, z: stripJitter (0 or 1), w: 0
+    float4 jitterDelta;   // x: jitterNowX - jitterPrevX, y: jitterNowY - jitterPrevY, z: stripJitter (0 or 1), w: hasSceneDepth (0 or 1)
 };
+Texture2D<float> sceneDepth : register(t0);
 
 struct VSIn {
     float4 curClip  : POSITION0;
@@ -34,7 +35,12 @@ VSOut vs_main(VSIn vin) {
     return o;
 }
 
-float4 ps_main(VSOut pin) : SV_Target {
+struct PSOut {
+    float4 color : SV_Target;
+    float depth : SV_Depth;
+};
+
+PSOut ps_main(VSOut pin) {
     bool validW = (pin.curClip.w > 1e-6 && pin.prevClip.w > 1e-6);
     float2 curNdc  = pin.curClip.xy / max(pin.curClip.w, 1e-6);
     float2 prevNdc = pin.prevClip.xy / max(pin.prevClip.w, 1e-6);
@@ -48,16 +54,29 @@ float4 ps_main(VSOut pin) : SV_Target {
     if (!validW || !isfinite(det) || det < 0.2 || det > 5.0 || dPrevX.x < 0.25 || dPrevY.y < 0.25) {
         discard;
     }
+    float rawDepth = saturate(pin.curClip.z / max(pin.curClip.w, 1e-6));
+    float depthErr = 0.0;
+    if (jitterDelta.w > 0.5) {
+        float sceneD = sceneDepth.Load(int3(int2(pin.pos.xy), 0));
+        depthErr = abs(rawDepth - sceneD);
+        if (!(sceneD > 0.0) || !isfinite(sceneD) ||
+            depthErr > max(2e-5, 0.002 * max(rawDepth, sceneD))) {
+            discard;
+        }
+    }
     float2 mv = prevPx - curPx;
     if (jitterDelta.z > 0.5) {
         mv += jitterDelta.xy;
     }
     mv = all(isfinite(mv)) ? clamp(mv, -65504.0, 65504.0) : float2(0.0, 0.0);
 
-    float rawDepth = saturate(pin.curClip.z / pin.curClip.w);
     float nearScale = (viewport.w > 1e-6) ? (viewport.z / viewport.w) : 1.0;
     float canonicalDepth = saturate(rawDepth * nearScale);
-    return float4(mv.x, mv.y, canonicalDepth, 1.0);
+
+    PSOut o;
+    o.color = float4(mv.x, mv.y, canonicalDepth, 1.0);
+    o.depth = (jitterDelta.w > 0.5) ? saturate(1.0 - depthErr * 16.0) : rawDepth;
+    return o;
 }
 )";
 

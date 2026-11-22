@@ -6491,6 +6491,7 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
 
 static edpe::WeaponMotionTracker s_weapon_motion;
 static unsigned long long s_weapon_motion_frame = ~0ull;
+static bool s_weapon_motion_on_foot = false;
 static bool s_weapon_motion_logged_active = false;
 
 static void beginWeaponMotionFrameIfNeeded(ID3D11DeviceContext* context, unsigned long long cur) {
@@ -6509,6 +6510,7 @@ static void beginWeaponMotionFrameIfNeeded(ID3D11DeviceContext* context, unsigne
         }
         const float nearM = (s_camera_now.depthB > 0.0f) ? s_camera_now.depthB : edpe::kDefaultWorldNearM;
         s_weapon_motion.beginFrame(context, w, h, nearM, nearM);
+        s_weapon_motion_on_foot = edpe::cobra_camera::MapFocusPoller::isOnFootActive();
         s_weapon_motion_frame = cur;
     }
 }
@@ -6525,9 +6527,9 @@ static void tryCaptureDynamicViewmodelDrawInstanced(ID3D11DeviceContext* context
     std::lock_guard<std::recursive_mutex> lock(g_scene_ctx_mutex);
     beginWeaponMotionFrameIfNeeded(context, cur);
     if (scene_depth_source) {
-    s_weapon_motion.captureDrawIndexedInstanced(
+        s_weapon_motion.captureDrawIndexedInstanced(
             context, scene_depth_source.Get(), index_count, instance_count,
-            start_index, base_vertex, start_instance, forward);
+            start_index, base_vertex, start_instance, forward, s_weapon_motion_on_foot);
     }
 }
 
@@ -6542,7 +6544,8 @@ static void tryCaptureDynamicViewmodelDrawIndexed(ID3D11DeviceContext* context,
     beginWeaponMotionFrameIfNeeded(context, cur);
     if (scene_depth_source) {
         s_weapon_motion.captureDrawIndexed(
-            context, scene_depth_source.Get(), index_count, start_index, base_vertex, forward);
+            context, scene_depth_source.Get(), index_count, start_index, base_vertex,
+            forward, s_weapon_motion_on_foot);
     }
 }
 
@@ -11424,7 +11427,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     s_weapon_motion_frame == rendered &&
                     s_weapon_motion.capturedDrawCount() > 0u) {
                     const bool vmJittered = (jx != 0.0f || jy != 0.0f || prev_jx != 0.0f || prev_jy != 0.0f);
-                    if (s_weapon_motion.resolve(context, jx, jy, prev_jx, prev_jy, vmJittered)) {
+                    if (s_weapon_motion.resolve(context, jx, jy, prev_jx, prev_jy, vmJittered,
+                                                motion_depth_view.Get())) {
                         weaponMotionSrv = s_weapon_motion.weaponMotionSrv();
                         if (!s_weapon_motion_logged_active) {
                             s_weapon_motion_logged_active = true;

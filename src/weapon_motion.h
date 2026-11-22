@@ -84,6 +84,13 @@ public:
     // && DepthWriteMask == ALL.
     static bool isFirstPersonWeaponState(ID3D11DeviceContext* context);
 
+    // Gate check for opaque visible viewmodel draws writing stencil on the expected scene depth.
+    // Rejects translucent, color-masked, depth-disabled, stencil-read-only, and PS-null draws,
+    // and when onFoot is true excludes 0x80 parked vehicle/cockpit stencil bits.
+    static bool isOpaqueVisibleViewmodelDraw(ID3D11DeviceContext* context,
+                                             ID3D11Texture2D* expectedDepthTex,
+                                             bool onFoot);
+
     // Begin a new frame: swap current/previous SO pools and clear draw records.
     void beginFrame(ID3D11DeviceContext* context, UINT width, UINT height,
                     float worldNear = kDefaultWorldNearM,
@@ -108,19 +115,22 @@ public:
                                      UINT startIndex,
                                      INT baseVertex,
                                      UINT startInstance,
-                                     DrawIndexedInstancedFn origDraw);
+                                     DrawIndexedInstancedFn origDraw,
+                                     bool onFoot = false);
     bool captureDrawIndexed(ID3D11DeviceContext* context,
                             ID3D11Texture2D* expectedDepthTex,
                             UINT indexCount,
                             UINT startIndex,
                             INT baseVertex,
-                            DrawIndexedFn origDraw);
+                            DrawIndexedFn origDraw,
+                            bool onFoot = false);
 
     // Rasterize all matched current/previous draws into WeaponMotion (R16G16B16A16_FLOAT).
     bool resolve(ID3D11DeviceContext* context,
                  float jitterNowX, float jitterNowY,
                  float jitterPrevX, float jitterPrevY,
-                 bool viewmodelJittered);
+                 bool viewmodelJittered,
+                 ID3D11ShaderResourceView* sceneDepthSrv = nullptr);
 
     ID3D11Buffer* currentSoBuffer() const { return soBuffers_[curSlot_].Get(); }
     ID3D11ShaderResourceView* weaponMotionSrv() const { return motionSrv_.Get(); }

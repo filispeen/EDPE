@@ -1,5 +1,7 @@
 #include "motion_pass.h"
 #include "celestial_motion.h"
+#include "weapon_motion.h"
+#include "shader_probe.h"
 
 #include <DirectXPackedVector.h>
 #include <d3dcompiler.h>
@@ -615,6 +617,503 @@ int main() {
     if (barrel_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 101;
     if (muzzle_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 102;
     if (ground_cls == static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 103;
+
+    // Issue #25 test 1: WeaponMotionTracker::isOpaqueVisibleViewmodelDraw state gate.
+    D3D11_TEXTURE2D_DESC gate_rt_desc{};
+    gate_rt_desc.Width = gate_rt_desc.Height = 4;
+    gate_rt_desc.MipLevels = gate_rt_desc.ArraySize = 1;
+    gate_rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    gate_rt_desc.SampleDesc.Count = 1;
+    gate_rt_desc.Usage = D3D11_USAGE_DEFAULT;
+    gate_rt_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> gate_rt_tex;
+    ComPtr<ID3D11RenderTargetView> gate_rtv;
+    if (FAILED(device->CreateTexture2D(&gate_rt_desc, nullptr, &gate_rt_tex)) ||
+        FAILED(device->CreateRenderTargetView(gate_rt_tex.Get(), nullptr, &gate_rtv))) {
+        return 104;
+    }
+
+    std::array<std::uint64_t, 16> gate_depths{};
+    gate_depths.fill(std::bit_cast<std::uint32_t>(0.01f)); // background z=2.5m
+    gate_depths[0] = 0u; // sky at (0,0)
+    gate_depths[5] = std::bit_cast<std::uint32_t>(0.20f); // visible weapon at (1,1)
+    D3D11_SUBRESOURCE_DATA gate_depth_init{gate_depths.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> gate_depth_tex;
+    ComPtr<ID3D11DepthStencilView> gate_dsv;
+    ComPtr<ID3D11ShaderResourceView> gate_depth_srv;
+    D3D11_DEPTH_STENCIL_VIEW_DESC gate_dsv_desc{};
+    gate_dsv_desc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    gate_dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &gate_depth_init, &gate_depth_tex)) ||
+        FAILED(device->CreateDepthStencilView(gate_depth_tex.Get(), &gate_dsv_desc, &gate_dsv)) ||
+        FAILED(device->CreateShaderResourceView(gate_depth_tex.Get(), &view_desc, &gate_depth_srv))) {
+        return 105;
+    }
+
+    static constexpr char kTestPsSrc[] = "float4 main() : SV_Target { return float4(1, 1, 1, 1); }";
+    ComPtr<ID3DBlob> test_ps_blob;
+    ComPtr<ID3D11PixelShader> test_ps;
+    if (FAILED(D3DCompile(kTestPsSrc, sizeof(kTestPsSrc) - 1, nullptr, nullptr, nullptr,
+            "main", "ps_5_0", 0, 0, &test_ps_blob, nullptr)) ||
+        FAILED(device->CreatePixelShader(test_ps_blob->GetBufferPointer(),
+            test_ps_blob->GetBufferSize(), nullptr, &test_ps))) {
+        return 106;
+    }
+
+    D3D11_DEPTH_STENCIL_DESC ds_weapon_desc{};
+    ds_weapon_desc.DepthEnable = TRUE;
+    ds_weapon_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO; // G-buffer after Z-prepass
+    ds_weapon_desc.DepthFunc = D3D11_COMPARISON_EQUAL;
+    ds_weapon_desc.StencilEnable = TRUE;
+    ds_weapon_desc.StencilReadMask = 0xFF;
+    ds_weapon_desc.StencilWriteMask = 0xFF;
+    ds_weapon_desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+    ds_weapon_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+    ds_weapon_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+    ds_weapon_desc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+    ds_weapon_desc.BackFace = ds_weapon_desc.FrontFace;
+    ds_weapon_desc.BackFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+    ComPtr<ID3D11DepthStencilState> ds_weapon, ds_depth_off, ds_stencil_ro;
+    if (FAILED(device->CreateDepthStencilState(&ds_weapon_desc, &ds_weapon))) return 107;
+    auto ds_depth_off_desc = ds_weapon_desc;
+    ds_depth_off_desc.DepthEnable = FALSE;
+    if (FAILED(device->CreateDepthStencilState(&ds_depth_off_desc, &ds_depth_off))) return 108;
+    auto ds_stencil_ro_desc = ds_weapon_desc;
+    ds_stencil_ro_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+    if (FAILED(device->CreateDepthStencilState(&ds_stencil_ro_desc, &ds_stencil_ro))) return 109;
+
+    D3D11_BLEND_DESC bs_desc{};
+    bs_desc.RenderTarget[0].BlendEnable = FALSE;
+    bs_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ComPtr<ID3D11BlendState> bs_opaque, bs_translucent, bs_color_masked;
+    if (FAILED(device->CreateBlendState(&bs_desc, &bs_opaque))) return 110;
+    auto bs_trans_desc = bs_desc;
+    bs_trans_desc.RenderTarget[0].BlendEnable = TRUE;
+    bs_trans_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    bs_trans_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bs_trans_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bs_trans_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bs_trans_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bs_trans_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    if (FAILED(device->CreateBlendState(&bs_trans_desc, &bs_translucent))) return 111;
+    auto bs_masked_desc = bs_desc;
+    bs_masked_desc.RenderTarget[0].RenderTargetWriteMask = 0;
+    if (FAILED(device->CreateBlendState(&bs_masked_desc, &bs_color_masked))) return 112;
+
+    ID3D11RenderTargetView* gate_rtvs[1] = {gate_rtv.Get()};
+    const float blend_zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    context->OMSetRenderTargets(1, gate_rtvs, gate_dsv.Get());
+    context->PSSetShader(test_ps.Get(), nullptr, 0);
+    context->OMSetDepthStencilState(ds_weapon.Get(), 0x15u);
+    context->OMSetBlendState(bs_opaque.Get(), blend_zero, 0xFFFFFFFFu);
+
+    if (!edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 113;
+    context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu); // null blend state = default opaque
+    if (!edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 114;
+
+    context->OMSetDepthStencilState(ds_weapon.Get(), 0x95u); // parked SRV/ship stencil (0x80 | 0x15)
+    if (edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 115;
+    if (!edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), false)) return 116;
+
+    context->OMSetDepthStencilState(ds_weapon.Get(), 0x15u);
+    context->OMSetBlendState(bs_translucent.Get(), blend_zero, 0xFFFFFFFFu);
+    if (edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 117;
+    context->OMSetBlendState(bs_color_masked.Get(), blend_zero, 0xFFFFFFFFu);
+    if (edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 118;
+    context->OMSetBlendState(bs_opaque.Get(), blend_zero, 0u);
+    if (edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 119;
+    context->OMSetBlendState(bs_opaque.Get(), blend_zero, 0xFFFFFFFFu);
+
+    context->OMSetDepthStencilState(ds_depth_off.Get(), 0x15u);
+    if (edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 120;
+    context->OMSetDepthStencilState(ds_stencil_ro.Get(), 0x15u);
+    if (edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 121;
+    context->OMSetDepthStencilState(ds_weapon.Get(), 0x15u);
+
+    context->PSSetShader(nullptr, nullptr, 0);
+    if (edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 122;
+    context->PSSetShader(test_ps.Get(), nullptr, 0);
+    context->OMSetRenderTargets(0, nullptr, gate_dsv.Get());
+    if (edpe::WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context.Get(), gate_depth_tex.Get(), true)) return 123;
+
+    // Issue #25 test 2: WeaponMotionTracker::resolve discards invisible foreground mesh
+    // whose rawDepth (0.50) mismatches sceneDepth (0.20 on weapon, 0.01 on world), preserving
+    // the visible weapon's true MV at (1,1) and leaving background pixels at w == 0.
+    edpe::WeaponMotionTracker wm_tracker;
+    if (!wm_tracker.initialize(device.Get())) return 124;
+
+    static constexpr char kTestVsSrc[] =
+        "cbuffer ShiftCb : register(b0) { float4 shiftAndZ; };\n"
+        "float4 main(float4 pos : POSITION) : SV_Position {\n"
+        "    return float4(pos.xy + shiftAndZ.xy, shiftAndZ.z, 1.0);\n"
+        "}\n";
+    ComPtr<ID3DBlob> test_vs_blob;
+    ComPtr<ID3D11VertexShader> test_vs;
+    if (FAILED(D3DCompile(kTestVsSrc, sizeof(kTestVsSrc) - 1, nullptr, nullptr, nullptr,
+            "main", "vs_5_0", 0, 0, &test_vs_blob, nullptr)) ||
+        FAILED(device->CreateVertexShader(test_vs_blob->GetBufferPointer(),
+            test_vs_blob->GetBufferSize(), nullptr, &test_vs))) {
+        return 125;
+    }
+    const std::uint64_t test_vs_hash = 0x123456789ABCDEF0ull;
+    if (FAILED(test_vs->SetPrivateData(kEdpeShaderHashGuid, sizeof(test_vs_hash), &test_vs_hash)) ||
+        FAILED(test_vs->SetPrivateData(kEdpeVertexBytecodeGuid,
+            static_cast<UINT>(test_vs_blob->GetBufferSize()), test_vs_blob->GetBufferPointer()))) {
+        return 126;
+    }
+
+    const D3D11_INPUT_ELEMENT_DESC test_il_desc{
+        "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0
+    };
+    ComPtr<ID3D11InputLayout> test_il;
+    if (FAILED(device->CreateInputLayout(&test_il_desc, 1,
+            test_vs_blob->GetBufferPointer(), test_vs_blob->GetBufferSize(), &test_il))) {
+        return 127;
+    }
+
+    const float test_verts[6 * 4] = {
+        -1.0f, -1.0f, 0.0f, 1.0f,
+        -1.0f,  3.0f, 0.0f, 1.0f,
+         3.0f, -1.0f, 0.0f, 1.0f,
+        -1.0f, -1.0f, 0.0f, 1.0f,
+        -1.0f,  3.0f, 0.0f, 1.0f,
+         3.0f, -1.0f, 0.0f, 1.0f,
+    };
+    const std::uint16_t test_indices[3] = {0, 1, 2};
+    D3D11_BUFFER_DESC vb_desc{sizeof(test_verts), D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0};
+    D3D11_SUBRESOURCE_DATA vb_init{test_verts, 0, 0};
+    D3D11_BUFFER_DESC ib_desc{sizeof(test_indices), D3D11_USAGE_DEFAULT, D3D11_BIND_INDEX_BUFFER, 0, 0, 0};
+    D3D11_SUBRESOURCE_DATA ib_init{test_indices, 0, 0};
+    D3D11_BUFFER_DESC cb_desc{16u, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+    ComPtr<ID3D11Buffer> test_vb, test_ib, test_cb;
+    if (FAILED(device->CreateBuffer(&vb_desc, &vb_init, &test_vb)) ||
+        FAILED(device->CreateBuffer(&ib_desc, &ib_init, &test_ib)) ||
+        FAILED(device->CreateBuffer(&cb_desc, nullptr, &test_cb))) {
+        return 128;
+    }
+
+    D3D11_RASTERIZER_DESC rs_none_desc{};
+    rs_none_desc.FillMode = D3D11_FILL_SOLID;
+    rs_none_desc.CullMode = D3D11_CULL_NONE;
+    rs_none_desc.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> rs_none;
+    if (FAILED(device->CreateRasterizerState(&rs_none_desc, &rs_none))) return 129;
+
+    const D3D11_VIEWPORT full_vp{0.0f, 0.0f, 4.0f, 4.0f, 0.0f, 1.0f};
+    ID3D11Buffer* vb_ptr = test_vb.Get();
+    const UINT vb_stride = 16u;
+    const UINT vb_offset = 0u;
+    ID3D11Buffer* vs_cb_ptr = test_cb.Get();
+    context->OMSetRenderTargets(1, gate_rtvs, gate_dsv.Get());
+    context->OMSetDepthStencilState(ds_weapon.Get(), 0x15u);
+    context->OMSetBlendState(bs_opaque.Get(), blend_zero, 0xFFFFFFFFu);
+    context->RSSetState(rs_none.Get());
+    context->RSSetViewports(1, &full_vp);
+    context->IASetInputLayout(test_il.Get());
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->IASetVertexBuffers(0, 1, &vb_ptr, &vb_stride, &vb_offset);
+    context->IASetIndexBuffer(test_ib.Get(), DXGI_FORMAT_R16_UINT, 0);
+    context->VSSetShader(test_vs.Get(), nullptr, 0);
+    context->VSSetConstantBuffers(0, 1, &vs_cb_ptr);
+    context->PSSetShader(test_ps.Get(), nullptr, 0);
+
+    auto invokeDrawIndexed = +[](ID3D11DeviceContext* ctx, UINT ic, UINT si, INT bv) {
+        ctx->DrawIndexed(ic, si, bv);
+    };
+
+    // Frame 0 (previous): weapon at depth 0.20 shifted (+1.25px, -0.75px),
+    // invisible foreground mesh at closer depth 0.50 shifted (+2.0px, +2.0px).
+    wm_tracker.beginFrame(context.Get(), 4, 4, 0.025f, 0.025f);
+    const float prev_weapon_cb[4] = {0.625f, 0.375f, 0.20f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, prev_weapon_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 0, invokeDrawIndexed, true)) {
+        return 130;
+    }
+    const float prev_fg_cb[4] = {1.0f, -1.0f, 0.50f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, prev_fg_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 3, invokeDrawIndexed, true)) {
+        return 131;
+    }
+
+    // Frame 1 (current): both unshifted at current frame.
+    wm_tracker.beginFrame(context.Get(), 4, 4, 0.025f, 0.025f);
+    const float cur_weapon_cb[4] = {0.0f, 0.0f, 0.20f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, cur_weapon_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 0, invokeDrawIndexed, true)) {
+        return 132;
+    }
+    const float cur_fg_cb[4] = {0.0f, 0.0f, 0.50f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, cur_fg_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 3, invokeDrawIndexed, true)) {
+        return 133;
+    }
+
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    if (!wm_tracker.resolve(context.Get(), 0.0f, 0.0f, 0.0f, 0.0f, false, gate_depth_srv.Get())) {
+        return 134;
+    }
+
+    D3D11_TEXTURE2D_DESC wm_rb_desc{};
+    wm_rb_desc.Width = wm_rb_desc.Height = 4;
+    wm_rb_desc.MipLevels = wm_rb_desc.ArraySize = 1;
+    wm_rb_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    wm_rb_desc.SampleDesc.Count = 1;
+    wm_rb_desc.Usage = D3D11_USAGE_STAGING;
+    wm_rb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> wm_rb;
+    if (FAILED(device->CreateTexture2D(&wm_rb_desc, nullptr, &wm_rb))) return 135;
+    context->CopyResource(wm_rb.Get(), wm_tracker.weaponMotionTexture());
+    if (FAILED(context->Map(wm_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 136;
+    const auto* wm_out_row0 = reinterpret_cast<const std::uint16_t*>(mapped.pData);
+    const auto* wm_out_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float sky_w = DirectX::PackedVector::XMConvertHalfToFloat(wm_out_row0[3]);
+    const float weap_x = DirectX::PackedVector::XMConvertHalfToFloat(wm_out_row1[4 + 0]);
+    const float weap_y = DirectX::PackedVector::XMConvertHalfToFloat(wm_out_row1[4 + 1]);
+    const float weap_d = DirectX::PackedVector::XMConvertHalfToFloat(wm_out_row1[4 + 2]);
+    const float weap_w = DirectX::PackedVector::XMConvertHalfToFloat(wm_out_row1[4 + 3]);
+    const float bg_w = DirectX::PackedVector::XMConvertHalfToFloat(wm_out_row1[8 + 3]);
+    context->Unmap(wm_rb.Get(), 0);
+    if (sky_w != 0.0f) return 137;
+    if (bg_w != 0.0f) return 138;
+    if (std::fabs(weap_w - 1.0f) >= 0.02f ||
+        std::fabs(weap_x - 1.25f) >= 0.05f ||
+        std::fabs(weap_y - (-0.75f)) >= 0.05f ||
+        std::fabs(weap_d - 0.20f) >= 0.02f) {
+        return 139;
+    }
+
+    // Issue #25 test 3: On-foot MotionPass (clampCockpit=false) treats parked SRV/ship
+    // pixel (stencil 0x95 = 0x80 | 0x15, even at z=0.40m < 0.60m and with non-zero weaponMotion)
+    // as World using camera-depth reprojection, not Weapon or (0,0).
+    std::array<std::uint64_t, 16> srv_depths{};
+    srv_depths.fill(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.00912f)) |
+                    (static_cast<std::uint64_t>(0x04u) << 32));
+    srv_depths[5] = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.0625f)) |
+                    (static_cast<std::uint64_t>(0x95u) << 32); // parked SRV tire at z=0.40m
+    D3D11_SUBRESOURCE_DATA srv_depth_init{srv_depths.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> srv_depth_tex;
+    ComPtr<ID3D11ShaderResourceView> srv_depth_view;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &srv_depth_init, &srv_depth_tex)) ||
+        FAILED(device->CreateShaderResourceView(srv_depth_tex.Get(), &view_desc, &srv_depth_view))) {
+        return 140;
+    }
+    std::array<std::uint16_t, 16 * 4> srv_wm_pixels{};
+    srv_wm_pixels[5 * 4 + 0] = DirectX::PackedVector::XMConvertFloatToHalf(4.5f);
+    srv_wm_pixels[5 * 4 + 1] = DirectX::PackedVector::XMConvertFloatToHalf(-3.5f);
+    srv_wm_pixels[5 * 4 + 2] = DirectX::PackedVector::XMConvertFloatToHalf(0.0625f);
+    srv_wm_pixels[5 * 4 + 3] = DirectX::PackedVector::XMConvertFloatToHalf(1.0f);
+    D3D11_SUBRESOURCE_DATA srv_wm_init{srv_wm_pixels.data(), 4 * 4 * sizeof(std::uint16_t), 0};
+    ComPtr<ID3D11Texture2D> srv_wm_tex;
+    ComPtr<ID3D11ShaderResourceView> srv_wm_view;
+    if (FAILED(device->CreateTexture2D(&wm_desc, &srv_wm_init, &srv_wm_tex)) ||
+        FAILED(device->CreateShaderResourceView(srv_wm_tex.Get(), nullptr, &srv_wm_view))) {
+        return 141;
+    }
+    auto srvWalkNow = walkPrev;
+    srvWalkNow.worldFromView[3] = 0.20f; // at z = 0.40m, priorPixel.x = 2.5 (on-screen), mv.x = +1.0
+    float srv_expected_x = 0.0f, srv_expected_y = 0.0f;
+    if (!edpe::cameraDepthMotion(srvWalkNow, walkPrev, 4, 4, 1, 1, 0.0625f,
+            &srv_expected_x, &srv_expected_y)) {
+        return 142;
+    }
+    if (!pass.render(srv_depth_view.Get(), srvWalkNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, srv_wm_view.Get(), nullptr, nullptr, 0u,
+            /*clampCockpit=*/false)) {
+        return 143;
+    }
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 144;
+    const auto* srv_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float srv_out_x = DirectX::PackedVector::XMConvertHalfToFloat(srv_row1[2]);
+    const float srv_out_y = DirectX::PackedVector::XMConvertHalfToFloat(srv_row1[3]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(srv_out_x - srv_expected_x) >= 0.05f ||
+        std::fabs(srv_out_y - srv_expected_y) >= 0.05f) {
+        return 145;
+    }
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 146;
+    const std::uint8_t srv_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (srv_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::World)) return 147;
+
+    // Issue #25 Phase 2 test 1: WeaponMotionTracker::resolve tie-breaks overlapping
+    // draws within tolerance by lowest |rawDepth - sceneDepth|, independent of draw order.
+    auto bindWeaponDrawState = [&]() {
+        context->OMSetRenderTargets(1, gate_rtvs, gate_dsv.Get());
+        context->OMSetDepthStencilState(ds_weapon.Get(), 0x15u);
+        context->OMSetBlendState(bs_opaque.Get(), blend_zero, 0xFFFFFFFFu);
+        context->RSSetState(rs_none.Get());
+        context->RSSetViewports(1, &full_vp);
+        context->IASetInputLayout(test_il.Get());
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->IASetVertexBuffers(0, 1, &vb_ptr, &vb_stride, &vb_offset);
+        context->IASetIndexBuffer(test_ib.Get(), DXGI_FORMAT_R16_UINT, 0);
+        context->VSSetShader(test_vs.Get(), nullptr, 0);
+        context->VSSetConstantBuffers(0, 1, &vs_cb_ptr);
+        context->PSSetShader(test_ps.Get(), nullptr, 0);
+    };
+    auto readWeaponMotionAt11 = [&](float& outX, float& outY, float& outD, float& outW) -> bool {
+        context->CopyResource(wm_rb.Get(), wm_tracker.weaponMotionTexture());
+        if (FAILED(context->Map(wm_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+        const auto* row1 = reinterpret_cast<const std::uint16_t*>(
+            static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+        outX = DirectX::PackedVector::XMConvertHalfToFloat(row1[4 + 0]);
+        outY = DirectX::PackedVector::XMConvertHalfToFloat(row1[4 + 1]);
+        outD = DirectX::PackedVector::XMConvertHalfToFloat(row1[4 + 2]);
+        outW = DirectX::PackedVector::XMConvertHalfToFloat(row1[4 + 3]);
+        context->Unmap(wm_rb.Get(), 0);
+        return true;
+    };
+
+    // Baseline frame for order-1 test: exact bv=0 shifted (+1.25px, -0.75px) at z=0.20000,
+    // bogus bv=3 shifted (+2.0px, +2.0px) at z=0.20015 (within 0.2% tolerance of sceneDepth=0.20).
+    bindWeaponDrawState();
+    wm_tracker.beginFrame(context.Get(), 4, 4, 0.0f, 0.0f);
+    const float f2_exact_cb[4] = {0.625f, 0.375f, 0.20000f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, f2_exact_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 0, invokeDrawIndexed, true)) {
+        return 148;
+    }
+    const float f2_bogus_cb[4] = {1.0f, -1.0f, 0.20015f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, f2_bogus_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 3, invokeDrawIndexed, true)) {
+        return 149;
+    }
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    if (!wm_tracker.resolve(context.Get(), 0.0f, 0.0f, 0.0f, 0.0f, false, gate_depth_srv.Get())) {
+        return 150;
+    }
+
+    // Order 1: bogus (0.20015) drawn FIRST, exact (0.20000) drawn SECOND -> exact must win.
+    bindWeaponDrawState();
+    wm_tracker.beginFrame(context.Get(), 4, 4, 0.0f, 0.0f);
+    const float f3_bogus_cb[4] = {0.0f, 0.0f, 0.20015f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, f3_bogus_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 3, invokeDrawIndexed, true)) {
+        return 151;
+    }
+    const float f3_exact_cb[4] = {0.0f, 0.0f, 0.20000f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, f3_exact_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 0, invokeDrawIndexed, true)) {
+        return 152;
+    }
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    if (!wm_tracker.resolve(context.Get(), 0.0f, 0.0f, 0.0f, 0.0f, false, gate_depth_srv.Get())) {
+        return 153;
+    }
+    float tie_x = 0.0f, tie_y = 0.0f, tie_d = 0.0f, tie_w = 0.0f;
+    if (!readWeaponMotionAt11(tie_x, tie_y, tie_d, tie_w)) return 154;
+    if (std::fabs(tie_w - 1.0f) >= 0.02f ||
+        std::fabs(tie_x - 1.25f) >= 0.05f ||
+        std::fabs(tie_y - (-0.75f)) >= 0.05f ||
+        std::fabs(tie_d - 0.20f) >= 0.02f) {
+        return 155;
+    }
+
+    // Order 2: exact (0.20000) drawn FIRST, bogus (0.20015) drawn SECOND -> exact must STILL win.
+    bindWeaponDrawState();
+    wm_tracker.beginFrame(context.Get(), 4, 4, 0.0f, 0.0f);
+    const float f4_exact_cb[4] = {-0.25f, -0.125f, 0.20000f, 0.0f}; // MV = (+0.50, -0.25)
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, f4_exact_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 0, invokeDrawIndexed, true)) {
+        return 156;
+    }
+    const float f4_bogus_cb[4] = {-0.50f, -0.50f, 0.20015f, 0.0f}; // MV = (+1.00, -1.00)
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, f4_bogus_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 3u, 0u, 3, invokeDrawIndexed, true)) {
+        return 157;
+    }
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    if (!wm_tracker.resolve(context.Get(), 0.0f, 0.0f, 0.0f, 0.0f, false, gate_depth_srv.Get())) {
+        return 158;
+    }
+    if (!readWeaponMotionAt11(tie_x, tie_y, tie_d, tie_w)) return 159;
+    if (std::fabs(tie_w - 1.0f) >= 0.02f ||
+        std::fabs(tie_x - 0.50f) >= 0.05f ||
+        std::fabs(tie_y - (-0.25f)) >= 0.05f ||
+        std::fabs(tie_d - 0.20f) >= 0.02f) {
+        return 160;
+    }
+
+    // Issue #25 Phase 2 test 2: On-foot MotionPass (clampCockpit=false) heals isolated 1 px
+    // weapon silhouette seam (+40, -30) at (8,8) using mutually consistent +-6px weapon probes (+2, -1).
+    D3D11_TEXTURE2D_DESC depth16_desc = vm_depth_desc;
+    depth16_desc.Width = 16;
+    depth16_desc.Height = 16;
+    std::array<std::uint64_t, 16 * 16> depths16{};
+    depths16.fill(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.20f)) |
+                  (static_cast<std::uint64_t>(0x15u) << 32));
+    D3D11_SUBRESOURCE_DATA depth16_init{depths16.data(), 16 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> depth16_tex;
+    ComPtr<ID3D11ShaderResourceView> depth16_view;
+    if (FAILED(device->CreateTexture2D(&depth16_desc, &depth16_init, &depth16_tex)) ||
+        FAILED(device->CreateShaderResourceView(depth16_tex.Get(), &view_desc, &depth16_view))) {
+        return 161;
+    }
+
+    D3D11_TEXTURE2D_DESC wm16_desc = wm_desc;
+    wm16_desc.Width = 16;
+    wm16_desc.Height = 16;
+    std::array<std::uint16_t, 16 * 16 * 4> wm16_pixels{};
+    for (std::size_t i = 0; i < 16u * 16u; ++i) {
+        wm16_pixels[i * 4 + 0] = DirectX::PackedVector::XMConvertFloatToHalf(2.0f);
+        wm16_pixels[i * 4 + 1] = DirectX::PackedVector::XMConvertFloatToHalf(-1.0f);
+        wm16_pixels[i * 4 + 2] = DirectX::PackedVector::XMConvertFloatToHalf(0.20f);
+        wm16_pixels[i * 4 + 3] = DirectX::PackedVector::XMConvertFloatToHalf(1.0f);
+    }
+    const std::size_t seam_idx = 8u * 16u + 8u;
+    wm16_pixels[seam_idx * 4 + 0] = DirectX::PackedVector::XMConvertFloatToHalf(40.0f);
+    wm16_pixels[seam_idx * 4 + 1] = DirectX::PackedVector::XMConvertFloatToHalf(-30.0f);
+    D3D11_SUBRESOURCE_DATA wm16_init{wm16_pixels.data(), 16 * 4 * sizeof(std::uint16_t), 0};
+    ComPtr<ID3D11Texture2D> wm16_tex;
+    ComPtr<ID3D11ShaderResourceView> wm16_view;
+    if (FAILED(device->CreateTexture2D(&wm16_desc, &wm16_init, &wm16_tex)) ||
+        FAILED(device->CreateShaderResourceView(wm16_tex.Get(), nullptr, &wm16_view))) {
+        return 162;
+    }
+
+    if (!pass.render(depth16_view.Get(), walkPrev, walkPrev, 16, 16,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, wm16_view.Get(), nullptr, nullptr, 0u,
+            /*clampCockpit=*/false)) {
+        return 163;
+    }
+
+    D3D11_TEXTURE2D_DESC out16_rb_desc{}, cls16_rb_desc{};
+    readback->GetDesc(&out16_rb_desc);
+    out16_rb_desc.Width = 16;
+    out16_rb_desc.Height = 16;
+    cls_rb->GetDesc(&cls16_rb_desc);
+    cls16_rb_desc.Width = 16;
+    cls16_rb_desc.Height = 16;
+    ComPtr<ID3D11Texture2D> out16_rb, cls16_rb;
+    if (FAILED(device->CreateTexture2D(&out16_rb_desc, nullptr, &out16_rb)) ||
+        FAILED(device->CreateTexture2D(&cls16_rb_desc, nullptr, &cls16_rb))) {
+        return 164;
+    }
+    context->CopyResource(out16_rb.Get(), pass.outputTexture());
+    context->CopyResource(cls16_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(out16_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 165;
+    const auto* out16_row8 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + 8 * mapped.RowPitch);
+    const float seam_out_x = DirectX::PackedVector::XMConvertHalfToFloat(out16_row8[8 * 2 + 0]);
+    const float seam_out_y = DirectX::PackedVector::XMConvertHalfToFloat(out16_row8[8 * 2 + 1]);
+    context->Unmap(out16_rb.Get(), 0);
+    if (std::fabs(seam_out_x - 2.0f) >= 0.05f ||
+        std::fabs(seam_out_y - (-1.0f)) >= 0.05f) {
+        return 166;
+    }
+    if (FAILED(context->Map(cls16_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 167;
+    const std::uint8_t seam_cls =
+        (static_cast<const std::uint8_t*>(mapped.pData) + 8 * mapped.RowPitch)[8];
+    context->Unmap(cls16_rb.Get(), 0);
+    if (seam_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 168;
 
     return 0;
 }
