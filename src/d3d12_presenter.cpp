@@ -359,7 +359,13 @@ bool D3D12ProxyPresenter::attachWrappedSwapChain(IDXGISwapChain4* wrappedSwapCha
     if (wrappedSwapChain) {
         swapChain_.Attach(wrappedSwapChain);
     }
-    return acquireBackBuffers();
+    if (!acquireBackBuffers()) {
+        return false;
+    }
+    if (swapChain_) {
+        swapChain_->SetColorSpace1(colorSpace_);
+    }
+    return true;
 }
 
 bool D3D12ProxyPresenter::recreatePlainSwapChain() {

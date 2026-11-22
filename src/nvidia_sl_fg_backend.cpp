@@ -319,13 +319,21 @@ struct NvidiaStreamlineFgBackend::Impl {
     SlApiTable sl;
     sl::ViewportHandle viewport{0};
     sl::FrameToken* currentToken = nullptr;
+    uint32_t currentFrameIdx = 0;
+    bool hasCurrentFrameIdx = false;
+    sl::FrameToken* pendingNextToken = nullptr;
+    uint32_t pendingNextFrameIdx = 0;
+    bool hasPendingNextToken = false;
+    Microsoft::WRL::ComPtr<ID3D12Device> slProxyDevice;
     Microsoft::WRL::ComPtr<IDXGIFactory4> slProxyFactory;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> slProxyQueue;
     bool swapChainWrapped = false;
 
     static void onPrePresent(void* userCtx) {
         auto* self = static_cast<Impl*>(userCtx);
-        if (!self || !self->initialized || !self->currentToken) return;
+        if (!self) return;
+        std::lock_guard<std::mutex> lock(self->mutex);
+        if (!self->initialized || !self->currentToken) return;
         if (self->sl.slPCLSetMarker && self->snapshot.pclSupported) {
             self->sl.slPCLSetMarker(sl::PCLMarker::ePresentStart, *self->currentToken);
         }
@@ -333,7 +341,9 @@ struct NvidiaStreamlineFgBackend::Impl {
 
     static void onPostPresent(void* userCtx) {
         auto* self = static_cast<Impl*>(userCtx);
-        if (!self || !self->initialized) return;
+        if (!self) return;
+        std::lock_guard<std::mutex> lock(self->mutex);
+        if (!self->initialized) return;
         if (self->currentToken && self->sl.slPCLSetMarker && self->snapshot.pclSupported) {
             self->sl.slPCLSetMarker(sl::PCLMarker::ePresentEnd, *self->currentToken);
         }
@@ -348,6 +358,15 @@ struct NvidiaStreamlineFgBackend::Impl {
                     (state.bIsDynamicMFGSupported == sl::Boolean::eTrue);
                 self->snapshot.vsyncSupported =
                     (state.bIsVsyncSupportAvailable == sl::Boolean::eTrue);
+
+                if (state.inputsProcessingCompletionFence &&
+                    state.lastPresentInputsProcessingCompletionFenceValue > 0 &&
+                    self->presenter) {
+                    if (auto* q = self->presenter->bridge().commandQueue()) {
+                        q->Wait(static_cast<ID3D12Fence*>(state.inputsProcessingCompletionFence),
+                                state.lastPresentInputsProcessingCompletionFenceValue);
+                    }
+                }
 
                 if (state.status != sl::DLSSGStatus::eOk && self->activeInLastEvaluate) {
                     wchar_t logBuf[256]{};
@@ -366,6 +385,22 @@ struct NvidiaStreamlineFgBackend::Impl {
                 }
             }
         }
+        if (self->hasCurrentFrameIdx && self->sl.slGetNewFrameToken) {
+            const uint32_t nextIdx = self->currentFrameIdx + 1u;
+            sl::FrameToken* nextTok = nullptr;
+            if (self->sl.slGetNewFrameToken(nextTok, &nextIdx) == sl::Result::eOk && nextTok) {
+                if (self->sl.slReflexSleep && self->snapshot.reflexSupported) {
+                    self->sl.slReflexSleep(*nextTok);
+                }
+                if (self->sl.slPCLSetMarker && self->snapshot.pclSupported) {
+                    self->sl.slPCLSetMarker(sl::PCLMarker::eSimulationStart, *nextTok);
+                }
+                self->pendingNextToken = nextTok;
+                self->pendingNextFrameIdx = nextIdx;
+                self->hasPendingNextToken = true;
+            }
+        }
+        self->currentToken = nullptr;
     }
 
     bool initAndProbe(ID3D12Device* d3d12Device, bool keepActive) {
@@ -602,38 +637,72 @@ bool NvidiaStreamlineFgBackend::initialize(D3D12ProxyPresenter* presenter) {
         return false;
     }
 
-    // ManualHooking requires factory + D3D12 queue upgraded BEFORE swapchain creation
-    // so Streamline owns the internal swapchain and routes Present() through presentCommon().
+    auto cleanupInitFailure = [&](bool restorePlainSwapChain) {
+        if (restorePlainSwapChain) {
+            IDXGISwapChain4* partialSc = presenter->detachSwapChainForWrap();
+            if (partialSc) partialSc->Release();
+        }
+        presenter->bridge().setOverrideCommandQueue(nullptr);
+        impl_->slProxyQueue.Reset();
+        impl_->slProxyDevice.Reset();
+        impl_->slProxyFactory.Reset();
+        if (impl_->snapshot.slInitialized && impl_->sl.slShutdown) {
+            impl_->sl.slShutdown();
+            impl_->snapshot.slInitialized = false;
+        }
+        impl_->sl.unload();
+        if (restorePlainSwapChain) {
+            presenter->recreatePlainSwapChain();
+        }
+    };
+
+    // ManualHooking requires upgrading ID3D12Device + IDXGIFactory, then creating the
+    // wrapped ID3D12CommandQueue via slProxyDevice->CreateCommandQueue (slUpgradeInterface
+    // does not accept ID3D12CommandQueue directly) before creating the SL proxy swapchain.
+    void* devicePtr = presenter->bridge().d3d12Device();
+    sl::Result upDevRc = impl_->sl.slUpgradeInterface(&devicePtr);
+    if (upDevRc != sl::Result::eOk || !devicePtr) {
+        std::swprintf(impl_->snapshot.unavailableReason, 255,
+                      L"slUpgradeInterface(ID3D12Device) failed: %S",
+                      slResultToString(upDevRc));
+        cleanupInitFailure(false);
+        return false;
+    }
+    impl_->slProxyDevice.Attach(static_cast<ID3D12Device*>(devicePtr));
+
     void* factoryPtr = presenter->dxgiFactory();
     sl::Result upFactoryRc = impl_->sl.slUpgradeInterface(&factoryPtr);
     if (upFactoryRc != sl::Result::eOk || !factoryPtr) {
         std::swprintf(impl_->snapshot.unavailableReason, 255,
                       L"slUpgradeInterface(IDXGIFactory) failed: %S",
                       slResultToString(upFactoryRc));
-        impl_->sl.slShutdown();
-        impl_->snapshot.slInitialized = false;
-        impl_->sl.unload();
+        cleanupInitFailure(false);
         return false;
     }
     impl_->slProxyFactory.Attach(static_cast<IDXGIFactory4*>(factoryPtr));
 
-    void* queuePtr = presenter->bridge().commandQueue();
-    sl::Result upQueueRc = impl_->sl.slUpgradeInterface(&queuePtr);
-    if (upQueueRc != sl::Result::eOk || !queuePtr) {
+    D3D12_COMMAND_QUEUE_DESC qDesc{};
+    qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    qDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+    HRESULT qHr = impl_->slProxyDevice->CreateCommandQueue(
+        &qDesc, IID_PPV_ARGS(&impl_->slProxyQueue));
+    if (FAILED(qHr)) {
+        qDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        qHr = impl_->slProxyDevice->CreateCommandQueue(
+            &qDesc, IID_PPV_ARGS(&impl_->slProxyQueue));
+    }
+    if (FAILED(qHr) || !impl_->slProxyQueue) {
         std::swprintf(impl_->snapshot.unavailableReason, 255,
-                      L"slUpgradeInterface(ID3D12CommandQueue) failed: %S",
-                      slResultToString(upQueueRc));
-        impl_->slProxyFactory.Reset();
-        impl_->sl.slShutdown();
-        impl_->snapshot.slInitialized = false;
-        impl_->sl.unload();
+                      L"ID3D12Device(SL proxy)::CreateCommandQueue failed (0x%08X).",
+                      static_cast<unsigned>(qHr));
+        cleanupInitFailure(false);
         return false;
     }
-    impl_->slProxyQueue.Attach(static_cast<ID3D12CommandQueue*>(queuePtr));
 
-    // Detach plain swapchain before creating Streamline's proxy swapchain on the same HWND.
+    // Detach plain swapchain before installing the SL proxy queue and creating SL's proxy swapchain.
     IDXGISwapChain4* rawSc = presenter->detachSwapChainForWrap();
     if (rawSc) rawSc->Release();
+    presenter->bridge().setOverrideCommandQueue(impl_->slProxyQueue.Get());
 
     // Do not request FRAME_LATENCY_WAITABLE_OBJECT per SL DLSS-G docs §12.1 (let SL pacer own it).
     UINT cleanFlags = presenter->swapChainFlags() & ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -652,17 +721,14 @@ bool NvidiaStreamlineFgBackend::initialize(D3D12ProxyPresenter* presenter) {
         &proxySc1);
 
     Microsoft::WRL::ComPtr<IDXGISwapChain4> proxySc4;
-    if (FAILED(hr) || FAILED(proxySc1.As(&proxySc4)) ||
+    const HRESULT qiHr = SUCCEEDED(hr) ? proxySc1.As(&proxySc4) : hr;
+    proxySc1.Reset();
+    if (FAILED(hr) || FAILED(qiHr) ||
         !presenter->attachWrappedSwapChain(proxySc4.Detach())) {
         std::swprintf(impl_->snapshot.unavailableReason, 255,
                       L"CreateSwapChainForHwnd(Streamline proxy) failed (0x%08X).",
                       static_cast<unsigned>(hr));
-        presenter->recreatePlainSwapChain();
-        impl_->slProxyQueue.Reset();
-        impl_->slProxyFactory.Reset();
-        impl_->sl.slShutdown();
-        impl_->snapshot.slInitialized = false;
-        impl_->sl.unload();
+        cleanupInitFailure(true);
         return false;
     }
 
@@ -682,6 +748,12 @@ bool NvidiaStreamlineFgBackend::initialize(D3D12ProxyPresenter* presenter) {
     }
 
     presenter->setPresentMarkerHooks(&Impl::onPrePresent, &Impl::onPostPresent, impl_.get());
+    impl_->currentToken = nullptr;
+    impl_->currentFrameIdx = 0;
+    impl_->hasCurrentFrameIdx = false;
+    impl_->pendingNextToken = nullptr;
+    impl_->pendingNextFrameIdx = 0;
+    impl_->hasPendingNextToken = false;
     impl_->presenter = presenter;
     impl_->swapChainWrapped = true;
     impl_->initialized = true;
@@ -715,12 +787,22 @@ void NvidiaStreamlineFgBackend::shutdown() {
         impl_->sl.slReflexSetOptions(offReflex);
     }
 
-    // Restore plain D3D12 swapchain BEFORE slShutdown() so SL swapchain proxy is released first.
-    if (impl_->swapChainWrapped && impl_->presenter && impl_->presenter->isInitialized()) {
-        impl_->presenter->recreatePlainSwapChain();
+    // Strict Streamline ManualHooking teardown:
+    // 1) Release SL proxy swapchain BEFORE slShutdown() so eIDXGISwapChain_Destroyed runs while SL is live.
+    // 2) Clear bridge override queue, then release slProxyQueue BEFORE slProxyDevice (raw m_device ref).
+    // 3) Call slShutdown() + unload, then recreate plain D3D12 swapchain on the restored native queue.
+    const bool needRestorePlainSwapChain =
+        impl_->swapChainWrapped && impl_->presenter && impl_->presenter->isInitialized();
+    if (needRestorePlainSwapChain) {
+        IDXGISwapChain4* proxySc = impl_->presenter->detachSwapChainForWrap();
+        if (proxySc) proxySc->Release();
+    }
+    if (impl_->presenter && impl_->presenter->isInitialized()) {
+        impl_->presenter->bridge().setOverrideCommandQueue(nullptr);
     }
 
     impl_->slProxyQueue.Reset();
+    impl_->slProxyDevice.Reset();
     impl_->slProxyFactory.Reset();
     if (impl_->snapshot.slInitialized && impl_->sl.slShutdown) {
         impl_->sl.slShutdown();
@@ -728,7 +810,16 @@ void NvidiaStreamlineFgBackend::shutdown() {
     }
     impl_->sl.unload();
 
+    if (needRestorePlainSwapChain) {
+        impl_->presenter->recreatePlainSwapChain();
+    }
+
     impl_->currentToken = nullptr;
+    impl_->currentFrameIdx = 0;
+    impl_->hasCurrentFrameIdx = false;
+    impl_->pendingNextToken = nullptr;
+    impl_->pendingNextFrameIdx = 0;
+    impl_->hasPendingNextToken = false;
     impl_->swapChainWrapped = false;
     impl_->presenter = nullptr;
     impl_->initialized = false;
@@ -748,13 +839,29 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
 
     const uint32_t frameIdx32 = static_cast<uint32_t>(inputs.frameIndex & 0xFFFFFFFFu);
     sl::FrameToken* token = nullptr;
-    if (impl_->sl.slGetNewFrameToken(token, &frameIdx32) != sl::Result::eOk || !token) {
-        return false;
+    if (impl_->hasPendingNextToken && impl_->pendingNextToken &&
+        impl_->pendingNextFrameIdx == frameIdx32) {
+        token = impl_->pendingNextToken;
+        impl_->pendingNextToken = nullptr;
+        impl_->hasPendingNextToken = false;
+    } else {
+        impl_->pendingNextToken = nullptr;
+        impl_->hasPendingNextToken = false;
+        if (impl_->sl.slGetNewFrameToken(token, &frameIdx32) != sl::Result::eOk || !token) {
+            return false;
+        }
+        if (impl_->sl.slReflexSleep && impl_->snapshot.reflexSupported) {
+            impl_->sl.slReflexSleep(*token);
+        }
+        if (impl_->sl.slPCLSetMarker && impl_->snapshot.pclSupported) {
+            impl_->sl.slPCLSetMarker(sl::PCLMarker::eSimulationStart, *token);
+        }
     }
     impl_->currentToken = token;
+    impl_->currentFrameIdx = frameIdx32;
+    impl_->hasCurrentFrameIdx = true;
 
     if (impl_->sl.slPCLSetMarker && impl_->snapshot.pclSupported) {
-        impl_->sl.slPCLSetMarker(sl::PCLMarker::eSimulationStart, *token);
         impl_->sl.slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *token);
         impl_->sl.slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *token);
     }
@@ -844,10 +951,18 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     uiRes.nativeFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
     const sl::ResourceTag tags[] = {
-        sl::ResourceTag{&depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &renderExtent},
-        sl::ResourceTag{&mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &renderExtent},
-        sl::ResourceTag{&hudlessRes, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &outExtent},
-        sl::ResourceTag{&uiRes, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, &outExtent},
+        sl::ResourceTag{(effectiveEnable && inputs.depth) ? &depthRes : nullptr,
+                        sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent,
+                        (effectiveEnable && inputs.depth) ? &renderExtent : nullptr},
+        sl::ResourceTag{(effectiveEnable && inputs.motionVectors) ? &mvecRes : nullptr,
+                        sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
+                        (effectiveEnable && inputs.motionVectors) ? &renderExtent : nullptr},
+        sl::ResourceTag{(effectiveEnable && inputs.hudlessColor) ? &hudlessRes : nullptr,
+                        sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent,
+                        (effectiveEnable && inputs.hudlessColor) ? &outExtent : nullptr},
+        sl::ResourceTag{(effectiveEnable && inputs.packedUiColorAndAlpha) ? &uiRes : nullptr,
+                        sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent,
+                        (effectiveEnable && inputs.packedUiColorAndAlpha) ? &outExtent : nullptr},
     };
     if (impl_->sl.slSetTagForFrame(*token, impl_->viewport, tags,
                                    static_cast<uint32_t>(std::size(tags)), cmdList) != sl::Result::eOk) {
