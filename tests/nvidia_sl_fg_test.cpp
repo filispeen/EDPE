@@ -86,6 +86,11 @@ int runUnitChecks() {
     REQUIRE(backend.isLowLatencyBoost());
     backend.setDynamicMfgMode(true, 120.0f);
     REQUIRE(backend.isDynamicMfgEnabled());
+    REQUIRE(!backend.isDebugViewEnabled());
+    backend.setDebugView(true);
+    REQUIRE(backend.isDebugViewEnabled());
+    backend.setDebugView(false);
+    REQUIRE(!backend.isDebugViewEnabled());
     return 0;
 }
 

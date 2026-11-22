@@ -299,6 +299,7 @@ struct NvidiaStreamlineFgBackend::Impl {
     bool lowLatencyBoost = false;
     bool dynamicMfg = false;
     float dynamicTargetFps = 0.0f;
+    bool debugView = false;
     bool forceResetNext = true;
     bool activeInLastEvaluate = false;
     bool probeAttempted = false;
@@ -1044,6 +1045,9 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     if (effectiveEnable && inputs.packedUiColorAndAlpha) {
         opts.flags |= sl::DLSSGFlags::eEnableFullscreenMenuDetection;
     }
+    if (effectiveEnable && impl_->debugView) {
+        opts.flags |= sl::DLSSGFlags::eShowOnlyInterpolatedFrame;
+    }
     opts.enableUserInterfaceRecomposition =
         (effectiveEnable && inputs.hudlessColor && inputs.packedUiColorAndAlpha)
             ? sl::Boolean::eTrue
@@ -1109,6 +1113,16 @@ void NvidiaStreamlineFgBackend::setDynamicMfgMode(bool enableDynamic, float targ
 bool NvidiaStreamlineFgBackend::isDynamicMfgEnabled() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->dynamicMfg;
+}
+
+void NvidiaStreamlineFgBackend::setDebugView(bool enabled) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->debugView = enabled;
+}
+
+bool NvidiaStreamlineFgBackend::isDebugViewEnabled() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->debugView;
 }
 
 bool NvidiaStreamlineFgBackend::reflexSleepCurrentFrame() {

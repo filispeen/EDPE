@@ -465,6 +465,16 @@ void AmdFsrFgBackend::setDebugFlags(bool tearLines, bool pacingLines, bool debug
     impl_->debugView = debugView;
 }
 
+void AmdFsrFgBackend::setDebugView(bool enabled) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->debugView = enabled;
+}
+
+bool AmdFsrFgBackend::isDebugViewEnabled() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->debugView;
+}
+
 bool AmdFsrFgBackend::queryGpuMemoryUsage(uint64_t* outFgTotalBytes,
                                           uint64_t* outSwapChainTotalBytes) const {
     if (outFgTotalBytes) *outFgTotalBytes = 0;

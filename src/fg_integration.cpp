@@ -149,25 +149,30 @@ void FgRuntime::applyConfig(int backendInt,
         auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
         sl->setLowLatencyBoost(reflexBoost_);
         sl->setDynamicMfgMode(dynamicMfg_, dynamicTargetFps_);
+        sl->setDebugView(fgDebugView_);
     }
     if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
         auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-        amd->setDebugFlags(false, false, fsrDebugView_);
+        amd->setDebugFlags(false, false, fgDebugView_);
     }
 }
 
-void FgRuntime::setFsrDebugView(bool enabled) {
+void FgRuntime::setFgDebugView(bool enabled) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    fsrDebugView_ = enabled;
+    fgDebugView_ = enabled;
     if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
         auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-        amd->setDebugFlags(false, false, fsrDebugView_);
+        amd->setDebugFlags(false, false, fgDebugView_);
+    }
+    if (auto* b = manager_.getBackend(FrameGenerationBackend::NvidiaDlssG)) {
+        auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
+        sl->setDebugView(fgDebugView_);
     }
 }
 
-bool FgRuntime::fsrDebugView() const {
+bool FgRuntime::fgDebugView() const {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    return fsrDebugView_;
+    return fgDebugView_;
 }
 
 bool FgRuntime::isMotionNeeded() const {
@@ -653,6 +658,11 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
             auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
             sl->setLowLatencyBoost(reflexBoost_);
             sl->setDynamicMfgMode(dynamicMfg_, dynamicTargetFps_);
+            sl->setDebugView(fgDebugView_);
+        }
+        if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
+            auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
+            amd->setDebugFlags(false, false, fgDebugView_);
         }
         if (!manager_.selectBackend(configuredBackend_, &presenter_)) {
             const wchar_t* reason = backendUnavailableReasonLocked(configuredBackend_);

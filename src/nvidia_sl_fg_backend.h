@@ -68,6 +68,9 @@ public:
     void setDynamicMfgMode(bool enableDynamic, float targetFps = 0.0f);
     bool isDynamicMfgEnabled() const;
 
+    void setDebugView(bool enabled) override;
+    bool isDebugViewEnabled() const override;
+
     // Invokes slReflexSleep for the current frame token when Reflex is active.
     bool reflexSleepCurrentFrame();
 

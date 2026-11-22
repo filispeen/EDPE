@@ -262,6 +262,11 @@ int main() {
     }
 
     std::printf("Testing teardown...\n");
+    REQUIRE(!fg.fgDebugView());
+    fg.setFgDebugView(true);
+    REQUIRE(fg.fgDebugView());
+    fg.setFgDebugView(false);
+    REQUIRE(!fg.fgDebugView());
     fg.applyConfig(0, 2, false, 0.0f, false);
     fg.onSwapChainRelease(sc1.Get());
     fg.shutdown();

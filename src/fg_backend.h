@@ -126,6 +126,9 @@ public:
                           uint32_t* outGeneratedFrames) = 0;
 
     virtual void resetHistory() = 0;
+
+    virtual void setDebugView(bool /*enabled*/) {}
+    virtual bool isDebugViewEnabled() const { return false; }
 };
 
 class NullFrameGenBackend : public IFrameGenerationBackend {
