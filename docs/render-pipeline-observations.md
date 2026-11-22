@@ -171,3 +171,18 @@ Following the nvidia-dlaa-input-contract.md implications and PLAN.md expected or
   - Inside 5376-byte `cb1`, `cb1[35..38]` (`words[140..155]`) persistently holds the Main World Camera inverse projection basis (`|cb1[35].xyz| = 1 / world_scaleX`, `|cb1[36].xyz| = 1 / world_scaleY`, `cb1[37] = (0, 0, 0, 1 / world_depthB)`, `|cb1[38].xyz| = 1.0`) even while `cb1` is unmapped for a viewmodel sub-pass.
   - **Confidence:** High (directly measured in `EDO1.rdc` and `EDO2.rdc` constant buffers).
   - **Implication:** Compare `parsed_camera` against `cb1[35..38]` (`isEliteSubpassVersusWorldCb1` / `matchesEliteWorldProjectionScales`) so same-`depthB` ADS viewmodel draws are routed to `SceneSubpassTracker` without triggering camera cuts or hijacking world camera staging/motion/deferred repair, while smooth world FOV zoom during ADS transitions is accepted without per-frame history resets (`projCut` > 25% or `depthB` change).
+
+## On-foot ADS FOV ramp & spinning settlement beacon camera hijack (`issue #26`, 2026-11-22)
+
+- **Date:** 2026-11-22. Sources: `issue #26` `edpe.log` (`v0.8.0-rc2`, Odyssey Surface Operations Tutorial, `3440x1440`) and DLSS-G debug-view video capture (`2026-11-22_10-31-31.mp4`, frames `634–2109`).
+- **Method:** Frame-by-frame inspection of DLSS-G debug tiles (motion vectors, canonical depth, HUD-less, UI, FG output) correlated with `edpe.log` `commitMainCamera` / `viewmodel subpass decision` / `unmap candidate ignored` traces.
+- **VERIFIED (Spinning settlement alarm beacon camera characteristics):**
+  - During on-foot settlement combat/alarm states, Cobra submits pre-scene (`in_scene=0`) rotating spotlight/shadow-beacon cameras with `depthB = 0.1002`, 1:1 square aspect ratio, fixed world position ~29–50 m from the player, rotating continuously ~12°–17°/frame (`dist = 0.0000`, `deg = 12..17`).
+  - **Confidence:** High (observed across thousands of consecutive frames in `edpe.log`, e.g. frames `63071–66166`, matching the ~15°/frame rotational MV saturation visible across skybox/buildings in DLSS-G debug frames `1098–2109`).
+- **VERIFIED (Smooth ADS FOV ramp triggers `cb1[35..38]` lag & `commitMainCamera fallback`):**
+  - Entering/exiting on-foot ADS smoothly animates `proj1080` (`scaleX` steps ~2–5%/frame, e.g. `0.7605 -> 0.7918 -> 0.8267 -> 0.8579 -> 0.8840` at `depthB = 0.0250`) while `cb1[35..38]` (`local_world140`) temporarily lags by >2%, causing `isEliteSubpassVersusWorldBlock16` to reject world G-buffer unmaps and fall into `commitMainCamera fallback` (`frames 60342, 60981, 62746, 63000, 66494, 88849..88851`).
+  - **Confidence:** High (directly observed in `edpe.log` and matched to ADS-exit corruption timestamps `634–665`, `871`, `1098–2109`).
+- **Implication:**
+  - All camera qualification and fallback recovery paths must enforce `isMainCameraGeometryValid` (including screen-matching aspect ratio, non-square viewport, `wLenSq`, and `depthB`) plus `worldDepthB` matching when `cb1[35..38]` is valid.
+  - `s_cut_rejection_streak` recovery must be gated to `(in_main_scene || matches_world_cb1 || s_consecutive_fallback_frames >= 3)` so pre-scene (`in_scene=0`) auxiliary cameras cannot hijack `s_camera_now`.
+  - Smooth world FOV ramps (`isSmoothWorldFovTransitionCandidate`) must update `s_camera_now` via `s_world_zoom_fallback_camera` without falsely promoting ~2.5x ADS viewmodel sub-passes (`sx = 2.3740 / 3.1901`) or dropping into fallback.

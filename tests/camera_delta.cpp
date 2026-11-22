@@ -499,5 +499,122 @@ int main() {
     verticalThrust.worldFromView[7] = 0.2728f;
     if (edpe::isStereoEyeOrIpdProbe(verticalThrust, identity())) return 110;
 
+    // 36. isMainCameraGeometryValid: accepts 21:9 and 16:9 world cameras and rejects
+    // 1:1 square spinning spotlights (depthB=0.1002), square viewports, bad chirality,
+    // out-of-range depthB, and degenerate perspective W columns.
+    const float validProj1080[16] = {
+        0.7832f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.8709f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+        0.0f, 0.0f, 0.025f, 0.0f
+    };
+    edpe::CameraProjection cam21x9 = identity();
+    cam21x9.scaleX = 0.7832f;
+    cam21x9.scaleY = 1.87098f;
+    cam21x9.depthB = 0.025f;
+    if (!edpe::isMainCameraGeometryValid(cam21x9, validProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 111;
+
+    edpe::CameraProjection cam16x9 = identity();
+    cam16x9.scaleX = 1.0525f;
+    cam16x9.scaleY = 1.8709f;
+    cam16x9.depthB = 0.025f;
+    if (!edpe::isMainCameraGeometryValid(cam16x9, validProj1080, 2560.0f, 1440.0f, 2560, 1440)) return 112;
+
+    edpe::CameraProjection squareSpotlight = identity();
+    squareSpotlight.scaleX = 1.0f;
+    squareSpotlight.scaleY = 1.0f;
+    squareSpotlight.depthB = 0.1002f;
+    if (edpe::isMainCameraGeometryValid(squareSpotlight, validProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 113;
+
+    if (edpe::isMainCameraGeometryValid(cam21x9, validProj1080, 1024.0f, 1024.0f, 3440, 1440)) return 114;
+    if (edpe::isMainCameraGeometryValid(cam21x9, validProj1080, 32.0f, 32.0f, 3440, 1440)) return 115;
+
+    edpe::CameraProjection reflected21x9 = cam21x9;
+    reflected21x9.worldFromView[0] = -1.0f;
+    if (edpe::isMainCameraGeometryValid(reflected21x9, validProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 116;
+
+    edpe::CameraProjection lowDepthB = cam21x9;
+    lowDepthB.depthB = 0.005f;
+    if (edpe::isMainCameraGeometryValid(lowDepthB, validProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 117;
+
+    edpe::CameraProjection highDepthB = cam21x9;
+    highDepthB.depthB = 0.5f;
+    if (edpe::isMainCameraGeometryValid(highDepthB, validProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 118;
+
+    const float degenerateProj1080[16]{};
+    if (edpe::isMainCameraGeometryValid(cam21x9, degenerateProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 119;
+
+    // 37. isSmoothWorldFovTransitionCandidate: accepts smooth ADS zoom-in/zoom-out ramps
+    // (including turning and movement) while rejecting ADS viewmodels (~2.5x scale),
+    // hip-fire viewmodels (depthB=0.0675), settlement beacons (depthB=0.1002 / distant),
+    // and large rotation cuts.
+    edpe::CameraProjection adsBase21x9 = cam21x9;
+    adsBase21x9.scaleX = 0.7250f;
+    adsBase21x9.scaleY = 0.7250f * (3440.0f / 1440.0f);
+
+    edpe::CameraProjection adsStep1 = adsBase21x9;
+    adsStep1.scaleX = 0.7605f;
+    adsStep1.scaleY = 0.7605f * (3440.0f / 1440.0f);
+    if (!edpe::isSmoothWorldFovTransitionCandidate(adsStep1, adsBase21x9, 0.7250f, 0.025f)) return 120;
+
+    edpe::CameraProjection adsStep2 = adsBase21x9;
+    adsStep2.scaleX = 0.7918f;
+    adsStep2.scaleY = 0.7918f * (3440.0f / 1440.0f);
+    if (!edpe::isSmoothWorldFovTransitionCandidate(adsStep2, adsStep1, 0.7250f, 0.025f)) return 121;
+
+    edpe::CameraProjection zoomOutStart = cam21x9;
+    zoomOutStart.scaleX = 1.05f;
+    zoomOutStart.scaleY = 1.05f * (3440.0f / 1440.0f);
+    edpe::CameraProjection zoomOutStep = cam21x9;
+    zoomOutStep.scaleX = 0.92f;
+    zoomOutStep.scaleY = 0.92f * (3440.0f / 1440.0f);
+    if (!edpe::isSmoothWorldFovTransitionCandidate(zoomOutStep, zoomOutStart, 1.05f, 0.025f)) return 122;
+
+    edpe::CameraProjection turningMovingZoom = yawed(20.0f);
+    turningMovingZoom.scaleX = 0.7918f;
+    turningMovingZoom.scaleY = 0.7918f * (3440.0f / 1440.0f);
+    turningMovingZoom.depthB = 0.025f;
+    turningMovingZoom.worldFromView[11] = 0.5f;
+    if (!edpe::isSmoothWorldFovTransitionCandidate(turningMovingZoom, adsStep1, 0.7250f, 0.025f)) return 123;
+
+    // ADS viewmodel sub-passes (~2.52x scaleX jump) must be rejected:
+    edpe::CameraProjection vm21x9Base = cam21x9;
+    vm21x9Base.scaleX = 0.94f;
+    vm21x9Base.scaleY = 0.94f * (3440.0f / 1440.0f);
+    edpe::CameraProjection vm21x9Sub = vm21x9Base;
+    vm21x9Sub.scaleX = 2.3740f;
+    vm21x9Sub.scaleY = 2.3740f * (3440.0f / 1440.0f);
+    if (edpe::isSmoothWorldFovTransitionCandidate(vm21x9Sub, vm21x9Base, 0.94f, 0.025f)) return 124;
+
+    if (edpe::isSmoothWorldFovTransitionCandidate(adsViewmodel, adsWorld, 1.2634f, 0.025f)) return 125;
+
+    // Hip-fire viewmodel (depthB=0.0675) and settlement beacon (depthB=0.1002) must be rejected:
+    if (edpe::isSmoothWorldFovTransitionCandidate(viewmodelSubpass, worldBase, worldBase.scaleX, 0.025f)) return 126;
+
+    edpe::CameraProjection beaconAtOrigin = adsBase21x9;
+    beaconAtOrigin.depthB = 0.1002f;
+    if (edpe::isSmoothWorldFovTransitionCandidate(beaconAtOrigin, adsBase21x9, 0.7250f, 0.025f)) return 127;
+
+    edpe::CameraProjection beaconFar = beaconAtOrigin;
+    beaconFar.worldFromView[3] = 29.5f;
+    if (edpe::isSmoothWorldFovTransitionCandidate(beaconFar, adsBase21x9, 0.7250f, 0.025f)) return 128;
+
+    // Distant same-depthB auxiliary camera and >45 deg rotation cuts must be rejected:
+    edpe::CameraProjection farWorld = adsStep1;
+    farWorld.worldFromView[3] = 29.5f;
+    if (edpe::isSmoothWorldFovTransitionCandidate(farWorld, adsBase21x9, 0.7250f, 0.025f)) return 129;
+
+    edpe::CameraProjection rot50 = yawed(50.0f);
+    rot50.scaleX = 0.7605f;
+    rot50.scaleY = 0.7605f * (3440.0f / 1440.0f);
+    rot50.depthB = 0.025f;
+    if (edpe::isSmoothWorldFovTransitionCandidate(rot50, adsBase21x9, 0.7250f, 0.025f)) return 130;
+
+    edpe::CameraProjection rot180 = yawed(180.0f);
+    rot180.scaleX = 0.7605f;
+    rot180.scaleY = 0.7605f * (3440.0f / 1440.0f);
+    rot180.depthB = 0.025f;
+    if (edpe::isSmoothWorldFovTransitionCandidate(rot180, adsBase21x9, 0.7250f, 0.025f)) return 131;
+
     return 0;
 }

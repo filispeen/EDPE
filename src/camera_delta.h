@@ -538,4 +538,88 @@ inline bool isSamePoseSceneSubpass(const CameraProjection& candidate,
     return !isRearOrAuxiliaryProbe(candidate, ref, last_velocity, dtRatio);
 }
 
+// Validates perspective camera geometry for the main display view:
+// finite positive scales, main-scene near-plane range [0.01, 0.25], right-handed
+// orthonormal rotation det in [0.85, 1.15], unit-length perspective W column (if proj1080
+// is supplied), non-square/non-tiny viewport (if vpW/vpH are supplied), and screen-matching
+// aspect ratio (rejecting 1:1 square shadow/spotlight/cubemap cameras on widescreen).
+inline bool isMainCameraGeometryValid(
+    const CameraProjection& candidate,
+    const float* proj1080,
+    float vpW,
+    float vpH,
+    unsigned outW,
+    unsigned outH)
+{
+    if (!(candidate.scaleX > 0.0f && candidate.scaleY > 0.0f)) return false;
+    if (candidate.depthB < 0.01f || candidate.depthB > 0.25f) return false;
+
+    const float det = cameraRotationDeterminant(candidate);
+    if (det < 0.85f || det > 1.15f) return false;
+
+    if (proj1080) {
+        const double w0 = proj1080[3], w1 = proj1080[7], w2 = proj1080[11];
+        const double wLenSq = w0 * w0 + w1 * w1 + w2 * w2;
+        if (wLenSq < 0.5 || wLenSq > 1.5) return false;
+    }
+
+    if (std::isfinite(vpW) && std::isfinite(vpH) && vpW > 0.0f && vpH > 0.0f) {
+        if (outW > outH && std::fabs(vpW - vpH) < 1.0f) return false;
+        if (vpW < 64.0f || vpH < 64.0f) return false;
+    }
+
+    const float camAspect = candidate.scaleY / candidate.scaleX;
+    if (outW > outH && std::fabs(camAspect - 1.0f) < 0.03f) return false;
+    if (outW > 0 && outH > 0) {
+        const float screenAspect = static_cast<float>(outW) / static_cast<float>(outH);
+        if (std::fabs(camAspect - screenAspect) > 0.05f) return false;
+    }
+    return true;
+}
+
+// True when a cb1[35..38]-mismatched pass (e.g. during an ADS FOV ramp where cb1[35..38]
+// lags proj1080 by >2%) is a smooth world-camera FOV step rather than a viewmodel sub-pass
+// (which jumps ~2.5x in scaleX or uses depthB=0.0675) or a distant auxiliary spotlight.
+inline bool isSmoothWorldFovTransitionCandidate(
+    const CameraProjection& candidate,
+    const CameraProjection& committed,
+    float worldScaleX,
+    float worldDepthB,
+    float maxPosDist = 1.0f,
+    float dtRatio = 1.0f,
+    const Vec3& last_velocity = {0.0f, 0.0f, 0.0f})
+{
+    if (!(committed.scaleX > 0.0f && committed.scaleY > 0.0f)) return false;
+    if (!(candidate.scaleX > 0.0f && candidate.scaleY > 0.0f)) return false;
+    if (std::fabs(candidate.depthB - committed.depthB) > 1e-3f) return false;
+    if (worldDepthB > 0.0f && std::fabs(candidate.depthB - worldDepthB) > 1e-3f) return false;
+
+    const float det = cameraRotationDeterminant(candidate);
+    if (det < 0.85f || det > 1.15f) return false;
+
+    // Require smooth single-frame FOV step relative to committed AND proximity to cb1[35..38]
+    // world scale so the ~2.52x ADS viewmodel sub-pass (e.g. 2.374 vs 0.94 or 3.19 vs 1.26)
+    // is never promoted as the main world camera.
+    const float ratioCommittedX = candidate.scaleX / committed.scaleX;
+    const float ratioCommittedY = candidate.scaleY / committed.scaleY;
+    if (ratioCommittedX < 0.65f || ratioCommittedX > 1.55f ||
+        ratioCommittedY < 0.65f || ratioCommittedY > 1.55f) {
+        return false;
+    }
+    if (worldScaleX > 0.0f) {
+        const float ratioWorldX = candidate.scaleX / worldScaleX;
+        if (ratioWorldX < 0.65f || ratioWorldX > 1.55f) return false;
+    }
+
+    if (cameraRotationTrace(candidate, committed) <= 2.40f) return false;
+    if (isRearOrAuxiliaryProbe(candidate, committed, last_velocity, dtRatio)) return false;
+
+    const Vec3 candPos = cameraPosition(candidate);
+    const Vec3 prevPos = cameraPosition(committed);
+    const float clampedDtRatio = std::clamp(dtRatio, 0.25f, 4.0f);
+    const float rawDist = length(candPos - prevPos);
+    const float predDist = length(candPos - (prevPos + last_velocity * clampedDtRatio));
+    return std::min(rawDist, predDist) <= maxPosDist;
+}
+
 } // namespace edpe

@@ -98,8 +98,8 @@ public:
 
     FgRuntimeTelemetry telemetry() const;
     bool isBackendAvailable(FrameGenerationBackend backend) const;
-    void setFsrDebugView(bool enabled);
-    bool fsrDebugView() const;
+    void setFgDebugView(bool enabled);
+    bool fgDebugView() const;
     const wchar_t* backendUnavailableReason(FrameGenerationBackend backend) const;
 
     // Custom window message dispatcher invoked from edpeWndProc on gameHwnd's UI thread
@@ -137,7 +137,7 @@ private:
     bool dynamicMfg_ = false;
     float dynamicTargetFps_ = 0.0f;
     bool reflexBoost_ = false;
-    bool fsrDebugView_ = false;
+    bool fgDebugView_ = false;
 
     IDXGISwapChain* trackedSwapChain_ = nullptr;
     HWND gameHwnd_ = nullptr;

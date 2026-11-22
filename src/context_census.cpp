@@ -553,6 +553,14 @@ static unsigned long long s_probe_fallback_frame = ~0ull;
 static bool s_has_probe_fallback_camera = false;
 static bool s_probe_fallback_from_in_scene = false;
 static bool s_probe_fallback_parse_ok = false;
+// Smooth world-camera FOV zoom fallback (e.g. on-foot ADS zoom ramp where cb1[35..38]
+// temporarily lags proj1080 by >2% without jumping to viewmodel scale):
+static edpe::CameraProjection s_world_zoom_fallback_camera{};
+static unsigned long long s_world_zoom_fallback_frame = ~0ull;
+static bool s_has_world_zoom_fallback_camera = false;
+static bool s_world_zoom_fallback_from_in_scene = false;
+static bool s_world_zoom_fallback_parse_ok = false;
+static float s_world_zoom_fallback_world_scale_err = 1e30f;
 static bool s_last_committed_scene_cut = false;
 static bool s_last_committed_origin_reanchor = false;
 static unsigned s_teleport_rejection_streak = 0;
@@ -673,48 +681,11 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
         return false;
     }
 
-    // 1. Strict Near Plane (depthB) range filter (0.01m .. 0.25m):
-    // In Cobra Odyssey, reversed-Z perspective depth is rawDepth = depthB / viewZ.
-    // The player's main eye camera consistently uses near plane depthB around 0.025m (2.5 cm, range 0.01m..0.25m).
-    if (parsed_camera.depthB < 0.01f || parsed_camera.depthB > 0.25f) {
-        return false;
-    }
-
-    // 2. Strict perspective vs orthographic check:
-    const float* p1080 = proj1080 ? proj1080 : &words[1080];
-    const double w0 = p1080[3], w1 = p1080[7], w2 = p1080[11];
-    const double wLenSq = w0 * w0 + w1 * w1 + w2 * w2;
-    if (wLenSq < 0.5 || wLenSq > 1.5) {
-        return false;
-    }
-
-    // 3. Viewport / resolution filtering from words 1328..1331:
-    const float vpW = words[1328];
-    const float vpH = words[1329];
-    if (std::isfinite(vpW) && std::isfinite(vpH) && vpW > 0.0f && vpH > 0.0f) {
-        if (outW > outH && std::fabs(vpW - vpH) < 1.0f) {
-            return false;
-        }
-        if (vpW < 64.0f || vpH < 64.0f) {
-            return false;
-        }
-    }
-
-    // 4. Camera aspect ratio validation:
-    const float camAspect = parsed_camera.scaleY / parsed_camera.scaleX;
-    if (outW > outH && std::fabs(camAspect - 1.0f) < 0.03f) {
-        return false;
-    }
-    if (outW > 0 && outH > 0) {
-        const float screenAspect = static_cast<float>(outW) / static_cast<float>(outH);
-        if (std::fabs(camAspect - screenAspect) > 0.05f) {
-            return false;
-        }
-    }
-
-    // 5. Coordinate chirality / orthonormality check (rejects planar reflections det < 0.85 or det > 1.15):
-    const float det = cameraRotationDeterminant(parsed_camera);
-    if (det < 0.85f || det > 1.15f) {
+    // 1-5. Main-camera geometry validation (near plane depthB, perspective W,
+    // viewport resolution/aspect, camera aspect ratio, rotation chirality/orthonormality):
+    if (!edpe::isMainCameraGeometryValid(
+            parsed_camera, proj1080 ? proj1080 : &words[1080],
+            words[1328], words[1329], outW, outH)) {
         return false;
     }
 
@@ -733,10 +704,10 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
         const bool matchesWorldCb1Zoom =
             matchesWorldCb1 &&
             std::fabs(parsed_camera.depthB - committed_camera.depthB) <= 1e-3f &&
-            parsed_camera.scaleX >= 0.4f * committed_camera.scaleX &&
-            parsed_camera.scaleX <= 2.5f * committed_camera.scaleX &&
-            cameraRotationTrace(parsed_camera, committed_camera) > 2.95f &&
-            minPosDist < 0.25f;
+            parsed_camera.scaleX >= 0.20f * committed_camera.scaleX &&
+            parsed_camera.scaleX <= 6.0f * committed_camera.scaleX &&
+            cameraRotationTrace(parsed_camera, committed_camera) > 2.40f &&
+            minPosDist < 1.0f;
         if (matchesWorldCb1Zoom) {
             compareCam.scaleX = parsed_camera.scaleX;
             compareCam.scaleY = parsed_camera.scaleY;
@@ -810,8 +781,14 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         !s_staged_was_probe_vs_committed &&
         s_camera_now.scaleX > 0.0f;
     const bool useOrientationOnlyHold = useProbePositionHold || useTeleportPositionHold;
+    const bool useWorldZoomFallback =
+        !haveNormalStaged &&
+        s_has_world_zoom_fallback_camera &&
+        s_world_zoom_fallback_frame == rendered_frame &&
+        s_camera_now.scaleX > 0.0f;
     const bool useProbeOrientationFallback =
         !haveNormalStaged &&
+        !useWorldZoomFallback &&
         s_has_probe_fallback_camera &&
         s_probe_fallback_frame == rendered_frame &&
         s_camera_now.scaleX > 0.0f &&
@@ -819,10 +796,13 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
 
     out_scene_cut = false;
     s_last_committed_origin_reanchor = false;
-    if (haveNormalStaged || useProbeOrientationFallback) {
+    if (haveNormalStaged || useWorldZoomFallback || useProbeOrientationFallback) {
         const edpe::CameraProjection committedCam = [&]() {
             if (haveNormalStaged && !useOrientationOnlyHold) {
                 return s_staged_camera;
+            }
+            if (useWorldZoomFallback) {
+                return s_world_zoom_fallback_camera;
             }
             const edpe::CameraProjection& orientSrc =
                 haveNormalStaged ? s_staged_camera : s_probe_fallback_camera;
@@ -844,7 +824,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
             const bool projCut = edpe::isCameraProjectionCut(committedCam, prevRef);
 
             s_prev_valid_velocity = s_last_valid_velocity;
-            if (!haveNormalStaged || useOrientationOnlyHold) {
+            if ((!haveNormalStaged && !useWorldZoomFallback) || useOrientationOnlyHold) {
                 s_camera_previous = s_camera_now;
                 s_camera_previous_frame = s_camera_frame;
                 out_scene_cut = false;
@@ -902,7 +882,9 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
             s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
         }
 
-        const bool committedFromParseOk = haveNormalStaged ? s_staged_was_parse_ok : s_probe_fallback_parse_ok;
+        const bool committedFromParseOk = haveNormalStaged
+            ? s_staged_was_parse_ok
+            : (useWorldZoomFallback ? s_world_zoom_fallback_parse_ok : s_probe_fallback_parse_ok);
         s_consecutive_fallback_frames = 0;
         s_cut_rejection_streak = 0;
         if (!useTeleportPositionHold) {
@@ -925,6 +907,10 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         s_has_probe_fallback_camera = false;
         s_probe_fallback_from_in_scene = false;
         s_probe_fallback_parse_ok = false;
+        s_has_world_zoom_fallback_camera = false;
+        s_world_zoom_fallback_from_in_scene = false;
+        s_world_zoom_fallback_parse_ok = false;
+        s_world_zoom_fallback_world_scale_err = 1e30f;
 
         if (useProbeOrientationFallback || useProbePositionHold) {
             static unsigned s_probe_orient_tokens = 0;
@@ -8181,7 +8167,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         std::fabs(bsx - worldSx) <= 0.02 * worldSx &&
                         std::fabs(bsy - worldSy) <= 0.02 * worldSy &&
                         std::fabs(local_proj1080[14] - worldDb) <= 1e-3f &&
-                        bsx >= 0.4 * blockRef.scaleX && bsx <= 2.5 * blockRef.scaleX;
+                        bsx >= 0.20 * blockRef.scaleX && bsx <= 6.0 * blockRef.scaleX;
                     bool ok =
                         (matchRefScale || matchWorldCb1ZoomScale) &&
                         local_proj1080[14] >= 0.01f && local_proj1080[14] <= 0.25f &&
@@ -8418,6 +8404,13 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const bool cb1HasLiveEyePos = cb1HasLiveEyePosPre;
                     const bool allowPreSceneMainEye =
                         in_main_scene || cb1HasLiveEyePos || matches_world_cb1;
+                    float worldSx = 0.0f, worldSy = 0.0f, worldDepthB = 0.0f;
+                    const bool has_world_cb1 = edpe::extractEliteWorldProjectionScalesFromBlock16(
+                        local_world140, &worldSx, &worldSy, &worldDepthB);
+                    const bool valid_main_geom = edpe::isMainCameraGeometryValid(
+                        parsed_camera, local_proj1080, curVpW, curVpH, outW, outH);
+                    const bool matches_world_depthB =
+                        !has_world_cb1 || (std::fabs(parsed_camera.depthB - worldDepthB) <= 1e-3f);
 
                     bool stage_probe_in_scene = false;
                     if (is_probe) {
@@ -8486,6 +8479,38 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         edpe::isSamePoseSceneSubpass(
                             parsed_camera, *spCheckRef, maxSubpassDist, dtRatio, spCheckVel, is_cb1_subpass);
 
+                    // Smooth world FOV transitions (e.g. on-foot ADS zoom ramp) where cb1[35..38]
+                    // temporarily lags proj1080 by >2% must still update s_camera_now cleanly
+                    // without promoting viewmodel sub-passes (~2.5x scale jump or depthB=0.0675)
+                    // or falling into fallback where auxiliary spotlights can hijack staging.
+                    if (!passes_filter && !is_probe && is_cb1_subpass &&
+                        valid_main_geom && matches_world_depthB &&
+                        !hasStagedForFrame && (in_main_scene || cb1HasLiveEyePos) &&
+                        edpe::isSmoothWorldFovTransitionCandidate(
+                            parsed_camera, s_camera_now, has_world_cb1 ? worldSx : 0.0f,
+                            has_world_cb1 ? worldDepthB : 0.0f, 1.0f, dtRatio, s_last_valid_velocity)) {
+                        const float scaleErr = (has_world_cb1 && worldSx > 0.0f)
+                            ? (std::fabs(parsed_camera.scaleX - worldSx) / worldSx)
+                            : 0.0f;
+                        const bool haveZoomFb =
+                            (s_has_world_zoom_fallback_camera && s_world_zoom_fallback_frame == cur_frame);
+                        const bool preferZoomUpgrade =
+                            !haveZoomFb ||
+                            (in_main_scene && !s_world_zoom_fallback_from_in_scene) ||
+                            (in_main_scene == s_world_zoom_fallback_from_in_scene &&
+                             (scaleErr + 1e-4f < s_world_zoom_fallback_world_scale_err ||
+                              (std::fabs(scaleErr - s_world_zoom_fallback_world_scale_err) <= 1e-4f &&
+                               parse_ok && !s_world_zoom_fallback_parse_ok)));
+                        if (preferZoomUpgrade) {
+                            s_world_zoom_fallback_camera = parsed_camera;
+                            s_has_world_zoom_fallback_camera = true;
+                            s_world_zoom_fallback_frame = cur_frame;
+                            s_world_zoom_fallback_from_in_scene = in_main_scene;
+                            s_world_zoom_fallback_parse_ok = parse_ok;
+                            s_world_zoom_fallback_world_scale_err = scaleErr;
+                        }
+                    }
+
                     // Real camera rotation or FOV change:
                     // 1) Pure in-place pilot head/ship rotation (rawDist < 0.05m) with valid FOV and chirality
                     //    is accepted immediately so fast head-look/mouse-look turns never drop camera updates.
@@ -8502,22 +8527,22 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     if (!passes_filter && !is_probe && !is_same_pose_subpass_cand &&
                         (!is_cb1_subpass || allow_cb1_subpass_fallback_recovery) &&
                         (in_main_scene || s_consecutive_fallback_frames >= 1 || cb1HasLiveEyePos) &&
-                        cameraRotationDeterminant(parsed_camera) >= 0.85f &&
-                        cameraRotationDeterminant(parsed_camera) <= 1.15f &&
-                        parsed_camera.depthB >= 0.01f && parsed_camera.depthB <= 0.25f &&
+                        valid_main_geom && matches_world_depthB &&
                         (allow_fallback_recovery ||
                          !isRearOrAuxiliaryProbe(parsed_camera, s_camera_now, s_last_valid_velocity, dtRatio))) {
                         const float rawDistToCommitted = (s_camera_now.scaleX > 0.0f)
                             ? edpe::length(edpe::cameraPosition(parsed_camera) - edpe::cameraPosition(s_camera_now))
                             : 0.0f;
                         const bool sameFov = (s_camera_now.scaleX > 0.0f) &&
+                            std::fabs(parsed_camera.depthB - s_camera_now.depthB) <= 1e-3f &&
                             std::fabs(parsed_camera.scaleX - s_camera_now.scaleX) <= 0.02f * s_camera_now.scaleX &&
                             std::fabs(parsed_camera.scaleY - s_camera_now.scaleY) <= 0.02f * s_camera_now.scaleY;
                         if (sameFov && rawDistToCommitted < 0.05f) {
                             passes_filter = true;
                             s_cut_rejection_streak = 0;
                             s_anchor_valid = false;
-                        } else if (!(s_has_staged_camera && s_staged_camera_frame == cur_frame &&
+                        } else if ((in_main_scene || matches_world_cb1 || s_consecutive_fallback_frames >= 3) &&
+                                   !(s_has_staged_camera && s_staged_camera_frame == cur_frame &&
                                      (s_staged_from_in_scene || !in_main_scene))) {
                             if (s_last_cut_rejection_frame != cur_frame) {
                                 s_last_cut_rejection_frame = cur_frame;
@@ -14127,6 +14152,10 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_has_probe_fallback_camera = false;
         s_probe_fallback_from_in_scene = false;
         s_probe_fallback_parse_ok = false;
+        s_has_world_zoom_fallback_camera = false;
+        s_world_zoom_fallback_from_in_scene = false;
+        s_world_zoom_fallback_parse_ok = false;
+        s_world_zoom_fallback_world_scale_err = 1e30f;
         s_hdr_slot0_seen_frame = ~0ull;
         s_scene_window_closed_frame.store(~0ull, std::memory_order_release);
         s_pass53_blit_seen_frame = ~0ull;
@@ -14876,6 +14905,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_probe_fallback_from_in_scene = false;
         s_probe_fallback_parse_ok = false;
         s_probe_fallback_frame = ~0ull;
+        s_has_world_zoom_fallback_camera = false;
+        s_world_zoom_fallback_from_in_scene = false;
+        s_world_zoom_fallback_parse_ok = false;
+        s_world_zoom_fallback_frame = ~0ull;
+        s_world_zoom_fallback_world_scale_err = 1e30f;
         s_camera_now = {};
         s_last_true_camera = {};
         s_last_true_camera_frame = ~0ull;

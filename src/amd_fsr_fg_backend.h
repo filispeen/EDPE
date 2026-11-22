@@ -35,6 +35,8 @@ public:
 
     // Optional debug overlay flags (tear lines / pacing lines / motion-flow debug view).
     void setDebugFlags(bool tearLines, bool pacingLines, bool debugView);
+    void setDebugView(bool enabled) override;
+    bool isDebugViewEnabled() const override;
 
     // Queries GPU memory footprint reported by FidelityFX FG + Swapchain contexts.
     bool queryGpuMemoryUsage(uint64_t* outFgTotalBytes, uint64_t* outSwapChainTotalBytes) const;
