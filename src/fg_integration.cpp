@@ -530,17 +530,13 @@ void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
                      L"Requires an NVIDIA GeForce RTX 40+ / 50+ GPU.", 255);
     } else {
 #if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
-        // Perform D3D12 bridge & Streamline capability probe WITHOUT holding mutex_
-        // because D3D12CreateDevice creates & releases internal DXGI factories.
-        D3D11D3D12Bridge probeBridge;
-        if (probeBridge.initialize(d3d11Device)) {
-            StreamlineStatusSnapshot snap{};
-            localDlssgAvail = NvidiaStreamlineFgBackend::probeCapabilities(
-                probeBridge.d3d12Device(), &snap);
-            if (!localDlssgAvail && snap.unavailableReason[0] != L'\0') {
-                std::wcsncpy(localDlssgReason, snap.unavailableReason, 255);
-            }
-            probeBridge.shutdown();
+        // Perform LUID-only Streamline capability probe WITHOUT holding mutex_ and without
+        // creating a temporary D3D12 device or calling slSetD3DDevice (Streamline DLSS-G §3.0).
+        StreamlineStatusSnapshot snap{};
+        localDlssgAvail = NvidiaStreamlineFgBackend::probeCapabilitiesForLuid(
+            desc.AdapterLuid, &snap);
+        if (!localDlssgAvail && snap.unavailableReason[0] != L'\0') {
+            std::wcsncpy(localDlssgReason, snap.unavailableReason, 255);
         }
 #else
         std::wcsncpy(localDlssgReason,

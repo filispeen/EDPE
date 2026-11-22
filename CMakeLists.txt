@@ -405,6 +405,49 @@ if(EDPE_HAVE_STREAMLINE)
 endif()
 add_test(NAME fg_integration COMMAND fg_integration_test)
 
+if(EDPE_HAVE_NGX AND EDPE_HAVE_STREAMLINE)
+    add_executable(ngx_streamline_interop_test
+        tests/ngx_streamline_interop_test.cpp
+        src/ngx_context.cpp
+        src/nvidia_sl_fg_backend.cpp
+        src/d3d12_bridge.cpp
+        src/d3d12_presenter.cpp
+        src/fg_backend.cpp
+        src/fg_ui_pack_pass.cpp
+        src/renderdoc_support.cpp
+        src/log.cpp)
+    target_compile_features(ngx_streamline_interop_test PRIVATE cxx_std_20)
+    target_compile_definitions(ngx_streamline_interop_test PRIVATE
+        WIN32_LEAN_AND_MEAN NOMINMAX EDPE_ENABLE_NGX=1 EDPE_ENABLE_STREAMLINE=1)
+    target_include_directories(ngx_streamline_interop_test PRIVATE
+        src
+        "${NGX_SDK_DIR}/include"
+        "${STREAMLINE_SDK_DIR}/include")
+    target_link_libraries(ngx_streamline_interop_test PRIVATE
+        "$<IF:$<CONFIG:Debug>,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib,${NGX_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib>"
+        d3d11 dxgi d3dcompiler version advapi32 user32)
+    add_custom_command(TARGET ngx_streamline_interop_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NGX_SDK_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$<TARGET_FILE_DIR:ngx_streamline_interop_test>/")
+    if(EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/sl.interposer.dll")
+        foreach(_sl_dll
+                sl.interposer.dll
+                sl.common.dll
+                sl.dlss.dll
+                sl.dlss_g.dll
+                sl.reflex.dll
+                sl.pcl.dll
+                nvngx_dlssg.dll)
+            if(EXISTS "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}")
+                add_custom_command(TARGET ngx_streamline_interop_test POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${STREAMLINE_SDK_DIR}/bin/x64/${_sl_dll}" "$<TARGET_FILE_DIR:ngx_streamline_interop_test>/")
+            endif()
+        endforeach()
+    endif()
+    add_test(NAME ngx_streamline_interop COMMAND ngx_streamline_interop_test)
+endif()
+
 add_executable(proxy_smoke tests/proxy_smoke.cpp)
 target_include_directories(proxy_smoke PRIVATE src)
 target_link_libraries(proxy_smoke PRIVATE d3dcompiler)

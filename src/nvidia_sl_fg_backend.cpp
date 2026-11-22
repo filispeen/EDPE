@@ -119,15 +119,6 @@ const char* slResultToString(sl::Result r) {
     }
 }
 
-void slLogCallback(sl::LogType type, const char* msg) {
-    if (!msg) return;
-    if (type == sl::LogType::eInfo) return; // Avoid spamming info logs during normal operation.
-    wchar_t buf[512]{};
-    const wchar_t* tag = (type == sl::LogType::eError) ? L"ERROR" : L"WARN";
-    std::swprintf(buf, 512, L"[EDPE][Streamline][%s] %S", tag, msg);
-    EdpeLog(buf);
-}
-
 void slApiErrorCallback(const sl::APIError& err) {
     wchar_t buf[160]{};
     std::swprintf(buf, 160, L"[EDPE][Streamline] Async APIError HRESULT=0x%08X",
@@ -368,6 +359,120 @@ struct NvidiaStreamlineFgBackend::Impl {
         }
     }
 
+    static sl::Preferences buildBasePreferences(const wchar_t* const* pluginPaths,
+                                              uint32_t numPaths,
+                                              const sl::Feature* features,
+                                              uint32_t numFeatures) {
+        sl::Preferences pref{};
+        pref.showConsole = false;
+        // CRITICAL: pref.logLevel MUST remain eOff with logMessageCallback = nullptr.
+        // Streamline's sl.common.dll installs its own ngxLog function pointer into _nvngx.dll's
+        // process-global logging hook whenever logLevel != eOff and NGX initializes during
+        // slSetD3DDevice(). Unloading sl.common.dll in slShutdown() leaves _nvngx.dll with a
+        // dangling callback pointer and crashes (0xC0000005) on subsequent D3D11 NGX calls (#19).
+        pref.logLevel = sl::LogLevel::eOff;
+        pref.pathsToPlugins = const_cast<const wchar_t**>(pluginPaths);
+        pref.numPathsToPlugins = numPaths;
+        pref.pathToLogsAndData = nullptr;
+        pref.logMessageCallback = nullptr;
+        pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
+                     sl::PreferenceFlags::eDisableDebugText |
+                     sl::PreferenceFlags::eUseManualHooking |
+                     sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+        pref.featuresToLoad = features;
+        pref.numFeaturesToLoad = numFeatures;
+        pref.engine = sl::EngineType::eCustom;
+        pref.engineVersion = "1.0";
+        pref.projectId = kEdpeProjectId;
+        pref.renderAPI = sl::RenderAPI::eD3D12;
+        return pref;
+    }
+
+    void queryAdapterFeatureCapabilities(LUID adapterLuid) {
+        sl::AdapterInfo adapterInfo{};
+        adapterInfo.deviceLUID = reinterpret_cast<uint8_t*>(&adapterLuid);
+        adapterInfo.deviceLUIDSizeInBytes = sizeof(adapterLuid);
+
+        const sl::Result reflexRc = sl.slIsFeatureSupported(sl::kFeatureReflex, adapterInfo);
+        const sl::Result pclRc = sl.slIsFeatureSupported(sl::kFeaturePCL, adapterInfo);
+        const sl::Result dlssgRc = sl.slIsFeatureSupported(sl::kFeatureDLSS_G, adapterInfo);
+
+        snapshot.lastReflexSupportCode = static_cast<int32_t>(reflexRc);
+        snapshot.lastDlssgSupportCode = static_cast<int32_t>(dlssgRc);
+        snapshot.reflexSupported = (reflexRc == sl::Result::eOk);
+        snapshot.pclSupported = (pclRc == sl::Result::eOk);
+        snapshot.dlssgSupported = (dlssgRc == sl::Result::eOk);
+
+        sl::FeatureVersion fv{};
+        if (sl.slGetFeatureVersion(sl::kFeatureDLSS_G, fv) == sl::Result::eOk && fv.versionSL) {
+            std::snprintf(snapshot.dlssgVersion, sizeof(snapshot.dlssgVersion), "%u.%u.%u",
+                          fv.versionSL.major, fv.versionSL.minor, fv.versionSL.build);
+        }
+        fv = {};
+        if (sl.slGetFeatureVersion(sl::kFeatureReflex, fv) == sl::Result::eOk && fv.versionSL) {
+            std::snprintf(snapshot.reflexVersion, sizeof(snapshot.reflexVersion), "%u.%u.%u",
+                          fv.versionSL.major, fv.versionSL.minor, fv.versionSL.build);
+        }
+    }
+
+    bool probeAdapterLuid(LUID adapterLuid) {
+        if (D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc()) {
+            std::wcsncpy(snapshot.unavailableReason,
+                         L"Blocked: Windows renderdoc.dll in-process.",
+                         255);
+            return false;
+        }
+
+        std::wstring pluginDir;
+        findInterposerPath(&pluginDir);
+        if (!sl.loadInterposer(snapshot)) {
+            return false;
+        }
+
+        const wchar_t* pluginPaths[] = {pluginDir.c_str()};
+        const sl::Feature features[] = {
+            sl::kFeatureDLSS_G,
+            sl::kFeatureReflex,
+            sl::kFeaturePCL,
+        };
+        const sl::Preferences pref = buildBasePreferences(
+            pluginPaths, pluginDir.empty() ? 0u : 1u,
+            features, static_cast<uint32_t>(std::size(features)));
+
+        const sl::Result res = sl.slInit(pref, sl::kSDKVersion);
+        snapshot.lastSlResult = static_cast<int32_t>(res);
+        if (res != sl::Result::eOk) {
+            std::swprintf(snapshot.unavailableReason, 255,
+                          L"slInit failed: %S", slResultToString(res));
+            sl.unload();
+            return false;
+        }
+        snapshot.slInitialized = true;
+
+        std::snprintf(snapshot.slVersion, sizeof(snapshot.slVersion), "%u.%u.%u",
+                      SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
+
+        queryAdapterFeatureCapabilities(adapterLuid);
+
+        const sl::Result dlssgRc = static_cast<sl::Result>(snapshot.lastDlssgSupportCode);
+        const sl::Result reflexRc = static_cast<sl::Result>(snapshot.lastReflexSupportCode);
+        if (!snapshot.dlssgSupported) {
+            std::swprintf(snapshot.unavailableReason, 255,
+                          L"DLSS-G unsupported on active GPU/OS (%S; Reflex=%S).",
+                          slResultToString(dlssgRc), slResultToString(reflexRc));
+        } else if (!snapshot.reflexSupported) {
+            std::wcsncpy(snapshot.unavailableReason,
+                         L"Mandatory sl.reflex unavailable for DLSS-G.",
+                         255);
+        }
+
+        sl.slShutdown();
+        snapshot.slInitialized = false;
+        sl.unload();
+
+        return snapshot.dlssgSupported && snapshot.reflexSupported;
+    }
+
     bool initAndProbe(ID3D12Device* d3d12Device, bool keepActive) {
         if (!d3d12Device) {
             std::wcsncpy(snapshot.unavailableReason, L"Null ID3D12Device.", 255);
@@ -392,24 +497,9 @@ struct NvidiaStreamlineFgBackend::Impl {
             sl::kFeatureReflex,
             sl::kFeaturePCL,
         };
-
-        sl::Preferences pref{};
-        pref.showConsole = false;
-        pref.logLevel = sl::LogLevel::eDefault;
-        pref.pathsToPlugins = pluginPaths;
-        pref.numPathsToPlugins = pluginDir.empty() ? 0u : 1u;
-        pref.pathToLogsAndData = nullptr;
-        pref.logMessageCallback = &slLogCallback;
-        pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
-                     sl::PreferenceFlags::eDisableDebugText |
-                     sl::PreferenceFlags::eUseManualHooking |
-                     sl::PreferenceFlags::eUseFrameBasedResourceTagging;
-        pref.featuresToLoad = features;
-        pref.numFeaturesToLoad = static_cast<uint32_t>(std::size(features));
-        pref.engine = sl::EngineType::eCustom;
-        pref.engineVersion = "1.0";
-        pref.projectId = kEdpeProjectId;
-        pref.renderAPI = sl::RenderAPI::eD3D12;
+        const sl::Preferences pref = buildBasePreferences(
+            pluginPaths, pluginDir.empty() ? 0u : 1u,
+            features, static_cast<uint32_t>(std::size(features)));
 
         sl::Result res = sl.slInit(pref, sl::kSDKVersion);
         snapshot.lastSlResult = static_cast<int32_t>(res);
@@ -435,38 +525,14 @@ struct NvidiaStreamlineFgBackend::Impl {
             return false;
         }
 
-        LUID luid = d3d12Device->GetAdapterLuid();
-        sl::AdapterInfo adapterInfo{};
-        adapterInfo.deviceLUID = reinterpret_cast<uint8_t*>(&luid);
-        adapterInfo.deviceLUIDSizeInBytes = sizeof(luid);
-
-        const sl::Result reflexRc = sl.slIsFeatureSupported(sl::kFeatureReflex, adapterInfo);
-        const sl::Result pclRc = sl.slIsFeatureSupported(sl::kFeaturePCL, adapterInfo);
-        const sl::Result dlssgRc = sl.slIsFeatureSupported(sl::kFeatureDLSS_G, adapterInfo);
-
-        snapshot.lastReflexSupportCode = static_cast<int32_t>(reflexRc);
-        snapshot.lastDlssgSupportCode = static_cast<int32_t>(dlssgRc);
-        snapshot.reflexSupported = (reflexRc == sl::Result::eOk);
-        snapshot.pclSupported = (pclRc == sl::Result::eOk);
-        snapshot.dlssgSupported = (dlssgRc == sl::Result::eOk);
-
+        queryAdapterFeatureCapabilities(d3d12Device->GetAdapterLuid());
         sl.resolveFeatureFunctions();
-
-        sl::FeatureVersion fv{};
-        if (sl.slGetFeatureVersion(sl::kFeatureDLSS_G, fv) == sl::Result::eOk && fv.versionSL) {
-            std::snprintf(snapshot.dlssgVersion, sizeof(snapshot.dlssgVersion), "%u.%u.%u",
-                          fv.versionSL.major, fv.versionSL.minor, fv.versionSL.build);
-        }
-        fv = {};
-        if (sl.slGetFeatureVersion(sl::kFeatureReflex, fv) == sl::Result::eOk && fv.versionSL) {
-            std::snprintf(snapshot.reflexVersion, sizeof(snapshot.reflexVersion), "%u.%u.%u",
-                          fv.versionSL.major, fv.versionSL.minor, fv.versionSL.build);
-        }
 
         if (!snapshot.dlssgSupported) {
             std::swprintf(snapshot.unavailableReason, 255,
                           L"DLSS-G unsupported on active GPU/OS (%S; Reflex=%S).",
-                          slResultToString(dlssgRc), slResultToString(reflexRc));
+                          slResultToString(static_cast<sl::Result>(snapshot.lastDlssgSupportCode)),
+                          slResultToString(static_cast<sl::Result>(snapshot.lastReflexSupportCode)));
             if (!keepActive) {
                 sl.slShutdown();
                 snapshot.slInitialized = false;
@@ -497,15 +563,6 @@ struct NvidiaStreamlineFgBackend::Impl {
                 sl.unload();
             }
             return false;
-        }
-
-        sl::DLSSGState st{};
-        if (sl.slDLSSGGetState(viewport, st, nullptr) == sl::Result::eOk) {
-            snapshot.maxFramesToGenerate = (std::max)(1u, st.numFramesToGenerateMax);
-            snapshot.dynamicMfgSupported = (st.bIsDynamicMFGSupported == sl::Boolean::eTrue);
-            snapshot.vsyncSupported = (st.bIsVsyncSupportAvailable == sl::Boolean::eTrue);
-        } else {
-            snapshot.maxFramesToGenerate = 1;
         }
 
         return true;
@@ -679,6 +736,8 @@ bool NvidiaStreamlineFgBackend::initialize(D3D12ProxyPresenter* presenter) {
         impl_->snapshot.maxFramesToGenerate = (std::max)(1u, st.numFramesToGenerateMax);
         impl_->snapshot.dynamicMfgSupported = (st.bIsDynamicMFGSupported == sl::Boolean::eTrue);
         impl_->snapshot.vsyncSupported = (st.bIsVsyncSupportAvailable == sl::Boolean::eTrue);
+    } else {
+        impl_->snapshot.maxFramesToGenerate = 1;
     }
 
     presenter->setPresentMarkerHooks(&Impl::onPrePresent, &Impl::onPostPresent, impl_.get());
@@ -966,25 +1025,31 @@ bool NvidiaStreamlineFgBackend::probeCapabilities(ID3D12Device* d3d12Device,
     if (!outSnapshot) return false;
     *outSnapshot = {};
 #if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
-    Impl probeImpl;
-    const bool dlssgOk = probeImpl.initAndProbe(d3d12Device, false);
-    if (probeImpl.snapshot.slInitialized && probeImpl.sl.slShutdown) {
-        // initAndProbe(..., keepActive=false) leaves SL open ONLY if dlssgSupported is true.
-        if (probeImpl.snapshot.reflexSupported && probeImpl.sl.slReflexSetOptions) {
-            sl::ReflexOptions ro{};
-            ro.mode = sl::ReflexMode::eLowLatency;
-            probeImpl.sl.slReflexSetOptions(ro);
-            ro.mode = sl::ReflexMode::eOff;
-            probeImpl.sl.slReflexSetOptions(ro);
-        }
-        probeImpl.sl.slShutdown();
-        probeImpl.snapshot.slInitialized = false;
-        probeImpl.sl.unload();
+    if (!d3d12Device) {
+        std::wcsncpy(outSnapshot->unavailableReason, L"Null ID3D12Device.", 255);
+        return false;
     }
+    return probeCapabilitiesForLuid(d3d12Device->GetAdapterLuid(), outSnapshot);
+#else
+    (void)d3d12Device;
+    std::wcsncpy(outSnapshot->unavailableReason,
+                 L"Built without Streamline SDK headers (EDPE_ENABLE_STREAMLINE=0).",
+                 255);
+    return false;
+#endif
+}
+
+bool NvidiaStreamlineFgBackend::probeCapabilitiesForLuid(LUID adapterLuid,
+                                                         StreamlineStatusSnapshot* outSnapshot) {
+    if (!outSnapshot) return false;
+    *outSnapshot = {};
+#if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
+    Impl probeImpl;
+    const bool dlssgOk = probeImpl.probeAdapterLuid(adapterLuid);
     *outSnapshot = probeImpl.snapshot;
     return dlssgOk;
 #else
-    (void)d3d12Device;
+    (void)adapterLuid;
     std::wcsncpy(outSnapshot->unavailableReason,
                  L"Built without Streamline SDK headers (EDPE_ENABLE_STREAMLINE=0).",
                  255);

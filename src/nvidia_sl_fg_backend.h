@@ -78,6 +78,11 @@ public:
     static bool probeCapabilities(ID3D12Device* d3d12Device,
                                   StreamlineStatusSnapshot* outSnapshot);
 
+    // Probes Streamline capability for an adapter LUID via slInit + slIsFeatureSupported
+    // without creating a D3D12 device or calling slSetD3DDevice.
+    static bool probeCapabilitiesForLuid(LUID adapterLuid,
+                                         StreamlineStatusSnapshot* outSnapshot);
+
     static const char* dlssgStatusToString(uint32_t statusMask);
 
 private:
