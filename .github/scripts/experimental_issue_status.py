@@ -76,7 +76,7 @@ def github_request(
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "EDPE-Experimental-Issue-Reporter/1.0",
+        "User-Agent": "EDPE-Test-Build-Issue-Reporter/2.0",
     }
     data = None
     if payload is not None:
@@ -224,18 +224,22 @@ def discover_linked_issues(
     ref_type: str,
     ref_name: str,
     sha: str,
+    issue_override: str = "",
 ) -> tuple[str, list[int]]:
     branches = resolve_candidate_branches(api_url, repo, token, ref_type, ref_name, sha)
-    if not branches:
-        return "", []
-
-    primary_branch = branches[0]
+    primary_branch = branches[0] if branches else (ref_name if ref_type == "branch" else "")
     discovered: list[int] = []
 
     def add_unique(nums: list[int]) -> None:
         for n in nums:
             if n not in discovered:
                 discovered.append(n)
+
+    override_clean = issue_override.strip().lstrip("#")
+    if override_clean.isdigit():
+        override_num = int(override_clean)
+        if override_num > 0 and verify_is_issue(api_url, repo, token, override_num):
+            discovered.append(override_num)
 
     for branch in branches:
         pr_issues: list[int] = []
@@ -287,12 +291,13 @@ def resolve_release_links(
     archive_name: str,
     release_url: str,
     assets_json: str,
+    asset_url: str = "",
 ) -> tuple[str, str]:
     encoded_tag = urllib.parse.quote(tag_name, safe="")
     resolved_release_url = release_url.strip() or f"{server_url}/{repo}/releases/tag/{encoded_tag}"
-    resolved_asset_url = ""
+    resolved_asset_url = asset_url.strip()
 
-    if assets_json.strip():
+    if not resolved_asset_url and assets_json.strip():
         try:
             assets = json.loads(assets_json)
             if isinstance(assets, list):
@@ -316,7 +321,9 @@ def resolve_release_links(
 
 
 def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
-    tag_name = ctx.get("tag_name", "exp-build")
+    tag_name = ctx.get("tag_name") or "test-builds"
+    display_version = ctx.get("edpe_version") or tag_name
+    base_tag = ctx.get("base_tag", "").strip()
     branch_name = ctx.get("branch_name", "")
     sha = ctx.get("sha", "")
     short_sha = sha[:7] if sha else "unknown"
@@ -325,8 +332,9 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
     run_id = ctx.get("run_id", "")
     run_number = ctx.get("run_number", "")
     has_artifact = ctx.get("has_artifact", "false").lower() == "true"
-    archive_name = ctx.get("archive_name") or f"EDPE({tag_name}).zip"
+    archive_name = ctx.get("archive_name") or f"EDPE-{tag_name}.zip"
     sha256 = ctx.get("sha256", "").strip()
+    commits_summary = ctx.get("commits_summary", "").strip()
 
     commit_url = f"{server_url}/{repo}/commit/{sha}" if sha else ""
     run_url = f"{server_url}/{repo}/actions/runs/{run_id}" if run_id else ""
@@ -343,16 +351,16 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
         if has_artifact:
             build_line = "- ✅ **Build EDPE (Release x64)**: built by CI"
             pkg_line = f"- 🔄 **Package Archive**: `{archive_name}` (downloading staged binaries...)"
-            rel_line = "- ⏳ **Publish GitHub Release**"
+            rel_line = f"- ⏳ **Publish Test Build** (`{tag_name}`)"
         else:
             build_line = "- 🔄 **Build EDPE (Release x64)**: configuring & compiling..."
             pkg_line = f"- ⏳ **Package Archive**: `{archive_name}`"
-            rel_line = "- ⏳ **Publish GitHub Release**"
+            rel_line = f"- ⏳ **Publish Test Build** (`{tag_name}`)"
     elif phase == "after_build":
         header_icon, status_text = "🛠️", "Packaging"
         build_line = "- ✅ **Build EDPE (Release x64)**"
         pkg_line = f"- 🔄 **Package Archive**: creating `{archive_name}`..."
-        rel_line = "- ⏳ **Publish GitHub Release**"
+        rel_line = f"- ⏳ **Publish Test Build** (`{tag_name}`)"
     elif phase == "after_package":
         header_icon, status_text = "🛠️", "Publishing"
         build_line = (
@@ -361,7 +369,7 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
             else "- ✅ **Build EDPE (Release x64)**"
         )
         pkg_line = f"- ✅ **Package Archive**: `{archive_name}`"
-        rel_line = "- 🔄 **Publish GitHub Release**: uploading build & creating release..."
+        rel_line = f"- 🔄 **Publish Test Build** (`{tag_name}`): uploading archive..."
     else:
         outcomes = [
             configure_outcome,
@@ -398,22 +406,31 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
             pkg_line = f"- {step_icon(pkg_state)} **Package Archive**: `{archive_name}` ({pkg_state})"
 
         rel_state = release_outcome or "skipped"
-        rel_line = f"- {step_icon(rel_state)} **Publish GitHub Release**: {rel_state}"
+        rel_line = f"- {step_icon(rel_state)} **Publish Test Build** (`{tag_name}`): {rel_state}"
 
     lines = [
-        f"### {header_icon} Experimental Build `{tag_name}`: {status_text}",
+        f"### {header_icon} Test Build `{display_version}`: {status_text}",
         "",
     ]
     if branch_name:
         lines.append(f"- **Branch:** `{branch_name}`")
+    if base_tag:
+        lines.append(f"- **Base Release:** `{base_tag}`")
     if commit_url:
         lines.append(f"- **Commit:** [`{short_sha}`]({commit_url})")
     if run_url:
         run_label = f"Actions Run #{run_number}" if run_number else "View Workflow Run"
         lines.append(f"- **Workflow Run:** [{run_label}]({run_url})")
 
+    if base_tag:
+        isolation_note = f"> Isolated test build branched from `{base_tag}`. Does **not** include unmerged fixes from other open issues."
+    else:
+        isolation_note = "> Isolated test build for this branch. Does **not** include unmerged fixes from other open issues."
+
     lines.extend(
         [
+            "",
+            isolation_note,
             "",
             "#### Build Progress",
             build_line,
@@ -430,17 +447,31 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
             archive_name=archive_name,
             release_url=ctx.get("release_url", ""),
             assets_json=ctx.get("release_assets", ""),
+            asset_url=ctx.get("asset_url", ""),
         )
         lines.extend(
             [
                 "",
                 "#### Build Download",
-                f"- **GitHub Release:** [{tag_name}]({release_url})",
                 f"- **Direct Archive:** [`{archive_name}`]({asset_url})",
+                f"- **Test Builds Release:** [{tag_name}]({release_url})",
             ]
         )
         if sha256:
             lines.append(f"- **SHA-256:** `{sha256}`")
+        if commits_summary:
+            base_label = base_tag or "base"
+            lines.extend(
+                [
+                    "",
+                    f"<details><summary>Commits since {base_label}</summary>",
+                    "",
+                    "```",
+                    commits_summary,
+                    "```",
+                    "</details>",
+                ]
+            )
     elif phase == "finish" and run_url:
         lines.extend(
             [
@@ -510,6 +541,7 @@ def main() -> int:
             ref_type=os.environ.get("GITHUB_REF_TYPE", "").strip(),
             ref_name=os.environ.get("GITHUB_REF_NAME", "").strip(),
             sha=os.environ.get("GITHUB_SHA", "").strip(),
+            issue_override=os.environ.get("ISSUE_NUMBER_OVERRIDE", "").strip(),
         )
         print(f"Resolved branch: '{branch_name}', linked issues: {issue_numbers}")
         write_github_outputs(
@@ -523,7 +555,10 @@ def main() -> int:
 
     ctx = {
         "tag_name": os.environ.get("TAG_NAME", "").strip(),
+        "edpe_version": os.environ.get("EDPE_VERSION", "").strip(),
+        "base_tag": os.environ.get("BASE_TAG", "").strip(),
         "branch_name": os.environ.get("BRANCH_NAME", "").strip(),
+        "commits_summary": os.environ.get("COMMITS_SUMMARY", "").strip(),
         "sha": os.environ.get("GITHUB_SHA", "").strip(),
         "server_url": os.environ.get("GITHUB_SERVER_URL", "https://github.com").strip(),
         "repo": repo,
@@ -534,6 +569,7 @@ def main() -> int:
         "sha256": os.environ.get("ARCHIVE_SHA256", "").strip(),
         "release_url": os.environ.get("RELEASE_URL", "").strip(),
         "release_assets": os.environ.get("RELEASE_ASSETS", "").strip(),
+        "asset_url": os.environ.get("ASSET_URL", "").strip(),
         "configure_outcome": os.environ.get("CONFIGURE_OUTCOME", "").strip(),
         "build_outcome": os.environ.get("BUILD_OUTCOME", "").strip(),
         "download_outcome": os.environ.get("DOWNLOAD_OUTCOME", "").strip(),

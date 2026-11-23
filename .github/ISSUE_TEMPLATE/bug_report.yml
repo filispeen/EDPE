@@ -12,8 +12,8 @@ body:
     id: version
     attributes:
       label: EDPE version
-      description: Shown in the overlay, or the release tag you downloaded.
-      placeholder: v0.6.0
+      description: Exact version shown in the overlay or top of edpe.log (for example v0.8.0-rc2 or v0.8.0-rc2+issue26.a1b2c3d).
+      placeholder: v0.8.0-rc2
     validations:
       required: true
 

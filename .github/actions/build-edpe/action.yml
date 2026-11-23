@@ -1,0 +1,153 @@
+name: Build EDPE
+description: Set up MSVC, cache/fetch upscaler and frame-generation SDKs, configure CMake, build EDPE, and optionally run tests.
+
+inputs:
+  edpe-version:
+    description: Version string passed to -DEDPE_VERSION
+    required: true
+  build-target:
+    description: Optional CMake target (leave empty to build all targets)
+    required: false
+    default: ''
+  run-tests:
+    description: Whether to run ctest after building
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Set up MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Cache NVIDIA DLSS SDK
+      id: cache-dlss
+      uses: actions/cache@v4
+      with:
+        path: external/DLSS
+        key: dlss-sdk-${{ runner.os }}-v1
+        restore-keys: |
+          dlss-sdk-${{ runner.os }}-
+
+    - name: Clone NVIDIA DLSS SDK
+      if: steps.cache-dlss.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        if (-not (Test-Path "external/DLSS/include/nvsdk_ngx.h")) {
+          Write-Host "Cloning official NVIDIA DLSS SDK (sparse)..."
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+          Push-Location external/DLSS
+          git sparse-checkout set include lib/Windows_x86_64
+          Pop-Location
+          Remove-Item -Recurse -Force external/DLSS/.git
+        } else {
+          Write-Host "NVIDIA DLSS SDK found in cache."
+        }
+
+    - name: Cache FidelityFX DX11 SDK
+      id: cache-ffx
+      uses: actions/cache@v4
+      with:
+        path: external/ffx-dx11
+        key: ffx-sdk-${{ runner.os }}-${{ hashFiles('tools/fetch_ffx_dx11.py') }}
+        restore-keys: |
+          ffx-sdk-${{ runner.os }}-
+
+    - name: Fetch FidelityFX DX11 SDK
+      if: steps.cache-ffx.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        python tools/fetch_ffx_dx11.py
+
+    - name: Cache FidelityFX FG SDK
+      id: cache-ffx-fg
+      uses: actions/cache@v4
+      with:
+        path: external/ffx-sdk
+        key: ffx-fg-sdk-${{ runner.os }}-v2.4.0
+        restore-keys: |
+          ffx-fg-sdk-${{ runner.os }}-
+
+    - name: Clone FidelityFX FG SDK
+      if: steps.cache-ffx-fg.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        if (-not (Test-Path "external/ffx-sdk/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h")) {
+          Write-Host "Cloning official AMD FidelityFX SDK v2.4.0 (sparse)..."
+          git clone --depth 1 --branch v2.4.0 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/ffx-sdk
+          Push-Location external/ffx-sdk
+          git sparse-checkout set Kits/FidelityFX/api Kits/FidelityFX/framegeneration Kits/FidelityFX/signedbin LICENSE.txt
+          Pop-Location
+          Remove-Item -Recurse -Force external/ffx-sdk/.git
+        } else {
+          Write-Host "FidelityFX FG SDK found in cache."
+        }
+
+    - name: Cache NVIDIA Streamline SDK
+      id: cache-streamline
+      uses: actions/cache@v4
+      with:
+        path: external/streamline
+        key: streamline-sdk-${{ runner.os }}-v2.14.16-bin-v2
+
+    - name: Fetch NVIDIA Streamline SDK
+      shell: pwsh
+      run: |
+        if (-not (Test-Path "external/streamline/include/sl_dlss_g.h") -or -not (Test-Path "external/streamline/bin/x64/sl.interposer.dll")) {
+          Write-Host "Downloading official NVIDIA Streamline SDK v2.14.16..."
+          $tmpZip = Join-Path $env:RUNNER_TEMP "streamline-sdk-v2.14.16.zip"
+          $tmpDir = Join-Path $env:RUNNER_TEMP "streamline-unpack"
+          Invoke-WebRequest -Uri "https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.16/streamline-sdk-v2.14.16.zip" -OutFile $tmpZip
+          Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+          Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
+          $hdr = Get-ChildItem -Path $tmpDir -Recurse -Filter "sl_dlss_g.h" | Select-Object -First 1
+          if (-not $hdr) { throw "sl_dlss_g.h not found in streamline-sdk-v2.14.16.zip" }
+          $sdkRoot = Split-Path (Split-Path $hdr.FullName -Parent) -Parent
+          Remove-Item -Recurse -Force "external/streamline" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path "external/streamline/bin/x64" -Force | Out-Null
+          Copy-Item (Join-Path $sdkRoot "include") -Destination "external/streamline/include" -Recurse -Force
+          Copy-Item (Join-Path $sdkRoot "bin/x64/*.dll") -Destination "external/streamline/bin/x64/" -Force
+          if (Test-Path (Join-Path $sdkRoot "license.txt")) {
+            Copy-Item (Join-Path $sdkRoot "license.txt") -Destination "external/streamline/" -Force
+          }
+          Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+        } else {
+          Write-Host "NVIDIA Streamline SDK found in cache."
+        }
+
+    - name: Set up sccache
+      uses: hendrikmuhs/ccache-action@v1
+      with:
+        variant: sccache
+        key: ${{ runner.os }}-sccache-${{ github.ref_name }}
+        restore-keys: |
+          sccache-${{ runner.os }}-sccache-${{ github.event.repository.default_branch }}-
+          sccache-${{ runner.os }}-sccache-
+        max-size: 2G
+
+    - name: Configure CMake
+      shell: pwsh
+      env:
+        EDPE_VERSION: ${{ inputs.edpe-version }}
+      run: |
+        cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$env:EDPE_VERSION" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+
+    - name: Build EDPE (Release)
+      shell: pwsh
+      env:
+        BUILD_TARGET: ${{ inputs.build-target }}
+      run: |
+        if (-not [string]::IsNullOrWhiteSpace($env:BUILD_TARGET)) {
+          cmake --build build --target "$env:BUILD_TARGET" --parallel
+        } else {
+          cmake --build build --parallel
+        }
+
+    - name: Run Tests
+      if: inputs.run-tests == 'true'
+      shell: pwsh
+      run: |
+        ctest --test-dir build --output-on-failure

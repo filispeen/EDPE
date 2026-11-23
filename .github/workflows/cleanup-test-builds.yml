@@ -1,0 +1,35 @@
+name: Cleanup Test Builds
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  cleanup:
+    name: Remove Closed Issue Test Archive
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete issue test archive from test-builds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+        run: |
+          assets=$(gh release view test-builds --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          deleted=0
+          while IFS= read -r asset; do
+            if [[ -n "$asset" && "$asset" == "EDPE-issue${ISSUE_NUM}-"* ]]; then
+              echo "Deleting stale test asset: $asset"
+              gh release delete-asset test-builds "$asset" --repo "$REPO" --yes
+              deleted=1
+            fi
+          done <<< "$assets"
+
+          if [ "$deleted" -eq 1 ]; then
+            gh issue comment "$ISSUE_NUM" --repo "$REPO" \
+              --body "The isolated test build for #${ISSUE_NUM} has been removed from \`test-builds\`. The fix will be included in the next RC/release."
+          fi

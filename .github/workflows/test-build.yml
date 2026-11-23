@@ -1,0 +1,344 @@
+name: Isolated Test Build
+
+on:
+  workflow_call:
+    inputs:
+      has-artifact:
+        description: 'Whether staged binaries were pre-built by CI'
+        type: boolean
+        required: false
+        default: true
+      edpe-version:
+        description: 'Pre-computed EDPE_VERSION from CI'
+        type: string
+        required: false
+        default: ''
+      base-tag:
+        description: 'Base v* release tag reachable from HEAD'
+        type: string
+        required: false
+        default: ''
+      issue-number:
+        description: 'Explicit issue number override'
+        type: string
+        required: false
+        default: ''
+      short-sha:
+        description: 'Short commit SHA'
+        type: string
+        required: false
+        default: ''
+  workflow_dispatch:
+    inputs:
+      has-artifact:
+        description: 'Whether staged binaries were pre-built by CI'
+        type: boolean
+        required: false
+        default: false
+      issue-number:
+        description: 'Target issue number (optional; auto-detected from branch/PR if empty)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: read
+
+jobs:
+  build-and-publish:
+    name: Build and Publish Test Build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.has-artifact && 'false' || 'recursive' }}
+          fetch-depth: 0
+
+      - name: Find Linked Issue
+        id: linked_issue
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: discover
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          ISSUE_NUMBER_OVERRIDE: ${{ inputs.issue-number }}
+        run: |
+          python .github/scripts/experimental_issue_status.py
+
+      - name: Resolve Test Build Metadata
+        id: build_info
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.edpe-version }}
+          INPUT_BASE_TAG: ${{ inputs.base-tag }}
+          INPUT_SHORT_SHA: ${{ inputs.short-sha }}
+          INPUT_ISSUE: ${{ inputs.issue-number }}
+          DISCOVERED_ISSUES: ${{ steps.linked_issue.outputs.issue_numbers }}
+          DISCOVERED_BRANCH: ${{ steps.linked_issue.outputs.branch_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $shortSha = "$env:INPUT_SHORT_SHA".Trim()
+          if (-not $shortSha) {
+            $shortSha = (git rev-parse --short=7 HEAD).Trim()
+          }
+
+          $baseTag = "$env:INPUT_BASE_TAG".Trim()
+          if (-not $baseTag) {
+            $baseTag = (git describe --tags --abbrev=0 --match "v*" 2>$null | Out-String).Trim()
+            if (-not $baseTag) { $baseTag = "v0.0.0" }
+          }
+
+          $primaryIssue = "$env:INPUT_ISSUE".Trim() -replace '^#', ''
+          if (-not $primaryIssue -and $env:DISCOVERED_ISSUES) {
+            $primaryIssue = ($env:DISCOVERED_ISSUES -split ',')[0].Trim()
+          }
+
+          $branchName = if ($env:DISCOVERED_BRANCH) { $env:DISCOVERED_BRANCH } else { $env:REF_NAME }
+          $branchSlug = ($branchName -replace '[^a-zA-Z0-9_-]', '-').Trim('-')
+          if (-not $branchSlug) { $branchSlug = "branch" }
+
+          $assetPrefix = if ($primaryIssue) { "issue$primaryIssue" } else { $branchSlug }
+          $archiveName = "EDPE-$assetPrefix-$shortSha.zip"
+
+          $edpeVersion = "$env:INPUT_VERSION".Trim()
+          if (-not $edpeVersion) {
+            $edpeVersion = "$baseTag+$assetPrefix.$shortSha"
+          }
+
+          $commits = ""
+          if ($baseTag -ne "v0.0.0") {
+            $commits = (git log "$baseTag..HEAD" --oneline -n 15 2>$null | Out-String).Trim()
+          }
+
+          $delim = "COMMITS_EOF_$([guid]::NewGuid().ToString('N'))"
+          Write-Host "Version: $edpeVersion | Base: $baseTag | Prefix: $assetPrefix | Archive: $archiveName"
+          "edpe_version=$edpeVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "base_tag=$baseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "short_sha=$shortSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "primary_issue=$primaryIssue" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "branch_name=$branchName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "asset_prefix=$assetPrefix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "commits<<$delim`n$commits`n$delim" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Notify Linked Issue (Build Started)
+        id: issue_start
+        if: ${{ steps.linked_issue.outputs.has_issue == 'true' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: start
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          TAG_NAME: test-builds
+          EDPE_VERSION: ${{ steps.build_info.outputs.edpe_version }}
+          BASE_TAG: ${{ steps.build_info.outputs.base_tag }}
+          BRANCH_NAME: ${{ steps.build_info.outputs.branch_name }}
+          ISSUE_NUMBERS: ${{ steps.linked_issue.outputs.issue_numbers }}
+          ARCHIVE_NAME: ${{ steps.build_info.outputs.archive_name }}
+          HAS_ARTIFACT: ${{ inputs.has-artifact }}
+        run: |
+          python .github/scripts/experimental_issue_status.py
+
+      - name: Build EDPE (Release)
+        id: build
+        if: ${{ !inputs.has-artifact }}
+        uses: ./.github/actions/build-edpe
+        with:
+          edpe-version: ${{ steps.build_info.outputs.edpe_version }}
+          build-target: proxy_stage
+          run-tests: 'false'
+
+      - name: Notify Linked Issue (Build Completed)
+        if: ${{ !inputs.has-artifact && steps.issue_start.outputs.comment_ids != '' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: after_build
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          TAG_NAME: test-builds
+          EDPE_VERSION: ${{ steps.build_info.outputs.edpe_version }}
+          BASE_TAG: ${{ steps.build_info.outputs.base_tag }}
+          BRANCH_NAME: ${{ steps.build_info.outputs.branch_name }}
+          ARCHIVE_NAME: ${{ steps.build_info.outputs.archive_name }}
+          COMMENT_IDS: ${{ steps.issue_start.outputs.comment_ids }}
+          HAS_ARTIFACT: ${{ inputs.has-artifact }}
+        run: |
+          python .github/scripts/experimental_issue_status.py
+
+      - name: Download Staged Binaries
+        id: download
+        if: ${{ inputs.has-artifact }}
+        uses: actions/download-artifact@v4
+        with:
+          name: edpe-stage-binaries
+          path: build/stage
+
+      - name: Prepare Test Build Package
+        id: package
+        shell: pwsh
+        env:
+          EDPE_VERSION: ${{ steps.build_info.outputs.edpe_version }}
+          BASE_TAG: ${{ steps.build_info.outputs.base_tag }}
+          BRANCH_NAME: ${{ steps.build_info.outputs.branch_name }}
+          PRIMARY_ISSUE: ${{ steps.build_info.outputs.primary_issue }}
+          ARCHIVE_NAME: ${{ steps.build_info.outputs.archive_name }}
+        run: |
+          $pkgDir = "EDPE-package"
+          New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+
+          # Copy staged runtime DLLs (dxgi, DLSS, FidelityFX FG, Streamline)
+          Copy-Item "build/stage/*.dll" -Destination "$pkgDir/" -Force
+
+          # Copy documentation and default configuration
+          Copy-Item "README.md" -Destination "$pkgDir/" -Force
+          if (Test-Path "edpe.ini") {
+            Copy-Item "edpe.ini" -Destination "$pkgDir/" -Force
+          }
+
+          $issueLabel = if ($env:PRIMARY_ISSUE) { "#$($env:PRIMARY_ISSUE)" } else { "none" }
+          $buildInfo = @(
+            "EDPE Isolated Test Build"
+            "========================"
+            "Version: $($env:EDPE_VERSION)"
+            "Branch:  $($env:BRANCH_NAME)"
+            "Base:    $($env:BASE_TAG)"
+            "Issue:   $issueLabel"
+            "Commit:  ${{ github.sha }}"
+            ""
+            "WARNING: This is an isolated test build for $issueLabel only."
+            "It does NOT include unmerged fixes from other open issues."
+          ) -join "`r`n"
+          Set-Content -Path "$pkgDir/BUILD_INFO.txt" -Value $buildInfo -Encoding utf8
+
+          $archiveName = $env:ARCHIVE_NAME
+          Compress-Archive -Path "$pkgDir/*" -DestinationPath $archiveName -Force
+
+          $sha256 = (Get-FileHash -Path $archiveName -Algorithm SHA256).Hash
+          Write-Host "Created archive: $archiveName (SHA-256: $sha256)"
+          "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha256=$sha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Notify Linked Issue (Package Ready)
+        if: ${{ steps.issue_start.outputs.comment_ids != '' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: after_package
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          TAG_NAME: test-builds
+          EDPE_VERSION: ${{ steps.build_info.outputs.edpe_version }}
+          BASE_TAG: ${{ steps.build_info.outputs.base_tag }}
+          BRANCH_NAME: ${{ steps.build_info.outputs.branch_name }}
+          COMMENT_IDS: ${{ steps.issue_start.outputs.comment_ids }}
+          HAS_ARTIFACT: ${{ inputs.has-artifact }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          ARCHIVE_SHA256: ${{ steps.package.outputs.sha256 }}
+        run: |
+          python .github/scripts/experimental_issue_status.py
+
+      - name: Upload Build Artifact
+        id: upload_artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EDPE-test-${{ steps.build_info.outputs.asset_prefix }}-${{ steps.build_info.outputs.short_sha }}-windows-x64
+          path: |
+            ${{ steps.package.outputs.archive_name }}
+          retention-days: 14
+
+      - name: Publish to Rolling Release (test-builds)
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSET_PREFIX: ${{ steps.build_info.outputs.asset_prefix }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+        run: |
+          $tag = "test-builds"
+          $notes = @(
+            "Isolated per-issue test builds for EDPE."
+            ""
+            "> **Important:** Each archive in this release is built from a separate issue branch and is **not** cumulative."
+            "> Do not assume a newer file includes fixes from other open issues. Download the exact archive linked in your issue thread."
+          ) -join "`n"
+
+          gh release view $tag --repo "${{ github.repository }}" 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag `
+              --repo "${{ github.repository }}" `
+              --target "${{ github.event.repository.default_branch }}" `
+              --prerelease `
+              --title "EDPE Isolated Test Builds" `
+              --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create rolling release '$tag'." }
+          }
+
+          $existingAssets = gh release view $tag --repo "${{ github.repository }}" --json assets --jq ".assets[].name"
+          foreach ($asset in $existingAssets) {
+            $assetName = "$asset".Trim()
+            if ($assetName -and $assetName -like "EDPE-$($env:ASSET_PREFIX)-*" -and $assetName -ne $env:ARCHIVE_NAME) {
+              Write-Host "Removing previous asset for $($env:ASSET_PREFIX): $assetName"
+              gh release delete-asset $tag $assetName --repo "${{ github.repository }}" --yes
+            }
+          }
+
+          gh release upload $tag $env:ARCHIVE_NAME --repo "${{ github.repository }}" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Failed to upload asset '$($env:ARCHIVE_NAME)' to '$tag'." }
+
+          $releaseUrl = "${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag"
+          $assetUrl = "${{ github.server_url }}/${{ github.repository }}/releases/download/$tag/$($env:ARCHIVE_NAME)"
+          "url=$releaseUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "asset_url=$assetUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Notify Linked Issue (Final Result)
+        if: ${{ always() && steps.issue_start.outputs.comment_ids != '' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          PHASE: finish
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          TAG_NAME: test-builds
+          EDPE_VERSION: ${{ steps.build_info.outputs.edpe_version }}
+          BASE_TAG: ${{ steps.build_info.outputs.base_tag }}
+          BRANCH_NAME: ${{ steps.build_info.outputs.branch_name }}
+          COMMITS_SUMMARY: ${{ steps.build_info.outputs.commits }}
+          COMMENT_IDS: ${{ steps.issue_start.outputs.comment_ids }}
+          HAS_ARTIFACT: ${{ inputs.has-artifact }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          ARCHIVE_SHA256: ${{ steps.package.outputs.sha256 }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          ASSET_URL: ${{ steps.release.outputs.asset_url }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload_artifact.outcome }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+        run: |
+          python .github/scripts/experimental_issue_status.py

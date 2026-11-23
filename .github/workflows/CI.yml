@@ -7,18 +7,20 @@ on:
       - 'docs/**'
       - '.gitignore'
       - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - 'LICENSE'
   workflow_dispatch:
     inputs:
-      rc:
-        description: 'Publish as Release Candidate (Pre-release)'
+      publish_test_build:
+        description: 'Publish isolated test build to the rolling test-builds pre-release'
         type: boolean
         default: false
-      experimental:
-        description: 'Publish experimental release'
-        type: boolean
-        default: false
-      build_number:
-        description: 'Build number for experimental release (leave empty for auto-increment by tag)'
+      issue_number:
+        description: 'Target issue number (optional; auto-detected from branch/PR if empty)'
         type: string
         required: false
         default: ''
@@ -36,272 +38,100 @@ jobs:
   CI:
     name: Build and Test
     runs-on: windows-latest
+    outputs:
+      edpe_version: ${{ steps.meta.outputs.edpe_version }}
+      base_tag: ${{ steps.meta.outputs.base_tag }}
+      issue_number: ${{ steps.meta.outputs.issue_number }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Set up MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Cache NVIDIA DLSS SDK
-        id: cache-dlss
-        uses: actions/cache@v4
-        with:
-          path: external/DLSS
-          key: dlss-sdk-${{ runner.os }}-v1
-          restore-keys: |
-            dlss-sdk-${{ runner.os }}-
-
-      - name: Clone NVIDIA DLSS SDK
-        if: steps.cache-dlss.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "external/DLSS/include/nvsdk_ngx.h")) {
-            Write-Host "Cloning official NVIDIA DLSS SDK (sparse)..."
-            git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
-            Push-Location external/DLSS
-            git sparse-checkout set include lib/Windows_x86_64
-            Pop-Location
-            # Remove .git metadata to keep cache size minimal (~370MB vs ~1.4GB)
-            Remove-Item -Recurse -Force external/DLSS/.git
-          } else {
-            Write-Host "NVIDIA DLSS SDK found in cache."
-          }
-
-      - name: Cache FidelityFX DX11 SDK
-        id: cache-ffx
-        uses: actions/cache@v4
-        with:
-          path: external/ffx-dx11
-          key: ffx-sdk-${{ runner.os }}-${{ hashFiles('tools/fetch_ffx_dx11.py') }}
-          restore-keys: |
-            ffx-sdk-${{ runner.os }}-
-
-      - name: Fetch FidelityFX DX11 SDK
-        if: steps.cache-ffx.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          python tools/fetch_ffx_dx11.py
-
-      - name: Cache FidelityFX FG SDK
-        id: cache-ffx-fg
-        uses: actions/cache@v4
-        with:
-          path: external/ffx-sdk
-          key: ffx-fg-sdk-${{ runner.os }}-v2.4.0
-          restore-keys: |
-            ffx-fg-sdk-${{ runner.os }}-
-
-      - name: Clone FidelityFX FG SDK
-        if: steps.cache-ffx-fg.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "external/ffx-sdk/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h")) {
-            Write-Host "Cloning official AMD FidelityFX SDK v2.4.0 (sparse)..."
-            git clone --depth 1 --branch v2.4.0 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/ffx-sdk
-            Push-Location external/ffx-sdk
-            git sparse-checkout set Kits/FidelityFX/api Kits/FidelityFX/framegeneration Kits/FidelityFX/signedbin LICENSE.txt
-            Pop-Location
-            Remove-Item -Recurse -Force external/ffx-sdk/.git
-          } else {
-            Write-Host "FidelityFX FG SDK found in cache."
-          }
-
-      - name: Cache NVIDIA Streamline SDK
-        id: cache-streamline
-        uses: actions/cache@v4
-        with:
-          path: external/streamline
-          key: streamline-sdk-${{ runner.os }}-v2.14.16-bin-v2
-
-      - name: Fetch NVIDIA Streamline SDK
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "external/streamline/include/sl_dlss_g.h") -or -not (Test-Path "external/streamline/bin/x64/sl.interposer.dll")) {
-            Write-Host "Downloading official NVIDIA Streamline SDK v2.14.16..."
-            $tmpZip = Join-Path $env:RUNNER_TEMP "streamline-sdk-v2.14.16.zip"
-            $tmpDir = Join-Path $env:RUNNER_TEMP "streamline-unpack"
-            Invoke-WebRequest -Uri "https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.16/streamline-sdk-v2.14.16.zip" -OutFile $tmpZip
-            Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
-            Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
-            $hdr = Get-ChildItem -Path $tmpDir -Recurse -Filter "sl_dlss_g.h" | Select-Object -First 1
-            if (-not $hdr) { throw "sl_dlss_g.h not found in streamline-sdk-v2.14.16.zip" }
-            $sdkRoot = Split-Path (Split-Path $hdr.FullName -Parent) -Parent
-            Remove-Item -Recurse -Force "external/streamline" -ErrorAction SilentlyContinue
-            New-Item -ItemType Directory -Path "external/streamline/bin/x64" -Force | Out-Null
-            Copy-Item (Join-Path $sdkRoot "include") -Destination "external/streamline/include" -Recurse -Force
-            Copy-Item (Join-Path $sdkRoot "bin/x64/*.dll") -Destination "external/streamline/bin/x64/" -Force
-            if (Test-Path (Join-Path $sdkRoot "license.txt")) {
-              Copy-Item (Join-Path $sdkRoot "license.txt") -Destination "external/streamline/" -Force
-            }
-            Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
-            Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
-          } else {
-            Write-Host "NVIDIA Streamline SDK found in cache."
-          }
-
-      - name: Set up sccache
-        uses: hendrikmuhs/ccache-action@v1
-        with:
-          variant: sccache
-          key: ${{ runner.os }}-sccache-${{ github.ref_name }}
-          restore-keys: |
-            sccache-${{ runner.os }}-sccache-${{ github.event.repository.default_branch }}-
-            sccache-${{ runner.os }}-sccache-
-          max-size: 2G
-
-      - name: Configure CMake
+      - name: Compute Version and Metadata
+        id: meta
         shell: pwsh
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
-          IS_EXPERIMENTAL: ${{ inputs.experimental }}
-          BUILD_NUMBER: ${{ inputs.build_number }}
+          PUBLISH_TEST_BUILD: ${{ inputs.publish_test_build }}
+          INPUT_ISSUE: ${{ inputs.issue_number }}
         run: |
-          $ver = if ($env:REF_TYPE -eq "tag") {
-            $env:REF_NAME
-          } elseif ($env:IS_EXPERIMENTAL -eq 'true') {
-            git fetch --depth=1 -f origin '+refs/tags/*:refs/tags/*'
-            $customNum = "$env:BUILD_NUMBER".Trim()
-            if (-not [string]::IsNullOrWhiteSpace($customNum)) {
-              "exp-build-$customNum"
-            } else {
-              $tags = git tag -l "exp-build-*" "experimental-build-*"
-              $maxNum = 0
-              foreach ($t in $tags) {
-                if ($t -match '^(?:exp|experimental)-build-(\d+)$') {
-                  $n = [int]$matches[1]
-                  if ($n -gt $maxNum) { $maxNum = $n }
-                }
-              }
-              "exp-build-$($maxNum + 1)"
-            }
-          } else {
-            'dev'
+          $shortSha = (git rev-parse --short=7 HEAD).Trim()
+          $baseTag = (git describe --tags --abbrev=0 --match "v*" 2>$null | Out-String).Trim()
+          if (-not $baseTag) {
+            $baseTag = "v0.0.0"
           }
-          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$ver" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
-      - name: Build EDPE (Release)
+          $issue = "$env:INPUT_ISSUE".Trim() -replace '^#', ''
+          if (-not $issue -and $env:REF_TYPE -eq 'branch') {
+            if ($env:REF_NAME -match '^#?(\d+)(?:[-_/]|$)') {
+              $issue = $matches[1]
+            } elseif ($env:REF_NAME -match '^(?:issue|fix|bug|feat|hotfix)[-_ /]#?(\d+)(?:[-_/]|$)') {
+              $issue = $matches[1]
+            }
+          }
+
+          if ($env:REF_TYPE -eq "tag") {
+            $ver = $env:REF_NAME
+          } elseif ($env:PUBLISH_TEST_BUILD -eq 'true') {
+            $suffix = if ($issue) { "issue$issue.$shortSha" } else { "branch.$shortSha" }
+            $ver = "$baseTag+$suffix"
+          } else {
+            $ver = "$baseTag+dev.$shortSha"
+          }
+
+          Write-Host "EDPE_VERSION: $ver (base: $baseTag, issue: $issue, sha: $shortSha)"
+          "edpe_version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "base_tag=$baseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "issue_number=$issue" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "short_sha=$shortSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build and Test EDPE
+        uses: ./.github/actions/build-edpe
+        with:
+          edpe-version: ${{ steps.meta.outputs.edpe_version }}
+          run-tests: 'true'
+
+      - name: Run CI Script Unit Tests
         shell: pwsh
         run: |
-          cmake --build build --parallel
-
-      - name: Run Tests
-        shell: pwsh
-        run: |
-          ctest --test-dir build --output-on-failure
+          python .github/scripts/test_experimental_issue_status.py
 
       - name: Upload Staged Binaries
-        if: (github.ref_type == 'tag' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'rc') || startsWith(github.ref_name, 'exp') || startsWith(github.ref_name, 'experimental'))) || inputs.rc == true || inputs.experimental == true
+        if: (github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) || inputs.publish_test_build == true
         uses: actions/upload-artifact@v4
         with:
           name: edpe-stage-binaries
           path: build/stage/
           retention-days: 1
 
-#  asan:
-#    name: ASan Build and Test
-#    runs-on: windows-latest
-#
-#    steps:
-#      - name: Checkout repository
-#        uses: actions/checkout@v4
-#        with:
-#          submodules: recursive
-#          fetch-depth: 1
-#
-#      - name: Set up MSVC environment
-#        uses: ilammy/msvc-dev-cmd@v1
-#        with:
-#          arch: x64
-#
-#      - name: Cache NVIDIA DLSS SDK
-#        id: cache-dlss
-#        uses: actions/cache@v4
-#        with:
-#          path: external/DLSS
-#          key: dlss-sdk-${{ runner.os }}-v1
-#          restore-keys: |
-#            dlss-sdk-${{ runner.os }}-
-#
-#      - name: Clone NVIDIA DLSS SDK
-#        if: steps.cache-dlss.outputs.cache-hit != 'true'
-#        shell: pwsh
-#        run: |
-#          if (-not (Test-Path "external/DLSS/include/nvsdk_ngx.h")) {
-#            Write-Host "Cloning official NVIDIA DLSS SDK (sparse)..."
-#            git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
-#            Push-Location external/DLSS
-#            git sparse-checkout set include lib/Windows_x86_64
-#            Pop-Location
-#            Remove-Item -Recurse -Force external/DLSS/.git
-#          }
-#
-#      - name: Cache FidelityFX DX11 SDK
-#        id: cache-ffx
-#        uses: actions/cache@v4
-#        with:
-#          path: external/ffx-dx11
-#          key: ffx-sdk-${{ runner.os }}-${{ hashFiles('tools/fetch_ffx_dx11.py') }}
-#          restore-keys: |
-#            ffx-sdk-${{ runner.os }}-
-#
-#      - name: Fetch FidelityFX DX11 SDK
-#        if: steps.cache-ffx.outputs.cache-hit != 'true'
-#        shell: pwsh
-#        run: |
-#          python tools/fetch_ffx_dx11.py
-#
-#      - name: Set up sccache
-#        uses: hendrikmuhs/ccache-action@v1
-#        with:
-#          variant: sccache
-#          key: ${{ runner.os }}-sccache-asan-${{ github.ref_name }}
-#          restore-keys: |
-#            ${{ runner.os }}-sccache-asan-
-#          max-size: 2G
-#
-#      - name: Configure CMake (ASan)
-#        shell: pwsh
-#        run: |
-#          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DEDPE_ENABLE_ASAN=ON -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
-#
-#      - name: Build EDPE (ASan)
-#        shell: pwsh
-#        run: |
-#          cmake --build build --config RelWithDebInfo --parallel
-#
-#      - name: Run Tests (ASan)
-#        shell: pwsh
-#        run: |
-#          ctest --test-dir build -C RelWithDebInfo --output-on-failure
-
   release:
     name: Publish Release
     needs: CI
-    if: (github.ref_type == 'tag' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'rc'))) || inputs.rc == true
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     uses: ./.github/workflows/release.yml
     with:
-      prerelease: ${{ inputs.rc == true || contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+      prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
       has-artifact: true
     secrets: inherit
     permissions:
       contents: write
 
-  experimental:
-    name: Publish Experimental
+  test-build:
+    name: Publish Isolated Test Build
     needs: CI
-    if: (github.ref_type == 'tag' && (startsWith(github.ref_name, 'exp') || startsWith(github.ref_name, 'experimental'))) || inputs.experimental == true
-    uses: ./.github/workflows/experimental.yml
+    if: inputs.publish_test_build == true
+    uses: ./.github/workflows/test-build.yml
     with:
       has-artifact: true
-      build-number: ${{ inputs.build_number || '' }}
+      edpe-version: ${{ needs.CI.outputs.edpe_version }}
+      base-tag: ${{ needs.CI.outputs.base_tag }}
+      issue-number: ${{ needs.CI.outputs.issue_number }}
+      short-sha: ${{ needs.CI.outputs.short_sha }}
     secrets: inherit
     permissions:
       contents: write
