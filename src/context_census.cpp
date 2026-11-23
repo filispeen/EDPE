@@ -2207,7 +2207,7 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
     // Verified Cockpit HUD & HDR UI shader families.
     // Explicitly excludes non-HUD Pass 35 & pre-atmosphere world shaders:
     // - 0xD1281DF454A153AD / 0x97DBC87FCAA429C4 (sun corona & radar glow; taking it pulls the real sun over the cockpit)
-    // - 0x5559BD94B6852E83 / 0xB12F7A618E1BDE98 (3D depth-sampling target, ship holograms, & on-foot 3D world shaders)
+    // - 0xB12F7A618E1BDE98 & non-hologram 0x5559BD94B6852E83 PS variants (planetary rings & on-foot 3D world shaders)
     // - 0x71DD8B8B09060A81 / 0x2D037A047171BF3B (world-space brackets)
     // - 0xB018D143700AB803 / 0x258B95AC99520C1F (null-output depth/stencil quad)
     // - 0x4EF6DDB075A927FA (main menu hangar / loading screen quad)
@@ -2215,6 +2215,8 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
         return true;
     }
     return vs_hash == 0xB7790CBFC6554097ull || // Flight HUD vector lines, altimeter ladder & pitch ladder (PS 8DEF46452FA459F5 / EDHM B1CA8D8EEF7C886D)
+           (vs_hash == 0x5559BD94B6852E83ull &&
+            (ps_hash == 0xEA02FAC2BD6C643Cull || ps_hash == 0xE95634B0F61D218Full)) || // Target & Own-Ship 3D schematic hologram billboards (cockpit-gated)
            (vs_hash == 0x9BFC7FD232328391ull && ps_hash == 0xDBF1725726018F52ull) || // Supercruise space dust particles (kSpaceDust)
            (vs_hash == 0xE904D334BC8B11EAull && ps_hash == 0x095030F27D2C362Aull);   // Normal-space dust particles (kNormalSpaceDust)
 }
@@ -2255,6 +2257,7 @@ static inline bool isCandidateHudGlassOrStencilVs(std::uint64_t vs_hash) {
     case 0xC31238331D8AC3D4ull:
     // isHudShaderPair extra VS
     case 0xB7790CBFC6554097ull:
+    case 0x5559BD94B6852E83ull:
     case 0x9BFC7FD232328391ull:
     case 0xE904D334BC8B11EAull:
     // isGlassShaderPair
