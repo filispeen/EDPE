@@ -108,6 +108,29 @@ if (-not $SkipSubmoduleUpdate) {
         Pop-Location
     }
 
+    $dlssDir = Join-Path $repoRoot 'external/DLSS'
+    if (-not (Test-Path -LiteralPath (Join-Path $dlssDir 'include/nvsdk_ngx.h'))) {
+        Write-Host 'Cloning official NVIDIA DLSS SDK v310.9.16 (sparse)...'
+        Remove-Item -Recurse -Force $dlssDir -ErrorAction SilentlyContinue
+        & $gitPath clone --depth 1 --branch v310.9.16 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git $dlssDir
+        if ($LASTEXITCODE -ne 0) { throw "Failed to clone NVIDIA DLSS SDK v310.9.16 (exit code $LASTEXITCODE)." }
+        Push-Location $dlssDir
+        try {
+            & $gitPath sparse-checkout set include lib/Windows_x86_64
+            if ($LASTEXITCODE -ne 0) { throw "Failed to sparse-checkout NVIDIA DLSS SDK (exit code $LASTEXITCODE)." }
+        }
+        finally {
+            Pop-Location
+        }
+    }
+    elseif (Test-Path -LiteralPath (Join-Path $dlssDir '.git')) {
+        Write-Host 'Updating NVIDIA DLSS SDK to v310.9.16...'
+        & $gitPath -C $dlssDir fetch --depth 1 origin tag v310.9.16
+        if ($LASTEXITCODE -eq 0) {
+            & $gitPath -C $dlssDir checkout v310.9.16
+        }
+    }
+
     if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'external/ffx-dx11/include/FidelityFX/host/ffx_fsr3upscaler.h'))) {
         $python = Get-Command python -ErrorAction SilentlyContinue
         if ($python) {

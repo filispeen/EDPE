@@ -185,7 +185,7 @@ Requirements:
 * CMake 3.25 or newer
 * Python 3 (CMake runs `tools/fetch_ffx_dx11.py` automatically if `external/ffx-dx11` is missing)
 * `external/imgui` Git submodule
-* Optional: NVIDIA NGX SDK under `external/DLSS` (if omitted, CMake builds without DLAA/DLSS support)
+* Optional: NVIDIA NGX / DLSS SDK (`v310.9.16`) under `external/DLSS` (if omitted, CMake builds without DLAA/DLSS support)
 * Optional: AMD FidelityFX SDK under `external/ffx-sdk` (if present, enables `EDPE_ENABLE_FFX_FG` / `amd_fsr_fg_dx12_x64.dll` runtime staging)
 * Optional: NVIDIA Streamline SDK under `external/streamline` (if present, enables `EDPE_ENABLE_STREAMLINE` / `sl.*.dll` runtime staging)
 

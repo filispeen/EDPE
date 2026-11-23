@@ -27,24 +27,19 @@ runs:
       uses: actions/cache@v4
       with:
         path: external/DLSS
-        key: dlss-sdk-${{ runner.os }}-v1
-        restore-keys: |
-          dlss-sdk-${{ runner.os }}-
+        key: dlss-sdk-${{ runner.os }}-v310.9.16
 
     - name: Clone NVIDIA DLSS SDK
       if: steps.cache-dlss.outputs.cache-hit != 'true'
       shell: pwsh
       run: |
-        if (-not (Test-Path "external/DLSS/include/nvsdk_ngx.h")) {
-          Write-Host "Cloning official NVIDIA DLSS SDK (sparse)..."
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
-          Push-Location external/DLSS
-          git sparse-checkout set include lib/Windows_x86_64
-          Pop-Location
-          Remove-Item -Recurse -Force external/DLSS/.git
-        } else {
-          Write-Host "NVIDIA DLSS SDK found in cache."
-        }
+        Remove-Item -Recurse -Force external/DLSS -ErrorAction SilentlyContinue
+        Write-Host "Cloning official NVIDIA DLSS SDK v310.9.16 (sparse)..."
+        git clone --depth 1 --branch v310.9.16 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+        Push-Location external/DLSS
+        git sparse-checkout set include lib/Windows_x86_64
+        Pop-Location
+        Remove-Item -Recurse -Force external/DLSS/.git
 
     - name: Cache FidelityFX DX11 SDK
       id: cache-ffx
