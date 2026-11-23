@@ -1,3 +1,8 @@
+// CLSID_D3D12SDKConfiguration is defined here so test targets that do not link dxguid.lib resolve it
+// (DEFINE_GUID is selectany under MSVC, so duplicate definitions are harmless).
+#ifndef INITGUID
+#define INITGUID
+#endif
 #include "d3d12_bridge.h"
 
 #include "log.h"
@@ -9,6 +14,9 @@
 namespace edpe {
 
 namespace {
+
+// Microsoft.Direct3D.D3D12 (Agility SDK) version whose D3D12Core.dll is staged beside the proxy.
+constexpr UINT kAgilitySdkVersion = 616;
 
 using PFN_D3D12CreateDevice = HRESULT(WINAPI*)(IUnknown* pAdapter,
                                                D3D_FEATURE_LEVEL MinimumFeatureLevel,
@@ -64,7 +72,7 @@ D3D11D3D12Bridge::~D3D11D3D12Bridge() {
     shutdown();
 }
 
-bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device) {
+bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device, const wchar_t* agilitySdkDir) {
     shutdown();
     if (!d3d11Device) return false;
 
@@ -104,11 +112,46 @@ bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device) {
         return false;
     }
 
-    hr = createDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device12_));
-    if (FAILED(hr)) {
-        logBridgeFailure(L"D3D12CreateDevice(FL_12_0)", hr);
-        shutdown();
-        return false;
+    // Optional: create the device from a side-loaded Agility SDK runtime (D3D12Core.dll in
+    // agilitySdkDir). Falls back to the system runtime below if any step fails.
+    if (agilitySdkDir && agilitySdkDir[0]) {
+        using PFN_D3D12GetInterface = HRESULT(WINAPI*)(REFCLSID, REFIID, void**);
+        auto getInterface = reinterpret_cast<PFN_D3D12GetInterface>(
+            GetProcAddress(d3d12Module_, "D3D12GetInterface"));
+        Microsoft::WRL::ComPtr<ID3D12SDKConfiguration1> sdkConfig;
+        char sdkPathUtf8[MAX_PATH * 3]{};
+        if (getInterface &&
+            WideCharToMultiByte(CP_UTF8, 0, agilitySdkDir, -1, sdkPathUtf8,
+                                static_cast<int>(sizeof(sdkPathUtf8)), nullptr, nullptr) > 0 &&
+            SUCCEEDED(getInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&sdkConfig)))) {
+            const HRESULT fhr = sdkConfig->CreateDeviceFactory(
+                kAgilitySdkVersion, sdkPathUtf8, IID_PPV_ARGS(&deviceFactory_));
+            if (SUCCEEDED(fhr)) {
+                const HRESULT dhr = deviceFactory_->CreateDevice(
+                    adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device12_));
+                if (SUCCEEDED(dhr)) {
+                    usingAgilitySdk_ = true;
+                    EdpeLog(L"EDPE D3D12Bridge: D3D12 device created from side-loaded Agility SDK runtime");
+                } else {
+                    logBridgeFailure(L"ID3D12DeviceFactory::CreateDevice", dhr);
+                    device12_.Reset();
+                    deviceFactory_.Reset();
+                }
+            } else {
+                logBridgeFailure(L"ID3D12SDKConfiguration1::CreateDeviceFactory", fhr);
+            }
+        } else {
+            EdpeLog(L"EDPE D3D12Bridge: Agility SDK configuration interface unavailable; using system D3D12");
+        }
+    }
+
+    if (!device12_) {
+        hr = createDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device12_));
+        if (FAILED(hr)) {
+            logBridgeFailure(L"D3D12CreateDevice(FL_12_0)", hr);
+            shutdown();
+            return false;
+        }
     }
 
     D3D12_COMMAND_QUEUE_DESC qDesc{};
@@ -209,6 +252,8 @@ void D3D11D3D12Bridge::shutdown() {
     overrideQueue_.Reset();
     queue_.Reset();
     device12_.Reset();
+    deviceFactory_.Reset();
+    usingAgilitySdk_ = false;
     device11_5_.Reset();
     device11_ = nullptr;
     fenceValue_ = 0;

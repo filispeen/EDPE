@@ -269,6 +269,13 @@ int runCorrectnessTest(ID3D11Device* d3d11Dev, ID3D11DeviceContext* d3d11Ctx) {
         if (nullBridge.isInitialized()) return 12;
     }
 
+    // An Agility SDK directory without D3D12Core.dll must fall back to the system D3D12 runtime.
+    {
+        edpe::D3D11D3D12Bridge fallback;
+        if (!fallback.initialize(d3d11Dev, L"C:\\edpe-no-such-agility-dir\\")) return 140;
+        if (fallback.usingAgilitySdk()) return 141;
+    }
+
     edpe::D3D11D3D12Bridge bridge;
     if (!bridge.initialize(d3d11Dev)) return 13;
 
