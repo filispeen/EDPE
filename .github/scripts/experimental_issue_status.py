@@ -19,6 +19,8 @@ BRANCH_ISSUE_PATTERNS = (
     re.compile(r"^(?:issue|fix|bug|feat|hotfix)[-_ /]#?(\d+)(?:[-_/]|$)", re.IGNORECASE),
 )
 
+COMMIT_LINE_RE = re.compile(r"^([0-9a-f]{7,40})\s+(.*)$", re.IGNORECASE)
+
 GRAPHQL_QUERY_TEMPLATE = """
 query($owner: String!, $repo: String!, $qualifiedRef: String!, $states: [IssueState!], $cursor: String) {
   repository(owner: $owner, name: $repo) {
@@ -320,6 +322,22 @@ def resolve_release_links(
     return markdown_safe_url(resolved_release_url), markdown_safe_url(resolved_asset_url)
 
 
+def format_commit_list(commits_summary: str, server_url: str, repo: str) -> list[str]:
+    formatted: list[str] = []
+    for raw_line in commits_summary.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = COMMIT_LINE_RE.match(line)
+        if m and repo:
+            commit_sha, subject = m.group(1), m.group(2)
+            url = f"{server_url}/{repo}/commit/{commit_sha}"
+            formatted.append(f"- [`{commit_sha}`]({url}) {subject}")
+        else:
+            formatted.append(f"- {line}")
+    return formatted
+
+
 def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
     tag_name = ctx.get("tag_name") or "test-builds"
     display_version = ctx.get("edpe_version") or tag_name
@@ -336,8 +354,8 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
     sha256 = ctx.get("sha256", "").strip()
     commits_summary = ctx.get("commits_summary", "").strip()
 
-    commit_url = f"{server_url}/{repo}/commit/{sha}" if sha else ""
-    run_url = f"{server_url}/{repo}/actions/runs/{run_id}" if run_id else ""
+    commit_url = f"{server_url}/{repo}/commit/{sha}" if sha and repo else ""
+    run_url = f"{server_url}/{repo}/actions/runs/{run_id}" if run_id and repo else ""
 
     configure_outcome = ctx.get("configure_outcome", "")
     build_outcome = ctx.get("build_outcome", "")
@@ -409,37 +427,13 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
         rel_line = f"- {step_icon(rel_state)} **Publish Test Build** (`{tag_name}`): {rel_state}"
 
     lines = [
-        f"### {header_icon} Test Build `{display_version}`: {status_text}",
+        f"### {header_icon} Test Build {status_text}: `{display_version}`",
         "",
     ]
-    if branch_name:
-        lines.append(f"- **Branch:** `{branch_name}`")
-    if base_tag:
-        lines.append(f"- **Base Release:** `{base_tag}`")
-    if commit_url:
-        lines.append(f"- **Commit:** [`{short_sha}`]({commit_url})")
-    if run_url:
-        run_label = f"Actions Run #{run_number}" if run_number else "View Workflow Run"
-        lines.append(f"- **Workflow Run:** [{run_label}]({run_url})")
 
-    if base_tag:
-        isolation_note = f"> Isolated test build branched from `{base_tag}`. Does **not** include unmerged fixes from other open issues."
-    else:
-        isolation_note = "> Isolated test build for this branch. Does **not** include unmerged fixes from other open issues."
+    is_ready = phase == "finish" and status_text == "Ready"
 
-    lines.extend(
-        [
-            "",
-            isolation_note,
-            "",
-            "#### Build Progress",
-            build_line,
-            pkg_line,
-            rel_line,
-        ]
-    )
-
-    if phase == "finish" and status_text == "Ready":
+    if is_ready:
         release_url, asset_url = resolve_release_links(
             server_url=server_url,
             repo=repo,
@@ -451,34 +445,91 @@ def render_comment_body(phase: str, ctx: dict[str, str]) -> str:
         )
         lines.extend(
             [
+                f"**Download:** **[`{archive_name}`]({asset_url})** · [All test builds (`{tag_name}`)]({release_url})",
                 "",
-                "#### Build Download",
-                f"- **Direct Archive:** [`{archive_name}`]({asset_url})",
-                f"- **Test Builds Release:** [{tag_name}]({release_url})",
             ]
         )
+
+    if base_tag:
+        isolation_text = f"Isolated test build branched from `{base_tag}`. Does **not** include unmerged fixes from other open issues."
+    else:
+        isolation_text = "Isolated test build for this branch. Does **not** include unmerged fixes from other open issues."
+
+    lines.extend(
+        [
+            "> [!WARNING]",
+            f"> {isolation_text}",
+            "",
+        ]
+    )
+
+    meta_headers: list[str] = []
+    meta_values: list[str] = []
+    if branch_name:
+        meta_headers.append("Branch")
+        meta_values.append(f"`{branch_name}`")
+    if base_tag:
+        meta_headers.append("Base")
+        meta_values.append(f"`{base_tag}`")
+    if commit_url:
+        meta_headers.append("Commit")
+        meta_values.append(f"[`{short_sha}`]({commit_url})")
+    if run_url:
+        run_label = f"Run #{run_number}" if run_number else "Logs"
+        meta_headers.append("Workflow")
+        meta_values.append(f"[{run_label}]({run_url})")
+
+    if meta_headers:
+        lines.append("| " + " | ".join(meta_headers) + " |")
+        lines.append("| " + " | ".join(":---" for _ in meta_headers) + " |")
+        lines.append("| " + " | ".join(meta_values) + " |")
+        lines.append("")
+
+    if is_ready:
+        detail_lines: list[str] = []
         if sha256:
-            lines.append(f"- **SHA-256:** `{sha256}`")
+            detail_lines.append(f"- **SHA-256:** `{sha256}`")
+        detail_lines.extend([build_line, pkg_line, rel_line])
+        lines.extend(
+            [
+                "<details><summary>SHA-256 & build steps</summary>",
+                "",
+                *detail_lines,
+                "",
+                "</details>",
+            ]
+        )
         if commits_summary:
-            base_label = base_tag or "base"
+            commit_items = format_commit_list(commits_summary, server_url, repo)
+            if commit_items:
+                base_label = base_tag or "base"
+                lines.extend(
+                    [
+                        "",
+                        f"<details><summary>Commits since {base_label} ({len(commit_items)})</summary>",
+                        "",
+                        *commit_items,
+                        "",
+                        "</details>",
+                    ]
+                )
+    else:
+        lines.extend(
+            [
+                "#### Build Progress",
+                build_line,
+                pkg_line,
+                rel_line,
+            ]
+        )
+        if phase == "finish" and run_url:
             lines.extend(
                 [
                     "",
-                    f"<details><summary>Commits since {base_label}</summary>",
-                    "",
-                    "```",
-                    commits_summary,
-                    "```",
-                    "</details>",
+                    "> [!CAUTION]",
+                    f"> Build did not complete. Check the [workflow run logs]({run_url}) for failure details.",
                 ]
             )
-    elif phase == "finish" and run_url:
-        lines.extend(
-            [
-                "",
-                f"> Check the [workflow run logs]({run_url}) for failure details.",
-            ]
-        )
 
     return "\n".join(lines)
 

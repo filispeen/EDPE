@@ -154,9 +154,9 @@ class ExperimentalIssueStatusTests(unittest.TestCase):
         }
 
         start_body = MOD.render_comment_body("start", ctx)
-        self.assertIn("Test Build `v0.8.0-rc2+issue26.1234567`: In Progress", start_body)
-        self.assertIn("Base Release:** `v0.8.0-rc2`", start_body)
-        self.assertIn("Does **not** include unmerged fixes from other open issues.", start_body)
+        self.assertIn("### 🛠️ Test Build In Progress — `v0.8.0-rc2+issue26.1234567`", start_body)
+        self.assertIn("> [!WARNING]", start_body)
+        self.assertIn("| `issue/26-2` | `v0.8.0-rc2` |", start_body)
         self.assertIn("configuring & compiling", start_body)
         self.assertIn("https://github.com/filispeen/EDPE/actions/runs/999", start_body)
 
@@ -167,12 +167,13 @@ class ExperimentalIssueStatusTests(unittest.TestCase):
         self.assertIn("Publishing", after_pkg_body)
 
         finish_body = MOD.render_comment_body("finish", ctx)
-        self.assertIn("Ready", finish_body)
+        self.assertIn("### ✅ Test Build Ready — `v0.8.0-rc2+issue26.1234567`", finish_body)
+        self.assertIn("**Download:** **[`EDPE-issue26-1234567.zip`](https://github.com/filispeen/EDPE/releases/download/test-builds/EDPE-issue26-1234567.zip)**", finish_body)
         self.assertIn("https://github.com/filispeen/EDPE/releases/tag/test-builds", finish_body)
-        self.assertIn("https://github.com/filispeen/EDPE/releases/download/test-builds/EDPE-issue26-1234567.zip", finish_body)
+        self.assertIn("<details><summary>SHA-256 & build steps</summary>", finish_body)
         self.assertIn("ABCD1234", finish_body)
-        self.assertIn("Commits since v0.8.0-rc2", finish_body)
-        self.assertIn("1234567 fix DLSS FG on-foot aiming", finish_body)
+        self.assertIn("Commits since v0.8.0-rc2 (1)", finish_body)
+        self.assertIn("[`1234567`](https://github.com/filispeen/EDPE/commit/1234567) fix DLSS FG on-foot aiming", finish_body)
 
     def test_render_comment_failure(self) -> None:
         ctx = {
@@ -194,8 +195,9 @@ class ExperimentalIssueStatusTests(unittest.TestCase):
             "release_outcome": "skipped",
         }
         body = MOD.render_comment_body("finish", ctx)
-        self.assertIn("❌ Test Build `v0.8.0-rc2+issue26.1234567`: Failed", body)
+        self.assertIn("### ❌ Test Build Failed — `v0.8.0-rc2+issue26.1234567`", body)
         self.assertIn("❌ **Build EDPE (Release x64)**: failure", body)
+        self.assertIn("> [!CAUTION]", body)
         self.assertIn("workflow run logs", body)
 
 

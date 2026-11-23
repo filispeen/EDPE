@@ -115,7 +115,7 @@ jobs:
 
           $commits = ""
           if ($baseTag -ne "v0.0.0") {
-            $commits = (git log "$baseTag..HEAD" --oneline -n 15 2>$null | Out-String).Trim()
+            $commits = (git log "$baseTag..HEAD" --no-merges --pretty=format:"%h %s" -n 15 2>$null | Out-String).Trim()
           }
 
           $delim = "COMMITS_EOF_$([guid]::NewGuid().ToString('N'))"
