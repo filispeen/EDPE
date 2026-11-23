@@ -1,71 +1,19 @@
 name: Bug report
-description: Report a rendering, stability, or performance problem in EDPE
+description: Report a rendering, stability, Frame Gen, or performance problem in EDPE
 title: "Feet pictures selection in debug view dropdown doesn't do anything"
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Check existing issues first. Attach logs and media to this issue instead of committing them to the repository.
+        **Before submitting:** Search existing issues first. Use an official release or CI test build, and drag-and-drop logs/media below instead of pasting huge logs.
 
   - type: input
-    id: version
+    id: version_backend
     attributes:
-      label: EDPE version
-      description: Exact version shown in the overlay or top of edpe.log (for example v0.8.0-rc2 or v0.8.0-rc2+issue26.a1b2c3d).
-      placeholder: v0.8.0-rc2
-    validations:
-      required: true
-
-  - type: dropdown
-    id: backend
-    attributes:
-      label: Upscaler backend
-      options:
-        - Native / Bypass
-        - NVIDIA DLAA
-        - NVIDIA DLSS
-        - AMD FSR Native AA
-        - AMD FSR Super Resolution
-        - Native TAA
-        - TAA with upscaling
-        - All of them
-        - All of them except Bypass
-        - With any AA
-        - With any upscaler
-        - Not sure
-    validations:
-      required: true
-
-  - type: input
-    id: quality
-    attributes:
-      label: render scale
-      placeholder: 65% 0.65
-    validations:
-      required: false
-
-  - type: textarea
-    id: system
-    attributes:
-      label: System
-      description: GPU, driver version, Windows version, and whether you use multiple GPUs.
-      placeholder: |
-        GPU: RTX 4080
-        Driver: 
-        Windows: 11 26H2
-    validations:
-      required: true
-
-  - type: dropdown
-    id: game_mode
-    attributes:
-      label: Game mode
-      options:
-        - Odyssey, desktop
-        - Odyssey, VR
-        - Horizons, desktop
-        - Horizons, VR
+      label: EDPE version & backend
+      description: Exact version from the overlay or top of `edpe.log` + active upscaler/FG backend.
+      placeholder: v0.8.0-rc2 (or v0.8.0-rc2+issue26.a1b2c3d) - DLSS + DLSS-G
     validations:
       required: true
 
@@ -76,65 +24,53 @@ body:
       options:
         - Flickering or strobing
         - Ghosting or smearing
+        - Frame Generation artifact / pacing
         - HUD or UI corruption
         - Black screen or bypass stuck
         - Crash or hang
         - FPS drop or stutter
+        - Linux / Proton issue
         - Input or HOTAS problem
         - Other
     validations:
       required: true
 
   - type: textarea
-    id: description
+    id: environment
     attributes:
-      label: What happens
-      description: Describe the problem and what you expected instead.
+      label: Environment & Settings
+      description: Fill in the values below (keep it short, one line per item).
+      value: |
+        GPU: 
+        Driver: 
+        OS: Windows 11 / Linux (Proton version)
+        Mode: Odyssey desktop / VR / Horizons
+        Render scale & FG: e.g. 67%, DLSS-G / FSR FG / Off
     validations:
       required: true
 
   - type: textarea
-    id: steps
+    id: description
     attributes:
-      label: Steps to reproduce
-      description: Where in the game it happens (menu, station, supercruise, planet, cockpit) and how to trigger it.
+      label: What happens & Steps to reproduce
+      description: Describe the bug, where it happens (station, planet, supercruise, on-foot), frequency, and whether Native / Bypass is affected.
       placeholder: |
+        What happens:
+
+        Steps to reproduce:
         1. 
         2. 
         3. 
+
+        Frequency / happens in Native Bypass?: 
     validations:
       required: true
 
   - type: textarea
-    id: frequency
+    id: attachments
     attributes:
-      label: Frequency
-      description: Always, periodic (for example once per second), or random. Does it happen with the Native / Bypass backend too?
-    validations:
-      required: false
-
-  - type: textarea
-    id: logs
-    attributes:
-      label: edpe.log and edpe.ini
-      description: Drag and drop the files here. For long logs, attach the file instead of pasting.
+      label: Attachments (logs, config, media)
+      description: Drag and drop `edpe.log` and `edpe.ini` here. Short video, screenshot, or RenderDoc `.rdc` capture is optional but very helpful.
+      placeholder: Paste or drag-and-drop edpe.log, edpe.ini, screenshots, or video here...
     validations:
       required: true
-
-  - type: textarea
-    id: media
-    attributes:
-      label: Video, screenshots, or RenderDoc capture
-      description: Optional. A short video or a .rdc capture of a bad frame helps a lot.
-    validations:
-      required: false
-
-  - type: checkboxes
-    id: checks
-    attributes:
-      label: Checks
-      options:
-        - label: I used a DLL produced by an official release or a successful build
-          required: true
-        - label: I searched existing issues
-          required: true

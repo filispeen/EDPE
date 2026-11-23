@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discord Community & Support
+    url: https://discord.gg/KxDBRcKwMK
+    about: Ask setup questions, troubleshoot Linux/Proton, or discuss settings before opening an issue.
+  - name: Nexus Mods Page
+    url: https://www.nexusmods.com/elitedangerous/mods/15?tab=files
+    about: Download official stable releases and support EDPE development.

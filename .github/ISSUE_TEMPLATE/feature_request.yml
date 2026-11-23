@@ -6,23 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Check existing issues and `PLAN.md` first. The feature may already be planned.
-
-  - type: textarea
-    id: problem
-    attributes:
-      label: Problem
-      description: What is missing or annoying right now?
-    validations:
-      required: true
-
-  - type: textarea
-    id: solution
-    attributes:
-      label: Proposed solution
-      description: What should EDPE do? Include UI, hotkeys, or `edpe.ini` options if relevant.
-    validations:
-      required: true
+        **Before submitting:** Check existing issues and `PLAN.md` first. Keep requests within EDPE scope (graphics API / overlay / config, no game binary or network changes).
 
   - type: dropdown
     id: area
@@ -30,11 +14,13 @@ body:
       label: Area
       options:
         - Upscaler backend (DLSS, FSR, XeSS, TAA)
+        - Frame Generation (DLSS-G / FSR FG)
         - Overlay or menu
         - Performance HUD or telemetry
         - Camera, jitter, or motion vectors
         - HUD or UI handling
         - VR
+        - Linux / Proton
         - Configuration
         - Build, CI, or release
         - Other
@@ -42,19 +28,15 @@ body:
       required: true
 
   - type: textarea
-    id: alternatives
+    id: details
     attributes:
-      label: Alternatives
-      description: Other approaches or workarounds you considered.
-    validations:
-      required: false
+      label: Problem & Proposed solution
+      description: What is missing or annoying right now, and how should EDPE handle it (UI, hotkeys, or `edpe.ini` options)?
+      placeholder: |
+        Problem:
 
-  - type: checkboxes
-    id: checks
-    attributes:
-      label: Checks
-      options:
-        - label: I searched existing issues
-          required: true
-        - label: The feature stays within EDPE scope (graphics API observation, no game binary, game logic, or network changes)
-          required: true
+        Proposed solution:
+
+        Alternatives / workarounds (optional): 
+    validations:
+      required: true
