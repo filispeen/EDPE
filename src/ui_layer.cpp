@@ -33,8 +33,40 @@ cbuffer CompositeParams : register(b0) {
     float  uiBrightness;
     float  uiGamma;
     float  bgAttenGamma;
-    float2 _pad;
+    float  sharpenStrength;
+    float  _pad;
 };
+
+float4 loadWorldSharpened(int2 p) {
+    if (sharpenStrength <= 1e-4) {
+        return tWorld.Load(int3(p, 0));
+    }
+    int2 hi = max(int2(outputSize) - int2(1, 1), int2(0, 0));
+    float4 center = tWorld.Load(int3(clamp(p, int2(0, 0), hi), 0));
+    float3 a = saturate(tWorld.Load(int3(clamp(p + int2(-1, -1), int2(0, 0), hi), 0)).rgb);
+    float3 b = saturate(tWorld.Load(int3(clamp(p + int2( 0, -1), int2(0, 0), hi), 0)).rgb);
+    float3 c = saturate(tWorld.Load(int3(clamp(p + int2( 1, -1), int2(0, 0), hi), 0)).rgb);
+    float3 d = saturate(tWorld.Load(int3(clamp(p + int2(-1,  0), int2(0, 0), hi), 0)).rgb);
+    float3 e = saturate(center.rgb);
+    float3 f = saturate(tWorld.Load(int3(clamp(p + int2( 1,  0), int2(0, 0), hi), 0)).rgb);
+    float3 g = saturate(tWorld.Load(int3(clamp(p + int2(-1,  1), int2(0, 0), hi), 0)).rgb);
+    float3 h = saturate(tWorld.Load(int3(clamp(p + int2( 0,  1), int2(0, 0), hi), 0)).rgb);
+    float3 k = saturate(tWorld.Load(int3(clamp(p + int2( 1,  1), int2(0, 0), hi), 0)).rgb);
+
+    float3 mn = min(min(min(d, e), min(f, b)), h);
+    float3 mn2 = min(min(a, c), min(g, k));
+    mn += min(mn, mn2);
+
+    float3 mx = max(max(max(d, e), max(f, b)), h);
+    float3 mx2 = max(max(a, c), max(g, k));
+    mx += max(mx, mx2);
+
+    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-4)));
+    float3 w = amp * (-0.2 * saturate(sharpenStrength));
+    float3 rcpW = 1.0 / (1.0 + 4.0 * w);
+    float3 res = saturate(max(((b + d + f + h) * w + e) * rcpW, 0.0));
+    return float4(res, center.a);
+}
 
 [numthreads(32, 8, 1)]
 void cs_main(uint3 id : SV_DispatchThreadID) {
@@ -54,7 +86,7 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     // Якщо піксель не містить ні емісійного UI, ні напівпрозорої підкладки (transmittance == 1),
     // повертаємо піксель 3D-світу (плюс дельта шолома, якщо активна) без читання tUi:
     if (debugView == 0 && all(hdrUi.rgb <= 1e-5) && transmittance >= 0.999 && all(mult >= 0.999)) {
-        float4 worldOnly = tWorld.Load(p);
+        float4 worldOnly = loadWorldSharpened(p.xy);
         if (hasVisorDelta != 0) {
             worldOnly.rgb = saturate(worldOnly.rgb + visorDelta);
         }
@@ -97,7 +129,7 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
         return;
     }
 
-    float4 world = tWorld.Load(p);
+    float4 world = loadWorldSharpened(p.xy);
     float3 cleanMult = all(mult >= 0.999) ? float3(1.0, 1.0, 1.0) : mult;
     float3 atten = transmittance * cleanMult;
     float  minAtten = min(atten.r, min(atten.g, atten.b));
@@ -145,7 +177,8 @@ cbuffer CompositeParams : register(b0) {
     float  uiBrightness;
     float  uiGamma;
     float  bgAttenGamma;
-    float2 _pad;
+    float  sharpenStrength;
+    float  _pad;
 };
 
 struct VSOut {
@@ -157,6 +190,37 @@ VSOut vs_main(uint id : SV_VertexID) {
     float2 uv = float2((id << 1) & 2, id & 2);
     o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
     return o;
+}
+
+float4 loadWorldSharpened(int2 p) {
+    if (sharpenStrength <= 1e-4) {
+        return tWorld.Load(int3(p, 0));
+    }
+    int2 hi = max(int2(outputSize) - int2(1, 1), int2(0, 0));
+    float4 center = tWorld.Load(int3(clamp(p, int2(0, 0), hi), 0));
+    float3 a = saturate(tWorld.Load(int3(clamp(p + int2(-1, -1), int2(0, 0), hi), 0)).rgb);
+    float3 b = saturate(tWorld.Load(int3(clamp(p + int2( 0, -1), int2(0, 0), hi), 0)).rgb);
+    float3 c = saturate(tWorld.Load(int3(clamp(p + int2( 1, -1), int2(0, 0), hi), 0)).rgb);
+    float3 d = saturate(tWorld.Load(int3(clamp(p + int2(-1,  0), int2(0, 0), hi), 0)).rgb);
+    float3 e = saturate(center.rgb);
+    float3 f = saturate(tWorld.Load(int3(clamp(p + int2( 1,  0), int2(0, 0), hi), 0)).rgb);
+    float3 g = saturate(tWorld.Load(int3(clamp(p + int2(-1,  1), int2(0, 0), hi), 0)).rgb);
+    float3 h = saturate(tWorld.Load(int3(clamp(p + int2( 0,  1), int2(0, 0), hi), 0)).rgb);
+    float3 k = saturate(tWorld.Load(int3(clamp(p + int2( 1,  1), int2(0, 0), hi), 0)).rgb);
+
+    float3 mn = min(min(min(d, e), min(f, b)), h);
+    float3 mn2 = min(min(a, c), min(g, k));
+    mn += min(mn, mn2);
+
+    float3 mx = max(max(max(d, e), max(f, b)), h);
+    float3 mx2 = max(max(a, c), max(g, k));
+    mx += max(mx, mx2);
+
+    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-4)));
+    float3 w = amp * (-0.2 * saturate(sharpenStrength));
+    float3 rcpW = 1.0 / (1.0 + 4.0 * w);
+    float3 res = saturate(max(((b + d + f + h) * w + e) * rcpW, 0.0));
+    return float4(res, center.a);
 }
 
 float4 ps_main(VSOut pin) : SV_Target {
@@ -173,7 +237,7 @@ float4 ps_main(VSOut pin) : SV_Target {
     }
 
     if (debugView == 0 && all(hdrUi.rgb <= 1e-5) && transmittance >= 0.999 && all(mult >= 0.999)) {
-        float4 worldOnly = tWorld.Load(p);
+        float4 worldOnly = loadWorldSharpened(p.xy);
         if (hasVisorDelta != 0) {
             worldOnly.rgb = saturate(worldOnly.rgb + visorDelta);
         }
@@ -213,7 +277,7 @@ float4 ps_main(VSOut pin) : SV_Target {
         return float4(saturate(dbg), 1.0);
     }
 
-    float4 world = tWorld.Load(p);
+    float4 world = loadWorldSharpened(p.xy);
     float3 cleanMult = all(mult >= 0.999) ? float3(1.0, 1.0, 1.0) : mult;
     float3 atten = transmittance * cleanMult;
     float  minAtten = min(atten.r, min(atten.g, atten.b));
@@ -1124,15 +1188,17 @@ bool matchesDevice(ID3D11DeviceChild* child, ID3D11Device* expectedDevice) {
 
 } // namespace
 
-void UiLayer::updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView) {
+void UiLayer::updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView, float sharpenStrength) {
     const bool hasVisorDelta = (visorLdrSrv_ != nullptr && cleanLdrSrv_ != nullptr);
     const TonemapTuning t = tonemapTuning_;
+    const float clampedSharpen = std::clamp(sharpenStrength, 0.0f, 1.0f);
     if (cbValid_ && cbWidth_ == outputWidth && cbHeight_ == outputHeight &&
         cbHasMult_ == hasMultiplyDraws_ && cbDebugView_ == debugView &&
         cbHasVisorDelta_ == hasVisorDelta &&
         cbUiBrightness_ == t.uiBrightness && cbUiGamma_ == t.uiGamma &&
         cbBgBrightness_ == t.bgBrightness && cbBgGamma_ == t.bgGamma &&
-        cbBgAttenGamma_ == t.bgAttenGamma) {
+        cbBgAttenGamma_ == t.bgAttenGamma &&
+        cbSharpenStrength_ == clampedSharpen) {
         return;
     }
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -1149,7 +1215,7 @@ void UiLayer::updateCompositeConstants(ID3D11DeviceContext* context, UINT output
         fdata[7] = t.uiBrightness;
         fdata[8] = t.uiGamma;
         fdata[9] = t.bgAttenGamma;
-        fdata[10] = 0.0f;
+        fdata[10] = clampedSharpen;
         fdata[11] = 0.0f;
         context->Unmap(constantBuffer_.Get(), 0);
         cbWidth_ = outputWidth;
@@ -1162,6 +1228,7 @@ void UiLayer::updateCompositeConstants(ID3D11DeviceContext* context, UINT output
         cbBgBrightness_ = t.bgBrightness;
         cbBgGamma_ = t.bgGamma;
         cbBgAttenGamma_ = t.bgAttenGamma;
+        cbSharpenStrength_ = clampedSharpen;
         cbValid_ = true;
     }
 }
@@ -1170,7 +1237,8 @@ bool UiLayer::composite(ID3D11DeviceContext* context,
                         ID3D11ShaderResourceView* worldReconstruction,
                         ID3D11UnorderedAccessView* backbufferUav,
                         UINT outputWidth, UINT outputHeight,
-                        bool debugView) {
+                        bool debugView,
+                        float sharpenStrength) {
     if (!context || !worldReconstruction || !backbufferUav || !compositeCs_ || !hdrLayerSrv_ || !device_) return false;
     if (!matchesDevice(context, device_.Get()) ||
         !matchesDevice(worldReconstruction, device_.Get()) ||
@@ -1190,7 +1258,7 @@ bool UiLayer::composite(ID3D11DeviceContext* context,
     }
 
     // Оновлюємо константи
-    updateCompositeConstants(context, outputWidth, outputHeight, debugView);
+    updateCompositeConstants(context, outputWidth, outputHeight, debugView, sharpenStrength);
 
     // Біндимо ресурси (t0 = world, t1 = ldrUi, t2 = mult, t3 = hdrUi, t4 = visorLdr, t5 = cleanLdr)
     ID3D11ShaderResourceView* srvs[6] = {
@@ -1232,7 +1300,8 @@ bool UiLayer::compositeToRtv(ID3D11DeviceContext* context,
                              ID3D11RenderTargetView* targetRtv,
                              UINT outputWidth, UINT outputHeight,
                              bool debugView,
-                             bool callerRestoresState) {
+                             bool callerRestoresState,
+                             float sharpenStrength) {
     if (!context || !worldReconstruction || !targetRtv ||
         !coverageVs_ || !compositePs_ || !hdrLayerSrv_ || !device_) {
         return false;
@@ -1244,7 +1313,7 @@ bool UiLayer::compositeToRtv(ID3D11DeviceContext* context,
     }
     EvaluatingUpscalerGuard guard;
 
-    updateCompositeConstants(context, outputWidth, outputHeight, debugView);
+    updateCompositeConstants(context, outputWidth, outputHeight, debugView, sharpenStrength);
 
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> origRtv;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> origDsv;

@@ -74,13 +74,15 @@ public:
                    ID3D11ShaderResourceView* worldReconstruction,
                    ID3D11UnorderedAccessView* backbufferUav,
                    UINT outputWidth, UINT outputHeight,
-                   bool debugView = false);
+                   bool debugView = false,
+                   float sharpenStrength = 0.0f);
     bool compositeToRtv(ID3D11DeviceContext* context,
                         ID3D11ShaderResourceView* worldReconstruction,
                         ID3D11RenderTargetView* targetRtv,
                         UINT outputWidth, UINT outputHeight,
                         bool debugView = false,
-                        bool callerRestoresState = false);
+                        bool callerRestoresState = false,
+                        float sharpenStrength = 0.0f);
 
     ID3D11Texture2D* hdrLayerTexture() const { return hdrLayerTex_.Get(); }
     ID3D11RenderTargetView* hdrLayerRtv() const { return hdrLayerRtv_.Get(); }
@@ -191,7 +193,7 @@ private:
     UINT width_ = 0;
     UINT height_ = 0;
 
-    void updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView);
+    void updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView, float sharpenStrength);
     UINT cbWidth_ = 0;
     UINT cbHeight_ = 0;
     bool cbHasMult_ = false;
@@ -203,6 +205,7 @@ private:
     float cbBgBrightness_ = 1.0f;
     float cbBgGamma_ = 1.0f;
     float cbBgAttenGamma_ = 1.0f;
+    float cbSharpenStrength_ = 0.0f;
     bool cbValid_ = false;
 };
 

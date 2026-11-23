@@ -11643,10 +11643,25 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
         bool compOk = false;
         bool upscalerEvalOk = false;
+        const bool preAllowBackbufferWrite = (s_diag_eval_stage == 1) || chosenIsBackbuffer;
+        const bool canDeferSharpen =
+            (activeBackend != edpe::UpscalerBackend::AmdFsr) &&
+            (inputs.sharpness > 0.0f) &&
+            !isHdrColor &&
+            (evalDestination == s_dlss_output_texture.Get()) &&
+            (s_dlss_output_srv != nullptr) &&
+            preAllowBackbufferWrite &&
+            (s_backbuffer_rtv != nullptr || s_backbuffer_uav != nullptr) &&
+            !fg_active;
+        const float deferredSharpen = canDeferSharpen ? inputs.sharpness : 0.0f;
+        edpe::TemporalFrameInputs evalInputs = inputs;
+        if (canDeferSharpen) {
+            evalInputs.sharpness = 0.0f;
+        }
         {
             edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: UpscaleEval");
             s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UpscaleEval);
-            upscalerEvalOk = upscaler.evaluate(context, inputs, nullptr, evalDestination);
+            upscalerEvalOk = upscaler.evaluate(context, evalInputs, nullptr, evalDestination);
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::UpscaleEval);
         }
         rearmContextHooks();
@@ -11716,6 +11731,23 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             {
                 edpe::ScopedRenderDocEvent rdocUiEvent(context, L"EDPE: UiComposite");
                 s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UiComposite);
+            auto deliverWorldToBackbuffer = [&]() {
+                if (!allowBackbufferWrite) return;
+                const bool directBlitSharpened =
+                    (deferredSharpen > 0.0f && s_backbuffer_rtv && s_dlss_output_srv) &&
+                    upscaler.applySharpenToRtv(
+                        context,
+                        s_dlss_output_srv.Get(),
+                        s_backbuffer_rtv.Get(),
+                        backbufferDesc.Width,
+                        backbufferDesc.Height,
+                        deferredSharpen,
+                        /*hdr=*/false,
+                        /*callerRestoresState=*/true);
+                if (!directBlitSharpened) {
+                    context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                }
+            };
             if (canCompositeUi) {
                 if (edpe::UiLayer::instance().device() != device.Get() ||
                     edpe::UiLayer::instance().width() != backbufferDesc.Width ||
@@ -11742,7 +11774,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                         backbufferDesc.Width,
                         backbufferDesc.Height,
                         s_hud_debug_view.load(std::memory_order_relaxed),
-                        /*callerRestoresState=*/true);
+                        /*callerRestoresState=*/true,
+                        deferredSharpen);
                 } else {
                     ID3D11UnorderedAccessView* targetUav =
                         (s_backbuffer_uav && allowBackbufferWrite) ? s_backbuffer_uav.Get() : s_comp_final_uav.Get();
@@ -11753,22 +11786,19 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                             targetUav,
                             backbufferDesc.Width,
                             backbufferDesc.Height,
-                            s_hud_debug_view.load(std::memory_order_relaxed));
+                            s_hud_debug_view.load(std::memory_order_relaxed),
+                            deferredSharpen);
                         if (compOk && targetUav == s_comp_final_uav.Get() && s_comp_final_tex && allowBackbufferWrite) {
                             context->CopyResource(backbuffer, s_comp_final_tex.Get());
                         }
                     }
                 }
                 if (!compOk && !isHdrColor) {
-                    if (allowBackbufferWrite) {
-                        context->CopyResource(backbuffer, s_dlss_output_texture.Get());
-                    }
+                    deliverWorldToBackbuffer();
                     compOk = true;
                 }
             } else if (evalDestination == s_dlss_output_texture.Get()) {
-                if (allowBackbufferWrite) {
-                    context->CopyResource(backbuffer, s_dlss_output_texture.Get());
-                }
+                deliverWorldToBackbuffer();
                 compOk = true;
             } else {
                 compOk = true;

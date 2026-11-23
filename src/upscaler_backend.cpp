@@ -1213,6 +1213,17 @@ bool UpscalerManager::evaluateBackend(UpscalerBackend backendType,
     return evalSuccess;
 }
 
+bool UpscalerManager::applySharpenToRtv(ID3D11DeviceContext* context,
+    ID3D11ShaderResourceView* sourceSrv,
+    ID3D11RenderTargetView* targetRtv,
+    uint32_t width, uint32_t height,
+    float sharpness, bool hdr,
+    bool callerRestoresState) {
+    EvaluatingUpscalerGuard evalGuard;
+    return sharpenPass_.applyToRtv(
+        context, sourceSrv, targetRtv, width, height, sharpness, hdr, callerRestoresState);
+}
+
 bool UpscalerManager::isBackendModeSupported(UpscalerBackend backendType) const {
     if (backendType == UpscalerBackend::None || !isBackendAvailable(backendType)) {
         return false;

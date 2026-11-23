@@ -14,7 +14,14 @@ public:
     bool initialize(ID3D11Device* device, ID3D11DeviceContext* context);
     void shutdown();
 
-    bool apply(ID3D11DeviceContext* context, ID3D11Texture2D* target, float sharpness, bool hdr);
+    bool apply(ID3D11DeviceContext* context, ID3D11Texture2D* target, float sharpness, bool hdr,
+               bool callerRestoresState = false);
+    bool applyToRtv(ID3D11DeviceContext* context,
+                    ID3D11ShaderResourceView* sourceSrv,
+                    ID3D11RenderTargetView* targetRtv,
+                    uint32_t width, uint32_t height,
+                    float sharpness, bool hdr,
+                    bool callerRestoresState = false);
 
     bool isInitialized() const { return device_ != nullptr; }
 

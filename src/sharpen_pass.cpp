@@ -249,7 +249,117 @@ bool SharpenPass::ensureResources(const D3D11_TEXTURE2D_DESC& desc, bool directT
     return true;
 }
 
-bool SharpenPass::apply(ID3D11DeviceContext* context, ID3D11Texture2D* target, float sharpness, bool hdr) {
+bool SharpenPass::applyToRtv(ID3D11DeviceContext* context,
+                             ID3D11ShaderResourceView* sourceSrv,
+                             ID3D11RenderTargetView* targetRtv,
+                             uint32_t width, uint32_t height,
+                             float sharpness, bool hdr,
+                             bool callerRestoresState) {
+    if (!device_ || !context || !sourceSrv || !targetRtv ||
+        width == 0 || height == 0 || sharpness <= 0.0f) {
+        return false;
+    }
+
+    SharpenConstants cb{};
+    cb.params[0] = std::clamp(sharpness, 0.0f, 1.0f);
+    cb.params[1] = static_cast<float>(width);
+    cb.params[2] = static_cast<float>(height);
+    cb.params[3] = hdr ? 1.0f : 0.0f;
+    context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cb, 0, 0);
+
+    UINT origVpCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    D3D11_VIEWPORT origVps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> origRs;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> origBs;
+    FLOAT origBlendFactor[4]{};
+    UINT origSampleMask = 0xFFFFFFFF;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> origDss;
+    UINT origStencilRef = 0;
+    ID3D11RenderTargetView* origRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+    ID3D11DepthStencilView* origDsv = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> origInputLayout;
+    D3D11_PRIMITIVE_TOPOLOGY origTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> origVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> origPs;
+    Microsoft::WRL::ComPtr<ID3D11GeometryShader> origGs;
+    Microsoft::WRL::ComPtr<ID3D11HullShader> origHs;
+    Microsoft::WRL::ComPtr<ID3D11DomainShader> origDs;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> origPsSrv;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> origPsCb;
+
+    if (!callerRestoresState) {
+        context->RSGetViewports(&origVpCount, origVps);
+        context->RSGetState(&origRs);
+        context->OMGetBlendState(&origBs, origBlendFactor, &origSampleMask);
+        context->OMGetDepthStencilState(&origDss, &origStencilRef);
+        context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, &origDsv);
+        context->IAGetInputLayout(&origInputLayout);
+        context->IAGetPrimitiveTopology(&origTopology);
+        context->VSGetShader(&origVs, nullptr, nullptr);
+        context->PSGetShader(&origPs, nullptr, nullptr);
+        context->GSGetShader(&origGs, nullptr, nullptr);
+        context->HSGetShader(&origHs, nullptr, nullptr);
+        context->DSGetShader(&origDs, nullptr, nullptr);
+        context->PSGetShaderResources(0, 1, &origPsSrv);
+        context->PSGetConstantBuffers(0, 1, &origPsCb);
+    }
+
+    const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+    context->RSSetViewports(1, &vp);
+    context->RSSetState(nullptr);
+    context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    context->OMSetDepthStencilState(nullptr, 0);
+    context->OMSetRenderTargets(1, &targetRtv, nullptr);
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(vertexShader_.Get(), nullptr, 0);
+    context->PSSetShader(pixelShader_.Get(), nullptr, 0);
+    context->GSSetShader(nullptr, nullptr, 0);
+    if (origHs) context->HSSetShader(nullptr, nullptr, 0);
+    if (origDs) context->DSSetShader(nullptr, nullptr, 0);
+
+    ID3D11ShaderResourceView* srvs[1] = { sourceSrv };
+    context->PSSetShaderResources(0, 1, srvs);
+    ID3D11Buffer* cbs[1] = { constantBuffer_.Get() };
+    context->PSSetConstantBuffers(0, 1, cbs);
+
+    context->Draw(3, 0);
+
+    ID3D11ShaderResourceView* nullSrv[1] = { nullptr };
+    context->PSSetShaderResources(0, 1, nullSrv);
+    ID3D11RenderTargetView* nullRtv[1] = { nullptr };
+    context->OMSetRenderTargets(1, nullRtv, nullptr);
+
+    if (!callerRestoresState) {
+        if (origVpCount > 0) {
+            context->RSSetViewports(origVpCount, origVps);
+        }
+        context->RSSetState(origRs.Get());
+        context->OMSetBlendState(origBs.Get(), origBlendFactor, origSampleMask);
+        context->OMSetDepthStencilState(origDss.Get(), origStencilRef);
+        context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, origDsv);
+        for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+            if (origRtvs[i]) origRtvs[i]->Release();
+        }
+        if (origDsv) origDsv->Release();
+        context->IASetInputLayout(origInputLayout.Get());
+        context->IASetPrimitiveTopology(origTopology);
+        context->VSSetShader(origVs.Get(), nullptr, 0);
+        context->PSSetShader(origPs.Get(), nullptr, 0);
+        if (origGs) context->GSSetShader(origGs.Get(), nullptr, 0);
+        if (origHs) context->HSSetShader(origHs.Get(), nullptr, 0);
+        if (origDs) context->DSSetShader(origDs.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* srvToRestore = origPsSrv.Get();
+        context->PSSetShaderResources(0, 1, &srvToRestore);
+        ID3D11Buffer* cbToRestore = origPsCb.Get();
+        context->PSSetConstantBuffers(0, 1, &cbToRestore);
+    }
+
+    return true;
+}
+
+bool SharpenPass::apply(ID3D11DeviceContext* context, ID3D11Texture2D* target, float sharpness, bool hdr,
+                        bool callerRestoresState) {
     if (!device_ || !context || !target || sharpness <= 0.0f) {
         if (device_) {
             wchar_t msg[192];
@@ -324,112 +434,10 @@ bool SharpenPass::apply(ID3D11DeviceContext* context, ID3D11Texture2D* target, f
 
     context->CopyResource(sourceTexture_.Get(), target);
 
-    SharpenConstants cb{};
-    cb.params[0] = std::clamp(sharpness, 0.0f, 1.0f);
-    cb.params[1] = static_cast<float>(desc.Width);
-    cb.params[2] = static_cast<float>(desc.Height);
-    cb.params[3] = hdr ? 1.0f : 0.0f;
-    context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cb, 0, 0);
-
-    // Save previous pipeline state manually (without ID3DDeviceContextState)
-    UINT origVpCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-    D3D11_VIEWPORT origVps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-    context->RSGetViewports(&origVpCount, origVps);
-
-    Microsoft::WRL::ComPtr<ID3D11RasterizerState> origRs;
-    context->RSGetState(&origRs);
-
-    Microsoft::WRL::ComPtr<ID3D11BlendState> origBs;
-    FLOAT origBlendFactor[4]{};
-    UINT origSampleMask = 0xFFFFFFFF;
-    context->OMGetBlendState(&origBs, origBlendFactor, &origSampleMask);
-
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> origDss;
-    UINT origStencilRef = 0;
-    context->OMGetDepthStencilState(&origDss, &origStencilRef);
-
-    ID3D11RenderTargetView* origRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-    ID3D11DepthStencilView* origDsv = nullptr;
-    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, &origDsv);
-
-    Microsoft::WRL::ComPtr<ID3D11InputLayout> origInputLayout;
-    context->IAGetInputLayout(&origInputLayout);
-
-    D3D11_PRIMITIVE_TOPOLOGY origTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-    context->IAGetPrimitiveTopology(&origTopology);
-
-    Microsoft::WRL::ComPtr<ID3D11VertexShader> origVs;
-    context->VSGetShader(&origVs, nullptr, nullptr);
-
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> origPs;
-    context->PSGetShader(&origPs, nullptr, nullptr);
-
-    Microsoft::WRL::ComPtr<ID3D11GeometryShader> origGs;
-    context->GSGetShader(&origGs, nullptr, nullptr);
-
-    Microsoft::WRL::ComPtr<ID3D11HullShader> origHs;
-    context->HSGetShader(&origHs, nullptr, nullptr);
-
-    Microsoft::WRL::ComPtr<ID3D11DomainShader> origDs;
-    context->DSGetShader(&origDs, nullptr, nullptr);
-
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> origPsSrv;
-    context->PSGetShaderResources(0, 1, &origPsSrv);
-
-    Microsoft::WRL::ComPtr<ID3D11Buffer> origPsCb;
-    context->PSGetConstantBuffers(0, 1, &origPsCb);
-
-    // Bind sharpen pipeline state
-    const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(desc.Width), static_cast<float>(desc.Height), 0.0f, 1.0f};
-    context->RSSetViewports(1, &vp);
-    context->RSSetState(nullptr);
-    context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
-    context->OMSetDepthStencilState(nullptr, 0);
-    context->OMSetRenderTargets(1, &targetRtv, nullptr);
-    context->IASetInputLayout(nullptr);
-    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    context->VSSetShader(vertexShader_.Get(), nullptr, 0);
-    context->PSSetShader(pixelShader_.Get(), nullptr, 0);
-    if (origGs) context->GSSetShader(nullptr, nullptr, 0);
-    if (origHs) context->HSSetShader(nullptr, nullptr, 0);
-    if (origDs) context->DSSetShader(nullptr, nullptr, 0);
-
-    ID3D11ShaderResourceView* srvs[1] = { sourceSrv_.Get() };
-    context->PSSetShaderResources(0, 1, srvs);
-    ID3D11Buffer* cbs[1] = { constantBuffer_.Get() };
-    context->PSSetConstantBuffers(0, 1, cbs);
-
-    context->Draw(3, 0);
-
-    // Mandatory unbind
-    ID3D11ShaderResourceView* nullSrv[1] = { nullptr };
-    context->PSSetShaderResources(0, 1, nullSrv);
-    ID3D11RenderTargetView* nullRtv[1] = { nullptr };
-    context->OMSetRenderTargets(1, nullRtv, nullptr);
-
-    // Restore original pipeline state
-    if (origVpCount > 0) {
-        context->RSSetViewports(origVpCount, origVps);
+    if (!applyToRtv(context, sourceSrv_.Get(), targetRtv, desc.Width, desc.Height,
+                    sharpness, hdr, callerRestoresState)) {
+        return false;
     }
-    context->RSSetState(origRs.Get());
-    context->OMSetBlendState(origBs.Get(), origBlendFactor, origSampleMask);
-    context->OMSetDepthStencilState(origDss.Get(), origStencilRef);
-    context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, origRtvs, origDsv);
-    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
-        if (origRtvs[i]) origRtvs[i]->Release();
-    }
-    if (origDsv) origDsv->Release();
-    context->IASetInputLayout(origInputLayout.Get());
-    context->IASetPrimitiveTopology(origTopology);
-    context->VSSetShader(origVs.Get(), nullptr, 0);
-    context->PSSetShader(origPs.Get(), nullptr, 0);
-    if (origGs) context->GSSetShader(origGs.Get(), nullptr, 0);
-    if (origHs) context->HSSetShader(origHs.Get(), nullptr, 0);
-    if (origDs) context->DSSetShader(origDs.Get(), nullptr, 0);
-    ID3D11ShaderResourceView* srvToRestore = origPsSrv.Get();
-    context->PSSetShaderResources(0, 1, &srvToRestore);
-    ID3D11Buffer* cbToRestore = origPsCb.Get();
-    context->PSSetConstantBuffers(0, 1, &cbToRestore);
 
     if (!direct) {
         context->CopyResource(target, stagingTarget_.Get());

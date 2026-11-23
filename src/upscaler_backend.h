@@ -224,6 +224,13 @@ public:
         ID3D11RenderTargetView* destinationRtv,
         ID3D11Texture2D* destinationTexture);
 
+    bool applySharpenToRtv(ID3D11DeviceContext* context,
+        ID3D11ShaderResourceView* sourceSrv,
+        ID3D11RenderTargetView* targetRtv,
+        uint32_t width, uint32_t height,
+        float sharpness, bool hdr,
+        bool callerRestoresState = false);
+
     bool isBackendModeSupported(UpscalerBackend backendType) const;
     void resetBackendHistory(UpscalerBackend backendType);
     unsigned getRecommendedJitterPhaseCount(unsigned configuredBasePhases,
