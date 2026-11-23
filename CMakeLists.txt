@@ -54,6 +54,18 @@ else()
     set(EDPE_HAVE_FFX_FG FALSE)
 endif()
 
+# FSR 4 (ML upscaler) through the D3D11/D3D12 bridge: needs the FidelityFX SDK headers and the signed
+# amd_fidelityfx_upscaler_dx12.dll. Optional D3D12 Agility SDK runtime (D3D12Core.dll) in external/agility
+# is staged under D3D12/ and used when present.
+set(EDPE_AGILITY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/agility")
+if(EDPE_HAVE_FFX_FG
+   AND EXISTS "${FFX_FG_SDK_DIR}/upscalers/include/ffx_upscale.h"
+   AND EXISTS "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_upscaler_dx12.dll")
+    set(EDPE_HAVE_FFX_FSR4 TRUE)
+else()
+    set(EDPE_HAVE_FFX_FSR4 FALSE)
+endif()
+
 set(STREAMLINE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/streamline")
 if(EXISTS "${STREAMLINE_SDK_DIR}/include/sl_dlss_g.h")
     set(EDPE_HAVE_STREAMLINE TRUE)
@@ -96,6 +108,7 @@ add_library(EDPE_DXGI SHARED
     src/fg_backend.cpp
     src/fg_ui_pack_pass.cpp
     src/amd_fsr_fg_backend.cpp
+    src/amd_fsr4_engine.cpp
     src/nvidia_sl_fg_backend.cpp
     src/fg_integration.cpp
     src/frame_limiter.cpp
@@ -159,6 +172,28 @@ if(EDPE_HAVE_FFX_FG)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_framegeneration_dx12.dll" "$<TARGET_FILE_DIR:EDPE_DXGI>/")
     endif()
+endif()
+
+# Copies the signed FidelityFX loader and upscaler DLLs, and the optional Agility SDK D3D12Core.dll (under D3D12/),
+# next to the built binary of `target` so it can run FSR 4.
+function(edpe_stage_fsr4_runtime target)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll" "$<TARGET_FILE_DIR:${target}>/"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_upscaler_dx12.dll" "$<TARGET_FILE_DIR:${target}>/")
+    if(EXISTS "${EDPE_AGILITY_DIR}/D3D12Core.dll")
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/D3D12"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${EDPE_AGILITY_DIR}/D3D12Core.dll" "$<TARGET_FILE_DIR:${target}>/D3D12/")
+    endif()
+endfunction()
+
+if(EDPE_HAVE_FFX_FSR4)
+    target_include_directories(EDPE_DXGI PRIVATE "${FFX_FG_SDK_DIR}/upscalers/include")
+    target_compile_definitions(EDPE_DXGI PRIVATE EDPE_ENABLE_FFX_FSR4=1)
+    edpe_stage_fsr4_runtime(EDPE_DXGI)
 endif()
 
 if(EDPE_HAVE_STREAMLINE)
@@ -225,7 +260,7 @@ target_compile_features(frame_limiter_test PRIVATE cxx_std_20)
 target_compile_definitions(frame_limiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(frame_limiter_test PRIVATE src)
 add_test(NAME frame_limiter COMMAND frame_limiter_test)
-add_executable(temporal_inputs_test tests/temporal_inputs.cpp src/upscaler_backend.cpp src/ngx_context.cpp src/log.cpp src/taa_pass.cpp src/sharpen_pass.cpp)
+add_executable(temporal_inputs_test tests/temporal_inputs.cpp src/upscaler_backend.cpp src/amd_fsr4_engine.cpp src/ngx_context.cpp src/log.cpp src/taa_pass.cpp src/sharpen_pass.cpp)
 target_compile_features(temporal_inputs_test PRIVATE cxx_std_20)
 target_compile_definitions(temporal_inputs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(temporal_inputs_test PRIVATE src)
@@ -245,7 +280,7 @@ if(EDPE_HAVE_FSR)
         "${FFX_SDK_DIR}/lib/ffx_backend_dx11_x64.lib")
 endif()
 add_test(NAME temporal_inputs COMMAND temporal_inputs_test)
-add_executable(upscaler_dejitter_test tests/upscaler_dejitter_test.cpp src/upscaler_backend.cpp src/ngx_context.cpp src/log.cpp src/taa_pass.cpp src/sharpen_pass.cpp)
+add_executable(upscaler_dejitter_test tests/upscaler_dejitter_test.cpp src/upscaler_backend.cpp src/amd_fsr4_engine.cpp src/ngx_context.cpp src/log.cpp src/taa_pass.cpp src/sharpen_pass.cpp)
 target_compile_features(upscaler_dejitter_test PRIVATE cxx_std_20)
 target_compile_definitions(upscaler_dejitter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(upscaler_dejitter_test PRIVATE src)
@@ -368,6 +403,29 @@ if(EDPE_HAVE_FFX_FG)
     endif()
 endif()
 add_test(NAME amd_fsr_fg COMMAND amd_fsr_fg_test)
+
+# FSR 4 pure logic (failure gate, provider selection, input mapping): CPU only, no GPU or SDK needed.
+add_executable(fsr4_logic_test tests/fsr4_logic_test.cpp)
+target_compile_features(fsr4_logic_test PRIVATE cxx_std_20)
+target_compile_definitions(fsr4_logic_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(fsr4_logic_test PRIVATE src)
+target_link_libraries(fsr4_logic_test PRIVATE d3d11 dxgi)
+add_test(NAME fsr4_logic COMMAND fsr4_logic_test)
+
+# FSR 4 engine smoke test (skips cleanly when the signed DLLs are not staged or the GPU does not offer FSR 4).
+add_executable(amd_fsr4_engine_test tests/amd_fsr4_engine_test.cpp src/amd_fsr4_engine.cpp src/d3d12_bridge.cpp src/renderdoc_support.cpp src/log.cpp)
+target_compile_features(amd_fsr4_engine_test PRIVATE cxx_std_20)
+target_compile_definitions(amd_fsr4_engine_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(amd_fsr4_engine_test PRIVATE src)
+target_link_libraries(amd_fsr4_engine_test PRIVATE d3d11 dxgi d3dcompiler dxguid)
+if(EDPE_HAVE_FFX_FSR4)
+    target_include_directories(amd_fsr4_engine_test PRIVATE
+        "${FFX_FG_SDK_DIR}/api/include"
+        "${FFX_FG_SDK_DIR}/upscalers/include")
+    target_compile_definitions(amd_fsr4_engine_test PRIVATE EDPE_ENABLE_FFX_FSR4=1)
+    edpe_stage_fsr4_runtime(amd_fsr4_engine_test)
+endif()
+add_test(NAME amd_fsr4_engine COMMAND amd_fsr4_engine_test)
 
 add_executable(nvidia_sl_fg_test tests/nvidia_sl_fg_test.cpp src/nvidia_sl_fg_backend.cpp src/fg_backend.cpp src/fg_ui_pack_pass.cpp src/d3d12_presenter.cpp src/d3d12_bridge.cpp src/renderdoc_support.cpp src/log.cpp)
 target_compile_features(nvidia_sl_fg_test PRIVATE cxx_std_20)

@@ -1507,8 +1507,10 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::NvidiaDlss);
             const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
             edpe::UpscalerManager::instance().setMode(static_cast<edpe::UpscaleMode>(m));
-        } else if (cfg.upscalerBackend == 2 &&
+        } else if ((cfg.upscalerBackend == 2 || cfg.upscalerBackend == 4) &&
             edpe::UpscalerManager::instance().isBackendAvailable(edpe::UpscalerBackend::AmdFsr)) {
+            // Backend=4 is "AMD FSR 4.1.2"; Backend=2 with Fsr4=1 also selects FSR 4.
+            edpe::UpscalerManager::instance().setFsr4Selected(cfg.upscalerBackend == 4 || cfg.fsr4);
             edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::AmdFsr);
             const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
             edpe::UpscalerManager::instance().setMode(static_cast<edpe::UpscaleMode>(m));
@@ -1862,18 +1864,35 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             ImGui::Spacing();
 
             // Upscaler backend selector
+            const bool fsr4_available = upscaler.isFsr4Available();
             const char* upscaler_items[] = {
                 "Native (Bypass)",
                 nvidia_available ? "NVIDIA DLSS / DLAA" : "NVIDIA DLSS / DLAA (unavailable)",
-                amd_available ? "AMD FSR (Native AA / SR)" : "AMD FSR (unavailable)",
-                "TAA (Temporal Anti-Aliasing)"
+                amd_available ? "AMD FSR 3.1.2 (Native AA / SR)" : "AMD FSR 3.1.2 (unavailable)",
+                "TAA (Temporal Anti-Aliasing)",
+                fsr4_available ? "AMD FSR 4.1.2 (Native AA / SR, D3D12 bridge)" : "AMD FSR 4.1.2 (unavailable)"
             };
+            // The combo index is the Backend= value in edpe.ini: 0 bypass, 1 DLSS, 2 AMD FSR 3.1.2, 3 TAA, 4 AMD FSR 4.1.2.
+            // Index 2 and 4 are both the AMD FSR backend; the runtime provider flag tells them apart.
             int current_backend_idx = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss) ? 1 :
-                                      (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) ? 2 :
+                                      (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr)
+                                          ? (upscaler.isFsr4Selected() ? 4 : 2) :
                                       (upscaler.getBackend() == edpe::UpscalerBackend::Taa) ? 3 : 0;
 
             if (ImGui::Combo("Upscaler Backend", &current_backend_idx, upscaler_items, IM_ARRAYSIZE(upscaler_items))) {
-                if (current_backend_idx == 1) {
+                if (current_backend_idx == 4) {
+                    if (fsr4_available) {
+                        const bool was_fsr = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
+                        upscaler.setFsr4Selected(true);
+                        // Reselecting FSR 4 while it is selected but not running retries its initialization.
+                        if (was_fsr) upscaler.retryFsr4();
+                        upscaler.setBackend(edpe::UpscalerBackend::AmdFsr);
+                        if (!was_fsr) upscaler.setMode(edpe::UpscaleMode::NativeAA);
+                        cfg.upscalerBackend = 4;
+                        cfg.fsr4 = true;
+                        cfg.save();
+                    }
+                } else if (current_backend_idx == 1) {
                     if (nvidia_available) {
                         upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
                         upscaler.setMode(edpe::UpscaleMode::NativeAA);
@@ -1882,9 +1901,12 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                     }
                 } else if (current_backend_idx == 2) {
                     if (amd_available) {
+                        const bool was_fsr = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
+                        upscaler.setFsr4Selected(false);
                         upscaler.setBackend(edpe::UpscalerBackend::AmdFsr);
-                        upscaler.setMode(edpe::UpscaleMode::NativeAA);
+                        if (!was_fsr) upscaler.setMode(edpe::UpscaleMode::NativeAA);
                         cfg.upscalerBackend = 2;
+                        cfg.fsr4 = false;
                         cfg.save();
                     }
                 } else if (current_backend_idx == 3) {
@@ -2018,8 +2040,16 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                     upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
             }
             if (!amd_available) {
-                ImGui::TextDisabled("AMD FSR reason: %ls",
+                ImGui::TextDisabled("AMD FSR 3.1.2 reason: %ls",
                     upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::AmdFsr));
+            } else if (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) {
+                ImGui::TextDisabled("Active AMD provider: %s", upscaler.describeAmdProvider().c_str());
+                if (upscaler.isFsr4Selected() && !upscaler.isFsr4Running()) {
+                    ImGui::TextDisabled("AMD FSR 4.1.2 reason: %ls", upscaler.getFsr4UnavailableReason());
+                }
+            }
+            if (!fsr4_available) {
+                ImGui::TextDisabled("AMD FSR 4.1.2 reason: %ls", upscaler.getFsr4UnavailableReason());
             }
 
             bool preserve_ui = ContextCensusGetPreserveNativeUi();

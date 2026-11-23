@@ -189,6 +189,7 @@ int main() {
         saved.wrapDirectInputMouse = false;
         saved.wrapDirectInputKeyboard = true;
         saved.gameFpsLimit = 120.0f;
+        saved.fsr4 = true;
 
         if (!saved.saveTo(iniPath.wstring())) return fail(23, "Config::saveTo failed");
 
@@ -226,6 +227,31 @@ int main() {
         if (zeroLoaded.gameFpsLimit != 0.0f) {
             return fail(49, "GameFpsLimit=0 must load as 0.0f");
         }
+        if (loaded.fsr4 != saved.fsr4) return fail(38, "fsr4 mismatch");
+    }
+
+    // 6b. The AMD FSR 4.1.2 menu entry persists as Backend=4, and defaults apply when the FSR 4 keys are absent.
+    {
+        const std::filesystem::path iniPath = std::filesystem::temp_directory_path() / L"edpe_config_fsr4_test.ini";
+        std::error_code ec;
+        std::filesystem::remove(iniPath, ec);
+
+        Config saved{};
+        saved.upscalerBackend = 4;
+        saved.upscaleMode = 4;
+        saved.fsr4 = true;
+        if (!saved.saveTo(iniPath.wstring())) return fail(42, "Config::saveTo (FSR 4 selection) failed");
+        Config loaded{};
+        loaded.loadFrom(iniPath.wstring());
+        if (loaded.upscalerBackend != 4 || !loaded.fsr4) return fail(43, "FSR 4 selection did not round trip");
+
+        // An ini without the FSR 4 key (older files) must load with FSR 4 off.
+        std::ofstream(iniPath, std::ios::binary | std::ios::trunc) << "[Upscaler]\r\nBackend=2\r\nMode=4\r\n";
+        Config legacy{};
+        legacy.fsr4 = true;
+        legacy.loadFrom(iniPath.wstring());
+        std::filesystem::remove(iniPath, ec);
+        if (legacy.fsr4) return fail(44, "FSR 4 key default wrong");
     }
 
     // 7. SSAA XML parser and effective MipLODBias calculation tests.

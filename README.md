@@ -186,7 +186,8 @@ Requirements:
 * Python 3 (CMake runs `tools/fetch_ffx_dx11.py` automatically if `external/ffx-dx11` is missing)
 * `external/imgui` Git submodule
 * Optional: NVIDIA NGX / DLSS SDK (`v310.9.16`) under `external/DLSS` (if omitted, CMake builds without DLAA/DLSS support)
-* Optional: AMD FidelityFX SDK under `external/ffx-sdk` (if present, enables `EDPE_ENABLE_FFX_FG` / `amd_fsr_fg_dx12_x64.dll` runtime staging)
+* Optional: AMD FidelityFX SDK v2.4.0 under `external/ffx-sdk` (`python tools/fetch_fsr4_runtime.py --ffx-only` fetches it with a sparse checkout of `Kits/FidelityFX/api`, `framegeneration`, `upscalers` and `signedbin`; CI runs the same script). If the frame generation headers are present, it enables `EDPE_ENABLE_FFX_FG` / `amd_fsr_fg_dx12_x64.dll` runtime staging. If the `upscalers` headers and the signed `amd_fidelityfx_upscaler_dx12.dll` are also present, it enables AMD FSR 4.1.2 (`EDPE_ENABLE_FFX_FSR4`); otherwise the FSR 4.1.2 menu entry stays greyed out. The signed DLLs are never committed.
+* Optional: Agility SDK `D3D12Core.dll` (Microsoft.Direct3D.D3D12 1.616.1) at `external/agility/D3D12Core.dll` (`python tools/fetch_fsr4_runtime.py --agility-only` downloads it from NuGet and checks a pinned SHA-256). If present it is staged under `D3D12/` and the D3D11-D3D12 bridge uses it; without it the bridge uses the system D3D12 runtime.
 * Optional: NVIDIA Streamline SDK under `external/streamline` (if present, enables `EDPE_ENABLE_STREAMLINE` / `sl.*.dll` runtime staging)
 
 Clone and initialize submodules:

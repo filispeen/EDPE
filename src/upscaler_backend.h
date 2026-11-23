@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <d3d11.h>
 #include <memory>
+#include <string>
 #include <wrl/client.h>
 
 namespace edpe {
@@ -154,7 +155,23 @@ public:
     void setVelocityFactor(float factor);
     float getVelocityFactor() const;
 
+    // Runtime FSR 3.1.2 / FSR 4 selection (menu). Both run under the same AMD FSR backend; FSR 4 falls back to
+    // FSR 3.1.2 on any failure. Selecting FSR 4 again after a failure retries initialization.
+    void setFsr4Selected(bool selected);
+    // Explicit user retry after FSR 4 failed to initialize or was disabled by failures.
+    void retryFsr4();
+    bool isFsr4Selected() const;
+    // True when FSR 4 is selected and its engine is initialized and not disabled by failures.
+    bool isFsr4Running() const;
+    // The startup probe succeeded: this GPU and AMD's runtime offer a 4.x provider (selectable in the menu).
+    bool isFsr4Capable() const;
+    // The provider that actually runs now, e.g. "FSR 4.1.2", "FSR 3.1.2", or "FSR 3.1.2 (FSR 4 unavailable)".
+    std::string describeProvider() const;
+    const wchar_t* fsr4LastError() const;
+
 private:
+    bool tryInitFsr4();
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
@@ -205,6 +222,17 @@ public:
 
     bool isBackendAvailable(UpscalerBackend backend) const;
     const wchar_t* getBackendUnavailableReason(UpscalerBackend backend) const;
+
+    // FSR 4.1.2 selection inside the AMD FSR backend (menu entry "AMD FSR 4.1.2"). Idempotent.
+    void setFsr4Selected(bool selected);
+    void retryFsr4() { amdBackend_.retryFsr4(); pendingReset_ = true; }
+    bool isFsr4Selected() const { return amdBackend_.isFsr4Selected(); }
+    bool isFsr4Running() const { return amdBackend_.isFsr4Running(); }
+    // FSR 4 can be offered: the FSR backend is usable, the signed DLLs are present beside the proxy and the
+    // startup probe found a 4.x provider.
+    bool isFsr4Available() const;
+    const wchar_t* getFsr4UnavailableReason() const;
+    std::string describeAmdProvider() const { return amdBackend_.describeProvider(); }
 
     bool isReconstructionActive() const {
         return currentBackendType_ != UpscalerBackend::None && currentMode_ != UpscaleMode::Native;

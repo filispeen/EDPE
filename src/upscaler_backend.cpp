@@ -3,6 +3,8 @@
 #include "log.h"
 #include "ngx_context.h"
 #include "temporal_math.h"
+#include "amd_fsr4_engine.h"
+#include "fsr4_logic.h"
 
 std::atomic<bool> g_is_evaluating_upscaler{false};
 std::atomic<int> g_evaluating_upscaler_depth{0};
@@ -257,6 +259,12 @@ struct AmdUpscalerBackend::Impl {
     float appliedVelocityFactor = -1.0f;
     wchar_t lastErrorReason[256]{};
 
+    // Optional FSR 4 provider: the official FidelityFX D3D12 upscaler through the D3D11/D3D12 bridge. The D3D11
+    // FSR 3.1.2 path stays the fallback.
+    std::unique_ptr<Fsr4Engine> fsr4;
+    ID3D11Device* fsr4Device = nullptr;
+    fsr4::ProviderState fsr4State;  // selection, init and failure-gate state (pure logic, see fsr4_logic.h)
+
     void applyVelocityFactorIfNeeded() {
 #if defined(EDPE_ENABLE_FSR)
         if (!contextCreated) return;
@@ -491,7 +499,9 @@ struct AmdUpscalerBackend::Impl {
 };
 
 AmdUpscalerBackend::AmdUpscalerBackend()
-    : impl_(std::make_unique<Impl>()) {}
+    : impl_(std::make_unique<Impl>()) {
+    impl_->fsr4State.setSelected(Fsr4Engine::selectedByConfig());
+}
 
 AmdUpscalerBackend::~AmdUpscalerBackend() {
     shutdown();
@@ -578,14 +588,67 @@ bool AmdUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* /
     impl_->initialized = true;
     impl_->lastErrorReason[0] = L'\0';
     EdpeLog(L"EDPE: AMD FSR 3.1 D3D11 backend initialized successfully");
+
+    // Optional FSR 4 path through the D3D11/D3D12 bridge; the FSR 3.1.2 path above stays the fallback.
+    impl_->fsr4 = std::make_unique<Fsr4Engine>();
+    impl_->fsr4Device = device;
+    impl_->fsr4State.onBackendInitialize();
+    // Probe FSR 4 once at startup when its files are present, so the menu can show it as unavailable (with the
+    // reason) the way DLSS is, instead of discovering a refusal only after it was selected.
+    if (Fsr4Engine::filesPresent()) tryInitFsr4();
     return true;
 #else
     return false;
 #endif
 }
 
+bool AmdUpscalerBackend::tryInitFsr4() {
+    if (impl_->fsr4State.isEngineReady()) return true;
+    if (!impl_->fsr4 || !impl_->fsr4Device) return false;
+    const bool ok = impl_->fsr4->initialize(impl_->fsr4Device);
+    impl_->fsr4State.onInitResult(ok);
+    if (ok) {
+        EdpeLog(L"EDPE: FSR 4 available; the D3D11 FSR 3.1.2 path stays the fallback");
+        return true;
+    }
+    wchar_t buf[320];
+    swprintf_s(buf, L"EDPE: FSR 4 unavailable: %ls; using FSR 3.1.2", impl_->fsr4->lastError());
+    EdpeLog(buf);
+    return false;
+}
+
+void AmdUpscalerBackend::setFsr4Selected(bool selected) {
+    if (!impl_->fsr4State.setSelected(selected)) return;  // a fresh selection of FSR 4 retries a failed initialization
+    EdpeLog(selected ? L"EDPE: AMD FSR provider switched to FSR 4" : L"EDPE: AMD FSR provider switched to FSR 3.1.2");
+    resetHistory();  // the two providers keep separate histories
+}
+
+void AmdUpscalerBackend::retryFsr4() {
+    if (!impl_->fsr4State.retry()) return;
+    EdpeLog(L"EDPE: retrying FSR 4 initialization");
+    resetHistory();
+}
+
+std::string AmdUpscalerBackend::describeProvider() const {
+    const char* version = (impl_ && impl_->fsr4) ? impl_->fsr4->providerVersion() : "4";
+    return fsr4::formatProviderLabel(impl_->fsr4State.label(), version);
+}
+
+bool AmdUpscalerBackend::isFsr4Selected() const { return impl_->fsr4State.isSelected(); }
+
+bool AmdUpscalerBackend::isFsr4Running() const { return impl_->fsr4State.running(); }
+
+bool AmdUpscalerBackend::isFsr4Capable() const { return impl_->fsr4State.isCapable(); }
+
+const wchar_t* AmdUpscalerBackend::fsr4LastError() const {
+    return impl_->fsr4 ? impl_->fsr4->lastError() : L"";
+}
+
 void AmdUpscalerBackend::shutdown() {
     if (!impl_) return;
+    if (impl_->fsr4) impl_->fsr4->shutdown();
+    impl_->fsr4State.onShutdown();
+    impl_->fsr4Device = nullptr;
     impl_->destroyFsrContext();
     impl_->outputTexture.Reset();
     impl_->outputUav.Reset();
@@ -602,6 +665,39 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     ID3D11Texture2D* destinationTexture) {
 #if defined(EDPE_ENABLE_FSR)
     if (!isAvailable() || !context || !impl_) return false;
+
+    // Initialize on first use when the startup probe did not leave the engine active (for example after a retry).
+    if (impl_->fsr4State.needsInit()) tryInitFsr4();
+
+    if (impl_->fsr4State.running() && impl_->fsr4) {
+        // HDR (linear) color input is not supported by FSR 4 yet: use FSR 3.1.2 while HdrInput is on, without counting
+        // these frames as failures.
+        if (impl_->fsr4State.setHdrFallback(inputs.colorIsHdr)) {
+            EdpeLog(L"EDPE: FSR 4 does not support HDR color input (HdrInput=1); using FSR 3.1.2 while it is on");
+        }
+    }
+
+    if (impl_->fsr4State.running() && impl_->fsr4 && !impl_->fsr4State.isHdrFallback()) {
+        ID3D11Texture2D* fsr4Dest = destinationTexture ? destinationTexture : inputs.color;
+        if (impl_->fsr4->evaluate(context, inputs, fsr4Dest)) {
+            impl_->fsr4State.onEvaluateSuccess();
+            return true;
+        }
+        const auto failure = impl_->fsr4State.onEvaluateFailure();
+        if (failure.logFirstFailure) {
+            wchar_t buf[320];
+            swprintf_s(buf, L"EDPE: FSR 4 evaluate failed: %ls; falling back to FSR 3.1.2 for this frame",
+                       impl_->fsr4->lastError());
+            EdpeLog(buf);
+        }
+        if (failure.disabled) {
+            wchar_t buf[200];
+            swprintf_s(buf, L"EDPE: FSR 4 disabled after %d consecutive failures; using FSR 3.1.2",
+                       fsr4::kMaxConsecutiveFailures);
+            EdpeLog(buf);
+        }
+        // fall through to the D3D11 FSR 3.1.2 path
+    }
 
     AmdFsrInputParams params{};
     const wchar_t* reason = nullptr;
@@ -728,6 +824,7 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
 
 void AmdUpscalerBackend::resetHistory() {
     if (impl_) {
+        if (impl_->fsr4) impl_->fsr4->resetHistory();
         impl_->resetRequested = true;
     }
 }
@@ -925,6 +1022,27 @@ bool UpscalerManager::isBackendAvailable(UpscalerBackend backend) const {
     default:
         return false;
     }
+}
+
+void UpscalerManager::setFsr4Selected(bool selected) {
+    if (selected == amdBackend_.isFsr4Selected()) return;
+    amdBackend_.setFsr4Selected(selected);
+    pendingReset_ = true;
+}
+
+bool UpscalerManager::isFsr4Available() const {
+    return amdBackend_.isAvailable() && Fsr4Engine::filesPresent() && amdBackend_.isFsr4Capable();
+}
+
+const wchar_t* UpscalerManager::getFsr4UnavailableReason() const {
+    if (!amdBackend_.isAvailable()) return amdBackend_.unavailableReason();
+    if (!Fsr4Engine::filesPresent()) {
+        return L"amd_fidelityfx_loader_dx12.dll / amd_fidelityfx_upscaler_dx12.dll not found beside dxgi.dll (or FSR 4 not compiled in)";
+    }
+    if (!amdBackend_.isFsr4Capable() || (amdBackend_.isFsr4Selected() && !amdBackend_.isFsr4Running())) {
+        return amdBackend_.fsr4LastError();
+    }
+    return L"";
 }
 
 const wchar_t* UpscalerManager::getBackendUnavailableReason(UpscalerBackend backend) const {

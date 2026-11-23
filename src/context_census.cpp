@@ -13840,12 +13840,16 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         edpe::JitterLogger::instance().setFlushIntervalMs(cfg.jitterLogFlushMs);
         edpe::JitterLogger::instance().setLoggingEnabled(cfg.devMode && cfg.jitterLogEnabled);
 
-        if (cfg.upscalerBackend >= 1 && cfg.upscalerBackend <= 3) {
+        // Backend ids: 1 DLSS, 2 AMD FSR 3.1.2, 3 TAA, 4 AMD FSR 4.1.2 (the AMD FSR backend with the FSR 4 provider).
+        if (cfg.upscalerBackend >= 1 && cfg.upscalerBackend <= 4) {
             auto& upscaler = edpe::UpscalerManager::instance();
             const auto targetBackend = (cfg.upscalerBackend == 1) ? edpe::UpscalerBackend::NvidiaDlss :
-                                       (cfg.upscalerBackend == 2) ? edpe::UpscalerBackend::AmdFsr :
+                                       (cfg.upscalerBackend == 2 || cfg.upscalerBackend == 4) ? edpe::UpscalerBackend::AmdFsr :
                                                                     edpe::UpscalerBackend::Taa;
             if (upscaler.isBackendAvailable(targetBackend)) {
+                if (targetBackend == edpe::UpscalerBackend::AmdFsr) {
+                    upscaler.setFsr4Selected(cfg.upscalerBackend == 4 || cfg.fsr4);
+                }
                 upscaler.setBackend(targetBackend);
                 const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
                 upscaler.setMode(static_cast<edpe::UpscaleMode>(m));
