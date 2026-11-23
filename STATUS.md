@@ -1,6 +1,6 @@
 # EDPE Status — Elite Dangerous Performance Enhanced
 
-**Last updated:** 2026-11-20
+**Last updated:** 2026-11-23
 
 This file documents **verified facts only**. Unverified claims, hypotheses, or speculative results are not recorded here. See `AGENTS.md` and `PLAN.md` for project governance and roadmap.
 
@@ -35,7 +35,7 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 | 12. Native-resolution HUD | **Verified in-game (Stage 2)** | Clean pre-HUD 3D scene color (`s_clean_hdr_scene_texture`) fed to upscaler. Cockpit HUD draws redirected live at native swapchain resolution (`UiLayer` / `ui_layer_composite_cs.hlsl`) with viewport subpixel projection unjittering and composited cleanly onto the reconstructed world (`evalStage=1`, `composite=2` verified in-game). |
 | 13. D3D11/D3D12 interoperability | **Implemented & verified in-game (v0.8.0)** | `D3D11D3D12Bridge` (shared NT handles + `ID3D12Fence`/`ID3D11Fence` sync) and `D3D12ProxyPresenter` (child `WS_CHILD` Flip-model D3D12 swapchain overlay, resize recovery, RenderDoc safety guard). Measured in-game D3D12 copy overhead ~0.08 ms at 2560×1440. |
 | 14. AMD Frame Generation | **Verified & working in-game (v0.8.0)** | `AmdFsrFgBackend` integrates official AMD FidelityFX Frame Generation DX12 (`ffxConfigure` + `ffxDispatch` PrepareV2/FG), premultiplied `RGBA16F` UI packing (`FgUiPackPass`), and `FgRuntime`. Verified in Elite Dangerous Odyssey on RTX 3060 with `AMD FSR Frame Generation (2x)` and automatic pause/menu stand-down. |
-| 15. NVIDIA Streamline / DLSS Frame Generation | **Prototype implemented; capability-gated (v0.8.0)** | `NvidiaStreamlineFgBackend` integrates official Streamline v2.14.16 (`slInit`, `Reflex`, `PCL`, `DLSS-G`). Hardware capability probe verified on RTX 3060 (`Reflex=eOk`, `PCL=eOk`, `DLSS_G=eErrorNoSupportedAdapterFound`), failing open cleanly without black screens; live DLSS-G generation remains to be tested on RTX 40+ hardware. |
+| 15. NVIDIA Streamline / DLSS Frame Generation | **Verified & working in-game (v0.8.0)** | `NvidiaStreamlineFgBackend` integrates official Streamline v2.14.16 (`slInit`, `Reflex`, `PCL`, `DLSS-G`). Verified in-game on RTX 4060 and RTX 5060 (`slProxyDevice->CreateCommandQueue` + wrapped D3D12 swapchain), and capability-gated fail-open verified on RTX 3060 (`Reflex=eOk`, `PCL=eOk`, `DLSS_G=eErrorNoSupportedAdapterFound`). |
 | 16. Intel XeSS, AMD FSR 4 & DittoSR upscaling | **Planned / Research** | Intel XeSS 1.3+ (XMX on Intel Arc, DP4a fallback on NVIDIA/AMD), AMD FSR 4 (4.1.2 on Radeon RX 7000/9000 via AMD signed DX12 DLLs, optional Agility SDK `D3D12Core.dll` with system runtime fallback; requested in [#27](https://github.com/filispeen/EDPE/issues/27)), and [DittoSR](https://github.com/Vancete/DittoSR) (MIT-licensed lightweight temporal upscaler built on GSR 2 as a DX12 FidelityFX API provider, evaluated against FSR 3.1.2). All run Native AA and Super Resolution over the Phase 13 D3D11/D3D12 interop bridge as separate upscaler options (greyed out when unsupported). |
 | 17. Low-Latency Framework (NVIDIA Reflex & AMD Anti-Lag) | **Planned / Architecture defined** | Standalone and FG-coupled input latency minimization. NVIDIA Reflex SDK (Low Latency / Boost, marker insertion, sleep pacing) and AMD Anti-Lag / Anti-Lag 2 SDK. Pacing controls in edpe.ini and telemetry HUD integration. |
 | 18. NVIDIA DLSS-NR | **Planned** | Research phase for G-buffer normal/roughness extraction and NGX neural rendering integration. |
@@ -56,20 +56,18 @@ This file documents **verified facts only**. Unverified claims, hypotheses, or s
 
 ## Next milestone
 
-Phases 13 & 14 (D3D11/D3D12 Interop & AMD FSR Frame Generation) are **Verified In-Game (`v0.8.0`)**:
+Phases 13–15 (D3D11/D3D12 Interop, AMD FSR Frame Generation & NVIDIA Streamline DLSS-G) are **Verified In-Game (`v0.8.0`)**:
 - `D3D11D3D12Bridge`, `D3D12ProxyPresenter`, and `FgRuntime` run live alongside `ContextCensusGetFgSnapshot()` on NVIDIA GeForce RTX 3060 (2560×1440, `0.08 ms` D3D12 bridge copy).
 - `AmdFsrFgBackend` verified in-game with `AMD FSR Frame Generation (2x)` and automatic pause/menu stand-down.
-- `NvidiaStreamlineFgBackend` initializes and reports hardware capabilities cleanly (`Reflex=eOk`, `PCL=eOk`, `DLSS-G` fails open with `eErrorNoSupportedAdapterFound` on RTX 3060).
+- `NvidiaStreamlineFgBackend` verified in-game with `NVIDIA DLSS-G` on RTX 4060 and RTX 5060, and fails open cleanly with `eErrorNoSupportedAdapterFound` on RTX 3060.
 
 The immediate next steps are:
-1. Validate `NvidiaStreamlineFgBackend` live frame generation on **Ada Lovelace (RTX 40+) / Blackwell hardware** with HAGS / vkd3d-proton.
-2. Proceed to **Phase 16 (Intel XeSS, AMD FSR 4, and DittoSR via D3D12 interop)** and **Phase 17 (Low Latency — standalone NVAPI Reflex & AMD Anti-Lag 2)**.
+1. Proceed to **Phase 16 (Intel XeSS, AMD FSR 4, and DittoSR via D3D12 interop)** and **Phase 17 (Low Latency — standalone NVAPI Reflex & AMD Anti-Lag 2)**.
 
 ---
 
 ## Not yet demonstrated
 
-- Live NVIDIA DLSS-G multi-frame generation on RTX 40+/50+ hardware (`eErrorNoSupportedAdapterFound` on RTX 3060 test GPU).
 - Intel XeSS, AMD FSR 4, and DittoSR (Phase 16), standalone NVAPI Reflex / AMD Anti-Lag 2 (Phase 17), DLSS-NR (Phase 18), and ReShade/EDHM/3Dmigoto proxy chaining (Phase 19).
 
 ---
@@ -191,9 +189,9 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
   - `AmdFsrFgBackend` integrates official AMD FidelityFX Frame Generation DX12 (`ffxConfigure` + `ffxDispatch` PrepareV2/FG), coupled with `FgUiPackPass` (`src/fg_ui_pack_pass.cpp`) packing HDR/LDR/multiply UI layers into premultiplied `R16G16B16A16_FLOAT`.
   - `FgRuntime` (`src/fg_integration.cpp`) + `ContextCensusGetFgSnapshot()` synchronize completed rendered frames into `FrameGenerationManager` (`src/fg_backend.cpp`), resetting temporal FG history (`Stand down (menu/loading)`) during pause/menus/loading.
   - Verified live in *Elite Dangerous Odyssey* (NVIDIA GeForce RTX 3060, 2560×1440, alongside NVIDIA DLAA): active `AMD FSR Frame Generation (2x)` output scaling with `0.08 ms` D3D12 copy time, no F5 menu crash, and working menu stand-down.
-- **Phase 15 (NVIDIA Streamline / DLSS-G — Capability-Gated Prototype):**
+- **Phase 15 (NVIDIA Streamline / DLSS-G — Verified In-Game):**
   - `NvidiaStreamlineFgBackend` (`src/nvidia_sl_fg_backend.cpp`) loads official NVIDIA Streamline v2.14.16 (`slInit`, `Reflex`, `PCL`, `DLSS-G`), queries adapter capabilities dynamically without hardcoded GPU lists, and surfaces unsupported reasons directly in the F5 menu.
-  - Hardware capability probe verified on RTX 3060 (`Reflex=eOk`, `PCL=eOk`, `DLSS_G=eErrorNoSupportedAdapterFound (6)`), failing open cleanly.
+  - Verified in-game on RTX 4060 and RTX 5060 (`slProxyDevice->CreateCommandQueue` + wrapped D3D12 swapchain), and capability-gated fail-open verified on RTX 3060 (`Reflex=eOk`, `PCL=eOk`, `DLSS_G=eErrorNoSupportedAdapterFound (6)`).
 
 ---
 
@@ -237,6 +235,7 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 | In-game captures (2026-10-15) | ✅ MEASURED IN-GAME | Full 2560×1440 captures of depth (DSV #2), emissive (RTV3), motion, color, and clean frame |
 | In-game NVIDIA DLAA (2026-10-16) | ✅ VERIFIED IN-GAME | Stable 2560×1440 DLAA evaluation (~0.3 ms GPU time) with Halton (2,3) jitter, depth, and motion |
 | In-game AMD FSR FG (2026-11-20) | ✅ VERIFIED IN-GAME | Active `2x` Frame Generation on RTX 3060 + NVIDIA DLAA (2560×1440, `0.08 ms` D3D12 copy, clean F5 overlay & menu stand-down) |
+| In-game NVIDIA DLSS-G (2026-11-22) | ✅ VERIFIED IN-GAME | Active Streamline DLSS-G on RTX 4060 & RTX 5060; clean capability-gated fail-open on RTX 3060 |
 | Standalone NGX probe | ✅ MEASURED | `tools/ngx_probe/` V1-V5 clean, 2 runs each |
 | Overlay lifecycle in Elite | ✅ MEASURED | Clean init, non-interfering input, clean shutdown on swap chain destroy |
 
@@ -244,10 +243,9 @@ Per `docs/render-pipeline-observations.md` (2026-10-15 in-game visual analysis &
 
 ## Next Verified Milestones (per PLAN.md order)
 
-1. **Phase 15 (Hardware Validation) — NVIDIA DLSS-G on Ada RTX 40+ / Blackwell:** Verify live DLSS Frame Generation & Multi Frame Generation on supported GPUs.
-2. **Phase 16 — Intel XeSS, AMD FSR 4 & DittoSR:** Native AA and Super Resolution via Phase 13 D3D11/D3D12 interop (XeSS XMX/DP4a, FSR 4.1.2 for RX 7000/9000 per [#27](https://github.com/filispeen/EDPE/issues/27), and [DittoSR](https://github.com/Vancete/DittoSR) evaluated against FSR 3.1.2).
-3. **Phase 17 — Low-Latency Framework:** Standalone and FG-coupled input lag minimization via NVIDIA Reflex (NVAPI / Streamline) and AMD Anti-Lag / Anti-Lag 2 SDK integration.
-4. **Phase 18–19 — NVIDIA DLSS-NR & Third-Party Mod Compatibility:** Neural rendering research and proxy DLL chaining for ReShade, EDHM, and 3Dmigoto.
+1. **Phase 16 — Intel XeSS, AMD FSR 4 & DittoSR:** Native AA and Super Resolution via Phase 13 D3D11/D3D12 interop (XeSS XMX/DP4a, FSR 4.1.2 for RX 7000/9000 per [#27](https://github.com/filispeen/EDPE/issues/27), and [DittoSR](https://github.com/Vancete/DittoSR) evaluated against FSR 3.1.2).
+2. **Phase 17 — Low-Latency Framework:** Standalone and FG-coupled input lag minimization via NVIDIA Reflex (NVAPI / Streamline) and AMD Anti-Lag / Anti-Lag 2 SDK integration.
+3. **Phase 18–19 — NVIDIA DLSS-NR & Third-Party Mod Compatibility:** Neural rendering research and proxy DLL chaining for ReShade, EDHM, and 3Dmigoto.
 
 ---
 

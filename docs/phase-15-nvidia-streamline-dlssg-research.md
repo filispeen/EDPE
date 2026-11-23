@@ -150,7 +150,7 @@ Inspecting `include/sl_reflex.h` & `include/sl_pcl.h`:
 
 ---
 
-## 6. Prototype Implementation & Live Verification (2026-11-20)
+## 6. Implementation & Live Verification (2026-11-20 – 2026-11-22)
 
 - **SDK:** `NVIDIA-RTX/Streamline` `v2.14.16` staged in gitignored `external/streamline/` (`include`, `docs`, shipping `bin/x64/{sl.interposer,sl.common,sl.dlss_g,sl.reflex,sl.pcl,nvngx_dlssg}.dll`).
 - **Source Files:**
@@ -164,4 +164,4 @@ Inspecting `include/sl_reflex.h` & `include/sl_pcl.h`:
   - `slIsFeatureSupported(kFeatureReflex)`: **`eOk`** (`rc=0`, `ver=2.14.16`); `slIsFeatureSupported(kFeaturePCL)`: **`eOk`**.
   - `slIsFeatureSupported(kFeatureDLSS_G)`: **`eErrorNoSupportedAdapterFound`** (`rc=6`, expected capability-driven rejection on Ampere RTX 3060; `maxGen=0`, `dynamicMfg=0`).
   - `FrameGenerationManager::selectBackend(NvidiaDlssG)` failed open to `FrameGenerationBackend::Off` with descriptive `unavailableReason`, leaving the plain `D3D12ProxyPresenter` swapchain presenting frames at 2560×1440 without crash or frame drop.
-  - Note (2026-11-22, GitHub Issue #23): Verified in `external/streamline` / `NVIDIA-RTX/Streamline` `sl.cpp` that `slUpgradeInterface` intentionally only accepts `ID3D12Device`, `ID3D11Device`, `IDXGIFactory`, and `IDXGISwapChain` (returning `eErrorUnsupportedInterface` on `ID3D12CommandQueue`). Updated `NvidiaStreamlineFgBackend::initialize()` to upgrade `ID3D12Device` + `IDXGIFactory` and create `slProxyQueue` via `slProxyDevice->CreateCommandQueue()` instead of calling `slUpgradeInterface(&queuePtr)`. Live `DLSS-G` frame-generation loop remains conditional on an Ada RTX 40+ / Blackwell RTX 50+ adapter where `probeCapabilities()` reports `dlssgSupported=true`.
+  - Note (2026-11-22, GitHub Issue #23): Verified in `external/streamline` / `NVIDIA-RTX/Streamline` `sl.cpp` that `slUpgradeInterface` intentionally only accepts `ID3D12Device`, `ID3D11Device`, `IDXGIFactory`, and `IDXGISwapChain` (returning `eErrorUnsupportedInterface` on `ID3D12CommandQueue`). Updated `NvidiaStreamlineFgBackend::initialize()` to upgrade `ID3D12Device` + `IDXGIFactory` and create `slProxyQueue` via `slProxyDevice->CreateCommandQueue()` instead of calling `slUpgradeInterface(&queuePtr)`. Verified live in-game on **NVIDIA GeForce RTX 4060** and **RTX 5060**.
