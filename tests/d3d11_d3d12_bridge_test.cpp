@@ -276,10 +276,16 @@ int runCorrectnessTest(ID3D11Device* d3d11Dev, ID3D11DeviceContext* d3d11Ctx) {
         edpe::D3D11D3D12Bridge fallback;
         if (!fallback.initialize(d3d11Dev, L"C:\\edpe-no-such-agility-dir\\")) return 140;
         if (!fallback.isInitialized()) return 141;
+        fallback.shutdown();
+        if (fallback.usingAgilitySdk()) return 142;
+        // Re-initializing after shutdown must work.
+        if (!fallback.initialize(d3d11Dev, L"C:\\edpe-no-such-agility-dir\\")) return 143;
     }
 
     edpe::D3D11D3D12Bridge bridge;
     if (!bridge.initialize(d3d11Dev)) return 13;
+    // The default path passes no Agility SDK directory, so it never uses the device factory.
+    if (bridge.usingAgilitySdk()) return 144;
 
     constexpr uint32_t W = 16;
     constexpr uint32_t H = 16;
@@ -451,6 +457,7 @@ int runCorrectnessTest(ID3D11Device* d3d11Dev, ID3D11DeviceContext* d3d11Ctx) {
     shared.reset();
     d12Compute.reset();
     bridge.shutdown();
+    if (bridge.usingAgilitySdk()) return 145;
     return 0;
 }
 
