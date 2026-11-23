@@ -1498,7 +1498,7 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
     {
         auto& cfg = edpe::Config::instance();
         cfg.load();
-        edpe::FrameLimiter::instance().configure(cfg.gameFpsLimitEnabled, cfg.gameFpsLimit);
+        edpe::FrameLimiter::instance().configure(cfg.gameFpsLimit);
         applyUiScale(cfg.uiScale);
         ContextCensusSetSharpness(cfg.sharpness);
         edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
@@ -2134,44 +2134,42 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         // 2c. Asynchronous Game FPS Limiter
         if (ImGui::CollapsingHeader("Game FPS Limiter", ImGuiTreeNodeFlags_DefaultOpen)) {
             auto& limiter = edpe::FrameLimiter::instance();
-            if (ImGui::Checkbox("Enable Async Game FPS Limiter", &cfg.gameFpsLimitEnabled)) {
-                limiter.configure(cfg.gameFpsLimitEnabled, cfg.gameFpsLimit);
-                cfg.save();
-                edpe::PerfTracker::instance().updateCachedStats();
-            }
-            ImGui::SetItemTooltip("Caps rendered Game FPS asynchronously after Present() using a high-resolution waitable timer with zero GPU stall. When Frame Generation is active, Presented FPS scales by the FG multiplier.");
-
-            if (!cfg.gameFpsLimitEnabled) ImGui::BeginDisabled();
-            int fpsInt = static_cast<int>(std::lround(cfg.gameFpsLimit));
-            if (ImGui::SliderInt("Target Game FPS", &fpsInt, 15, 300, "%d FPS")) {
-                fpsInt = std::clamp(fpsInt,
-                    static_cast<int>(edpe::FrameLimiter::kMinTargetFps),
-                    static_cast<int>(edpe::FrameLimiter::kMaxTargetFps));
-                cfg.gameFpsLimit = static_cast<float>(fpsInt);
-                limiter.configure(cfg.gameFpsLimitEnabled, cfg.gameFpsLimit);
+            int fpsInt = (cfg.gameFpsLimit >= edpe::FrameLimiter::kMinTargetFps)
+                ? static_cast<int>(std::lround(cfg.gameFpsLimit))
+                : 0;
+            if (ImGui::SliderInt("Game FPS Limit", &fpsInt, 0, 300, fpsInt == 0 ? "Off" : "%d FPS")) {
+                cfg.gameFpsLimit = (fpsInt <= 0)
+                    ? 0.0f
+                    : static_cast<float>(std::clamp(fpsInt,
+                        static_cast<int>(edpe::FrameLimiter::kMinTargetFps),
+                        static_cast<int>(edpe::FrameLimiter::kMaxTargetFps)));
+                limiter.configure(cfg.gameFpsLimit);
                 edpe::PerfTracker::instance().updateCachedStats();
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 cfg.save();
             }
-            ImGui::SetItemTooltip("Ctrl+Click to type any value from 10 to 500 FPS.");
+            ImGui::SetItemTooltip("Asynchronous CPU-side limiter after Present() using a high-resolution waitable timer with zero GPU stall. Set 0 = Off. Ctrl+Click to type 0 or 10..500 FPS. When Frame Generation is active, Presented FPS scales by the FG multiplier.");
 
             ImGui::TextDisabled("Presets:");
-            static constexpr int kFpsPresets[] = { 30, 45, 60, 72, 90, 120, 144 };
+            static constexpr int kFpsPresets[] = { 0, 30, 45, 60, 72, 90, 120, 144 };
             for (int i = 0; i < IM_ARRAYSIZE(kFpsPresets); ++i) {
                 ImGui::SameLine();
                 char btnLabel[24]{};
-                std::snprintf(btnLabel, sizeof(btnLabel), "%d##FpsLimit", kFpsPresets[i]);
+                if (kFpsPresets[i] == 0) {
+                    std::snprintf(btnLabel, sizeof(btnLabel), "Off##FpsLimit");
+                } else {
+                    std::snprintf(btnLabel, sizeof(btnLabel), "%d##FpsLimit", kFpsPresets[i]);
+                }
                 if (ImGui::SmallButton(btnLabel)) {
                     cfg.gameFpsLimit = static_cast<float>(kFpsPresets[i]);
-                    limiter.configure(cfg.gameFpsLimitEnabled, cfg.gameFpsLimit);
+                    limiter.configure(cfg.gameFpsLimit);
                     cfg.save();
                     edpe::PerfTracker::instance().updateCachedStats();
                 }
             }
-            if (!cfg.gameFpsLimitEnabled) ImGui::EndDisabled();
 
-            if (cfg.gameFpsLimitEnabled) {
+            if (cfg.gameFpsLimit > 0.0f) {
                 const auto stats = limiter.getStats();
                 if (stats.lastFrameOverrun) {
                     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),

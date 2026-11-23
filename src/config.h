@@ -85,13 +85,11 @@ public:
         if (frameGenDynamicTargetFps < 0.0f || frameGenDynamicTargetFps > 1000.0f) frameGenDynamicTargetFps = 0.0f;
         frameGenReflexBoost = GetPrivateProfileIntW(L"FrameGeneration", L"ReflexBoost", 0, path.c_str()) != 0;
 
-        gameFpsLimitEnabled = GetPrivateProfileIntW(L"FrameLimiter", L"Enabled", 0, path.c_str()) != 0;
         wchar_t fpsLimitBuf[64]{};
-        GetPrivateProfileStringW(L"FrameLimiter", L"TargetFps", L"60.0", fpsLimitBuf, 64, path.c_str());
+        GetPrivateProfileStringW(L"FrameLimiter", L"GameFpsLimit", L"0.0", fpsLimitBuf, 64, path.c_str());
         gameFpsLimit = static_cast<float>(_wtof(fpsLimitBuf));
         if (!std::isfinite(gameFpsLimit) || gameFpsLimit <= 0.0f) {
-            gameFpsLimitEnabled = false;
-            gameFpsLimit = 60.0f;
+            gameFpsLimit = 0.0f;
         } else {
             gameFpsLimit = std::clamp(gameFpsLimit, 10.0f, 500.0f);
         }
@@ -274,8 +272,7 @@ public:
         appendBool("ReflexBoost", frameGenReflexBoost);
 
         appendSection("FrameLimiter");
-        appendBool("Enabled", gameFpsLimitEnabled);
-        appendFloat("TargetFps", "%.1f", gameFpsLimit);
+        appendFloat("GameFpsLimit", "%.1f", gameFpsLimit);
 
         appendSection("Jitter");
         appendBool("Enabled", jitterEnabled);
@@ -480,8 +477,7 @@ public:
     float frameGenDynamicTargetFps = 0.0f;
     bool frameGenReflexBoost = false;
 
-    bool gameFpsLimitEnabled = false;
-    float gameFpsLimit = 60.0f;
+    float gameFpsLimit = 0.0f;
 
     static int parseJitterModeString(const wchar_t* s) {
         if (!s || !s[0]) return 0;

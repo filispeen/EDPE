@@ -13858,7 +13858,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             cfg.frameGenDynamicMfg,
             cfg.frameGenDynamicTargetFps,
             cfg.frameGenReflexBoost);
-        edpe::FrameLimiter::instance().configure(cfg.gameFpsLimitEnabled, cfg.gameFpsLimit);
+        edpe::FrameLimiter::instance().configure(cfg.gameFpsLimit);
     }
     s_inside_main_scene.store(false, std::memory_order_release);
     if (!(flags & DXGI_PRESENT_TEST)) {

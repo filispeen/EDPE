@@ -75,7 +75,7 @@ int main() {
 
         MockClockState clock{};
         FrameLimiter lim(makeMockOps(&clock));
-        lim.configure(false, 60.0f);
+        lim.configure(0.0f);
         if (lim.isEnabled()) return fail(9, "disabled state mismatch");
         clock.ticks += 50'000;
         lim.waitForNextFrame();
@@ -83,15 +83,15 @@ int main() {
             return fail(10, "disabled limiter must not sleep/spin/pace");
         }
 
-        lim.configure(true, 0.0f);
-        if (lim.isEnabled()) return fail(11, "0 fps must keep limiter disabled");
-        lim.configure(true, std::numeric_limits<float>::quiet_NaN());
+        lim.configure(-10.0f);
+        if (lim.isEnabled()) return fail(11, "negative fps must keep limiter disabled");
+        lim.configure(std::numeric_limits<float>::quiet_NaN());
         if (lim.isEnabled()) return fail(12, "NaN fps must keep limiter disabled");
-        lim.configure(true, 5.0f);
+        lim.configure(5.0f);
         if (!lim.isEnabled() || lim.targetFps() != FrameLimiter::kMinTargetFps) {
             return fail(13, "clamped min fps mismatch");
         }
-        lim.configure(true, 999.0f);
+        lim.configure(999.0f);
         if (!lim.isEnabled() || lim.targetFps() != FrameLimiter::kMaxTargetFps) {
             return fail(14, "clamped max fps mismatch");
         }
@@ -103,7 +103,7 @@ int main() {
         MockClockState clock{};
         clock.spinStepTicks = 10; // 1 us granularity
         FrameLimiter lim(makeMockOps(&clock, true, 10'000'000));
-        lim.configure(true, 60.0f);
+        lim.configure(60.0f);
 
         clock.ticks += 50'000; // 5 ms render for frame 1
         lim.waitForNextFrame();
@@ -133,7 +133,7 @@ int main() {
         clock.spinStepTicks = 10;
         FrameLimiter lim(makeMockOps(&clock, true, 10'000'000));
         const float target = 59.94f;
-        lim.configure(true, target);
+        lim.configure(target);
 
         clock.ticks += 50'000;
         lim.waitForNextFrame();
@@ -156,7 +156,7 @@ int main() {
         MockClockState clock{};
         clock.spinStepTicks = 10;
         FrameLimiter lim(makeMockOps(&clock, true, 10'000'000));
-        lim.configure(true, 60.0f);
+        lim.configure(60.0f);
 
         // Frame 1: anchor
         clock.ticks += 60'000;
@@ -195,7 +195,7 @@ int main() {
         MockClockState clock{};
         clock.spinStepTicks = 10;
         FrameLimiter lim(makeMockOps(&clock, true, 10'000'000));
-        lim.configure(true, 60.0f);
+        lim.configure(60.0f);
 
         // Frame 1: anchor
         clock.ticks += 50'000;
@@ -225,7 +225,7 @@ int main() {
         MockClockState clock{};
         clock.spinStepTicks = 10;
         FrameLimiter lim(makeMockOps(&clock, true, 10'000'000));
-        lim.configure(true, 30.0f);
+        lim.configure(30.0f);
 
         clock.ticks += 50'000;
         lim.waitForNextFrame(); // anchor
@@ -239,7 +239,7 @@ int main() {
         }
 
         // Switch to 120 FPS: transition frame must re-anchor with 0 sleep.
-        lim.configure(true, 120.0f);
+        lim.configure(120.0f);
         const int64_t sleepsAtSwitch = clock.sleepCalls;
         clock.ticks += 20'000;
         lim.waitForNextFrame();
@@ -274,7 +274,7 @@ int main() {
         MockClockState clock{};
         clock.spinStepTicks = 100; // 10 us granularity for fast 70k-frame loop
         FrameLimiter lim(makeMockOps(&clock, true, 10'000'000));
-        lim.configure(true, 60.0f);
+        lim.configure(60.0f);
 
         clock.ticks += 50'000;
         lim.waitForNextFrame();
@@ -302,7 +302,7 @@ int main() {
         MockClockState clock{};
         clock.spinStepTicks = 10;
         FrameLimiter limHr(makeMockOps(&clock, true, 10'000'000));
-        limHr.configure(true, 60.0f);
+        limHr.configure(60.0f);
 
         clock.ticks += 50'000;
         limHr.waitForNextFrame(); // anchor
@@ -328,7 +328,7 @@ int main() {
         MockClockState clockFb{};
         clockFb.spinStepTicks = 10;
         FrameLimiter limFb(makeMockOps(&clockFb, false, 10'000'000));
-        limFb.configure(true, 60.0f);
+        limFb.configure(60.0f);
 
         clockFb.ticks += 50'000;
         limFb.waitForNextFrame(); // anchor
@@ -352,7 +352,7 @@ int main() {
     // 9. Live Win32 QPC + waitable timer pacing test at 120 FPS for 20 frames.
     {
         FrameLimiter liveLimiter;
-        liveLimiter.configure(true, 120.0f);
+        liveLimiter.configure(120.0f);
 
         LARGE_INTEGER freq{};
         QueryPerformanceFrequency(&freq);
@@ -380,11 +380,11 @@ int main() {
         }
 
         liveLimiter.shutdown();
-        if (liveLimiter.isEnabled()) {
+        if (liveLimiter.isEnabled() || liveLimiter.targetFps() != 0.0f) {
             return fail(92, "shutdown must leave limiter disabled");
         }
         // Safe to re-configure after shutdown.
-        liveLimiter.configure(true, 120.0f);
+        liveLimiter.configure(120.0f);
         liveLimiter.waitForNextFrame();
         liveLimiter.shutdown();
     }

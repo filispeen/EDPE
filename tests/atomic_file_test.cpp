@@ -188,7 +188,6 @@ int main() {
         saved.renderDocAnnotations = false;
         saved.wrapDirectInputMouse = false;
         saved.wrapDirectInputKeyboard = true;
-        saved.gameFpsLimitEnabled = true;
         saved.gameFpsLimit = 120.0f;
 
         if (!saved.saveTo(iniPath.wstring())) return fail(23, "Config::saveTo failed");
@@ -213,20 +212,19 @@ int main() {
         if (loaded.renderDocAnnotations != saved.renderDocAnnotations) return fail(35, "renderDocAnnotations mismatch");
         if (loaded.wrapDirectInputMouse != saved.wrapDirectInputMouse) return fail(36, "wrapDirectInputMouse mismatch");
         if (loaded.wrapDirectInputKeyboard != saved.wrapDirectInputKeyboard) return fail(37, "wrapDirectInputKeyboard mismatch");
-        if (loaded.gameFpsLimitEnabled != saved.gameFpsLimitEnabled) return fail(47, "gameFpsLimitEnabled mismatch");
-        if (std::fabs(loaded.gameFpsLimit - saved.gameFpsLimit) > 0.1f) return fail(48, "gameFpsLimit mismatch");
+        if (std::fabs(loaded.gameFpsLimit - saved.gameFpsLimit) > 0.1f) return fail(47, "gameFpsLimit mismatch");
 
-        // TargetFps=0 must disable limiter cleanly on load and reset target to 60.0.
+        // GameFpsLimit=0 must disable limiter cleanly (0.0).
         const std::filesystem::path zeroIniPath = dir / L"edpe_config_zero_fps_test.ini";
         std::filesystem::remove(zeroIniPath, ec);
-        if (!writeFileAtomic(zeroIniPath, "[FrameLimiter]\r\nEnabled=1\r\nTargetFps=0\r\n")) {
-            return fail(49, "write zero fps ini failed");
+        if (!writeFileAtomic(zeroIniPath, "[FrameLimiter]\r\nGameFpsLimit=0\r\n")) {
+            return fail(48, "write zero fps ini failed");
         }
         Config zeroLoaded{};
         zeroLoaded.loadFrom(zeroIniPath.wstring());
         std::filesystem::remove(zeroIniPath, ec);
-        if (zeroLoaded.gameFpsLimitEnabled || std::fabs(zeroLoaded.gameFpsLimit - 60.0f) > 0.1f) {
-            return fail(50, "TargetFps=0 must disable limiter and default target to 60.0");
+        if (zeroLoaded.gameFpsLimit != 0.0f) {
+            return fail(49, "GameFpsLimit=0 must load as 0.0f");
         }
     }
 

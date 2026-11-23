@@ -35,7 +35,6 @@ class FrameLimiter {
 public:
     static constexpr float kMinTargetFps = 10.0f;
     static constexpr float kMaxTargetFps = 500.0f;
-    static constexpr float kDefaultTargetFps = 60.0f;
     static constexpr double kHighResSpinMarginMs = 1.5;
     static constexpr double kFallbackSpinMarginMs = 2.5;
     static constexpr double kMinKernelSleepMs = 0.5;
@@ -53,8 +52,8 @@ public:
     // Clamps valid target FPS to [kMinTargetFps, kMaxTargetFps]; non-finite or <= 0 returns 0.0f.
     static float sanitizeTargetFps(float fps);
 
-    // Updates limiter enabled state and target FPS; thread-safe and lock-free for callers.
-    void configure(bool enabled, float targetFps);
+    // Updates limiter target FPS (<= 0 or non-finite disables); thread-safe and lock-free for callers.
+    void configure(float maxFps);
 
     // Invalidates the current pacing phase anchor (e.g. on swapchain resize or teardown).
     void reset();
@@ -79,7 +78,7 @@ private:
     int64_t qpcFrequency_ = 0;
 
     std::atomic<bool> enabled_{false};
-    std::atomic<float> targetFps_{kDefaultTargetFps};
+    std::atomic<float> targetFps_{0.0f};
     std::atomic<uint64_t> resetGeneration_{1};
 
     std::atomic<float> lastWaitMs_{0.0f};

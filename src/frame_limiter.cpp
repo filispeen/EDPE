@@ -57,9 +57,9 @@ float FrameLimiter::sanitizeTargetFps(float fps) {
     return std::clamp(fps, kMinTargetFps, kMaxTargetFps);
 }
 
-void FrameLimiter::configure(bool enabled, float targetFps) {
-    const float cleanFps = sanitizeTargetFps(targetFps);
-    const bool cleanEnabled = enabled && (cleanFps >= kMinTargetFps);
+void FrameLimiter::configure(float maxFps) {
+    const float cleanFps = sanitizeTargetFps(maxFps);
+    const bool cleanEnabled = (cleanFps >= kMinTargetFps);
 
     const bool prevEnabled = enabled_.exchange(cleanEnabled, std::memory_order_acq_rel);
     const float prevFps = targetFps_.exchange(cleanFps, std::memory_order_acq_rel);
@@ -91,6 +91,7 @@ void FrameLimiter::reset() {
 
 void FrameLimiter::shutdown() {
     enabled_.store(false, std::memory_order_release);
+    targetFps_.store(0.0f, std::memory_order_release);
     resetGeneration_.fetch_add(1, std::memory_order_release);
     anchored_ = false;
     anchorTick_ = 0;
