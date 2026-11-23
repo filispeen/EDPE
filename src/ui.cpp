@@ -12,6 +12,7 @@
 #include "jitter_logger.h"
 #include "jitter_view_recorder.h"
 #include "renderdoc_support.h"
+#include "sampler_bias_manager.h"
 
 
 #include <d3d11_1.h>
@@ -1513,6 +1514,7 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::Taa);
             edpe::UpscalerManager::instance().setMode(edpe::UpscaleMode::NativeAA);
         }
+        ContextCensusRefreshMipLodBias();
     }
     if (ui.font_proggy_forever) {
         wchar_t fontMsg[128];
@@ -1897,6 +1899,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 nvidia_active = (upscaler.getBackend() == edpe::UpscalerBackend::NvidiaDlss);
                 amd_active = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);
                 taa_active = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
+                ContextCensusRefreshMipLodBias();
                 edpe::PerfTracker::instance().updateCachedStats();
             }
 
@@ -1973,6 +1976,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             float curMipOffset = cfg.mipLodBiasOffset;
             if (ImGui::SliderFloat("Texture MIP Bias Offset", &curMipOffset, -2.0f, 2.0f, "%.2f")) {
                 cfg.mipLodBiasOffset = curMipOffset;
+                ContextCensusRefreshMipLodBias();
             }
             if (ImGui::IsItemDeactivatedAfterEdit()) {
                 cfg.save();
@@ -1981,11 +1985,15 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Reset##MipBias")) {
                     cfg.mipLodBiasOffset = 0.0f;
+                    ContextCensusRefreshMipLodBias();
                     cfg.save();
                 }
             }
             if (!backend_active) ImGui::EndDisabled();
-            ImGui::SetItemTooltip("Offsets sampler MipLODBias on next game launch (base = log2(in-game SSAA)). Positive (+0.25..+0.75) reduces specular shimmer on rough floors; negative sharpens textures.");
+            ImGui::SetItemTooltip("Offsets sampler MipLODBias live at runtime (base = log2(render/output)). Positive (+0.25..+0.75) reduces specular shimmer on rough floors; negative sharpens textures.");
+            if (backend_active) {
+                ImGui::TextDisabled("Active MipLODBias: %.2f (live)", edpe::SamplerBiasManager::instance().getTargetBias());
+            }
 
             if (!nvidia_available) {
                 ImGui::TextDisabled("NVIDIA DLSS/DLAA reason: %ls",

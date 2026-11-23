@@ -95,6 +95,7 @@ void ContextCensusSetPreserveNativeUi(bool preserve);
 bool ContextCensusGetPreserveNativeUi();
 void ContextCensusSetSharpness(float sharpness);
 float ContextCensusGetSharpness();
+void ContextCensusRefreshMipLodBias();
 void ContextCensusGetSceneRenderSize(UINT* outWidth, UINT* outHeight);
 void ContextCensusRequestComparisonCapture();
 bool ContextCensusIsComparisonCapturePending();

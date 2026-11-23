@@ -5,6 +5,7 @@
 #include "dxbc_fanout.h"
 #include "input_hook.h"
 #include "log.h"
+#include "sampler_bias_manager.h"
 #include "shader_probe.h"
 #include "system_dll.h"
 #include "vtable_hook.h"
@@ -74,44 +75,33 @@ HRESULT STDMETHODCALLTYPE observedCreatePixelShader(ID3D11Device* device,
 
 HRESULT STDMETHODCALLTYPE observedCreateSamplerState(ID3D11Device* device,
     const D3D11_SAMPLER_DESC* desc, ID3D11SamplerState** sampler) {
+    const auto forward = original_create_sampler_state.load(std::memory_order_acquire);
     if (!desc) {
-        return original_create_sampler_state.load(std::memory_order_acquire)(device, desc, sampler);
-    }
-
-    D3D11_SAMPLER_DESC mod_desc = *desc;
-    const bool is_comparison = D3D11_DECODE_IS_COMPARISON_FILTER(desc->Filter);
-    const bool is_linear_mip = (D3D11_DECODE_MIP_FILTER(desc->Filter) == D3D11_FILTER_TYPE_LINEAR) ||
-                               D3D11_DECODE_IS_ANISOTROPIC_FILTER(desc->Filter);
-    const bool has_mipmaps = desc->MaxLOD > 0.5f;
-
-    if (!is_comparison && is_linear_mip && has_mipmaps) {
-        auto& cfg = edpe::Config::instance();
-        static const float s_elite_ssaa = edpe::Config::readEliteSsaaMultiplier();
-        const float bias = edpe::Config::computeEffectiveMipLodBias(
-            cfg.upscalerBackend, cfg.upscaleMode, s_elite_ssaa, cfg.mipLodBiasOffset);
-        if (std::fabs(bias) > 1e-4f) {
-            mod_desc.MipLODBias = std::clamp(desc->MipLODBias + bias, -15.99f, 15.99f);
-        }
+        return forward ? forward(device, desc, sampler) : E_FAIL;
     }
 
     static std::set<std::tuple<UINT, int, int, int>> s_seen_samplers;
     static std::mutex s_sampler_mutex;
     {
         const auto key = std::make_tuple(
-            static_cast<UINT>(mod_desc.Filter),
-            static_cast<int>(std::lround(mod_desc.MipLODBias * 100.0f)),
-            static_cast<int>(std::lround(mod_desc.MinLOD * 100.0f)),
-            static_cast<int>(std::lround(std::min(mod_desc.MaxLOD, 1000.0f) * 100.0f)));
+            static_cast<UINT>(desc->Filter),
+            static_cast<int>(std::lround(desc->MipLODBias * 100.0f)),
+            static_cast<int>(std::lround(desc->MinLOD * 100.0f)),
+            static_cast<int>(std::lround(std::min(desc->MaxLOD, 1000.0f) * 100.0f)));
         std::lock_guard<std::mutex> lock(s_sampler_mutex);
         if (s_seen_samplers.size() < 128 && s_seen_samplers.insert(key).second) {
             wchar_t msg[160];
             swprintf_s(msg, L"EDPE: CreateSamplerState filter=%u mipBias=%.2f minLOD=%.2f maxLOD=%.2f",
-                mod_desc.Filter, mod_desc.MipLODBias, mod_desc.MinLOD, mod_desc.MaxLOD);
+                desc->Filter, desc->MipLODBias, desc->MinLOD, desc->MaxLOD);
             EdpeLog(msg);
         }
     }
 
-    return original_create_sampler_state.load(std::memory_order_acquire)(device, &mod_desc, sampler);
+    const HRESULT result = forward ? forward(device, desc, sampler) : E_FAIL;
+    if (SUCCEEDED(result) && sampler && *sampler) {
+        edpe::SamplerBiasManager::instance().registerSampler(device, *desc, *sampler);
+    }
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE observedCreateDeferredContext(ID3D11Device* device,
@@ -296,6 +286,7 @@ void hookShaderCreation(ID3D11Device* device) {
         auto sampler_forward = reinterpret_cast<CreateSamplerStateFn>(table[sampler_slot]);
         if (sampler_forward && sampler_forward != &observedCreateSamplerState) {
             original_create_sampler_state.store(sampler_forward, std::memory_order_release);
+            edpe::SamplerBiasManager::instance().setOriginalCreateSampler(sampler_forward);
             if (VirtualProtect(table + sampler_slot, sizeof(void*), PAGE_READWRITE, &old_protection)) {
                 replaced = InterlockedCompareExchangePointer(
                     reinterpret_cast<PVOID volatile*>(table + sampler_slot),

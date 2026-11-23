@@ -72,6 +72,7 @@ add_library(EDPE_DXGI SHARED
     src/dxbc_hash.cpp
     src/ui.cpp
     src/perf_overlay.cpp
+    src/sampler_bias_manager.cpp
     src/input_hook.cpp
     src/motion_pass.cpp
     src/weapon_motion.cpp
@@ -206,6 +207,12 @@ add_executable(gpu_vendor_test tests/gpu_vendor_test.cpp)
 target_compile_features(gpu_vendor_test PRIVATE cxx_std_20)
 target_include_directories(gpu_vendor_test PRIVATE src)
 add_test(NAME gpu_vendor COMMAND gpu_vendor_test)
+add_executable(sampler_bias_test tests/sampler_bias_test.cpp src/sampler_bias_manager.cpp src/log.cpp)
+target_compile_features(sampler_bias_test PRIVATE cxx_std_20)
+target_compile_definitions(sampler_bias_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(sampler_bias_test PRIVATE src)
+target_link_libraries(sampler_bias_test PRIVATE d3d11)
+add_test(NAME sampler_bias COMMAND sampler_bias_test)
 add_executable(atomic_file_test tests/atomic_file_test.cpp src/renderdoc_support.cpp src/log.cpp)
 target_compile_features(atomic_file_test PRIVATE cxx_std_20)
 target_compile_definitions(atomic_file_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

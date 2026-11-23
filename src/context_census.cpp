@@ -24,6 +24,7 @@
 #include "jitter_view_recorder.h"
 #include "profiler.h"
 #include "renderdoc_support.h"
+#include "sampler_bias_manager.h"
 #include "d3d11_proxy.h"
 #include "vtable_hook.h"
 
@@ -49,6 +50,7 @@
 
 namespace {
 constexpr size_t kVSSetConstantBuffers = 7;
+constexpr size_t kPSSetSamplers = 10;
 constexpr size_t kDrawIndexed = 12;
 constexpr size_t kDraw = 13;
 constexpr size_t kMap = 14;
@@ -74,6 +76,8 @@ using FinishCommandListFn = HRESULT(STDMETHODCALLTYPE*)(
     ID3D11DeviceContext*, BOOL, ID3D11CommandList**);
 using VSSetConstantBuffersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
     UINT, ID3D11Buffer* const*);
+using PSSetSamplersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT,
+    UINT, ID3D11SamplerState* const*);
 using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 using MapFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*,
@@ -146,6 +150,8 @@ static void logContextHookOnce(ID3D11DeviceContext* context, size_t slot, const 
     }
 }
 std::atomic<VSSetConstantBuffersFn> original_vs_set_buffers{nullptr};
+std::atomic<PSSetSamplersFn> original_ps_set_samplers{nullptr};
+std::atomic<PSSetSamplersFn> original_deferred_ps_set_samplers{nullptr};
 std::atomic<DrawIndexedFn> original_draw_indexed{nullptr};
 std::atomic<DrawFn> original_draw{nullptr};
 std::atomic<MapFn> original_map{nullptr};
@@ -176,6 +182,7 @@ struct HookedTableEntry {
     OMSetRenderTargetsAndUnorderedAccessViewsFn orig_om_uav = nullptr;
     ExecuteCommandListFn orig_exec = nullptr;
     FinishCommandListFn orig_finish = nullptr;
+    PSSetSamplersFn orig_ps_samplers = nullptr;
     MapFn orig_map = nullptr;
     UnmapFn orig_unmap = nullptr;
     UpdateSubresourceFn orig_update_subresource = nullptr;
@@ -10890,6 +10897,17 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         ? edpe::selectModeByRatio(depthDesc.Width, backbufferDesc.Width)
         : edpe::UpscaleMode::NativeAA;
     upscaler.setMode(desiredMode);
+    {
+        const float liveBias = upscale_active
+            ? edpe::SamplerBiasManager::computeLiveMipLodBias(
+                static_cast<int>(upscaler.getBackend()),
+                static_cast<int>(desiredMode),
+                depthDesc.Width,
+                backbufferDesc.Width,
+                edpe::Config::instance().mipLodBiasOffset)
+            : 0.0f;
+        edpe::SamplerBiasManager::instance().setTargetBias(liveBias);
+    }
     const bool hdrInput = edpe::Config::instance().hdrInput;
 
     ID3D11Texture2D* ldrCandidate = nullptr;
@@ -13424,6 +13442,63 @@ void STDMETHODCALLTYPE observedOMSetRenderTargetsAndUnorderedAccessViews(
     observeDepthStencilView(context, numRTVs, targets, dsv);
 }
 
+void STDMETHODCALLTYPE observedPSSetSamplers(
+    ID3D11DeviceContext* context,
+    UINT StartSlot,
+    UINT NumSamplers,
+    ID3D11SamplerState* const* ppSamplers);
+
+PSSetSamplersFn resolveOriginalPSSetSamplers(ID3D11DeviceContext* context) {
+    if (!context) return original_ps_set_samplers.load(std::memory_order_acquire);
+    if (context == s_primary_hook_ctx.load(std::memory_order_acquire)) {
+        if (const auto fast = original_ps_set_samplers.load(std::memory_order_acquire)) {
+            return fast;
+        }
+    }
+    void** table = *reinterpret_cast<void***>(context);
+    const size_t tblCount = s_hooked_table_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < tblCount; ++i) {
+        if (s_hooked_tables[i].context == context ||
+            s_hooked_tables[i].table == table ||
+            s_hooked_tables[i].original_table == table) {
+            if (s_hooked_tables[i].orig_ps_samplers &&
+                s_hooked_tables[i].orig_ps_samplers != &observedPSSetSamplers) {
+                return s_hooked_tables[i].orig_ps_samplers;
+            }
+            if (s_context_vtable_hooks[i] && s_context_vtable_hooks[i]->isInitialized()) {
+                void* stub = s_context_vtable_hooks[i]->liveStubForSlot(kPSSetSamplers);
+                if (stub && stub != &observedPSSetSamplers) {
+                    return reinterpret_cast<PSSetSamplersFn>(stub);
+                }
+            }
+            break;
+        }
+    }
+    const bool is_deferred = (context->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED);
+    PSSetSamplersFn forward = is_deferred
+        ? original_deferred_ps_set_samplers.load(std::memory_order_acquire)
+        : original_ps_set_samplers.load(std::memory_order_acquire);
+    return forward ? forward : original_ps_set_samplers.load(std::memory_order_acquire);
+}
+
+void STDMETHODCALLTYPE observedPSSetSamplers(
+    ID3D11DeviceContext* context,
+    UINT StartSlot,
+    UINT NumSamplers,
+    ID3D11SamplerState* const* ppSamplers) {
+    const PSSetSamplersFn forward = resolveOriginalPSSetSamplers(context);
+    if (!forward) return;
+    if (ppSamplers && NumSamplers > 0 && NumSamplers <= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT &&
+        !g_is_evaluating_upscaler.load(std::memory_order_relaxed)) {
+        ID3D11SamplerState* remapped[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT]{};
+        if (edpe::SamplerBiasManager::instance().remapSamplers(NumSamplers, ppSamplers, remapped)) {
+            forward(context, StartSlot, NumSamplers, remapped);
+            return;
+        }
+    }
+    forward(context, StartSlot, NumSamplers, ppSamplers);
+}
+
 void STDMETHODCALLTYPE observedExecuteCommandList(
     ID3D11DeviceContext* context,
     ID3D11CommandList* pCommandList,
@@ -13621,6 +13696,16 @@ void rearmContextHooks() {
                 entry.table[kOMSetRenderTargetsAndUnorderedAccessViews],
                 reinterpret_cast<void*>(&observedOMSetRenderTargetsAndUnorderedAccessViews));
         }
+        if (entry.orig_finish &&
+            entry.table[kFinishCommandList] != reinterpret_cast<void*>(&observedFinishCommandList)) {
+            patchSlot(entry.table, kFinishCommandList, entry.table[kFinishCommandList],
+                reinterpret_cast<void*>(&observedFinishCommandList));
+        }
+        if (entry.orig_ps_samplers &&
+            entry.table[kPSSetSamplers] != reinterpret_cast<void*>(&observedPSSetSamplers)) {
+            patchSlot(entry.table, kPSSetSamplers, entry.table[kPSSetSamplers],
+                reinterpret_cast<void*>(&observedPSSetSamplers));
+        }
         if (map_active && entry.orig_map &&
             entry.table[kMap] != reinterpret_cast<void*>(&observedMap)) {
             patchSlot(entry.table, kMap, entry.table[kMap],
@@ -13762,6 +13847,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 upscaler.setMode(static_cast<edpe::UpscaleMode>(m));
             }
         }
+        ContextCensusRefreshMipLodBias();
         edpe::FgRuntime::instance().applyConfig(
             cfg.frameGenBackend,
             cfg.frameGenMultiplier,
@@ -15044,6 +15130,11 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
                     reinterpret_cast<void*>(&observedFinishCommandList),
                     reinterpret_cast<void*>(entry.orig_finish));
             }
+            if (entry.orig_ps_samplers) {
+                patchSlot(entry.table, kPSSetSamplers,
+                    reinterpret_cast<void*>(&observedPSSetSamplers),
+                    reinterpret_cast<void*>(entry.orig_ps_samplers));
+            }
             if (entry.orig_map) {
                 patchSlot(entry.table, kMap,
                     reinterpret_cast<void*>(&observedMap),
@@ -15272,6 +15363,31 @@ float ContextCensusGetSharpness() {
         return edpe::Config::instance().sharpness;
     }
     return s_sharpness.load(std::memory_order_relaxed);
+}
+
+void ContextCensusRefreshMipLodBias() {
+    auto& upscaler = edpe::UpscalerManager::instance();
+    const auto& cfg = edpe::Config::instance();
+    const auto backend = upscaler.getBackend();
+    if (backend == edpe::UpscalerBackend::None) {
+        edpe::SamplerBiasManager::instance().setTargetBias(0.0f);
+        return;
+    }
+    const UINT rW = s_observed_scene_width.load(std::memory_order_relaxed);
+    UINT oW = upscaler.getDiagnostics().outputWidth;
+    if (oW == 0 && observed_swap_chain) {
+        DXGI_SWAP_CHAIN_DESC scd{};
+        if (SUCCEEDED(observed_swap_chain->GetDesc(&scd))) {
+            oW = scd.BufferDesc.Width;
+        }
+    }
+    const float bias = edpe::SamplerBiasManager::computeLiveMipLodBias(
+        static_cast<int>(backend),
+        static_cast<int>(upscaler.getMode()),
+        rW,
+        oW,
+        cfg.mipLodBiasOffset);
+    edpe::SamplerBiasManager::instance().setTargetBias(bias);
 }
 
 void ContextCensusSetZeroMotion(bool zero) {
@@ -15528,6 +15644,16 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
         original_finish_command_list.store(entry.orig_finish, std::memory_order_release);
     } else {
         original_deferred_finish_command_list.store(entry.orig_finish, std::memory_order_release);
+    }
+
+    void* fwdPsSamplers = nullptr;
+    vtHook->hook(context, kPSSetSamplers,
+        reinterpret_cast<void*>(&observedPSSetSamplers), &fwdPsSamplers, mode);
+    entry.orig_ps_samplers = reinterpret_cast<PSSetSamplersFn>(fwdPsSamplers);
+    if (is_immediate || !original_ps_set_samplers.load(std::memory_order_relaxed)) {
+        original_ps_set_samplers.store(entry.orig_ps_samplers, std::memory_order_release);
+    } else {
+        original_deferred_ps_set_samplers.store(entry.orig_ps_samplers, std::memory_order_release);
     }
 
     if (is_immediate) {
