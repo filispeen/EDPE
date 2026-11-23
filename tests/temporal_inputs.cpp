@@ -268,5 +268,85 @@ int main() {
     auto& cfg = edpe::Config::instance();
     if (cfg.devMode != false && cfg.devMode != true) return 86;
 
+    // -------------------------------------------------------------------------
+    // Test 13: NGX DRS override & DLSS version log parser
+    // -------------------------------------------------------------------------
+    {
+        if (std::strcmp(edpe::ngxPresetDisplayNameA(0u), "Auto") != 0 ||
+            std::strcmp(edpe::ngxPresetDisplayNameA(5u), "E") != 0 ||
+            std::strcmp(edpe::ngxPresetDisplayNameA(10u), "J") != 0 ||
+            std::strcmp(edpe::ngxPresetDisplayNameA(11u), "K") != 0 ||
+            std::strcmp(edpe::ngxPresetDisplayNameA(12u), "L") != 0 ||
+            std::strcmp(edpe::ngxPresetDisplayNameA(13u), "M") != 0 ||
+            std::strcmp(edpe::ngxPresetDisplayNameA(99u), "Unknown") != 0) {
+            return 87;
+        }
+        if (std::wcscmp(edpe::ngxPresetDisplayNameW(0u), L"Auto") != 0 ||
+            std::wcscmp(edpe::ngxPresetDisplayNameW(5u), L"E") != 0 ||
+            std::wcscmp(edpe::ngxPresetDisplayNameW(10u), L"J") != 0 ||
+            std::wcscmp(edpe::ngxPresetDisplayNameW(11u), L"K") != 0 ||
+            std::wcscmp(edpe::ngxPresetDisplayNameW(12u), L"L") != 0 ||
+            std::wcscmp(edpe::ngxPresetDisplayNameW(13u), L"M") != 0 ||
+            std::wcscmp(edpe::ngxPresetDisplayNameW(99u), L"Unknown") != 0) {
+            return 88;
+        }
+
+        edpe::NgxOverrideInfo ov{};
+        if (edpe::parseNgxLogLineForOverrides(nullptr, &ov) ||
+            edpe::parseNgxLogLineForOverrides("Feature dlss override enabled", nullptr)) {
+            return 89;
+        }
+        if (!edpe::parseNgxLogLineForOverrides("[NGXSecureLoadFeature:1348] Feature dlss override enabled", &ov) ||
+            !ov.dllOverrideEnabled) {
+            return 90;
+        }
+        if (!edpe::parseNgxLogLineForOverrides("[NGXDLAA::ReadValuesFromDRS:1791] Using global override for DLSS-SR preset", &ov) ||
+            !ov.drsGlobalPresetOverride) {
+            return 91;
+        }
+        if (!edpe::parseNgxLogLineForOverrides(
+                "[NGXOverrideStatusCallback:2189] Feature [SuperSampling] Override Reported: ModelPreset, Value: 13, Requested: Yes, Applied: Yes, Is Latest: Yes",
+                &ov) ||
+            !ov.presetOverrideApplied || ov.overriddenPresetValue != 13u || !ov.presetOverrideIsLatest) {
+            return 92;
+        }
+        // FrameGeneration override must not overwrite DLSS-SR preset override state.
+        if (edpe::parseNgxLogLineForOverrides(
+                "[NGXOverrideStatusCallback:2189] Feature [FrameGeneration] Override Reported: ModelPreset, Value: 5, Requested: Yes, Applied: Yes, Is Latest: No",
+                &ov) ||
+            ov.overriddenPresetValue != 13u) {
+            return 93;
+        }
+        if (!edpe::parseNgxLogLineForOverrides(
+                "[NGXOverrideStatusCallback:2189] Feature [SuperSampling] Override Reported: ModelPreset, Value: 11, Requested: Yes, Applied: No, Is Latest: No",
+                &ov) ||
+            ov.presetOverrideApplied || ov.overriddenPresetValue != 0u || ov.presetOverrideIsLatest) {
+            return 94;
+        }
+        if (!edpe::parseNgxLogLineForOverrides(
+                "[NGXSecureLoadFeature:1499] app 876232C feature dlss snippet: C:\\nvngx_dlss.dll version: 310.9.16",
+                &ov) ||
+            std::strcmp(ov.dlssVersion, "310.9.16") != 0) {
+            return 95;
+        }
+        if (edpe::parseNgxLogLineForOverrides(
+                "[NGXSecureLoadFeature:1499] app 876232C feature dlssg snippet: C:\\nvngx_dlssg.dll version: 310.5.0",
+                &ov) ||
+            std::strcmp(ov.dlssVersion, "310.9.16") != 0) {
+            return 96;
+        }
+
+        edpe::NgxOverrideInfo ov2{};
+        if (!edpe::parseNgxLogLineForOverrides("[NGXSendTelemetryInitializeData:362] ngxFeatureVersion = 310.9.16", &ov2) ||
+            std::strcmp(ov2.dlssVersion, "310.9.16") != 0) {
+            return 97;
+        }
+        edpe::NgxOverrideInfo ov3{};
+        if (!edpe::parseNgxLogLineForOverrides("[NGXInitLog:12] Build v310.9.16", &ov3) ||
+            std::strcmp(ov3.dlssVersion, "310.9.16") != 0) {
+            return 98;
+        }
+    }
+
     return 0; // All temporal input layer tests passed
 }

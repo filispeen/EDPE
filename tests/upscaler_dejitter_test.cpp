@@ -1,3 +1,5 @@
+#include "ngx_context.h"
+#include "sharpen_pass.h"
 #include "temporal_inputs.h"
 #include "temporal_math.h"
 #include "upscaler_backend.h"
@@ -10,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -75,11 +78,14 @@ struct GpuHarness {
     uint32_t rh = 0;
     uint32_t ow = 0;
     uint32_t oh = 0;
+    DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    DXGI_FORMAT depthFormat = DXGI_FORMAT_R32_FLOAT;
 
     ComPtr<ID3D11Texture2D> colorTex;
     ComPtr<ID3D11ShaderResourceView> colorSrv;
     ComPtr<ID3D11Texture2D> depthTex[2];
     ComPtr<ID3D11ShaderResourceView> depthSrv[2];
+    ComPtr<ID3D11Texture2D> depthUploadStagingTex;
     ComPtr<ID3D11Texture2D> motionTex;
     ComPtr<ID3D11ShaderResourceView> motionSrv;
     ComPtr<ID3D11Texture2D> outputTex;
@@ -100,11 +106,15 @@ struct GpuHarness {
         return SUCCEEDED(hr) && device && context;
     }
 
-    bool allocateSurfaces(uint32_t renderW, uint32_t renderH, uint32_t outputW, uint32_t outputH) {
+    bool allocateSurfaces(uint32_t renderW, uint32_t renderH, uint32_t outputW, uint32_t outputH,
+                          DXGI_FORMAT cFmt = DXGI_FORMAT_R8G8B8A8_UNORM,
+                          DXGI_FORMAT dFmt = DXGI_FORMAT_R32_FLOAT) {
         rw = renderW;
         rh = renderH;
         ow = outputW;
         oh = outputH;
+        colorFormat = cFmt;
+        depthFormat = dFmt;
         currDepthIdx = 0;
         hasPrevDepth = false;
 
@@ -126,19 +136,34 @@ struct GpuHarness {
         colorTex.Reset(); colorSrv.Reset();
         depthTex[0].Reset(); depthSrv[0].Reset();
         depthTex[1].Reset(); depthSrv[1].Reset();
+        depthUploadStagingTex.Reset();
         motionTex.Reset(); motionSrv.Reset();
         outputTex.Reset(); outputRtv.Reset();
         stagingTex.Reset();
 
-        if (!makeTex(rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+        if (!makeTex(rw, rh, colorFormat, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
                      D3D11_USAGE_DEFAULT, 0, colorTex) ||
             FAILED(device->CreateShaderResourceView(colorTex.Get(), nullptr, &colorSrv))) {
             return false;
         }
+        const DXGI_FORMAT depthSrvFmt = (depthFormat == DXGI_FORMAT_R32G8X24_TYPELESS)
+            ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+            : depthFormat;
         for (int i = 0; i < 2; ++i) {
-            if (!makeTex(rw, rh, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE,
-                         D3D11_USAGE_DEFAULT, 0, depthTex[i]) ||
-                FAILED(device->CreateShaderResourceView(depthTex[i].Get(), nullptr, &depthSrv[i]))) {
+            if (!makeTex(rw, rh, depthFormat, D3D11_BIND_SHADER_RESOURCE,
+                         D3D11_USAGE_DEFAULT, 0, depthTex[i])) {
+                return false;
+            }
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Format = depthSrvFmt;
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+            if (FAILED(device->CreateShaderResourceView(depthTex[i].Get(), &srvDesc, &depthSrv[i]))) {
+                return false;
+            }
+        }
+        if (depthFormat == DXGI_FORMAT_R32G8X24_TYPELESS) {
+            if (!makeTex(rw, rh, depthFormat, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_WRITE, depthUploadStagingTex)) {
                 return false;
             }
         }
@@ -147,33 +172,51 @@ struct GpuHarness {
             FAILED(device->CreateShaderResourceView(motionTex.Get(), nullptr, &motionSrv))) {
             return false;
         }
-        if (!makeTex(ow, oh, DXGI_FORMAT_R8G8B8A8_UNORM,
+        if (!makeTex(ow, oh, colorFormat,
                      D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
                      D3D11_USAGE_DEFAULT, 0, outputTex) ||
             FAILED(device->CreateRenderTargetView(outputTex.Get(), nullptr, &outputRtv))) {
             return false;
         }
-        if (!makeTex(ow, oh, DXGI_FORMAT_R8G8B8A8_UNORM, 0,
+        if (!makeTex(ow, oh, colorFormat, 0,
                      D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ, stagingTex)) {
             return false;
         }
         return true;
     }
 
-    bool uploadAndEvaluate(edpe::IUpscalerBackend& backend, const FrameBuffers& fb,
-                           float jitterX, float jitterY, float prevJitterX, float prevJitterY,
-                           bool reset, std::vector<uint32_t>& outPixels) {
-        if (reset) {
-            backend.resetHistory();
-            hasPrevDepth = false;
-        } else {
-            currDepthIdx ^= 1;
+    bool uploadDepth(const std::vector<float>& depthData) {
+        if (depthFormat == DXGI_FORMAT_R32_FLOAT) {
+            context->UpdateSubresource(depthTex[currDepthIdx].Get(), 0, nullptr, depthData.data(), rw * sizeof(float), 0);
+            return true;
         }
+        if (depthFormat == DXGI_FORMAT_R32G8X24_TYPELESS && depthUploadStagingTex) {
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (FAILED(context->Map(depthUploadStagingTex.Get(), 0, D3D11_MAP_WRITE, 0, &mapped))) {
+                return false;
+            }
+            struct Depth32Stencil32 {
+                float d;
+                uint32_t s;
+            };
+            auto* dstBytes = static_cast<uint8_t*>(mapped.pData);
+            for (uint32_t y = 0; y < rh; ++y) {
+                auto* dstRow = reinterpret_cast<Depth32Stencil32*>(dstBytes + static_cast<size_t>(y) * mapped.RowPitch);
+                const float* srcRow = depthData.data() + static_cast<size_t>(y) * rw;
+                for (uint32_t x = 0; x < rw; ++x) {
+                    dstRow[x].d = srcRow[x];
+                    dstRow[x].s = 0u;
+                }
+            }
+            context->Unmap(depthUploadStagingTex.Get(), 0);
+            context->CopyResource(depthTex[currDepthIdx].Get(), depthUploadStagingTex.Get());
+            return true;
+        }
+        return false;
+    }
 
-        context->UpdateSubresource(colorTex.Get(), 0, nullptr, fb.color.data(), rw * sizeof(uint32_t), 0);
-        context->UpdateSubresource(depthTex[currDepthIdx].Get(), 0, nullptr, fb.depth.data(), rw * sizeof(float), 0);
-        context->UpdateSubresource(motionTex.Get(), 0, nullptr, fb.motion.data(), rw * sizeof(uint32_t), 0);
-
+    edpe::TemporalFrameInputs makeInputs(float jitterX, float jitterY, float prevJitterX, float prevJitterY,
+                                         bool reset, float sharpness = 0.0f) const {
         edpe::TemporalFrameInputs inputs{};
         inputs.color = colorTex.Get();
         inputs.colorSrv = colorSrv.Get();
@@ -193,18 +236,107 @@ struct GpuHarness {
         inputs.motionScaleX = 1.0f;
         inputs.motionScaleY = 1.0f;
         inputs.frameTimeMs = 16.667f;
-        inputs.sharpness = 0.0f;
+        inputs.sharpness = sharpness;
         inputs.reset = reset;
         inputs.depthInverted = true;
         inputs.depthInfinite = true;
         inputs.motionJittered = false;
         inputs.motionIsLowRes = true;
-        inputs.colorIsHdr = false;
+        inputs.colorIsHdr = (colorFormat == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                             colorFormat == DXGI_FORMAT_R11G11B10_FLOAT);
         inputs.cameraNow.scaleX = 1.0f;
         inputs.cameraNow.scaleY = 1.0f;
         inputs.cameraNow.depthB = kDepthB;
         inputs.cameraPrevious = inputs.cameraNow;
+        return inputs;
+    }
 
+    bool uploadAndEvaluateLuma(edpe::IUpscalerBackend& backend, const FrameBuffers& fb,
+                               float jitterX, float jitterY, float prevJitterX, float prevJitterY,
+                               bool reset, std::vector<float>& outLuma) {
+        if (reset) {
+            backend.resetHistory();
+            hasPrevDepth = false;
+        } else {
+            currDepthIdx ^= 1;
+        }
+
+        if (colorFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            const size_t n = static_cast<size_t>(rw) * rh;
+            std::vector<uint16_t> hdr(n * 4u);
+            for (size_t i = 0; i < n; ++i) {
+                const uint32_t c = fb.color[i];
+                const float r = unorm8ToFloat(static_cast<uint8_t>(c & 0xFFu));
+                const float g = unorm8ToFloat(static_cast<uint8_t>((c >> 8) & 0xFFu));
+                const float b = unorm8ToFloat(static_cast<uint8_t>((c >> 16) & 0xFFu));
+                const float a = unorm8ToFloat(static_cast<uint8_t>((c >> 24) & 0xFFu));
+                hdr[i * 4u + 0u] = DirectX::PackedVector::XMConvertFloatToHalf(r);
+                hdr[i * 4u + 1u] = DirectX::PackedVector::XMConvertFloatToHalf(g);
+                hdr[i * 4u + 2u] = DirectX::PackedVector::XMConvertFloatToHalf(b);
+                hdr[i * 4u + 3u] = DirectX::PackedVector::XMConvertFloatToHalf(a);
+            }
+            context->UpdateSubresource(colorTex.Get(), 0, nullptr, hdr.data(), rw * 8u, 0);
+        } else {
+            context->UpdateSubresource(colorTex.Get(), 0, nullptr, fb.color.data(), rw * sizeof(uint32_t), 0);
+        }
+        if (!uploadDepth(fb.depth)) {
+            return false;
+        }
+        context->UpdateSubresource(motionTex.Get(), 0, nullptr, fb.motion.data(), rw * sizeof(uint32_t), 0);
+
+        const auto inputs = makeInputs(jitterX, jitterY, prevJitterX, prevJitterY, reset, 0.0f);
+        if (!backend.evaluate(context.Get(), inputs, outputRtv.Get(), outputTex.Get())) {
+            return false;
+        }
+
+        hasPrevDepth = true;
+
+        context->CopyResource(stagingTex.Get(), outputTex.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            return false;
+        }
+        outLuma.resize(static_cast<size_t>(ow) * oh);
+        const auto* srcBytes = static_cast<const uint8_t*>(mapped.pData);
+        if (colorFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            for (uint32_t y = 0; y < oh; ++y) {
+                const auto* row = reinterpret_cast<const uint16_t*>(srcBytes + static_cast<size_t>(y) * mapped.RowPitch);
+                for (uint32_t x = 0; x < ow; ++x) {
+                    const float r = DirectX::PackedVector::XMConvertHalfToFloat(row[x * 4u + 0u]);
+                    const float g = DirectX::PackedVector::XMConvertHalfToFloat(row[x * 4u + 1u]);
+                    const float b = DirectX::PackedVector::XMConvertHalfToFloat(row[x * 4u + 2u]);
+                    outLuma[static_cast<size_t>(y) * ow + x] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                }
+            }
+        } else {
+            for (uint32_t y = 0; y < oh; ++y) {
+                const auto* row = reinterpret_cast<const uint32_t*>(srcBytes + static_cast<size_t>(y) * mapped.RowPitch);
+                for (uint32_t x = 0; x < ow; ++x) {
+                    outLuma[static_cast<size_t>(y) * ow + x] = pixelLuma(row[x]);
+                }
+            }
+        }
+        context->Unmap(stagingTex.Get(), 0);
+        return true;
+    }
+
+    bool uploadAndEvaluate(edpe::IUpscalerBackend& backend, const FrameBuffers& fb,
+                           float jitterX, float jitterY, float prevJitterX, float prevJitterY,
+                           bool reset, std::vector<uint32_t>& outPixels) {
+        if (reset) {
+            backend.resetHistory();
+            hasPrevDepth = false;
+        } else {
+            currDepthIdx ^= 1;
+        }
+
+        context->UpdateSubresource(colorTex.Get(), 0, nullptr, fb.color.data(), rw * sizeof(uint32_t), 0);
+        if (!uploadDepth(fb.depth)) {
+            return false;
+        }
+        context->UpdateSubresource(motionTex.Get(), 0, nullptr, fb.motion.data(), rw * sizeof(uint32_t), 0);
+
+        const auto inputs = makeInputs(jitterX, jitterY, prevJitterX, prevJitterY, reset, 0.0f);
         if (!backend.evaluate(context.Get(), inputs, outputRtv.Get(), outputTex.Get())) {
             return false;
         }
@@ -239,10 +371,10 @@ struct StepEdgeMetrics {
     float rmsY = 0.0f;
 };
 
-StepEdgeMetrics measureStepEdge(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
-                                uint32_t renderW, uint32_t renderH,
-                                uint32_t outputW, uint32_t outputH,
-                                float jitterSign) {
+StepEdgeMetrics measureStepEdgeXY(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
+                                  uint32_t renderW, uint32_t renderH,
+                                  uint32_t outputW, uint32_t outputH,
+                                  float signX, float signY) {
     constexpr int kFrames = 48;
     constexpr int kWarmup = 16;
 
@@ -311,10 +443,10 @@ StepEdgeMetrics measureStepEdge(GpuHarness& gpu, edpe::IUpscalerBackend& backend
             }
         }
 
-        const float passJx = j.pixelX * jitterSign;
-        const float passJy = j.pixelY * jitterSign;
-        const float passPrevJx = (t > 0) ? (prevJ.pixelX * jitterSign) : 0.0f;
-        const float passPrevJy = (t > 0) ? (prevJ.pixelY * jitterSign) : 0.0f;
+        const float passJx = j.pixelX * signX;
+        const float passJy = j.pixelY * signY;
+        const float passPrevJx = (t > 0) ? (prevJ.pixelX * signX) : 0.0f;
+        const float passPrevJy = (t > 0) ? (prevJ.pixelY * signY) : 0.0f;
 
         if (!gpu.uploadAndEvaluate(backend, fb, passJx, passJy, passPrevJx, passPrevJy, t == 0, outPixels)) {
             return {999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f};
@@ -410,6 +542,13 @@ StepEdgeMetrics measureStepEdge(GpuHarness& gpu, edpe::IUpscalerBackend& backend
     return m;
 }
 
+StepEdgeMetrics measureStepEdge(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
+                                uint32_t renderW, uint32_t renderH,
+                                uint32_t outputW, uint32_t outputH,
+                                float jitterSign) {
+    return measureStepEdgeXY(gpu, backend, renderW, renderH, outputW, outputH, jitterSign, jitterSign);
+}
+
 struct ThinLineMetrics {
     float subpixelPeakSpan = 0.0f;
     float subpixelRmsDelta = 0.0f;
@@ -420,7 +559,8 @@ struct ThinLineMetrics {
 
 ThinLineMetrics measureStaticThinLines(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                        uint32_t renderW, uint32_t renderH,
-                                       uint32_t outputW, uint32_t outputH) {
+                                       uint32_t outputW, uint32_t outputH,
+                                       float signX = 1.0f, float signY = 1.0f) {
     constexpr int kFrames = 48;
     constexpr int kWarmup = 16;
 
@@ -469,9 +609,9 @@ ThinLineMetrics measureStaticThinLines(GpuHarness& gpu, edpe::IUpscalerBackend& 
             }
         }
 
-        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
-                                   t > 0 ? prevJ.pixelX : 0.0f,
-                                   t > 0 ? prevJ.pixelY : 0.0f,
+        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX * signX, j.pixelY * signY,
+                                   t > 0 ? prevJ.pixelX * signX : 0.0f,
+                                   t > 0 ? prevJ.pixelY * signY : 0.0f,
                                    t == 0, outPixels)) {
             return {999.0f, 999.0f, 0.0f, 999.0f, 999.0f};
         }
@@ -556,7 +696,8 @@ struct PanningThinLineMetrics {
 
 PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                                   uint32_t renderW, uint32_t renderH,
-                                                  uint32_t outputW, uint32_t outputH) {
+                                                  uint32_t outputW, uint32_t outputH,
+                                                  float signX = 1.0f, float signY = 1.0f) {
     constexpr int kFrames = 64;
     constexpr int kWarmup = 32;
 
@@ -641,7 +782,8 @@ PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscal
 
 float measureUnvectoredBlobGhostResidual(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                          uint32_t renderW, uint32_t renderH,
-                                         uint32_t outputW, uint32_t outputH) {
+                                         uint32_t outputW, uint32_t outputH,
+                                         float signX = 1.0f, float signY = 1.0f) {
     constexpr int kTotalFrames = 36;
     constexpr int kDisappearFrame = 20;
     constexpr int kMeasureFrame = 30;
@@ -672,9 +814,9 @@ float measureUnvectoredBlobGhostResidual(GpuHarness& gpu, edpe::IUpscalerBackend
             }
         }
 
-        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
-                                   t > 0 ? prevJ.pixelX : 0.0f,
-                                   t > 0 ? prevJ.pixelY : 0.0f,
+        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX * signX, j.pixelY * signY,
+                                   t > 0 ? prevJ.pixelX * signX : 0.0f,
+                                   t > 0 ? prevJ.pixelY * signY : 0.0f,
                                    t == 0, outPixels)) {
             return 999.0f;
         }
@@ -952,13 +1094,639 @@ WalkShimmerMetrics measurePerfSrWalkingShimmer(GpuHarness& gpu, edpe::AmdUpscale
 }
 #endif
 
+struct GpuTimingStats {
+    bool ok = false;
+    double avgMs = 0.0;
+    double minMs = 0.0;
+    double medianMs = 0.0;
+    double maxMs = 0.0;
+    double fastest5[5]{};
+    int fastestCount = 0;
+};
+
+StepEdgeMetrics measureStepEdgeScaled(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
+                                      uint32_t renderW, uint32_t renderH,
+                                      uint32_t outputW, uint32_t outputH,
+                                      float signX, float signY,
+                                      DXGI_FORMAT colorFmt = DXGI_FORMAT_R8G8B8A8_UNORM,
+                                      int totalFrames = 48,
+                                      int warmupFrames = 16,
+                                      bool printTrace = false) {
+    if (!gpu.allocateSurfaces(renderW, renderH, outputW, outputH, colorFmt, DXGI_FORMAT_R32_FLOAT)) {
+        return {999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f};
+    }
+    const int kFrames = totalFrames;
+    const int kWarmup = warmupFrames;
+
+    const float scaleX = static_cast<float>(outputW) / static_cast<float>(renderW);
+    const float scaleY = static_cast<float>(outputH) / static_cast<float>(renderH);
+
+    // Top half: vertical step edge at vertEdgeU = 0.25*renderW + 0.5.
+    // Bottom half: horizontal step edge at horizEdgeU = 0.75*renderH + 0.5.
+    const float vertEdgeU = static_cast<float>(renderW) * 0.25f + 0.5f;
+    const float horizEdgeU = static_cast<float>(renderH) * 0.75f + 0.5f;
+    constexpr float kBright = 0.90f;
+
+    const float edgeOutX = vertEdgeU * scaleX;
+    const float edgeOutY = horizEdgeU * scaleY;
+    const int bx0 = std::max(0, static_cast<int>(std::floor(edgeOutX)) - 2);
+    const int bx1 = std::min(static_cast<int>(outputW) - 1, static_cast<int>(std::floor(edgeOutX)) + 2);
+    const int by0 = std::max(0, static_cast<int>(std::floor(edgeOutY)) - 2);
+    const int by1 = std::min(static_cast<int>(outputH) - 1, static_cast<int>(std::floor(edgeOutY)) + 2);
+
+    auto stepGtLuma = [](int p, float edgeOut) {
+        const float pf = static_cast<float>(p);
+        float cov = 0.0f;
+        if (pf + 1.0f <= edgeOut) {
+            cov = 0.0f;
+        } else if (pf >= edgeOut) {
+            cov = 1.0f;
+        } else {
+            cov = (pf + 1.0f) - edgeOut;
+        }
+        return kBgColor + cov * (kBright - kBgColor);
+    };
+
+    std::vector<float> posXList;
+    std::vector<float> posYList;
+    std::vector<std::vector<float>> bandXFrames;
+    std::vector<std::vector<float>> bandYFrames;
+    double errXSum = 0.0, errYSum = 0.0;
+    size_t errXCount = 0, errYCount = 0;
+
+    FrameBuffers fb;
+    std::vector<float> outLuma;
+    edpe::ProjectionJitter prevJ{};
+    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+
+    for (int t = 0; t < kFrames; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
+        fb.resize(renderW, renderH);
+
+        for (uint32_t iy = 0; iy < renderH; ++iy) {
+            const float sy = static_cast<float>(iy) + 0.5f;
+            const float uy = sy - j.pixelY;
+            for (uint32_t ix = 0; ix < renderW; ++ix) {
+                const float sx = static_cast<float>(ix) + 0.5f;
+                const float ux = sx - j.pixelX;
+                const size_t idx = static_cast<size_t>(iy) * renderW + ix;
+
+                bool fg = false;
+                if (iy < renderH / 2) {
+                    fg = (ux >= vertEdgeU);
+                } else {
+                    fg = (uy >= horizEdgeU);
+                }
+                if (fg) {
+                    fb.color[idx] = packRgba8(kBright, kBright, kBright);
+                    fb.depth[idx] = kFgDepth;
+                }
+            }
+        }
+
+        const float passJx = j.pixelX * signX;
+        const float passJy = j.pixelY * signY;
+        const float passPrevJx = (t > 0) ? (prevJ.pixelX * signX) : 0.0f;
+        const float passPrevJy = (t > 0) ? (prevJ.pixelY * signY) : 0.0f;
+
+        if (!gpu.uploadAndEvaluateLuma(backend, fb, passJx, passJy, passPrevJx, passPrevJy, t == 0, outLuma)) {
+            return {999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f};
+        }
+        prevJ = j;
+
+        if (t >= kWarmup) {
+            const int wx0 = std::max(0, static_cast<int>(std::round((vertEdgeU - 8.0f) * scaleX)));
+            const int wx1 = std::min(static_cast<int>(outputW) - 1, static_cast<int>(std::round((vertEdgeU + 8.0f) * scaleX)));
+            const uint32_t ry0 = static_cast<uint32_t>(std::round(static_cast<float>(renderH) * 0.10f * scaleY));
+            const uint32_t ry1 = static_cast<uint32_t>(std::round(static_cast<float>(renderH) * 0.35f * scaleY));
+            double sumEdgeX = 0.0;
+            int rowCount = 0;
+            std::vector<float> bandX;
+            bandX.reserve(static_cast<size_t>(ry1 - ry0) * (bx1 - bx0 + 1));
+            for (uint32_t y = ry0; y < ry1; ++y) {
+                double normSum = 0.0;
+                for (int x = wx0; x <= wx1; ++x) {
+                    const float l = outLuma[static_cast<size_t>(y) * outputW + x];
+                    normSum += std::clamp((l - kBgColor) / (kBright - kBgColor), 0.0f, 1.0f);
+                    if (x >= bx0 && x <= bx1) {
+                        errXSum += std::fabs(l - stepGtLuma(x, edgeOutX));
+                        ++errXCount;
+                        bandX.push_back(l);
+                    }
+                }
+                sumEdgeX += static_cast<double>(wx1 + 1) - normSum;
+                ++rowCount;
+            }
+            posXList.push_back(static_cast<float>(sumEdgeX / rowCount));
+            bandXFrames.push_back(std::move(bandX));
+
+            const int wy0 = std::max(0, static_cast<int>(std::round((horizEdgeU - 8.0f) * scaleY)));
+            const int wy1 = std::min(static_cast<int>(outputH) - 1, static_cast<int>(std::round((horizEdgeU + 8.0f) * scaleY)));
+            const uint32_t cx0 = static_cast<uint32_t>(std::round(static_cast<float>(renderW) * 0.15f * scaleX));
+            const uint32_t cx1 = static_cast<uint32_t>(std::round(static_cast<float>(renderW) * 0.65f * scaleX));
+            double sumEdgeY = 0.0;
+            int colCount = 0;
+            std::vector<float> bandY;
+            bandY.reserve(static_cast<size_t>(cx1 - cx0) * (by1 - by0 + 1));
+            for (uint32_t x = cx0; x < cx1; ++x) {
+                double normSum = 0.0;
+                for (int y = wy0; y <= wy1; ++y) {
+                    const float l = outLuma[static_cast<size_t>(y) * outputW + x];
+                    normSum += std::clamp((l - kBgColor) / (kBright - kBgColor), 0.0f, 1.0f);
+                    if (y >= by0 && y <= by1) {
+                        errYSum += std::fabs(l - stepGtLuma(y, edgeOutY));
+                        ++errYCount;
+                        bandY.push_back(l);
+                    }
+                }
+                sumEdgeY += static_cast<double>(wy1 + 1) - normSum;
+                ++colCount;
+            }
+            posYList.push_back(static_cast<float>(sumEdgeY / colCount));
+            bandYFrames.push_back(std::move(bandY));
+        }
+    }
+
+    auto calcStats = [](const std::vector<float>& vals, float& outSpan, float& outStd) {
+        auto [mn, mx] = std::minmax_element(vals.begin(), vals.end());
+        outSpan = *mx - *mn;
+        double mean = 0.0;
+        for (float v : vals) mean += v;
+        mean /= vals.size();
+        double var = 0.0;
+        for (float v : vals) {
+            const double d = v - mean;
+            var += d * d;
+        }
+        outStd = static_cast<float>(std::sqrt(var / vals.size()));
+    };
+    auto calcRmsDelta = [](const std::vector<std::vector<float>>& frames) {
+        double sq = 0.0;
+        size_t n = 0;
+        for (size_t i = 1; i < frames.size(); ++i) {
+            for (size_t k = 0; k < frames[i].size(); ++k) {
+                const double d = frames[i][k] - frames[i - 1][k];
+                sq += d * d;
+                ++n;
+            }
+        }
+        return n > 0 ? static_cast<float>(std::sqrt(sq / n)) : 0.0f;
+    };
+
+    StepEdgeMetrics m{};
+    if (printTrace) {
+        std::printf("    posX trace (first %zu post-warmup frames):", std::min<size_t>(16u, posXList.size()));
+        for (size_t i = 0; i < std::min<size_t>(16u, posXList.size()); ++i) {
+            std::printf(" %.4f", posXList[i]);
+        }
+        std::printf("\n");
+    }
+    calcStats(posXList, m.spanX, m.stdX);
+    calcStats(posYList, m.spanY, m.stdY);
+    m.errX = errXCount > 0 ? static_cast<float>(errXSum / errXCount) : 999.0f;
+    m.errY = errYCount > 0 ? static_cast<float>(errYSum / errYCount) : 999.0f;
+    m.rmsX = calcRmsDelta(bandXFrames);
+    m.rmsY = calcRmsDelta(bandYFrames);
+    return m;
+}
+
+bool seedBenchmarkSurfaces(GpuHarness& gpu) {
+    const size_t n = static_cast<size_t>(gpu.rw) * gpu.rh;
+    if (gpu.colorFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        std::vector<uint16_t> hdr(n * 4u);
+        for (uint32_t y = 0; y < gpu.rh; ++y) {
+            for (uint32_t x = 0; x < gpu.rw; ++x) {
+                const bool hi = (((x >> 4) ^ (y >> 4)) & 1u) != 0u;
+                const float c = hi ? 0.85f : 0.15f;
+                const uint16_t hc = DirectX::PackedVector::XMConvertFloatToHalf(c);
+                const uint16_t ha = DirectX::PackedVector::XMConvertFloatToHalf(1.0f);
+                const size_t base = (static_cast<size_t>(y) * gpu.rw + x) * 4u;
+                hdr[base + 0] = hc;
+                hdr[base + 1] = hc;
+                hdr[base + 2] = hc;
+                hdr[base + 3] = ha;
+            }
+        }
+        gpu.context->UpdateSubresource(gpu.colorTex.Get(), 0, nullptr, hdr.data(), gpu.rw * 8u, 0);
+    } else {
+        std::vector<uint32_t> ldr(n);
+        for (uint32_t y = 0; y < gpu.rh; ++y) {
+            for (uint32_t x = 0; x < gpu.rw; ++x) {
+                const bool hi = (((x >> 4) ^ (y >> 4)) & 1u) != 0u;
+                const float c = hi ? 0.85f : 0.15f;
+                ldr[static_cast<size_t>(y) * gpu.rw + x] = packRgba8(c, c, c);
+            }
+        }
+        gpu.context->UpdateSubresource(gpu.colorTex.Get(), 0, nullptr, ldr.data(), gpu.rw * sizeof(uint32_t), 0);
+    }
+
+    std::vector<float> depth(n);
+    for (uint32_t y = 0; y < gpu.rh; ++y) {
+        for (uint32_t x = 0; x < gpu.rw; ++x) {
+            const bool fg = (x > gpu.rw / 4 && x < (gpu.rw * 3) / 4);
+            depth[static_cast<size_t>(y) * gpu.rw + x] = fg ? kFgDepth : kBgDepth;
+        }
+    }
+    if (!gpu.uploadDepth(depth)) {
+        return false;
+    }
+
+    std::vector<uint32_t> motion(n, packHalf2(0.25f, -0.15f));
+    gpu.context->UpdateSubresource(gpu.motionTex.Get(), 0, nullptr, motion.data(), gpu.rw * sizeof(uint32_t), 0);
+    return true;
+}
+
+GpuTimingStats measureUpscalerGpuTimeMs(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
+                                        uint32_t renderW, uint32_t renderH,
+                                        uint32_t outputW, uint32_t outputH,
+                                        DXGI_FORMAT colorFmt, float sharpness) {
+    GpuTimingStats stats{};
+    if (!gpu.allocateSurfaces(renderW, renderH, outputW, outputH, colorFmt, DXGI_FORMAT_R32_FLOAT)) {
+        return stats;
+    }
+    if (!seedBenchmarkSurfaces(gpu)) {
+        return stats;
+    }
+
+    ComPtr<ID3D11Query> disjointQ, startQ, endQ;
+    D3D11_QUERY_DESC dqDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+    D3D11_QUERY_DESC tsDesc{ D3D11_QUERY_TIMESTAMP, 0 };
+    if (FAILED(gpu.device->CreateQuery(&dqDesc, &disjointQ)) ||
+        FAILED(gpu.device->CreateQuery(&tsDesc, &startQ)) ||
+        FAILED(gpu.device->CreateQuery(&tsDesc, &endQ))) {
+        return stats;
+    }
+
+    constexpr int kWarmup = 10;
+    constexpr int kTimed = 30;
+    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+    edpe::ProjectionJitter prevJ{};
+
+    std::vector<double> samples;
+    samples.reserve(kTimed);
+
+    for (int t = 0; t < kWarmup + kTimed; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
+        const bool isReset = (t == 0);
+        if (isReset) {
+            backend.resetHistory();
+            gpu.hasPrevDepth = false;
+        }
+        const auto inputs = gpu.makeInputs(
+            j.pixelX, j.pixelY,
+            t > 0 ? prevJ.pixelX : 0.0f,
+            t > 0 ? prevJ.pixelY : 0.0f,
+            isReset, sharpness);
+        prevJ = j;
+
+        const bool timed = (t >= kWarmup);
+        if (timed) {
+            gpu.context->Begin(disjointQ.Get());
+            gpu.context->End(startQ.Get());
+        }
+        if (!backend.evaluate(gpu.context.Get(), inputs, gpu.outputRtv.Get(), gpu.outputTex.Get())) {
+            return stats;
+        }
+        gpu.hasPrevDepth = true;
+        if (timed) {
+            gpu.context->End(endQ.Get());
+            gpu.context->End(disjointQ.Get());
+            gpu.context->Flush();
+
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
+            UINT64 tStart = 0, tEnd = 0;
+            while (gpu.context->GetData(disjointQ.Get(), &disjointData, sizeof(disjointData), 0) == S_FALSE) {}
+            while (gpu.context->GetData(startQ.Get(), &tStart, sizeof(tStart), 0) == S_FALSE) {}
+            while (gpu.context->GetData(endQ.Get(), &tEnd, sizeof(tEnd), 0) == S_FALSE) {}
+            if (!disjointData.Disjoint && disjointData.Frequency > 0 && tEnd >= tStart) {
+                const double ms = static_cast<double>(tEnd - tStart) * 1000.0 /
+                                  static_cast<double>(disjointData.Frequency);
+                samples.push_back(ms);
+            }
+        }
+    }
+
+    if (!samples.empty()) {
+        std::sort(samples.begin(), samples.end());
+        double sumMs = 0.0;
+        for (double v : samples) sumMs += v;
+        stats.ok = true;
+        stats.avgMs = sumMs / static_cast<double>(samples.size());
+        stats.minMs = samples.front();
+        stats.medianMs = samples[samples.size() / 2u];
+        stats.maxMs = samples.back();
+        stats.fastestCount = static_cast<int>(std::min<size_t>(5u, samples.size()));
+        for (int i = 0; i < stats.fastestCount; ++i) {
+            stats.fastest5[i] = samples[i];
+        }
+    }
+    return stats;
+}
+
+GpuTimingStats measureSharpenGpuTimeMs(GpuHarness& gpu, uint32_t width, uint32_t height,
+                                       float sharpness, bool hdr, bool directRtv = false) {
+    GpuTimingStats stats{};
+    const DXGI_FORMAT fmt = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (!gpu.allocateSurfaces(width, height, width, height, fmt, DXGI_FORMAT_R32_FLOAT)) {
+        return stats;
+    }
+    if (!seedBenchmarkSurfaces(gpu)) {
+        return stats;
+    }
+
+    edpe::SharpenPass sharpen;
+    if (!sharpen.initialize(gpu.device.Get(), gpu.context.Get())) {
+        return stats;
+    }
+
+    ComPtr<ID3D11Query> disjointQ, startQ, endQ;
+    D3D11_QUERY_DESC dqDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+    D3D11_QUERY_DESC tsDesc{ D3D11_QUERY_TIMESTAMP, 0 };
+    if (FAILED(gpu.device->CreateQuery(&dqDesc, &disjointQ)) ||
+        FAILED(gpu.device->CreateQuery(&tsDesc, &startQ)) ||
+        FAILED(gpu.device->CreateQuery(&tsDesc, &endQ))) {
+        sharpen.shutdown();
+        return stats;
+    }
+
+    constexpr int kWarmup = 10;
+    constexpr int kTimed = 30;
+    std::vector<double> samples;
+    samples.reserve(kTimed);
+
+    for (int t = 0; t < kWarmup + kTimed; ++t) {
+        const bool timed = (t >= kWarmup);
+        if (timed) {
+            gpu.context->Begin(disjointQ.Get());
+            gpu.context->End(startQ.Get());
+        }
+        const bool ok = directRtv
+            ? sharpen.applyToRtv(gpu.context.Get(), gpu.colorSrv.Get(), gpu.outputRtv.Get(),
+                                 width, height, sharpness, hdr, false)
+            : sharpen.apply(gpu.context.Get(), gpu.outputTex.Get(), sharpness, hdr);
+        if (!ok) {
+            sharpen.shutdown();
+            return stats;
+        }
+        if (timed) {
+            gpu.context->End(endQ.Get());
+            gpu.context->End(disjointQ.Get());
+            gpu.context->Flush();
+
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
+            UINT64 tStart = 0, tEnd = 0;
+            while (gpu.context->GetData(disjointQ.Get(), &disjointData, sizeof(disjointData), 0) == S_FALSE) {}
+            while (gpu.context->GetData(startQ.Get(), &tStart, sizeof(tStart), 0) == S_FALSE) {}
+            while (gpu.context->GetData(endQ.Get(), &tEnd, sizeof(tEnd), 0) == S_FALSE) {}
+            if (!disjointData.Disjoint && disjointData.Frequency > 0 && tEnd >= tStart) {
+                const double ms = static_cast<double>(tEnd - tStart) * 1000.0 /
+                                  static_cast<double>(disjointData.Frequency);
+                samples.push_back(ms);
+            }
+        }
+    }
+
+    sharpen.shutdown();
+    if (!samples.empty()) {
+        std::sort(samples.begin(), samples.end());
+        double sumMs = 0.0;
+        for (double v : samples) sumMs += v;
+        stats.ok = true;
+        stats.avgMs = sumMs / static_cast<double>(samples.size());
+        stats.minMs = samples.front();
+        stats.medianMs = samples[samples.size() / 2u];
+        stats.maxMs = samples.back();
+        stats.fastestCount = static_cast<int>(std::min<size_t>(5u, samples.size()));
+        for (int i = 0; i < stats.fastestCount; ++i) {
+            stats.fastest5[i] = samples[i];
+        }
+    }
+    return stats;
+}
+
+int runDlssDiag(GpuHarness& gpu) {
+    ComPtr<IDXGIDevice> dxgiDev;
+    ComPtr<IDXGIAdapter> adapter;
+    if (SUCCEEDED(gpu.device.As(&dxgiDev)) && SUCCEEDED(dxgiDev->GetAdapter(&adapter))) {
+        DXGI_ADAPTER_DESC ad{};
+        if (SUCCEEDED(adapter->GetDesc(&ad))) {
+            std::printf("Adapter: %ls (Vendor=0x%04X Device=0x%04X)\n",
+                        ad.Description, ad.VendorId, ad.DeviceId);
+        }
+    }
+
+#if !(defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX)
+    std::printf("DLSS diagnostic unavailable: EDPE_ENABLE_NGX is not enabled.\n");
+    return 4;
+#else
+    edpe::NvidiaUpscalerBackend nvidiaBackend;
+    if (!nvidiaBackend.initialize(gpu.device.Get(), gpu.context.Get())) {
+        std::printf("Failed to initialize NvidiaUpscalerBackend: %ls\n", nvidiaBackend.unavailableReason());
+        return 4;
+    }
+    std::printf("NGX init status: %ls\n", edpe::NgxContext::get_status_message());
+    {
+        const edpe::NgxOverrideInfo ov = edpe::NgxContext::get_override_info();
+        std::printf("NGX override info: version=%s dllOverride=%d drsGlobal=%d overrideApplied=%d runtimePreset=%s\n",
+                    ov.dlssVersion[0] ? ov.dlssVersion : "(unknown)",
+                    ov.dllOverrideEnabled ? 1 : 0,
+                    ov.drsGlobalPresetOverride ? 1 : 0,
+                    ov.presetOverrideApplied ? 1 : 0,
+                    edpe::ngxPresetDisplayNameA(edpe::NgxContext::get_effective_runtime_preset()));
+    }
+
+#if defined(EDPE_ENABLE_FSR)
+    edpe::AmdUpscalerBackend fsrBackend;
+    if (!fsrBackend.initialize(gpu.device.Get(), gpu.context.Get())) {
+        std::printf("Failed to initialize AmdUpscalerBackend: %ls\n", fsrBackend.unavailableReason());
+        nvidiaBackend.shutdown();
+        return 2;
+    }
+#endif
+
+    struct PresetInfo {
+        uint32_t id;
+        const char* name;
+    };
+    const PresetInfo diagPresets[] = {
+        {  5u, "E" },
+        { 11u, "K" },
+        { 13u, "M" },
+    };
+
+    std::printf("\n=== 1. NGX OPTIMAL SETTINGS ===\n");
+    const struct {
+        uint32_t w, h;
+        edpe::UpscaleMode mode;
+        const char* label;
+    } optQueries[] = {
+        { 2560, 1440, edpe::UpscaleMode::Quality,          "2560x1440 Quality" },
+        { 2560, 1440, edpe::UpscaleMode::Balanced,         "2560x1440 Balanced" },
+        { 2560, 1440, edpe::UpscaleMode::Performance,      "2560x1440 Performance" },
+        { 2560, 1440, edpe::UpscaleMode::UltraPerformance, "2560x1440 UltraPerf" },
+        { 2560, 1440, edpe::UpscaleMode::NativeAA,         "2560x1440 NativeAA" },
+        {  512,  320, edpe::UpscaleMode::Performance,      "512x320 Performance" },
+    };
+    for (const auto& q : optQueries) {
+        edpe::DlssOptimalSettings os{};
+        const bool ok = edpe::NgxContext::queryOptimalSettings(q.w, q.h, q.mode, &os);
+        std::printf("  %-24s: ok=%d opt=%ux%u min=%ux%u max=%ux%u\n",
+                    q.label, ok ? 1 : 0, os.optimalWidth, os.optimalHeight,
+                    os.minWidth, os.minHeight, os.maxWidth, os.maxHeight);
+    }
+
+    std::printf("\n=== 2. 640x360->1280x720 (50%% Perf SR) STEP-EDGE & JITTER SCALE ===\n");
+#if defined(EDPE_ENABLE_FSR)
+    {
+        const StepEdgeMetrics m = measureStepEdgeScaled(gpu, fsrBackend, 640, 360, 1280, 720, +1.0f, +1.0f);
+        std::printf("  [AMD FSR 3.1 (+1,+1)]           span=(%.4f, %.4f) std=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f)\n",
+                    m.spanX, m.spanY, m.stdX, m.stdY, m.errX, m.errY, m.rmsX, m.rmsY);
+    }
+#endif
+    for (const auto& pr : diagPresets) {
+        edpe::NgxContext::set_preset(pr.id);
+        const StepEdgeMetrics m = measureStepEdgeScaled(gpu, nvidiaBackend, 640, 360, 1280, 720, +1.0f, +1.0f);
+        std::printf("  [DLSS Preset %s (+1,+1) RGBA8]    span=(%.4f, %.4f) std=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f) | %ls\n",
+                    pr.name, m.spanX, m.spanY, m.stdX, m.stdY, m.errX, m.errY, m.rmsX, m.rmsY,
+                    edpe::NgxContext::get_status_message());
+    }
+    {
+        edpe::NgxContext::set_preset(11u);
+        const struct {
+            float sx, sy;
+            const char* label;
+        } scaleTests[] = {
+            { +0.5f, +0.5f, "(+0.5,+0.5)" },
+            { +2.0f, +2.0f, "(+2.0,+2.0)" },
+            { -1.0f, -1.0f, "(-1.0,-1.0)" },
+            {  0.0f,  0.0f, "( 0.0, 0.0)" },
+        };
+        for (const auto& st : scaleTests) {
+            const StepEdgeMetrics m = measureStepEdgeScaled(gpu, nvidiaBackend, 640, 360, 1280, 720, st.sx, st.sy);
+            std::printf("  [DLSS Preset K %s]     span=(%.4f, %.4f) std=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f)\n",
+                        st.label, m.spanX, m.spanY, m.stdX, m.stdY, m.errX, m.errY, m.rmsX, m.rmsY);
+        }
+        const StepEdgeMetrics hdrM = measureStepEdgeScaled(
+            gpu, nvidiaBackend, 640, 360, 1280, 720, +1.0f, +1.0f, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        std::printf("  [DLSS Preset K (+1,+1) FP16 HDR] span=(%.4f, %.4f) std=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f) | %ls\n",
+                    hdrM.spanX, hdrM.spanY, hdrM.stdX, hdrM.stdY, hdrM.errX, hdrM.errY, hdrM.rmsX, hdrM.rmsY,
+                    edpe::NgxContext::get_status_message());
+    }
+
+    std::printf("\n=== 3. 1280x720->2560x1440 (1440p 50%% Perf SR) STEP-EDGE ===\n");
+#if defined(EDPE_ENABLE_FSR)
+    {
+        const StepEdgeMetrics m = measureStepEdgeScaled(gpu, fsrBackend, 1280, 720, 2560, 1440, +1.0f, +1.0f);
+        std::printf("  [AMD FSR 3.1 (+1,+1)]           span=(%.4f, %.4f) std=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f)\n",
+                    m.spanX, m.spanY, m.stdX, m.stdY, m.errX, m.errY, m.rmsX, m.rmsY);
+    }
+#endif
+    for (const auto& pr : diagPresets) {
+        edpe::NgxContext::set_preset(pr.id);
+        const StepEdgeMetrics m = measureStepEdgeScaled(gpu, nvidiaBackend, 1280, 720, 2560, 1440, +1.0f, +1.0f);
+        std::printf("  [DLSS Preset %s (+1,+1) RGBA8]    span=(%.4f, %.4f) std=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f) | %ls\n",
+                    pr.name, m.spanX, m.spanY, m.stdX, m.stdY, m.errX, m.errY, m.rmsX, m.rmsY,
+                    edpe::NgxContext::get_status_message());
+    }
+
+    std::printf("\n=== 4. GPU TIMING TABLE (1280x720->2560x1440, 10 warmup + 30 timed) ===\n");
+    auto printTimingRow = [](const char* label, const GpuTimingStats& st, const wchar_t* extra = nullptr) {
+        std::printf("  %-34s ok=%d min=%.3f med=%.3f avg=%.3f max=%.3f fast5=[%.3f, %.3f, %.3f, %.3f, %.3f]%ls%ls\n",
+                    label, st.ok ? 1 : 0, st.minMs, st.medianMs, st.avgMs, st.maxMs,
+                    st.fastestCount > 0 ? st.fastest5[0] : 0.0,
+                    st.fastestCount > 1 ? st.fastest5[1] : 0.0,
+                    st.fastestCount > 2 ? st.fastest5[2] : 0.0,
+                    st.fastestCount > 3 ? st.fastest5[3] : 0.0,
+                    st.fastestCount > 4 ? st.fastest5[4] : 0.0,
+                    extra ? L" | " : L"", extra ? extra : L"");
+    };
+#if defined(EDPE_ENABLE_FSR)
+    printTimingRow("AMD FSR 3.1 (sharp=0.50, RGBA8)",
+                   measureUpscalerGpuTimeMs(gpu, fsrBackend, 1280, 720, 2560, 1440, DXGI_FORMAT_R8G8B8A8_UNORM, 0.5f));
+#endif
+    for (const auto& pr : diagPresets) {
+        edpe::NgxContext::set_preset(pr.id);
+        char lbl[64];
+        std::snprintf(lbl, sizeof(lbl), "NVIDIA DLSS Preset %s (RGBA8)", pr.name);
+        const auto st = measureUpscalerGpuTimeMs(
+            gpu, nvidiaBackend, 1280, 720, 2560, 1440, DXGI_FORMAT_R8G8B8A8_UNORM, 0.0f);
+        printTimingRow(lbl, st, edpe::NgxContext::get_status_message());
+    }
+    printTimingRow("EDPE SharpenPass (sharp=0.50)",
+                   measureSharpenGpuTimeMs(gpu, 2560, 1440, 0.5f, false, false));
+    printTimingRow("EDPE SharpenPass::applyToRtv",
+                   measureSharpenGpuTimeMs(gpu, 2560, 1440, 0.5f, false, true));
+
+    std::printf("\n=== 5. PRESET K (QUALITY/BALANCED) vs PRESET M (PERF 50%%) AT 2560x1440 OUTPUT ===\n");
+    {
+        const struct {
+            uint32_t rw, rh;
+            const char* modeLabel;
+            int totalFrames;
+            int warmupFrames;
+            bool trace;
+        } cmpModes[] = {
+            { 1707, 960, "Quality 1707x960->2560x1440 (66.7%)", 48, 16, false },
+            { 1485, 835, "Balanced 1485x835->2560x1440 (58.0%)", 48, 16, false },
+            { 1280, 720, "Perf 1280x720->2560x1440 (50.0%, f=96/w=64)", 96, 64, true },
+        };
+        for (const auto& cm : cmpModes) {
+#if defined(EDPE_ENABLE_FSR)
+            {
+                const StepEdgeMetrics fm = measureStepEdgeScaled(
+                    gpu, fsrBackend, cm.rw, cm.rh, 2560, 1440, +1.0f, +1.0f,
+                    DXGI_FORMAT_R8G8B8A8_UNORM, cm.totalFrames, cm.warmupFrames, false);
+                std::printf("  [AMD FSR 3.1  %s] span=(%.4f, %.4f) std=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f)\n",
+                            cm.modeLabel, fm.spanX, fm.spanY, fm.stdX, fm.stdY, fm.errX, fm.errY, fm.rmsX, fm.rmsY);
+            }
+#endif
+            edpe::NgxContext::set_preset(11u);
+            const StepEdgeMetrics dm = measureStepEdgeScaled(
+                gpu, nvidiaBackend, cm.rw, cm.rh, 2560, 1440, +1.0f, +1.0f,
+                DXGI_FORMAT_R8G8B8A8_UNORM, cm.totalFrames, cm.warmupFrames, cm.trace);
+            std::printf("  [NVIDIA DLSS  %s] span=(%.4f, %.4f) std=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f) | %ls\n",
+                        cm.modeLabel, dm.spanX, dm.spanY, dm.stdX, dm.stdY, dm.errX, dm.errY, dm.rmsX, dm.rmsY,
+                        edpe::NgxContext::get_status_message());
+        }
+
+        std::printf("\n  --- GPU Timing for Quality (1707x960) & Balanced (1485x835) -> 2560x1440 ---\n");
+#if defined(EDPE_ENABLE_FSR)
+        printTimingRow("AMD FSR Quality 1707x960 (sharp=0.50)",
+                       measureUpscalerGpuTimeMs(gpu, fsrBackend, 1707, 960, 2560, 1440, DXGI_FORMAT_R8G8B8A8_UNORM, 0.5f));
+        printTimingRow("AMD FSR Balanced 1485x835 (sharp=0.50)",
+                       measureUpscalerGpuTimeMs(gpu, fsrBackend, 1485, 835, 2560, 1440, DXGI_FORMAT_R8G8B8A8_UNORM, 0.5f));
+#endif
+        edpe::NgxContext::set_preset(11u);
+        printTimingRow("NVIDIA DLSS Quality 1707x960 (Preset K)",
+                       measureUpscalerGpuTimeMs(gpu, nvidiaBackend, 1707, 960, 2560, 1440, DXGI_FORMAT_R8G8B8A8_UNORM, 0.0f),
+                       edpe::NgxContext::get_status_message());
+        edpe::NgxContext::set_preset(11u);
+        printTimingRow("NVIDIA DLSS Balanced 1485x835 (Preset K)",
+                       measureUpscalerGpuTimeMs(gpu, nvidiaBackend, 1485, 835, 2560, 1440, DXGI_FORMAT_R8G8B8A8_UNORM, 0.0f),
+                       edpe::NgxContext::get_status_message());
+    }
+
+#if defined(EDPE_ENABLE_FSR)
+    fsrBackend.shutdown();
+#endif
+    nvidiaBackend.shutdown();
+    return 0;
+#endif
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     GpuHarness gpu;
     if (!gpu.initDevice()) {
         std::printf("Failed to initialize D3D11 device\n");
         return 1;
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--dlss-diag") == 0) {
+            return runDlssDiag(gpu);
+        }
     }
 
     bool allOk = true;

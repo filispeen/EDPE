@@ -6,11 +6,15 @@
 #include "log.h"
 
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <mutex>
 #include <string>
 #include <windows.h>
 #include <wrl/client.h>
@@ -50,6 +54,127 @@ constexpr char kNgxEngineVersion[] = "EDPE-unreleased";
 static NgxFeatureState g_ngx_state{};
 static wchar_t g_status_msg[256] = L"NGX uninitialized";
 static std::atomic<bool> s_ngx_has_evaluated{false};
+static std::mutex g_override_mutex;
+static NgxOverrideInfo g_override_info{};
+static std::atomic<bool> g_ngx_verbose_stdout{false};
+
+static const char* findInsensitive(const char* hay, const char* needle) {
+    if (!hay || !needle || !*needle) return nullptr;
+    for (const char* h = hay; *h; ++h) {
+        const char* p = h;
+        const char* n = needle;
+        while (*p && *n &&
+               std::tolower(static_cast<unsigned char>(*p)) ==
+                   std::tolower(static_cast<unsigned char>(*n))) {
+            ++p;
+            ++n;
+        }
+        if (*n == '\0') return h;
+    }
+    return nullptr;
+}
+
+static bool containsInsensitive(const char* hay, const char* needle) {
+    return findInsensitive(hay, needle) != nullptr;
+}
+
+static uint32_t resolveSrPreset(uint32_t preset) {
+    return (preset == 5u || (preset >= 10u && preset <= 13u)) ? preset : 11u;
+}
+
+static bool extractVersionToken(const char* p, char* out, size_t outSize) {
+    if (!p || !out || outSize < 2) return false;
+    while (*p == ' ' || *p == '\t' || *p == ':') ++p;
+    if (*p == 'v' || *p == 'V') ++p;
+    if (!std::isdigit(static_cast<unsigned char>(*p))) return false;
+    size_t len = 0;
+    while (*p && (std::isdigit(static_cast<unsigned char>(*p)) || *p == '.') && len + 1 < outSize) {
+        out[len++] = *p++;
+    }
+    while (len > 0 && out[len - 1] == '.') {
+        --len;
+    }
+    if (len == 0) return false;
+    out[len] = '\0';
+    return true;
+}
+
+const char* ngxPresetDisplayNameA(uint32_t preset) {
+    static constexpr const char* kNames[] = {
+        "Auto", "A", "B", "C", "D", "E", "F", "G",
+        "H", "I", "J", "K", "L", "M", "N", "O"
+    };
+    return (preset < sizeof(kNames) / sizeof(kNames[0])) ? kNames[preset] : "Unknown";
+}
+
+const wchar_t* ngxPresetDisplayNameW(uint32_t preset) {
+    static constexpr const wchar_t* kNames[] = {
+        L"Auto", L"A", L"B", L"C", L"D", L"E", L"F", L"G",
+        L"H", L"I", L"J", L"K", L"L", L"M", L"N", L"O"
+    };
+    return (preset < sizeof(kNames) / sizeof(kNames[0])) ? kNames[preset] : L"Unknown";
+}
+
+bool parseNgxLogLineForOverrides(const char* line, NgxOverrideInfo* info) {
+    if (!line || !info) return false;
+    bool matched = false;
+
+    if (findInsensitive(line, "Feature dlss override enabled")) {
+        info->dllOverrideEnabled = true;
+        matched = true;
+    }
+    if (findInsensitive(line, "Using global override for DLSS-SR preset")) {
+        info->drsGlobalPresetOverride = true;
+        matched = true;
+    }
+    if (findInsensitive(line, "Override Reported: ModelPreset") &&
+        !findInsensitive(line, "FrameGeneration")) {
+        uint32_t val = 0u;
+        if (const char* v = findInsensitive(line, "Value:")) {
+            v += 6;
+            while (*v == ' ' || *v == '\t') ++v;
+            char* endPtr = nullptr;
+            const unsigned long parsed = std::strtoul(v, &endPtr, 10);
+            if (endPtr && endPtr != v) {
+                val = static_cast<uint32_t>(parsed);
+            }
+        }
+        if (findInsensitive(line, "Applied: Yes")) {
+            info->presetOverrideApplied = true;
+            info->overriddenPresetValue = val;
+            info->presetOverrideIsLatest = (findInsensitive(line, "Is Latest: Yes") != nullptr);
+            matched = true;
+        } else if (findInsensitive(line, "Applied: No")) {
+            info->presetOverrideApplied = false;
+            info->overriddenPresetValue = 0u;
+            info->presetOverrideIsLatest = false;
+            matched = true;
+        }
+    }
+
+    if (const char* snip = findInsensitive(line, "feature dlss snippet:")) {
+        if (const char* ver = findInsensitive(snip, "version:")) {
+            if (extractVersionToken(ver + 8, info->dlssVersion, sizeof(info->dlssVersion))) {
+                matched = true;
+            }
+        }
+    } else if (findInsensitive(line, "ngxFeatureVersion =") && !findInsensitive(line, "dlssg")) {
+        const char* fv = findInsensitive(line, "ngxFeatureVersion =");
+        if (extractVersionToken(fv + 19, info->dlssVersion, sizeof(info->dlssVersion))) {
+            matched = true;
+        }
+    } else if (info->dlssVersion[0] == '\0' &&
+               findInsensitive(line, "NGXInitLog") &&
+               !findInsensitive(line, "dlssg")) {
+        if (const char* b = findInsensitive(line, "Build v")) {
+            if (extractVersionToken(b + 7, info->dlssVersion, sizeof(info->dlssVersion))) {
+                matched = true;
+            }
+        }
+    }
+
+    return matched;
+}
 
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
 struct NgxFeatureSlot {
@@ -68,8 +193,45 @@ static NgxFeatureSlot g_feature_slots[2]{}; // [0] = LDR, [1] = HDR
 static ID3D11Device* g_ngx_device = nullptr;
 static ID3D11Texture2D* g_exposure_one = nullptr;
 
-static uint32_t resolveSrPreset(uint32_t preset) {
-    return (preset == 5u || (preset >= 10u && preset <= 13u)) ? preset : 11u;
+static void NVSDK_CONV ngxLogCallback(const char* message,
+    NVSDK_NGX_Logging_Level /*loggingLevel*/,
+    NVSDK_NGX_Feature /*sourceComponent*/) {
+    if (!message) return;
+    {
+        std::lock_guard<std::mutex> lock(g_override_mutex);
+        parseNgxLogLineForOverrides(message, &g_override_info);
+    }
+    if (!g_ngx_verbose_stdout.load(std::memory_order_relaxed)) return;
+
+    static std::mutex s_ngx_log_mutex;
+    static uint32_t s_ngx_log_count = 0;
+    const bool important =
+        containsInsensitive(message, "preset") ||
+        containsInsensitive(message, "model") ||
+        containsInsensitive(message, "create") ||
+        containsInsensitive(message, "init") ||
+        containsInsensitive(message, "override") ||
+        containsInsensitive(message, "warn") ||
+        containsInsensitive(message, "err") ||
+        containsInsensitive(message, "fail") ||
+        containsInsensitive(message, "dlss") ||
+        containsInsensitive(message, "version") ||
+        containsInsensitive(message, "cnn") ||
+        containsInsensitive(message, "transformer") ||
+        containsInsensitive(message, "subrect") ||
+        containsInsensitive(message, "jitter") ||
+        containsInsensitive(message, "hdr") ||
+        containsInsensitive(message, "exposure");
+
+    std::lock_guard<std::mutex> lock(s_ngx_log_mutex);
+    const uint32_t idx = s_ngx_log_count++;
+    if (idx >= 200u && !important) return;
+
+    std::string line(message);
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.pop_back();
+    }
+    std::printf("[NGX] %s\n", line.c_str());
 }
 
 // Presets L (12) and M (13) are calibrated for Ultra-Performance / Performance ratios;
@@ -187,9 +349,21 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     CreateDirectoryW(appdata.c_str(), nullptr);
 
     const wchar_t* paths[1] = { dll_dir.c_str() };
+    {
+        std::lock_guard<std::mutex> lock(g_override_mutex);
+        g_override_info = {};
+    }
+    wchar_t verboseEnv[8]{};
+    const bool verboseStdout =
+        (GetEnvironmentVariableW(L"EDPE_NGX_VERBOSE_LOG", verboseEnv, 8) > 0 && verboseEnv[0] == L'1');
+    g_ngx_verbose_stdout.store(verboseStdout, std::memory_order_relaxed);
+
     NVSDK_NGX_FeatureCommonInfo common{};
     common.PathListInfo.Path = paths;
     common.PathListInfo.Length = 1;
+    common.LoggingInfo.LoggingCallback = &ngxLogCallback;
+    common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
+    common.LoggingInfo.DisableOtherLoggingSinks = true;
 
     NVSDK_NGX_Result r = NVSDK_NGX_D3D11_Init_with_ProjectID(
         kNgxProjectId,
@@ -280,6 +454,10 @@ void NgxContext::shutdown() {
         g_ngx_device = nullptr;
     }
 #endif
+    {
+        std::lock_guard<std::mutex> lock(g_override_mutex);
+        g_override_info = {};
+    }
     g_ngx_state = {};
     swprintf_s(g_status_msg, L"NGX shutdown complete");
 }
@@ -444,6 +622,13 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     // AutoExposure on LDR causes DLSS to re-estimate exposure on dark/bright transitions (e.g.
     // night settlement interiors) and blow out lighting.
 
+    {
+        std::lock_guard<std::mutex> lock(g_override_mutex);
+        g_override_info.presetOverrideApplied = false;
+        g_override_info.presetOverrideIsLatest = false;
+        g_override_info.overriddenPresetValue = 0u;
+    }
+
     NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &slot.handle, g_ngx_params, &cp);
     if (r != NVSDK_NGX_Result_Success || !slot.handle) {
         slot.handle = nullptr;
@@ -470,16 +655,28 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     g_ngx_state.is_hdr = isHdr;
     g_ngx_state.reset_requested = true;
 
-    const wchar_t* presetName =
-        effectivePreset == 5u ? L"E" :
-        effectivePreset == 10u ? L"J" :
-        effectivePreset == 11u ? L"K" :
-        effectivePreset == 12u ? L"L" :
-        effectivePreset == 13u ? L"M" : L"Auto";
-    swprintf_s(g_status_msg, L"NVIDIA %ls feature active (%ux%u -> %ux%u, Preset %ls, %ls)",
-        (renderWidth == outputWidth && renderHeight == outputHeight) ? L"DLAA" : L"DLSS SR",
-        renderWidth, renderHeight, outputWidth, outputHeight,
-        presetName, isHdr ? L"HDR" : L"LDR");
+    const NgxOverrideInfo ov = get_override_info();
+    const wchar_t* presetName = ngxPresetDisplayNameW(effectivePreset);
+    if (ov.presetOverrideApplied && ov.overriddenPresetValue != 0u) {
+        const wchar_t* forcedName = ngxPresetDisplayNameW(ov.overriddenPresetValue);
+        swprintf_s(g_status_msg,
+            L"NVIDIA %ls feature active (%ux%u -> %ux%u, Preset %ls, %ls) [DRS Override -> Preset %ls]",
+            (renderWidth == outputWidth && renderHeight == outputHeight) ? L"DLAA" : L"DLSS SR",
+            renderWidth, renderHeight, outputWidth, outputHeight,
+            presetName, isHdr ? L"HDR" : L"LDR", forcedName);
+        if (ov.overriddenPresetValue != effectivePreset) {
+            wchar_t warnMsg[320];
+            swprintf_s(warnMsg,
+                L"EDPE WARNING: NVIDIA App / DRS overrode DLSS preset (requested Preset %ls, driver forced Preset %ls%ls). Disable 'DLSS Override - Model Presets' in NVIDIA App to use EDPE preset selection.",
+                presetName, forcedName, ov.presetOverrideIsLatest ? L" / Latest" : L"");
+            EdpeLog(warnMsg);
+        }
+    } else {
+        swprintf_s(g_status_msg, L"NVIDIA %ls feature active (%ux%u -> %ux%u, Preset %ls, %ls)",
+            (renderWidth == outputWidth && renderHeight == outputHeight) ? L"DLAA" : L"DLSS SR",
+            renderWidth, renderHeight, outputWidth, outputHeight,
+            presetName, isHdr ? L"HDR" : L"LDR");
+    }
     EdpeLog(g_status_msg);
     return true;
 #else
@@ -606,6 +803,29 @@ const wchar_t* NgxContext::get_status_message() {
 
 bool NgxContext::has_evaluated() {
     return s_ngx_has_evaluated.load(std::memory_order_acquire);
+}
+
+NgxOverrideInfo NgxContext::get_override_info() {
+    std::lock_guard<std::mutex> lock(g_override_mutex);
+    return g_override_info;
+}
+
+uint32_t NgxContext::get_effective_runtime_preset() {
+    const NgxOverrideInfo ov = get_override_info();
+    if (ov.presetOverrideApplied && ov.overriddenPresetValue != 0u) {
+        return ov.overriddenPresetValue;
+    }
+    return g_ngx_state.active_preset ? g_ngx_state.active_preset : resolveSrPreset(g_ngx_state.preset);
+}
+
+bool NgxContext::is_preset_overridden() {
+    const NgxOverrideInfo ov = get_override_info();
+    const uint32_t requested = g_ngx_state.active_preset
+        ? g_ngx_state.active_preset
+        : resolveSrPreset(g_ngx_state.preset);
+    return ov.presetOverrideApplied &&
+           ov.overriddenPresetValue != 0u &&
+           (ov.overriddenPresetValue != requested || ov.presetOverrideIsLatest);
 }
 
 } // namespace edpe

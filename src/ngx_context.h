@@ -69,6 +69,19 @@ struct DlssOptimalSettings {
     bool supported = false;
 };
 
+struct NgxOverrideInfo {
+    bool dllOverrideEnabled = false;
+    bool drsGlobalPresetOverride = false;
+    bool presetOverrideApplied = false;
+    bool presetOverrideIsLatest = false;
+    uint32_t overriddenPresetValue = 0; // 0 = none, 5 = E, 10 = J, 11 = K, 12 = L, 13 = M
+    char dlssVersion[32] = {};
+};
+
+const char* ngxPresetDisplayNameA(uint32_t preset);
+const wchar_t* ngxPresetDisplayNameW(uint32_t preset);
+bool parseNgxLogLineForOverrides(const char* line, NgxOverrideInfo* info);
+
 // NGX context management.
 // Handles NVIDIA DLSS Super Resolution and DLAA initialization, evaluation,
 // and shutdown through the NVIDIA NGX D3D11 SDK.
@@ -131,6 +144,10 @@ public:
 
     static const wchar_t* get_status_message();
     static bool has_evaluated();
+
+    static NgxOverrideInfo get_override_info();
+    static uint32_t get_effective_runtime_preset();
+    static bool is_preset_overridden();
 };
 
 } // namespace edpe

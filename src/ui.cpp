@@ -1929,6 +1929,21 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             }
             if (!nvidia_active) ImGui::EndDisabled();
 
+            if (nvidia_active) {
+                const edpe::NgxOverrideInfo ov = edpe::NgxContext::get_override_info();
+                if (ov.presetOverrideApplied && ov.overriddenPresetValue != 0u) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.72f, 0.25f, 1.0f));
+                    ImGui::TextWrapped("NVIDIA App Override active: Preset %s%s (disable 'DLSS Override - Model Presets' in NVIDIA App to use EDPE preset).",
+                        edpe::ngxPresetDisplayNameA(ov.overriddenPresetValue),
+                        ov.presetOverrideIsLatest ? " / Latest" : "");
+                    ImGui::PopStyleColor();
+                } else if (ov.dlssVersion[0] != '\0') {
+                    ImGui::TextDisabled("DLSS v%s | Active: Preset %s",
+                        ov.dlssVersion,
+                        edpe::ngxPresetDisplayNameA(edpe::NgxContext::get_effective_runtime_preset()));
+                }
+            }
+
             if (!amd_active) ImGui::BeginDisabled();
             float curFsrVel = upscaler.getFsrVelocityFactor();
             if (ImGui::SliderFloat("AMD FSR Velocity Factor", &curFsrVel, 0.0f, 1.0f, "%.2f")) {
