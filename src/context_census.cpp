@@ -2178,6 +2178,8 @@ bool isConfirmedShipCockpitHudPair(std::uint64_t vs_hash, std::uint64_t ps_hash)
         return true;
     }
     return (vs_hash == 0x2CECEC3065EF0D4Aull && ps_hash == 0xA4D03619D631B186ull) || // Cockpit HUD stencil setup (A4D03619, 0x04)
+           (vs_hash == 0x5559BD94B6852E83ull &&
+            (ps_hash == 0xEA02FAC2BD6C643Cull || ps_hash == 0xE95634B0F61D218Full)) || // Target & Own-Ship 3D schematic hologram billboards
            (vs_hash == 0xF8D8A92E96419901ull && ps_hash == 0x16196F69ADE35E77ull) || // Hologram icon core (kHoloFamiliesTake)
            (vs_hash == 0x1989B75BF034ECC3ull && ps_hash == 0xDB79AE788E049DFDull) || // Radar contact triangles & elevation stalks
            (vs_hash == 0xC7FA0C0F5DD49180ull && ps_hash == 0x6EEF165A350DA30Full) || // Orbit / exclusion lines (kOrbitLines)
@@ -2216,8 +2218,6 @@ bool isHudShaderPair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
         return true;
     }
     return vs_hash == 0xB7790CBFC6554097ull || // Flight HUD vector lines, altimeter ladder & pitch ladder (PS 8DEF46452FA459F5 / EDHM B1CA8D8EEF7C886D)
-           (vs_hash == 0x5559BD94B6852E83ull &&
-            (ps_hash == 0xEA02FAC2BD6C643Cull || ps_hash == 0xE95634B0F61D218Full)) || // Target & Own-Ship 3D schematic hologram billboards (cockpit-gated)
            (vs_hash == 0x9BFC7FD232328391ull && ps_hash == 0xDBF1725726018F52ull) || // Supercruise space dust particles (kSpaceDust)
            (vs_hash == 0xE904D334BC8B11EAull && ps_hash == 0x095030F27D2C362Aull);   // Normal-space dust particles (kNormalSpaceDust)
 }
