@@ -12,6 +12,7 @@
 #include "temporal_math.h"
 #include "upscaler_backend.h"
 #include "fg_integration.h"
+#include "frame_limiter.h"
 #include "ngx_context.h"
 #include "config.h"
 #include "cb_map_bounce.h"
@@ -13857,6 +13858,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             cfg.frameGenDynamicMfg,
             cfg.frameGenDynamicTargetFps,
             cfg.frameGenReflexBoost);
+        edpe::FrameLimiter::instance().configure(cfg.gameFpsLimitEnabled, cfg.gameFpsLimit);
     }
     s_inside_main_scene.store(false, std::memory_order_release);
     if (!(flags & DXGI_PRESENT_TEST)) {

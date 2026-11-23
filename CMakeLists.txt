@@ -98,6 +98,7 @@ add_library(EDPE_DXGI SHARED
     src/amd_fsr_fg_backend.cpp
     src/nvidia_sl_fg_backend.cpp
     src/fg_integration.cpp
+    src/frame_limiter.cpp
     src/version.cpp
     src/dxgi_proxy.def
 )
@@ -219,6 +220,11 @@ target_compile_definitions(atomic_file_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
 target_include_directories(atomic_file_test PRIVATE src)
 target_link_libraries(atomic_file_test PRIVATE d3d11 dxgi)
 add_test(NAME atomic_file COMMAND atomic_file_test)
+add_executable(frame_limiter_test tests/frame_limiter_test.cpp src/frame_limiter.cpp src/log.cpp)
+target_compile_features(frame_limiter_test PRIVATE cxx_std_20)
+target_compile_definitions(frame_limiter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(frame_limiter_test PRIVATE src)
+add_test(NAME frame_limiter COMMAND frame_limiter_test)
 add_executable(temporal_inputs_test tests/temporal_inputs.cpp src/upscaler_backend.cpp src/ngx_context.cpp src/log.cpp src/taa_pass.cpp src/sharpen_pass.cpp)
 target_compile_features(temporal_inputs_test PRIVATE cxx_std_20)
 target_compile_definitions(temporal_inputs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

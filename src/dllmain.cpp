@@ -1,5 +1,6 @@
 #include "cobra_camera_inject.h"
 #include "crash_logger.h"
+#include "frame_limiter.h"
 #include "log.h"
 #include <windows.h>
 
@@ -14,6 +15,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID lpvReserved) {
 #endif
     } else if (reason == DLL_PROCESS_DETACH) {
         edpe::cobra_camera::EngineHookManager::instance().shutdown();
+        edpe::FrameLimiter::instance().shutdown();
         EdpeLogShutdown(lpvReserved == nullptr);
         edpe::uninstallCrashLogger();
     }

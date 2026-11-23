@@ -1,6 +1,7 @@
 #include "d3d11_proxy.h"
 #include "crash_logger.h"
 #include "config.h"
+#include "frame_limiter.h"
 #include "log.h"
 #include "renderdoc_support.h"
 #include "system_dll.h"
@@ -58,6 +59,7 @@ void syncConfigOnce() {
     std::call_once(s_once, [] {
         auto& cfg = edpe::Config::instance();
         cfg.load();
+        edpe::FrameLimiter::instance().configure(cfg.gameFpsLimitEnabled, cfg.gameFpsLimit);
         edpe::RenderDocBridge::instance().refresh();
         // Preload backend/system DLLs before patching IATs so RenderDoc's LoadLibrary hook
         // does not immediately overwrite EDPE's D3D11 IAT entries.

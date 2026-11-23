@@ -1,6 +1,7 @@
 #include "perf_overlay.h"
 #include "upscaler_backend.h"
 #include "fg_integration.h"
+#include "frame_limiter.h"
 #include "context_census.h"
 #include "ngx_context.h"
 #include "config.h"
@@ -286,6 +287,31 @@ void PerfTracker::updateCachedStats() {
     } else {
         cachedStats_.fgPresentedFpsLine[0] = '\0';
         snprintf(cachedStats_.fgInfoLine, sizeof(cachedStats_.fgInfoLine), "Off");
+    }
+
+    const auto flStats = FrameLimiter::instance().getStats();
+    cachedStats_.fpsLimitActive = flStats.enabled;
+    if (flStats.enabled) {
+        const bool isInteger = std::fabs(flStats.targetFps - std::round(flStats.targetFps)) < 0.05f;
+        if (flStats.lastFrameOverrun) {
+            if (isInteger) {
+                snprintf(cachedStats_.fpsLimitInfoLine, sizeof(cachedStats_.fpsLimitInfoLine),
+                    "%.0f FPS (Async | Below target)", flStats.targetFps);
+            } else {
+                snprintf(cachedStats_.fpsLimitInfoLine, sizeof(cachedStats_.fpsLimitInfoLine),
+                    "%.1f FPS (Async | Below target)", flStats.targetFps);
+            }
+        } else {
+            if (isInteger) {
+                snprintf(cachedStats_.fpsLimitInfoLine, sizeof(cachedStats_.fpsLimitInfoLine),
+                    "%.0f FPS (Async | Wait %4.2f ms)", flStats.targetFps, flStats.lastWaitMs);
+            } else {
+                snprintf(cachedStats_.fpsLimitInfoLine, sizeof(cachedStats_.fpsLimitInfoLine),
+                    "%.1f FPS (Async | Wait %4.2f ms)", flStats.targetFps, flStats.lastWaitMs);
+            }
+        }
+    } else {
+        cachedStats_.fpsLimitInfoLine[0] = '\0';
     }
 
     snprintf(cachedStats_.gameFtLine, sizeof(cachedStats_.gameFtLine),
@@ -665,11 +691,14 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
     static float s_max_overlay_width = 0.0f;
     static float s_last_scale = -1.0f;
     static int s_last_backend = -1;
+    static bool s_last_fps_limit_active = false;
     const int cur_backend = static_cast<int>(edpe::UpscalerManager::instance().getBackend());
-    if (std::fabs(scale - s_last_scale) > 0.01f || cur_backend != s_last_backend) {
+    if (std::fabs(scale - s_last_scale) > 0.01f || cur_backend != s_last_backend ||
+        cachedStats_.fpsLimitActive != s_last_fps_limit_active) {
         s_max_overlay_width = 0.0f;
         s_last_scale = scale;
         s_last_backend = cur_backend;
+        s_last_fps_limit_active = cachedStats_.fpsLimitActive;
     }
     if (s_max_overlay_width > 0.0f) {
         ImGui::SetNextWindowSizeConstraints(ImVec2(s_max_overlay_width, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
@@ -796,6 +825,14 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
                 ImGui::TextUnformatted("Frame Gen:");
                 ImGui::TableSetColumnIndex(1);
                 ImGui::TextUnformatted(cachedStats_.fgInfoLine);
+            }
+
+            if (cachedStats_.fpsLimitActive && !override) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted("FPS Limit:");
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(cachedStats_.fpsLimitInfoLine);
             }
 
             ImGui::EndTable();

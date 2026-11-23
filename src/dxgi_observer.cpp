@@ -6,6 +6,7 @@
 #include "ui.h"
 #include "context_census.h"
 #include "fg_integration.h"
+#include "frame_limiter.h"
 #include "perf_overlay.h"
 #include "vtable_hook.h"
 
@@ -98,6 +99,7 @@ HRESULT STDMETHODCALLTYPE observedResizeBuffers(IDXGISwapChain* swap_chain, UINT
     UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
     UiOnResize(swap_chain);
     edpe::FgRuntime::instance().onResize(swap_chain);
+    edpe::FrameLimiter::instance().reset();
     ContextCensusOnResize(swap_chain);
     const auto original = reinterpret_cast<ResizeBuffersFn>(tableOf(swap_chain)->original[kResizeBuffers]);
     return original(swap_chain, buffer_count, width, height, format, flags);
@@ -278,6 +280,7 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
     const HRESULT result = presentedViaFgProxy ? S_OK : original(swap_chain, sync_interval, flags);
     edpe::setLastD3D11HResult(result);
     ContextCensusAfterPresent(swap_chain, flags);
+    edpe::FrameLimiter::instance().waitForNextFrame();
     edpe::PerfTracker::instance().onPresentEnd();
     return result;
 }
