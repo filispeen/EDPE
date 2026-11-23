@@ -2,9 +2,11 @@
 
 # EDPE<br><sub>(Elite Dangerous Performance Enhanced)</sub>
 
-[![Latest Release](https://img.shields.io/github/v/release/filispeen/EDPE?color=blue&label=version&style=for-the-badge)](https://github.com/filispeen/EDPE/releases/latest)
-![CI](https://img.shields.io/github/actions/workflow/status/filispeen/EDPE/CI.yml?style=for-the-badge&label=CI)
-[![Tests](https://img.shields.io/badge/tests-26%2F26%20Passing-brightgreen.svg?style=for-the-badge)]()
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/filispeen/EDPE/CI.yml?style=for-the-badge&color=rgba(0%2C%20143%2C%200%2C%200.8))
+[![Tests](https://img.shields.io/badge/tests-26%2F26%20Passing-brightgreen.svg?style=for-the-badge&color=rgba(0%2C%20143%2C%200%2C%200.8))]()
+
+![GitHub Release](https://img.shields.io/github/v/release/filispeen/EDPE?include_prereleases&filter=EDPE%20v*&display_name=release&style=for-the-badge)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/filispeen/EDPE/total?style=for-the-badge&color=rgba(44%2C%2096%2C%20171%2C%200.8))
 
 [![Status](https://img.shields.io/badge/status-in%20development-yellow.svg?style=for-the-badge)](STATUS.md)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20|%20LINUX-blue.svg?style=for-the-badge)](#installation)
