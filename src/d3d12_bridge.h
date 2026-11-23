@@ -48,7 +48,8 @@ public:
     // FSR 4.1.2); if that fails the bridge falls back to the system D3D12 runtime.
     bool initialize(ID3D11Device* d3d11Device, const wchar_t* agilitySdkDir = nullptr);
 
-    // True when the D3D12 device was created from a side-loaded Agility SDK runtime.
+    // True when the D3D12 device was created through ID3D12DeviceFactory for the requested Agility SDK version:
+    // from the side-loaded D3D12Core.dll, or from a system runtime that already provides that version.
     bool usingAgilitySdk() const { return usingAgilitySdk_; }
 
     // Drains pending GPU work and releases all D3D12/shared resources.
