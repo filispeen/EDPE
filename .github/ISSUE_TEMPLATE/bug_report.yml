@@ -44,7 +44,7 @@ body:
         GPU: 
         Driver: 
         OS: Windows 11 / Linux (Proton version)
-        Mode: Odyssey desktop / VR / Horizons
+        Mode: Odyssey / Horizons in desktop / VR
         Render scale & FG: e.g. 67%, DLSS-G / FSR FG / Off
     validations:
       required: true
