@@ -1,3 +1,8 @@
+// CLSID_D3D12SDKConfiguration is defined here so test targets that do not link dxguid.lib resolve it
+// (DEFINE_GUID is selectany under MSVC, so duplicate definitions are harmless).
+#ifndef INITGUID
+#define INITGUID
+#endif
 #include "d3d12_bridge.h"
 
 #include "log.h"
@@ -5,10 +10,47 @@
 #include "system_dll.h"
 
 #include <cstdio>
+#include <string>
 
 namespace edpe {
 
 namespace {
+
+// Agility SDK version requested when the D3D12SDKVersion export cannot be read from the staged D3D12Core.dll
+// (Microsoft.Direct3D.D3D12 1.616.1).
+constexpr UINT kDefaultAgilitySdkVersion = 616;
+
+// Reads the version the staged D3D12Core.dll declares through its D3D12SDKVersion export, so the requested version
+// always matches the file. Returns kDefaultAgilitySdkVersion if the file cannot be loaded or has no such export.
+UINT readAgilitySdkVersion(const wchar_t* dir) {
+    std::wstring path(dir);
+    if (path.back() != L'\\' && path.back() != L'/') path += L'\\';
+    path += L"D3D12Core.dll";
+    HMODULE core = LoadLibraryExW(path.c_str(), nullptr,
+                                  LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
+    if (!core) {
+        EdpeLog((L"EDPE D3D12Bridge: could not load D3D12Core.dll to read its SDK version; requesting " + std::to_wstring(kDefaultAgilitySdkVersion)).c_str());
+        return kDefaultAgilitySdkVersion;
+    }
+    UINT version = kDefaultAgilitySdkVersion;
+    if (const auto* exported = reinterpret_cast<const UINT*>(GetProcAddress(core, "D3D12SDKVersion"))) {
+        version = *exported;
+    } else {
+        EdpeLog((L"EDPE D3D12Bridge: D3D12Core.dll has no D3D12SDKVersion export; requesting " + std::to_wstring(kDefaultAgilitySdkVersion)).c_str());
+    }
+    FreeLibrary(core);
+    return version;
+}
+
+// UTF-8 copy of a wide string, sized by a first WideCharToMultiByte pass. Empty on failure.
+std::string toUtf8(const wchar_t* wide) {
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    if (bytes <= 1) return {};
+    std::string out(static_cast<size_t>(bytes), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), bytes, nullptr, nullptr) <= 0) return {};
+    out.resize(static_cast<size_t>(bytes) - 1);
+    return out;
+}
 
 using PFN_D3D12CreateDevice = HRESULT(WINAPI*)(IUnknown* pAdapter,
                                                D3D_FEATURE_LEVEL MinimumFeatureLevel,
@@ -64,7 +106,7 @@ D3D11D3D12Bridge::~D3D11D3D12Bridge() {
     shutdown();
 }
 
-bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device) {
+bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device, const wchar_t* agilitySdkDir) {
     shutdown();
     if (!d3d11Device) return false;
 
@@ -104,11 +146,55 @@ bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device) {
         return false;
     }
 
-    hr = createDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device12_));
-    if (FAILED(hr)) {
-        logBridgeFailure(L"D3D12CreateDevice(FL_12_0)", hr);
-        shutdown();
-        return false;
+    // Optional: create the device from a side-loaded Agility SDK runtime (D3D12Core.dll in
+    // agilitySdkDir). Falls back to the system runtime below if any step fails.
+    if (agilitySdkDir && agilitySdkDir[0]) {
+        using PFN_D3D12GetInterface = HRESULT(WINAPI*)(REFCLSID, REFIID, void**);
+        auto getInterface = reinterpret_cast<PFN_D3D12GetInterface>(
+            GetProcAddress(d3d12Module_, "D3D12GetInterface"));
+        Microsoft::WRL::ComPtr<ID3D12SDKConfiguration1> sdkConfig;
+        const std::string sdkPathUtf8 = toUtf8(agilitySdkDir);
+        if (sdkPathUtf8.empty()) {
+            EdpeLog(L"EDPE D3D12Bridge: Agility SDK path conversion to UTF-8 failed; using system D3D12");
+        } else if (!getInterface ||
+                   FAILED(getInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&sdkConfig)))) {
+            EdpeLog(L"EDPE D3D12Bridge: Agility SDK configuration interface unavailable; using system D3D12");
+        } else {
+            const UINT sdkVersion = readAgilitySdkVersion(agilitySdkDir);
+            const HRESULT fhr = sdkConfig->CreateDeviceFactory(
+                sdkVersion, sdkPathUtf8.c_str(), IID_PPV_ARGS(&deviceFactory_));
+            if (SUCCEEDED(fhr)) {
+                const HRESULT dhr = deviceFactory_->CreateDevice(
+                    adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device12_));
+                if (SUCCEEDED(dhr)) {
+                    usingAgilitySdk_ = true;
+                    // The factory also succeeds when the OS runtime already provides this version, so the
+                    // runtime's own report is logged instead of assuming a side-loaded D3D12Core.dll.
+                    UINT reported = 0;
+                    Microsoft::WRL::ComPtr<ID3D12DeviceConfiguration> deviceConfig;
+                    if (SUCCEEDED(deviceFactory_->QueryInterface(IID_PPV_ARGS(&deviceConfig))) && deviceConfig) {
+                        reported = deviceConfig->GetDesc().SDKVersion;
+                    }
+                    EdpeLog((L"EDPE D3D12Bridge: D3D12 device created through ID3D12DeviceFactory (requested SDK version " +
+                             std::to_wstring(sdkVersion) + L", runtime reports " + std::to_wstring(reported) + L")").c_str());
+                } else {
+                    logBridgeFailure(L"ID3D12DeviceFactory::CreateDevice", dhr);
+                    device12_.Reset();
+                    deviceFactory_.Reset();
+                }
+            } else {
+                logBridgeFailure(L"ID3D12SDKConfiguration1::CreateDeviceFactory", fhr);
+            }
+        }
+    }
+
+    if (!device12_) {
+        hr = createDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device12_));
+        if (FAILED(hr)) {
+            logBridgeFailure(L"D3D12CreateDevice(FL_12_0)", hr);
+            shutdown();
+            return false;
+        }
     }
 
     D3D12_COMMAND_QUEUE_DESC qDesc{};
@@ -209,6 +295,12 @@ void D3D11D3D12Bridge::shutdown() {
     overrideQueue_.Reset();
     queue_.Reset();
     device12_.Reset();
+    deviceFactory_.Reset();
+    // ID3D12SDKConfiguration1::FreeUnusedSDKs() is deliberately not called here, so D3D12Core.dll stays loaded for
+    // the process lifetime. Tried and rejected: after the call, the next initialize() in the same process still gets
+    // a device factory from CreateDeviceFactory, but ID3D12DeviceFactory::CreateDevice then crashes inside d3d12.dll.
+    // The bridge is re-initialized in normal use (resolution or backend changes).
+    usingAgilitySdk_ = false;
     device11_5_.Reset();
     device11_ = nullptr;
     fenceValue_ = 0;

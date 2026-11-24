@@ -43,7 +43,14 @@ public:
 
     // Initializes secondary D3D12 device, high-priority queue, command allocators, and shared fence
     // on the exact DXGI adapter backing d3d11Device.
-    bool initialize(ID3D11Device* d3d11Device);
+    // When agilitySdkDir is non-null and holds D3D12Core.dll, the device is created through
+    // ID3D12DeviceFactory from that Agility SDK runtime (the inbox runtime on Windows 10 did not offer
+    // FSR 4.1.2); if that fails the bridge falls back to the system D3D12 runtime.
+    bool initialize(ID3D11Device* d3d11Device, const wchar_t* agilitySdkDir = nullptr);
+
+    // True when the D3D12 device was created through ID3D12DeviceFactory for the requested Agility SDK version:
+    // from the side-loaded D3D12Core.dll, or from a system runtime that already provides that version.
+    bool usingAgilitySdk() const { return usingAgilitySdk_; }
 
     // Drains pending GPU work and releases all D3D12/shared resources.
     void shutdown();
@@ -105,6 +112,8 @@ private:
     HMODULE d3d12Module_ = nullptr;
     ID3D11Device* device11_ = nullptr; // Non-owning
     Microsoft::WRL::ComPtr<ID3D11Device5> device11_5_;
+    Microsoft::WRL::ComPtr<ID3D12DeviceFactory> deviceFactory_; // keeps the Agility runtime alive
+    bool usingAgilitySdk_ = false;
     Microsoft::WRL::ComPtr<ID3D12Device> device12_;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> overrideQueue_;
