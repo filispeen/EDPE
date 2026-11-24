@@ -1518,6 +1518,19 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             edpe::UpscalerManager::instance().setMode(edpe::UpscaleMode::NativeAA);
         }
         ContextCensusRefreshMipLodBias();
+        edpe::FgRuntime::instance().startCapabilitiesProbeAsync(ui.device);
+        if (ui.font_proggy_forever && ui.font_proggy_forever->OwnerAtlas &&
+            ui.font_proggy_forever->OwnerAtlas->Builder) {
+            ImGui::SetCurrentContext(ui.imgui);
+            const float baseSize = ImGui::GetStyle().FontSizeBase > 0.0f
+                ? ImGui::GetStyle().FontSizeBase
+                : 13.0f;
+            ui.font_proggy_forever->GetFontBaked(
+                baseSize * std::clamp(cfg.perfOverlayScale, 0.5f, 2.5f), 1.0f);
+            ui.font_proggy_forever->GetFontBaked(
+                baseSize * std::clamp(cfg.uiScale, 0.5f, 2.5f), 1.0f);
+            ImGui::SetCurrentContext(previous);
+        }
     }
     if (ui.font_proggy_forever) {
         wchar_t fontMsg[128];
@@ -2033,7 +2046,10 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         // 2b. Frame Generation (Independent subsystem: Phases 13-15)
         if (ImGui::CollapsingHeader("Frame Generation", ImGuiTreeNodeFlags_DefaultOpen)) {
             auto& fgRt = edpe::FgRuntime::instance();
-            fgRt.ensureCapabilitiesProbed(ui.device);
+            fgRt.startCapabilitiesProbeAsync(ui.device);
+            if (fgRt.isCapabilitiesProbeInProgress()) {
+                ImGui::TextDisabled("Probing FG capabilities...");
+            }
 
             const bool amdFgAvail = fgRt.isBackendAvailable(edpe::FrameGenerationBackend::AmdFsrFg);
             const bool nvFgAvail = fgRt.isBackendAvailable(edpe::FrameGenerationBackend::NvidiaDlssG);

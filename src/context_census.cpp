@@ -5488,15 +5488,22 @@ struct VisorCheckedPair {
     std::uint64_t vs = 0;
     std::uint64_t ps = 0;
 };
+struct VisorPatchedEntry {
+    std::uint64_t vs = 0;
+    std::uint64_t ps = 0;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> patchedVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> patchedPs;
+};
+static constexpr size_t kVisorPatchedCacheMax = 32;
 
 ID3D11Device* s_visor_device = nullptr;
 Microsoft::WRL::ComPtr<ID3D11Buffer> s_visor_jitter_cb;
-std::uint64_t s_visor_cached_vs_hash = 0;
-std::uint64_t s_visor_cached_ps_hash = 0;
-Microsoft::WRL::ComPtr<ID3D11VertexShader> s_visor_patched_vs;
-Microsoft::WRL::ComPtr<ID3D11PixelShader> s_visor_patched_ps;
-std::array<VisorCheckedPair, 32> s_visor_checked_neg{};
+std::vector<VisorPatchedEntry> s_visor_patched_cache;
+std::array<VisorCheckedPair, 512> s_visor_checked_neg{};
 size_t s_visor_checked_neg_count = 0;
+size_t s_visor_checked_neg_cursor = 0;
+size_t s_visor_cache_misses = 0;
+size_t s_visor_neg_overflow = 0;
 bool s_visor_align_logged = false;
 bool s_visor_divert_logged = false;
 
@@ -5528,11 +5535,11 @@ Microsoft::WRL::ComPtr<ID3D11Resource> s_visor_diverted_hdr_res;
 void resetVisorJitterAlign() {
     s_visor_device = nullptr;
     s_visor_jitter_cb.Reset();
-    s_visor_cached_vs_hash = 0;
-    s_visor_cached_ps_hash = 0;
-    s_visor_patched_vs.Reset();
-    s_visor_patched_ps.Reset();
+    s_visor_patched_cache.clear();
     s_visor_checked_neg_count = 0;
+    s_visor_checked_neg_cursor = 0;
+    s_visor_cache_misses = 0;
+    s_visor_neg_overflow = 0;
     s_visor_align_logged = false;
     s_visor_pre_hdr_tex.Reset();
     s_visor_pre_hdr_srv.Reset();
@@ -5785,6 +5792,15 @@ static void renderVisorTonemapVariants(ID3D11DeviceContext* context,
 void recordVisorNegativePair(std::uint64_t vs_hash, std::uint64_t ps_hash) {
     if (s_visor_checked_neg_count < s_visor_checked_neg.size()) {
         s_visor_checked_neg[s_visor_checked_neg_count++] = {vs_hash, ps_hash};
+    } else {
+        s_visor_checked_neg[s_visor_checked_neg_cursor] = {vs_hash, ps_hash};
+        s_visor_checked_neg_cursor = (s_visor_checked_neg_cursor + 1) % s_visor_checked_neg.size();
+        if (++s_visor_neg_overflow == 1) {
+            wchar_t msg[160];
+            swprintf_s(msg, L"EDPE: visor negative cache overflowed %zu slots (rotating ring)",
+                s_visor_checked_neg.size());
+            EdpeLog(msg);
+        }
     }
 }
 
@@ -5860,8 +5876,17 @@ bool tryVisorJitterAlignDraw(ID3D11DeviceContext* context, UINT vertex_count, UI
     context->PSGetShader(&origPs, nullptr, nullptr);
     if (!origVs || !origPs) return false;
 
-    if (vs_hash != s_visor_cached_vs_hash || ps_hash != s_visor_cached_ps_hash ||
-        !s_visor_patched_vs || !s_visor_patched_ps) {
+    ID3D11VertexShader* matchedVs = nullptr;
+    ID3D11PixelShader* matchedPs = nullptr;
+    for (const auto& entry : s_visor_patched_cache) {
+        if (entry.vs == vs_hash && entry.ps == ps_hash) {
+            matchedVs = entry.patchedVs.Get();
+            matchedPs = entry.patchedPs.Get();
+            break;
+        }
+    }
+
+    if (!matchedVs || !matchedPs) {
         UINT vsBytes = 0, psBytes = 0;
         if (FAILED(origPs->GetPrivateData(kEdpePixelBytecodeGuid, &psBytes, nullptr)) ||
             psBytes < 32 || psBytes > 1024 * 1024) {
@@ -5933,10 +5958,21 @@ bool tryVisorJitterAlignDraw(ID3D11DeviceContext* context, UINT vertex_count, UI
             recordVisorNegativePair(vs_hash, ps_hash);
             return false;
         }
-        s_visor_patched_vs = std::move(newVs);
-        s_visor_patched_ps = std::move(newPs);
-        s_visor_cached_vs_hash = vs_hash;
-        s_visor_cached_ps_hash = ps_hash;
+        ++s_visor_cache_misses;
+        if (s_visor_cache_misses <= 16) {
+            wchar_t cmsg[224];
+            swprintf_s(cmsg,
+                L"EDPE: visor shader pair cached #%zu (entries=%zu, neg=%zu, negOverflow=%zu) VS=%016llX PS=%016llX",
+                s_visor_cache_misses, s_visor_patched_cache.size() + 1,
+                s_visor_checked_neg_count, s_visor_neg_overflow, vs_hash, ps_hash);
+            EdpeLog(cmsg);
+        }
+        if (s_visor_patched_cache.size() >= kVisorPatchedCacheMax) {
+            s_visor_patched_cache.erase(s_visor_patched_cache.begin());
+        }
+        s_visor_patched_cache.push_back({vs_hash, ps_hash, std::move(newVs), std::move(newPs)});
+        matchedVs = s_visor_patched_cache.back().patchedVs.Get();
+        matchedPs = s_visor_patched_cache.back().patchedPs.Get();
     }
 
     // Separate on-foot helmet visor out of scene HDR target when Preserve Native UI (or Debug View)
@@ -6052,8 +6088,8 @@ bool tryVisorJitterAlignDraw(ID3D11DeviceContext* context, UINT vertex_count, UI
 
     ID3D11Buffer* cbPtr = s_visor_jitter_cb.Get();
     const auto origVsSetCb = resolveOriginalVSSetConstantBuffers(context);
-    context->VSSetShader(s_visor_patched_vs.Get(), nullptr, 0);
-    context->PSSetShader(s_visor_patched_ps.Get(), nullptr, 0);
+    context->VSSetShader(matchedVs, nullptr, 0);
+    context->PSSetShader(matchedPs, nullptr, 0);
     if (origVsSetCb) {
         origVsSetCb(context, 13, 1, &cbPtr);
     } else {
@@ -11178,6 +11214,26 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     }
     if (srcColorDesc.Width != depthDesc.Width || srcColorDesc.Height != depthDesc.Height) {
         return;
+    }
+
+    // Pre-warm on-foot visor HDR scratch textures once at target resolution so building airlock
+    // transitions do not allocate full-screen textures inside DrawInstanced.
+    if (preserveUi && !hdrInput && motion_color_source && !s_visor_hdr_tex &&
+        sameD3D11Device(motion_color_source.Get(), device.Get())) {
+        Microsoft::WRL::ComPtr<ID3D11Resource> mcRes;
+        motion_color_source->GetResource(&mcRes);
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> mcTex;
+        if (mcRes && SUCCEEDED(mcRes.As(&mcTex)) && mcTex) {
+            D3D11_TEXTURE2D_DESC mcDesc{};
+            mcTex->GetDesc(&mcDesc);
+            if (mcDesc.SampleDesc.Count == 1) {
+                if (device.Get() != s_visor_device) {
+                    resetVisorJitterAlign();
+                    s_visor_device = device.Get();
+                }
+                ensureVisorScratchHdr(device.Get(), mcDesc);
+            }
+        }
     }
 
     static bool s_first_exec_logged = false;

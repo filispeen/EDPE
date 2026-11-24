@@ -324,6 +324,7 @@ struct NvidiaStreamlineFgBackend::Impl {
     bool hasPendingNextToken = false;
     bool hasCachedDlssgOpts = false;
     sl::DLSSGOptions cachedDlssgOpts{};
+    uint64_t setOptionsCount = 0;
     Microsoft::WRL::ComPtr<ID3D12Device> slProxyDevice;
     Microsoft::WRL::ComPtr<IDXGIFactory4> slProxyFactory;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> slProxyQueue;
@@ -1109,6 +1110,18 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     if (!sameDlssgOpts) {
         optRc = impl_->sl.slDLSSGSetOptions(impl_->viewport, opts);
         impl_->snapshot.lastSlResult = static_cast<int32_t>(optRc);
+        if (++impl_->setOptionsCount <= 8) {
+            wchar_t optMsg[224]{};
+            std::swprintf(optMsg, 224,
+                          L"[EDPE][SL] slDLSSGSetOptions #%llu mode=%d gen=%u flags=0x%X uiRecomp=%d rc=%S",
+                          static_cast<unsigned long long>(impl_->setOptionsCount),
+                          static_cast<int>(opts.mode),
+                          opts.numFramesToGenerate,
+                          static_cast<unsigned>(opts.flags),
+                          opts.enableUserInterfaceRecomposition == sl::Boolean::eTrue ? 1 : 0,
+                          slResultToString(optRc));
+            EdpeLog(optMsg);
+        }
         if (optRc == sl::Result::eOk) {
             impl_->cachedDlssgOpts = opts;
             impl_->hasCachedDlssgOpts = true;

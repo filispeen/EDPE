@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <thread>
 
 namespace edpe {
 
@@ -99,6 +100,10 @@ public:
     // without disrupting the active swapchain.
     void ensureCapabilitiesProbed(ID3D11Device* d3d11Device);
 
+    // Launches capability detection on a background thread so Present/UI never stalls.
+    void startCapabilitiesProbeAsync(ID3D11Device* d3d11Device);
+    bool isCapabilitiesProbeInProgress() const;
+
     FgRuntimeTelemetry telemetry() const;
     bool isBackendAvailable(FrameGenerationBackend backend) const;
     void setFgDebugView(bool enabled);
@@ -137,7 +142,12 @@ private:
                               uint32_t slot);
     void releaseBridgeResources();
     void shutdownLocked();
+    void joinProbeThread();
     const wchar_t* backendUnavailableReasonLocked(FrameGenerationBackend backend) const;
+
+    std::thread probeThread_;
+    std::atomic<bool> probeStarted_{false};
+    std::atomic<bool> probeInProgress_{false};
 
     mutable std::recursive_mutex mutex_;
     FrameGenerationBackend configuredBackend_ = FrameGenerationBackend::Off;

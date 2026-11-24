@@ -126,6 +126,12 @@ FgRuntime::~FgRuntime() {
     shutdown();
 }
 
+void FgRuntime::joinProbeThread() {
+    if (probeThread_.joinable() && probeThread_.get_id() != std::this_thread::get_id()) {
+        probeThread_.join();
+    }
+}
+
 void FgRuntime::applyConfig(int backendInt,
                             int multiplier,
                             bool dynamicMfg,
@@ -532,6 +538,7 @@ void FgRuntime::shutdownLocked() {
 }
 
 void FgRuntime::shutdown() {
+    joinProbeThread();
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     shutdownLocked();
 }
@@ -551,13 +558,9 @@ void FgRuntime::onSwapChainRelease(IUnknown* object) {
     }
 }
 
-void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
-    {
-        std::lock_guard<std::recursive_mutex> lock(mutex_);
-        if (capabilitiesProbed_ || !d3d11Device) return;
-        // Mark probed immediately under lock so concurrent/re-entrant calls cannot double-probe.
-        capabilitiesProbed_ = true;
-    }
+void FgRuntime::startCapabilitiesProbeAsync(ID3D11Device* d3d11Device) {
+    if (!d3d11Device) return;
+    if (probeStarted_.exchange(true, std::memory_order_acq_rel)) return;
 
     if (D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc()) {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -565,6 +568,7 @@ void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
         dlssgCapAvailable_ = false;
         std::wcsncpy(amdUnavailableReason_, L"Blocked while Windows renderdoc.dll is active.", 255);
         std::wcsncpy(dlssgUnavailableReason_, L"Blocked while Windows renderdoc.dll is active.", 255);
+        capabilitiesProbed_ = true;
         return;
     }
 
@@ -588,36 +592,69 @@ void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
         adapter->GetDesc(&desc);
     }
 
-    bool localDlssgAvail = false;
-    wchar_t localDlssgReason[256]{};
     if (desc.VendorId != 0x10DE) {
-        std::wcsncpy(localDlssgReason,
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        amdDllAvailable_ = localAmdAvail;
+        if (!amdDllAvailable_ && localAmdReason[0]) {
+            std::wcsncpy(amdUnavailableReason_, localAmdReason, 255);
+        }
+        dlssgCapAvailable_ = false;
+        std::wcsncpy(dlssgUnavailableReason_,
                      L"Requires an NVIDIA GeForce RTX 40+ / 50+ GPU.", 255);
-    } else {
-#if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
+        capabilitiesProbed_ = true;
+        return;
+    }
+
+#if !(defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE)
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        amdDllAvailable_ = localAmdAvail;
+        if (!amdDllAvailable_ && localAmdReason[0]) {
+            std::wcsncpy(amdUnavailableReason_, localAmdReason, 255);
+        }
+        dlssgCapAvailable_ = false;
+        std::wcsncpy(dlssgUnavailableReason_,
+                     L"Built without NVIDIA Streamline SDK headers.", 255);
+        capabilitiesProbed_ = true;
+    }
+#else
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        amdDllAvailable_ = localAmdAvail;
+        if (!amdDllAvailable_ && localAmdReason[0]) {
+            std::wcsncpy(amdUnavailableReason_, localAmdReason, 255);
+        }
+        std::wcsncpy(dlssgUnavailableReason_,
+                     L"Probing NVIDIA DLSS-G capabilities...", 255);
+    }
+
+    const LUID adapterLuid = desc.AdapterLuid;
+    probeInProgress_.store(true, std::memory_order_release);
+    probeThread_ = std::thread([this, adapterLuid]() {
         // Perform LUID-only Streamline capability probe WITHOUT holding mutex_ and without
         // creating a temporary D3D12 device or calling slSetD3DDevice (Streamline DLSS-G §3.0).
         StreamlineStatusSnapshot snap{};
-        localDlssgAvail = NvidiaStreamlineFgBackend::probeCapabilitiesForLuid(
-            desc.AdapterLuid, &snap);
-        if (!localDlssgAvail && snap.unavailableReason[0] != L'\0') {
-            std::wcsncpy(localDlssgReason, snap.unavailableReason, 255);
-        }
-#else
-        std::wcsncpy(localDlssgReason,
-                     L"Built without NVIDIA Streamline SDK headers.", 255);
-#endif
-    }
+        const bool localDlssgAvail =
+            NvidiaStreamlineFgBackend::probeCapabilitiesForLuid(adapterLuid, &snap);
 
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    amdDllAvailable_ = localAmdAvail;
-    if (!amdDllAvailable_ && localAmdReason[0]) {
-        std::wcsncpy(amdUnavailableReason_, localAmdReason, 255);
-    }
-    dlssgCapAvailable_ = localDlssgAvail;
-    if (!dlssgCapAvailable_ && localDlssgReason[0]) {
-        std::wcsncpy(dlssgUnavailableReason_, localDlssgReason, 255);
-    }
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        dlssgCapAvailable_ = localDlssgAvail;
+        if (!dlssgCapAvailable_ && snap.unavailableReason[0] != L'\0') {
+            std::wcsncpy(dlssgUnavailableReason_, snap.unavailableReason, 255);
+        }
+        capabilitiesProbed_ = true;
+        probeInProgress_.store(false, std::memory_order_release);
+    });
+#endif
+}
+
+bool FgRuntime::isCapabilitiesProbeInProgress() const {
+    return probeInProgress_.load(std::memory_order_acquire);
+}
+
+void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
+    startCapabilitiesProbeAsync(d3d11Device);
+    joinProbeThread();
 }
 
 void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
@@ -647,6 +684,12 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     }
 
     if (configuredBackend_ == failedBackend_) {
+        return;
+    }
+
+    if (configuredBackend_ == FrameGenerationBackend::NvidiaDlssG &&
+        probeInProgress_.load(std::memory_order_acquire)) {
+        std::wcsncpy(telemetry_.statusMessage, L"Probing NVIDIA DLSS-G capabilities...", 255);
         return;
     }
 
@@ -835,6 +878,12 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
                                   sharedUiUav_[slot].Get())) {
                 in.packedUiColorAndAlpha = sharedUi_[slot].d3d12.Get();
             }
+        } else if (manager_.selectedBackend() == FrameGenerationBackend::NvidiaDlssG &&
+                   in.hudlessColor != nullptr &&
+                   sharedUi_[slot].isValid() && sharedUiUav_[slot]) {
+            static constexpr FLOAT kZeroUi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            ctx11->ClearUnorderedAccessViewFloat(sharedUiUav_[slot].Get(), kZeroUi);
+            in.packedUiColorAndAlpha = sharedUi_[slot].d3d12.Get();
         }
         in.finalBackbuffer = presenter_.currentBackBuffer();
         in.jitterX = snap.jitterX;
