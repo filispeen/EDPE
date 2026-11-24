@@ -11683,7 +11683,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         {
             edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: UpscaleEval");
             s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UpscaleEval);
-            upscalerEvalOk = upscaler.evaluate(context, evalInputs, nullptr, evalDestination);
+            upscalerEvalOk = upscaler.evaluate(context, evalInputs, nullptr, evalDestination, true);
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::UpscaleEval);
         }
         rearmContextHooks();

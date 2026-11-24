@@ -111,6 +111,7 @@ public:
 
 private:
     bool initialized_ = false;
+    ID3D11Device* device_ = nullptr;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> outputTexture_;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> outputUav_;
     ID3D11Device* outputDevice_ = nullptr;
@@ -186,6 +187,19 @@ public:
 
 private:
     TaaPass pass_;
+    ID3D11Device* device_ = nullptr;
+    ID3D11Texture2D* cachedColorTex_ = nullptr;
+    uint32_t cachedColorW_ = 0;
+    uint32_t cachedColorH_ = 0;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cachedColorSrv_;
+    ID3D11Texture2D* cachedMotionTex_ = nullptr;
+    uint32_t cachedMotionW_ = 0;
+    uint32_t cachedMotionH_ = 0;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cachedMotionSrv_;
+    ID3D11Texture2D* cachedDepthTex_ = nullptr;
+    uint32_t cachedDepthW_ = 0;
+    uint32_t cachedDepthH_ = 0;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cachedDepthSrv_;
 };
 
 // Central coordinator for temporal upscaling in EDPE.
@@ -216,7 +230,8 @@ public:
     bool evaluate(ID3D11DeviceContext* context,
         const TemporalFrameInputs& inputs,
         ID3D11RenderTargetView* destinationRtv,
-        ID3D11Texture2D* destinationTexture);
+        ID3D11Texture2D* destinationTexture,
+        bool callerRestoresState = false);
 
     bool evaluateBackend(UpscalerBackend backendType,
         ID3D11DeviceContext* context,

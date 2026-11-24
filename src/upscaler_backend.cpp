@@ -56,7 +56,11 @@ bool NvidiaUpscalerBackend::isModeSupported(UpscaleMode mode) const {
 }
 
 bool NvidiaUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
+    device_ = device;
     initialized_ = NgxContext::initialize(device, context);
+    if (!initialized_) {
+        device_ = nullptr;
+    }
     return initialized_;
 }
 
@@ -105,6 +109,7 @@ void NvidiaUpscalerBackend::shutdown() {
     outputTexture_.Reset();
     outputUav_.Reset();
     outputDevice_ = nullptr;
+    device_ = nullptr;
     outputWidth_ = 0;
     outputHeight_ = 0;
     outputFormat_ = DXGI_FORMAT_UNKNOWN;
@@ -193,9 +198,13 @@ bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         outDesc, inputs.outputWidth, inputs.outputHeight, destinationTexture, inputs.color, uavFormat);
 
     if (!directDest) {
-        Microsoft::WRL::ComPtr<ID3D11Device> device;
-        context->GetDevice(&device);
-        if (!ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
+        ID3D11Device* dev = device_;
+        Microsoft::WRL::ComPtr<ID3D11Device> localDevice;
+        if (!dev) {
+            context->GetDevice(&localDevice);
+            dev = localDevice.Get();
+        }
+        if (!ensureOutputTexture(dev, inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
             return false;
         }
     }
@@ -237,6 +246,7 @@ struct AmdUpscalerBackend::Impl {
     bool initialized = false;
     bool contextCreated = false;
     bool resetRequested = false;
+    ID3D11Device* device = nullptr;
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> outputTexture;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> outputUav;
@@ -576,6 +586,7 @@ bool AmdUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* /
         return false;
     }
     impl_->initialized = true;
+    impl_->device = device;
     impl_->lastErrorReason[0] = L'\0';
     EdpeLog(L"EDPE: AMD FSR 3.1 D3D11 backend initialized successfully");
     return true;
@@ -592,6 +603,7 @@ void AmdUpscalerBackend::shutdown() {
 #if defined(EDPE_ENABLE_FSR)
     impl_->scratchBuffer.clear();
 #endif
+    impl_->device = nullptr;
     impl_->initialized = false;
     impl_->lastErrorReason[0] = L'\0';
 }
@@ -612,8 +624,12 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         return false;
     }
 
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
+    ID3D11Device* device = impl_->device;
+    Microsoft::WRL::ComPtr<ID3D11Device> localDevice;
+    if (!device) {
+        context->GetDevice(&localDevice);
+        device = localDevice.Get();
+    }
     if (!device) return false;
 
     D3D11_TEXTURE2D_DESC outDesc{};
@@ -628,11 +644,11 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         outDesc, inputs.outputWidth, inputs.outputHeight, destinationTexture, inputs.color, uavFormat);
 
     if (!directDest &&
-        !impl_->ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
+        !impl_->ensureOutputTexture(device, inputs.outputWidth, inputs.outputHeight, uavFormat)) {
         return false;
     }
 
-    if (!impl_->ensureFsrContext(device.Get(), inputs.renderWidth, inputs.renderHeight,
+    if (!impl_->ensureFsrContext(device, inputs.renderWidth, inputs.renderHeight,
                                  inputs.outputWidth, inputs.outputHeight, inputs.colorIsHdr)) {
         return false;
     }
@@ -745,10 +761,21 @@ const wchar_t* TaaUpscalerBackend::unavailableReason() const {
 }
 
 bool TaaUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
+    device_ = device;
     return pass_.initialize(device, context);
 }
 
 void TaaUpscalerBackend::shutdown() {
+    cachedColorSrv_.Reset();
+    cachedColorTex_ = nullptr;
+    cachedColorW_ = cachedColorH_ = 0;
+    cachedMotionSrv_.Reset();
+    cachedMotionTex_ = nullptr;
+    cachedMotionW_ = cachedMotionH_ = 0;
+    cachedDepthSrv_.Reset();
+    cachedDepthTex_ = nullptr;
+    cachedDepthW_ = cachedDepthH_ = 0;
+    device_ = nullptr;
     pass_.shutdown();
 }
 
@@ -760,38 +787,65 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         return false;
     }
 
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
+    ID3D11Device* device = device_;
+    Microsoft::WRL::ComPtr<ID3D11Device> localDevice;
+    if (!device) {
+        context->GetDevice(&localDevice);
+        device = localDevice.Get();
+    }
     if (!device) return false;
 
     // Resolve color SRV
     ID3D11ShaderResourceView* colorSrv = inputs.colorSrv;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> localColorSrv;
     if (!colorSrv && inputs.color) {
-        if (FAILED(device->CreateShaderResourceView(inputs.color, nullptr, &localColorSrv))) {
-            return false;
+        if (cachedColorTex_ != inputs.color || cachedColorW_ != inputs.renderWidth ||
+            cachedColorH_ != inputs.renderHeight || !cachedColorSrv_) {
+            cachedColorSrv_.Reset();
+            cachedColorTex_ = nullptr;
+            if (FAILED(device->CreateShaderResourceView(inputs.color, nullptr, &cachedColorSrv_))) {
+                return false;
+            }
+            cachedColorTex_ = inputs.color;
+            cachedColorW_ = inputs.renderWidth;
+            cachedColorH_ = inputs.renderHeight;
         }
-        colorSrv = localColorSrv.Get();
+        colorSrv = cachedColorSrv_.Get();
     }
 
     // Resolve motion SRV
     ID3D11ShaderResourceView* motionSrv = inputs.motionSrv;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> localMotionSrv;
     if (!motionSrv && inputs.motionVectors) {
-        device->CreateShaderResourceView(inputs.motionVectors, nullptr, &localMotionSrv);
-        motionSrv = localMotionSrv.Get();
+        if (cachedMotionTex_ != inputs.motionVectors || cachedMotionW_ != inputs.renderWidth ||
+            cachedMotionH_ != inputs.renderHeight || !cachedMotionSrv_) {
+            cachedMotionSrv_.Reset();
+            cachedMotionTex_ = nullptr;
+            if (SUCCEEDED(device->CreateShaderResourceView(inputs.motionVectors, nullptr, &cachedMotionSrv_))) {
+                cachedMotionTex_ = inputs.motionVectors;
+                cachedMotionW_ = inputs.renderWidth;
+                cachedMotionH_ = inputs.renderHeight;
+            }
+        }
+        motionSrv = cachedMotionSrv_.Get();
     }
 
     // Resolve depth SRV
     ID3D11ShaderResourceView* depthSrv = inputs.depthSrv;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> localDepthSrv;
     if (!depthSrv && inputs.depth) {
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-        srvDesc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-        device->CreateShaderResourceView(inputs.depth, &srvDesc, &localDepthSrv);
-        depthSrv = localDepthSrv.Get();
+        if (cachedDepthTex_ != inputs.depth || cachedDepthW_ != inputs.renderWidth ||
+            cachedDepthH_ != inputs.renderHeight || !cachedDepthSrv_) {
+            cachedDepthSrv_.Reset();
+            cachedDepthTex_ = nullptr;
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+            if (SUCCEEDED(device->CreateShaderResourceView(inputs.depth, &srvDesc, &cachedDepthSrv_))) {
+                cachedDepthTex_ = inputs.depth;
+                cachedDepthW_ = inputs.renderWidth;
+                cachedDepthH_ = inputs.renderHeight;
+            }
+        }
+        depthSrv = cachedDepthSrv_.Get();
     }
 
     return pass_.render(context,
@@ -988,7 +1042,8 @@ bool UpscalerManager::setMode(UpscaleMode mode) {
 bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     const TemporalFrameInputs& inputs,
     ID3D11RenderTargetView* destinationRtv,
-    ID3D11Texture2D* destinationTexture) {
+    ID3D11Texture2D* destinationTexture,
+    bool callerRestoresState) {
     if (context) {
         Microsoft::WRL::ComPtr<ID3D11Device> evalDevice;
         context->GetDevice(&evalDevice);
@@ -1080,7 +1135,7 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
         if (evalSuccess && currentBackendType_ != UpscalerBackend::AmdFsr && inputs.sharpness > 0.0f) {
             ID3D11Texture2D* sharpenTarget = destinationTexture ? destinationTexture : inputs.color;
-            if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr)) {
+            if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr, callerRestoresState)) {
                 static bool s_sharpenFailLogged = false;
                 if (!s_sharpenFailLogged) {
                     s_sharpenFailLogged = true;
