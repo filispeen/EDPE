@@ -322,7 +322,7 @@ struct GpuHarness {
 
     bool uploadAndEvaluate(edpe::IUpscalerBackend& backend, const FrameBuffers& fb,
                            float jitterX, float jitterY, float prevJitterX, float prevJitterY,
-                           bool reset, std::vector<uint32_t>& outPixels) {
+                           bool reset, std::vector<uint32_t>& outPixels, float sharpness = 0.0f) {
         if (reset) {
             backend.resetHistory();
             hasPrevDepth = false;
@@ -336,7 +336,7 @@ struct GpuHarness {
         }
         context->UpdateSubresource(motionTex.Get(), 0, nullptr, fb.motion.data(), rw * sizeof(uint32_t), 0);
 
-        const auto inputs = makeInputs(jitterX, jitterY, prevJitterX, prevJitterY, reset, 0.0f);
+        const auto inputs = makeInputs(jitterX, jitterY, prevJitterX, prevJitterY, reset, sharpness);
         if (!backend.evaluate(context.Get(), inputs, outputRtv.Get(), outputTex.Get())) {
             return false;
         }
@@ -374,7 +374,9 @@ struct StepEdgeMetrics {
 StepEdgeMetrics measureStepEdgeXY(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                   uint32_t renderW, uint32_t renderH,
                                   uint32_t outputW, uint32_t outputH,
-                                  float signX, float signY) {
+                                  float signX, float signY,
+                                  unsigned overridePhaseCount = 0,
+                                  float sharpness = 0.0f) {
     constexpr int kFrames = 48;
     constexpr int kWarmup = 16;
 
@@ -416,7 +418,8 @@ StepEdgeMetrics measureStepEdgeXY(GpuHarness& gpu, edpe::IUpscalerBackend& backe
     FrameBuffers fb;
     std::vector<uint32_t> outPixels;
     edpe::ProjectionJitter prevJ{};
-    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+    const unsigned phaseCount = overridePhaseCount ? overridePhaseCount
+                                                 : backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
 
     for (int t = 0; t < kFrames; ++t) {
         const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
@@ -448,7 +451,7 @@ StepEdgeMetrics measureStepEdgeXY(GpuHarness& gpu, edpe::IUpscalerBackend& backe
         const float passPrevJx = (t > 0) ? (prevJ.pixelX * signX) : 0.0f;
         const float passPrevJy = (t > 0) ? (prevJ.pixelY * signY) : 0.0f;
 
-        if (!gpu.uploadAndEvaluate(backend, fb, passJx, passJy, passPrevJx, passPrevJy, t == 0, outPixels)) {
+        if (!gpu.uploadAndEvaluate(backend, fb, passJx, passJy, passPrevJx, passPrevJy, t == 0, outPixels, sharpness)) {
             return {999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f};
         }
         prevJ = j;
@@ -560,7 +563,9 @@ struct ThinLineMetrics {
 ThinLineMetrics measureStaticThinLines(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                        uint32_t renderW, uint32_t renderH,
                                        uint32_t outputW, uint32_t outputH,
-                                       float signX = 1.0f, float signY = 1.0f) {
+                                       float signX = 1.0f, float signY = 1.0f,
+                                       unsigned overridePhaseCount = 0,
+                                       float sharpness = 0.0f) {
     constexpr int kFrames = 48;
     constexpr int kWarmup = 16;
 
@@ -581,7 +586,8 @@ ThinLineMetrics measureStaticThinLines(GpuHarness& gpu, edpe::IUpscalerBackend& 
     FrameBuffers fb;
     std::vector<uint32_t> outPixels;
     edpe::ProjectionJitter prevJ{};
-    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+    const unsigned phaseCount = overridePhaseCount ? overridePhaseCount
+                                                 : backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
 
     for (int t = 0; t < kFrames; ++t) {
         const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
@@ -612,7 +618,7 @@ ThinLineMetrics measureStaticThinLines(GpuHarness& gpu, edpe::IUpscalerBackend& 
         if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX * signX, j.pixelY * signY,
                                    t > 0 ? prevJ.pixelX * signX : 0.0f,
                                    t > 0 ? prevJ.pixelY * signY : 0.0f,
-                                   t == 0, outPixels)) {
+                                   t == 0, outPixels, sharpness)) {
             return {999.0f, 999.0f, 0.0f, 999.0f, 999.0f};
         }
         prevJ = j;
@@ -697,7 +703,9 @@ struct PanningThinLineMetrics {
 PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                                   uint32_t renderW, uint32_t renderH,
                                                   uint32_t outputW, uint32_t outputH,
-                                                  float signX = 1.0f, float signY = 1.0f) {
+                                                  float signX = 1.0f, float signY = 1.0f,
+                                                  unsigned overridePhaseCount = 0,
+                                                  float sharpness = 0.0f) {
     constexpr int kFrames = 64;
     constexpr int kWarmup = 32;
 
@@ -713,7 +721,8 @@ PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscal
     FrameBuffers fb;
     std::vector<uint32_t> outPixels;
     edpe::ProjectionJitter prevJ{};
-    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+    const unsigned phaseCount = overridePhaseCount ? overridePhaseCount
+                                                 : backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
 
     for (int t = 0; t < kFrames; ++t) {
         const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
@@ -738,7 +747,7 @@ PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscal
         if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
                                    t > 0 ? prevJ.pixelX : 0.0f,
                                    t > 0 ? prevJ.pixelY : 0.0f,
-                                   t == 0, outPixels)) {
+                                   t == 0, outPixels, sharpness)) {
             return {999.0f, 999.0f, 0.0f};
         }
         prevJ = j;
@@ -783,7 +792,9 @@ PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscal
 float measureUnvectoredBlobGhostResidual(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                          uint32_t renderW, uint32_t renderH,
                                          uint32_t outputW, uint32_t outputH,
-                                         float signX = 1.0f, float signY = 1.0f) {
+                                         float signX = 1.0f, float signY = 1.0f,
+                                         unsigned overridePhaseCount = 0,
+                                         float sharpness = 0.0f) {
     constexpr int kTotalFrames = 36;
     constexpr int kDisappearFrame = 20;
     constexpr int kMeasureFrame = 30;
@@ -795,7 +806,8 @@ float measureUnvectoredBlobGhostResidual(GpuHarness& gpu, edpe::IUpscalerBackend
     std::vector<uint32_t> outPixels;
     edpe::ProjectionJitter prevJ{};
     float residualAtFrame30 = 999.0f;
-    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+    const unsigned phaseCount = overridePhaseCount ? overridePhaseCount
+                                                 : backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
 
     for (int t = 0; t < kTotalFrames; ++t) {
         const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
@@ -817,7 +829,7 @@ float measureUnvectoredBlobGhostResidual(GpuHarness& gpu, edpe::IUpscalerBackend
         if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX * signX, j.pixelY * signY,
                                    t > 0 ? prevJ.pixelX * signX : 0.0f,
                                    t > 0 ? prevJ.pixelY * signY : 0.0f,
-                                   t == 0, outPixels)) {
+                                   t == 0, outPixels, sharpness)) {
             return 999.0f;
         }
         prevJ = j;
@@ -1714,6 +1726,182 @@ int runDlssDiag(GpuHarness& gpu) {
 #endif
 }
 
+struct VerticalLineWidthMetrics {
+    float peakSpan = 0.0f;
+    float rmsDelta = 0.0f;
+    float maxPixDelta = 0.0f;
+    float meanPeak = 0.0f;
+};
+
+VerticalLineWidthMetrics measureVerticalThinLineWidth(
+    GpuHarness& gpu, edpe::IUpscalerBackend& backend,
+    uint32_t renderW, uint32_t renderH,
+    uint32_t outputW, uint32_t outputH,
+    float lineWidthPx, bool depthDiscontinuity,
+    unsigned phaseCount, float sharpness) {
+    constexpr int kFrames = 64;
+    constexpr int kWarmup = 32;
+    constexpr float kCenterX = 64.25f;
+    const float halfW = lineWidthPx * 0.5f;
+    const float lineDepth = depthDiscontinuity ? (kDepthB / 20.0f) : (kDepthB / 40.0f);
+    const float bgDepth = kDepthB / 40.0f;
+    const float scaleX = static_cast<float>(outputW) / static_cast<float>(renderW);
+    const float scaleY = static_cast<float>(outputH) / static_cast<float>(renderH);
+
+    std::vector<float> peakSeries;
+    std::vector<std::vector<float>> windowFrames;
+    FrameBuffers fb;
+    std::vector<uint32_t> outPixels;
+    edpe::ProjectionJitter prevJ{};
+
+    for (int t = 0; t < kFrames; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
+        fb.resize(renderW, renderH);
+        std::fill(fb.depth.begin(), fb.depth.end(), bgDepth);
+
+        for (uint32_t iy = 16; iy < renderH - 16; ++iy) {
+            for (uint32_t ix = 0; ix < renderW; ++ix) {
+                const float sx = static_cast<float>(ix) + 0.5f;
+                const float ux = sx - j.pixelX;
+                if (std::fabs(ux - kCenterX) <= halfW) {
+                    const size_t idx = static_cast<size_t>(iy) * renderW + ix;
+                    fb.color[idx] = packRgba8(0.85f, 0.85f, 0.85f);
+                    fb.depth[idx] = lineDepth;
+                }
+            }
+        }
+
+        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
+                                   t > 0 ? prevJ.pixelX : 0.0f,
+                                   t > 0 ? prevJ.pixelY : 0.0f,
+                                   t == 0, outPixels, sharpness)) {
+            return {999.0f, 999.0f, 999.0f, 0.0f};
+        }
+        prevJ = j;
+
+        if (t >= kWarmup) {
+            const uint32_t y0 = static_cast<uint32_t>(std::round(32 * scaleY));
+            const uint32_t y1 = static_cast<uint32_t>(std::round((renderH - 32) * scaleY));
+            const uint32_t x0 = static_cast<uint32_t>(std::round((kCenterX - 3.0f) * scaleX));
+            const uint32_t x1 = static_cast<uint32_t>(std::round((kCenterX + 3.0f) * scaleX));
+            float peakSum = 0.0f;
+            std::vector<float> win;
+            for (uint32_t y = y0; y < y1; ++y) {
+                float rmax = 0.0f;
+                for (uint32_t x = x0; x <= x1; ++x) {
+                    const float l = pixelLuma(outPixels[static_cast<size_t>(y) * outputW + x]);
+                    rmax = std::max(rmax, l);
+                    win.push_back(l);
+                }
+                peakSum += rmax;
+            }
+            peakSeries.push_back(peakSum / static_cast<float>(y1 - y0));
+            windowFrames.push_back(std::move(win));
+        }
+    }
+
+    VerticalLineWidthMetrics m{};
+    auto [mn, mx] = std::minmax_element(peakSeries.begin(), peakSeries.end());
+    m.peakSpan = *mx - *mn;
+    double peakMean = 0.0;
+    for (float v : peakSeries) peakMean += v;
+    m.meanPeak = static_cast<float>(peakMean / peakSeries.size());
+
+    double sqSum = 0.0;
+    size_t cnt = 0;
+    float maxD = 0.0f;
+    for (size_t i = 1; i < windowFrames.size(); ++i) {
+        for (size_t k = 0; k < windowFrames[i].size(); ++k) {
+            const float d = std::fabs(windowFrames[i][k] - windowFrames[i - 1][k]);
+            sqSum += static_cast<double>(d) * d;
+            maxD = std::max(maxD, d);
+            ++cnt;
+        }
+    }
+    m.rmsDelta = cnt > 0 ? static_cast<float>(std::sqrt(sqSum / cnt)) : 0.0f;
+    m.maxPixDelta = maxD;
+    return m;
+}
+
+int runFsrDiag(GpuHarness& gpu) {
+    if (!gpu.allocateSurfaces(128, 128, 128, 128)) {
+        std::printf("Failed to allocate surfaces\n");
+        return 1;
+    }
+    const float widths[] = { 0.45f, 0.85f, 1.25f, 1.75f };
+
+#if defined(EDPE_ENABLE_FSR)
+    {
+        edpe::AmdUpscalerBackend fsrBackend;
+        if (!fsrBackend.initialize(gpu.device.Get(), gpu.context.Get())) {
+            std::printf("FSR init failed\n");
+            return 2;
+        }
+        const unsigned phaseList[] = { 8u, 15u, 16u, 32u };
+        const float sharpList[] = { 0.0f, 0.50f };
+        for (float sharp : sharpList) {
+            std::printf("\n=== AMD FSR NativeAA 128x128 (vf=0.00, sharpness=%.2f) ===\n", sharp);
+            for (unsigned phases : phaseList) {
+                const StepEdgeMetrics edge = measureStepEdgeXY(gpu, fsrBackend, 128, 128, 128, 128, +1.0f, +1.0f, phases, sharp);
+                const PanningThinLineMetrics pan = measureSlowPanningThinLine(gpu, fsrBackend, 128, 128, 128, 128, +1.0f, +1.0f, phases, sharp);
+                const float ghost = measureUnvectoredBlobGhostResidual(gpu, fsrBackend, 128, 128, 128, 128, +1.0f, +1.0f, phases, sharp);
+                std::printf("  [phases=%2u] StepEdge span=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f) | SlowPan span=%.4f rms=%.4f | Ghost=%.4f\n",
+                            phases, edge.spanX, edge.spanY, edge.errX, edge.errY, edge.rmsX, edge.rmsY,
+                            pan.peakSpan, pan.rmsStepDelta, ghost);
+                for (float w : widths) {
+                    const auto flat = measureVerticalThinLineWidth(gpu, fsrBackend, 128, 128, 128, 128, w, false, phases, sharp);
+                    const auto disc = measureVerticalThinLineWidth(gpu, fsrBackend, 128, 128, 128, 128, w, true, phases, sharp);
+                    std::printf("    w=%.2fpx flat:(span=%.4f rms=%.4f maxD=%.4f pk=%.3f) depthEdge:(span=%.4f rms=%.4f maxD=%.4f pk=%.3f)\n",
+                                w, flat.peakSpan, flat.rmsDelta, flat.maxPixDelta, flat.meanPeak,
+                                disc.peakSpan, disc.rmsDelta, disc.maxPixDelta, disc.meanPeak);
+                }
+            }
+        }
+        fsrBackend.shutdown();
+    }
+#endif
+
+    {
+        edpe::TaaUpscalerBackend taaBackend;
+        if (!taaBackend.initialize(gpu.device.Get(), gpu.context.Get())) {
+            std::printf("TAA init failed\n");
+            return 3;
+        }
+        std::printf("\n=== Native D3D11 TAA 128x128 (phases=32, sharpness=0.00) ===\n");
+        const StepEdgeMetrics edge = measureStepEdgeXY(gpu, taaBackend, 128, 128, 128, 128, +1.0f, +1.0f, 32u, 0.0f);
+        const PanningThinLineMetrics pan = measureSlowPanningThinLine(gpu, taaBackend, 128, 128, 128, 128, +1.0f, +1.0f, 32u, 0.0f);
+        const float ghost = measureUnvectoredBlobGhostResidual(gpu, taaBackend, 128, 128, 128, 128, +1.0f, +1.0f, 32u, 0.0f);
+        std::printf("  [phases=32] StepEdge span=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f) | SlowPan span=%.4f rms=%.4f | Ghost=%.4f\n",
+                    edge.spanX, edge.spanY, edge.errX, edge.errY, edge.rmsX, edge.rmsY,
+                    pan.peakSpan, pan.rmsStepDelta, ghost);
+        for (float w : widths) {
+            const auto flat = measureVerticalThinLineWidth(gpu, taaBackend, 128, 128, 128, 128, w, false, 32u, 0.0f);
+            const auto disc = measureVerticalThinLineWidth(gpu, taaBackend, 128, 128, 128, 128, w, true, 32u, 0.0f);
+            std::printf("    w=%.2fpx flat:(span=%.4f rms=%.4f maxD=%.4f pk=%.3f) depthEdge:(span=%.4f rms=%.4f maxD=%.4f pk=%.3f)\n",
+                        w, flat.peakSpan, flat.rmsDelta, flat.maxPixDelta, flat.meanPeak,
+                        disc.peakSpan, disc.rmsDelta, disc.maxPixDelta, disc.meanPeak);
+        }
+        taaBackend.shutdown();
+    }
+    return 0;
+}
+
+bool verifyVerticalThinLines(const char* label, GpuHarness& gpu, edpe::IUpscalerBackend& backend, unsigned phases) {
+    bool ok = true;
+    const float testWidths[] = { 0.85f, 1.75f };
+    for (float w : testWidths) {
+        const auto m = measureVerticalThinLineWidth(gpu, backend, 128, 128, 128, 128, w, true, phases, 0.0f);
+        std::printf("  [%s] VertThinLine(w=%.2fpx, depthEdge): span=%.4f rms=%.4f maxD=%.4f pk=%.3f\n",
+                    label, w, m.peakSpan, m.rmsDelta, m.maxPixDelta, m.meanPeak);
+        if (!(m.rmsDelta < 0.008f && m.maxPixDelta < 0.040f)) {
+            std::printf("  -> FAIL: %s w=%.2fpx vertical line flickered (rms=%.4f, maxD=%.4f)\n",
+                        label, w, m.rmsDelta, m.maxPixDelta);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1726,6 +1914,9 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dlss-diag") == 0) {
             return runDlssDiag(gpu);
+        }
+        if (std::strcmp(argv[i], "--fsr-diag") == 0) {
+            return runFsrDiag(gpu);
         }
     }
 
@@ -1768,6 +1959,9 @@ int main(int argc, char** argv) {
             return 2;
         }
         allOk &= runSuiteForBackend("AMD_FSR_NativeAA", gpu, fsrBackend, 128, 128, 128, 128);
+        allOk &= verifyVerticalThinLines(
+            "AMD_FSR_NativeAA", gpu, fsrBackend,
+            fsrBackend.recommendedJitterPhaseCount(32u, 128, 128, 128, 128));
         allOk &= runSuiteForBackend("AMD_FSR_QualitySR", gpu, fsrBackend, 128, 128, 192, 192);
 
         const PanningThinLineMetrics panVf100 = measureRealisticSlowPan(gpu, fsrBackend, 1.00f);
@@ -1818,6 +2012,17 @@ int main(int argc, char** argv) {
             return 3;
         }
         allOk &= runSuiteForBackend("Native_D3D11_TAA", gpu, taaBackend, 128, 128, 128, 128);
+        {
+            const StepEdgeMetrics taaEdge = measureStepEdge(gpu, taaBackend, 128, 128, 128, 128, +1.0f);
+            if (!(taaEdge.rmsX < 0.007f && taaEdge.rmsY < 0.007f)) {
+                std::printf("  -> FAIL: Native_D3D11_TAA StepEdge(+jit) rms (%.4f, %.4f) >= 0.007\n",
+                            taaEdge.rmsX, taaEdge.rmsY);
+                allOk = false;
+            }
+            allOk &= verifyVerticalThinLines(
+                "Native_D3D11_TAA", gpu, taaBackend,
+                taaBackend.recommendedJitterPhaseCount(32u, 128, 128, 128, 128));
+        }
         taaBackend.shutdown();
     }
 

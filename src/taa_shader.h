@@ -12,6 +12,7 @@ cbuffer TaaConstants : register(b0) {
     float4 renderResolution; // x: renderWidth, y: renderHeight, z: 1/renderWidth, w: 1/renderHeight
     float4 params;           // x: jitterX, y: jitterY, z: blendWeight, w: resetFlag
     float4 jitterHistory;    // x: prevJitterX, y: prevJitterY, z: depthB, w: hasPrevDepth
+    float4 temporalMeta;     // x: maxBlendCap, yzw: reserved
 };
 
 Texture2D<float4> currentFrame  : register(t0);
@@ -231,14 +232,29 @@ float4 ps_main(VSOutput pin) : SV_Target {
     // 6. Brian Karis Ray-to-AABB Clipping + stationary & slow-pan thin-feature ridge retention
     float3 clampedHistY = ClipToAABB(histY, currentY, finalMin, finalMax);
     float2 histTexel = resolution.zw;
-    float hL = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(-histTexel.x, 0.0), 0).rgb).x;
-    float hR = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2( histTexel.x, 0.0), 0).rgb).x;
-    float hU = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0, -histTexel.y), 0).rgb).x;
-    float hD = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0,  histTexel.y), 0).rgb).x;
-    // Detect isolated 1-pixel ridges/lines (zero on monotonic step edges and flat/bordered blobs).
+    float hL  = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(-histTexel.x, 0.0), 0).rgb).x;
+    float hR  = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2( histTexel.x, 0.0), 0).rgb).x;
+    float hU  = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0, -histTexel.y), 0).rgb).x;
+    float hD  = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0,  histTexel.y), 0).rgb).x;
+    float hL2 = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(-2.0 * histTexel.x, 0.0), 0).rgb).x;
+    float hR2 = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2( 2.0 * histTexel.x, 0.0), 0).rgb).x;
+    float hU2 = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0, -2.0 * histTexel.y), 0).rgb).x;
+    float hD2 = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0,  2.0 * histTexel.y), 0).rgb).x;
+    // Detect isolated 1-pixel and 2-pixel ridges/lines (zero on monotonic step edges and flat/bordered blobs).
     float ridgeX = max(0.0, abs(histY.x - 0.5 * (hL + hR)) - 0.5 * abs(hL - hR));
     float ridgeY = max(0.0, abs(histY.x - 0.5 * (hU + hD)) - 0.5 * abs(hU - hD));
-    float histThinness = saturate((max(ridgeX, ridgeY) - 0.012) * 24.0);
+    float ridgeX2L = max(0.0, abs(histY.x - 0.5 * (hL2 + hR)) - 0.5 * abs(hL2 - hR));
+    float ridgeX2R = max(0.0, abs(histY.x - 0.5 * (hL + hR2)) - 0.5 * abs(hL - hR2));
+    float ridgeY2U = max(0.0, abs(histY.x - 0.5 * (hU2 + hD)) - 0.5 * abs(hU2 - hD));
+    float ridgeY2D = max(0.0, abs(histY.x - 0.5 * (hU + hD2)) - 0.5 * abs(hU - hD2));
+    float ridge2X = max(
+        min(ridgeX2L, max(0.0, abs(hL - 0.5 * (hL2 + hR)) - 0.5 * abs(hL2 - hR))),
+        min(ridgeX2R, max(0.0, abs(hR - 0.5 * (hL + hR2)) - 0.5 * abs(hL - hR2))));
+    float ridge2Y = max(
+        min(ridgeY2U, max(0.0, abs(hU - 0.5 * (hU2 + hD)) - 0.5 * abs(hU2 - hD))),
+        min(ridgeY2D, max(0.0, abs(hD - 0.5 * (hU + hD2)) - 0.5 * abs(hU - hD2))));
+    float ridgeStrength = max(max(ridgeX, ridgeY), 0.85 * max(ridge2X, ridge2Y));
+    float histThinness = saturate((ridgeStrength - 0.012) * 24.0);
     float staticThinLock = stationaryBoost * staticDepthConsistent * histThinness;
     float panThinWeight = saturate(1.0 - speed / 1.5) * (1.0 - stationaryBoost) * staticDepthConsistent * depthConfidence * histThinness;
     float ridgeRetention = max(0.96 * staticThinLock, 0.72 * panThinWeight);
@@ -246,6 +262,7 @@ float4 ps_main(VSOutput pin) : SV_Target {
 
     // 7. Velocity / Disocclusion / UI Confidence
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
+    float staticVerified = stationaryBoost * staticDepthConsistent * (1.0 - saturate(clampDistance * 12.0));
     float speedFactor = saturate(speed * 0.35);
     float historyConfidence = lerp(1.0, 1.0 / (1.0 + clampDistance * 6.0), speedFactor) * depthConfidence;
     float lumaRange = max(finalMax.x - finalMin.x, 0.08);
@@ -253,20 +270,22 @@ float4 ps_main(VSOutput pin) : SV_Target {
     float relLumaShift = saturate((lumaDelta / lumaRange - 0.60) * 1.25) * saturate((speed - 0.75) * 0.45);
     historyConfidence *= (1.0 - 0.45 * relLumaShift);
 
-    // Base blend weight: 0.90 for static/smooth, higher on depth-verified thin ridges, lower at high speed
+    // Base blend weight: 0.90 baseline, higher when depth-verified static or thin ridge, lower at high speed
     float blendWeight = clamp(params.z, 0.0, 0.95);
-    blendWeight = lerp(blendWeight, 0.96, staticThinLock);
+    blendWeight = lerp(blendWeight, 0.96, staticVerified);
+    blendWeight = lerp(blendWeight, 0.975, staticThinLock);
     blendWeight = lerp(blendWeight, 0.92, panThinWeight);
     blendWeight = lerp(blendWeight, 0.65, saturate(speed * 0.08));
+    blendWeight = min(blendWeight, temporalMeta.x);
 
     // Dynamic blend weight
     float dynamicBlend = blendWeight * historyConfidence;
 
-    // 8. Karis luma weighting during accumulation
+    // 8. HDR-only Karis luma firefly weighting during accumulation
     float lumaCurrent = currentY.x;
     float lumaHistory = clampedHistY.x;
-    float wCurrent = 1.0 / (1.0 + max(0.0, lumaCurrent));
-    float wHistory = 1.0 / (1.0 + max(0.0, lumaHistory));
+    float wCurrent = 1.0 / (1.0 + max(0.0, lumaCurrent - 1.0));
+    float wHistory = 1.0 / (1.0 + max(0.0, lumaHistory - 1.0));
 
     float blendCurrent = (1.0 - dynamicBlend) * wCurrent;
     float blendHistory = dynamicBlend * wHistory;

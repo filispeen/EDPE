@@ -33,7 +33,10 @@ public:
         float depthB = 0.025f,
         ID3D11ShaderResourceView* prevDepthSrv = nullptr);
 
-    void resetHistory() { resetRequested_ = true; }
+    void resetHistory() {
+        resetRequested_ = true;
+        framesSinceReset_ = 0;
+    }
     bool isInitialized() const { return device_ != nullptr; }
 
 private:
@@ -59,6 +62,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> cachedDestRtv_;
 
     bool resetRequested_ = true;
+    uint32_t framesSinceReset_ = 0;
 };
 
 } // namespace edpe
