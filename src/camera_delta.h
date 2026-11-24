@@ -572,7 +572,7 @@ inline bool isMainCameraGeometryValid(
     if (outW > outH && std::fabs(camAspect - 1.0f) < 0.03f) return false;
     if (outW > 0 && outH > 0) {
         const float screenAspect = static_cast<float>(outW) / static_cast<float>(outH);
-        if (std::fabs(camAspect - screenAspect) > 0.05f) return false;
+        if (std::fabs(camAspect - screenAspect) > 0.05f * screenAspect) return false;
     }
     return true;
 }

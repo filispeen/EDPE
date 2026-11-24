@@ -544,6 +544,22 @@ int main() {
     const float degenerateProj1080[16]{};
     if (edpe::isMainCameraGeometryValid(cam21x9, degenerateProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 119;
 
+    // Relative 5% aspect tolerance on ultrawide (21:9 & 32:9):
+    // 21:9 (3440x1440 => 2.3889) accepts camAspect=2.3333 (|diff|=0.0556 > 0.05 absolute, <= 5% relative).
+    edpe::CameraProjection cam21x9SlightlyNarrow = cam21x9;
+    cam21x9SlightlyNarrow.scaleX = 0.8000f;
+    cam21x9SlightlyNarrow.scaleY = 0.8000f * (21.0f / 9.0f);
+    if (!edpe::isMainCameraGeometryValid(cam21x9SlightlyNarrow, validProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 132;
+
+    // 32:9 (5120x1440 => 3.5556) accepts camAspect=3.42 (|diff|=0.1356 > 0.05 absolute, <= 5% relative),
+    // while still rejecting 16:9 (1.7778) and 1:1 square spotlights.
+    edpe::CameraProjection cam32x9 = cam21x9;
+    cam32x9.scaleX = 0.5500f;
+    cam32x9.scaleY = 0.5500f * 3.42f;
+    if (!edpe::isMainCameraGeometryValid(cam32x9, validProj1080, 5120.0f, 1440.0f, 5120, 1440)) return 133;
+    if (edpe::isMainCameraGeometryValid(cam16x9, validProj1080, 5120.0f, 1440.0f, 5120, 1440)) return 134;
+    if (edpe::isMainCameraGeometryValid(squareSpotlight, validProj1080, 5120.0f, 1440.0f, 5120, 1440)) return 135;
+
     // 37. isSmoothWorldFovTransitionCandidate: accepts smooth ADS zoom-in/zoom-out ramps
     // (including turning and movement) while rejecting ADS viewmodels (~2.5x scale),
     // hip-fire viewmodels (depthB=0.0675), settlement beacons (depthB=0.1002 / distant),

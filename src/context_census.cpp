@@ -535,6 +535,7 @@ static unsigned long long s_camera_frame = ~0ull;
 static unsigned long long s_camera_previous_frame = ~0ull;
 static unsigned long long s_hdr_slot0_seen_frame = ~0ull;
 static unsigned s_consecutive_skipped_frames = 0;
+static unsigned long long s_last_skip_counted_frame = ~0ull;
 
 // Authoritative Camera Anchor state (Steps 2-4)
 static edpe::CameraProjection s_anchor_camera{};
@@ -588,6 +589,7 @@ struct UnmapFrameStats {
     float firstFailWords[28]{};
     unsigned long long mapsAtReset = 0;
     float lastRDist = 0.0f, lastRTrace = 0.0f;
+    float lastCandAspect = 0.0f;
 };
 static UnmapFrameStats s_ustat{};
 static std::atomic<uint64_t> s_valid_camera_seen_counter{0};
@@ -645,7 +647,7 @@ inline bool isSceneCameraAspect(float scaleX, float scaleY, UINT width, UINT hei
     if (width > height && std::fabs(camAspect - 1.0f) < 0.03f) return false; // Square cameras are cubemaps/RTTs on widescreen displays
     if (!width || !height) return true;
     const float screenAspect = static_cast<float>(width) / static_cast<float>(height);
-    return std::fabs(camAspect - screenAspect) < 0.05f;
+    return std::fabs(camAspect - screenAspect) <= 0.05f * screenAspect;
 }
 
 inline float getJitterLogTimeMs() {
@@ -8131,6 +8133,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 s_cb1_memo_matches_world = parse_ok &&
                     edpe::matchesEliteWorldProjectionScalesFromBlock16(local_world140, parsed_camera);
             }
+            if (parsed_camera.scaleX > 0.0f && parsed_camera.scaleY > 0.0f) {
+                s_ustat.lastCandAspect = parsed_camera.scaleY / parsed_camera.scaleX;
+            }
             if (parse_ok && !s_ustat.haveFirstOk) {
                 s_ustat.haveFirstOk = true;
                 std::memcpy(&s_ustat.firstOkWords[0], local_cam932, sizeof(local_cam932));
@@ -10854,24 +10859,28 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 }
             }
         }
-        if (++s_consecutive_skipped_frames > 4) {
-            s_camera_reset = true;
-            if (s_consecutive_skipped_frames > 15) {
-                s_camera_now = {};
-                s_last_true_camera = {};
-                s_last_true_camera_frame = ~0ull;
-                s_consecutive_fallback_frames = 0;
-                s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
-                s_anchor_valid = false;
-                s_cut_rejection_streak = 0;
-                s_teleport_rejection_streak = 0;
+        const bool countSkipThisFrame = (s_last_skip_counted_frame != rendered);
+        if (countSkipThisFrame) {
+            s_last_skip_counted_frame = rendered;
+            if (++s_consecutive_skipped_frames > 4) {
+                s_camera_reset = true;
+                if (s_consecutive_skipped_frames > 15) {
+                    s_camera_now = {};
+                    s_last_true_camera = {};
+                    s_last_true_camera_frame = ~0ull;
+                    s_consecutive_fallback_frames = 0;
+                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                    s_anchor_valid = false;
+                    s_cut_rejection_streak = 0;
+                    s_teleport_rejection_streak = 0;
+                }
             }
-        }
-        if (upscale_active && (s_consecutive_skipped_frames == 10 || s_consecutive_skipped_frames % 600 == 0)) {
-            wchar_t msg[192];
-            swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu streak=%u (%ls)",
-                frame, s_consecutive_skipped_frames, skip);
-            EdpeLog(msg);
+            if (upscale_active && (s_consecutive_skipped_frames == 10 || s_consecutive_skipped_frames % 600 == 0)) {
+                wchar_t msg[192];
+                swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu streak=%u (%ls)",
+                    frame, s_consecutive_skipped_frames, skip);
+                EdpeLog(msg);
+            }
         }
         return;
     }
@@ -10941,8 +10950,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         } else if (!isSubNative) {
             rawColorChoice = scene_hdr_color_source ? scene_hdr_color_source.Get() : presentBackbuffer;
         } else {
-            if (++s_consecutive_skipped_frames > 4) {
-                s_camera_reset = true;
+            if (s_last_skip_counted_frame != rendered) {
+                s_last_skip_counted_frame = rendered;
+                if (++s_consecutive_skipped_frames > 4) {
+                    s_camera_reset = true;
+                }
             }
             return;
         }
@@ -10968,11 +10980,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 EdpeLog(msg);
             }
         } else {
-            if (++s_consecutive_skipped_frames > 4) {
-                s_camera_reset = true;
+            const bool countSkipThisFrame = (s_last_skip_counted_frame != rendered);
+            if (countSkipThisFrame) {
+                s_last_skip_counted_frame = rendered;
+                if (++s_consecutive_skipped_frames > 4) {
+                    s_camera_reset = true;
+                }
             }
             static unsigned long long s_last_ldr_log = ~0ull;
-            if (s_last_ldr_log == ~0ull || frame >= s_last_ldr_log + 300) {
+            if (countSkipThisFrame && (s_last_ldr_log == ~0ull || frame >= s_last_ldr_log + 300)) {
                 s_last_ldr_log = frame;
                 wchar_t msg[192];
                 swprintf_s(msg, L"EDPE: reconstruction skipped frame=%llu (low-res LDR scene target %ux%u not observed)",
@@ -10983,6 +10999,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
     }
     s_consecutive_skipped_frames = 0;
+    s_last_skip_counted_frame = ~0ull;
 
     // Apply debounce hysteresis filter to prevent flapping between scene target and backbuffer
     const bool rawIsBackbuffer = (rawColorChoice == presentBackbuffer);
@@ -14137,10 +14154,16 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                     static unsigned long long s_last_zero_write_warn = 0;
                     if (rendered_frame > s_last_zero_write_warn + 60) {
                         s_last_zero_write_warn = rendered_frame;
-                        wchar_t zMsg[256];
+                        std::lock_guard<std::recursive_mutex> sceneLock(g_scene_ctx_mutex);
+                        wchar_t zMsg[512];
                         swprintf_s(zMsg,
-                            L"EDPE: zero jitter writes on scene frame %llu (mrt_frame=%llu, hdr0_frame=%llu, has_staged=%d, staged_frame=%llu)",
-                            rendered_frame, motion_color_frame, s_hdr_slot0_seen_frame, (int)s_has_staged_camera, s_staged_camera_frame);
+                            L"EDPE: zero jitter writes on scene frame %llu (mrt_frame=%llu, hdr0_frame=%llu, has_staged=%d, staged_frame=%llu, maps=%u, unmaps=%u, noMapped=%u, parseFail=%u, firstFailReason=%d, filterFail=%u, stageDenied=%u, out=%ux%u, camAspect=%.4f)",
+                            rendered_frame, motion_color_frame, s_hdr_slot0_seen_frame, (int)s_has_staged_camera, s_staged_camera_frame,
+                            scene_maps.load(std::memory_order_relaxed), s_ustat.total, s_ustat.noMapped,
+                            s_ustat.parseFail, s_ustat.firstFailReason, s_ustat.filterFail, s_ustat.stageDenied,
+                            s_swapchain_width.load(std::memory_order_relaxed),
+                            s_swapchain_height.load(std::memory_order_relaxed),
+                            s_ustat.lastCandAspect);
                         EdpeLog(zMsg);
                     }
                 }
@@ -15046,6 +15069,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_last_fg_composite_path = 0;
         s_hdr_slot0_seen_frame = ~0ull;
         s_consecutive_skipped_frames = 0;
+        s_last_skip_counted_frame = ~0ull;
         s_has_staged_camera = false;
         s_staged_from_in_scene = false;
         s_staged_was_probe_vs_committed = false;
