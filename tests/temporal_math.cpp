@@ -892,7 +892,7 @@ int main() {
 
     // -------------------------------------------------------------------------
     // Issue #30: ADS rifle & hands viewmodel vs world camera with skybox-space
-    // cb1[35..38] (words 140..155) and local-to-skybox cb1[58..60] (words 232..243)
+    // cb1[35..38] (words 140..155) and local-to-skybox cb1[64..66] (words 256..267)
     // Captured from EDO2.rdc EIDs 8526..8622 (ADS rifle/hands) and EID 8635 (world).
     // -------------------------------------------------------------------------
     {
@@ -905,12 +905,23 @@ int main() {
              0.158155f, -0.403417f, 0.901245f, 0.0f};
         std::memcpy(&edo2Cb1[140], world140, sizeof(world140));
 
-        // cb1[58..60] (words 232..243): local-to-skybox basis rotation R_58
-        const float skybox232[12]{
+        // cb1[58..60] (words 232..243): shifted axis block [0,1,0,0; 0,0,1,0; 0,0,0,1] present in EDO2.rdc;
+        // words[243] == 1.0f so any regression reading offset 232 fails isValidEliteSkyboxRotation12.
+        const float block232[12]{
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f};
+        std::memcpy(&edo2Cb1[232], block232, sizeof(block232));
+
+        // cb1[64..66] (words 256..267): local-to-skybox basis rotation R_64, followed by cb1[67]=(0,0,0,1)
+        const float skybox256[12]{
             -0.987473f, -0.112762f, -0.110369f, 0.0f,
              0.056711f, -0.906380f,  0.418640f, 0.0f,
             -0.147243f,  0.407136f,  0.901421f, 0.0f};
-        std::memcpy(&edo2Cb1[232], skybox232, sizeof(skybox232));
+        std::memcpy(&edo2Cb1[256], skybox256, sizeof(skybox256));
+        edo2Cb1[271] = 1.0f;
+        if (edpe::isValidEliteSkyboxRotation12(&edo2Cb1[232])) return 163;
+        if (!edpe::isValidEliteSkyboxRotation12(&edo2Cb1[256])) return 164;
 
         // cam932 (words 932..943): planetary horizon basis + eye pos in EDO2.rdc
         const float cam932[12]{

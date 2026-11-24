@@ -255,8 +255,8 @@ inline bool isValidEliteSkyboxRotation12(const float* skyboxRot12) {
 }
 
 // cb1[35..38] (words 140..155) stores the Main World Camera inverse projection basis in
-// star-system / skybox space: R_35 = R_277_world * R_58, where cb1[58..60] (words 232..243)
-// holds the orthonormal 3x3 local-to-skybox basis rotation R_58. Un-rotate R_35 by R_58^T
+// star-system / skybox space: R_35 = R_277_world * R_64, where cb1[64..66] (words 256..267)
+// holds the orthonormal 3x3 local-to-skybox basis rotation R_64. Un-rotate R_35 by R_64^T
 // before comparing against parsedCam.worldFromView (R_277^T in local render space).
 inline float eliteWorldBlock16RotationTrace(const float* block16,
     float worldScaleX, float worldScaleY, const CameraProjection& parsedCam,
@@ -314,7 +314,7 @@ inline bool matchesEliteWorldProjectionScales(const float* words, size_t count,
     float local16[16]{};
     float localSkybox12[12]{};
     for (size_t i = 0; i < 16; ++i) local16[i] = words[140 + i];
-    for (size_t i = 0; i < 12; ++i) localSkybox12[i] = words[232 + i];
+    for (size_t i = 0; i < 12; ++i) localSkybox12[i] = words[256 + i];
     return matchesEliteWorldProjectionScalesFromBlock16(local16, parsedCam, localSkybox12);
 }
 
@@ -348,7 +348,7 @@ inline bool isEliteSubpassVersusWorldCb1(const float* words, size_t count,
     float local16[16]{};
     float localSkybox12[12]{};
     for (size_t i = 0; i < 16; ++i) local16[i] = words[140 + i];
-    for (size_t i = 0; i < 12; ++i) localSkybox12[i] = words[232 + i];
+    for (size_t i = 0; i < 12; ++i) localSkybox12[i] = words[256 + i];
     return isEliteSubpassVersusWorldBlock16(local16, parsedCam, localSkybox12);
 }
 
