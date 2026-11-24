@@ -572,6 +572,8 @@ static bool s_world_zoom_fallback_parse_ok = false;
 static float s_world_zoom_fallback_world_scale_err = 1e30f;
 static bool s_last_committed_scene_cut = false;
 static bool s_last_committed_origin_reanchor = false;
+static bool s_last_committed_teleport_hold = false;
+static bool s_last_fg_reset = false;
 static unsigned s_teleport_rejection_streak = 0;
 static unsigned long long s_last_teleport_rejection_frame = ~0ull;
 static unsigned s_cut_rejection_streak = 0;
@@ -806,6 +808,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
 
     out_scene_cut = false;
     s_last_committed_origin_reanchor = false;
+    s_last_committed_teleport_hold = false;
     if (haveNormalStaged || useWorldZoomFallback || useProbeOrientationFallback) {
         const edpe::CameraProjection committedCam = [&]() {
             if (haveNormalStaged && !useOrientationOnlyHold) {
@@ -908,6 +911,21 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         s_last_true_camera_frame = rendered_frame;
         s_camera_now = committedCam;
         s_camera_frame = rendered_frame;
+        s_last_committed_teleport_hold = useTeleportPositionHold;
+        if (s_last_committed_origin_reanchor || useTeleportPositionHold) {
+            static unsigned s_rebase_diag_tokens = 0;
+            static unsigned long long s_rebase_diag_refill_frame = ~0ull;
+            if (allowRefilledDiagLog(rendered_frame, s_rebase_diag_refill_frame, s_rebase_diag_tokens, 16, 120)) {
+                const float stepDist = edpe::length(
+                    edpe::cameraPosition(committedCam) - edpe::cameraPosition(s_camera_previous));
+                wchar_t msg[224];
+                swprintf_s(msg,
+                    L"EDPE DIAG: rebase/hold frame=%llu originReanchor=%d teleportHold=%d sceneCut=%d step=%.2fm",
+                    rendered_frame, s_last_committed_origin_reanchor ? 1 : 0,
+                    useTeleportPositionHold ? 1 : 0, out_scene_cut ? 1 : 0, stepDist);
+                EdpeLog(msg);
+            }
+        }
         s_has_staged_camera = false;
         s_staged_from_in_scene = false;
         s_staged_was_probe_vs_committed = false;
@@ -8637,7 +8655,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                                 }
                                 if (edpe::isTransientOriginRebaseHoldEligible(
                                         parsed_camera, s_camera_now, jumpResidual,
-                                        s_teleport_rejection_streak, allowPreSceneMainEye, cut_streak_satisfied)) {
+                                        s_teleport_rejection_streak, allowPreSceneMainEye, cut_streak_satisfied,
+                                        edpe::length(s_last_valid_velocity))) {
                                     is_teleport_hold_candidate = true;
                                 } else {
                                     const bool persistentInSceneTeleport =
@@ -11541,7 +11560,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 motion_pass->clear(context);
             } else {
                 // Render motion vectors at render resolution using current and previous camera projections and jitter phases
-                const bool clampCockpit = !edpe::cobra_camera::MapFocusPoller::isOnFootActive();
+                const bool recentOnFootVisor =
+                    (s_visor_diverted_frame != ~0ull && rendered >= s_visor_diverted_frame &&
+                     (rendered - s_visor_diverted_frame) <= 300ull);
+                const bool onFootActive = edpe::cobra_camera::MapFocusPoller::isOnFootActive() || recentOnFootVisor;
+                const bool clampCockpit = !onFootActive;
                 ID3D11ShaderResourceView* weaponMotionSrv = nullptr;
                 if (!eval_reset &&
                     s_weapon_motion.isInitialized() &&
@@ -11625,6 +11648,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
 
     s_last_temporal_inputs = inputs;
     s_last_temporal_inputs_frame = rendered;
+    s_last_fg_reset = eval_reset || origin_reanchor || s_last_committed_teleport_hold;
     s_last_fg_motion_tex = motionTexture;
     s_last_fg_motion_frame = rendered;
     s_last_fg_pause_menu = isPauseOrModalMenuActive(rendered);
@@ -15122,6 +15146,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_last_completed_rendered_frame = ~0ull;
         s_last_fg_motion_frame = ~0ull;
         s_last_fg_pause_menu = false;
+        s_last_fg_reset = false;
         s_last_fg_composite_path = 0;
         s_hdr_slot0_seen_frame = ~0ull;
         s_consecutive_skipped_frames = 0;
@@ -15926,7 +15951,7 @@ bool ContextCensusGetFgSnapshot(edpe::FgSceneSnapshot* outSnapshot) {
     outSnapshot->motionScaleY = s_last_temporal_inputs.motionScaleY;
     outSnapshot->frameTimeMs = s_last_temporal_inputs.frameTimeMs;
     outSnapshot->frameIndex = rendered;
-    outSnapshot->reset = s_last_temporal_inputs.reset;
+    outSnapshot->reset = s_last_temporal_inputs.reset || s_last_fg_reset;
     outSnapshot->colorIsHdr = s_last_temporal_inputs.colorIsHdr;
     outSnapshot->isPauseOrMenu = s_last_fg_pause_menu;
     outSnapshot->cameraNow = s_last_temporal_inputs.cameraNow;

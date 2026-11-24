@@ -277,9 +277,11 @@ inline bool isTransientOriginRebaseHoldEligible(
     float jumpResidual,
     unsigned teleportStreak,
     bool inMainScene,
-    bool cutStreakSatisfied)
+    bool cutStreakSatisfied,
+    float prevSpeed = 0.0f)
 {
     if (!inMainScene || cutStreakSatisfied || teleportStreak >= 5) return false;
+    if (prevSpeed > 5.0f) return false;
     if (jumpResidual <= 15.0f || jumpResidual >= 2000.0f) return false;
     if (isCameraProjectionCut(candidate, committed)) return false;
     return cameraRotationTrace(candidate, committed) > 2.414f;

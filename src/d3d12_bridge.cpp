@@ -146,27 +146,34 @@ bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device) {
     }
     cmdList_->Close();
 
-    hr = device12_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence12_));
-    if (FAILED(hr)) {
-        logBridgeFailure(L"CreateFence(SHARED)", hr);
-        shutdown();
-        return false;
-    }
+    auto createSharedFencePair = [&](const char* debugName,
+                                     Microsoft::WRL::ComPtr<ID3D12Fence>& out12,
+                                     Microsoft::WRL::ComPtr<ID3D11Fence>& out11) -> bool {
+        hr = device12_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&out12));
+        if (FAILED(hr)) {
+            logBridgeFailure(L"CreateFence(SHARED)", hr);
+            return false;
+        }
+        HANDLE sharedFenceHandle = nullptr;
+        hr = device12_->CreateSharedHandle(
+            out12.Get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle);
+        if (FAILED(hr) || !sharedFenceHandle) {
+            if (sharedFenceHandle) CloseHandle(sharedFenceHandle);
+            logBridgeFailure(L"CreateSharedHandle(fence)", hr);
+            return false;
+        }
+        const HRESULT openHr = device11_5_->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&out11));
+        CloseHandle(sharedFenceHandle);
+        if (FAILED(openHr)) {
+            logBridgeFailure(L"OpenSharedFence", openHr);
+            return false;
+        }
+        SetD3D12DebugName(out12.Get(), debugName);
+        return true;
+    };
 
-    HANDLE sharedFenceHandle = nullptr;
-    hr = device12_->CreateSharedHandle(
-        fence12_.Get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle);
-    if (FAILED(hr) || !sharedFenceHandle) {
-        if (sharedFenceHandle) CloseHandle(sharedFenceHandle);
-        logBridgeFailure(L"CreateSharedHandle(fence)", hr);
-        shutdown();
-        return false;
-    }
-
-    const HRESULT openHr = device11_5_->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&fence11_));
-    CloseHandle(sharedFenceHandle);
-    if (FAILED(openHr)) {
-        logBridgeFailure(L"OpenSharedFence", openHr);
+    if (!createSharedFencePair("EDPE_D3D12Bridge_D11ToD12Fence", d11ToD12Fence12_, d11ToD12Fence11_) ||
+        !createSharedFencePair("EDPE_D3D12Bridge_D12ToD11Fence", d12ToD11Fence12_, d12ToD11Fence11_)) {
         shutdown();
         return false;
     }
@@ -183,7 +190,6 @@ bool D3D11D3D12Bridge::initialize(ID3D11Device* d3d11Device) {
     SetD3D12DebugName(device12_.Get(), "EDPE_D3D12Bridge_Device");
     SetD3D12DebugName(queue_.Get(), "EDPE_D3D12Bridge_Queue");
     SetD3D12DebugName(cmdList_.Get(), "EDPE_D3D12Bridge_CmdList");
-    SetD3D12DebugName(fence12_.Get(), "EDPE_D3D12Bridge_SharedFence");
 
     device11_ = d3d11Device;
     initialized_ = true;
@@ -199,8 +205,10 @@ void D3D11D3D12Bridge::shutdown() {
         CloseHandle(fenceEvent_);
         fenceEvent_ = nullptr;
     }
-    fence11_.Reset();
-    fence12_.Reset();
+    d11ToD12Fence11_.Reset();
+    d11ToD12Fence12_.Reset();
+    d12ToD11Fence11_.Reset();
+    d12ToD11Fence12_.Reset();
     cmdList_.Reset();
     for (auto& alloc : allocators_) {
         alloc.Reset();
@@ -211,7 +219,9 @@ void D3D11D3D12Bridge::shutdown() {
     device12_.Reset();
     device11_5_.Reset();
     device11_ = nullptr;
-    fenceValue_ = 0;
+    d11ToD12Value_ = 0;
+    d12ToD11Value_ = 0;
+    cpuWaitCount_ = 0;
     frameCounter_ = 0;
     timestampFrequency_ = 0;
     d3d12Module_ = nullptr;
@@ -339,9 +349,10 @@ ID3D12GraphicsCommandList* D3D11D3D12Bridge::beginCommandList(uint32_t& outSlot,
 
     outSlot = frameCounter_++ % kAllocatorCount;
     const uint64_t waitVal = allocatorFence_[outSlot];
-    if (waitVal > 0 && fence12_->GetCompletedValue() < waitVal) {
+    if (waitVal > 0 && d12ToD11Fence12_->GetCompletedValue() < waitVal) {
+        ++cpuWaitCount_;
         if (outDidCpuWait) *outDidCpuWait = true;
-        if (SUCCEEDED(fence12_->SetEventOnCompletion(waitVal, fenceEvent_))) {
+        if (SUCCEEDED(d12ToD11Fence12_->SetEventOnCompletion(waitVal, fenceEvent_))) {
             WaitForSingleObject(fenceEvent_, 5000);
         }
     }
@@ -362,8 +373,8 @@ uint64_t D3D11D3D12Bridge::submitAfterD3D11Signal(ID3D11DeviceContext4* ctx4,
         return 0;
     }
 
-    const uint64_t d11Done = ++fenceValue_;
-    if (FAILED(ctx4->Signal(fence11_.Get(), d11Done))) {
+    const uint64_t d11Done = ++d11ToD12Value_;
+    if (FAILED(ctx4->Signal(d11ToD12Fence11_.Get(), d11Done))) {
         cmdList_->Close();
         return 0;
     }
@@ -373,43 +384,43 @@ uint64_t D3D11D3D12Bridge::submitAfterD3D11Signal(ID3D11DeviceContext4* ctx4,
 
     if (FAILED(cmdList_->Close())) return 0;
 
-    if (FAILED(q->Wait(fence12_.Get(), d11Done))) return 0;
+    if (FAILED(q->Wait(d11ToD12Fence12_.Get(), d11Done))) return 0;
     ID3D12CommandList* lists[] = {cmdList_.Get()};
     q->ExecuteCommandLists(1, lists);
 
-    const uint64_t d12Done = ++fenceValue_;
-    if (FAILED(q->Signal(fence12_.Get(), d12Done))) return 0;
+    const uint64_t d12Done = ++d12ToD11Value_;
+    if (FAILED(q->Signal(d12ToD11Fence12_.Get(), d12Done))) return 0;
     allocatorFence_[slot] = d12Done;
     return d12Done;
 }
 
 uint64_t D3D11D3D12Bridge::signalD3D12Queue() {
     ID3D12CommandQueue* q = activeQueue();
-    if (!initialized_ || !q || !fence12_) return 0;
-    const uint64_t val = ++fenceValue_;
-    if (FAILED(q->Signal(fence12_.Get(), val))) return 0;
+    if (!initialized_ || !q || !d12ToD11Fence12_) return 0;
+    const uint64_t val = ++d12ToD11Value_;
+    if (FAILED(q->Signal(d12ToD11Fence12_.Get(), val))) return 0;
     return val;
 }
 
 bool D3D11D3D12Bridge::waitOnD3D11(ID3D11DeviceContext4* ctx4, uint64_t d12DoneFence) const {
-    if (!initialized_ || !ctx4 || !fence11_ || d12DoneFence == 0) return false;
-    return SUCCEEDED(ctx4->Wait(fence11_.Get(), d12DoneFence));
+    if (!initialized_ || !ctx4 || !d12ToD11Fence11_ || d12DoneFence == 0) return false;
+    return SUCCEEDED(ctx4->Wait(d12ToD11Fence11_.Get(), d12DoneFence));
 }
 
 void D3D11D3D12Bridge::waitGpuIdle() {
     ID3D12CommandQueue* q = activeQueue();
-    if (!q || !fence12_ || !fenceEvent_) return;
-    const uint64_t target = ++fenceValue_;
-    if (SUCCEEDED(q->Signal(fence12_.Get(), target)) &&
-        fence12_->GetCompletedValue() < target) {
-        if (SUCCEEDED(fence12_->SetEventOnCompletion(target, fenceEvent_))) {
+    if (!q || !d12ToD11Fence12_ || !fenceEvent_) return;
+    const uint64_t target = ++d12ToD11Value_;
+    if (SUCCEEDED(q->Signal(d12ToD11Fence12_.Get(), target)) &&
+        d12ToD11Fence12_->GetCompletedValue() < target) {
+        if (SUCCEEDED(d12ToD11Fence12_->SetEventOnCompletion(target, fenceEvent_))) {
             WaitForSingleObject(fenceEvent_, 5000);
         }
     }
 }
 
 uint64_t D3D11D3D12Bridge::completedFenceValue() const {
-    return fence12_ ? fence12_->GetCompletedValue() : 0;
+    return d12ToD11Fence12_ ? d12ToD11Fence12_->GetCompletedValue() : 0;
 }
 
 HRESULT D3D11D3D12Bridge::serializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC* desc,

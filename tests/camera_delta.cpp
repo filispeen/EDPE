@@ -409,6 +409,15 @@ int main() {
             planetaryTurningRebase, worldBase, 2500.0f, 1, true, false)) {
         return 101;
     }
+    // Ship glide / fast flight (prevSpeed > 5.0 m/frame) MUST NOT hold old position:
+    if (edpe::isTransientOriginRebaseHoldEligible(
+            planetaryTurningRebase, worldBase, 519.124f, 1, true, false, 12.0f)) {
+        return 136;
+    }
+    if (!edpe::isTransientOriginRebaseHoldEligible(
+            planetaryTurningRebase, worldBase, 519.124f, 1, true, false, 0.1f)) {
+        return 137;
+    }
 
     // 31. Persistent unpredicted teleport (>15m beyond velocity prediction) triggers scene cut,
     // while smooth high-speed continuous flight (residual <= 15m, step <= 50m) does not.

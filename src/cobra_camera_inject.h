@@ -1315,8 +1315,9 @@ private:
                 f2 += 8;
                 while (*f2 == ' ' || *f2 == '\t' || *f2 == ':') ++f2;
                 const unsigned long flags2 = std::strtoul(f2, nullptr, 10);
-                // Flags2 bit 0 (0x1) = OnFoot
-                m_cachedOnFoot = (flags2 & 0x1u) != 0;
+                // Flags2 bits: 0x1=OnFoot, 0x8=OnFootInHangar, 0x10=OnFootInStation,
+                // 0x20=OnFootOnPlanet, 0x1000=OnFootSocialSpace, 0x2000=OnFootExterior
+                m_cachedOnFoot = (flags2 & 0x3039u) != 0;
             } else {
                 m_cachedOnFoot = false;
             }

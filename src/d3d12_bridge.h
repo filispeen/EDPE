@@ -87,8 +87,11 @@ public:
     // Blocks CPU until all previously submitted D3D12 work completes (used on resize/shutdown).
     void waitGpuIdle();
 
-    // Queries completed D3D12 fence value without blocking.
+    // Queries completed D3D12->D3D11 fence value without blocking.
     uint64_t completedFenceValue() const;
+
+    // Total number of CPU waits on allocator ring slots since initialize().
+    uint64_t cpuWaitCount() const { return cpuWaitCount_; }
 
     // Overrides the active D3D12 command queue (e.g., with a Streamline-wrapped queue).
     // Passing nullptr restores the native queue created by initialize().
@@ -98,8 +101,12 @@ public:
     ID3D11Device5* d3d11Device5() const { return device11_5_.Get(); }
     ID3D12Device* d3d12Device() const { return device12_.Get(); }
     ID3D12CommandQueue* commandQueue() const { return activeQueue(); }
-    ID3D12Fence* d3d12Fence() const { return fence12_.Get(); }
-    ID3D11Fence* d3d11Fence() const { return fence11_.Get(); }
+    ID3D12Fence* d3d12Fence() const { return d12ToD11Fence12_.Get(); }
+    ID3D11Fence* d3d11Fence() const { return d12ToD11Fence11_.Get(); }
+    ID3D12Fence* d11ToD12Fence12() const { return d11ToD12Fence12_.Get(); }
+    ID3D11Fence* d11ToD12Fence11() const { return d11ToD12Fence11_.Get(); }
+    ID3D12Fence* d12ToD11Fence12() const { return d12ToD11Fence12_.Get(); }
+    ID3D11Fence* d12ToD11Fence11() const { return d12ToD11Fence11_.Get(); }
     uint64_t timestampFrequency() const { return timestampFrequency_; }
 
     // Helper to dynamically serialize a D3D12 root signature without hard-linking d3d12.dll.
@@ -122,10 +129,17 @@ private:
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> overrideQueue_;
     std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>, kAllocatorCount> allocators_;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmdList_;
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence12_;
-    Microsoft::WRL::ComPtr<ID3D11Fence> fence11_;
+    // Separate monotonic shared fences (one writer per fence):
+    // - d11ToD12: signaled ONLY by D3D11, waited ONLY by D3D12
+    // - d12ToD11: signaled ONLY by D3D12, waited ONLY by D3D11 / CPU
+    Microsoft::WRL::ComPtr<ID3D12Fence> d11ToD12Fence12_;
+    Microsoft::WRL::ComPtr<ID3D11Fence> d11ToD12Fence11_;
+    Microsoft::WRL::ComPtr<ID3D12Fence> d12ToD11Fence12_;
+    Microsoft::WRL::ComPtr<ID3D11Fence> d12ToD11Fence11_;
     HANDLE fenceEvent_ = nullptr;
-    uint64_t fenceValue_ = 0;
+    uint64_t d11ToD12Value_ = 0;
+    uint64_t d12ToD11Value_ = 0;
+    uint64_t cpuWaitCount_ = 0;
     std::array<uint64_t, kAllocatorCount> allocatorFence_{};
     uint32_t frameCounter_ = 0;
     uint64_t timestampFrequency_ = 0;

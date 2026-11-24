@@ -479,8 +479,18 @@ bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
 
     // 2. Open D3D12 command list and read prior timestamp for this allocator ring slot non-blockingly.
     uint32_t slot = 0;
-    auto* cmdList = bridge_.beginCommandList(slot);
+    bool didCpuWait = false;
+    auto* cmdList = bridge_.beginCommandList(slot, &didCpuWait);
     if (!cmdList) return false;
+    if (didCpuWait) {
+        const uint64_t waits = bridge_.cpuWaitCount();
+        if (waits <= 4 || (waits % 60) == 0) {
+            wchar_t wmsg[160]{};
+            std::swprintf(wmsg, 160, L"EDPE D3D12Presenter: CPU allocator ring wait #%llu (slot=%u)",
+                          static_cast<unsigned long long>(waits), slot);
+            EdpeLog(wmsg);
+        }
+    }
 
     const bool recordTiming = telemetryTimingEnabled_.load(std::memory_order_relaxed);
     if (outGpuCopyMs && slotHasTimestamp_[slot] && mappedTimestamps_ && bridge_.timestampFrequency() > 0) {
