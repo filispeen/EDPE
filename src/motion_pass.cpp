@@ -29,9 +29,9 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
 
     Microsoft::WRL::ComPtr<ID3DBlob> cs_code, cs_gpu_code;
     if (FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, nullptr,
-            nullptr, "cs", "cs_5_0", 0, 0, &cs_code, nullptr)) ||
+            nullptr, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_code, nullptr)) ||
         FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, nullptr,
-            nullptr, "cs_gpu", "cs_5_0", 0, 0, &cs_gpu_code, nullptr)) ||
+            nullptr, "cs_gpu", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_gpu_code, nullptr)) ||
         FAILED(device->CreateComputeShader(cs_code->GetBufferPointer(),
             cs_code->GetBufferSize(), nullptr, &compute_)) ||
         FAILED(device->CreateComputeShader(cs_gpu_code->GetBufferPointer(),

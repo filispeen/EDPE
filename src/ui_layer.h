@@ -105,8 +105,12 @@ public:
 private:
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> compositeCs_;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> blackFloorCs_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> compositePs_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constantBuffer_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> blackFloorTex_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> blackFloorSrv_;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> blackFloorUav_;
 
     Microsoft::WRL::ComPtr<ID3D11VertexShader> coverageVs_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> coveragePs_;
@@ -194,6 +198,7 @@ private:
     UINT height_ = 0;
 
     void updateCompositeConstants(ID3D11DeviceContext* context, UINT outputWidth, UINT outputHeight, bool debugView, float sharpenStrength);
+    void updateBlackFloor(ID3D11DeviceContext* context, bool preserveCallerCsState);
     UINT cbWidth_ = 0;
     UINT cbHeight_ = 0;
     bool cbHasMult_ = false;

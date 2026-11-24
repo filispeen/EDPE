@@ -42,11 +42,11 @@ bool TaaPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
 
     Microsoft::WRL::ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
     if (FAILED(D3DCompile(kTaaShader, sizeof(kTaaShader) - 1, nullptr, nullptr,
-            nullptr, "vs_main", "vs_5_0", 0, 0, &vsBlob, &errBlob))) {
+            nullptr, "vs_main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob))) {
         return false;
     }
     if (FAILED(D3DCompile(kTaaShader, sizeof(kTaaShader) - 1, nullptr, nullptr,
-            nullptr, "ps_main", "ps_5_0", 0, 0, &psBlob, &errBlob))) {
+            nullptr, "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob))) {
         return false;
     }
 

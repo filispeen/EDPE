@@ -113,12 +113,12 @@ bool SharpenPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context)
 
     Microsoft::WRL::ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
     if (FAILED(D3DCompile(kSharpenShader, sizeof(kSharpenShader) - 1, nullptr, nullptr,
-            nullptr, "vs_main", "vs_5_0", 0, 0, &vsBlob, &errBlob))) {
+            nullptr, "vs_main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob))) {
         EdpeLog(L"EDPE: sharpen vertex shader compile failed");
         return false;
     }
     if (FAILED(D3DCompile(kSharpenShader, sizeof(kSharpenShader) - 1, nullptr, nullptr,
-            nullptr, "ps_main", "ps_5_0", 0, 0, &psBlob, &errBlob))) {
+            nullptr, "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob))) {
         EdpeLog(L"EDPE: sharpen pixel shader compile failed");
         return false;
     }
