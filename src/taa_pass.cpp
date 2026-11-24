@@ -94,8 +94,12 @@ void TaaPass::shutdown() {
     linearSampler_.Reset();
     pointSampler_.Reset();
     constantBuffer_.Reset();
-    historyTexture_.Reset();
-    historySrv_.Reset();
+    for (int i = 0; i < 2; ++i) {
+        historyTexture_[i].Reset();
+        historySrv_[i].Reset();
+        historyRtv_[i].Reset();
+    }
+    historyReadIdx_ = 0;
     cachedDestRtv_.Reset();
     cachedDestTexture_ = nullptr;
     context_.Reset();
@@ -107,12 +111,16 @@ void TaaPass::shutdown() {
 }
 
 bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT format) {
-    if (!device_ || width == 0 || height == 0) return false;
+    if (!device_ || width == 0 || height == 0 || format == DXGI_FORMAT_UNKNOWN) return false;
 
-    if (historyTexture_) {
+    if (historyTexture_[0] || historyTexture_[1]) {
         if (historyWidth_ != width || historyHeight_ != height || historyFormat_ != format) {
-            historyTexture_.Reset();
-            historySrv_.Reset();
+            for (int i = 0; i < 2; ++i) {
+                historyTexture_[i].Reset();
+                historySrv_[i].Reset();
+                historyRtv_[i].Reset();
+            }
+            historyReadIdx_ = 0;
             historyWidth_ = 0;
             historyHeight_ = 0;
             historyFormat_ = DXGI_FORMAT_UNKNOWN;
@@ -120,7 +128,7 @@ bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT forma
         }
     }
 
-    if (!historyTexture_) {
+    if (!historyTexture_[0] || !historyTexture_[1]) {
         D3D11_TEXTURE2D_DESC td{};
         td.Width = width;
         td.Height = height;
@@ -132,13 +140,20 @@ bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT forma
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-        if (FAILED(device_->CreateTexture2D(&td, nullptr, &historyTexture_)) ||
-            FAILED(device_->CreateShaderResourceView(historyTexture_.Get(), nullptr, &historySrv_))) {
-            historyTexture_.Reset();
-            historySrv_.Reset();
-            return false;
+        for (int i = 0; i < 2; ++i) {
+            if (FAILED(device_->CreateTexture2D(&td, nullptr, &historyTexture_[i])) ||
+                FAILED(device_->CreateShaderResourceView(historyTexture_[i].Get(), nullptr, &historySrv_[i])) ||
+                FAILED(device_->CreateRenderTargetView(historyTexture_[i].Get(), nullptr, &historyRtv_[i]))) {
+                for (int j = 0; j < 2; ++j) {
+                    historyTexture_[j].Reset();
+                    historySrv_[j].Reset();
+                    historyRtv_[j].Reset();
+                }
+                return false;
+            }
         }
 
+        historyReadIdx_ = 0;
         historyWidth_ = width;
         historyHeight_ = height;
         historyFormat_ = format;
@@ -164,23 +179,36 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     float prevJitterX,
     float prevJitterY,
     float depthB,
-    ID3D11ShaderResourceView* prevDepthSrv) {
-    if (!device_ || !context || !currentFrameSrv || !destinationTexture || width == 0 || height == 0) {
+    ID3D11ShaderResourceView* prevDepthSrv,
+    DXGI_FORMAT preferredFormat) {
+    if (!device_ || !context || !currentFrameSrv || width == 0 || height == 0) {
         return false;
     }
 
     const uint32_t rW = (renderWidth > 0) ? renderWidth : width;
     const uint32_t rH = (renderHeight > 0) ? renderHeight : height;
 
-    D3D11_TEXTURE2D_DESC destDesc{};
-    destinationTexture->GetDesc(&destDesc);
+    DXGI_FORMAT fmt = preferredFormat;
+    if (destinationTexture) {
+        D3D11_TEXTURE2D_DESC destDesc{};
+        destinationTexture->GetDesc(&destDesc);
+        fmt = destDesc.Format;
+    } else if (fmt == DXGI_FORMAT_UNKNOWN) {
+        fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
 
-    if (!ensureResources(width, height, destDesc.Format)) {
+    if (!ensureResources(width, height, fmt)) {
         return false;
     }
 
+    const uint32_t readIdx = historyReadIdx_;
+    const uint32_t writeIdx = readIdx ^ 1u;
+    const bool zeroCopyPingPong = (destinationTexture == nullptr && destinationRtv == nullptr);
+
     ID3D11RenderTargetView* targetRtv = destinationRtv;
-    if (!targetRtv) {
+    if (zeroCopyPingPong) {
+        targetRtv = historyRtv_[writeIdx].Get();
+    } else if (!targetRtv && destinationTexture) {
         if (cachedDestTexture_ != destinationTexture || !cachedDestRtv_) {
             cachedDestRtv_.Reset();
             cachedDestTexture_ = nullptr;
@@ -191,6 +219,7 @@ bool TaaPass::render(ID3D11DeviceContext* context,
         }
         targetRtv = cachedDestRtv_.Get();
     }
+    if (!targetRtv) return false;
 
     const bool performReset = reset || resetRequested_;
     resetRequested_ = false;
@@ -229,7 +258,7 @@ bool TaaPass::render(ID3D11DeviceContext* context,
 
     ID3D11ShaderResourceView* srvs[5] = {
         currentFrameSrv,
-        historySrv_.Get(),
+        historySrv_[readIdx].Get(),
         motionVectorsSrv,
         depthSrv,
         (!performReset) ? prevDepthSrv : nullptr
@@ -244,14 +273,17 @@ bool TaaPass::render(ID3D11DeviceContext* context,
 
     context->Draw(3, 0);
 
-    // Unbind resources before copy to prevent pipeline hazards
+    // Unbind resources before copy/next use to prevent pipeline hazards
     ID3D11ShaderResourceView* nullSrvs[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
     context->PSSetShaderResources(0, 5, nullSrvs);
     ID3D11RenderTargetView* nullRtv = nullptr;
     context->OMSetRenderTargets(1, &nullRtv, nullptr);
 
-    // Save the resolved output as the new history
-    context->CopyResource(historyTexture_.Get(), destinationTexture);
+    if (!zeroCopyPingPong && destinationTexture) {
+        // Save the resolved output into the next history slot
+        context->CopyResource(historyTexture_[writeIdx].Get(), destinationTexture);
+    }
+    historyReadIdx_ = writeIdx;
 
     return true;
 }

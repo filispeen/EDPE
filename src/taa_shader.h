@@ -72,7 +72,8 @@ float3 ClipToAABB(float3 history, float3 target, float3 aabbMin, float3 aabbMax)
 }
 
 // 5-tap Catmull-Rom Bicubic texture filter for pristine history sharpness
-float4 SampleCatmullRom5(Texture2D<float4> tex, SamplerState s, float2 uv, float2 texSize, float2 invTexSize) {
+float4 SampleCatmullRom5WithCross(Texture2D<float4> tex, SamplerState s, float2 uv, float2 texSize, float2 invTexSize,
+                                  out float4 outUp, out float4 outLeft, out float4 outRight, out float4 outDown) {
     float2 samplePos = uv * texSize;
     float2 tc = floor(samplePos - 0.5) + 0.5;
     float2 f = samplePos - tc;
@@ -93,9 +94,19 @@ float4 SampleCatmullRom5(Texture2D<float4> tex, SamplerState s, float2 uv, float
     float4 c3 = tex.SampleLevel(s, float2(tc.x + 2.0, tc12.y) * invTexSize, 0);
     float4 c4 = tex.SampleLevel(s, float2(tc12.x, tc.y + 2.0) * invTexSize, 0);
 
+    outUp = c0;
+    outLeft = c1;
+    outRight = c3;
+    outDown = c4;
+
     float totalWeight = (w12.x * w0.y) + (w0.x * w12.y) + (w12.x * w12.y) + (w3.x * w12.y) + (w12.x * w3.y);
     float4 c = c0 * (w12.x * w0.y) + c1 * (w0.x * w12.y) + c2 * (w12.x * w12.y) + c3 * (w3.x * w12.y) + c4 * (w12.x * w3.y);
     return c / max(1e-4, totalWeight);
+}
+
+float4 SampleCatmullRom5(Texture2D<float4> tex, SamplerState s, float2 uv, float2 texSize, float2 invTexSize) {
+    float4 unusedU, unusedL, unusedR, unusedD;
+    return SampleCatmullRom5WithCross(tex, s, uv, texSize, invTexSize, unusedU, unusedL, unusedR, unusedD);
 }
 
 float4 ps_main(VSOutput pin) : SV_Target {
@@ -188,8 +199,10 @@ float4 ps_main(VSOutput pin) : SV_Target {
         return float4(current, centerSample.a);
     }
 
-    // 4. Sample history with 5-tap Catmull-Rom Bicubic filtering for maximum clarity
-    float4 histSample = SampleCatmullRom5(historyFrame, linearSampler, priorUv, resolution.xy, resolution.zw);
+    // 4. Sample history with 5-tap Catmull-Rom Bicubic filtering and reuse cross taps for ridge detection
+    float4 histUp, histLeft, histRight, histDown;
+    float4 histSample = SampleCatmullRom5WithCross(historyFrame, linearSampler, priorUv, resolution.xy, resolution.zw,
+                                                   histUp, histLeft, histRight, histDown);
     float3 histY = RGBToYCoCg(histSample.rgb);
 
     // 5. Fast disocclusion & stationary depth-envelope check against previous frame depth buffer
@@ -213,28 +226,19 @@ float4 ps_main(VSOutput pin) : SV_Target {
             int2 base = int2(floor((priorUv + prevJitterUv) * renderResolution.xy - 0.5));
             float envMin = minDepth * 0.95 - 1e-4;
             float envMax = nearestDepth * 1.05 + 1e-4;
-            bool matchedEnv = false;
-            [unroll]
-            for (int oy = 0; oy <= 1; ++oy) {
-                [unroll]
-                for (int ox = 0; ox <= 1; ++ox) {
-                    float pd2 = prevSceneDepth.Load(int3(clamp(base + int2(ox, oy), int2(0, 0), maxCoord), 0));
-                    if (pd2 >= envMin && pd2 <= envMax) {
-                        matchedEnv = true;
-                    }
-                }
-            }
+            float2 gatherUv = (clamp(float2(base), -1.0, float2(maxCoord)) + 1.0) * renderResolution.zw;
+            float4 prevQuad = prevSceneDepth.GatherRed(pointSampler, gatherUv);
+            bool matchedEnv = any(prevQuad >= envMin && prevQuad <= envMax);
             staticDepthConsistent = matchedEnv ? 1.0 : 0.0;
         }
     }
 
     // 6. Brian Karis Ray-to-AABB Clipping + stationary & slow-pan thin-feature ridge retention
     float3 clampedHistY = ClipToAABB(histY, currentY, finalMin, finalMax);
-    float2 histTexel = resolution.zw;
-    float hL = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(-histTexel.x, 0.0), 0).rgb).x;
-    float hR = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2( histTexel.x, 0.0), 0).rgb).x;
-    float hU = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0, -histTexel.y), 0).rgb).x;
-    float hD = RGBToYCoCg(historyFrame.SampleLevel(pointSampler, priorUv + float2(0.0,  histTexel.y), 0).rgb).x;
+    float hL = RGBToYCoCg(histLeft.rgb).x;
+    float hR = RGBToYCoCg(histRight.rgb).x;
+    float hU = RGBToYCoCg(histUp.rgb).x;
+    float hD = RGBToYCoCg(histDown.rgb).x;
     // Detect isolated 1-pixel ridges/lines (zero on monotonic step edges and flat/bordered blobs).
     float ridgeX = max(0.0, abs(histY.x - 0.5 * (hL + hR)) - 0.5 * abs(hL - hR));
     float ridgeY = max(0.0, abs(histY.x - 0.5 * (hU + hD)) - 0.5 * abs(hU - hD));

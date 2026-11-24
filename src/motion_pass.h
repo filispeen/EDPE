@@ -58,6 +58,7 @@ public:
 
 private:
     bool ensureOutputs(UINT width, UINT height, bool needClassOutput);
+    bool ensureCockpitTileTexture(UINT width, UINT height);
     bool renderInternal(ID3D11ShaderResourceView* depth,
         ID3D11ShaderResourceView* prevDepth,
         ID3D11ShaderResourceView* weaponMotion,
@@ -71,8 +72,17 @@ private:
     Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context_;
     Microsoft::WRL::ComPtr<ID3DDeviceContextState> state_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> compute_;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> compute_full_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> compute_gpu_;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> cockpit_tile_cs_;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> point_sampler_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constants_;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> cockpit_tile_tex_;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> cockpit_tile_uav_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cockpit_tile_srv_;
+    UINT cockpit_tile_w_ = 0;
+    UINT cockpit_tile_h_ = 0;
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> output_texture_;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> output_uav_;

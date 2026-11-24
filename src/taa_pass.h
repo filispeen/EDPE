@@ -31,10 +31,14 @@ public:
         float prevJitterX = 0.0f,
         float prevJitterY = 0.0f,
         float depthB = 0.025f,
-        ID3D11ShaderResourceView* prevDepthSrv = nullptr);
+        ID3D11ShaderResourceView* prevDepthSrv = nullptr,
+        DXGI_FORMAT preferredFormat = DXGI_FORMAT_UNKNOWN);
 
     void resetHistory() { resetRequested_ = true; }
     bool isInitialized() const { return device_ != nullptr; }
+
+    ID3D11Texture2D* latestOutputTexture() const { return historyTexture_[historyReadIdx_].Get(); }
+    ID3D11ShaderResourceView* latestOutputSrv() const { return historySrv_[historyReadIdx_].Get(); }
 
 private:
     bool ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT format);
@@ -49,8 +53,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D11SamplerState> pointSampler_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constantBuffer_;
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> historyTexture_;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> historySrv_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> historyTexture_[2];
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> historySrv_[2];
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> historyRtv_[2];
+    uint32_t historyReadIdx_ = 0;
     uint32_t historyWidth_ = 0;
     uint32_t historyHeight_ = 0;
     DXGI_FORMAT historyFormat_ = DXGI_FORMAT_UNKNOWN;

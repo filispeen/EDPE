@@ -783,7 +783,7 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     const TemporalFrameInputs& inputs,
     ID3D11RenderTargetView* destinationRtv,
     ID3D11Texture2D* destinationTexture) {
-    if (!pass_.isInitialized() || !context || !inputs.color || !destinationTexture) {
+    if (!pass_.isInitialized() || !context || !inputs.color) {
         return false;
     }
 
@@ -864,7 +864,8 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.prevJitterX,
         inputs.prevJitterY,
         inputs.cameraNow.depthB,
-        inputs.prevDepthSrv);
+        inputs.prevDepthSrv,
+        preferredOutputFormat_);
 }
 
 void TaaUpscalerBackend::resetHistory() {
@@ -1134,7 +1135,11 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         EvaluatingUpscalerGuard evalGuard;
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
         if (evalSuccess && currentBackendType_ != UpscalerBackend::AmdFsr && inputs.sharpness > 0.0f) {
-            ID3D11Texture2D* sharpenTarget = destinationTexture ? destinationTexture : inputs.color;
+            ID3D11Texture2D* sharpenTarget = destinationTexture
+                ? destinationTexture
+                : ((currentBackendType_ == UpscalerBackend::Taa && taaBackend_.latestOutputTexture())
+                       ? taaBackend_.latestOutputTexture()
+                       : inputs.color);
             if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr, callerRestoresState)) {
                 static bool s_sharpenFailLogged = false;
                 if (!s_sharpenFailLogged) {

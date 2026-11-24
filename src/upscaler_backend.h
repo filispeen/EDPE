@@ -185,9 +185,14 @@ public:
 
     void resetHistory() override;
 
+    void setPreferredOutputFormat(DXGI_FORMAT fmt) { preferredOutputFormat_ = fmt; }
+    ID3D11Texture2D* latestOutputTexture() const { return pass_.latestOutputTexture(); }
+    ID3D11ShaderResourceView* latestOutputSrv() const { return pass_.latestOutputSrv(); }
+
 private:
     TaaPass pass_;
     ID3D11Device* device_ = nullptr;
+    DXGI_FORMAT preferredOutputFormat_ = DXGI_FORMAT_UNKNOWN;
     ID3D11Texture2D* cachedColorTex_ = nullptr;
     uint32_t cachedColorW_ = 0;
     uint32_t cachedColorH_ = 0;
@@ -254,6 +259,10 @@ public:
 
     void setFsrVelocityFactor(float factor);
     float getFsrVelocityFactor() const;
+
+    void setTaaOutputFormat(DXGI_FORMAT fmt) { taaBackend_.setPreferredOutputFormat(fmt); }
+    ID3D11Texture2D* getTaaLatestOutputTexture() const { return taaBackend_.latestOutputTexture(); }
+    ID3D11ShaderResourceView* getTaaLatestOutputSrv() const { return taaBackend_.latestOutputSrv(); }
 
     void requestReset() { pendingReset_ = true; }
 

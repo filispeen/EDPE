@@ -27,15 +27,48 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
         FAILED(device->CheckFormatSupport(DXGI_FORMAT_R32_FLOAT, &depth_support)) ||
         !(depth_support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE)) return false;
 
-    Microsoft::WRL::ComPtr<ID3DBlob> cs_code, cs_gpu_code;
-    if (FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, nullptr,
-            nullptr, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_code, nullptr)) ||
-        FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, nullptr,
+    const D3D_SHADER_MACRO macrosBase[] = {
+        {"EDPE_MOTION_HAS_WEAPON", "0"},
+        {"EDPE_MOTION_HAS_CELESTIAL", "0"},
+        {nullptr, nullptr}
+    };
+    const D3D_SHADER_MACRO macrosFull[] = {
+        {"EDPE_MOTION_HAS_WEAPON", "1"},
+        {"EDPE_MOTION_HAS_CELESTIAL", "1"},
+        {nullptr, nullptr}
+    };
+    const D3D_SHADER_MACRO macrosTile[] = {
+        {"EDPE_COCKPIT_TILE_PASS", "1"},
+        {nullptr, nullptr}
+    };
+
+    Microsoft::WRL::ComPtr<ID3DBlob> cs_base_code, cs_full_code, cs_gpu_code, cs_tile_code;
+    if (FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, macrosBase,
+            nullptr, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_base_code, nullptr)) ||
+        FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, macrosFull,
+            nullptr, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_full_code, nullptr)) ||
+        FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, macrosBase,
             nullptr, "cs_gpu", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_gpu_code, nullptr)) ||
-        FAILED(device->CreateComputeShader(cs_code->GetBufferPointer(),
-            cs_code->GetBufferSize(), nullptr, &compute_)) ||
+        FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, macrosTile,
+            nullptr, "cs_cockpit_tiles", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_tile_code, nullptr)) ||
+        FAILED(device->CreateComputeShader(cs_base_code->GetBufferPointer(),
+            cs_base_code->GetBufferSize(), nullptr, &compute_)) ||
+        FAILED(device->CreateComputeShader(cs_full_code->GetBufferPointer(),
+            cs_full_code->GetBufferSize(), nullptr, &compute_full_)) ||
         FAILED(device->CreateComputeShader(cs_gpu_code->GetBufferPointer(),
-            cs_gpu_code->GetBufferSize(), nullptr, &compute_gpu_))) return false;
+            cs_gpu_code->GetBufferSize(), nullptr, &compute_gpu_)) ||
+        FAILED(device->CreateComputeShader(cs_tile_code->GetBufferPointer(),
+            cs_tile_code->GetBufferSize(), nullptr, &cockpit_tile_cs_))) return false;
+
+    D3D11_SAMPLER_DESC sampDesc{};
+    sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sampDesc.MinLOD = 0.0f;
+    sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(device->CreateSamplerState(&sampDesc, &point_sampler_))) return false;
 
     D3D11_BUFFER_DESC desc{};
     desc.ByteWidth = 36 * sizeof(float);
@@ -43,6 +76,48 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (FAILED(device->CreateBuffer(&desc, nullptr, &constants_))) return false;
     device_ = device;
+    return true;
+}
+
+bool MotionPass::ensureCockpitTileTexture(UINT width, UINT height) {
+    if (!device_ || !width || !height) return false;
+    const UINT tileW = (width + 15u) / 16u;
+    const UINT tileH = (height + 15u) / 16u;
+    if (cockpit_tile_tex_ && cockpit_tile_uav_ && cockpit_tile_srv_ &&
+        cockpit_tile_w_ == tileW && cockpit_tile_h_ == tileH) {
+        return true;
+    }
+
+    cockpit_tile_tex_.Reset();
+    cockpit_tile_uav_.Reset();
+    cockpit_tile_srv_.Reset();
+    cockpit_tile_w_ = 0;
+    cockpit_tile_h_ = 0;
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = tileW;
+    td.Height = tileH;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> uav;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+    if (FAILED(device_->CreateTexture2D(&td, nullptr, &tex)) ||
+        FAILED(device_->CreateUnorderedAccessView(tex.Get(), nullptr, &uav)) ||
+        FAILED(device_->CreateShaderResourceView(tex.Get(), nullptr, &srv))) {
+        return false;
+    }
+
+    cockpit_tile_tex_ = tex;
+    cockpit_tile_uav_ = uav;
+    cockpit_tile_srv_ = srv;
+    cockpit_tile_w_ = tileW;
+    cockpit_tile_h_ = tileH;
+    SetD3D11DebugName(cockpit_tile_tex_.Get(), "EDPE_CockpitMotionTiles");
     return true;
 }
 
@@ -309,6 +384,19 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     if (!celestialRecords) flags &= ~32;
     if (activeStencilSrv) flags |= 128;
     else flags &= ~128;
+
+    const bool useWeapon = ((flags & 16) != 0);
+    const bool useCelestial = ((flags & 32) != 0);
+    const bool clampCockpit = ((flags & 64) != 0);
+    const bool useCockpitTiles =
+        (!now) && useWeapon && clampCockpit && activeStencilSrv && cockpit_tile_cs_ &&
+        ensureCockpitTileTexture(width, height);
+    if (useCockpitTiles) {
+        flags |= 256;
+    } else {
+        flags &= ~256;
+    }
+
     patched[31] = static_cast<float>(flags);
     context_->UpdateSubresource(constants_.Get(), 0, nullptr, patched, 0, 0);
 
@@ -317,8 +405,25 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
         context_->SwapDeviceContextState(state_.Get(), &prior);
     }
 
-    ID3D11ShaderResourceView* srvs[5] = {
-        depth, prevDepth, weaponMotion, activeStencilSrv, celestialRecords
+    if (useCockpitTiles) {
+        ID3D11Buffer* tileCb = constants_.Get();
+        ID3D11ShaderResourceView* tileSrvs[2] = {weaponMotion, activeStencilSrv};
+        ID3D11UnorderedAccessView* tileUav = cockpit_tile_uav_.Get();
+        context_->CSSetShader(cockpit_tile_cs_.Get(), nullptr, 0);
+        context_->CSSetConstantBuffers(0, 1, &tileCb);
+        context_->CSSetShaderResources(2, 2, tileSrvs);
+        context_->CSSetUnorderedAccessViews(0, 1, &tileUav, nullptr);
+        context_->Dispatch(cockpit_tile_w_, cockpit_tile_h_, 1u);
+
+        ID3D11UnorderedAccessView* nullTileUav = nullptr;
+        ID3D11ShaderResourceView* nullTileSrvs[2] = {nullptr, nullptr};
+        context_->CSSetUnorderedAccessViews(0, 1, &nullTileUav, nullptr);
+        context_->CSSetShaderResources(2, 2, nullTileSrvs);
+    }
+
+    ID3D11ShaderResourceView* srvs[6] = {
+        depth, prevDepth, weaponMotion, activeStencilSrv, celestialRecords,
+        useCockpitTiles ? cockpit_tile_srv_.Get() : nullptr
     };
     ID3D11UnorderedAccessView* uavs[3] = {
         output_uav_.Get(),
@@ -326,17 +431,24 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
         (enableClassOutput && class_output_uav_) ? class_output_uav_.Get() : nullptr
     };
     ID3D11Buffer* buffers[3] = {constants_.Get(), now, previous};
+    ID3D11SamplerState* smp = point_sampler_.Get();
+    ID3D11ComputeShader* activeCs = now
+        ? compute_gpu_.Get()
+        : ((useWeapon || useCelestial) ? compute_full_.Get() : compute_.Get());
 
-    context_->CSSetShader(now ? compute_gpu_.Get() : compute_.Get(), nullptr, 0);
+    context_->CSSetShader(activeCs, nullptr, 0);
+    context_->CSSetSamplers(0, 1, &smp);
     context_->CSSetConstantBuffers(0, now ? 3 : 1, buffers);
-    context_->CSSetShaderResources(0, 5, srvs);
+    context_->CSSetShaderResources(0, 6, srvs);
     context_->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
     context_->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
 
     ID3D11UnorderedAccessView* empty_uavs[3] = {nullptr, nullptr, nullptr};
-    ID3D11ShaderResourceView* empty_srvs[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    ID3D11ShaderResourceView* empty_srvs[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    ID3D11SamplerState* null_smp = nullptr;
     context_->CSSetUnorderedAccessViews(0, 3, empty_uavs, nullptr);
-    context_->CSSetShaderResources(0, 5, empty_srvs);
+    context_->CSSetShaderResources(0, 6, empty_srvs);
+    context_->CSSetSamplers(0, 1, &null_smp);
     context_->CSSetShader(nullptr, nullptr, 0);
 
     if (preserveContextState) {

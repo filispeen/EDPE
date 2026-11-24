@@ -11666,12 +11666,21 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         bool compOk = false;
         bool upscalerEvalOk = false;
         const bool preAllowBackbufferWrite = (s_diag_eval_stage == 1) || chosenIsBackbuffer;
+        const bool useTaaZeroCopy =
+            (activeBackend == edpe::UpscalerBackend::Taa) &&
+            !isHdrColor &&
+            !s_cmp_seq.active &&
+            !s_hud_debug_view.load(std::memory_order_relaxed) &&
+            (inputs.sharpness <= 0.0f ||
+             (preAllowBackbufferWrite && (s_backbuffer_rtv != nullptr || s_backbuffer_uav != nullptr) && !fg_active));
+        if (useTaaZeroCopy) {
+            upscaler.setTaaOutputFormat(outFormat);
+        }
         const bool canDeferSharpen =
             (activeBackend != edpe::UpscalerBackend::AmdFsr) &&
             (inputs.sharpness > 0.0f) &&
             !isHdrColor &&
-            (evalDestination == s_dlss_output_texture.Get()) &&
-            (s_dlss_output_srv != nullptr) &&
+            ((evalDestination == s_dlss_output_texture.Get() && s_dlss_output_srv != nullptr) || useTaaZeroCopy) &&
             preAllowBackbufferWrite &&
             (s_backbuffer_rtv != nullptr || s_backbuffer_uav != nullptr) &&
             !fg_active;
@@ -11683,7 +11692,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         {
             edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: UpscaleEval");
             s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UpscaleEval);
-            upscalerEvalOk = upscaler.evaluate(context, evalInputs, nullptr, evalDestination, true);
+            upscalerEvalOk = upscaler.evaluate(
+                context, evalInputs, nullptr, useTaaZeroCopy ? nullptr : evalDestination, true);
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::UpscaleEval);
         }
         rearmContextHooks();
@@ -11743,10 +11753,16 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 visorWasDiverted ||
                 s_hud_debug_view.load(std::memory_order_relaxed);
 
+            ID3D11Texture2D* resolvedWorldTex =
+                useTaaZeroCopy ? upscaler.getTaaLatestOutputTexture() : evalDestination;
+            ID3D11ShaderResourceView* resolvedWorldSrv =
+                useTaaZeroCopy ? upscaler.getTaaLatestOutputSrv() : s_dlss_output_srv.Get();
+            const bool hasOffscreenWorldOutput =
+                (resolvedWorldTex != nullptr && resolvedWorldTex != backbuffer && resolvedWorldSrv != nullptr);
+
             const bool canCompositeUi = (s_preserve_native_ui.load(std::memory_order_relaxed) &&
                                          hasHudThisFrame &&
-                                         evalDestination == s_dlss_output_texture.Get() &&
-                                         s_dlss_output_srv &&
+                                         hasOffscreenWorldOutput &&
                                          ((allowBackbufferWrite && s_backbuffer_rtv) || s_backbuffer_uav || s_comp_final_uav) &&
                                          (hudWasDiverted || visorWasDiverted || colorSource != backbuffer));
             s_diag_composite_path = canCompositeUi ? 1 : 2;
@@ -11756,10 +11772,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             auto deliverWorldToBackbuffer = [&]() {
                 if (!allowBackbufferWrite) return;
                 const bool directBlitSharpened =
-                    (deferredSharpen > 0.0f && s_backbuffer_rtv && s_dlss_output_srv) &&
+                    (deferredSharpen > 0.0f && s_backbuffer_rtv && resolvedWorldSrv) &&
                     upscaler.applySharpenToRtv(
                         context,
-                        s_dlss_output_srv.Get(),
+                        resolvedWorldSrv,
                         s_backbuffer_rtv.Get(),
                         backbufferDesc.Width,
                         backbufferDesc.Height,
@@ -11767,7 +11783,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                         /*hdr=*/false,
                         /*callerRestoresState=*/true);
                 if (!directBlitSharpened) {
-                    context->CopyResource(backbuffer, s_dlss_output_texture.Get());
+                    context->CopyResource(backbuffer, resolvedWorldTex);
                 }
             };
             if (canCompositeUi) {
@@ -11791,7 +11807,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 if (allowBackbufferWrite && s_backbuffer_rtv) {
                     compOk = edpe::UiLayer::instance().compositeToRtv(
                         context,
-                        s_dlss_output_srv.Get(),
+                        resolvedWorldSrv,
                         s_backbuffer_rtv.Get(),
                         backbufferDesc.Width,
                         backbufferDesc.Height,
@@ -11804,7 +11820,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     if (targetUav) {
                         compOk = edpe::UiLayer::instance().composite(
                             context,
-                            s_dlss_output_srv.Get(),
+                            resolvedWorldSrv,
                             targetUav,
                             backbufferDesc.Width,
                             backbufferDesc.Height,
@@ -11819,15 +11835,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     deliverWorldToBackbuffer();
                     compOk = true;
                 }
-            } else if (evalDestination == s_dlss_output_texture.Get()) {
+            } else if (hasOffscreenWorldOutput) {
                 deliverWorldToBackbuffer();
                 compOk = true;
             } else {
                 compOk = true;
             }
             s_last_fg_composite_path = s_diag_composite_path;
-            if (!isHdrColor && evalDestination == s_dlss_output_texture.Get() && s_dlss_output_texture) {
-                s_last_fg_hudless_texture = s_dlss_output_texture;
+            if (!isHdrColor && hasOffscreenWorldOutput) {
+                s_last_fg_hudless_texture = resolvedWorldTex;
             } else {
                 s_last_fg_hudless_texture.Reset();
             }
@@ -11914,7 +11930,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
 
         {
-            const bool evalToIntermediate = (evalDestination == s_dlss_output_texture.Get());
+            const bool evalToIntermediate = useTaaZeroCopy || (evalDestination == s_dlss_output_texture.Get());
             static bool s_path_state_valid = false;
             static ID3D11Texture2D* s_prev_color_source = nullptr;
             static DXGI_FORMAT s_prev_color_format = DXGI_FORMAT_UNKNOWN;
