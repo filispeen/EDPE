@@ -172,10 +172,18 @@ bool D3D12ProxyPresenter::initialize(ID3D11Device* d3d11Device,
     bufferCount_ = scDesc.BufferCount;
     swapChainFlags_ = scDesc.Flags;
 
+    slotPresentFence_.fill(0);
     if (!acquireBackBuffers() || !ensureSharedInput(width_, height_, format_) ||
         !ensureTimestampQueries()) {
         releaseBackBuffers();
-        sharedInput_.reset();
+        for (auto& s : sharedInputs_) {
+            s.reset();
+        }
+        if (mappedTimestamps_ && queryReadback_) {
+            const D3D12_RANGE emptyRange{0, 0};
+            queryReadback_->Unmap(0, &emptyRange);
+            mappedTimestamps_ = nullptr;
+        }
         queryReadback_.Reset();
         queryHeap_.Reset();
         swapChain_.Reset();
@@ -193,7 +201,15 @@ void D3D12ProxyPresenter::shutdown() {
     // Caller may hold presentResizeMutex_ (initialize) or call externally; guard safely.
     bridge_.waitGpuIdle();
     releaseBackBuffers();
-    sharedInput_.reset();
+    for (auto& s : sharedInputs_) {
+        s.reset();
+    }
+    slotPresentFence_.fill(0);
+    if (mappedTimestamps_ && queryReadback_) {
+        const D3D12_RANGE emptyRange{0, 0};
+        queryReadback_->Unmap(0, &emptyRange);
+        mappedTimestamps_ = nullptr;
+    }
     queryReadback_.Reset();
     queryHeap_.Reset();
     slotHasTimestamp_.fill(false);
@@ -234,26 +250,51 @@ void D3D12ProxyPresenter::releaseBackBuffers() {
 }
 
 bool D3D12ProxyPresenter::ensureSharedInput(uint32_t width, uint32_t height, DXGI_FORMAT format) {
-    if (sharedInput_.isValid() && sharedInput_.width == width &&
-        sharedInput_.height == height && sharedInput_.format == format) {
+    bool allValid = true;
+    for (const auto& s : sharedInputs_) {
+        if (!s.isValid() || s.width != width || s.height != height || s.format != format) {
+            allValid = false;
+            break;
+        }
+    }
+    if (allValid) {
         return true;
     }
-    sharedInput_.reset();
-    if (!bridge_.createSharedTexture(
-            width, height, format,
-            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
-            sharedInput_)) {
-        return false;
+    for (auto& s : sharedInputs_) {
+        s.reset();
     }
-    SetD3D11DebugName(sharedInput_.d3d11.Get(), "EDPE_PresenterSharedIn_D3D11");
-    SetD3D12DebugName(sharedInput_.d3d12.Get(), "EDPE_PresenterSharedIn_D3D12");
+    for (uint32_t i = 0; i < D3D11D3D12Bridge::kAllocatorCount; ++i) {
+        if (!bridge_.createSharedTexture(
+                width, height, format,
+                D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+                sharedInputs_[i])) {
+            for (auto& s : sharedInputs_) {
+                s.reset();
+            }
+            return false;
+        }
+        char n11[64]{};
+        char n12[64]{};
+        std::snprintf(n11, sizeof(n11), "EDPE_PresenterSharedIn_%u_D3D11", i);
+        std::snprintf(n12, sizeof(n12), "EDPE_PresenterSharedIn_%u_D3D12", i);
+        SetD3D11DebugName(sharedInputs_[i].d3d11.Get(), n11);
+        SetD3D12DebugName(sharedInputs_[i].d3d12.Get(), n12);
+    }
     return true;
 }
 
 bool D3D12ProxyPresenter::ensureTimestampQueries() {
-    if (queryHeap_ && queryReadback_) return true;
+    if (queryHeap_ && queryReadback_ && mappedTimestamps_) return true;
     auto* dev = bridge_.d3d12Device();
     if (!dev) return false;
+
+    if (mappedTimestamps_ && queryReadback_) {
+        const D3D12_RANGE emptyRange{0, 0};
+        queryReadback_->Unmap(0, &emptyRange);
+        mappedTimestamps_ = nullptr;
+    }
+    queryReadback_.Reset();
+    queryHeap_.Reset();
 
     constexpr uint32_t kSlots = D3D11D3D12Bridge::kAllocatorCount;
     D3D12_QUERY_HEAP_DESC qh{};
@@ -279,6 +320,15 @@ bool D3D12ProxyPresenter::ensureTimestampQueries() {
         queryHeap_.Reset();
         return false;
     }
+
+    const D3D12_RANGE fullReadRange{0, sizeof(uint64_t) * kSlots * 2};
+    void* mapped = nullptr;
+    if (FAILED(queryReadback_->Map(0, &fullReadRange, &mapped)) || !mapped) {
+        queryReadback_.Reset();
+        queryHeap_.Reset();
+        return false;
+    }
+    mappedTimestamps_ = static_cast<uint64_t*>(mapped);
     slotHasTimestamp_.fill(false);
     return true;
 }
@@ -293,8 +343,11 @@ bool D3D12ProxyPresenter::resizeBuffers(uint32_t bufferCount,
 
     bridge_.waitGpuIdle();
     lastPresentDoneFence_ = 0;
+    slotPresentFence_.fill(0);
     releaseBackBuffers();
-    sharedInput_.reset();
+    for (auto& s : sharedInputs_) {
+        s.reset();
+    }
     slotHasTimestamp_.fill(false);
 
     const DXGI_SWAP_CHAIN_DESC1 nextDesc = sanitizeFlipSwapChainDesc(
@@ -347,6 +400,14 @@ bool D3D12ProxyPresenter::waitForLastPresentOnD3D11(ID3D11DeviceContext4* ctx4) 
     return bridge_.waitOnD3D11(ctx4, lastPresentDoneFence_);
 }
 
+void D3D12ProxyPresenter::waitForSharedSlotOnD3D11(ID3D11DeviceContext4* ctx4, uint32_t slot) const {
+    if (!initialized_ || !ctx4 || slot >= D3D11D3D12Bridge::kAllocatorCount) return;
+    const uint64_t fence = slotPresentFence_[slot];
+    if (fence != 0) {
+        bridge_.waitOnD3D11(ctx4, fence);
+    }
+}
+
 IDXGISwapChain4* D3D12ProxyPresenter::detachSwapChainForWrap() {
     bridge_.waitGpuIdle();
     releaseBackBuffers();
@@ -394,12 +455,15 @@ bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
                                                   UINT syncInterval,
                                                   UINT flags,
                                                   HRESULT* outPresentHr,
-                                                  double* outGpuCopyMs) {
+                                                  double* outGpuCopyMs,
+                                                  bool callerWaitedForSlot) {
     if (outPresentHr) *outPresentHr = E_FAIL;
     if (outGpuCopyMs) *outGpuCopyMs = 0.0;
 
     std::shared_lock lock(presentResizeMutex_);
-    if (!initialized_ || !ctx4 || !srcD3D11 || !swapChain_ || !sharedInput_.isValid()) {
+    const uint32_t expectedSlot = bridge_.nextAllocatorSlot();
+    if (!initialized_ || !ctx4 || !srcD3D11 || !swapChain_ ||
+        !sharedInputs_[expectedSlot].isValid()) {
         return false;
     }
 
@@ -407,38 +471,30 @@ bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
     if (bbIdx >= backBuffers_.size() || !backBuffers_[bbIdx]) return false;
     ID3D12Resource* backBuffer = backBuffers_[bbIdx].Get();
 
-    // 1. Wait on GPU for prior D3D12 Present/FG reads before overwriting sharedInput_.
-    if (lastPresentDoneFence_ != 0) {
-        bridge_.waitOnD3D11(ctx4, lastPresentDoneFence_);
+    // 1. Wait on GPU for prior D3D12 Present/FG reads on this ring slot before overwriting it.
+    if (!callerWaitedForSlot && slotPresentFence_[expectedSlot] != 0) {
+        bridge_.waitOnD3D11(ctx4, slotPresentFence_[expectedSlot]);
     }
-    ctx4->CopyResource(sharedInput_.d3d11.Get(), srcD3D11);
+    ctx4->CopyResource(sharedInputs_[expectedSlot].d3d11.Get(), srcD3D11);
 
     // 2. Open D3D12 command list and read prior timestamp for this allocator ring slot non-blockingly.
     uint32_t slot = 0;
     auto* cmdList = bridge_.beginCommandList(slot);
     if (!cmdList) return false;
 
-    if (outGpuCopyMs && slotHasTimestamp_[slot] && queryReadback_ && bridge_.timestampFrequency() > 0) {
-        uint64_t* mappedTs = nullptr;
-        const D3D12_RANGE readRange{
-            sizeof(uint64_t) * slot * 2,
-            sizeof(uint64_t) * (slot * 2 + 2)
-        };
-        if (SUCCEEDED(queryReadback_->Map(0, &readRange, reinterpret_cast<void**>(&mappedTs)))) {
-            const uint64_t t0 = mappedTs[slot * 2];
-            const uint64_t t1 = mappedTs[slot * 2 + 1];
-            const D3D12_RANGE emptyRange{0, 0};
-            queryReadback_->Unmap(0, &emptyRange);
-            if (t1 >= t0) {
-                *outGpuCopyMs = static_cast<double>(t1 - t0) /
-                                (static_cast<double>(bridge_.timestampFrequency()) / 1000.0);
-            }
+    const bool recordTiming = telemetryTimingEnabled_.load(std::memory_order_relaxed);
+    if (outGpuCopyMs && slotHasTimestamp_[slot] && mappedTimestamps_ && bridge_.timestampFrequency() > 0) {
+        const uint64_t t0 = mappedTimestamps_[slot * 2];
+        const uint64_t t1 = mappedTimestamps_[slot * 2 + 1];
+        if (t1 >= t0) {
+            *outGpuCopyMs = static_cast<double>(t1 - t0) /
+                            (static_cast<double>(bridge_.timestampFrequency()) / 1000.0);
         }
     }
 
     {
         ScopedD3D12RenderDocEvent ev(cmdList, L"EDPE: D3D12ProxyPresentBlit");
-        if (queryHeap_ && queryReadback_) {
+        if (recordTiming && queryHeap_ && queryReadback_) {
             cmdList->EndQuery(queryHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
         }
 
@@ -446,29 +502,28 @@ bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
             prePresentCb_(cmdList, prePresentUserCtx_);
         }
 
-        D3D11D3D12Bridge::transitionResource(
-            cmdList, sharedInput_.d3d12.Get(),
-            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        D3D11D3D12Bridge::transitionResource(
-            cmdList, backBuffer,
-            D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        ID3D12Resource* sharedD3D12 = sharedInputs_[slot].d3d12.Get();
+        D3D11D3D12Bridge::transitionResources2(
+            cmdList,
+            sharedD3D12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
 
-        cmdList->CopyResource(backBuffer, sharedInput_.d3d12.Get());
+        cmdList->CopyResource(backBuffer, sharedD3D12);
 
-        D3D11D3D12Bridge::transitionResource(
-            cmdList, backBuffer,
-            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-        D3D11D3D12Bridge::transitionResource(
-            cmdList, sharedInput_.d3d12.Get(),
-            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        D3D11D3D12Bridge::transitionResources2(
+            cmdList,
+            backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT,
+            sharedD3D12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 
-        if (queryHeap_ && queryReadback_) {
+        if (recordTiming && queryHeap_ && queryReadback_) {
             cmdList->EndQuery(queryHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
             cmdList->ResolveQueryData(
                 queryHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                 slot * 2, 2,
                 queryReadback_.Get(), sizeof(uint64_t) * slot * 2);
             slotHasTimestamp_[slot] = true;
+        } else {
+            slotHasTimestamp_[slot] = false;
         }
     }
 
@@ -492,6 +547,7 @@ bool D3D12ProxyPresenter::presentFromD3D11Texture(ID3D11DeviceContext4* ctx4,
     }
     const uint64_t postPresentFence = bridge_.signalD3D12Queue();
     if (postPresentFence != 0) {
+        slotPresentFence_[slot] = postPresentFence;
         lastPresentDoneFence_ = postPresentFence;
     }
     if (outPresentHr) *outPresentHr = presentHr;

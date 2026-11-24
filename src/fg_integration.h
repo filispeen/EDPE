@@ -6,6 +6,8 @@
 
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 
@@ -15,6 +17,7 @@ namespace edpe {
 struct FgSceneSnapshot {
     bool valid = false;
     ID3D11Texture2D* hudlessColorTex = nullptr;
+    ID3D11Texture2D* depthTex = nullptr;
     ID3D11ShaderResourceView* depthSrv = nullptr;
     ID3D11Texture2D* motionVectorsTex = nullptr;
     ID3D11ShaderResourceView* uiHdrSrv = nullptr;
@@ -102,6 +105,11 @@ public:
     bool fgDebugView() const;
     const wchar_t* backendUnavailableReason(FrameGenerationBackend backend) const;
 
+    void setTelemetryTimingEnabled(bool enabled);
+    void setFrameLimitFps(float maxFps);
+    bool isReflexFrameLimiterActive() const;
+    void onMainSceneRenderStart();
+
     // Custom window message dispatcher invoked from edpeWndProc on gameHwnd's UI thread
     // so the WS_CHILD overlay HWND is created/resized/destroyed on the owning thread.
     static bool handleWindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* outResult);
@@ -125,7 +133,8 @@ private:
     bool extractDepthToShared(ID3D11DeviceContext* ctx,
                               ID3D11ShaderResourceView* depthSrv,
                               uint32_t renderW,
-                              uint32_t renderH);
+                              uint32_t renderH,
+                              uint32_t slot);
     void releaseBridgeResources();
     void shutdownLocked();
     const wchar_t* backendUnavailableReasonLocked(FrameGenerationBackend backend) const;
@@ -144,17 +153,27 @@ private:
     HWND overlayHwnd_ = nullptr;
     ATOM overlayClassAtom_ = 0;
 
+    Microsoft::WRL::ComPtr<ID3D11Device> cachedDev11_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> cachedCtx11_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext4> cachedCtx4_;
+    HWND cachedScHwnd_ = nullptr;
+
     D3D12ProxyPresenter presenter_;
     FrameGenerationManager manager_;
     FgUiPackPass uiPackPass_;
 
-    SharedBridgeTexture sharedHudless_;
-    SharedBridgeTexture sharedUi_;
-    SharedBridgeTexture sharedDepth_;
-    SharedBridgeTexture sharedMvec_;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> sharedUiUav_;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> sharedDepthUav_;
+    static constexpr uint32_t kSharedSlotCount = D3D11D3D12Bridge::kAllocatorCount;
+    std::array<SharedBridgeTexture, kSharedSlotCount> sharedHudless_{};
+    std::array<SharedBridgeTexture, kSharedSlotCount> sharedUi_{};
+    std::array<SharedBridgeTexture, kSharedSlotCount> sharedDepth_{};
+    std::array<SharedBridgeTexture, kSharedSlotCount> sharedMvec_{};
+    std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>, kSharedSlotCount> sharedUiUav_{};
+    std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>, kSharedSlotCount> sharedDepthUav_{};
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> depthExtractCs_;
+
+    std::atomic<bool> nvidiaFgActive_{false};
+    std::atomic<bool> reflexLimiterActive_{false};
+    std::atomic<float> frameLimitFps_{0.0f};
 
     uint64_t monotonicFrameIndex_ = 0;
     double lastCopyMs_ = 0.0;

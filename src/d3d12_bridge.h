@@ -60,6 +60,18 @@ public:
                                    D3D12_RESOURCE_STATES before,
                                    D3D12_RESOURCE_STATES after);
 
+    // Emits up to two D3D12 resource state transition barriers in a single ResourceBarrier call.
+    static void transitionResources2(ID3D12GraphicsCommandList* cmdList,
+                                     ID3D12Resource* res0,
+                                     D3D12_RESOURCE_STATES before0,
+                                     D3D12_RESOURCE_STATES after0,
+                                     ID3D12Resource* res1,
+                                     D3D12_RESOURCE_STATES before1,
+                                     D3D12_RESOURCE_STATES after1);
+
+    // Returns the allocator ring slot index that the next beginCommandList() call will use.
+    uint32_t nextAllocatorSlot() const { return frameCounter_ % kAllocatorCount; }
+
     // Opens a fresh command list for the next allocator ring slot (waits only if slot is still in flight).
     ID3D12GraphicsCommandList* beginCommandList(uint32_t& outSlot, bool* outDidCpuWait = nullptr);
 

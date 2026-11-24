@@ -12976,6 +12976,11 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             }
             if (sceneDevice) sceneDevice->Release();
             s_inside_main_scene.store(true, std::memory_order_release);
+            static unsigned long long s_last_main_scene_marker_frame = ~0ull;
+            if (s_last_main_scene_marker_frame != current_frame) {
+                s_last_main_scene_marker_frame = current_frame;
+                edpe::FgRuntime::instance().onMainSceneRenderStart();
+            }
             for (UINT slot = 0; slot < 4; ++slot) {
                 ID3D11Resource* gbRes = nullptr;
                 targets[slot]->GetResource(&gbRes);
@@ -15822,6 +15827,7 @@ bool ContextCensusGetFgSnapshot(edpe::FgSceneSnapshot* outSnapshot) {
     }
     outSnapshot->valid = true;
     outSnapshot->hudlessColorTex = s_last_fg_hudless_texture.Get();
+    outSnapshot->depthTex = s_last_temporal_inputs.depth;
     outSnapshot->depthSrv = s_last_temporal_inputs.depthSrv;
     outSnapshot->motionVectorsTex = s_last_fg_motion_tex.Get();
     if (s_last_fg_composite_path == 1) {

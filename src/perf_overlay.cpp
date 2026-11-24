@@ -159,6 +159,7 @@ void PerfTracker::onPresentStart(IDXGISwapChain* swapChain) {
     const bool menuOpen = UiMenuVisible();
     const bool uiOrStatsNeeded = cfg.showPerfOverlay || menuOpen || cfg.enableProfiler || cfg.captureOverlayInComparison;
     upscaler.setTelemetryVisibility(uiOrStatsNeeded, menuOpen);
+    edpe::FgRuntime::instance().setTelemetryTimingEnabled(uiOrStatsNeeded);
     if (!uiOrStatsNeeded) {
         return;
     }

@@ -24,6 +24,8 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -304,6 +306,10 @@ struct NvidiaStreamlineFgBackend::Impl {
     bool activeInLastEvaluate = false;
     bool probeAttempted = false;
     uint32_t lastAppliedReflexMode = 0;
+    float frameLimitFps = 0.0f;
+    uint32_t lastAppliedFrameLimitUs = 0;
+    std::atomic<bool> reflexFrameLimiterActive{false};
+    std::atomic<bool> renderSubmitStartedThisFrame{false};
 
     StreamlineStatusSnapshot snapshot{};
 
@@ -316,6 +322,8 @@ struct NvidiaStreamlineFgBackend::Impl {
     sl::FrameToken* pendingNextToken = nullptr;
     uint32_t pendingNextFrameIdx = 0;
     bool hasPendingNextToken = false;
+    bool hasCachedDlssgOpts = false;
+    sl::DLSSGOptions cachedDlssgOpts{};
     Microsoft::WRL::ComPtr<ID3D12Device> slProxyDevice;
     Microsoft::WRL::ComPtr<IDXGIFactory4> slProxyFactory;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> slProxyQueue;
@@ -373,10 +381,12 @@ struct NvidiaStreamlineFgBackend::Impl {
                         offOpts.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
                         self->sl.slDLSSGSetOptions(self->viewport, offOpts);
                     }
+                    self->hasCachedDlssgOpts = false;
                     self->activeInLastEvaluate = false;
                 }
             }
         }
+        self->renderSubmitStartedThisFrame.store(false, std::memory_order_relaxed);
         if (self->hasCurrentFrameIdx && self->sl.slGetNewFrameToken) {
             const uint32_t nextIdx = self->currentFrameIdx + 1u;
             sl::FrameToken* nextTok = nullptr;
@@ -606,11 +616,28 @@ struct NvidiaStreamlineFgBackend::Impl {
 
     bool applyReflexOptions(sl::ReflexMode mode) {
         if (!sl.slReflexSetOptions || !snapshot.reflexSupported) return false;
+        const uint32_t desiredLimitUs =
+            (frameLimitFps > 0.0f)
+                ? static_cast<uint32_t>(
+                      (std::max)(1L, std::lround(1000000.0 / static_cast<double>(frameLimitFps))))
+                : 0u;
+        if (lastAppliedReflexMode == static_cast<uint32_t>(mode) &&
+            lastAppliedFrameLimitUs == desiredLimitUs) {
+            reflexFrameLimiterActive.store(
+                mode != sl::ReflexMode::eOff && desiredLimitUs > 0u,
+                std::memory_order_relaxed);
+            return true;
+        }
         sl::ReflexOptions ro{};
         ro.mode = mode;
+        ro.frameLimitUs = desiredLimitUs;
         const sl::Result r = sl.slReflexSetOptions(ro);
         if (r == sl::Result::eOk) {
             lastAppliedReflexMode = static_cast<uint32_t>(mode);
+            lastAppliedFrameLimitUs = desiredLimitUs;
+            reflexFrameLimiterActive.store(
+                mode != sl::ReflexMode::eOff && desiredLimitUs > 0u,
+                std::memory_order_relaxed);
             if (sl.slPCLSetOptions && snapshot.pclSupported) {
                 sl::PCLOptions po{};
                 po.virtualKey = sl::PCLHotKey::eUsePingMessage;
@@ -793,6 +820,12 @@ bool NvidiaStreamlineFgBackend::initialize(D3D12ProxyPresenter* presenter) {
     impl_->slProxyFactory->MakeWindowAssociation(presenter->targetHwnd(), DXGI_MWA_NO_ALT_ENTER);
 
     // Enable mandatory SL Reflex before any DLSS-G evaluation.
+    impl_->lastAppliedReflexMode = 0;
+    impl_->lastAppliedFrameLimitUs = 0;
+    impl_->reflexFrameLimiterActive.store(false, std::memory_order_relaxed);
+    impl_->renderSubmitStartedThisFrame.store(false, std::memory_order_relaxed);
+    impl_->hasCachedDlssgOpts = false;
+    impl_->cachedDlssgOpts = {};
     impl_->applyReflexOptions(impl_->lowLatencyBoost
                                   ? sl::ReflexMode::eLowLatencyWithBoost
                                   : sl::ReflexMode::eLowLatency);
@@ -880,6 +913,12 @@ void NvidiaStreamlineFgBackend::shutdown() {
     impl_->pendingNextToken = nullptr;
     impl_->pendingNextFrameIdx = 0;
     impl_->hasPendingNextToken = false;
+    impl_->hasCachedDlssgOpts = false;
+    impl_->cachedDlssgOpts = {};
+    impl_->lastAppliedReflexMode = 0;
+    impl_->lastAppliedFrameLimitUs = 0;
+    impl_->reflexFrameLimiterActive.store(false, std::memory_order_relaxed);
+    impl_->renderSubmitStartedThisFrame.store(false, std::memory_order_relaxed);
     impl_->swapChainWrapped = false;
     impl_->presenter = nullptr;
     impl_->initialized = false;
@@ -898,16 +937,19 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     if (!impl_->initialized || !impl_->presenter || !cmdList) return false;
 
     const uint32_t frameIdx32 = static_cast<uint32_t>(inputs.frameIndex & 0xFFFFFFFFu);
+    bool usedPendingToken = false;
     sl::FrameToken* token = nullptr;
     if (impl_->hasPendingNextToken && impl_->pendingNextToken &&
         impl_->pendingNextFrameIdx == frameIdx32) {
         token = impl_->pendingNextToken;
         impl_->pendingNextToken = nullptr;
         impl_->hasPendingNextToken = false;
+        usedPendingToken = true;
     } else {
         impl_->pendingNextToken = nullptr;
         impl_->hasPendingNextToken = false;
         if (impl_->sl.slGetNewFrameToken(token, &frameIdx32) != sl::Result::eOk || !token) {
+            impl_->renderSubmitStartedThisFrame.store(false, std::memory_order_relaxed);
             return false;
         }
         if (impl_->sl.slReflexSleep && impl_->snapshot.reflexSupported) {
@@ -921,7 +963,9 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     impl_->currentFrameIdx = frameIdx32;
     impl_->hasCurrentFrameIdx = true;
 
-    if (impl_->sl.slPCLSetMarker && impl_->snapshot.pclSupported) {
+    const bool earlyRenderSubmit =
+        impl_->renderSubmitStartedThisFrame.exchange(false, std::memory_order_acq_rel) && usedPendingToken;
+    if (!earlyRenderSubmit && impl_->sl.slPCLSetMarker && impl_->snapshot.pclSupported) {
         impl_->sl.slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *token);
         impl_->sl.slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *token);
     }
@@ -929,9 +973,7 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     const sl::ReflexMode desiredReflex = impl_->lowLatencyBoost
                                              ? sl::ReflexMode::eLowLatencyWithBoost
                                              : sl::ReflexMode::eLowLatency;
-    if (impl_->lastAppliedReflexMode != static_cast<uint32_t>(desiredReflex)) {
-        impl_->applyReflexOptions(desiredReflex);
-    }
+    impl_->applyReflexOptions(desiredReflex);
 
     const bool effectiveEnable = enabled && !inputs.isPauseOrMenu;
 
@@ -943,6 +985,7 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
             offOpts.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
             impl_->sl.slDLSSGSetOptions(impl_->viewport, offOpts);
         }
+        impl_->hasCachedDlssgOpts = false;
         impl_->activeInLastEvaluate = false;
         return false;
     }
@@ -1054,8 +1097,25 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
             : sl::Boolean::eFalse;
     opts.onErrorCallback = &slApiErrorCallback;
 
-    const sl::Result optRc = impl_->sl.slDLSSGSetOptions(impl_->viewport, opts);
-    impl_->snapshot.lastSlResult = static_cast<int32_t>(optRc);
+    const bool sameDlssgOpts =
+        impl_->hasCachedDlssgOpts &&
+        impl_->cachedDlssgOpts.mode == opts.mode &&
+        impl_->cachedDlssgOpts.numFramesToGenerate == opts.numFramesToGenerate &&
+        impl_->cachedDlssgOpts.dynamicTargetFrameRate == opts.dynamicTargetFrameRate &&
+        impl_->cachedDlssgOpts.flags == opts.flags &&
+        impl_->cachedDlssgOpts.enableUserInterfaceRecomposition == opts.enableUserInterfaceRecomposition;
+
+    sl::Result optRc = sl::Result::eOk;
+    if (!sameDlssgOpts) {
+        optRc = impl_->sl.slDLSSGSetOptions(impl_->viewport, opts);
+        impl_->snapshot.lastSlResult = static_cast<int32_t>(optRc);
+        if (optRc == sl::Result::eOk) {
+            impl_->cachedDlssgOpts = opts;
+            impl_->hasCachedDlssgOpts = true;
+        } else {
+            impl_->hasCachedDlssgOpts = false;
+        }
+    }
 
     if (impl_->sl.slPCLSetMarker && impl_->snapshot.pclSupported) {
         impl_->sl.slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *token);
@@ -1141,6 +1201,41 @@ bool NvidiaStreamlineFgBackend::reflexSleepCurrentFrame() {
     return impl_->sl.slReflexSleep(*impl_->currentToken) == sl::Result::eOk;
 #else
     return false;
+#endif
+}
+
+void NvidiaStreamlineFgBackend::setFrameLimitFps(float fps) {
+    const float clamped = (fps > 0.0f) ? fps : 0.0f;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->frameLimitFps == clamped) return;
+    impl_->frameLimitFps = clamped;
+#if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
+    if (impl_->initialized && impl_->snapshot.reflexSupported) {
+        const sl::ReflexMode desiredReflex = impl_->lowLatencyBoost
+                                                 ? sl::ReflexMode::eLowLatencyWithBoost
+                                                 : sl::ReflexMode::eLowLatency;
+        impl_->applyReflexOptions(desiredReflex);
+    }
+#endif
+}
+
+bool NvidiaStreamlineFgBackend::isReflexFrameLimiterActive() const {
+    return impl_->reflexFrameLimiterActive.load(std::memory_order_relaxed);
+}
+
+void NvidiaStreamlineFgBackend::markRenderSubmitStart() {
+#if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->initialized || !impl_->snapshot.pclSupported || !impl_->sl.slPCLSetMarker) {
+        return;
+    }
+    if (!impl_->hasPendingNextToken || !impl_->pendingNextToken) {
+        return;
+    }
+    if (!impl_->renderSubmitStartedThisFrame.exchange(true, std::memory_order_acq_rel)) {
+        impl_->sl.slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *impl_->pendingNextToken);
+        impl_->sl.slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *impl_->pendingNextToken);
+    }
 #endif
 }
 

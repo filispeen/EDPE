@@ -305,6 +305,33 @@ void D3D11D3D12Bridge::transitionResource(ID3D12GraphicsCommandList* cmdList,
     cmdList->ResourceBarrier(1, &barrier);
 }
 
+void D3D11D3D12Bridge::transitionResources2(ID3D12GraphicsCommandList* cmdList,
+                                            ID3D12Resource* res0,
+                                            D3D12_RESOURCE_STATES before0,
+                                            D3D12_RESOURCE_STATES after0,
+                                            ID3D12Resource* res1,
+                                            D3D12_RESOURCE_STATES before1,
+                                            D3D12_RESOURCE_STATES after1) {
+    if (!cmdList) return;
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    UINT count = 0;
+    auto push = [&](ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        if (!res || before == after) return;
+        D3D12_RESOURCE_BARRIER& b = barriers[count++];
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        b.Transition.pResource = res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = after;
+    };
+    push(res0, before0, after0);
+    push(res1, before1, after1);
+    if (count > 0) {
+        cmdList->ResourceBarrier(count, barriers);
+    }
+}
+
 ID3D12GraphicsCommandList* D3D11D3D12Bridge::beginCommandList(uint32_t& outSlot,
                                                               bool* outDidCpuWait) {
     if (outDidCpuWait) *outDidCpuWait = false;
