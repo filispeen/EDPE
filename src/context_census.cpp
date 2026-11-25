@@ -1549,7 +1549,46 @@ std::atomic<bool> scene_shader_probe_active{false};
 std::atomic<bool> draw_hook_active{false};
 std::atomic<bool> draw_indexed_instanced_hook_active{false};
 std::atomic<bool> draw_instanced_hook_active{false};
-std::atomic<ID3D11Buffer*> scene_map_target{nullptr}; // Weak; valid only for this bind interval.
+// The scene constant buffer EDPE watches in Map/Unmap. It holds one reference to the buffer, so the
+// game cannot free it and have a different resource reuse the address while EDPE still compares
+// against it (that sent a large buffer into the 64 KB map-bounce slots and overran static memory).
+// Only change it through the helpers below. observedMap/observedUnmap only compare the pointer.
+std::atomic<ID3D11Buffer*> scene_map_target{nullptr};
+
+void setSceneMapTarget(ID3D11Buffer* buffer) {
+    if (buffer) buffer->AddRef();
+    if (ID3D11Buffer* old = scene_map_target.exchange(buffer, std::memory_order_acq_rel)) old->Release();
+}
+
+void setSceneMapTargetIfEmpty(ID3D11Buffer* buffer) {
+    if (!buffer) return;
+    buffer->AddRef();
+    ID3D11Buffer* expected = nullptr;
+    if (!scene_map_target.compare_exchange_strong(expected, buffer, std::memory_order_acq_rel)) {
+        buffer->Release();
+    }
+}
+
+void clearSceneMapTarget() {
+    setSceneMapTarget(nullptr);
+}
+
+// Called once per Present: when EDPE holds the last reference, the game has dropped the buffer.
+// Release it so scene buffer detection can pick up the game's new one.
+void releaseOrphanedSceneMapTarget() {
+    ID3D11Buffer* target = scene_map_target.exchange(nullptr, std::memory_order_acq_rel);
+    if (!target) return;
+    target->AddRef();
+    const ULONG refs = target->Release();
+    if (refs <= 1) {
+        target->Release();
+        return;
+    }
+    ID3D11Buffer* expected = nullptr;
+    if (!scene_map_target.compare_exchange_strong(expected, target, std::memory_order_acq_rel)) {
+        target->Release();
+    }
+}
 struct MappedBufferEntry {
     ID3D11Resource* resource = nullptr;
     void* mapped_ptr = nullptr;
@@ -6243,7 +6282,7 @@ void STDMETHODCALLTYPE observedVSSetConstantBuffers(ID3D11DeviceContext* context
         const unsigned scene_bind = vs_scene_buffer_calls.fetch_add(1, std::memory_order_relaxed) + 1;
         ID3D11Buffer* expected = nullptr;
         if (vs_first_scene_buffer.compare_exchange_strong(expected, buffer, std::memory_order_relaxed)) {
-            scene_map_target.store(buffer, std::memory_order_release);
+            setSceneMapTarget(buffer);
             if (vs_probe_bind_ordinal.load(std::memory_order_relaxed) == 3)
                 queueConstantBufferSample(context, buffer, desc, 0); // Existing interval-3 diagnostic.
         }
@@ -7628,7 +7667,7 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
                 if (desc.ByteWidth == 5376 && desc.Usage == D3D11_USAGE_DYNAMIC &&
                     (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
                     const bool had_target = (target != nullptr);
-                    scene_map_target.store(buffer, std::memory_order_release);
+                    setSceneMapTarget(buffer);
                     if (probe_active) clearTrackedMappedBuffersExcept(buffer);
                     target = buffer;
                     is_scene_cb = true;
@@ -9251,7 +9290,9 @@ void endDrawProbe() {
     EdpeLog(message);
     dumpFirstSceneShader();
     dumpSceneShaders();
-    auto* map_target = scene_map_target.exchange(nullptr, std::memory_order_acq_rel);
+    // Only the address is logged below; drop the reference first.
+    auto* map_target = scene_map_target.load(std::memory_order_acquire);
+    clearSceneMapTarget();
     scene_mapped_data.store(nullptr, std::memory_order_release);
     const bool map_restored = map_hook_active.load(std::memory_order_acquire);
     const bool unmap_restored = unmap_hook_active.load(std::memory_order_acquire);
@@ -9393,14 +9434,11 @@ void beginVSBufferProbe(ID3D11DeviceContext* context, unsigned bind_ordinal) {
     ID3D11Buffer* initial = nullptr;
     context->VSGetConstantBuffers(1, 1, &initial);
     D3D11_BUFFER_DESC initial_desc{};
-    if (initial) {
-        initial->GetDesc(&initial_desc);
-        initial->Release();
-    }
+    if (initial) initial->GetDesc(&initial_desc);
     vs_scene_buffer_bound.store(initial_desc.ByteWidth == 5376 &&
         initial_desc.Usage == D3D11_USAGE_DYNAMIC, std::memory_order_relaxed);
-    scene_map_target.store(vs_scene_buffer_bound.load(std::memory_order_relaxed)
-        ? initial : nullptr, std::memory_order_release);
+    setSceneMapTarget(vs_scene_buffer_bound.load(std::memory_order_relaxed) ? initial : nullptr);
+    if (initial) initial->Release();
     vs_buffer_probe_active.store(true, std::memory_order_release);
     if (forward != &observedVSSetConstantBuffers &&
         !patchSlot(patched_table, kVSSetConstantBuffers,
@@ -9714,9 +9752,7 @@ void takeCameraDeltaSource(ID3D11DeviceContext* context, unsigned long long fram
         buffer->Release();
         return;
     }
-    if (!scene_map_target.load(std::memory_order_acquire)) {
-        scene_map_target.store(buffer, std::memory_order_release);
-    }
+    setSceneMapTargetIfEmpty(buffer);
     camera_delta_source.Attach(buffer);
     camera_delta_source_context = context;
     camera_delta_source_frame = frame;
@@ -14311,6 +14347,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         if ((last_present_frame.load(std::memory_order_relaxed) % 30ull) == 0ull) {
             clearRejectedResourceCache();
         }
+        releaseOrphanedSceneMapTarget();
         static uint64_t s_watchdog_last_camera_seen = 0;
         static unsigned s_watchdog_no_camera_frames = 0;
         const uint64_t cur_camera_seen = s_valid_camera_seen_counter.load(std::memory_order_relaxed);
@@ -14318,7 +14355,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             if (cur_camera_seen == s_watchdog_last_camera_seen) {
                 if (scene_map_target.load(std::memory_order_relaxed) != nullptr) {
                     if (++s_watchdog_no_camera_frames >= 120) {
-                        scene_map_target.store(nullptr, std::memory_order_release);
+                        clearSceneMapTarget();
                         clearRejectedResourceCache();
                         s_watchdog_no_camera_frames = 0;
                     }
@@ -15196,7 +15233,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
     s_scene_window_closed_frame.store(~0ull, std::memory_order_release);
     s_last_jitter_active_frame.store(~0ull, std::memory_order_release);
     clearSmoothMotionTracking();
-    scene_map_target.store(nullptr, std::memory_order_release);
+    clearSceneMapTarget();
     scene_mapped_data.store(nullptr, std::memory_order_release);
     s_hud_probe_armed_once.store(false, std::memory_order_release);
     clearTrackedMappedBuffers();
