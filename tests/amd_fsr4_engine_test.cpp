@@ -199,6 +199,15 @@ CaseOutcome caseBasic(Env& e) {
 }
 
 CaseOutcome caseProvider(Env& e) {
+    // The picked provider is known as soon as the engine is initialized, before any frame is evaluated, and is
+    // cleared again by shutdown.
+    e.engine.shutdown();
+    if (e.engine.providerVersion()[0] != '\0') return fail("provider version not cleared by shutdown");
+    if (!e.engine.initialize(e.dev.Get())) return fail(std::string("re-initialize failed"));
+    const std::string picked = e.engine.providerVersion();
+    if (picked.empty() || picked[0] < '4' || picked[0] > '9') {
+        return fail("provider '" + picked + "' right after initialize, not a 4.x provider");
+    }
     Frame f;
     if (!e.makeFrame(f, 960, 540, 1920, 1080)) return fail("test texture creation");
     const std::string err = e.runFlat(f, kFlat, kFlatRgb, 4);  // makes the context, which reports its provider

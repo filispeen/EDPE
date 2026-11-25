@@ -163,7 +163,7 @@ struct Fsr4Engine::Impl {
     bool ready = false;
     bool resetPending = true;
     wchar_t error[256] = L"";
-    char providerVer[64] = "unavailable";
+    char providerVer[64] = "";  // the picked 4.x provider, for example "4.1.2"; empty until one is picked
     uint64_t providerVersionId = 0;  // the 4.x provider chosen from those AMD's runtime offers (ffxOverrideVersion)
 
     // Active configuration; any change recreates the resources and the FFX context.
@@ -256,6 +256,7 @@ struct Fsr4Engine::Impl {
             return false;
         }
         providerVersionId = ids[static_cast<size_t>(index)];
+        std::snprintf(providerVer, sizeof(providerVer), "%s", offered[static_cast<size_t>(index)].c_str());
         wchar_t buf[256]{};
         std::swprintf(buf, 256, L"EDPE FSR4: AMD's runtime offers FSR %hs; using %u.%u.%u", list.c_str(), picked.major,
                       picked.minor, picked.patch);
@@ -604,11 +605,12 @@ void Fsr4Engine::shutdown() {
     impl_->device.Reset();
     impl_->evalCount = 0;
     impl_->resetPending = true;
+    impl_->providerVer[0] = '\0';
 }
 
 bool Fsr4Engine::isReady() const { return impl_ && impl_->ready; }
 const wchar_t* Fsr4Engine::lastError() const { return impl_ ? impl_->error : L""; }
-const char* Fsr4Engine::providerVersion() const { return impl_ ? impl_->providerVer : "unavailable"; }
+const char* Fsr4Engine::providerVersion() const { return impl_ ? impl_->providerVer : ""; }
 
 bool Fsr4Engine::evaluate(ID3D11DeviceContext* context, const TemporalFrameInputs& inputs,
                           ID3D11Texture2D* destination) {
@@ -634,7 +636,7 @@ bool Fsr4Engine::initialize(ID3D11Device*) { return false; }
 void Fsr4Engine::shutdown() {}
 bool Fsr4Engine::isReady() const { return false; }
 const wchar_t* Fsr4Engine::lastError() const { return impl_ ? impl_->error : L""; }
-const char* Fsr4Engine::providerVersion() const { return "unavailable"; }
+const char* Fsr4Engine::providerVersion() const { return ""; }
 bool Fsr4Engine::evaluate(ID3D11DeviceContext*, const TemporalFrameInputs&, ID3D11Texture2D*) { return false; }
 void Fsr4Engine::resetHistory() {}
 
