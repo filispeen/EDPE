@@ -69,6 +69,8 @@ HRESULT STDMETHODCALLTYPE observedCreatePixelShader(ID3D11Device* device,
         const auto hash = EdpeShaderHash(bytecode, size);
         (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
         (*shader)->SetPrivateData(kEdpePixelBytecodeGuid, static_cast<UINT>(size), bytecode);
+        const uint8_t frostedBackdrop = edpe::isFrostedBackdropPixelShader(bytecode, size) ? 1u : 0u;
+        (*shader)->SetPrivateData(kEdpePsFrostedBackdropGuid, sizeof(frostedBackdrop), &frostedBackdrop);
     }
     return result;
 }

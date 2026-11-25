@@ -1850,6 +1850,8 @@ struct CachedShaderHashEntry {
     edpe::VsProjectionCb proj_cb = edpe::VsProjectionCb::Unknown;
     bool known = false;
     bool proj_known = false;
+    bool frosted_backdrop = false;
+    bool frosted_known = false;
 };
 static constexpr size_t kShaderHashCacheSets = 256;
 static constexpr size_t kShaderHashCacheWays = 2;
@@ -1888,6 +1890,8 @@ static inline std::uint64_t lookupOrFetchShaderHash(ID3D11DeviceChild* shader,
         set.ways[targetSlot].shader = shader;
         set.ways[targetSlot].proj_known = false;
         set.ways[targetSlot].proj_cb = edpe::VsProjectionCb::Unknown;
+        set.ways[targetSlot].frosted_known = false;
+        set.ways[targetSlot].frosted_backdrop = false;
     }
     set.ways[targetSlot].hash = ok ? hash : 0;
     set.ways[targetSlot].known = true;
@@ -1931,6 +1935,8 @@ static inline edpe::VsProjectionCb lookupOrFetchVsProjCb(ID3D11VertexShader* vs)
         set.ways[targetSlot].shader = vs;
         set.ways[targetSlot].hash = 0;
         set.ways[targetSlot].known = false;
+        set.ways[targetSlot].frosted_known = false;
+        set.ways[targetSlot].frosted_backdrop = false;
     }
     set.ways[targetSlot].proj_cb = projCb;
     set.ways[targetSlot].proj_known = true;
@@ -1944,6 +1950,62 @@ static inline edpe::VsProjectionCb getFastBoundVsProjCb(ID3D11DeviceContext* con
     const edpe::VsProjectionCb projCb = lookupOrFetchVsProjCb(vs);
     if (vs) vs->Release();
     return projCb;
+}
+
+static inline bool lookupOrFetchPsFrostedBackdrop(ID3D11PixelShader* ps) {
+    if (!ps) return false;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ps);
+    const size_t setIdx = ((p >> 4) ^ (p >> 13)) & (kShaderHashCacheSets - 1);
+    CachedShaderHashSet& set = s_ps_hash_cache[setIdx];
+    for (size_t w = 0; w < kShaderHashCacheWays; ++w) {
+        if (set.ways[w].shader == ps && set.ways[w].frosted_known) {
+            return set.ways[w].frosted_backdrop;
+        }
+    }
+    bool frosted = false;
+    uint8_t flag = 0;
+    UINT sz = sizeof(flag);
+    if (SUCCEEDED(ps->GetPrivateData(kEdpePsFrostedBackdropGuid, &sz, &flag)) && sz == sizeof(flag)) {
+        frosted = (flag != 0);
+    } else {
+        UINT bcSize = 0;
+        if (SUCCEEDED(ps->GetPrivateData(kEdpePixelBytecodeGuid, &bcSize, nullptr)) &&
+            bcSize >= 32u && bcSize <= 1024u * 1024u) {
+            std::vector<BYTE> bc(bcSize);
+            if (SUCCEEDED(ps->GetPrivateData(kEdpePixelBytecodeGuid, &bcSize, bc.data()))) {
+                frosted = edpe::isFrostedBackdropPixelShader(bc.data(), bcSize);
+            }
+        }
+    }
+    size_t targetSlot = set.next_victim & 1u;
+    bool matchedExisting = false;
+    for (size_t w = 0; w < kShaderHashCacheWays; ++w) {
+        if (set.ways[w].shader == ps) {
+            targetSlot = w;
+            matchedExisting = true;
+            break;
+        }
+    }
+    if (!matchedExisting) {
+        set.next_victim = static_cast<uint8_t>(targetSlot ^ 1u);
+        set.ways[targetSlot].shader = ps;
+        set.ways[targetSlot].hash = 0;
+        set.ways[targetSlot].known = false;
+        set.ways[targetSlot].proj_known = false;
+        set.ways[targetSlot].proj_cb = edpe::VsProjectionCb::Unknown;
+    }
+    set.ways[targetSlot].frosted_backdrop = frosted;
+    set.ways[targetSlot].frosted_known = true;
+    return frosted;
+}
+
+static inline bool getFastBoundPsFrostedBackdrop(ID3D11DeviceContext* context) {
+    if (!context) return false;
+    ID3D11PixelShader* ps = nullptr;
+    context->PSGetShader(&ps, nullptr, nullptr);
+    const bool frosted = lookupOrFetchPsFrostedBackdrop(ps);
+    if (ps) ps->Release();
+    return frosted;
 }
 
 static inline std::uint64_t getFastBoundVsHash(ID3D11DeviceContext* context) {
@@ -2196,7 +2258,7 @@ bool isConfirmedShipCockpitHudPair(std::uint64_t vs_hash, std::uint64_t ps_hash)
         vs_hash == 0xB932058F26B76691ull) { // Radar contact hologram family 4 (kHoloFamiliesTake)
         return true;
     }
-    return (vs_hash == 0x2CECEC3065EF0D4Aull && ps_hash == 0xA4D03619D631B186ull) || // Cockpit HUD stencil setup (A4D03619, 0x04)
+    return (vs_hash == 0x2CECEC3065EF0D4Aull && ps_hash == 0xA4D03619D631B186ull) || // Cockpit HUD stencil setup & frosted panel backdrops (A4D03619; color draws pass through to Cobra HDR scene)
            (vs_hash == 0xF8D8A92E96419901ull && ps_hash == 0x16196F69ADE35E77ull) || // Hologram icon core (kHoloFamiliesTake)
            (vs_hash == 0x1989B75BF034ECC3ull && ps_hash == 0xDB79AE788E049DFDull) || // Radar contact triangles & elevation stalks
            (vs_hash == 0xC7FA0C0F5DD49180ull && ps_hash == 0x6EEF165A350DA30Full) || // Orbit / exclusion lines (kOrbitLines)
@@ -3218,9 +3280,17 @@ ID3D11DepthStencilView* ensureSeededHudDepthStencil(
     return s_hud_depth_stencil_dsv.Get();
 }
 
-bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT instance_count,
-                   UINT start_index_or_vertex, INT base_vertex, UINT start_instance) {
-    if (!context || !s_hud_mask_rtv || !s_hud_mask_blend_add || !s_hud_mask_blend_alpha || !s_hud_mask_active_pass) return false;
+enum class HudReplayResult : uint8_t {
+    Declined = 0,
+    Redirected = 1,
+    ScenePassThrough = 2,
+};
+
+HudReplayResult replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT instance_count,
+                              UINT start_index_or_vertex, INT base_vertex, UINT start_instance) {
+    if (!context || !s_hud_mask_rtv || !s_hud_mask_blend_add || !s_hud_mask_blend_alpha || !s_hud_mask_active_pass) {
+        return HudReplayResult::Declined;
+    }
 
     ID3D11RenderTargetView* orig_rtv0 = nullptr;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth;
@@ -3229,13 +3299,13 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         (!motion_color_bound && orig_rtv0 != motion_color_source.Get() &&
          !sameRenderTargetResource(orig_rtv0, motion_color_source.Get()))) {
         if (orig_rtv0) orig_rtv0->Release();
-        return false;
+        return HudReplayResult::Declined;
     }
 
     const OMSetRenderTargetsFn set_targets = resolveOriginalOM(context);
     if (!set_targets) {
         orig_rtv0->Release();
-        return false;
+        return HudReplayResult::Declined;
     }
 
     Microsoft::WRL::ComPtr<ID3D11BlendState> original_blend;
@@ -3424,31 +3494,101 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
         }
     };
 
-    ID3D11BlendState* blend_to_use = s_hud_mask_blend_add.Get();
-    if (!original_blend) {
-        blend_to_use = s_hud_mask_blend_opaque.Get();
-    } else {
-        D3D11_BLEND_DESC origBlendDesc{};
+    // Cancel viewport jitter when projection came from a jittered 192/208-byte CB0 transpose block
+    // or when orig_cb1 was jittered and could not be substituted.
+    const bool needViewportJitterCancel = cb0_is_jittered || (cb1_is_jittered && !cb1_substituted);
+    const float jitterX = needViewportJitterCancel ? s_injected_jitter.pixelX : 0.0f;
+    const float jitterY = needViewportJitterCancel ? s_injected_jitter.pixelY : 0.0f;
+
+    bool isStencilOnly = false;
+    bool isDarkenBlend = false;
+    D3D11_BLEND_DESC origBlendDesc{};
+    if (original_blend) {
         original_blend->GetDesc(&origBlendDesc);
         const auto& rt0 = origBlendDesc.RenderTarget[0];
-        if (rt0.RenderTargetWriteMask == 0) {
-            // Stencil-only setup draw (e.g. VS 2CECEC3065EF0D4A / PS A4D03619D631B186):
-            // execute with unjittered camera CB1 on the game's depth-stencil target (and on
-            // s_hud_depth_stencil_dsv in Super Resolution) so stencil mask 0x04 aligns with HUD panels.
+        isStencilOnly = (rt0.RenderTargetWriteMask == 0);
+        isDarkenBlend = (rt0.BlendEnable && rt0.SrcBlend == D3D11_BLEND_ZERO);
+    }
+
+    if (isStencilOnly) {
+        // Stencil-only setup draw (e.g. VS 2CECEC3065EF0D4A / PS A4D03619D631B186):
+        // execute with unjittered camera CB1 on the game's depth-stencil target (and on
+        // s_hud_depth_stencil_dsv in Super Resolution) so stencil mask 0x04 aligns with HUD panels.
+        issueDraw();
+        if (s_hud_depth_only_seeded && s_hud_depth_stencil_dsv && depth_to_bind != depth.Get()) {
+            UINT numViewports = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+            D3D11_VIEWPORT origViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+            D3D11_VIEWPORT hudViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+            UINT numScissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+            D3D11_RECT origScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+            D3D11_RECT hudScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+            if (needVpScale) {
+                context->RSGetViewports(&numViewports, origViewports);
+                context->RSGetScissorRects(&numScissors, origScissors);
+                for (UINT i = 0; i < numViewports; ++i) {
+                    hudViewports[i].TopLeftX = origViewports[i].TopLeftX * scaleX;
+                    hudViewports[i].TopLeftY = origViewports[i].TopLeftY * scaleY;
+                    hudViewports[i].Width = origViewports[i].Width * scaleX;
+                    hudViewports[i].Height = origViewports[i].Height * scaleY;
+                    hudViewports[i].MinDepth = origViewports[i].MinDepth;
+                    hudViewports[i].MaxDepth = origViewports[i].MaxDepth;
+                }
+                const LONG maxW = static_cast<LONG>(s_hud_mask_width);
+                const LONG maxH = static_cast<LONG>(s_hud_mask_height);
+                for (UINT i = 0; i < numScissors; ++i) {
+                    hudScissors[i].left = std::clamp(static_cast<LONG>(std::lround(origScissors[i].left * scaleX)), 0L, maxW);
+                    hudScissors[i].top = std::clamp(static_cast<LONG>(std::lround(origScissors[i].top * scaleY)), 0L, maxH);
+                    hudScissors[i].right = std::clamp(static_cast<LONG>(std::lround(origScissors[i].right * scaleX)), 0L, maxW);
+                    hudScissors[i].bottom = std::clamp(static_cast<LONG>(std::lround(origScissors[i].bottom * scaleY)), 0L, maxH);
+                }
+                if (numViewports > 0) context->RSSetViewports(numViewports, hudViewports);
+                if (numScissors > 0) context->RSSetScissorRects(numScissors, hudScissors);
+            }
+            set_targets(context, 0, nullptr, s_hud_depth_stencil_dsv.Get());
             issueDraw();
-            if (s_hud_depth_only_seeded && s_hud_depth_stencil_dsv && depth_to_bind != depth.Get()) {
+            if (needVpScale) {
+                if (numViewports > 0) context->RSSetViewports(numViewports, origViewports);
+                if (numScissors > 0) context->RSSetScissorRects(numScissors, origScissors);
+            }
+            set_targets(context, 1, &orig_rtv0, depth.Get());
+            s_hud_stencil_bits_seeded |= origDsDesc.StencilWriteMask;
+        }
+        restoreSubstitutedBindings();
+        orig_rtv0->Release();
+        if (auto* stat = findOrAddHudPairStat(s_current_hud_vs_hash, s_current_hud_ps_hash)) {
+            ++stat->stencil_only;
+            if (cb1_substituted) ++stat->cb1_substituted;
+        }
+        abandonAmortizedAndRearmHudProbe(context);
+        return HudReplayResult::Redirected;
+    }
+
+    const bool isFrostedBackdrop =
+        (s_current_hud_ps_hash == 0xA4D03619D631B186ull) ||
+        (s_current_hud_ps_hash == 0x0146ABCC53240479ull) ||
+        getFastBoundPsFrostedBackdrop(context);
+    if (isFrostedBackdrop || isDarkenBlend) {
+        // Frosted-glass HUD backdrops (sampling 320x180 blurred HDR scene t0 via SV_Position * cb1[332].zw)
+        // and multiplicative darkening quads must blend directly in Cobra's pre-tonemap linear HDR scene.
+        // If this draw also writes stencil (e.g. 0x04), keep s_hud_depth_stencil_dsv synchronized.
+        if (orig_writes_stencil && depth) {
+            if (s_hud_depth_only_seeded && s_hud_depth_stencil_dsv &&
+                depth_to_bind != depth.Get() && s_hud_mask_blend_colorless) {
                 UINT numViewports = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
                 D3D11_VIEWPORT origViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
                 D3D11_VIEWPORT hudViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
                 UINT numScissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
                 D3D11_RECT origScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
                 D3D11_RECT hudScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-                if (needVpScale) {
+                const bool needVpOrJitter = needVpScale || needViewportJitterCancel;
+                if (needVpOrJitter) {
+                    const float cancelX = -jitterX * scaleX;
+                    const float cancelY = -jitterY * scaleY;
                     context->RSGetViewports(&numViewports, origViewports);
                     context->RSGetScissorRects(&numScissors, origScissors);
                     for (UINT i = 0; i < numViewports; ++i) {
-                        hudViewports[i].TopLeftX = origViewports[i].TopLeftX * scaleX;
-                        hudViewports[i].TopLeftY = origViewports[i].TopLeftY * scaleY;
+                        hudViewports[i].TopLeftX = origViewports[i].TopLeftX * scaleX + cancelX;
+                        hudViewports[i].TopLeftY = origViewports[i].TopLeftY * scaleY + cancelY;
                         hudViewports[i].Width = origViewports[i].Width * scaleX;
                         hudViewports[i].Height = origViewports[i].Height * scaleY;
                         hudViewports[i].MinDepth = origViewports[i].MinDepth;
@@ -3457,41 +3597,42 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
                     const LONG maxW = static_cast<LONG>(s_hud_mask_width);
                     const LONG maxH = static_cast<LONG>(s_hud_mask_height);
                     for (UINT i = 0; i < numScissors; ++i) {
-                        hudScissors[i].left = std::clamp(static_cast<LONG>(std::lround(origScissors[i].left * scaleX)), 0L, maxW);
-                        hudScissors[i].top = std::clamp(static_cast<LONG>(std::lround(origScissors[i].top * scaleY)), 0L, maxH);
-                        hudScissors[i].right = std::clamp(static_cast<LONG>(std::lround(origScissors[i].right * scaleX)), 0L, maxW);
-                        hudScissors[i].bottom = std::clamp(static_cast<LONG>(std::lround(origScissors[i].bottom * scaleY)), 0L, maxH);
+                        hudScissors[i].left = std::clamp(static_cast<LONG>(std::lround(origScissors[i].left * scaleX + cancelX)), 0L, maxW);
+                        hudScissors[i].top = std::clamp(static_cast<LONG>(std::lround(origScissors[i].top * scaleY + cancelY)), 0L, maxH);
+                        hudScissors[i].right = std::clamp(static_cast<LONG>(std::lround(origScissors[i].right * scaleX + cancelX)), 0L, maxW);
+                        hudScissors[i].bottom = std::clamp(static_cast<LONG>(std::lround(origScissors[i].bottom * scaleY + cancelY)), 0L, maxH);
                     }
                     if (numViewports > 0) context->RSSetViewports(numViewports, hudViewports);
                     if (numScissors > 0) context->RSSetScissorRects(numScissors, hudScissors);
                 }
+                const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+                context->OMSetBlendState(s_hud_mask_blend_colorless.Get(), blend_factor, 0xFFFFFFFF);
                 set_targets(context, 0, nullptr, s_hud_depth_stencil_dsv.Get());
                 issueDraw();
-                if (needVpScale) {
+                context->OMSetBlendState(original_blend.Get(), original_blend_factor, original_sample_mask);
+                if (needVpOrJitter) {
                     if (numViewports > 0) context->RSSetViewports(numViewports, origViewports);
                     if (numScissors > 0) context->RSSetScissorRects(numScissors, origScissors);
                 }
                 set_targets(context, 1, &orig_rtv0, depth.Get());
                 s_hud_stencil_bits_seeded |= origDsDesc.StencilWriteMask;
+            } else {
+                s_hud_stencil_bits_seeded &= ~origDsDesc.StencilWriteMask;
             }
-            restoreSubstitutedBindings();
-            orig_rtv0->Release();
-            if (auto* stat = findOrAddHudPairStat(s_current_hud_vs_hash, s_current_hud_ps_hash)) {
-                ++stat->stencil_only;
-                if (cb1_substituted) ++stat->cb1_substituted;
-            }
-            abandonAmortizedAndRearmHudProbe(context);
-            return true;
         }
+        restoreSubstitutedBindings();
+        orig_rtv0->Release();
+        abandonAmortizedAndRearmHudProbe(context);
+        return HudReplayResult::ScenePassThrough;
+    }
 
+    ID3D11BlendState* blend_to_use = s_hud_mask_blend_add.Get();
+    if (!original_blend) {
+        blend_to_use = s_hud_mask_blend_opaque.Get();
+    } else {
+        const auto& rt0 = origBlendDesc.RenderTarget[0];
         if (!rt0.BlendEnable) {
             blend_to_use = s_hud_mask_blend_opaque.Get();
-        } else if (rt0.SrcBlend == D3D11_BLEND_ZERO) {
-            // Multiplicative darkening / backing quad: let Cobra render it directly into the 3D scene.
-            restoreSubstitutedBindings();
-            orig_rtv0->Release();
-            abandonAmortizedAndRearmHudProbe(context);
-            return false;
         } else if (rt0.SrcBlend == D3D11_BLEND_ONE && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA) {
             blend_to_use = s_hud_mask_blend_premul.Get();
         } else if ((rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA || rt0.SrcBlend == D3D11_BLEND_SRC_ALPHA_SAT) &&
@@ -3506,12 +3647,6 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
             blend_to_use = s_hud_mask_blend_alpha.Get();
         }
     }
-
-    // Cancel viewport jitter when projection came from a jittered 192/208-byte CB0 transpose block
-    // or when orig_cb1 was jittered and could not be substituted.
-    const bool needViewportJitterCancel = cb0_is_jittered || (cb1_is_jittered && !cb1_substituted);
-    const float jitterX = needViewportJitterCancel ? s_injected_jitter.pixelX : 0.0f;
-    const float jitterY = needViewportJitterCancel ? s_injected_jitter.pixelY : 0.0f;
 
     // For 3D Ship/Target Holograms (VS 5559BD94 / PS EA02FAC2 or E95634B0), bind the DXBC-patched PS
     // with cb13 (SV_Position remap to renderW x renderH linear depth at PS t1 + Sobel relief scale).
@@ -3572,7 +3707,7 @@ bool replayHudDraw(ID3D11DeviceContext* context, char kind, UINT count, UINT ins
     restoreSubstitutedBindings();
     orig_rtv0->Release();
     abandonAmortizedAndRearmHudProbe(context);
-    return true;
+    return HudReplayResult::Redirected;
 }
 
 HudDrawResult observeHudDrawImpl(ID3D11DeviceContext* context, char kind, UINT instances) {
@@ -6473,8 +6608,9 @@ void STDMETHODCALLTYPE observedDrawIndexed(ID3D11DeviceContext* context, UINT co
     }
     bool redirected = false;
     if (hudResult == HudDrawResult::HudReplay) {
-        redirected = replayHudDraw(context, 'I', count, 1, start, base, 0);
-        if (!redirected) {
+        const HudReplayResult replayRes = replayHudDraw(context, 'I', count, 1, start, base, 0);
+        redirected = (replayRes == HudReplayResult::Redirected);
+        if (replayRes == HudReplayResult::Declined) {
             ++s_diag_hud_declined_draws;
             if (auto* stat = findOrAddHudPairStat(s_current_hud_vs_hash, s_current_hud_ps_hash)) ++stat->declined;
         }
@@ -6521,8 +6657,9 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
     }
     bool redirected = false;
     if (hudResult == HudDrawResult::HudReplay) {
-        redirected = replayHudDraw(context, 'D', count, 1, start, 0, 0);
-        if (!redirected) {
+        const HudReplayResult replayRes = replayHudDraw(context, 'D', count, 1, start, 0, 0);
+        redirected = (replayRes == HudReplayResult::Redirected);
+        if (replayRes == HudReplayResult::Declined) {
             ++s_diag_hud_declined_draws;
             if (auto* stat = findOrAddHudPairStat(s_current_hud_vs_hash, s_current_hud_ps_hash)) ++stat->declined;
         }
@@ -6637,9 +6774,10 @@ void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context
     }
     bool redirected = false;
     if (hudResult == HudDrawResult::HudReplay) {
-        redirected = replayHudDraw(context, 'X', index_count, instance_count,
+        const HudReplayResult replayRes = replayHudDraw(context, 'X', index_count, instance_count,
             start_index, base_vertex, start_instance);
-        if (!redirected) {
+        redirected = (replayRes == HudReplayResult::Redirected);
+        if (replayRes == HudReplayResult::Declined) {
             ++s_diag_hud_declined_draws;
             if (auto* stat = findOrAddHudPairStat(s_current_hud_vs_hash, s_current_hud_ps_hash)) ++stat->declined;
         }
@@ -6796,8 +6934,9 @@ void STDMETHODCALLTYPE observedDrawInstanced(ID3D11DeviceContext* context,
     }
     bool redirected = false;
     if (hudResult == HudDrawResult::HudReplay) {
-        redirected = replayHudDraw(context, 'N', vertex_count, instance_count, start_vertex, 0, start_instance);
-        if (!redirected) {
+        const HudReplayResult replayRes = replayHudDraw(context, 'N', vertex_count, instance_count, start_vertex, 0, start_instance);
+        redirected = (replayRes == HudReplayResult::Redirected);
+        if (replayRes == HudReplayResult::Declined) {
             ++s_diag_hud_declined_draws;
             if (auto* stat = findOrAddHudPairStat(s_current_hud_vs_hash, s_current_hud_ps_hash)) ++stat->declined;
         }

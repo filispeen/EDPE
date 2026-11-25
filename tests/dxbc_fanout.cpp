@@ -366,5 +366,77 @@ float4 main(float4 pos : POSITION) : SV_Position {
         edpe::classifyVsProjectionCb(ps_code->GetBufferPointer(), ps_code->GetBufferSize()) !=
             edpe::VsProjectionCb::Unknown) return 25;
 
+    // Verify frosted-backdrop pixel shader classification (Issue #34).
+    const char* frosted_ps_src = R"hlsl(
+cbuffer cb1 : register(b1) { float4 c1[333]; };
+cbuffer cb2 : register(b2) { float4 c2[5]; };
+Texture2D t0 : register(t0);
+Texture2D t1 : register(t1);
+Texture2D t2 : register(t2);
+Texture2D t3 : register(t3);
+SamplerState s0 : register(s0);
+SamplerState s1 : register(s1);
+struct In {
+    float4 uv0 : TEXCOORD0;
+    float2 uv1 : TEXCOORD7;
+    float4 pos : SV_Position;
+};
+float4 main(In i) : SV_Target {
+    float3 blur = float3(0.0f, 0.0f, 0.0f);
+    if (c1[49].x != 0.0f) {
+        float2 screenUv = i.pos.xy * c1[332].zw;
+        blur = t0.Sample(s1, screenUv).rgb * c1[90].z;
+    }
+    float mask = t3.Sample(s0, i.uv0.zw).r;
+    float alpha = saturate(t2.Sample(s0, i.uv1).a - c2[0].w);
+    float3 panel = blur * c2[4].rgb * c2[1].y + mask * c2[4].rgb * c2[4].a;
+    return float4(panel * alpha * c1[61].y, alpha * c2[3].w);
+}
+)hlsl";
+    const char* holo_depth_ps_src = R"hlsl(
+cbuffer cb1 : register(b1) { float4 c1[280]; };
+cbuffer cb2 : register(b2) { float4 c2[23]; };
+Texture2D<float> t1 : register(t1);
+float4 main(float3 viewPos : TEXCOORD0, float4 pos : SV_Position) : SV_Target {
+    float d = t1.Load(int3((int2)pos.xy, 0));
+    float vz = dot(viewPos, c1[279].xyz);
+    return float4(d - vz, c2[14].x, c2[14].y, 1.0f);
+}
+)hlsl";
+    const char* hud_text_ps_src = R"hlsl(
+cbuffer cb1 : register(b1) { float4 c1[91]; };
+Texture2D t0 : register(t0);
+SamplerState s0 : register(s0);
+float4 main(float2 uv : TEXCOORD0) : SV_Target {
+    return t0.Sample(s0, uv) * c1[90].y;
+}
+)hlsl";
+    ComPtr<ID3DBlob> bFrosted, bHoloDepth, bHudText, bFrostErr;
+    if (FAILED(D3DCompile(frosted_ps_src, std::strlen(frosted_ps_src), nullptr, nullptr,
+            nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &bFrosted, &bFrostErr)) ||
+        FAILED(D3DCompile(holo_depth_ps_src, std::strlen(holo_depth_ps_src), nullptr, nullptr,
+            nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &bHoloDepth, &bFrostErr)) ||
+        FAILED(D3DCompile(hud_text_ps_src, std::strlen(hud_text_ps_src), nullptr, nullptr,
+            nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &bHudText, &bFrostErr))) {
+        std::fprintf(stderr, "frosted classifier test compile failed: %s\n",
+            bFrostErr ? static_cast<const char*>(bFrostErr->GetBufferPointer()) : "");
+        return 26;
+    }
+    if (!edpe::isFrostedBackdropPixelShader(bFrosted->GetBufferPointer(), bFrosted->GetBufferSize())) {
+        std::fprintf(stderr, "frosted backdrop PS should match isFrostedBackdropPixelShader\n");
+        return 27;
+    }
+    if (edpe::isFrostedBackdropPixelShader(ps_code->GetBufferPointer(), ps_code->GetBufferSize()) ||
+        edpe::isFrostedBackdropPixelShader(v_ps_blob->GetBufferPointer(), v_ps_blob->GetBufferSize()) ||
+        edpe::isFrostedBackdropPixelShader(bHoloDepth->GetBufferPointer(), bHoloDepth->GetBufferSize()) ||
+        edpe::isFrostedBackdropPixelShader(bHudText->GetBufferPointer(), bHudText->GetBufferSize()) ||
+        edpe::isFrostedBackdropPixelShader(vs_code->GetBufferPointer(), vs_code->GetBufferSize()) ||
+        edpe::isFrostedBackdropPixelShader(v_vs_blob->GetBufferPointer(), v_vs_blob->GetBufferSize()) ||
+        edpe::isFrostedBackdropPixelShader(nullptr, 0) ||
+        edpe::isFrostedBackdropPixelShader(bFrosted->GetBufferPointer(), 16)) {
+        std::fprintf(stderr, "non-frosted shaders must not match isFrostedBackdropPixelShader\n");
+        return 28;
+    }
+
     return 0;
 }

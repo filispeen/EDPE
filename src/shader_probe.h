@@ -27,3 +27,7 @@ constexpr GUID kEdpeShaderHashGuid =
 // Cached classification of which CB(s) a vertex shader reads for clip-space projection.
 constexpr GUID kEdpeVsProjCbGuid =
     {0x3a91c8e2, 0x4b5d, 0x4f71, {0x9e, 0x12, 0x6c, 0x84, 0xd0, 0x25, 0x7b, 0x91}};
+
+// Cached flag (uint8_t: 1 = frosted backdrop PS sampling blurred scene t0 via SV_Position * cb1[332].zw).
+constexpr GUID kEdpePsFrostedBackdropGuid =
+    {0x6c42d91f, 0x8e3a, 0x4b12, {0xa5, 0x71, 0x2d, 0x90, 0x4e, 0xc8, 0x3b, 0x54}};
