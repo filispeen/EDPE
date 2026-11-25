@@ -2041,16 +2041,19 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                     upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::NvidiaDlss));
             }
             if (!amd_available) {
-                ImGui::TextDisabled("AMD FSR 3.1.2 reason: %ls",
+                // Both AMD entries depend on the same backend, so they share one reason line.
+                ImGui::TextDisabled("AMD FSR 3.1.2 / 4.1.2 reason: %ls",
                     upscaler.getBackendUnavailableReason(edpe::UpscalerBackend::AmdFsr));
-            } else if (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) {
-                ImGui::TextDisabled("Active AMD provider: %s", upscaler.describeAmdProvider().c_str());
-                if (upscaler.isFsr4Selected() && !upscaler.isFsr4Running()) {
-                    ImGui::TextDisabled("AMD FSR 4.1.2 reason: %ls", upscaler.getFsr4UnavailableReason());
+            } else {
+                if (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr) {
+                    ImGui::TextDisabled("Active AMD provider: %s", upscaler.describeAmdProvider().c_str());
                 }
-            }
-            if (!fsr4_available) {
-                ImGui::TextDisabled("AMD FSR 4.1.2 reason: %ls", upscaler.getFsr4UnavailableReason());
+                // One FSR 4.1.2 line: it cannot be selected, or it is selected but not running (its initialization
+                // failed or failures disabled it).
+                const wchar_t* fsr4_reason = upscaler.getFsr4UnavailableReason();
+                if ((!fsr4_available || (upscaler.isFsr4Selected() && !upscaler.isFsr4Running())) && fsr4_reason[0]) {
+                    ImGui::TextDisabled("AMD FSR 4.1.2 reason: %ls", fsr4_reason);
+                }
             }
 
             bool preserve_ui = ContextCensusGetPreserveNativeUi();
