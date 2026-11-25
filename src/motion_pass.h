@@ -57,6 +57,9 @@ public:
     void clear(ID3D11DeviceContext* context);
 
 private:
+    bool ensureFullComputeShader();
+    bool ensureGpuComputeShader();
+    bool ensureCockpitTileShader();
     bool ensureOutputs(UINT width, UINT height, bool needClassOutput);
     bool ensureCockpitTileTexture(UINT width, UINT height);
     bool renderInternal(ID3D11ShaderResourceView* depth,
@@ -75,6 +78,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> compute_full_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> compute_gpu_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> cockpit_tile_cs_;
+    bool compute_full_attempted_ = false;
+    bool compute_gpu_attempted_ = false;
+    bool cockpit_tile_attempted_ = false;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> point_sampler_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constants_;
 

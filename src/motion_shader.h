@@ -15,6 +15,9 @@ inline constexpr char kMotionShader[] = R"(
 #ifndef EDPE_MOTION_HAS_CELESTIAL
 #define EDPE_MOTION_HAS_CELESTIAL 1
 #endif
+#ifndef EDPE_MOTION_GPU_CAMERAS
+#define EDPE_MOTION_GPU_CAMERAS 0
+#endif
 
 static const uint kClassSky           = 0u;
 static const uint kClassWorld         = 1u;
@@ -29,6 +32,7 @@ static const uint kWeaponStencilBit   = 0x10u;
 static const uint kCockpitStencilBit  = 0x80u;
 static const float kFp16Max           = 65504.0;
 
+#if EDPE_MOTION_HAS_CELESTIAL
 struct CelestialRecord {
     float4 relRow0; // view-space [R_rel_0 | t_rel_x] cur -> prev
     float4 relRow1; // view-space [R_rel_1 | t_rel_y]
@@ -37,6 +41,7 @@ struct CelestialRecord {
     float4 span;    // x=depthMin, y=depthMax, z=rMinPx, w=rMaxPx
     float4 center;  // xy=screen center (px), z=valid (>0.5), w=0
 };
+#endif
 
 cbuffer Camera : register(b0) {
     float4 now0, now1, now2;
@@ -49,7 +54,9 @@ Texture2D<float> sceneDepth : register(t0);
 Texture2D<float> prevSceneDepth : register(t1);
 Texture2D<float4> weaponMotion : register(t2);
 Texture2D<uint2> sceneStencil : register(t3);
+#if EDPE_MOTION_HAS_CELESTIAL
 StructuredBuffer<CelestialRecord> celestialRecords : register(t4);
+#endif
 
 #ifdef EDPE_COCKPIT_TILE_PASS
 RWTexture2D<float4> OutCockpitTiles : register(u0);
@@ -69,13 +76,22 @@ void cs_cockpit_tiles(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, u
     }
     gsCockpitAccum[gi] = val;
     GroupMemoryBarrierWithGroupSync();
-    [unroll]
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (gi < stride) {
-            gsCockpitAccum[gi] += gsCockpitAccum[gi + stride];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
+    if (gi < 128u) gsCockpitAccum[gi] += gsCockpitAccum[gi + 128u];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 64u) gsCockpitAccum[gi] += gsCockpitAccum[gi + 64u];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 32u) gsCockpitAccum[gi] += gsCockpitAccum[gi + 32u];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 16u) gsCockpitAccum[gi] += gsCockpitAccum[gi + 16u];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 8u) gsCockpitAccum[gi] += gsCockpitAccum[gi + 8u];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 4u) gsCockpitAccum[gi] += gsCockpitAccum[gi + 4u];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 2u) gsCockpitAccum[gi] += gsCockpitAccum[gi + 2u];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 1u) gsCockpitAccum[gi] += gsCockpitAccum[gi + 1u];
+    GroupMemoryBarrierWithGroupSync();
     if (gi == 0u) {
         float cnt = gsCockpitAccum[0].z;
         float2 avg = (cnt > 0.5) ? (gsCockpitAccum[0].xy / cnt) : float2(0.0, 0.0);
@@ -89,8 +105,10 @@ SamplerState pointSampler : register(s0);
 RWTexture2D<float2> OutMotion : register(u0);
 RWTexture2D<float> OutDepth : register(u1);
 RWTexture2D<uint> OutClass : register(u2);
+#if EDPE_MOTION_GPU_CAMERAS
 cbuffer EliteNow : register(b1) { float4 currentWords[336]; };
 cbuffer ElitePrevious : register(b2) { float4 previousWords[336]; };
+#endif
 
 struct MotionResult {
     float2 mv;
@@ -272,8 +290,11 @@ bool tryWeaponOverride(int2 pixCoord, bool isReset, bool clampCockpit, out Motio
         if (nCount >= 3) {
             float2 nAvg = nSum / float(nCount);
             float maxDev = 0.0;
-            for (int j = 0; j < nCount; ++j) {
-                maxDev = max(maxDev, length(nSamples[j] - nAvg));
+            [unroll]
+            for (int j = 0; j < 4; ++j) {
+                if (j < nCount) {
+                    maxDev = max(maxDev, length(nSamples[j] - nAvg));
+                }
             }
             if (maxDev <= 8.0 && length(wm.xy - nAvg) > 12.0) {
                 wm.xy = nAvg;
@@ -465,6 +486,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
     return res;
 }
 
+#if EDPE_MOTION_GPU_CAMERAS
 MotionResult reproject(float2 pixelCenter, int2 pixCoord,
     float4 current0, float4 current1, float4 current2,
     float4 prior0, float4 prior1, float4 prior2,
@@ -541,6 +563,7 @@ MotionResult reproject(float2 pixelCenter, int2 pixCoord,
     return classifyAndFinishWorld(pixCoord, pixelCenter, rawPixel, priorPixel,
         depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit, hasWeapon);
 }
+#endif
 
 )" R"(
 MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
@@ -681,6 +704,7 @@ void cs(uint3 tid : SV_DispatchThreadID) {
     writeOutputs(pixCoord, res);
 }
 
+#if EDPE_MOTION_GPU_CAMERAS
 [numthreads(8, 8, 1)]
 void cs_gpu(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= uint(info.y) || tid.y >= uint(info.z)) return;
@@ -737,6 +761,7 @@ void cs_gpu(uint3 tid : SV_DispatchThreadID) {
         prior0, prior1, prior2, projection, depthB, false);
     writeOutputs(pixCoord, res);
 }
+#endif
 #endif
 )";
 
