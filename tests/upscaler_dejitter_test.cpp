@@ -1931,24 +1931,14 @@ int main(int argc, char** argv) {
                 }
             }
             if (gpu.allocateSurfaces(kSw, kSh, kSw, kSh)) {
-                gpu.uploadFrame(fb);
+                gpu.context->UpdateSubresource(gpu.colorTex.Get(), 0, nullptr, fb.color.data(), kSw * sizeof(uint32_t), 0);
+                gpu.uploadDepth(fb.depth);
+                gpu.context->UpdateSubresource(gpu.motionTex.Get(), 0, nullptr, fb.motion.data(), kSw * sizeof(uint32_t), 0);
                 edpe::UpscalerManager& mgr = edpe::UpscalerManager::instance();
                 if (mgr.initialize(gpu.device.Get(), gpu.context.Get()) &&
                     mgr.setBackend(edpe::UpscalerBackend::Taa) &&
                     mgr.setMode(edpe::UpscaleMode::NativeAA)) {
-                    edpe::TemporalFrameInputs in{};
-                    in.color = gpu.colorTex.Get();
-                    in.colorSrv = gpu.colorSrv.Get();
-                    in.depth = gpu.depthTex[gpu.currDepthIdx].Get();
-                    in.depthSrv = gpu.depthSrv[gpu.currDepthIdx].Get();
-                    in.motionVectors = gpu.motionTex.Get();
-                    in.motionSrv = gpu.motionSrv.Get();
-                    in.renderWidth = kSw;
-                    in.renderHeight = kSh;
-                    in.outputWidth = kSw;
-                    in.outputHeight = kSh;
-                    in.reset = true;
-                    in.colorIsHdr = false;
+                    edpe::TemporalFrameInputs in = gpu.makeInputs(0.0f, 0.0f, 0.0f, 0.0f, true, 0.0f);
 
                     auto readBackFp16 = [&](ID3D11Texture2D* tex, std::vector<uint16_t>& out) -> bool {
                         if (!tex) return false;
