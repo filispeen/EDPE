@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cwchar>
 #include <memory>
 
 using Microsoft::WRL::ComPtr;
@@ -46,9 +47,13 @@ public:
         return true;
     }
     void resetHistory() override {}
+    void setDebugView(bool enabled) override { debugView = enabled; }
+    bool isDebugViewEnabled() const override { return debugView; }
+    bool presentsRealFrame() const override { return !debugView; }
 
     bool available = true;
     bool shouldFail = false;
+    bool debugView = false;
     bool lastReset = false;
     bool shutdownCalled = false;
     uint32_t maxGen = 1;
@@ -168,15 +173,49 @@ int testManagerContracts() {
         return fail("Monotonic frameIndex +1 should keep reset=false");
     }
 
-    // Frame 5 (skipped!) -> must auto-set reset=true.
+    // Debug view (interp-only) at 2x: 1 generated, 1 presented (no real frame).
+    mockPtr->setDebugView(true);
+    inputs.frameIndex = 3;
+    if (!mgr.evaluate(nullptr, inputs, true) ||
+        mgr.diagnostics().generatedFramesThisCycle != 1 ||
+        mgr.diagnostics().presentedFramesThisCycle != 1 ||
+        std::fabs(mgr.diagnostics().presentedFps - 100.0f) > 0.1f ||
+        std::wcsstr(mgr.diagnostics().statusMessage, L"interp-only") == nullptr) {
+        return fail("2x interp-only debug view telemetry mismatch");
+    }
+
+    // Debug view (interp-only) at 3x: 2 generated, 2 presented.
+    mockPtr->maxGen = 2;
+    mgr.setRequestedExtraFrames(2);
+    inputs.frameIndex = 4;
+    if (!mgr.evaluate(nullptr, inputs, true) ||
+        mgr.diagnostics().generatedFramesThisCycle != 2 ||
+        mgr.diagnostics().presentedFramesThisCycle != 2 ||
+        std::fabs(mgr.diagnostics().presentedFps - 200.0f) > 0.1f) {
+        return fail("3x interp-only debug view telemetry mismatch");
+    }
+
+    // Disable debug view -> restores 3x (1 real + 2 generated).
+    mockPtr->setDebugView(false);
     inputs.frameIndex = 5;
+    if (!mgr.evaluate(nullptr, inputs, true) ||
+        mgr.diagnostics().generatedFramesThisCycle != 2 ||
+        mgr.diagnostics().presentedFramesThisCycle != 3 ||
+        std::fabs(mgr.diagnostics().presentedFps - 300.0f) > 0.1f) {
+        return fail("Restored 3x telemetry mismatch after disabling debug view");
+    }
+    mockPtr->maxGen = 1;
+    mgr.setRequestedExtraFrames(1);
+
+    // Frame 8 (skipped!) -> must auto-set reset=true.
+    inputs.frameIndex = 8;
     if (!mgr.evaluate(nullptr, inputs, true) || !mockPtr->lastReset) {
         return fail("Skipped frameIndex must auto-set reset=true");
     }
 
     // Pause menu -> stand down without failing.
     inputs.isPauseOrMenu = true;
-    inputs.frameIndex = 6;
+    inputs.frameIndex = 9;
     if (!mgr.evaluate(nullptr, inputs, true) || mgr.diagnostics().generatedFramesThisCycle != 0) {
         return fail("Pause menu should stand down FG cleanly");
     }
@@ -184,7 +223,7 @@ int testManagerContracts() {
 
     // Backend failure -> fail-open (0 generated frames, false).
     mockPtr->shouldFail = true;
-    inputs.frameIndex = 7;
+    inputs.frameIndex = 10;
     if (mgr.evaluate(nullptr, inputs, true) || mgr.diagnostics().generatedFramesThisCycle != 0) {
         return fail("Backend failure must fail-open");
     }

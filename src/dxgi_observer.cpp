@@ -277,7 +277,7 @@ HRESULT STDMETHODCALLTYPE observedPresent(IDXGISwapChain* swap_chain, UINT sync_
     ContextCensusAfterOverlay(swap_chain, flags);
     bool presentedViaFgProxy = false;
     edpe::FgRuntime::instance().setFrameLimitFps(edpe::FrameLimiter::instance().targetFps());
-    edpe::FgRuntime::instance().onPresent(swap_chain, sync_interval, flags, &presentedViaFgProxy);
+    edpe::FgRuntime::instance().onPresent(swap_chain, sync_interval, flags, &presentedViaFgProxy, UiMenuVisible());
     const HRESULT result = presentedViaFgProxy ? S_OK : original(swap_chain, sync_interval, flags);
     edpe::setLastD3D11HResult(result);
     ContextCensusAfterPresent(swap_chain, flags);

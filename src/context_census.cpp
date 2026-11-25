@@ -15722,6 +15722,10 @@ ID3D11RenderTargetView* ContextCensusGetBackbufferCopyRtv() {
 }
 
 void ContextCensusSetJitterDebugView(bool enable) {
+    if (enable) {
+        s_motion_class_debug_view.store(false, std::memory_order_relaxed);
+        edpe::FgRuntime::instance().setFgDebugView(false);
+    }
     s_jitter_debug_view.store(enable, std::memory_order_relaxed);
     edpe::Config::instance().jitterDebugView = enable;
 }

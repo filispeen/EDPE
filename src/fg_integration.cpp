@@ -152,14 +152,13 @@ void FgRuntime::applyConfig(int backendInt,
     telemetry_.configuredBackend = configuredBackend_;
 
     if (auto* b = manager_.getBackend(FrameGenerationBackend::NvidiaDlssG)) {
-        auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
+        auto* sl = static_cast<NvidiaStreamlineFgBackend*>(b);
         sl->setLowLatencyBoost(reflexBoost_);
         sl->setDynamicMfgMode(dynamicMfg_, dynamicTargetFps_);
-        sl->setDebugView(fgDebugView_);
+        b->setDebugView(fgDebugView_);
     }
     if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
-        auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-        amd->setDebugFlags(false, false, fgDebugView_);
+        b->setDebugView(fgDebugView_);
     }
 }
 
@@ -167,12 +166,10 @@ void FgRuntime::setFgDebugView(bool enabled) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     fgDebugView_ = enabled;
     if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
-        auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-        amd->setDebugFlags(false, false, fgDebugView_);
+        b->setDebugView(fgDebugView_);
     }
     if (auto* b = manager_.getBackend(FrameGenerationBackend::NvidiaDlssG)) {
-        auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-        sl->setDebugView(fgDebugView_);
+        b->setDebugView(fgDebugView_);
     }
 }
 
@@ -532,6 +529,7 @@ void FgRuntime::shutdownLocked() {
     telemetry_.active = false;
     telemetry_.activeBackend = FrameGenerationBackend::Off;
     telemetry_.generatedFramesThisCycle = 0;
+    telemetry_.presentedFramesThisCycle = 1;
     telemetry_.renderedFps = 0.0f;
     telemetry_.presentedFps = 0.0f;
     telemetry_.fgGpuTimeMs = 0.0f;
@@ -660,7 +658,8 @@ void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
 void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
                           UINT syncInterval,
                           UINT flags,
-                          bool* outPresentedViaProxy) {
+                          bool* outPresentedViaProxy,
+                          bool overlayMenuVisible) {
     if (outPresentedViaProxy) *outPresentedViaProxy = false;
     if (!gameSwapChain || (flags & DXGI_PRESENT_TEST)) return;
 
@@ -766,15 +765,14 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
 
     if (manager_.selectedBackend() != configuredBackend_) {
         if (auto* b = manager_.getBackend(FrameGenerationBackend::NvidiaDlssG)) {
-            auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
+            auto* sl = static_cast<NvidiaStreamlineFgBackend*>(b);
             sl->setLowLatencyBoost(reflexBoost_);
             sl->setDynamicMfgMode(dynamicMfg_, dynamicTargetFps_);
             sl->setFrameLimitFps(frameLimitFps_.load(std::memory_order_relaxed));
-            sl->setDebugView(fgDebugView_);
+            b->setDebugView(fgDebugView_);
         }
         if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
-            auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-            amd->setDebugFlags(false, false, fgDebugView_);
+            b->setDebugView(fgDebugView_);
         }
         if (!manager_.selectBackend(configuredBackend_, &presenter_)) {
             const wchar_t* reason = backendUnavailableReasonLocked(configuredBackend_);
@@ -818,6 +816,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     in.renderHeight = renderH;
     in.outputWidth = bbDesc.Width;
     in.outputHeight = bbDesc.Height;
+    in.overlayMenuVisible = overlayMenuVisible;
     in.frameTimeMs = (hasSnap && snap.frameTimeMs > 0.0f) ? snap.frameTimeMs : 16.6667f;
     in.frameIndex = monotonicFrameIndex_;
     in.reset = !hasSnap || snap.reset || (monotonicFrameIndex_ == 1);
@@ -936,6 +935,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     telemetry_.activeBackend = manager_.selectedBackend();
     telemetry_.pausedForMenu = in.isPauseOrMenu;
     telemetry_.generatedFramesThisCycle = mgrDiag.generatedFramesThisCycle;
+    telemetry_.presentedFramesThisCycle = mgrDiag.presentedFramesThisCycle;
     telemetry_.totalGeneratedFrames = mgrDiag.totalGeneratedFrames;
     telemetry_.renderedFps = mgrDiag.renderedFps;
     telemetry_.presentedFps = mgrDiag.presentedFps;

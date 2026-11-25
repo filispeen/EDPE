@@ -52,6 +52,7 @@ struct FrameGenerationInputs {
     bool reset = false;
     bool isHdr = false;
     bool isPauseOrMenu = false;
+    bool overlayMenuVisible = false;
 
     CameraProjection cameraNow{};
     CameraProjection cameraPrevious{};
@@ -93,6 +94,7 @@ struct FrameGenerationDiagnostics {
     uint32_t outputHeight = 0;
     uint64_t frameIndex = 0;
     uint32_t generatedFramesThisCycle = 0;
+    uint32_t presentedFramesThisCycle = 1;
     uint64_t totalGeneratedFrames = 0;
     float renderedFps = 0.0f;
     float presentedFps = 0.0f;
@@ -129,6 +131,7 @@ public:
 
     virtual void setDebugView(bool /*enabled*/) {}
     virtual bool isDebugViewEnabled() const { return false; }
+    virtual bool presentsRealFrame() const { return true; }
 };
 
 class NullFrameGenBackend : public IFrameGenerationBackend {
@@ -173,6 +176,7 @@ public:
                   bool userEnabled);
 
     const IFrameGenerationBackend* activeBackend() const;
+    IFrameGenerationBackend* getBackend(FrameGenerationBackend backend);
     const IFrameGenerationBackend* getBackend(FrameGenerationBackend backend) const;
     const FrameGenerationDiagnostics& diagnostics() const { return diagnostics_; }
 

@@ -52,6 +52,7 @@ struct FgRuntimeTelemetry {
     uint32_t maxFramesToGenerate = 0;
     bool dynamicMfgSupported = false;
     uint32_t generatedFramesThisCycle = 0;
+    uint32_t presentedFramesThisCycle = 1;
     uint64_t totalGeneratedFrames = 0;
     float renderedFps = 0.0f;
     float presentedFps = 0.0f;
@@ -86,7 +87,8 @@ public:
     void onPresent(IDXGISwapChain* gameSwapChain,
                    UINT syncInterval,
                    UINT flags,
-                   bool* outPresentedViaProxy);
+                   bool* outPresentedViaProxy,
+                   bool overlayMenuVisible = false);
 
     // Called from observedResizeBuffers before native ResizeBuffers executes.
     void onResize(IDXGISwapChain* gameSwapChain);

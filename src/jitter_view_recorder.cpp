@@ -2,6 +2,7 @@
 #include "jitter_view_stats_shader.h"
 #include "jitter_logger.h"
 #include "context_census.h"
+#include "fg_integration.h"
 #include "upscaler_backend.h"
 #include "config.h"
 #include "log.h"
@@ -120,6 +121,10 @@ void JitterViewRecorder::startRecording() {
     }
     if (state_.load(std::memory_order_relaxed) != State::Idle) return;
 
+    restoreFgDebugView_ = edpe::FgRuntime::instance().fgDebugView();
+    if (restoreFgDebugView_) {
+        edpe::FgRuntime::instance().setFgDebugView(false);
+    }
     restoreDebugView_ = !ContextCensusGetJitterDebugView();
     if (restoreDebugView_) {
         ContextCensusSetJitterDebugView(true);
@@ -408,6 +413,10 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
                         ContextCensusSetJitterDebugView(false);
                         restoreDebugView_ = false;
                     }
+                    if (restoreFgDebugView_) {
+                        edpe::FgRuntime::instance().setFgDebugView(true);
+                        restoreFgDebugView_ = false;
+                    }
                     return;
                 }
 
@@ -665,6 +674,10 @@ void JitterViewRecorder::onFrame(ID3D11DeviceContext* context,
             if (restoreDebugView_) {
                 ContextCensusSetJitterDebugView(false);
                 restoreDebugView_ = false;
+            }
+            if (restoreFgDebugView_) {
+                edpe::FgRuntime::instance().setFgDebugView(true);
+                restoreFgDebugView_ = false;
             }
             triggerBackgroundWrite(renderWidth, renderHeight, width, height, isHdr, droppedFrames_);
         }

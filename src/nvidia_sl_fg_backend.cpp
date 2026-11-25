@@ -325,6 +325,8 @@ struct NvidiaStreamlineFgBackend::Impl {
     bool hasCachedDlssgOpts = false;
     sl::DLSSGOptions cachedDlssgOpts{};
     uint64_t setOptionsCount = 0;
+    uint64_t setOptionsErrorCount = 0;
+    bool lastLoggedDebugFlag = false;
     Microsoft::WRL::ComPtr<ID3D12Device> slProxyDevice;
     Microsoft::WRL::ComPtr<IDXGIFactory4> slProxyFactory;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> slProxyQueue;
@@ -827,6 +829,8 @@ bool NvidiaStreamlineFgBackend::initialize(D3D12ProxyPresenter* presenter) {
     impl_->renderSubmitStartedThisFrame.store(false, std::memory_order_relaxed);
     impl_->hasCachedDlssgOpts = false;
     impl_->cachedDlssgOpts = {};
+    impl_->setOptionsErrorCount = 0;
+    impl_->lastLoggedDebugFlag = false;
     impl_->applyReflexOptions(impl_->lowLatencyBoost
                                   ? sl::ReflexMode::eLowLatencyWithBoost
                                   : sl::ReflexMode::eLowLatency);
@@ -916,6 +920,8 @@ void NvidiaStreamlineFgBackend::shutdown() {
     impl_->hasPendingNextToken = false;
     impl_->hasCachedDlssgOpts = false;
     impl_->cachedDlssgOpts = {};
+    impl_->setOptionsErrorCount = 0;
+    impl_->lastLoggedDebugFlag = false;
     impl_->lastAppliedReflexMode = 0;
     impl_->lastAppliedFrameLimitUs = 0;
     impl_->reflexFrameLimiterActive.store(false, std::memory_order_relaxed);
@@ -1092,8 +1098,9 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     if (effectiveEnable && impl_->debugView) {
         opts.flags |= sl::DLSSGFlags::eShowOnlyInterpolatedFrame;
     }
+    const bool keepOverlayVisible = impl_->debugView && inputs.overlayMenuVisible;
     opts.enableUserInterfaceRecomposition =
-        (effectiveEnable && inputs.hudlessColor && inputs.packedUiColorAndAlpha)
+        (effectiveEnable && !keepOverlayVisible && inputs.hudlessColor && inputs.packedUiColorAndAlpha)
             ? sl::Boolean::eTrue
             : sl::Boolean::eFalse;
     opts.onErrorCallback = &slApiErrorCallback;
@@ -1110,7 +1117,20 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     if (!sameDlssgOpts) {
         optRc = impl_->sl.slDLSSGSetOptions(impl_->viewport, opts);
         impl_->snapshot.lastSlResult = static_cast<int32_t>(optRc);
-        if (++impl_->setOptionsCount <= 8) {
+        const bool debugFlag =
+            (static_cast<uint32_t>(opts.flags) &
+             static_cast<uint32_t>(sl::DLSSGFlags::eShowOnlyInterpolatedFrame)) != 0u;
+        const bool debugFlagChanged = (debugFlag != impl_->lastLoggedDebugFlag);
+        ++impl_->setOptionsCount;
+        if (optRc != sl::Result::eOk) {
+            ++impl_->setOptionsErrorCount;
+        }
+        const bool shouldLogOpt =
+            (impl_->setOptionsCount <= 8) ||
+            debugFlagChanged ||
+            (optRc != sl::Result::eOk &&
+             (impl_->setOptionsErrorCount <= 8 || (impl_->setOptionsErrorCount % 120) == 0));
+        if (shouldLogOpt) {
             wchar_t optMsg[224]{};
             std::swprintf(optMsg, 224,
                           L"[EDPE][SL] slDLSSGSetOptions #%llu mode=%d gen=%u flags=0x%X uiRecomp=%d rc=%S",
@@ -1121,10 +1141,13 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
                           opts.enableUserInterfaceRecomposition == sl::Boolean::eTrue ? 1 : 0,
                           slResultToString(optRc));
             EdpeLog(optMsg);
+            impl_->lastLoggedDebugFlag = debugFlag;
         }
         if (optRc == sl::Result::eOk) {
             impl_->cachedDlssgOpts = opts;
             impl_->hasCachedDlssgOpts = true;
+            impl_->lastLoggedDebugFlag = debugFlag;
+            impl_->snapshot.lastPresentedFrames = 0;
         } else {
             impl_->hasCachedDlssgOpts = false;
         }
@@ -1144,6 +1167,14 @@ bool NvidiaStreamlineFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     if (outGeneratedFrames) {
         if (!effectiveEnable) {
             *outGeneratedFrames = 0;
+        } else if (impl_->debugView) {
+            if (impl_->snapshot.lastPresentedFrames > 0) {
+                *outGeneratedFrames = impl_->snapshot.lastPresentedFrames;
+            } else if (opts.mode == sl::DLSSGMode::eOn) {
+                *outGeneratedFrames = opts.numFramesToGenerate;
+            } else {
+                *outGeneratedFrames = 1;
+            }
         } else if (impl_->snapshot.lastPresentedFrames > 1) {
             *outGeneratedFrames = impl_->snapshot.lastPresentedFrames - 1;
         } else if (opts.mode == sl::DLSSGMode::eOn) {
@@ -1196,6 +1227,11 @@ void NvidiaStreamlineFgBackend::setDebugView(bool enabled) {
 bool NvidiaStreamlineFgBackend::isDebugViewEnabled() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->debugView;
+}
+
+bool NvidiaStreamlineFgBackend::presentsRealFrame() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return !impl_->debugView;
 }
 
 bool NvidiaStreamlineFgBackend::reflexSleepCurrentFrame() {

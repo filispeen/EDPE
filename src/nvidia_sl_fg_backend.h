@@ -70,6 +70,7 @@ public:
 
     void setDebugView(bool enabled) override;
     bool isDebugViewEnabled() const override;
+    bool presentsRealFrame() const override;
 
     // Invokes slReflexSleep for the current frame token when Reflex is active.
     bool reflexSleepCurrentFrame();

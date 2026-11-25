@@ -263,6 +263,7 @@ bool FrameGenerationManager::evaluate(ID3D12GraphicsCommandList* cmdList,
     diagnostics_.backend = selected_;
     diagnostics_.enabled = false;
     diagnostics_.generatedFramesThisCycle = 0;
+    diagnostics_.presentedFramesThisCycle = 1;
     diagnostics_.success = false;
     diagnostics_.renderWidth = inputs.renderWidth;
     diagnostics_.renderHeight = inputs.renderHeight;
@@ -329,18 +330,28 @@ bool FrameGenerationManager::evaluate(ID3D12GraphicsCommandList* cmdList,
         return false;
     }
 
+    const bool presentsReal = backend->presentsRealFrame();
+    const uint32_t presentedPerCycle = (std::max)(1u, (presentsReal ? 1u : 0u) + generated);
+
     diagnostics_.enabled = true;
     diagnostics_.generatedFramesThisCycle = generated;
+    diagnostics_.presentedFramesThisCycle = presentedPerCycle;
     totalGeneratedFrames_ += generated;
     diagnostics_.totalGeneratedFrames = totalGeneratedFrames_;
-    diagnostics_.presentedFps = diagnostics_.renderedFps * static_cast<float>(1u + generated);
-    std::swprintf(diagnostics_.statusMessage, 256, L"%ls (%ux)",
-                  backend->name(), 1u + generated);
+    diagnostics_.presentedFps = diagnostics_.renderedFps * static_cast<float>(presentedPerCycle);
+    std::swprintf(diagnostics_.statusMessage, 256,
+                  presentsReal ? L"%ls (%ux)" : L"%ls (%ux interp-only)",
+                  backend->name(), presentedPerCycle);
     return true;
 }
 
 const IFrameGenerationBackend* FrameGenerationManager::activeBackend() const {
     return getBackend(selected_);
+}
+
+IFrameGenerationBackend* FrameGenerationManager::getBackend(FrameGenerationBackend backend) {
+    const size_t idx = static_cast<size_t>(backend);
+    return (idx < std::size(backends_)) ? backends_[idx].get() : nullptr;
 }
 
 const IFrameGenerationBackend* FrameGenerationManager::getBackend(FrameGenerationBackend backend) const {

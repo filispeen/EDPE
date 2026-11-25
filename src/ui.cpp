@@ -2201,7 +2201,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 }
                 const auto fgNow = edpe::FgRuntime::instance().telemetry();
                 if (fgNow.active && !fgNow.pausedForMenu && fgNow.generatedFramesThisCycle > 0) {
-                    const uint32_t mult = 1u + fgNow.generatedFramesThisCycle;
+                    const uint32_t mult = (fgNow.presentedFramesThisCycle > 0)
+                                              ? fgNow.presentedFramesThisCycle
+                                              : (1u + fgNow.generatedFramesThisCycle);
                     ImGui::TextDisabled("Target Presented (+FG x%u): ~%.1f FPS",
                         mult, stats.targetFps * static_cast<float>(mult));
                 }

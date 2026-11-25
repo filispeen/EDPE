@@ -271,11 +271,18 @@ void PerfTracker::updateCachedStats() {
     const auto fgTel = FgRuntime::instance().telemetry();
     cachedStats_.fgActive = fgTel.active;
     if (fgTel.active) {
+        const uint32_t presentedMult = (fgTel.presentedFramesThisCycle > 0)
+                                           ? fgTel.presentedFramesThisCycle
+                                           : (1u + fgTel.generatedFramesThisCycle);
+        const bool interpOnly = !fgTel.pausedForMenu && fgTel.generatedFramesThisCycle > 0 &&
+                                presentedMult == fgTel.generatedFramesThisCycle;
         const float presented = (!fgTel.pausedForMenu && fgTel.generatedFramesThisCycle > 0)
-                                    ? cachedStats_.fps * static_cast<float>(1u + fgTel.generatedFramesThisCycle)
+                                    ? cachedStats_.fps * static_cast<float>(presentedMult)
                                     : cachedStats_.fps;
         snprintf(cachedStats_.fgPresentedFpsLine, sizeof(cachedStats_.fgPresentedFpsLine),
-            "Presented FPS (+FG): %5.1f (x%u)", presented, 1u + fgTel.generatedFramesThisCycle);
+            interpOnly ? "Presented FPS (+FG): %5.1f (x%u interp)"
+                       : "Presented FPS (+FG): %5.1f (x%u)",
+            presented, presentedMult);
         const char* fgName = (fgTel.activeBackend == FrameGenerationBackend::NvidiaDlssG)
                                  ? "NVIDIA DLSS-G"
                                  : (fgTel.activeBackend == FrameGenerationBackend::AmdFsrFg ? "AMD FSR FG" : "Off");
@@ -283,7 +290,8 @@ void PerfTracker::updateCachedStats() {
             snprintf(cachedStats_.fgInfoLine, sizeof(cachedStats_.fgInfoLine), "%s (Paused/Menu)", fgName);
         } else {
             snprintf(cachedStats_.fgInfoLine, sizeof(cachedStats_.fgInfoLine),
-                "%s (x%u | Copy %.2f ms)", fgName, 1u + fgTel.generatedFramesThisCycle, fgTel.d3d12CopyMs);
+                interpOnly ? "%s (x%u interp | Copy %.2f ms)" : "%s (x%u | Copy %.2f ms)",
+                fgName, presentedMult, fgTel.d3d12CopyMs);
         }
     } else {
         cachedStats_.fgPresentedFpsLine[0] = '\0';

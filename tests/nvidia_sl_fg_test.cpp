@@ -87,10 +87,13 @@ int runUnitChecks() {
     backend.setDynamicMfgMode(true, 120.0f);
     REQUIRE(backend.isDynamicMfgEnabled());
     REQUIRE(!backend.isDebugViewEnabled());
+    REQUIRE(backend.presentsRealFrame());
     backend.setDebugView(true);
     REQUIRE(backend.isDebugViewEnabled());
+    REQUIRE(!backend.presentsRealFrame());
     backend.setDebugView(false);
     REQUIRE(!backend.isDebugViewEnabled());
+    REQUIRE(backend.presentsRealFrame());
     return 0;
 }
 
@@ -442,6 +445,45 @@ int main() {
             const auto st = backend.statusSnapshot();
             totalPresented += st.lastPresentedFrames;
             REQUIRE(st.dlssgStatusFlags == 0);
+        }
+
+        // Toggle eShowOnlyInterpolatedFrame ON (with and without overlayMenuVisible) then OFF.
+        backend.setDebugView(true);
+        REQUIRE(!backend.presentsRealFrame());
+        for (uint64_t j = 0; j < 4; ++j) {
+            ctx4->CopyResource(sharedHudless.d3d11.Get(), hudlessTex.Get());
+            ctx4->CopyResource(sharedUi.d3d11.Get(), uiTex.Get());
+            ctx4->CopyResource(sharedDepth.d3d11.Get(), depthTex.Get());
+            ctx4->CopyResource(sharedMvec.d3d11.Get(), mvecTex.Get());
+            hookCtx.inputs.frameIndex = 11 + j;
+            hookCtx.inputs.reset = false;
+            hookCtx.inputs.isPauseOrMenu = false;
+            hookCtx.inputs.overlayMenuVisible = (j == 0);
+            HRESULT phr = S_OK;
+            REQUIRE(presenter.presentFromD3D11Texture(ctx4.Get(), colorTex.Get(), 0, 0, &phr));
+            REQUIRE(SUCCEEDED(phr));
+            const auto st = backend.statusSnapshot();
+            REQUIRE(st.dlssgStatusFlags == 0);
+            REQUIRE(st.lastSlResult == static_cast<int32_t>(sl::Result::eOk));
+        }
+
+        backend.setDebugView(false);
+        REQUIRE(backend.presentsRealFrame());
+        hookCtx.inputs.overlayMenuVisible = false;
+        for (uint64_t j = 0; j < 3; ++j) {
+            ctx4->CopyResource(sharedHudless.d3d11.Get(), hudlessTex.Get());
+            ctx4->CopyResource(sharedUi.d3d11.Get(), uiTex.Get());
+            ctx4->CopyResource(sharedDepth.d3d11.Get(), depthTex.Get());
+            ctx4->CopyResource(sharedMvec.d3d11.Get(), mvecTex.Get());
+            hookCtx.inputs.frameIndex = 15 + j;
+            hookCtx.inputs.reset = false;
+            hookCtx.inputs.isPauseOrMenu = false;
+            HRESULT phr = S_OK;
+            REQUIRE(presenter.presentFromD3D11Texture(ctx4.Get(), colorTex.Get(), 0, 0, &phr));
+            REQUIRE(SUCCEEDED(phr));
+            const auto st = backend.statusSnapshot();
+            REQUIRE(st.dlssgStatusFlags == 0);
+            REQUIRE(st.lastSlResult == static_cast<int32_t>(sl::Result::eOk));
         }
         std::printf("DLSS-G live loop complete: totalPresented=%llu\n",
                     static_cast<unsigned long long>(totalPresented));
