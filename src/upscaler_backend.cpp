@@ -616,6 +616,9 @@ bool AmdUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* /
     impl_->fsr4 = std::make_unique<Fsr4Engine>();
     impl_->fsr4Device = device;
     impl_->fsr4State.onBackendInitialize();
+    // The saved selection is applied here, before the probe, so a startup on Backend=4 keeps the probed engine
+    // instead of releasing it and initializing it again when the menu code applies the selection later.
+    if (Config::instance().upscalerBackend == 4) impl_->fsr4State.setSelected(true);
     impl_->fsr4SkipReason[0] = L'\0';
     if (!adapterAllowsFsr4(device, impl_->fsr4SkipReason, std::size(impl_->fsr4SkipReason))) {
         wchar_t buf[256];
