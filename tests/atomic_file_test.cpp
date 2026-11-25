@@ -228,6 +228,28 @@ int main() {
         }
     }
 
+    // 6b. The AMD FSR 4.1.2 menu entry persists as Backend=4 and Backend=2 stays AMD FSR 3.1.2.
+    {
+        const std::filesystem::path iniPath = std::filesystem::temp_directory_path() / L"edpe_config_fsr4_test.ini";
+        std::error_code ec;
+        std::filesystem::remove(iniPath, ec);
+
+        Config saved{};
+        saved.upscalerBackend = 4;
+        saved.upscaleMode = 4;
+        if (!saved.saveTo(iniPath.wstring())) return fail(42, "Config::saveTo (FSR 4 selection) failed");
+        Config loaded{};
+        loaded.loadFrom(iniPath.wstring());
+        if (loaded.upscalerBackend != 4) return fail(43, "FSR 4 selection did not round trip");
+
+        saved.upscalerBackend = 2;
+        if (!saved.saveTo(iniPath.wstring())) return fail(50, "Config::saveTo (FSR 3.1.2 selection) failed");
+        Config loaded2{};
+        loaded2.loadFrom(iniPath.wstring());
+        std::filesystem::remove(iniPath, ec);
+        if (loaded2.upscalerBackend != 2) return fail(51, "FSR 3.1.2 selection did not round trip");
+    }
+
     // 7. SSAA XML parser and effective MipLODBias calculation tests.
     {
         if (std::fabs(Config::parseEliteSsaaMultiplierXml("<Graphics><SSAAMultiplier>0.500000</SSAAMultiplier></Graphics>") - 0.5f) > 1e-5f) {

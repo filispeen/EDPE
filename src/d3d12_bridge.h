@@ -44,8 +44,8 @@ public:
     // Initializes secondary D3D12 device, high-priority queue, command allocators, and shared fence
     // on the exact DXGI adapter backing d3d11Device.
     // When agilitySdkDir is non-null and holds D3D12Core.dll, the device is created through
-    // ID3D12DeviceFactory from that Agility SDK runtime (the inbox runtime on Windows 10 did not offer
-    // FSR 4.1.2); if that fails the bridge falls back to the system D3D12 runtime.
+    // ID3D12DeviceFactory from that Agility SDK runtime (some system runtimes, such as the Windows 10 inbox
+    // one, may not offer FSR 4.1.2); if that fails the bridge falls back to the system D3D12 runtime.
     bool initialize(ID3D11Device* d3d11Device, const wchar_t* agilitySdkDir = nullptr);
 
     // True when the D3D12 device was created through ID3D12DeviceFactory for the requested Agility SDK version:

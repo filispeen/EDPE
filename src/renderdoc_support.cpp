@@ -53,8 +53,9 @@ bool detectProtonVulkanCaptureEnv() {
 const char* backendLabel(int backend) {
     switch (backend) {
     case 1: return "NVIDIA DLSS/DLAA";
-    case 2: return "AMD FSR";
+    case 2: return "AMD FSR 3.1.2";
     case 3: return "Native TAA";
+    case 4: return "AMD FSR 4.1.2";
     default: return "Native (Bypass)";
     }
 }

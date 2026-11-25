@@ -61,24 +61,16 @@ runs:
       uses: actions/cache@v4
       with:
         path: external/ffx-sdk
-        key: ffx-fg-sdk-${{ runner.os }}-v2.4.0
+        # Change the key together with FFX_TAG or FFX_SPARSE in tools/fetch_fsr4_runtime.py.
+        key: ffx-fg-sdk-${{ runner.os }}-v2.4.0-upscalers
         restore-keys: |
           ffx-fg-sdk-${{ runner.os }}-
 
-    - name: Clone FidelityFX FG SDK
+    - name: Fetch FidelityFX SDK (frame generation, upscalers, signed binaries)
       if: steps.cache-ffx-fg.outputs.cache-hit != 'true'
       shell: pwsh
       run: |
-        if (-not (Test-Path "external/ffx-sdk/Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h")) {
-          Write-Host "Cloning official AMD FidelityFX SDK v2.4.0 (sparse)..."
-          git clone --depth 1 --branch v2.4.0 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/ffx-sdk
-          Push-Location external/ffx-sdk
-          git sparse-checkout set Kits/FidelityFX/api Kits/FidelityFX/framegeneration Kits/FidelityFX/signedbin LICENSE.txt
-          Pop-Location
-          Remove-Item -Recurse -Force external/ffx-sdk/.git
-        } else {
-          Write-Host "FidelityFX FG SDK found in cache."
-        }
+        python tools/fetch_fsr4_runtime.py --ffx-only
 
     - name: Cache NVIDIA Streamline SDK
       id: cache-streamline
@@ -128,7 +120,9 @@ runs:
       env:
         EDPE_VERSION: ${{ inputs.edpe-version }}
       run: |
-        cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$env:EDPE_VERSION" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+        # EDPE_REQUIRE_FSR4 fails the configure step when the fetched SDK lacks the FSR 4 inputs. Without it CMake would
+        # build the inert FSR 4 stub, and the engine test skips on this GPU-less runner, so CI would still pass.
+        cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$env:EDPE_VERSION" -DEDPE_REQUIRE_FSR4=ON -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
     - name: Build EDPE (Release)
       shell: pwsh
