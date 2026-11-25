@@ -722,8 +722,8 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
 
     if (impl_->fsr4State.running() && impl_->fsr4) {
         // HDR (linear) color input is not supported by FSR 4 yet: use FSR 3.1.2 while HdrInput is on, without counting
-        // these frames as failures.
-        // Whichever provider takes over has not seen the frames the other one rendered, so it starts from a clean history.
+        // these frames as failures. Whichever provider takes over has not seen the frames the other one rendered, so it
+        // starts from a clean history.
         switch (impl_->fsr4State.setHdrFallback(inputs.colorIsHdr)) {
         case fsr4::ProviderState::HdrTransition::Started:
             EdpeLog(L"EDPE: FSR 4 does not support HDR color input (HdrInput=1); using FSR 3.1.2 while it is on");
