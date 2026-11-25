@@ -900,7 +900,7 @@ struct RefreshTls {
     float savedBoundX = 0.0f;      // offset 16
     float savedBoundY = 0.0f;      // offset 20
     uint32_t savedFlags = 0;       // offset 24
-    uint32_t layoutVariant = 0;    // offset 28 (1 = +0x28C/+0x290, 2 = +0x228/+0x22C)
+    uint32_t layoutVariant = 0;    // offset 28 (0 = none, 1 = +0x28C/+0x290)
 };
 
 inline __declspec(thread) RefreshTls t_refreshTls{};
@@ -921,6 +921,7 @@ struct FrameJitterWindow {
     std::atomic<uint64_t> readFaultsTotal{0};
     std::atomic<uint64_t> writeFaultsTotal{0};
     std::atomic<uint64_t> rollbacksTotal{0};
+    std::atomic<uint64_t> rejectedKindTotal{0};
 };
 
 inline FrameJitterWindow& frameWindow() noexcept {
@@ -973,19 +974,12 @@ inline bool applyTransientCameraBoundJitter(uint8_t* camera, RefreshTls& tls) no
     const float jy = win.jitterPxY.load(std::memory_order_relaxed);
     if (std::fabs(jx) < 1e-6f && std::fabs(jy) < 1e-6f) return false;
 
-    // SEH-protected reads for layout variant 1 (+0x264 kind, +0x28C/+0x290 bounds, +0x250 flags)
-    // and layout variant 2 (+0x240/+0x244 kind, +0x228/+0x22C bounds, +0x250 flags).
+    // SEH-protected reads for verified camera layout (+0x264 kind, +0x28C/+0x290 bounds, +0x250 flags).
     uint32_t kind1 = 0;
     float bx1 = 0.0f, by1 = 0.0f;
-    uint32_t kind2a = 0, kind2b = 0;
-    float bx2 = 0.0f, by2 = 0.0f;
     if (!sehReadU32(camera + 0x264, &kind1) ||
         !sehReadF32(camera + 0x28C, &bx1) ||
-        !sehReadF32(camera + 0x290, &by1) ||
-        !sehReadU32(camera + 0x240, &kind2a) ||
-        !sehReadU32(camera + 0x244, &kind2b) ||
-        !sehReadF32(camera + 0x228, &bx2) ||
-        !sehReadF32(camera + 0x22C, &by2)) {
+        !sehReadF32(camera + 0x290, &by1)) {
         win.readFaultsTotal.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -999,23 +993,19 @@ inline bool applyTransientCameraBoundJitter(uint8_t* camera, RefreshTls& tls) no
         return std::fabs(camAspect - targetAspect) <= 0.12f * targetAspect;
     };
 
-    size_t offBx = 0, offBy = 0;
-    uint32_t variant = 0;
-    if (kind1 == 3 && validBounds(bx1, by1)) {
-        offBx = 0x28C;
-        offBy = 0x290;
-        variant = 1;
-        tls.savedBoundX = bx1;
-        tls.savedBoundY = by1;
-    } else if ((kind2a == 3 || kind2b == 3) && validBounds(bx2, by2)) {
-        offBx = 0x228;
-        offBy = 0x22C;
-        variant = 2;
-        tls.savedBoundX = bx2;
-        tls.savedBoundY = by2;
-    } else {
+    if (kind1 != 3) {
+        win.rejectedKindTotal.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    if (!validBounds(bx1, by1)) {
+        return false;
+    }
+
+    const size_t offBx = 0x28C;
+    const size_t offBy = 0x290;
+    const uint32_t variant = 1;
+    tls.savedBoundX = bx1;
+    tls.savedBoundY = by1;
 
     uint32_t flags = 0;
     if (!sehReadU32(camera + 0x250, &flags)) {
@@ -1057,11 +1047,9 @@ inline bool applyTransientCameraBoundJitter(uint8_t* camera, RefreshTls& tls) no
 
 inline void __fastcall refreshPost() noexcept {
     RefreshTls& tls = t_refreshTls;
-    if (tls.camera && tls.layoutVariant != 0) {
-        const size_t offBx = (tls.layoutVariant == 1) ? 0x28Cu : 0x228u;
-        const size_t offBy = (tls.layoutVariant == 1) ? 0x290u : 0x22Cu;
-        const bool okX = sehWriteF32(tls.camera + offBx, tls.savedBoundX);
-        const bool okY = sehWriteF32(tls.camera + offBy, tls.savedBoundY);
+    if (tls.camera && tls.layoutVariant == 1) {
+        const bool okX = sehWriteF32(tls.camera + 0x28Cu, tls.savedBoundX);
+        const bool okY = sehWriteF32(tls.camera + 0x290u, tls.savedBoundY);
         const bool okF = sehWriteU32(tls.camera + 0x250, tls.savedFlags);
         if (!okX || !okY || !okF) {
             recordHookWriteFault();
