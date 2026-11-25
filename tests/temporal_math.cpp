@@ -784,6 +784,74 @@ int main() {
         if (cockpitPanel.mapGuiFocus) return 1237;
     }
 
+    // 6-DOF cameraDepthMotion accuracy across individual & simultaneous translations and rotations
+    {
+        auto makeCam = [](float px, float py, float pz, float yaw, float pitch, float roll) {
+            const float cy = std::cos(yaw), sy = std::sin(yaw);
+            const float cp = std::cos(pitch), sp = std::sin(pitch);
+            const float cr = std::cos(roll), sr = std::sin(roll);
+            edpe::CameraProjection c{};
+            c.worldFromView[0] = cy * cr + sy * sp * sr;
+            c.worldFromView[1] = -cy * sr + sy * sp * cr;
+            c.worldFromView[2] = sy * cp;
+            c.worldFromView[3] = px;
+            c.worldFromView[4] = cp * sr;
+            c.worldFromView[5] = cp * cr;
+            c.worldFromView[6] = -sp;
+            c.worldFromView[7] = py;
+            c.worldFromView[8] = -sy * cr + cy * sp * sr;
+            c.worldFromView[9] = sy * sr + cy * sp * cr;
+            c.worldFromView[10] = cy * cp;
+            c.worldFromView[11] = pz;
+            c.scaleX = 1.2f;
+            c.scaleY = 1.6f;
+            c.depthB = 0.025f;
+            return c;
+        };
+        struct Case { float vx, vy, vz, yaw, pitch, roll; };
+        const Case cases[] = {
+            {0.16f, 0.0f,  0.0f,  0.0f,   0.0f,   0.0f},   // TranslateX
+            {0.0f,  0.12f, 0.0f,  0.0f,   0.0f,   0.0f},   // TranslateY
+            {0.0f,  0.0f,  0.22f, 0.0f,   0.0f,   0.0f},   // TranslateZ
+            {0.0f,  0.0f,  0.0f,  0.032f, 0.0f,   0.0f},   // RotateYaw
+            {0.0f,  0.0f,  0.0f,  0.0f,   0.025f, 0.0f},   // RotatePitch
+            {0.0f,  0.0f,  0.0f,  0.0f,   0.0f,   0.035f}, // RotateRoll
+            {0.12f, 0.06f, 0.15f, 0.024f, 0.015f, 0.020f}, // Combined6DOF
+        };
+        const auto prevCam = makeCam(0.0f, 0.0f, 0.0f, 0.0f, -0.10f, 0.0f);
+        const float wx = 1.25f, wy = -1.5f, wz = 8.0f;
+        // Project world point into prevCam
+        const auto projectPoint = [](const edpe::CameraProjection& c, float x, float y, float z,
+                                     float& outPx, float& outPy, float& outDepth) -> bool {
+            const float dx = x - c.worldFromView[3];
+            const float dy = y - c.worldFromView[7];
+            const float dz = z - c.worldFromView[11];
+            const float vx = c.worldFromView[0] * dx + c.worldFromView[4] * dy + c.worldFromView[8] * dz;
+            const float vy = c.worldFromView[1] * dx + c.worldFromView[5] * dy + c.worldFromView[9] * dz;
+            const float vz = c.worldFromView[2] * dx + c.worldFromView[6] * dy + c.worldFromView[10] * dz;
+            if (vz <= 0.1f) return false;
+            outPx = (c.scaleX * vx / vz + 1.0f) * 128.0f * 0.5f - 0.5f;
+            outPy = (1.0f - c.scaleY * vy / vz) * 96.0f * 0.5f - 0.5f;
+            outDepth = c.depthB / vz;
+            return true;
+        };
+        float prevPx = 0.0f, prevPy = 0.0f, prevDepth = 0.0f;
+        if (!projectPoint(prevCam, wx, wy, wz, prevPx, prevPy, prevDepth)) return 1240;
+        for (int ci = 0; ci < 7; ++ci) {
+            const auto& cs = cases[ci];
+            const auto nowCam = makeCam(cs.vx, cs.vy, cs.vz, cs.yaw, -0.10f + cs.pitch, cs.roll);
+            float curPx = 0.0f, curPy = 0.0f, curDepth = 0.0f;
+            if (!projectPoint(nowCam, wx, wy, wz, curPx, curPy, curDepth)) return 1241 + ci;
+            float mvX = 0.0f, mvY = 0.0f;
+            if (!edpe::cameraDepthMotion(nowCam, prevCam, 128u, 96u, curPx, curPy, curDepth, &mvX, &mvY)) {
+                return 1250 + ci;
+            }
+            if (std::fabs((curPx + mvX) - prevPx) > 1e-3f || std::fabs((curPy + mvY) - prevPy) > 1e-3f) {
+                return 1260 + ci;
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Stage 3: Per-frame phase consistency audit (checkRowPair & PhasePairAuditor)
     // -------------------------------------------------------------------------

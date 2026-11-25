@@ -421,7 +421,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
                         }
                         shipMatches = (shipErr <= shipTol);
                     }
-                    bool preferShip = !worldMatches || (z < 1.5) || (shipErr + 1e-5 * depth < worldErr * 0.5);
+                    bool preferShip = !worldMatches || (z < 1.5);
                     if (shipMatches && preferShip) {
                         res.mv = shipMv;
                         res.pixelClass = isReset ? kClassReset : kClassWeapon;
@@ -463,7 +463,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
             }
             // Use depth-relative tie-breaker so exterior ship nose/hull (depth ~ 0.002-0.01) is not
             // penalized by a fixed 1e-6 offset while flat world planes (worldErr == 0) stay World.
-            bool preferStatic = !worldMatches || (z < 1.5) || (staticErr + 1e-5 * depth < worldErr * 0.5);
+            bool preferStatic = !worldMatches || (z < 1.5);
             if (staticMatches && preferStatic) {
                 res.mv = float2(0.0, 0.0);
                 res.pixelClass = isReset ? kClassReset : kClassCockpitStatic;

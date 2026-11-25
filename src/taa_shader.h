@@ -187,7 +187,7 @@ PSOutput ps_main(VSOutput pin) {
     float speed = length(mvPixels);
 
     // Smooth variance-clip gamma: active even at speed == 0 so un-tracked movers do not ghost.
-    float gamma = lerp(1.25, 1.00, saturate(speed * 0.15));
+    float gamma = lerp(1.25, 0.75, saturate(speed * 0.25));
     float3 finalMin = max(boxMin, mean - gamma * sigma);
     float3 finalMax = min(boxMax, mean + gamma * sigma);
 
@@ -212,8 +212,12 @@ PSOutput ps_main(VSOutput pin) {
     float depthConfidence = 1.0;
     float2 prevJitterUv = jitterHistory.xy * renderResolution.zw;
     if (reactiveInfo.x > 0.5) {
-        float reactive = motionReactive.SampleLevel(pointSampler, nearestUv, 0).r;
-        depthConfidence = lerp(1.0, 0.15, saturate(reactive));
+        // Sample both centerUv (newly disoccluded background) and nearestUv (dilated silhouette)
+        // so foreground dilation never masks a disoccluded pixel, and fully drop stale history.
+        float reactiveCenter = motionReactive.SampleLevel(pointSampler, centerUv, 0).r;
+        float reactiveNear = motionReactive.SampleLevel(pointSampler, nearestUv, 0).r;
+        float reactive = max(reactiveCenter, reactiveNear);
+        depthConfidence = 1.0 - saturate(reactive);
     } else if (jitterHistory.w > 0.5 && nearestDepth > 0.0 && speed > 0.5) {
         float2 prevUv = clamp(priorUv + prevJitterUv, 0.0, 1.0);
         float pd = prevSceneDepth.SampleLevel(pointSampler, prevUv, 0).r;
@@ -276,17 +280,18 @@ PSOutput ps_main(VSOutput pin) {
         clampedHistY = lerp(clampedHistY, histY, 0.98 * stationaryWeight * thinRidge);
     }
 
-    // 6. Velocity / Disocclusion Confidence
+    // 6. Velocity / Disocclusion Confidence (normalized to local variance to suppress dark-floor/specular smearing)
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
-    float speedFactor = saturate(speed * 0.35);
-    float historyConfidence = lerp(1.0, 1.0 / (1.0 + clampDistance * 6.0), speedFactor) * depthConfidence;
-    float lumaRange = max(finalMax.x - finalMin.x, 0.08);
+    float normClamp = clampDistance / max(length(sigma), 0.015);
+    float speedFactor = saturate(speed * 0.50);
+    float historyConfidence = lerp(1.0, 1.0 / (1.0 + normClamp * 1.5), speedFactor) * depthConfidence;
+    float lumaRange = max(finalMax.x - finalMin.x, 0.025);
     float lumaDelta = abs(currentY.x - clampedHistY.x);
-    float relLumaShift = saturate((lumaDelta / lumaRange - 0.60) * 1.25) * saturate((speed - 0.75) * 0.45);
-    historyConfidence *= (1.0 - 0.45 * relLumaShift);
+    float relLumaShift = saturate((lumaDelta / lumaRange - 0.45) * 1.50) * saturate((speed - 0.50) * 0.60);
+    historyConfidence *= (1.0 - 0.65 * relLumaShift);
 
     float blendWeight = clamp(params.z, 0.0, 0.95);
-    blendWeight = lerp(blendWeight, 0.65, saturate(speed * 0.08));
+    blendWeight = lerp(blendWeight, 0.55, saturate(speed * 0.14));
 
     float dynamicBlend = blendWeight * historyConfidence;
 
