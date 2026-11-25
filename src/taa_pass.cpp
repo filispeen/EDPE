@@ -180,7 +180,7 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     float prevJitterY,
     float depthB,
     ID3D11ShaderResourceView* prevDepthSrv,
-    DXGI_FORMAT preferredFormat) {
+    DXGI_FORMAT /*preferredFormat*/) {
     if (!device_ || !context || !currentFrameSrv || width == 0 || height == 0) {
         return false;
     }
@@ -188,16 +188,9 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     const uint32_t rW = (renderWidth > 0) ? renderWidth : width;
     const uint32_t rH = (renderHeight > 0) ? renderHeight : height;
 
-    DXGI_FORMAT fmt = preferredFormat;
-    if (destinationTexture) {
-        D3D11_TEXTURE2D_DESC destDesc{};
-        destinationTexture->GetDesc(&destDesc);
-        fmt = destDesc.Format;
-    } else if (fmt == DXGI_FORMAT_UNKNOWN) {
-        fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-    }
-
-    if (!ensureResources(width, height, fmt)) {
+    // Always allocate fp16 history buffers for both LDR and HDR so 8-bit UNORM
+    // quantization never stalls temporal convergence at high blend weights or bands dark space.
+    if (!ensureResources(width, height, kHistoryFormat)) {
         return false;
     }
 
@@ -206,9 +199,7 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     const bool zeroCopyPingPong = (destinationTexture == nullptr && destinationRtv == nullptr);
 
     ID3D11RenderTargetView* targetRtv = destinationRtv;
-    if (zeroCopyPingPong) {
-        targetRtv = historyRtv_[writeIdx].Get();
-    } else if (!targetRtv && destinationTexture) {
+    if (!zeroCopyPingPong && !targetRtv && destinationTexture) {
         if (cachedDestTexture_ != destinationTexture || !cachedDestRtv_) {
             cachedDestRtv_.Reset();
             cachedDestTexture_ = nullptr;
@@ -219,7 +210,7 @@ bool TaaPass::render(ID3D11DeviceContext* context,
         }
         targetRtv = cachedDestRtv_.Get();
     }
-    if (!targetRtv) return false;
+    if (!zeroCopyPingPong && !targetRtv) return false;
 
     const bool performReset = reset || resetRequested_;
     resetRequested_ = false;
@@ -249,7 +240,14 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     context->RSSetState(nullptr);
     context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     context->OMSetDepthStencilState(nullptr, 0);
-    context->OMSetRenderTargets(1, &targetRtv, nullptr);
+    if (zeroCopyPingPong) {
+        ID3D11RenderTargetView* rtv = historyRtv_[writeIdx].Get();
+        context->OMSetRenderTargets(1, &rtv, nullptr);
+    } else {
+        // Write fp16 history (SV_Target0) and hardware-converted destination (SV_Target1) in one pass.
+        ID3D11RenderTargetView* rtvs[2] = { historyRtv_[writeIdx].Get(), targetRtv };
+        context->OMSetRenderTargets(2, rtvs, nullptr);
+    }
     context->IASetInputLayout(nullptr);
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context->VSSetShader(vertexShader_.Get(), nullptr, 0);
@@ -273,16 +271,12 @@ bool TaaPass::render(ID3D11DeviceContext* context,
 
     context->Draw(3, 0);
 
-    // Unbind resources before copy/next use to prevent pipeline hazards
+    // Unbind resources before next use to prevent pipeline hazards
     ID3D11ShaderResourceView* nullSrvs[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
     context->PSSetShaderResources(0, 5, nullSrvs);
-    ID3D11RenderTargetView* nullRtv = nullptr;
-    context->OMSetRenderTargets(1, &nullRtv, nullptr);
+    ID3D11RenderTargetView* nullRtvs[2] = { nullptr, nullptr };
+    context->OMSetRenderTargets(2, nullRtvs, nullptr);
 
-    if (!zeroCopyPingPong && destinationTexture) {
-        // Save the resolved output into the next history slot
-        context->CopyResource(historyTexture_[writeIdx].Get(), destinationTexture);
-    }
     historyReadIdx_ = writeIdx;
 
     return true;

@@ -1809,8 +1809,10 @@ int main(int argc, char** argv) {
 
     {
         edpe::TaaUpscalerBackend taaBackend;
-        if (taaBackend.recommendedJitterPhaseCount(32u, 2560, 1440, 2560, 1440) != 32u) {
-            std::printf("  -> FAIL: TaaUpscalerBackend recommendedJitterPhaseCount != 32\n");
+        if (taaBackend.recommendedJitterPhaseCount(0u, 2560, 1440, 2560, 1440) != 8u ||
+            taaBackend.recommendedJitterPhaseCount(0u, 1707, 960, 2560, 1440) != 18u ||
+            taaBackend.recommendedJitterPhaseCount(32u, 2560, 1440, 2560, 1440) != 32u) {
+            std::printf("  -> FAIL: TaaUpscalerBackend recommendedJitterPhaseCount mismatch\n");
             allOk = false;
         }
         if (!taaBackend.initialize(gpu.device.Get(), gpu.context.Get())) {
@@ -1818,6 +1820,103 @@ int main(int argc, char** argv) {
             return 3;
         }
         allOk &= runSuiteForBackend("Native_D3D11_TAA", gpu, taaBackend, 128, 128, 128, 128);
+
+        // Verify TaaPass allocates DXGI_FORMAT_R16G16B16A16_FLOAT history buffers even for 8-bit LDR output
+        ID3D11Texture2D* taaHist = taaBackend.latestOutputTexture();
+        if (!taaHist) {
+            std::printf("  -> FAIL: TaaUpscalerBackend latestOutputTexture is null\n");
+            allOk = false;
+        } else {
+            D3D11_TEXTURE2D_DESC histDesc{};
+            taaHist->GetDesc(&histDesc);
+            if (histDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                std::printf("  -> FAIL: TaaPass history format %u != DXGI_FORMAT_R16G16B16A16_FLOAT\n",
+                            static_cast<unsigned>(histDesc.Format));
+                allOk = false;
+            }
+        }
+
+        // Verify HDR > 1.0 round-trip and R11G11B10_FLOAT safe upper clamp (no NaN/Inf)
+        {
+            constexpr uint32_t kHdrW = 16;
+            constexpr uint32_t kHdrH = 16;
+            std::vector<float> hdrPixels(static_cast<size_t>(kHdrW) * kHdrH * 4u, 0.0f);
+            for (uint32_t y = 0; y < kHdrH; ++y) {
+                for (uint32_t x = 0; x < kHdrW; ++x) {
+                    const size_t idx = (static_cast<size_t>(y) * kHdrW + x) * 4u;
+                    if (x < kHdrW / 2) {
+                        hdrPixels[idx + 0] = 8.0f;
+                        hdrPixels[idx + 1] = 2.5f;
+                        hdrPixels[idx + 2] = 0.5f;
+                        hdrPixels[idx + 3] = 1.0f;
+                    } else {
+                        hdrPixels[idx + 0] = 100000.0f;
+                        hdrPixels[idx + 1] = 100000.0f;
+                        hdrPixels[idx + 2] = 100000.0f;
+                        hdrPixels[idx + 3] = 1.0f;
+                    }
+                }
+            }
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = kHdrW;
+            td.Height = kHdrH;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            D3D11_SUBRESOURCE_DATA initData{ hdrPixels.data(), kHdrW * 16u, 0 };
+            ComPtr<ID3D11Texture2D> hdrInTex, hdrOutTex, hdrStageTex;
+            ComPtr<ID3D11ShaderResourceView> hdrInSrv;
+            ComPtr<ID3D11RenderTargetView> hdrOutRtv;
+            D3D11_TEXTURE2D_DESC outDesc = td;
+            D3D11_TEXTURE2D_DESC stageDesc = td;
+            stageDesc.Usage = D3D11_USAGE_STAGING;
+            stageDesc.BindFlags = 0;
+            stageDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+            if (SUCCEEDED(gpu.device->CreateTexture2D(&td, &initData, &hdrInTex)) &&
+                SUCCEEDED(gpu.device->CreateShaderResourceView(hdrInTex.Get(), nullptr, &hdrInSrv)) &&
+                SUCCEEDED(gpu.device->CreateTexture2D(&outDesc, nullptr, &hdrOutTex)) &&
+                SUCCEEDED(gpu.device->CreateRenderTargetView(hdrOutTex.Get(), nullptr, &hdrOutRtv)) &&
+                SUCCEEDED(gpu.device->CreateTexture2D(&stageDesc, nullptr, &hdrStageTex))) {
+                edpe::TaaPass hdrPass;
+                if (hdrPass.initialize(gpu.device.Get(), gpu.context.Get())) {
+                    const bool ok = hdrPass.render(gpu.context.Get(), hdrInSrv.Get(), nullptr, nullptr,
+                        hdrOutRtv.Get(), hdrOutTex.Get(), kHdrW, kHdrH, 0.0f, 0.0f, true);
+                    if (!ok || hdrPass.historyFormat() != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                        std::printf("  -> FAIL: TaaPass HDR render or fp16 history format check failed\n");
+                        allOk = false;
+                    } else {
+                        gpu.context->CopyResource(hdrStageTex.Get(), hdrOutTex.Get());
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        if (SUCCEEDED(gpu.context->Map(hdrStageTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                            const auto* row = reinterpret_cast<const float*>(
+                                static_cast<const uint8_t*>(mapped.pData) + (kHdrH / 2) * mapped.RowPitch);
+                            const float rLo = row[2 * 4 + 0];
+                            const float gLo = row[2 * 4 + 1];
+                            const float bLo = row[2 * 4 + 2];
+                            const float rHi = row[(kHdrW - 2) * 4 + 0];
+                            const float gHi = row[(kHdrW - 2) * 4 + 1];
+                            const float bHi = row[(kHdrW - 2) * 4 + 2];
+                            gpu.context->Unmap(hdrStageTex.Get(), 0);
+                            if (!std::isfinite(rLo) || !std::isfinite(gLo) || !std::isfinite(bLo) ||
+                                std::fabs(rLo - 8.0f) > 0.1f || std::fabs(gLo - 2.5f) > 0.1f || std::fabs(bLo - 0.5f) > 0.05f) {
+                                std::printf("  -> FAIL: TaaPass HDR > 1.0 round-trip clipped (%.3f, %.3f, %.3f)\n", rLo, gLo, bLo);
+                                allOk = false;
+                            }
+                            if (!std::isfinite(rHi) || !std::isfinite(gHi) || !std::isfinite(bHi) ||
+                                rHi > 65024.0f || gHi > 65024.0f || bHi > 64512.0f) {
+                                std::printf("  -> FAIL: TaaPass extreme HDR not safely clamped (%.1f, %.1f, %.1f)\n", rHi, gHi, bHi);
+                                allOk = false;
+                            }
+                        }
+                    }
+                    hdrPass.shutdown();
+                }
+            }
+        }
         taaBackend.shutdown();
     }
 

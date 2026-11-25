@@ -104,7 +104,7 @@ public:
         jitterScale = static_cast<float>(_wtof(buf));
         if (jitterScale < 0.0f || jitterScale > 2.0f) jitterScale = 1.0f;
 
-        jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 32, path.c_str());
+        jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 8, path.c_str());
         wchar_t modeBuf[64]{};
         GetPrivateProfileStringW(L"Jitter", L"Mode", L"auto", modeBuf, 64, path.c_str());
         jitterMode = parseJitterModeString(modeBuf);
@@ -499,7 +499,7 @@ public:
     bool jitterInvertY = false;
     bool jitterSwapXY = false;
     float jitterScale = 1.0f;
-    unsigned jitterPhaseCount = 32;
+    unsigned jitterPhaseCount = 8;
     int jitterMode = 0; // 0=auto (upstream->d3d11 fallback), 1=d3d11, 2=upstream
     bool jitterLogEnabled = false;
     unsigned jitterLogInterval = 10;

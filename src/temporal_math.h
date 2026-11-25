@@ -138,7 +138,7 @@ inline unsigned computeEffectiveJitterPhaseCount(
     unsigned renderHeight,
     unsigned outputWidth,
     unsigned outputHeight) {
-    const unsigned base = basePhases ? basePhases : 32u;
+    const unsigned base = basePhases ? basePhases : 8u;
     unsigned minPhases = 8u;
     if (renderWidth > 0 && renderHeight > 0 &&
         outputWidth > 0 && outputHeight > 0) {

@@ -9,6 +9,8 @@ namespace edpe {
 
 class TaaPass {
 public:
+    static constexpr DXGI_FORMAT kHistoryFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
     TaaPass() = default;
     ~TaaPass() = default;
 
@@ -39,6 +41,7 @@ public:
 
     ID3D11Texture2D* latestOutputTexture() const { return historyTexture_[historyReadIdx_].Get(); }
     ID3D11ShaderResourceView* latestOutputSrv() const { return historySrv_[historyReadIdx_].Get(); }
+    DXGI_FORMAT historyFormat() const { return historyFormat_; }
 
 private:
     bool ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT format);

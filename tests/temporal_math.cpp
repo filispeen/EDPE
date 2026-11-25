@@ -700,6 +700,58 @@ int main() {
     if (edpe::computeEffectiveJitterPhaseCount(4, 2560, 1440, 2560, 1440) != 8u) return 121;
     if (edpe::computeEffectiveJitterPhaseCount(128, 2560, 1440, 2560, 1440) != 64u) return 122;
 
+    // Default (basePhases == 0) defaults to 8 at NativeAA (1.0x) and scales via ceil(8 * scale^2)
+    if (edpe::computeEffectiveJitterPhaseCount(0, 2560, 1440, 2560, 1440) != 8u) return 1221;
+    if (edpe::computeEffectiveJitterPhaseCount(0, 1707, 960, 2560, 1440) != 18u) return 1222;
+    if (edpe::computeEffectiveJitterPhaseCount(0, 1280, 720, 2560, 1440) != 32u) return 1223;
+    if (edpe::computeEffectiveJitterPhaseCount(0, 1280, 720, 3840, 2160) != 72u) return 1224;
+
+    // Karis reversible tone compression + YCoCg round-trip & R11G11B10_FLOAT safe clamp verification
+    {
+        auto tonemapKaris = [](float r, float g, float b, float& outR, float& outG, float& outB) {
+            r = (r > 0.0f) ? r : 0.0f;
+            g = (g > 0.0f) ? g : 0.0f;
+            b = (b > 0.0f) ? b : 0.0f;
+            const float peak = (std::max)(r, (std::max)(g, b));
+            const float inv = 1.0f / (1.0f + peak);
+            outR = r * inv; outG = g * inv; outB = b * inv;
+        };
+        auto rgbToYCoCg = [](float r, float g, float b, float& y, float& co, float& cg) {
+            y  =  0.25f * r + 0.5f * g + 0.25f * b;
+            co =  0.5f  * r            - 0.5f  * b;
+            cg = -0.25f * r + 0.5f * g - 0.25f * b;
+        };
+        auto yCoCgToRgb = [](float y, float co, float cg, float& r, float& g, float& b) {
+            r = (std::max)(y + co - cg, 0.0f);
+            g = (std::max)(y + cg,      0.0f);
+            b = (std::max)(y - co - cg, 0.0f);
+        };
+        auto invTonemapKaris = [](float r, float g, float b, float& outR, float& outG, float& outB) {
+            r = (r > 0.0f) ? r : 0.0f;
+            g = (g > 0.0f) ? g : 0.0f;
+            b = (b > 0.0f) ? b : 0.0f;
+            const float peak = (std::max)(r, (std::max)(g, b));
+            const float denom = (std::max)(1.0f - peak, 1.0f / 65504.0f);
+            outR = (std::min)(r / denom, 65024.0f);
+            outG = (std::min)(g / denom, 65024.0f);
+            outB = (std::min)(b / denom, 64512.0f);
+        };
+
+        // HDR value > 1.0 must round-trip without clipping to 1.0
+        float kr, kg, kb, y, co, cg, ur, ug, ub, fr, fg, fb;
+        tonemapKaris(12.5f, 3.25f, 0.75f, kr, kg, kb);
+        rgbToYCoCg(kr, kg, kb, y, co, cg);
+        yCoCgToRgb(y, co, cg, ur, ug, ub);
+        invTonemapKaris(ur, ug, ub, fr, fg, fb);
+        if (!std::isfinite(fr) || !std::isfinite(fg) || !std::isfinite(fb)) return 1225;
+        if (std::fabs(fr - 12.5f) > 1e-3f || std::fabs(fg - 3.25f) > 1e-3f || std::fabs(fb - 0.75f) > 1e-3f) return 1226;
+
+        // Extreme HDR / saturated compressed value must clamp below R11G11B10_FLOAT max with no NaN/Inf
+        invTonemapKaris(1.0f, 1.0f, 1.0f, fr, fg, fb);
+        if (!std::isfinite(fr) || !std::isfinite(fg) || !std::isfinite(fb)) return 1227;
+        if (fr > 65024.0f || fg > 65024.0f || fb > 64512.0f) return 1228;
+    }
+
     // -------------------------------------------------------------------------
     // Stage 3: Per-frame phase consistency audit (checkRowPair & PhasePairAuditor)
     // -------------------------------------------------------------------------
