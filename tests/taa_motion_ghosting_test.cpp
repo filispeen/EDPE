@@ -294,17 +294,17 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
                     // 1. Newly disoccluded dark back-wall pixels that were covered by the bright pillar last frame
                     if (refUnjittered.surface[idx] == SurfaceKind::BackWall &&
                         prevScene.surface[idx] == SurfaceKind::Pillar) {
-                        // Exclude 1px anti-aliased boundary right next to the pillar
-                        bool nearPillar = false;
-                        for (int oy = -1; oy <= 1 && !nearPillar; ++oy) {
+                        // Exclude 1px anti-aliased boundary right next to the pillar or bright floor horizon
+                        bool nearOtherSurface = false;
+                        for (int oy = -1; oy <= 1 && !nearOtherSurface; ++oy) {
                             for (int ox = -1; ox <= 1; ++ox) {
-                                if (refUnjittered.surface[static_cast<size_t>(y + oy) * kWidth + (x + ox)] == SurfaceKind::Pillar) {
-                                    nearPillar = true;
+                                if (refUnjittered.surface[static_cast<size_t>(y + oy) * kWidth + (x + ox)] != SurfaceKind::BackWall) {
+                                    nearOtherSurface = true;
                                     break;
                                 }
                             }
                         }
-                        if (!nearPillar) {
+                        if (!nearOtherSurface) {
                             const float ghost = std::fabs(outL - refUnjittered.luma[idx]);
                             worstDisocclGhost = std::max(worstDisocclGhost, ghost);
                             ++disocclPixelCount;

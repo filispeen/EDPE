@@ -116,6 +116,7 @@ struct MotionResult {
     float2 mv;
     float canonicalDepth;
     uint pixelClass;
+    float reactive;
 };
 
 float2 sanitizeMotion(float2 mv) {
@@ -233,6 +234,7 @@ bool tryWeaponOverride(int2 pixCoord, bool isReset, bool clampCockpit, out Motio
     outRes.mv = float2(0.0, 0.0);
     outRes.canonicalDepth = 0.0;
     outRes.pixelClass = kClassWeapon;
+    outRes.reactive = 0.0;
     uint stencil = sceneStencil.Load(int3(pixCoord, 0)).g;
     uint masked = stencil & (kWeaponStencilBit | kCockpitStencilBit);
     if (clampCockpit ? (masked == 0u) : (masked != kWeaponStencilBit)) return false;
@@ -316,6 +318,7 @@ bool tryCelestialOverride(float2 rawPixel, float depth, float3 view,
     outRes.mv = float2(0.0, 0.0);
     outRes.canonicalDepth = depth;
     outRes.pixelClass = kClassCelestial;
+    outRes.reactive = 0.0;
     uint count = min(celestialCount, 16u);
     [loop]
     for (uint i = 0u; i < count; ++i) {
@@ -347,15 +350,24 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
     bool hasPrevDepth, bool isReset, bool clampCockpit, bool hasWeapon, bool inSrv) {
     MotionResult res;
     res.canonicalDepth = depth;
+    res.reactive = 0.0;
     float2 worldMv = priorPixel - rawPixel;
     int2 maxCoord = int2(info.y - 1.0, info.z - 1.0);
     bool priorOffscreen = (priorPixel.x < 0.0 || priorPixel.x >= info.y ||
                            priorPixel.y < 0.0 || priorPixel.y >= info.z);
 
     bool worldMatches = false;
+    bool prevFootprintHasOccluder = false;
     float worldErr = 1e30;
     if (hasPrevDepth && !priorOffscreen) {
-        worldMatches = prevDepthMatches(priorPixel + jitterInfo.zw, expectedPriorDepth, maxCoord, worldErr);
+        float2 prevSamplePx = priorPixel + jitterInfo.zw;
+        worldMatches = prevDepthMatches(prevSamplePx, expectedPriorDepth, maxCoord, worldErr);
+        if (worldMatches && expectedPriorDepth > 0.0) {
+            int2 occBase = clamp(int2(floor(prevSamplePx - 0.5)), int2(-1, -1), maxCoord);
+            float4 occQuad = prevSceneDepth.GatherRed(pointSampler, (float2(occBase) + 1.0) * rcp(info.yz));
+            float maxPrevD = max(max(occQuad.x, occQuad.y), max(occQuad.z, occQuad.w));
+            prevFootprintHasOccluder = (maxPrevD > expectedPriorDepth * 1.15 + 1e-4);
+        }
     }
 
     // Depth-validated cockpit & exterior ship hull (z < 150m) vs. world geometry disambiguation.
@@ -490,6 +502,9 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
         res.pixelClass = kClassDisoccluded;
     } else {
         res.pixelClass = kClassWorld;
+        if (prevFootprintHasOccluder) {
+            res.reactive = 1.0;
+        }
     }
     return res;
 }
@@ -503,6 +518,7 @@ MotionResult reproject(float2 pixelCenter, int2 pixCoord,
     res.mv = float2(0.0, 0.0);
     res.canonicalDepth = 0.0;
     res.pixelClass = kClassSky;
+    res.reactive = 0.0;
 
     if (info.y <= 0 || info.z <= 0 || projection.x <= 0 || projection.y <= 0) return res;
     float depth = sceneDepth.Load(int3(pixCoord, 0));
@@ -582,6 +598,7 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
     res.mv = float2(0.0, 0.0);
     res.canonicalDepth = 0.0;
     res.pixelClass = kClassSky;
+    res.reactive = 0.0;
 
     if (info.y <= 0 || info.z <= 0 || scales.x <= 0 || scales.y <= 0) return res;
     float depth = sceneDepth.Load(int3(pixCoord, 0));
@@ -702,7 +719,7 @@ void writeOutputs(int2 pixCoord, MotionResult res) {
     if ((modeFlags & 512) != 0) {
         float reactive = (res.pixelClass == kClassDisoccluded ||
                           res.pixelClass == kClassOffscreenFG ||
-                          res.pixelClass == kClassReset) ? 1.0 : 0.0;
+                          res.pixelClass == kClassReset) ? 1.0 : res.reactive;
         OutReactive[pixCoord] = reactive;
     }
 }
@@ -730,6 +747,7 @@ void cs_gpu(uint3 tid : SV_DispatchThreadID) {
     res.mv = float2(0.0, 0.0);
     res.canonicalDepth = sceneDepth.Load(int3(pixCoord, 0));
     res.pixelClass = kClassSky;
+    res.reactive = 0.0;
 
     float3 currentW = float3(currentWords[270].w, currentWords[271].w, currentWords[272].w);
     float3 previousW = float3(previousWords[270].w, previousWords[271].w, previousWords[272].w);
