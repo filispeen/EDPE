@@ -7358,6 +7358,30 @@ inline UINT getCachedDotCbByteWidth(ID3D11Resource* res) {
     return 0;
 }
 
+inline void evictDotCbResource(ID3D11Resource* res) {
+    auto& set = s_accepted_dot_cb_cache[resourceCacheSetIndex(res)];
+    for (size_t w = 0; w < kResourceCacheWays; ++w) {
+        ID3D11Resource* expected = res;
+        if (set.ways[w].compare_exchange_strong(expected, nullptr, std::memory_order_relaxed)) {
+            set.bytes[w].store(0, std::memory_order_relaxed);
+        }
+    }
+}
+
+// The resource caches hold raw pointers without a reference. After the game frees a buffer, a different resource
+// (for example a large dynamic vertex buffer) can be created at the same address and hit the cache. Check the real
+// description before trusting a cached constant buffer width: bouncing a larger buffer into a 64 KB map-bounce slot
+// let the game overrun the pool and EDPE's static data. GetType plus GetDesc, no QueryInterface.
+inline bool isConstantBufferOfWidth(ID3D11Resource* res, UINT byteWidth, bool requireDynamic) {
+    D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    res->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER) return false;
+    D3D11_BUFFER_DESC desc{};
+    static_cast<ID3D11Buffer*>(res)->GetDesc(&desc);
+    return desc.ByteWidth == byteWidth && (!requireDynamic || desc.Usage == D3D11_USAGE_DYNAMIC) &&
+           (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0;
+}
+
 inline void cacheDotCbResource(ID3D11Resource* res, UINT byteWidth) {
     auto& set = s_accepted_dot_cb_cache[resourceCacheSetIndex(res)];
     size_t targetWay = kResourceCacheWays;
@@ -7649,6 +7673,11 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
         return result;
     }
     UINT dot_cb_bytes = (is_scene_cb || !jitterActive) ? 0u : getCachedDotCbByteWidth(resource);
+    if (dot_cb_bytes != 0 && !isConstantBufferOfWidth(resource, dot_cb_bytes, true)) {
+        // Stale cache entry: the address now belongs to a different resource. Re-classify it below.
+        evictDotCbResource(resource);
+        dot_cb_bytes = 0;
+    }
     if (!is_scene_cb && dot_cb_bytes == 0) {
         if (isResourceCachedRejected(resource)) {
             return result;
@@ -9197,6 +9226,10 @@ void STDMETHODCALLTYPE observedUpdateSubresource(ID3D11DeviceContext* context,
         isObservedImmediateContext(context) &&
         ContextCensusIsJitterActive()) {
         UINT cbBytes = getCachedDotCbByteWidth(pDstResource);
+        if (cbBytes != 0 && !isConstantBufferOfWidth(pDstResource, cbBytes, false)) {
+            evictDotCbResource(pDstResource); // stale entry, see isConstantBufferOfWidth
+            cbBytes = 0;
+        }
         if (cbBytes == 0 && !isResourceCachedRejected(pDstResource)) {
             ID3D11Buffer* buf = nullptr;
             if (SUCCEEDED(pDstResource->QueryInterface(__uuidof(ID3D11Buffer),
