@@ -209,13 +209,17 @@ bool sampleCockpitNeighborMotion(int2 pixCoord, int2 maxCoord, out float2 outMv)
     return false;
 }
 
-bool tryWeaponOverride(int2 pixCoord, bool isReset, bool clampCockpit, out MotionResult outRes) {
+bool tryWeaponOverride(int2 pixCoord, float depth, float depthB, bool isReset, bool clampCockpit, out MotionResult outRes) {
     outRes.mv = float2(0.0, 0.0);
     outRes.canonicalDepth = 0.0;
     outRes.pixelClass = kClassWeapon;
     uint stencil = sceneStencil.Load(int3(pixCoord, 0)).g;
     uint masked = stencil & (kWeaponStencilBit | kCockpitStencilBit);
     if (clampCockpit ? (masked == 0u) : (masked != kWeaponStencilBit)) return false;
+    if (!clampCockpit) {
+        float zView = (depth > 0.0 && depth <= 1.0 && depthB > 0.0) ? (depthB / depth) : 1e30;
+        if (zView >= 0.60) return false;
+    }
     float4 wm = weaponMotion.Load(int3(pixCoord, 0));
     if (wm.w <= 0.5 || !all(isfinite(wm.xyz))) return false;
     float mv2 = dot(wm.xy, wm.xy);
@@ -262,6 +266,8 @@ bool tryWeaponOverride(int2 pixCoord, bool isReset, bool clampCockpit, out Motio
             int2 sc = pixCoord + kWeaponProbe[i];
             if (sc.x < 0 || sc.x >= dims.x || sc.y < 0 || sc.y >= dims.y) continue;
             if ((sceneStencil.Load(int3(sc, 0)).g & (kWeaponStencilBit | kCockpitStencilBit)) != kWeaponStencilBit) continue;
+            float nd = sceneDepth.Load(int3(sc, 0));
+            if (!(nd > 0.0 && nd <= 1.0) || (depthB > 0.0 && (depthB / nd) >= 0.60)) continue;
             float4 nwm = weaponMotion.Load(int3(sc, 0));
             if (nwm.w > 0.5 && all(isfinite(nwm.xyz)) && dot(nwm.xy, nwm.xy) <= 90000.0) {
                 nSamples[nCount] = nwm.xy;
@@ -485,7 +491,7 @@ MotionResult reproject(float2 pixelCenter, int2 pixCoord,
 #if EDPE_MOTION_HAS_WEAPON
     if (hasWeapon) {
         MotionResult wmRes;
-        if (tryWeaponOverride(pixCoord, isReset, clampCockpit, wmRes)) return wmRes;
+        if (tryWeaponOverride(pixCoord, depth, depthB, isReset, clampCockpit, wmRes)) return wmRes;
     }
 #endif
 
@@ -566,7 +572,7 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
 #if EDPE_MOTION_HAS_WEAPON
     if (hasWeapon) {
         MotionResult wmRes;
-        if (tryWeaponOverride(pixCoord, isReset, clampCockpit, wmRes)) return wmRes;
+        if (tryWeaponOverride(pixCoord, depth, depthB, isReset, clampCockpit, wmRes)) return wmRes;
     }
 #endif
 
@@ -596,12 +602,13 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
         }
         if (!clampCockpit) {
             // Cover both stencil-tagged weapon/arms (0x10 with 0x80 clear) and near-camera
-            // un-stenciled weapon parts (muzzle tip / scope rim / glass at z < 0.60m),
-            // while excluding 0x80 parked SRV/ship pixels even when approached closely.
+            // un-stenciled weapon parts (muzzle tip / scope rim / glass) within first-person
+            // reach (zView < 0.60m, i.e. < 1.62m in the 0.0675m viewmodel camera).
+            // World characters (Flight Suit corpses, NPCs, faces inside visors) also carry
+            // stencil bit 0x10 at world distances (zView >= 0.60m) and must fall through to
+            // world camera-depth reprojection instead of clamping to (0, 0).
             float zView = (depthB > 0.0) ? (depthB / depth) : 1e30;
-            bool isOnFootWeaponStencil = ((st & (kWeaponStencilBit | kCockpitStencilBit)) == kWeaponStencilBit);
-            bool isNearUnstenciledWeapon = ((st & kCockpitStencilBit) == 0u) && (zView < 0.60);
-            if (isOnFootWeaponStencil || isNearUnstenciledWeapon) {
+            if ((st & kCockpitStencilBit) == 0u && zView < 0.60) {
                 res.mv = float2(0.0, 0.0);
                 res.canonicalDepth = depth;
                 res.pixelClass = isReset ? kClassReset : kClassWeapon;
