@@ -8,6 +8,7 @@
 #include "log.h"
 #include "motion_pass.h"
 #include "weapon_motion.h"
+#include "celestial_motion.h"
 #include "shader_probe.h"
 #include "temporal_math.h"
 #include "upscaler_backend.h"
@@ -6680,6 +6681,7 @@ void STDMETHODCALLTYPE observedDraw(ID3D11DeviceContext* context, UINT count, UI
 }
 
 static edpe::WeaponMotionTracker s_weapon_motion;
+static edpe::CelestialMotionTracker s_celestial_motion;
 static unsigned long long s_weapon_motion_frame = ~0ull;
 static bool s_weapon_motion_on_foot = false;
 static bool s_weapon_motion_logged_active = false;
@@ -10389,6 +10391,7 @@ void tryMotionPair(ID3D11DeviceContext* fallback_context, unsigned long long fra
     if (motion_pass && s_motion_pass_device != device.Get()) {
         motion_pass.reset();
         s_weapon_motion.shutdown();
+        s_celestial_motion.shutdown();
         s_weapon_motion_frame = ~0ull;
     }
     if (!motion_pass) {
@@ -11016,6 +11019,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                                    s_hud_debug_view.load(std::memory_order_relaxed);
     if ((!upscale_active && !debug_view_active && !fg_active) || !context || !backbuffer) return;
 
+    // P2: Disable TAA accumulation on Galaxy Map, System Map, Orrery, and FSS (GuiFocus 6..9)
+    // so dragging maps and orbit lines stays sharp without temporal smearing or shimmer.
+    const bool mapGuiFocusActive = edpe::cobra_camera::MapFocusPoller::isMapGuiFocusActive();
+    edpe::cobra_camera::frameWindow().mapModeActive.store(mapGuiFocusActive, std::memory_order_relaxed);
+    if (mapGuiFocusActive && upscaler.getBackend() == edpe::UpscalerBackend::Taa) {
+        s_camera_reset = true;
+        return;
+    }
+
     if (s_upscale_evaluated_this_frame) {
         return;
     }
@@ -11335,6 +11347,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_cached_hdr_rtv0 = nullptr;
         motion_pass.reset();
         s_weapon_motion.shutdown();
+        s_celestial_motion.shutdown();
         s_weapon_motion_frame = ~0ull;
         s_dlss_output_texture.Reset();
         s_dlss_output_srv.Reset();
@@ -11727,6 +11740,20 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                         }
                     }
                 }
+                ID3D11ShaderResourceView* celestialRecordsSrv = nullptr;
+                uint32_t celestialCount = 0u;
+                if (!s_celestial_motion.isInitialized()) {
+                    s_celestial_motion.initialize(device.Get());
+                }
+                if (s_celestial_motion.isInitialized()) {
+                    s_celestial_motion.pollStatusJson();
+                    if (!eval_reset && s_celestial_motion.isSupercruise() &&
+                        s_celestial_motion.recordCount() > 0u &&
+                        s_celestial_motion.upload(context)) {
+                        celestialRecordsSrv = s_celestial_motion.recordsSrv();
+                        celestialCount = s_celestial_motion.recordCount();
+                    }
+                }
                 motion_pass->render(motion_depth_view.Get(),
                     s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
                     jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv,
@@ -11735,11 +11762,14 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     /*enableClassOutput=*/want_motion_class_debug,
                     /*weaponMotion=*/weaponMotionSrv,
                     /*sceneStencil=*/nullptr,
-                    /*celestialRecords=*/nullptr,
-                    /*celestialCount=*/0u,
+                    /*celestialRecords=*/celestialRecordsSrv,
+                    /*celestialCount=*/celestialCount,
                     /*clampCockpit=*/clampCockpit,
                     /*enableReactiveOutput=*/wantReactiveMask,
                     /*inSrv=*/inSrvActive);
+                if (s_celestial_motion.isInitialized()) {
+                    s_celestial_motion.beginFrame();
+                }
             }
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
         }
@@ -15361,6 +15391,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         resetVisorJitterAlign();
         motion_pass.reset();
         s_weapon_motion.shutdown();
+        s_celestial_motion.shutdown();
         s_weapon_motion_frame = ~0ull;
         motion_camera_frames = {~0ull, ~0ull};
         camera_pair_sample_frames = {~0ull, ~0ull};
@@ -15529,6 +15560,7 @@ bool ContextCensusIsJitterActive() {
     if (jitter_test_override.load(std::memory_order_relaxed)) return true;
     if (s_jitter_debug_view.load(std::memory_order_relaxed)) return true;
     if (last_present_frame.load(std::memory_order_relaxed) < s_jitter_standdown_until.load(std::memory_order_relaxed)) return false;
+    if (edpe::cobra_camera::frameWindow().mapModeActive.load(std::memory_order_relaxed)) return false;
     return edpe::UpscalerManager::instance().isReconstructionActive();
 }
 
