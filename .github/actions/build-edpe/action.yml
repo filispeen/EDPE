@@ -120,7 +120,9 @@ runs:
       env:
         EDPE_VERSION: ${{ inputs.edpe-version }}
       run: |
-        cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$env:EDPE_VERSION" -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+        # EDPE_REQUIRE_FSR4 fails the configure step when the fetched SDK lacks the FSR 4 inputs. Without it CMake would
+        # build the inert FSR 4 stub, and the engine test skips on this GPU-less runner, so CI would still pass.
+        cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DEDPE_VERSION="$env:EDPE_VERSION" -DEDPE_REQUIRE_FSR4=ON -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
     - name: Build EDPE (Release)
       shell: pwsh

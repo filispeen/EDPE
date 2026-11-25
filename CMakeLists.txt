@@ -58,12 +58,25 @@ endif()
 # amd_fidelityfx_upscaler_dx12.dll. Optional D3D12 Agility SDK runtime (D3D12Core.dll) in external/agility
 # is staged under D3D12/ and used when present.
 set(EDPE_AGILITY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/agility")
-if(EDPE_HAVE_FFX_FG
-   AND EXISTS "${FFX_FG_SDK_DIR}/upscalers/include/ffx_upscale.h"
-   AND EXISTS "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_upscaler_dx12.dll")
-    set(EDPE_HAVE_FFX_FSR4 TRUE)
+option(EDPE_REQUIRE_FSR4 "Fail the configure step when the FSR 4 inputs are missing instead of building the stub" OFF)
+set(EDPE_FSR4_INPUTS
+    "${FFX_FG_SDK_DIR}/framegeneration/include/ffx_framegeneration.h"
+    "${FFX_FG_SDK_DIR}/upscalers/include/ffx_upscale.h"
+    "${FFX_FG_SDK_DIR}/signedbin/amd_fidelityfx_upscaler_dx12.dll")
+set(EDPE_HAVE_FFX_FSR4 TRUE)
+set(EDPE_FSR4_MISSING "")
+foreach(input IN LISTS EDPE_FSR4_INPUTS)
+    if(NOT EXISTS "${input}")
+        set(EDPE_HAVE_FFX_FSR4 FALSE)
+        string(APPEND EDPE_FSR4_MISSING "\n  ${input}")
+    endif()
+endforeach()
+if(EDPE_HAVE_FFX_FSR4)
+    message(STATUS "FSR 4: enabled (FidelityFX upscaler headers and signed upscaler DLL found)")
+elseif(EDPE_REQUIRE_FSR4)
+    message(FATAL_ERROR "EDPE_REQUIRE_FSR4 is ON but the FSR 4 inputs are missing (run tools/fetch_fsr4_runtime.py):${EDPE_FSR4_MISSING}")
 else()
-    set(EDPE_HAVE_FFX_FSR4 FALSE)
+    message(STATUS "FSR 4: disabled, building the stub (missing:${EDPE_FSR4_MISSING})")
 endif()
 
 set(STREAMLINE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/streamline")
