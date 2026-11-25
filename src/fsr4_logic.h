@@ -92,19 +92,25 @@ public:
     void onEvaluateSuccess() { gate_.reset(); }
 
     // FSR 4 does not support HDR (linear) color input yet, so those frames use FSR 3.1.2. This is an unsupported input, not
-    // a failure: it does not count toward the failure gate. Returns true when HDR input starts, so it is logged once.
-    bool setHdrFallback(bool hdrInput) {
-        const bool started = hdrInput && !hdrFallback_;
+    // a failure: it does not count toward the failure gate. The result says when the provider changes, so the caller can
+    // log it once and reset the history of the provider that takes over.
+    enum class HdrTransition { None, Started, Ended };
+    HdrTransition setHdrFallback(bool hdrInput) {
+        const HdrTransition transition = hdrInput == hdrFallback_ ? HdrTransition::None
+                                         : hdrInput               ? HdrTransition::Started
+                                                                  : HdrTransition::Ended;
         hdrFallback_ = hdrInput;
-        return started;
+        return transition;
     }
 
     struct FailureOutcome {
         bool logFirstFailure = false;  // log the "falling back" line (once per selection)
+        bool startedStreak = false;    // first failure after FSR 4 last succeeded: FSR 3.1.2 takes over from here
         bool disabled = false;         // the threshold was reached; FSR 4 is now off until reselected
     };
     FailureOutcome onEvaluateFailure() {
         FailureOutcome out;
+        out.startedStreak = gate_.consecutive == 0;
         if (!failLogged_) {
             failLogged_ = true;
             out.logFirstFailure = true;

@@ -288,6 +288,7 @@ struct AmdUpscalerBackend::Impl {
     ID3D11Device* fsr4Device = nullptr;
     fsr4::ProviderState fsr4State;  // selection, init and failure-gate state (pure logic, see fsr4_logic.h)
     wchar_t fsr4SkipReason[192]{};  // why FSR 4 was not probed (not an AMD GPU); empty otherwise
+    bool fsr4HistoryStale = false;  // FSR 3.1.2 rendered frames since FSR 4 last did: reset FSR 4 before its next frame
 
     void applyVelocityFactorIfNeeded() {
 #if defined(EDPE_ENABLE_FSR)
@@ -722,18 +723,33 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     if (impl_->fsr4State.running() && impl_->fsr4) {
         // HDR (linear) color input is not supported by FSR 4 yet: use FSR 3.1.2 while HdrInput is on, without counting
         // these frames as failures.
-        if (impl_->fsr4State.setHdrFallback(inputs.colorIsHdr)) {
+        // Whichever provider takes over has not seen the frames the other one rendered, so it starts from a clean history.
+        switch (impl_->fsr4State.setHdrFallback(inputs.colorIsHdr)) {
+        case fsr4::ProviderState::HdrTransition::Started:
             EdpeLog(L"EDPE: FSR 4 does not support HDR color input (HdrInput=1); using FSR 3.1.2 while it is on");
+            impl_->resetRequested = true;
+            break;
+        case fsr4::ProviderState::HdrTransition::Ended:
+            impl_->fsr4HistoryStale = true;
+            break;
+        case fsr4::ProviderState::HdrTransition::None:
+            break;
         }
     }
 
     if (impl_->fsr4State.running() && impl_->fsr4 && !impl_->fsr4State.isHdrFallback()) {
         ID3D11Texture2D* fsr4Dest = destinationTexture ? destinationTexture : inputs.color;
+        if (impl_->fsr4HistoryStale) {
+            impl_->fsr4->resetHistory();
+            impl_->fsr4HistoryStale = false;
+        }
         if (impl_->fsr4->evaluate(context, inputs, fsr4Dest)) {
             impl_->fsr4State.onEvaluateSuccess();
             return true;
         }
         const auto failure = impl_->fsr4State.onEvaluateFailure();
+        impl_->fsr4HistoryStale = true;  // FSR 3.1.2 renders the following frames until FSR 4 succeeds again
+        if (failure.startedStreak) impl_->resetRequested = true;  // FSR 3.1.2 has not run since before FSR 4 took over
         if (failure.logFirstFailure) {
             wchar_t buf[320];
             swprintf_s(buf, L"EDPE: FSR 4 evaluate failed: %ls; falling back to FSR 3.1.2 for this frame",

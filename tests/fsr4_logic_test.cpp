@@ -109,9 +109,10 @@ void testProviderFailurePath() {
     // The first failure asks for one log line; later failures do not.
     auto first = s.onEvaluateFailure();
     CHECK(first.logFirstFailure && !first.disabled);
+    CHECK(first.startedStreak);  // FSR 3.1.2 takes over here: the caller resets its history once
     for (int i = 2; i < kMaxConsecutiveFailures; ++i) {
         auto o = s.onEvaluateFailure();
-        CHECK(!o.logFirstFailure && !o.disabled);
+        CHECK(!o.logFirstFailure && !o.disabled && !o.startedStreak);
         CHECK(s.running());
     }
     auto last = s.onEvaluateFailure();  // 120th consecutive failure
@@ -133,7 +134,11 @@ void testProviderFailurePath() {
     t.setSelected(true);
     t.onInitResult(true);
     for (int round = 0; round < 5; ++round) {
-        for (int i = 0; i < 100; ++i) CHECK(!t.onEvaluateFailure().disabled);
+        for (int i = 0; i < 100; ++i) {
+            const auto o = t.onEvaluateFailure();
+            CHECK(!o.disabled);
+            CHECK(o.startedStreak == (i == 0));  // each streak after a success starts again
+        }
         t.onEvaluateSuccess();
     }
     CHECK(t.running());
@@ -240,17 +245,18 @@ void testHdrFallback() {
     CHECK(s.running() && s.label() == ProviderLabel::Fsr4);
 
     // HDR input starts: logged once, shown as FSR 3.1 with the reason, and not counted as failures.
-    CHECK(s.setHdrFallback(true));
-    CHECK(!s.setHdrFallback(true));
+    CHECK(s.setHdrFallback(true) == ProviderState::HdrTransition::Started);
+    CHECK(s.setHdrFallback(true) == ProviderState::HdrTransition::None);
     CHECK(s.label() == ProviderLabel::Fsr31HdrInput);
     CHECK(s.running());
     for (int i = 0; i < 2 * kMaxConsecutiveFailures; ++i) s.setHdrFallback(true);
     CHECK(s.running() && s.consecutiveFailures() == 0);
 
     // LDR input again: FSR 4 resumes, and a later HDR episode logs again.
-    CHECK(!s.setHdrFallback(false));
+    CHECK(s.setHdrFallback(false) == ProviderState::HdrTransition::Ended);
+    CHECK(s.setHdrFallback(false) == ProviderState::HdrTransition::None);
     CHECK(s.label() == ProviderLabel::Fsr4);
-    CHECK(s.setHdrFallback(true));
+    CHECK(s.setHdrFallback(true) == ProviderState::HdrTransition::Started);
 
     // Not running (FSR 3.1.2 selected or FSR 4 unavailable): the label ignores the HDR flag.
     s.setSelected(false);
