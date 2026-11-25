@@ -340,6 +340,12 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
     //   parallel to themselves do not accidentally pass worldMatches and inherit bogus world MVs.
     // - On exterior ship hull / nose (1.5m <= z < 150m), clamp when world reprojection fails
     //   or when static depth matches strictly tighter than world reprojection.
+    if (clampCockpit && isReset && z < 10.0) {
+        res.mv = float2(0.0, 0.0);
+        res.pixelClass = kClassReset;
+        return res;
+    }
+
     bool canClampDistance = (z < 10.0) || (z < 150.0 && !priorOffscreen);
     if (clampCockpit && canClampDistance && hasPrevDepth) {
         // Un-stenciled exterior ship hull/wings/nacelles (e.g. Imperial Courier wings & nacelles):

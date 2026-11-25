@@ -420,14 +420,32 @@ int main() {
     }
 
     // 31. Persistent unpredicted teleport (>15m beyond velocity prediction) triggers scene cut,
-    // while smooth high-speed continuous flight (residual <= 15m, step <= 50m) does not.
+    // while smooth high-speed continuous flight / Orbital Glide (residual <= 15m, step <= 150m) does not.
     const edpe::Vec3 teleportDelta{-0.0741f, -4.1486f, -22.5333f};
     const edpe::Vec3 walkingVel{0.0f, 0.0f, 0.08f};
     if (!edpe::isUnpredictedPositionCut(teleportDelta, walkingVel)) return 93;
     const edpe::Vec3 flightStep{0.0f, 0.0f, 30.0f};
     if (edpe::isUnpredictedPositionCut(flightStep, flightStep)) return 94;
-    const edpe::Vec3 over50Step{0.0f, 0.0f, 55.0f};
-    if (!edpe::isUnpredictedPositionCut(over50Step, over50Step)) return 95;
+    const edpe::Vec3 glideStep{0.0f, 0.0f, 80.0f};
+    if (edpe::isUnpredictedPositionCut(glideStep, glideStep)) return 95;
+    if (!edpe::isUnpredictedPositionCut(glideStep, walkingVel)) return 138;
+    const edpe::Vec3 over150Step{0.0f, 0.0f, 160.0f};
+    if (!edpe::isUnpredictedPositionCut(over150Step, over150Step)) return 139;
+
+    // 31b. Seated ship/SRV Orbital Glide steps (15..150 m/frame, continuous orientation)
+    // must bypass the on-foot transient origin-rebase hold, while on-foot / pre-scene / >150m do not.
+    auto glideCam = worldBase;
+    glideCam.worldFromView[11] += 65.0f;
+    if (!edpe::isContinuousHighSpeedFlightStep(glideCam, worldBase, 65.0f, true, false)) return 140;
+    if (edpe::isContinuousHighSpeedFlightStep(glideCam, worldBase, 65.0f, true, true)) return 141;
+    if (edpe::isContinuousHighSpeedFlightStep(glideCam, worldBase, 65.0f, false, false)) return 142;
+    if (edpe::isContinuousHighSpeedFlightStep(glideCam, worldBase, 160.0f, true, false)) return 143;
+    auto rotatedGlide = yawed(20.0f);
+    rotatedGlide.scaleX = worldBase.scaleX;
+    rotatedGlide.scaleY = worldBase.scaleY;
+    rotatedGlide.depthB = worldBase.depthB;
+    rotatedGlide.worldFromView[11] += 65.0f;
+    if (edpe::isContinuousHighSpeedFlightStep(rotatedGlide, worldBase, 65.0f, true, false)) return 144;
 
     // 32. Viewmodel sub-pass during fast camera turn (>12.8 deg, <=45 deg) and
     // planetary origin-rebased sub-pass (cb1[35..38] verified, ~460m offset, same orientation).
