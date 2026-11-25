@@ -175,11 +175,17 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     if (hPeak > 1e-5 && uPeak > 1e-5) {
         float3 uiChromaLin = hdrPos * (uPeak / hPeak);
         float  uiRawPeak   = max(uiRaw.r, max(uiRaw.g, uiRaw.b));
-        float  toeMix      = 1.0 - smoothstep(0.25, 0.65, uiRawPeak);
-        uiLin = lerp(uiLin, max(uiLin, uiChromaLin), toeMix);
+        float  toeMix      = 1.0 - smoothstep(0.15, 0.32, uiRawPeak);
+        uiLin = lerp(uiLin, uiChromaLin, toeMix);
     }
     float3 worldAndBackdropLin = pow(max(worldAndBackdrop, 0.0), 2.2);
-    float3 finalSrgb = pow(max(uiLin + worldAndBackdropLin, 0.0), 1.0 / 2.2);
+    float3 sumLin = uiLin + worldAndBackdropLin;
+    float  sumPeak = max(sumLin.r, max(sumLin.g, sumLin.b));
+    if (sumPeak > 1.0) {
+        float excess = sumPeak - 1.0;
+        sumLin = lerp(sumLin / sumPeak, float3(1.0, 1.0, 1.0), saturate(excess / (1.0 + excess)));
+    }
+    float3 finalSrgb = pow(max(sumLin, 0.0), 1.0 / 2.2);
     float3 finalRgb = finalSrgb + visorDelta * atten;
     uOut[id.xy] = float4(saturate(finalRgb), world.a);
 }
@@ -318,11 +324,17 @@ float4 ps_main(VSOut pin) : SV_Target {
     if (hPeak > 1e-5 && uPeak > 1e-5) {
         float3 uiChromaLin = hdrPos * (uPeak / hPeak);
         float  uiRawPeak   = max(uiRaw.r, max(uiRaw.g, uiRaw.b));
-        float  toeMix      = 1.0 - smoothstep(0.25, 0.65, uiRawPeak);
-        uiLin = lerp(uiLin, max(uiLin, uiChromaLin), toeMix);
+        float  toeMix      = 1.0 - smoothstep(0.15, 0.32, uiRawPeak);
+        uiLin = lerp(uiLin, uiChromaLin, toeMix);
     }
     float3 worldAndBackdropLin = pow(max(worldAndBackdrop, 0.0), 2.2);
-    float3 finalSrgb = pow(max(uiLin + worldAndBackdropLin, 0.0), 1.0 / 2.2);
+    float3 sumLin = uiLin + worldAndBackdropLin;
+    float  sumPeak = max(sumLin.r, max(sumLin.g, sumLin.b));
+    if (sumPeak > 1.0) {
+        float excess = sumPeak - 1.0;
+        sumLin = lerp(sumLin / sumPeak, float3(1.0, 1.0, 1.0), saturate(excess / (1.0 + excess)));
+    }
+    float3 finalSrgb = pow(max(sumLin, 0.0), 1.0 / 2.2);
     float3 finalRgb = finalSrgb + visorDelta * atten;
     return float4(saturate(finalRgb), world.a);
 }

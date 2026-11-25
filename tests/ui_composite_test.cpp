@@ -768,6 +768,20 @@ int main() {
         hPx[(2 * 4 + 1) * 4 + 0] = 0.04f;
         hPx[(2 * 4 + 1) * 4 + 1] = 0.0048f;
         hPx[(2 * 4 + 1) * 4 + 3] = 1.0f;
+        // Row 3, col 0: midtone yellow/orange HUD (140, 95, 0) preserves Pass 52 LUT hue even when
+        // hdrUi carries a redder pre-LUT ratio (0.5, 0.05, 0).
+        wPx[3 * 4 + 0] = packRgbaA(0, 0, 0, 255);
+        uiPx[3 * 4 + 0] = packRgbaA(140, 95, 0, 255);
+        hPx[(3 * 4 + 0) * 4 + 0] = 0.50f;
+        hPx[(3 * 4 + 0) * 4 + 1] = 0.05f;
+        hPx[(3 * 4 + 0) * 4 + 3] = 1.0f;
+        // Row 3, col 1: bright orange HUD (240, 160, 0) over bright world (200, 200, 200)
+        // rolls off smoothly toward warm white (R == 255, G > 210, B > 180, R >= G > B).
+        wPx[3 * 4 + 1] = packRgbaA(200, 200, 200, 255);
+        uiPx[3 * 4 + 1] = packRgbaA(240, 160, 0, 255);
+        hPx[(3 * 4 + 1) * 4 + 0] = 0.80f;
+        hPx[(3 * 4 + 1) * 4 + 1] = 0.35f;
+        hPx[(3 * 4 + 1) * 4 + 3] = 1.0f;
 
         D3D11_TEXTURE2D_DESC hdrDesc = outDesc;
         hdrDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -846,6 +860,17 @@ int main() {
             int(outRow2[5]) <= int(outRow2[6])) {
             context->Unmap(staging.Get(), 0);
             return 113;
+        }
+        const auto* outRow3 = static_cast<const uint8_t*>(mapped.pData) + 3 * mapped.RowPitch;
+        // Row 3 Col 0: midtone yellow/orange HUD preserves exact Pass 52 LUT hue (140, 95, 0)
+        if (std::abs(int(outRow3[0]) - 140) > 2 || std::abs(int(outRow3[1]) - 95) > 2 || int(outRow3[2]) > 2) {
+            context->Unmap(staging.Get(), 0);
+            return 114;
+        }
+        // Row 3 Col 1: bright orange on bright world rolls off smoothly toward warm white
+        if (outRow3[4] != 255 || outRow3[5] < 210 || outRow3[6] < 180 || int(outRow3[5]) <= int(outRow3[6])) {
+            context->Unmap(staging.Get(), 0);
+            return 115;
         }
         context->Unmap(staging.Get(), 0);
 
