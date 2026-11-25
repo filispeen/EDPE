@@ -8895,11 +8895,32 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             lateTrace > 2.95f) {
                             ++s_ustat.nearLate;
                             if (s_ustat.firstNearLateIdx == 0) s_ustat.firstNearLateIdx = s_ustat.total;
-                            if (!is_cb1_subpass && jitterActive && s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                            const bool needLateCleanCb1 =
+                                s_preserve_native_ui.load(std::memory_order_relaxed) ||
+                                s_hud_debug_view.load(std::memory_order_relaxed) ||
+                                s_jitter_debug_view.load(std::memory_order_relaxed);
+                            if (!is_cb1_subpass && jitterActive && needLateCleanCb1 &&
                                 s_clean_camera_frame != cur_frame &&
                                 (parse_ok || block_cam_ok) &&
                                 std::fabs(parsed_camera.depthB - nearRef->depthB) <= 1e-3f) {
                                 std::memcpy(s_last_clean_cb1_data, words, 5376);
+                                if (upstream_cb1_had_jitter) {
+                                    std::memcpy(&s_last_clean_cb1_data[1080], local_proj1080, 16 * sizeof(float));
+                                    const float invR0 = s_last_clean_cb1_data[98 * 4 + 0];
+                                    const float invR5 = s_last_clean_cb1_data[98 * 4 + 5];
+                                    if (std::isfinite(invR0) && std::isfinite(invR5) &&
+                                        (std::fabs(invR0) > 1e-4f || std::fabs(invR5) > 1e-4f) &&
+                                        areFiniteFloats(&s_last_clean_cb1_data[98 * 4], 12)) {
+                                        edpe::cobra_camera::jitterInverseUvRay(
+                                            &s_last_clean_cb1_data[98 * 4],
+                                            -existing_ndc_offset.x * 0.5f,
+                                            existing_ndc_offset.y * 0.5f);
+                                    }
+                                    if (parsed_camera.scaleX > 0.1f) {
+                                        edpe::cobra_camera::unjitterRowMajorUvToViewBlock(
+                                            &s_last_clean_cb1_data[237 * 4], parsed_camera);
+                                    }
+                                }
                                 s_has_clean_cb1_data = true;
                                 s_clean_camera_cb_dirty = true;
                                 s_clean_camera_frame = cur_frame;
@@ -8961,11 +8982,15 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     }
                 }
                 const edpe::ProjectionJitter jitter = getOrUpdateSceneProjectionJitter();
+                const bool needCleanCb1 =
+                    s_preserve_native_ui.load(std::memory_order_relaxed) ||
+                    s_hud_debug_view.load(std::memory_order_relaxed) ||
+                    s_jitter_debug_view.load(std::memory_order_relaxed);
                 if (upstream_cb1_active && upstream_cb1_had_jitter) {
                     // Upstream route: do NOT double-jitter CB1. Strip known NDC phase into
                     // s_last_clean_cb1_data for native HUD preservation and update reference blocks
                     // so repairAuxiliarySceneConstantBuffer stays active for Deferred CB2.
-                    if (!is_subpass_camera && s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                    if (!is_subpass_camera && needCleanCb1 &&
                         (s_clean_camera_frame != cur_frame ||
                          (in_main_scene && s_clean_camera_in_scene_frame != cur_frame))) {
                         std::memcpy(s_last_clean_cb1_data, mutable_words, 5376);
@@ -9041,7 +9066,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const bool jitOk = forwardCached ||
                         edpe::jitterEliteProjectionBlock(local_proj1080, jittered_block, jitter);
                     if (jitOk) {
-                        if (!is_subpass_camera && s_preserve_native_ui.load(std::memory_order_relaxed) &&
+                        if (!is_subpass_camera && needCleanCb1 &&
                             (s_clean_camera_frame != cur_frame ||
                              (in_main_scene && s_clean_camera_in_scene_frame != cur_frame))) {
                             std::memcpy(s_last_clean_cb1_data, mutable_words, 5376);
@@ -9123,6 +9148,44 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 }
             }
             if (!jitter_applied_this_unmap) {
+                if (upstream_cb1_had_jitter) {
+                    // Upstream Cobra hook already wrote subpixel jitter into this CB1, but EDPE
+                    // declined to jitter this pass (e.g. Pass 35 / auxiliary unmap). Strip the
+                    // upstream jitter back out of GPU memory so the buffer is genuinely unjittered
+                    // before clearing s_jittered_cb1_buffer (prevents Pass 35 HUD/holograms from
+                    // rendering jittered into UiLayer when replayHudDraw skips clean CB1 substitution).
+                    std::memcpy(&mutable_unmap_words[1080], local_proj1080, sizeof(local_proj1080));
+                    const float invR0 = mutable_unmap_words[98 * 4 + 0];
+                    const float invR5 = mutable_unmap_words[98 * 4 + 5];
+                    if (std::isfinite(invR0) && std::isfinite(invR5) &&
+                        (std::fabs(invR0) > 1e-4f || std::fabs(invR5) > 1e-4f)) {
+                        alignas(16) float local_inv_rays[12];
+                        std::memcpy(local_inv_rays, &mutable_unmap_words[98 * 4], sizeof(local_inv_rays));
+                        if (areFiniteFloats(local_inv_rays, 12)) {
+                            edpe::cobra_camera::jitterInverseUvRay(
+                                local_inv_rays,
+                                -existing_ndc_offset.x * 0.5f,
+                                existing_ndc_offset.y * 0.5f);
+                            std::memcpy(&mutable_unmap_words[98 * 4], local_inv_rays, sizeof(local_inv_rays));
+                        }
+                    }
+                    const edpe::CameraProjection& unjitRefCam =
+                        (s_has_staged_camera && s_staged_camera_frame == cur_frame)
+                            ? s_staged_camera
+                            : s_camera_now;
+                    if (unjitRefCam.scaleX > 0.1f) {
+                        const float expectedUv0 = 2.0f / unjitRefCam.scaleX;
+                        const float uv0 = mutable_unmap_words[237 * 4];
+                        if (std::isfinite(uv0) && std::fabs(uv0 - expectedUv0) <= 0.02f * expectedUv0) {
+                            alignas(16) float local_uv2view[16];
+                            std::memcpy(local_uv2view, &mutable_unmap_words[237 * 4], sizeof(local_uv2view));
+                            if (edpe::cobra_camera::unjitterRowMajorUvToViewBlock(local_uv2view, unjitRefCam)) {
+                                mutable_unmap_words[237 * 4 + 3] = local_uv2view[3];
+                                mutable_unmap_words[237 * 4 + 7] = local_uv2view[7];
+                            }
+                        }
+                    }
+                }
                 if (s_hdr_slot0_seen_frame == cur_frame &&
                     s_jittered_cb1_buffer.load(std::memory_order_acquire) == resource) {
                     // Cobra re-mapped and unmapped this buffer without jitter (e.g. Pass 35 unjittered camera
