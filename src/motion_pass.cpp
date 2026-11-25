@@ -46,7 +46,7 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     return true;
 }
 
-bool MotionPass::ensureOutputs(UINT width, UINT height, bool needClassOutput) {
+bool MotionPass::ensureOutputs(UINT width, UINT height, bool needClassOutput, bool needReactiveOutput) {
     const bool sizeChanged = (width != width_ || height != height_);
     if (!output_texture_ || !depth_output_texture_ || sizeChanged) {
         D3D11_TEXTURE2D_DESC mvDesc{};
@@ -88,6 +88,10 @@ bool MotionPass::ensureOutputs(UINT width, UINT height, bool needClassOutput) {
         class_output_uav_.Reset();
         class_output_srv_.Reset();
 
+        reactive_output_texture_.Reset();
+        reactive_output_uav_.Reset();
+        reactive_output_srv_.Reset();
+
         width_ = width;
         height_ = height;
     }
@@ -114,6 +118,29 @@ bool MotionPass::ensureOutputs(UINT width, UINT height, bool needClassOutput) {
             SetD3D11DebugName(class_output_texture_.Get(), "EDPE_MotionClass");
         }
     }
+
+    if (needReactiveOutput && !reactive_output_texture_) {
+        D3D11_TEXTURE2D_DESC reactiveDesc{};
+        reactiveDesc.Width = width;
+        reactiveDesc.Height = height;
+        reactiveDesc.MipLevels = reactiveDesc.ArraySize = 1;
+        reactiveDesc.Format = DXGI_FORMAT_R8_UNORM;
+        reactiveDesc.SampleDesc.Count = 1;
+        reactiveDesc.Usage = D3D11_USAGE_DEFAULT;
+        reactiveDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> reactiveTex;
+        Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> reactiveUav;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> reactiveSrv;
+        if (SUCCEEDED(device_->CreateTexture2D(&reactiveDesc, nullptr, &reactiveTex)) &&
+            SUCCEEDED(device_->CreateUnorderedAccessView(reactiveTex.Get(), nullptr, &reactiveUav)) &&
+            SUCCEEDED(device_->CreateShaderResourceView(reactiveTex.Get(), nullptr, &reactiveSrv))) {
+            reactive_output_texture_ = reactiveTex;
+            reactive_output_uav_ = reactiveUav;
+            reactive_output_srv_ = reactiveSrv;
+            SetD3D11DebugName(reactive_output_texture_.Get(), "EDPE_ReactiveMask");
+        }
+    }
     return true;
 }
 
@@ -128,7 +155,8 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     ID3D11ShaderResourceView* sceneStencil,
     ID3D11ShaderResourceView* celestialRecords,
     uint32_t celestialCount,
-    bool clampCockpit) {
+    bool clampCockpit,
+    bool enableReactiveOutput) {
     if (!device_ || !depth || !width || !height ||
         !(now.scaleX > 0 && now.scaleY > 0 && now.depthB > 0 &&
           previous.scaleX > 0 && previous.scaleY > 0) ||
@@ -147,7 +175,8 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
         (reset ? 8 : 0) |
         (useWeapon ? 16 : 0) |
         (useCelestial ? 32 : 0) |
-        (clampCockpit ? 64 : 0);
+        (clampCockpit ? 64 : 0) |
+        (enableReactiveOutput ? 256 : 0);
     // Precompute relative view-space transform M_rel = R_prev^T * R_now,
     // t_rel = R_prev^T * (t_now - t_prev) in double precision on CPU to avoid
     // float32 cancellation during translation and halve per-pixel ALU.
@@ -200,7 +229,7 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
         useWeapon ? weaponMotion : nullptr,
         useWeapon ? sceneStencil : nullptr,
         useCelestial ? celestialRecords : nullptr,
-        values, nullptr, nullptr, width, height, preserveContextState, enableClassOutput);
+        values, nullptr, nullptr, width, height, preserveContextState, enableClassOutput, enableReactiveOutput);
 }
 
 bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
@@ -235,7 +264,7 @@ bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
     return renderInternal(depth,
         (prevDepth && !reset) ? prevDepth : nullptr,
         nullptr, nullptr, nullptr,
-        values, now, previous, width, height, true, enableClassOutput);
+        values, now, previous, width, height, true, enableClassOutput, false);
 }
 
 bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
@@ -244,7 +273,7 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     ID3D11ShaderResourceView* sceneStencil,
     ID3D11ShaderResourceView* celestialRecords,
     const float (&values)[36], ID3D11Buffer* now, ID3D11Buffer* previous,
-    UINT width, UINT height, bool preserveContextState, bool enableClassOutput) {
+    UINT width, UINT height, bool preserveContextState, bool enableClassOutput, bool enableReactiveOutput) {
     if (!device_ || !depth || !width || !height) return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     depth->GetDesc(&srv_desc);
@@ -269,7 +298,7 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
         if (bound_dsv) { bound_dsv->Release(); return false; }
     }
 
-    if (!ensureOutputs(width, height, enableClassOutput)) return false;
+    if (!ensureOutputs(width, height, enableClassOutput, enableReactiveOutput)) return false;
 
     float patched[36];
     for (int i = 0; i < 36; ++i) patched[i] = values[i];
@@ -305,6 +334,7 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     }
 
     if (enableClassOutput && !class_output_uav_) flags &= ~4;
+    if (enableReactiveOutput && !reactive_output_uav_) flags &= ~256;
     if (!weaponMotion || !activeStencilSrv) flags &= ~16;
     if (!celestialRecords) flags &= ~32;
     if (activeStencilSrv) flags |= 128;
@@ -320,22 +350,23 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     ID3D11ShaderResourceView* srvs[5] = {
         depth, prevDepth, weaponMotion, activeStencilSrv, celestialRecords
     };
-    ID3D11UnorderedAccessView* uavs[3] = {
+    ID3D11UnorderedAccessView* uavs[4] = {
         output_uav_.Get(),
         depth_output_uav_.Get(),
-        (enableClassOutput && class_output_uav_) ? class_output_uav_.Get() : nullptr
+        (enableClassOutput && class_output_uav_) ? class_output_uav_.Get() : nullptr,
+        (enableReactiveOutput && reactive_output_uav_) ? reactive_output_uav_.Get() : nullptr
     };
     ID3D11Buffer* buffers[3] = {constants_.Get(), now, previous};
 
     context_->CSSetShader(now ? compute_gpu_.Get() : compute_.Get(), nullptr, 0);
     context_->CSSetConstantBuffers(0, now ? 3 : 1, buffers);
     context_->CSSetShaderResources(0, 5, srvs);
-    context_->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+    context_->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
     context_->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
 
-    ID3D11UnorderedAccessView* empty_uavs[3] = {nullptr, nullptr, nullptr};
+    ID3D11UnorderedAccessView* empty_uavs[4] = {nullptr, nullptr, nullptr, nullptr};
     ID3D11ShaderResourceView* empty_srvs[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
-    context_->CSSetUnorderedAccessViews(0, 3, empty_uavs, nullptr);
+    context_->CSSetUnorderedAccessViews(0, 4, empty_uavs, nullptr);
     context_->CSSetShaderResources(0, 5, empty_srvs);
     context_->CSSetShader(nullptr, nullptr, 0);
 
@@ -355,6 +386,9 @@ void MotionPass::clear(ID3D11DeviceContext* context) {
             static_cast<UINT>(MotionPixelClass::Reset), 0u, 0u, 0u
         };
         context->ClearUnorderedAccessViewUint(class_output_uav_.Get(), resetCls);
+    }
+    if (reactive_output_uav_) {
+        context->ClearUnorderedAccessViewFloat(reactive_output_uav_.Get(), zero);
     }
 }
 

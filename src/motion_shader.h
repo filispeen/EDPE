@@ -8,6 +8,7 @@ namespace edpe {
 //   u0 OutMotion (R16G16_FLOAT): prev - cur in render pixels, +Y down, no jitter (fp16-safe)
 //   u1 OutDepth  (R32_FLOAT):    canonical reversed-Z depth in world near-plane scale
 //   u2 OutClass  (R8_UINT):      optional pixel class (when modeFlags bit 2 is set)
+//   u3 OutReactive (R8_UNORM):   optional disocclusion/cutout reactive mask (when modeFlags bit 8 is set)
 inline constexpr char kMotionShader[] = R"(
 static const uint kClassSky           = 0u;
 static const uint kClassWorld         = 1u;
@@ -47,6 +48,7 @@ StructuredBuffer<CelestialRecord> celestialRecords : register(t4);
 RWTexture2D<float2> OutMotion : register(u0);
 RWTexture2D<float> OutDepth : register(u1);
 RWTexture2D<uint> OutClass : register(u2);
+RWTexture2D<unorm float> OutReactive : register(u3);
 cbuffer EliteNow : register(b1) { float4 currentWords[336]; };
 cbuffer ElitePrevious : register(b2) { float4 previousWords[336]; };
 
@@ -54,6 +56,7 @@ struct MotionResult {
     float2 mv;
     float canonicalDepth;
     uint pixelClass;
+    float reactive;
 };
 
 float2 sanitizeMotion(float2 mv) {
@@ -132,6 +135,7 @@ bool tryWeaponOverride(int2 pixCoord, bool isReset, bool clampCockpit, out Motio
     outRes.mv = float2(0.0, 0.0);
     outRes.canonicalDepth = 0.0;
     outRes.pixelClass = kClassWeapon;
+    outRes.reactive = 0.0;
     uint stencil = sceneStencil.Load(int3(pixCoord, 0)).g;
     uint masked = stencil & (kWeaponStencilBit | kCockpitStencilBit);
     if (clampCockpit ? (masked == 0u) : (masked != kWeaponStencilBit)) return false;
@@ -210,6 +214,7 @@ bool tryCelestialOverride(float2 rawPixel, float depth, float3 view,
     outRes.mv = float2(0.0, 0.0);
     outRes.canonicalDepth = depth;
     outRes.pixelClass = kClassCelestial;
+    outRes.reactive = 0.0;
     uint count = min(celestialCount, 16u);
     [loop]
     for (uint i = 0u; i < count; ++i) {
@@ -240,6 +245,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
     bool hasPrevDepth, bool isReset, bool clampCockpit, bool hasWeapon) {
     MotionResult res;
     res.canonicalDepth = depth;
+    res.reactive = 0.0;
     float2 worldMv = priorPixel - rawPixel;
     int2 maxCoord = int2(info.y - 1.0, info.z - 1.0);
     bool priorOffscreen = (priorPixel.x < 0.0 || priorPixel.x >= info.y ||
@@ -354,12 +360,19 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
 
     // Preserve real physical off-screen motion vectors for newly-revealed edges (FG policy).
     res.mv = worldMv;
+    bool movingPx = dot(worldMv, worldMv) > 0.25;
     if (isReset) {
         res.pixelClass = kClassReset;
     } else if (priorOffscreen) {
         res.pixelClass = kClassOffscreenFG;
+        if (hasPrevDepth && movingPx) {
+            res.reactive = 0.85;
+        }
     } else if (hasPrevDepth && !worldMatches) {
         res.pixelClass = kClassDisoccluded;
+        if (movingPx && worldErr > 0.05 * depth) {
+            res.reactive = 0.75;
+        }
     } else {
         res.pixelClass = kClassWorld;
     }
@@ -374,6 +387,7 @@ MotionResult reproject(float2 pixelCenter, int2 pixCoord,
     res.mv = float2(0.0, 0.0);
     res.canonicalDepth = 0.0;
     res.pixelClass = kClassSky;
+    res.reactive = 0.0;
 
     if (info.y <= 0 || info.z <= 0 || projection.x <= 0 || projection.y <= 0) return res;
     float depth = sceneDepth.Load(int3(pixCoord, 0));
@@ -450,6 +464,7 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
     res.mv = float2(0.0, 0.0);
     res.canonicalDepth = 0.0;
     res.pixelClass = kClassSky;
+    res.reactive = 0.0;
 
     if (info.y <= 0 || info.z <= 0 || scales.x <= 0 || scales.y <= 0) return res;
     float depth = sceneDepth.Load(int3(pixCoord, 0));
@@ -558,6 +573,9 @@ void writeOutputs(int2 pixCoord, MotionResult res) {
     if ((modeFlags & 4) != 0) {
         OutClass[pixCoord] = res.pixelClass;
     }
+    if ((modeFlags & 256) != 0) {
+        OutReactive[pixCoord] = saturate(res.reactive);
+    }
 }
 
 [numthreads(8, 8, 1)]
@@ -582,6 +600,7 @@ void cs_gpu(uint3 tid : SV_DispatchThreadID) {
     res.mv = float2(0.0, 0.0);
     res.canonicalDepth = sceneDepth.Load(int3(pixCoord, 0));
     res.pixelClass = kClassSky;
+    res.reactive = 0.0;
 
     float3 currentW = float3(currentWords[270].w, currentWords[271].w, currentWords[272].w);
     float3 previousW = float3(previousWords[270].w, previousWords[271].w, previousWords[272].w);

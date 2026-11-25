@@ -10680,7 +10680,7 @@ struct ScopedD3D11PipelineState {
     ID3D11Buffer* csCbs[4]{};
     ID3D11ShaderResourceView* psSrvs[8]{};
     ID3D11ShaderResourceView* csSrvs[8]{};
-    ID3D11UnorderedAccessView* csUavs[2]{};
+    ID3D11UnorderedAccessView* csUavs[D3D11_PS_CS_UAV_REGISTER_COUNT]{};
     ID3D11SamplerState* psSamps[4]{};
     ID3D11SamplerState* csSamps[4]{};
     ID3D11InputLayout* inputLayout = nullptr;
@@ -10710,7 +10710,7 @@ struct ScopedD3D11PipelineState {
         ctx->CSGetConstantBuffers(0, 4, csCbs);
         ctx->PSGetShaderResources(0, 8, psSrvs);
         ctx->CSGetShaderResources(0, 8, csSrvs);
-        ctx->CSGetUnorderedAccessViews(0, 2, csUavs);
+        ctx->CSGetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, csUavs);
         ctx->PSGetSamplers(0, 4, psSamps);
         ctx->CSGetSamplers(0, 4, csSamps);
         ctx->IAGetInputLayout(&inputLayout);
@@ -10731,10 +10731,10 @@ struct ScopedD3D11PipelineState {
         if (!ctx) return;
         rearmContextHooks();
         ID3D11ShaderResourceView* nullSrvs[8]{};
-        ID3D11UnorderedAccessView* nullUavs[2]{};
+        ID3D11UnorderedAccessView* nullUavs[D3D11_PS_CS_UAV_REGISTER_COUNT]{};
         ctx->PSSetShaderResources(0, 8, nullSrvs);
         ctx->CSSetShaderResources(0, 8, nullSrvs);
-        ctx->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+        ctx->CSSetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, nullUavs, nullptr);
         if (rawSetOm) {
             ID3D11RenderTargetView* nullRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
             rawSetOm(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullRtvs, nullptr);
@@ -10753,7 +10753,7 @@ struct ScopedD3D11PipelineState {
         ctx->CSSetConstantBuffers(0, 4, csCbs);
         ctx->PSSetShaderResources(0, 8, psSrvs);
         ctx->CSSetShaderResources(0, 8, csSrvs);
-        ctx->CSSetUnorderedAccessViews(0, 2, csUavs, nullptr);
+        ctx->CSSetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, csUavs, nullptr);
         ctx->PSSetSamplers(0, 4, psSamps);
         ctx->CSSetSamplers(0, 4, csSamps);
         ctx->IASetInputLayout(inputLayout);
@@ -11511,7 +11511,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     /*sceneStencil=*/nullptr,
                     /*celestialRecords=*/nullptr,
                     /*celestialCount=*/0u,
-                    /*clampCockpit=*/clampCockpit);
+                    /*clampCockpit=*/clampCockpit,
+                    /*enableReactiveOutput=*/(activeBackend == edpe::UpscalerBackend::AmdFsr));
             }
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
         }
@@ -11555,6 +11556,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.cameraPrevious = s_camera_previous;
     inputs.sharpness = s_sharpness.load(std::memory_order_relaxed);
     inputs.depthInverted = true;
+    inputs.depthInfinite = false;
     inputs.motionIsLowRes = true;
     const bool isHdrColor = (hdrInput || (preserveUi && rawColorChoice == s_clean_hdr_scene_texture.Get())) &&
                             (srcColorDesc.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
@@ -11562,7 +11564,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                              srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
     inputs.colorIsHdr = isHdrColor;
 
-    // Reactive mask removed: HUD and UI are composited via separate native layer.
+    if (activeBackend == edpe::UpscalerBackend::AmdFsr && motion_pass && need_motion) {
+        inputs.reactiveMask = motion_pass->reactiveMaskTexture();
+        inputs.reactiveMaskSrv = motion_pass->reactiveMask();
+    }
 
     s_last_temporal_inputs = inputs;
     s_last_temporal_inputs_frame = rendered;
@@ -11681,7 +11686,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         bool upscalerEvalOk = false;
         const bool preAllowBackbufferWrite = (s_diag_eval_stage == 1) || chosenIsBackbuffer;
         const bool canDeferSharpen =
-            (activeBackend != edpe::UpscalerBackend::AmdFsr) &&
             (inputs.sharpness > 0.0f) &&
             !isHdrColor &&
             (evalDestination == s_dlss_output_texture.Get()) &&

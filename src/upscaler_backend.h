@@ -150,7 +150,7 @@ public:
         uint32_t renderWidth, uint32_t renderHeight,
         uint32_t outputWidth, uint32_t outputHeight) const override;
 
-    static constexpr float kDefaultVelocityFactor = 0.00f;
+    static constexpr float kDefaultVelocityFactor = 0.50f;
     void setVelocityFactor(float factor);
     float getVelocityFactor() const;
 

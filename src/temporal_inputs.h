@@ -119,7 +119,9 @@ struct TemporalFrameInputs {
     ID3D11Texture2D* motionVectors = nullptr;
     ID3D11ShaderResourceView* motionSrv = nullptr;
 
-    // Reactive mask removed: HUD and UI are composited via separate native layer.
+    // Optional reactive mask (R8_UNORM, render resolution) for disocclusion / alpha-cutout reactivity.
+    ID3D11Texture2D* reactiveMask = nullptr;
+    ID3D11ShaderResourceView* reactiveMaskSrv = nullptr;
 
     ID3D11Texture2D* transparencyMask = nullptr;
     ID3D11ShaderResourceView* transparencyMaskSrv = nullptr;
