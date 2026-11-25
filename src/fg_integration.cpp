@@ -21,6 +21,17 @@ constexpr UINT kWmEdpeFgCreateChild = WM_APP + 0x4E1;
 constexpr UINT kWmEdpeFgResizeChild = WM_APP + 0x4E2;
 constexpr UINT kWmEdpeFgDestroyChild = WM_APP + 0x4E3;
 
+// After the overlay child window is destroyed, DWM can keep the game window in a state where a renderer below the
+// display rate loses a third of its frames (judder) until the window changes; minimize and restore cleared it. A
+// no-op frame change makes DWM re-evaluate the window and pacing recovers within about two seconds. Runs once per
+// overlay teardown, on the window's own thread.
+void requestPresentationReevaluation(HWND parent) {
+    if (!parent || !IsWindow(parent)) return;
+    SetWindowPos(parent, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    RedrawWindow(parent, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
 struct CreateChildParams {
     HWND parent = nullptr;
     uint32_t width = 0;
@@ -218,6 +229,7 @@ bool FgRuntime::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, L
         if (child && IsWindow(child)) {
             DestroyWindow(child);
         }
+        requestPresentationReevaluation(hwnd);
         if (outResult) *outResult = 1;
         return true;
     }
@@ -312,6 +324,7 @@ void FgRuntime::destroyOverlayWindow() {
         const DWORD ownerTid = GetWindowThreadProcessId(child, nullptr);
         if (ownerTid == GetCurrentThreadId()) {
             DestroyWindow(child);
+            requestPresentationReevaluation(parent);
         } else if (parent && IsWindow(parent)) {
             DWORD_PTR res = 0;
             SendMessageTimeoutW(parent, kWmEdpeFgDestroyChild, 0,
