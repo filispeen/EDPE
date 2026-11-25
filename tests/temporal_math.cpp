@@ -890,5 +890,88 @@ int main() {
             edpe::hasLargeEliteTransposeTranslation(nullptr)) return 156;
     }
 
+    // -------------------------------------------------------------------------
+    // Issue #30: ADS rifle & hands viewmodel vs world camera with skybox-space
+    // cb1[35..38] (words 140..155) and local-to-skybox cb1[64..66] (words 256..267)
+    // Captured from EDO2.rdc EIDs 8526..8622 (ADS rifle/hands) and EID 8635 (world).
+    // -------------------------------------------------------------------------
+    {
+        std::array<float, 1344> edo2Cb1{};
+        // cb1[35..38] (words 140..155) in skybox space (1/world_scaleX, 1/world_scaleY, 1/world_depthB):
+        const float world140[16]{
+             0.585254f,  0.517105f, 0.128764f, 0.0f,
+            -0.291366f,  0.285239f, 0.178810f, 0.0f,
+             0.0f,       0.0f,      0.0f,     40.0f,
+             0.158155f, -0.403417f, 0.901245f, 0.0f};
+        std::memcpy(&edo2Cb1[140], world140, sizeof(world140));
+
+        // cb1[58..60] (words 232..243): shifted axis block [0,1,0,0; 0,0,1,0; 0,0,0,1] present in EDO2.rdc;
+        // words[243] == 1.0f so any regression reading offset 232 fails isValidEliteSkyboxRotation12.
+        const float block232[12]{
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f};
+        std::memcpy(&edo2Cb1[232], block232, sizeof(block232));
+
+        // cb1[64..66] (words 256..267): local-to-skybox basis rotation R_64, followed by cb1[67]=(0,0,0,1)
+        const float skybox256[12]{
+            -0.987473f, -0.112762f, -0.110369f, 0.0f,
+             0.056711f, -0.906380f,  0.418640f, 0.0f,
+            -0.147243f,  0.407136f,  0.901421f, 0.0f};
+        std::memcpy(&edo2Cb1[256], skybox256, sizeof(skybox256));
+        edo2Cb1[271] = 1.0f;
+        if (edpe::isValidEliteSkyboxRotation12(&edo2Cb1[232])) return 163;
+        if (!edpe::isValidEliteSkyboxRotation12(&edo2Cb1[256])) return 164;
+
+        // cam932 (words 932..943): planetary horizon basis + eye pos in EDO2.rdc
+        const float cam932[12]{
+            0.075821f,  0.534115f,  0.842005f, -168.080521f,
+            0.856850f, -0.466772f,  0.218934f,  357.418030f,
+            0.509960f,  0.704872f, -0.493048f,  333.031158f};
+        std::memcpy(&edo2Cb1[932], cam932, sizeof(cam932));
+        // cb1[241].xyz (words 964..966): live eye position matching cam932
+        edo2Cb1[964] = -168.080505f;
+        edo2Cb1[965] =  357.418030f;
+        edo2Cb1[966] =  333.031158f;
+        // cb1[275].xyz (words 1100..1102): vertex-shader render origin
+        edo2Cb1[1100] = -0.302622f;
+        edo2Cb1[1101] =  0.264623f;
+        edo2Cb1[1102] = -0.398612f;
+        // cb1[277..279] (words 1108..1119): local render-space view rotation rows R_277
+        const float rot277[12]{
+            -0.821768f, -0.482109f, 0.303756f, 0.0f,
+             0.529653f, -0.449661f, 0.719217f, 0.0f,
+            -0.210153f,  0.751915f, 0.624868f, 0.0f};
+        std::memcpy(&edo2Cb1[1108], rot277, sizeof(rot277));
+
+        auto setProj1080 = [&](float sx, float sy, float db) {
+            for (size_t row = 0; row < 3; ++row) {
+                edo2Cb1[1080 + row * 4 + 0] = rot277[0 * 4 + row] * sx;
+                edo2Cb1[1080 + row * 4 + 1] = rot277[1 * 4 + row] * sy;
+                edo2Cb1[1080 + row * 4 + 2] = 0.0f;
+                edo2Cb1[1080 + row * 4 + 3] = rot277[2 * 4 + row];
+            }
+            edo2Cb1[1080 + 12] = 0.0f;
+            edo2Cb1[1080 + 13] = 0.0f;
+            edo2Cb1[1080 + 14] = db;
+            edo2Cb1[1080 + 15] = 0.0f;
+        };
+
+        // 1) Main world G-buffer draw (EID 8635): scaleX=1.263396, scaleY=2.246037, depthB=0.025
+        setProj1080(1.263396f, 2.246037f, 0.025f);
+        edpe::CameraProjection worldCam{};
+        if (!edpe::parseEliteCamera(edo2Cb1.data(), edo2Cb1.size(), &worldCam)) return 157;
+        if (!edpe::matchesEliteWorldProjectionScales(edo2Cb1.data(), edo2Cb1.size(), worldCam)) return 158;
+        if (edpe::isEliteSubpassVersusWorldCb1(edo2Cb1.data(), edo2Cb1.size(), worldCam)) return 159;
+
+        // 2) ADS rifle & hands G-buffer draws (EIDs 8526..8622): same depthB=0.025 as world,
+        //    narrower viewmodel FOV scaleX=3.190097, scaleY=5.671283.
+        setProj1080(3.190097f, 5.671283f, 0.025f);
+        edpe::CameraProjection adsRifleCam{};
+        if (!edpe::parseEliteCamera(edo2Cb1.data(), edo2Cb1.size(), &adsRifleCam)) return 160;
+        if (edpe::matchesEliteWorldProjectionScales(edo2Cb1.data(), edo2Cb1.size(), adsRifleCam)) return 161;
+        if (!edpe::isEliteSubpassVersusWorldCb1(edo2Cb1.data(), edo2Cb1.size(), adsRifleCam)) return 162;
+    }
+
     return 0; // All temporal math tests passed
 }

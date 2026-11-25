@@ -228,25 +228,79 @@ inline bool extractEliteWorldProjectionScales(const float* words, size_t count,
         local16, outWorldScaleX, outWorldScaleY, outWorldDepthB);
 }
 
+inline bool isValidEliteSkyboxRotation12(const float* skyboxRot12) {
+    if (!skyboxRot12) return false;
+    for (size_t i = 0; i < 12; ++i) {
+        if (!std::isfinite(skyboxRot12[i])) return false;
+    }
+    if (std::fabs(skyboxRot12[3]) > 0.002f ||
+        std::fabs(skyboxRot12[7]) > 0.002f ||
+        std::fabs(skyboxRot12[11]) > 0.002f) {
+        return false;
+    }
+    for (size_t r = 0; r < 3; ++r) {
+        const double rx = skyboxRot12[r * 4 + 0];
+        const double ry = skyboxRot12[r * 4 + 1];
+        const double rz = skyboxRot12[r * 4 + 2];
+        const double lenSq = rx * rx + ry * ry + rz * rz;
+        if (lenSq < 0.98 || lenSq > 1.02) return false;
+        for (size_t r2 = 0; r2 < r; ++r2) {
+            const double dot = rx * skyboxRot12[r2 * 4 + 0] +
+                               ry * skyboxRot12[r2 * 4 + 1] +
+                               rz * skyboxRot12[r2 * 4 + 2];
+            if (std::fabs(dot) > 0.02) return false;
+        }
+    }
+    return true;
+}
+
+// cb1[35..38] (words 140..155) stores the Main World Camera inverse projection basis in
+// star-system / skybox space: R_35 = R_277_world * R_64, where cb1[64..66] (words 256..267)
+// holds the orthonormal 3x3 local-to-skybox basis rotation R_64. Un-rotate R_35 by R_64^T
+// before comparing against parsedCam.worldFromView (R_277^T in local render space).
 inline float eliteWorldBlock16RotationTrace(const float* block16,
-    float worldScaleX, float worldScaleY, const CameraProjection& parsedCam) {
+    float worldScaleX, float worldScaleY, const CameraProjection& parsedCam,
+    const float* skyboxRot12 = nullptr) {
+    const double r35[3][3] = {
+        { static_cast<double>(block16[0]) * worldScaleX,
+          static_cast<double>(block16[1]) * worldScaleX,
+          static_cast<double>(block16[2]) * worldScaleX },
+        { static_cast<double>(block16[4]) * worldScaleY,
+          static_cast<double>(block16[5]) * worldScaleY,
+          static_cast<double>(block16[6]) * worldScaleY },
+        { static_cast<double>(block16[12]),
+          static_cast<double>(block16[13]),
+          static_cast<double>(block16[14]) }
+    };
     double trace = 0.0;
-    for (size_t row = 0; row < 3; ++row) {
-        trace += (static_cast<double>(block16[row]) * worldScaleX) * parsedCam.worldFromView[row * 4 + 0];
-        trace += (static_cast<double>(block16[4 + row]) * worldScaleY) * parsedCam.worldFromView[row * 4 + 1];
-        trace += static_cast<double>(block16[12 + row]) * parsedCam.worldFromView[row * 4 + 2];
+    if (isValidEliteSkyboxRotation12(skyboxRot12)) {
+        for (size_t row = 0; row < 3; ++row) {
+            const double s0 = skyboxRot12[row * 4 + 0];
+            const double s1 = skyboxRot12[row * 4 + 1];
+            const double s2 = skyboxRot12[row * 4 + 2];
+            for (size_t a = 0; a < 3; ++a) {
+                const double rLocal = r35[a][0] * s0 + r35[a][1] * s1 + r35[a][2] * s2;
+                trace += rLocal * parsedCam.worldFromView[row * 4 + a];
+            }
+        }
+    } else {
+        for (size_t row = 0; row < 3; ++row) {
+            trace += r35[0][row] * parsedCam.worldFromView[row * 4 + 0];
+            trace += r35[1][row] * parsedCam.worldFromView[row * 4 + 1];
+            trace += r35[2][row] * parsedCam.worldFromView[row * 4 + 2];
+        }
     }
     return static_cast<float>(trace);
 }
 
 inline bool matchesEliteWorldProjectionScalesFromBlock16(const float* block16,
-    const CameraProjection& parsedCam) {
+    const CameraProjection& parsedCam, const float* skyboxRot12 = nullptr) {
     float wsx = 0.0f, wsy = 0.0f, wdb = 0.0f;
     if (!extractEliteWorldProjectionScalesFromBlock16(block16, &wsx, &wsy, &wdb)) {
         return false;
     }
     if (!(parsedCam.scaleX > 0.0f && parsedCam.scaleY > 0.0f)) return false;
-    if (eliteWorldBlock16RotationTrace(block16, wsx, wsy, parsedCam) < 2.50f) {
+    if (eliteWorldBlock16RotationTrace(block16, wsx, wsy, parsedCam, skyboxRot12) < 2.50f) {
         return false;
     }
     return std::fabs(parsedCam.scaleX - wsx) <= 0.02f * wsx &&
@@ -258,12 +312,14 @@ inline bool matchesEliteWorldProjectionScales(const float* words, size_t count,
     const CameraProjection& parsedCam) {
     if (!words || count != 5376 / sizeof(float)) return false;
     float local16[16]{};
+    float localSkybox12[12]{};
     for (size_t i = 0; i < 16; ++i) local16[i] = words[140 + i];
-    return matchesEliteWorldProjectionScalesFromBlock16(local16, parsedCam);
+    for (size_t i = 0; i < 12; ++i) localSkybox12[i] = words[256 + i];
+    return matchesEliteWorldProjectionScalesFromBlock16(local16, parsedCam, localSkybox12);
 }
 
 inline bool isEliteSubpassVersusWorldBlock16(const float* block16,
-    const CameraProjection& parsedCam) {
+    const CameraProjection& parsedCam, const float* skyboxRot12 = nullptr) {
     float wsx = 0.0f, wsy = 0.0f, wdb = 0.0f;
     if (!extractEliteWorldProjectionScalesFromBlock16(block16, &wsx, &wsy, &wdb)) {
         return false;
@@ -275,7 +331,7 @@ inline bool isEliteSubpassVersusWorldBlock16(const float* block16,
     // A viewmodel/ADS sub-pass shares the active world camera orientation (trace ~3.0).
     // On System Map / Galaxy Map, Cobra leaves the stale space/cockpit camera in cb1[35..38]
     // with an unrelated orientation (e.g. trace = -0.965, ~133 deg apart).
-    if (eliteWorldBlock16RotationTrace(block16, wsx, wsy, parsedCam) < 2.50f) {
+    if (eliteWorldBlock16RotationTrace(block16, wsx, wsy, parsedCam, skyboxRot12) < 2.50f) {
         return false;
     }
     const float worldAspect = wsy / wsx;
@@ -290,8 +346,10 @@ inline bool isEliteSubpassVersusWorldCb1(const float* words, size_t count,
     const CameraProjection& parsedCam) {
     if (!words || count != 5376 / sizeof(float)) return false;
     float local16[16]{};
+    float localSkybox12[12]{};
     for (size_t i = 0; i < 16; ++i) local16[i] = words[140 + i];
-    return isEliteSubpassVersusWorldBlock16(local16, parsedCam);
+    for (size_t i = 0; i < 12; ++i) localSkybox12[i] = words[256 + i];
+    return isEliteSubpassVersusWorldBlock16(local16, parsedCam, localSkybox12);
 }
 
 // Inverse of jitterEliteDotProjectionBlock on the 208-byte CB0 transpose layout
