@@ -16,8 +16,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr uint32_t kWidth = 1600;
-constexpr uint32_t kHeight = 900;
+constexpr uint32_t kWidth = 3840;
+constexpr uint32_t kHeight = 2160;
 constexpr float kScaleX = 0.9f;
 constexpr float kScaleY = 1.6f;
 constexpr float kDepthB = 0.025f;
@@ -205,8 +205,8 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
                       ID3D11Texture2D* outTex, ID3D11RenderTargetView* outRtv,
                       ID3D11Texture2D* readbackStaging,
                       const MotionProfile& prof) {
-    constexpr int kFrames = 10;
-    constexpr int kEvalStart = 7;
+    constexpr int kFrames = 8;
+    constexpr int kEvalStart = 6;
 
     taaPass.resetHistory();
 
@@ -439,7 +439,7 @@ int main() {
         {"Combined6DOF",  0.12f,  0.06f,  0.15f,  0.024f,  0.015f,  0.020f},
     };
 
-    std::printf("[TAA_Motion_Ghosting_And_Smearing_Suite 1600x900]\n");
+    std::printf("[TAA_Motion_Ghosting_And_Smearing_Suite 3840x2160]\n");
     ID3D11Texture2D* dTexRaw[2] = { depthTex[0].Get(), depthTex[1].Get() };
     ID3D11ShaderResourceView* dSrvRaw[2] = { depthSrv[0].Get(), depthSrv[1].Get() };
 
