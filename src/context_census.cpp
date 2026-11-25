@@ -1277,6 +1277,7 @@ unsigned hud_target_draws = 0;
 Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 ID3D11DeviceContext* motion_grid_context = nullptr;
 std::unique_ptr<edpe::MotionPass> motion_pass;
+static ID3D11Device* s_motion_pass_failed_device = nullptr;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
 UINT motion_snapshot_width = 0;
 UINT motion_snapshot_height = 0;
@@ -11346,6 +11347,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_has_motion_prev_depth = false;
         s_cached_hdr_rtv0 = nullptr;
         motion_pass.reset();
+        s_motion_pass_failed_device = nullptr;
         s_weapon_motion.shutdown();
         s_celestial_motion.shutdown();
         s_weapon_motion_frame = ~0ull;
@@ -11703,9 +11705,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_has_motion_prev_depth = (s_motion_prev_depth && s_motion_prev_depth_view);
 
         if (!motion_pass) {
+            if (s_motion_pass_failed_device == device.Get()) return;
             auto candidate = std::make_unique<edpe::MotionPass>();
-            if (!candidate->initialize(device.Get(), context)) return;
+            if (!candidate->initialize(device.Get(), context)) {
+                s_motion_pass_failed_device = device.Get();
+                EdpeLog(L"EDPE: MotionPass initialize failed; skipping temporal reconstruction for this device");
+                return;
+            }
             motion_pass = std::move(candidate);
+            s_motion_pass_failed_device = nullptr;
         }
 
         {
@@ -11774,6 +11782,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
         }
 
+        static bool s_first_motion_dispatch_logged = false;
+        if (!s_first_motion_dispatch_logged && motion_pass->output()) {
+            s_first_motion_dispatch_logged = true;
+            EdpeLog(L"EDPE: MotionPass first dispatch completed");
+        }
         if (!motion_pass->output()) return;
 
         Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
@@ -11981,6 +11994,14 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             evalInputs.sharpness = 0.0f;
         }
         {
+            static bool s_first_eval_call_logged = false;
+            if (!s_first_eval_call_logged) {
+                s_first_eval_call_logged = true;
+                wchar_t evalMsg[128]{};
+                swprintf_s(evalMsg, L"EDPE: UpscalerManager::evaluate first call (backend=%d)",
+                    static_cast<int>(activeBackend));
+                EdpeLog(evalMsg);
+            }
             edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: UpscaleEval");
             s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::UpscaleEval);
             upscalerEvalOk = upscaler.evaluate(
@@ -15390,6 +15411,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_hud_mask_snapshot.Reset();
         resetVisorJitterAlign();
         motion_pass.reset();
+        s_motion_pass_failed_device = nullptr;
         s_weapon_motion.shutdown();
         s_celestial_motion.shutdown();
         s_weapon_motion_frame = ~0ull;

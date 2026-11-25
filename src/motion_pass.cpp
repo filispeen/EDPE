@@ -1,11 +1,71 @@
 #include "motion_pass.h"
 #include "motion_shader.h"
 #include "renderdoc_support.h"
+#include "log.h"
 
 #include <d3dcompiler.h>
 #include <cmath>
+#include <cstdio>
 
 namespace edpe {
+
+namespace {
+
+bool isWineRuntime() {
+    static const bool s_wine = []() {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+    }();
+    return s_wine;
+}
+
+UINT motionCompileFlags() {
+    // Wine's builtin d3dcompiler_47 (vkd3d-shader) can stall or fail under -O3 on
+    // large compute shaders; DXVK + RADV/ACO still optimize the resulting DXBC.
+    return isWineRuntime() ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_OPTIMIZATION_LEVEL3;
+}
+
+bool compileMotionComputeShader(ID3D11Device* device,
+                                const D3D_SHADER_MACRO* macros,
+                                const char* entryPoint,
+                                const wchar_t* tag,
+                                Microsoft::WRL::ComPtr<ID3D11ComputeShader>& outShader) {
+    if (!device || !entryPoint) return false;
+    Microsoft::WRL::ComPtr<ID3DBlob> code;
+    Microsoft::WRL::ComPtr<ID3DBlob> err;
+    const UINT flags = motionCompileFlags();
+    const HRESULT hr = D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, macros,
+        nullptr, entryPoint, "cs_5_0", flags, 0, &code, &err);
+    if (FAILED(hr) || !code) {
+        wchar_t errWide[256]{};
+        if (err && err->GetBufferPointer() && err->GetBufferSize() > 0) {
+            const char* raw = static_cast<const char*>(err->GetBufferPointer());
+            const int rawLen = static_cast<int>(err->GetBufferSize() > 240 ? 240 : err->GetBufferSize());
+            MultiByteToWideChar(CP_UTF8, 0, raw, rawLen, errWide, 255);
+            for (wchar_t& ch : errWide) {
+                if (ch == L'\r' || ch == L'\n') ch = L' ';
+            }
+        }
+        wchar_t msg[512]{};
+        swprintf_s(msg, L"EDPE: MotionPass D3DCompile(%ls) failed hr=0x%08X flags=0x%X%ls%ls",
+            tag ? tag : L"cs", static_cast<unsigned>(hr), flags,
+            errWide[0] ? L" err=" : L"", errWide);
+        EdpeLog(msg);
+        return false;
+    }
+    const HRESULT hrCs = device->CreateComputeShader(
+        code->GetBufferPointer(), code->GetBufferSize(), nullptr, &outShader);
+    if (FAILED(hrCs)) {
+        wchar_t msg[192]{};
+        swprintf_s(msg, L"EDPE: MotionPass CreateComputeShader(%ls) failed hr=0x%08X",
+            tag ? tag : L"cs", static_cast<unsigned>(hrCs));
+        EdpeLog(msg);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
 
 bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
     if (!device || !context || device_ ||
@@ -18,7 +78,9 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     const UINT flags = device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED
         ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED : 0;
     if (FAILED(device1->CreateDeviceContextState(flags, &level, 1, D3D11_SDK_VERSION,
-            __uuidof(ID3D11Device1), nullptr, &state_))) return false;
+            __uuidof(ID3D11Device1), nullptr, &state_))) {
+        state_.Reset();
+    }
 
     UINT mv_support = 0;
     UINT depth_support = 0;
@@ -30,35 +92,12 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     const D3D_SHADER_MACRO macrosBase[] = {
         {"EDPE_MOTION_HAS_WEAPON", "0"},
         {"EDPE_MOTION_HAS_CELESTIAL", "0"},
+        {"EDPE_MOTION_GPU_CAMERAS", "0"},
         {nullptr, nullptr}
     };
-    const D3D_SHADER_MACRO macrosFull[] = {
-        {"EDPE_MOTION_HAS_WEAPON", "1"},
-        {"EDPE_MOTION_HAS_CELESTIAL", "1"},
-        {nullptr, nullptr}
-    };
-    const D3D_SHADER_MACRO macrosTile[] = {
-        {"EDPE_COCKPIT_TILE_PASS", "1"},
-        {nullptr, nullptr}
-    };
-
-    Microsoft::WRL::ComPtr<ID3DBlob> cs_base_code, cs_full_code, cs_gpu_code, cs_tile_code;
-    if (FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, macrosBase,
-            nullptr, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_base_code, nullptr)) ||
-        FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, macrosFull,
-            nullptr, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_full_code, nullptr)) ||
-        FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, macrosBase,
-            nullptr, "cs_gpu", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_gpu_code, nullptr)) ||
-        FAILED(D3DCompile(kMotionShader, sizeof(kMotionShader) - 1, nullptr, macrosTile,
-            nullptr, "cs_cockpit_tiles", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs_tile_code, nullptr)) ||
-        FAILED(device->CreateComputeShader(cs_base_code->GetBufferPointer(),
-            cs_base_code->GetBufferSize(), nullptr, &compute_)) ||
-        FAILED(device->CreateComputeShader(cs_full_code->GetBufferPointer(),
-            cs_full_code->GetBufferSize(), nullptr, &compute_full_)) ||
-        FAILED(device->CreateComputeShader(cs_gpu_code->GetBufferPointer(),
-            cs_gpu_code->GetBufferSize(), nullptr, &compute_gpu_)) ||
-        FAILED(device->CreateComputeShader(cs_tile_code->GetBufferPointer(),
-            cs_tile_code->GetBufferSize(), nullptr, &cockpit_tile_cs_))) return false;
+    if (!compileMotionComputeShader(device, macrosBase, "cs", L"cs_base", compute_)) {
+        return false;
+    }
 
     D3D11_SAMPLER_DESC sampDesc{};
     sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -76,7 +115,48 @@ bool MotionPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (FAILED(device->CreateBuffer(&desc, nullptr, &constants_))) return false;
     device_ = device;
+    wchar_t initMsg[160]{};
+    swprintf_s(initMsg, L"EDPE: MotionPass initialized (wine=%d flags=0x%X ctxState=%d)",
+        isWineRuntime() ? 1 : 0, motionCompileFlags(), state_ ? 1 : 0);
+    EdpeLog(initMsg);
     return true;
+}
+
+bool MotionPass::ensureFullComputeShader() {
+    if (compute_full_) return true;
+    if (compute_full_attempted_ || !device_) return false;
+    compute_full_attempted_ = true;
+    const D3D_SHADER_MACRO macrosFull[] = {
+        {"EDPE_MOTION_HAS_WEAPON", "1"},
+        {"EDPE_MOTION_HAS_CELESTIAL", "1"},
+        {"EDPE_MOTION_GPU_CAMERAS", "0"},
+        {nullptr, nullptr}
+    };
+    return compileMotionComputeShader(device_.Get(), macrosFull, "cs", L"cs_full", compute_full_);
+}
+
+bool MotionPass::ensureGpuComputeShader() {
+    if (compute_gpu_) return true;
+    if (compute_gpu_attempted_ || !device_) return false;
+    compute_gpu_attempted_ = true;
+    const D3D_SHADER_MACRO macrosGpu[] = {
+        {"EDPE_MOTION_HAS_WEAPON", "0"},
+        {"EDPE_MOTION_HAS_CELESTIAL", "0"},
+        {"EDPE_MOTION_GPU_CAMERAS", "1"},
+        {nullptr, nullptr}
+    };
+    return compileMotionComputeShader(device_.Get(), macrosGpu, "cs_gpu", L"cs_gpu", compute_gpu_);
+}
+
+bool MotionPass::ensureCockpitTileShader() {
+    if (cockpit_tile_cs_) return true;
+    if (cockpit_tile_attempted_ || !device_) return false;
+    cockpit_tile_attempted_ = true;
+    const D3D_SHADER_MACRO macrosTile[] = {
+        {"EDPE_COCKPIT_TILE_PASS", "1"},
+        {nullptr, nullptr}
+    };
+    return compileMotionComputeShader(device_.Get(), macrosTile, "cs_cockpit_tiles", L"cs_cockpit_tiles", cockpit_tile_cs_);
 }
 
 bool MotionPass::ensureCockpitTileTexture(UINT width, UINT height) {
@@ -420,8 +500,15 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     const bool useWeapon = ((flags & 16) != 0);
     const bool useCelestial = ((flags & 32) != 0);
     const bool clampCockpit = ((flags & 64) != 0);
+    const bool wantFullShader = (!now) && (useWeapon || useCelestial);
+    const bool hasFullShader = wantFullShader && ensureFullComputeShader();
+    if (wantFullShader && !hasFullShader) {
+        flags &= ~(16 | 32);
+    }
+    const bool effectiveWeapon = ((flags & 16) != 0);
     const bool useCockpitTiles =
-        (!now) && useWeapon && clampCockpit && activeStencilSrv && cockpit_tile_cs_ &&
+        (!now) && effectiveWeapon && clampCockpit && activeStencilSrv &&
+        ensureCockpitTileShader() &&
         ensureCockpitTileTexture(width, height);
     if (useCockpitTiles) {
         flags |= 256;
@@ -432,8 +519,13 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     patched[31] = static_cast<float>(flags);
     context_->UpdateSubresource(constants_.Get(), 0, nullptr, patched, 0, 0);
 
+    if (now && !ensureGpuComputeShader()) {
+        return false;
+    }
+
     Microsoft::WRL::ComPtr<ID3DDeviceContextState> prior;
-    if (preserveContextState) {
+    const bool swappedState = preserveContextState && (state_ != nullptr);
+    if (swappedState) {
         context_->SwapDeviceContextState(state_.Get(), &prior);
     }
 
@@ -467,7 +559,13 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     ID3D11SamplerState* smp = point_sampler_.Get();
     ID3D11ComputeShader* activeCs = now
         ? compute_gpu_.Get()
-        : ((useWeapon || useCelestial) ? compute_full_.Get() : compute_.Get());
+        : (hasFullShader ? compute_full_.Get() : compute_.Get());
+    if (!activeCs) {
+        if (swappedState) {
+            context_->SwapDeviceContextState(prior.Get(), nullptr);
+        }
+        return false;
+    }
 
     context_->CSSetShader(activeCs, nullptr, 0);
     context_->CSSetSamplers(0, 1, &smp);
@@ -484,7 +582,7 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     context_->CSSetSamplers(0, 1, &null_smp);
     context_->CSSetShader(nullptr, nullptr, 0);
 
-    if (preserveContextState) {
+    if (swappedState) {
         context_->SwapDeviceContextState(prior.Get(), nullptr);
     }
 
