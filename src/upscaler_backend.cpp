@@ -865,7 +865,8 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.prevJitterY,
         inputs.cameraNow.depthB,
         inputs.prevDepthSrv,
-        preferredOutputFormat_);
+        preferredOutputFormat_,
+        inputs.reactiveMaskSrv);
 }
 
 void TaaUpscalerBackend::resetHistory() {
@@ -1135,12 +1136,13 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
         EvaluatingUpscalerGuard evalGuard;
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
         if (evalSuccess && currentBackendType_ != UpscalerBackend::AmdFsr && inputs.sharpness > 0.0f) {
+            // Never sharpen TAA's internal ping-pong history texture in-place when destinationTexture == nullptr;
+            // mutating historyTexture_[historyReadIdx_] creates recursive sharpening halos/shimmer on subsequent frames.
             ID3D11Texture2D* sharpenTarget = destinationTexture
                 ? destinationTexture
-                : ((currentBackendType_ == UpscalerBackend::Taa && taaBackend_.latestOutputTexture())
-                       ? taaBackend_.latestOutputTexture()
-                       : inputs.color);
-            if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr, callerRestoresState)) {
+                : ((currentBackendType_ == UpscalerBackend::Taa) ? nullptr : inputs.color);
+            if (sharpenTarget &&
+                !sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr, callerRestoresState)) {
                 static bool s_sharpenFailLogged = false;
                 if (!s_sharpenFailLogged) {
                     s_sharpenFailLogged = true;

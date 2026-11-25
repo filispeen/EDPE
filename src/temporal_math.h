@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace edpe {
@@ -333,5 +334,49 @@ private:
     uint64_t m_checked = 0;
     uint64_t m_mismatched = 0;
 };
+
+
+struct EliteStatusFlags {
+    bool mapGuiFocus = false; // GuiFocus 6..9 (Galaxy Map, System Map, Orrery, FSS)
+    bool onFoot = false;      // Flags2 bits: OnFoot / Hangar / Station / Planet / Social / Exterior
+    bool inSrv = false;       // Flags bit 26 (1u << 26 = 0x04000000): InSRV
+};
+
+inline EliteStatusFlags parseEliteStatusJsonFlags(const char* buf) {
+    EliteStatusFlags out{};
+    if (!buf) return out;
+    if (const char* p = std::strstr(buf, "\"GuiFocus\"")) {
+        p += 10;
+        while (*p == ' ' || *p == '\t' || *p == ':') ++p;
+        const int guiFocus = std::atoi(p);
+        out.mapGuiFocus = (guiFocus >= 6 && guiFocus <= 9);
+    }
+    if (const char* f1 = std::strstr(buf, "\"Flags\"")) {
+        f1 += 7;
+        while (*f1 == ' ' || *f1 == '\t' || *f1 == ':') ++f1;
+        const unsigned long flags = std::strtoul(f1, nullptr, 10);
+        // Flags bit 26 (0x04000000): InSRV
+        out.inSrv = (flags & (1ul << 26)) != 0;
+    }
+    if (const char* f2 = std::strstr(buf, "\"Flags2\"")) {
+        f2 += 8;
+        while (*f2 == ' ' || *f2 == '\t' || *f2 == ':') ++f2;
+        const unsigned long flags2 = std::strtoul(f2, nullptr, 10);
+        // Flags2 bits: 0x1=OnFoot, 0x8=OnFootInHangar, 0x10=OnFootInStation,
+        // 0x20=OnFootOnPlanet, 0x1000=OnFootSocialSpace, 0x2000=OnFootExterior
+        out.onFoot = (flags2 & 0x3039ul) != 0;
+    }
+    return out;
+}
+
+// Returns effective cockpit/vehicle near-field clamp distance in meters:
+//   - OnFoot: 0.0 m (disabled — world motion applies to all non-weapon geometry)
+//   - InSRV:  3.5 m (caps vehicle split so nearby rocky terrain uses world camera motion)
+//   - Ship:   150.0 m (cockpit + exterior hull)
+inline float computeCockpitClampMaxMeters(bool onFoot, bool inSrv) {
+    if (onFoot) return 0.0f;
+    if (inSrv) return 3.5f;
+    return 150.0f;
+}
 
 } // namespace edpe

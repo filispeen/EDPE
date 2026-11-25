@@ -13,6 +13,7 @@ cbuffer TaaConstants : register(b0) {
     float4 renderResolution; // x: renderWidth, y: renderHeight, z: 1/renderWidth, w: 1/renderHeight
     float4 params;           // x: jitterX, y: jitterY, z: blendWeight, w: resetFlag
     float4 jitterHistory;    // x: prevJitterX, y: prevJitterY, z: depthB, w: hasPrevDepth
+    float4 reactiveInfo;     // x: hasReactiveMask, yzw: unused
 };
 
 Texture2D<float4> currentFrame  : register(t0);
@@ -20,6 +21,7 @@ Texture2D<float4> historyFrame  : register(t1);
 Texture2D<float2> motionVectors : register(t2);
 Texture2D<float>  sceneDepth    : register(t3);
 Texture2D<float>  prevSceneDepth: register(t4);
+Texture2D<float>  motionReactive: register(t5);
 
 SamplerState linearSampler : register(s0);
 SamplerState pointSampler  : register(s1);
@@ -205,11 +207,14 @@ PSOutput ps_main(VSOutput pin) {
     float4 histSample = SampleCatmullRom5(historyFrame, linearSampler, priorUv, resolution.xy, resolution.zw);
     float3 histY = RGBToYCoCg(TonemapKaris(histSample.rgb));
 
-    // 4. Disocclusion depth validation against nearestDepth with directed 4x4 current-footprint guard
-    //    and Z-translation drift tolerance.
+    // 4. Disocclusion confidence: prefer MotionPass prevDepthMatches reactive mask when available;
+    //    otherwise fall back to directed 4x4 current-footprint guard against nearestDepth.
     float depthConfidence = 1.0;
     float2 prevJitterUv = jitterHistory.xy * renderResolution.zw;
-    if (jitterHistory.w > 0.5 && nearestDepth > 0.0 && speed > 0.5) {
+    if (reactiveInfo.x > 0.5) {
+        float reactive = motionReactive.SampleLevel(pointSampler, nearestUv, 0).r;
+        depthConfidence = lerp(1.0, 0.15, saturate(reactive));
+    } else if (jitterHistory.w > 0.5 && nearestDepth > 0.0 && speed > 0.5) {
         float2 prevUv = clamp(priorUv + prevJitterUv, 0.0, 1.0);
         float pd = prevSceneDepth.SampleLevel(pointSampler, prevUv, 0).r;
 

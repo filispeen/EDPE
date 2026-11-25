@@ -8,6 +8,7 @@ namespace edpe {
 //   u0 OutMotion (R16G16_FLOAT): prev - cur in render pixels, +Y down, no jitter (fp16-safe)
 //   u1 OutDepth  (R32_FLOAT):    canonical reversed-Z depth in world near-plane scale
 //   u2 OutClass  (R8_UINT):      optional pixel class (when modeFlags bit 2 is set)
+//   u3 OutReactive (R8_UNORM):   optional disocclusion/reactive mask (when modeFlags bit 9 is set)
 inline constexpr char kMotionShader[] = R"(
 #ifndef EDPE_MOTION_HAS_WEAPON
 #define EDPE_MOTION_HAS_WEAPON 1
@@ -42,7 +43,7 @@ cbuffer Camera : register(b0) {
     float4 now0, now1, now2;
     float4 prev0, prev1, prev2; // prev0.x=translationStep, prev0.y=celestialDepthThresh, prev0.z=celestialCount
     float4 scales;     // current X/Y, previous X/Y
-    float4 info;       // depthB, width, height, flags (bit0=hasPrevDepth, bit2=writeClass, bit3=reset, bit4=hasWeapon, bit5=hasCelestial, bit6=clampCockpit, bit8=hasCockpitTiles)
+    float4 info;       // depthB, width, height, flags (bit0=hasPrevDepth, bit2=writeClass, bit3=reset, bit4=hasWeapon, bit5=hasCelestial, bit6=clampCockpit, bit8=hasCockpitTiles, bit9=writeReactive, bit10=inSrv)
     float4 jitterInfo; // jitterX, jitterY, prevJitterX, prevJitterY (render pixels)
 };
 Texture2D<float> sceneDepth : register(t0);
@@ -89,6 +90,7 @@ SamplerState pointSampler : register(s0);
 RWTexture2D<float2> OutMotion : register(u0);
 RWTexture2D<float> OutDepth : register(u1);
 RWTexture2D<uint> OutClass : register(u2);
+RWTexture2D<float> OutReactive : register(u3);
 cbuffer EliteNow : register(b1) { float4 currentWords[336]; };
 cbuffer ElitePrevious : register(b2) { float4 previousWords[336]; };
 
@@ -321,7 +323,7 @@ bool tryCelestialOverride(float2 rawPixel, float depth, float3 view,
 )" R"(
 MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 rawPixel,
     float2 priorPixel, float depth, float expectedPriorDepth, float z,
-    bool hasPrevDepth, bool isReset, bool clampCockpit, bool hasWeapon) {
+    bool hasPrevDepth, bool isReset, bool clampCockpit, bool hasWeapon, bool inSrv) {
     MotionResult res;
     res.canonicalDepth = depth;
     float2 worldMv = priorPixel - rawPixel;
@@ -340,7 +342,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
     //   parallel to themselves do not accidentally pass worldMatches and inherit bogus world MVs.
     // - On exterior ship hull / nose (1.5m <= z < 150m), clamp when world reprojection fails
     //   or when static depth matches strictly tighter than world reprojection.
-    bool canClampDistance = (z < 10.0) || (z < 150.0 && !priorOffscreen);
+    bool canClampDistance = inSrv ? (z < 3.5) : ((z < 10.0) || (z < 150.0 && !priorOffscreen));
     if (clampCockpit && canClampDistance && hasPrevDepth) {
         // Un-stenciled exterior ship hull/wings/nacelles (e.g. Imperial Courier wings & nacelles):
         // validate against prevSceneDepth using the nearest captured cockpit WeaponMotion MV.
@@ -357,7 +359,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
                     bool shipMatches = prevDepthMatches(shipPrevPx, depth, maxCoord, shipErr);
                     if (!shipMatches) {
                         int2 scShip = clamp(int2(floor(shipPrevPx)), 0, maxCoord);
-                        float shipTol = max(1e-5, 0.06 * depth);
+                        float shipTol = max(1e-5, 0.025 * depth);
                         // Ring 1: 3x3 (-1..1)
                         [unroll]
                         for (int oy = -1; oy <= 1; ++oy) {
@@ -383,15 +385,13 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
                                 }
                             }
                         }
-                        // Ring 3: 12 outer taps at radii 3, 4, 6
+                        // Ring 3: 4 cardinal taps at radius 3 (capped <= 3 px to prevent station wall oscillation)
                         if (shipErr > shipTol) {
-                            static const int2 kOuter[12] = {
-                                int2(3, 0), int2(-3, 0), int2(0, 3), int2(0, -3),
-                                int2(4, 0), int2(-4, 0), int2(0, 4), int2(0, -4),
-                                int2(6, 0), int2(-6, 0), int2(0, 6), int2(0, -6)
+                            static const int2 kOuter[4] = {
+                                int2(3, 0), int2(-3, 0), int2(0, 3), int2(0, -3)
                             };
                             [unroll]
-                            for (int oi = 0; oi < 12; ++oi) {
+                            for (int oi = 0; oi < 4; ++oi) {
                                 float pd = prevSceneDepth.Load(int3(clamp(scShip + kOuter[oi], int2(0, 0), maxCoord), 0));
                                 if (pd > 0.0 && pd <= 1.0 && isfinite(pd)) {
                                     shipErr = min(shipErr, abs(pd - depth));
@@ -415,7 +415,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
             bool staticMatches = prevDepthMatches(rawPixel + jitterInfo.zw, depth, maxCoord, staticErr);
             if (!staticMatches) {
                 int2 sc = clamp(int2(floor(rawPixel + jitterInfo.zw)), 0, maxCoord);
-                float staticTol = max(1e-5, 0.04 * depth);
+                float staticTol = max(1e-5, 0.0175 * depth);
                 [unroll]
                 for (int oy = -1; oy <= 1; ++oy) {
                     [unroll]
@@ -539,7 +539,7 @@ MotionResult reproject(float2 pixelCenter, int2 pixCoord,
                                (1.0 - priorNdc.y) * info.z * 0.5);
     float expectedPriorDepth = depthB / prior.z;
     return classifyAndFinishWorld(pixCoord, pixelCenter, rawPixel, priorPixel,
-        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit, hasWeapon);
+        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit, hasWeapon, false);
 }
 
 )" R"(
@@ -561,6 +561,7 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
     bool hasWeapon = (modeFlags & 16) != 0;
     bool hasCelestial = (modeFlags & 32) != 0;
     bool hasSceneStencil = (modeFlags & 128) != 0;
+    bool inSrv = (modeFlags & 1024) != 0;
 
     // 0. First-person weapon / viewmodel override (stencil 0x10 + valid WeaponMotion):
 #if EDPE_MOTION_HAS_WEAPON
@@ -645,7 +646,7 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
                           dot(rel2.xyz, view) + rel2.w);
     res.pixelClass = isReset ? kClassReset : kClassWorld;
     if (prior.z <= 0.0) {
-        if (clampCockpit && z < 10.0 && hasPrevDepth) {
+        if (clampCockpit && z < (inSrv ? 3.5 : 10.0) && hasPrevDepth) {
             float se = 1e30;
             int2 mc = int2(info.y - 1.0, info.z - 1.0);
             if (prevDepthMatches(rawPixel + jitterInfo.zw, depth, mc, se)) {
@@ -657,7 +658,7 @@ MotionResult reprojectRel(float2 pixelCenter, int2 pixCoord,
     float2 priorPixel = prior.xy * rcp(prior.z) * prevProjHalf.xy + prevProjHalf.zw;
     float expectedPriorDepth = depthB / prior.z;
     return classifyAndFinishWorld(pixCoord, pixelCenter, rawPixel, priorPixel,
-        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit, hasWeapon);
+        depth, expectedPriorDepth, z, hasPrevDepth, isReset, clampCockpit, hasWeapon, inSrv);
 }
 
 void writeOutputs(int2 pixCoord, MotionResult res) {
@@ -666,6 +667,12 @@ void writeOutputs(int2 pixCoord, MotionResult res) {
     int modeFlags = int(info.w + 0.1);
     if ((modeFlags & 4) != 0) {
         OutClass[pixCoord] = res.pixelClass;
+    }
+    if ((modeFlags & 512) != 0) {
+        float reactive = (res.pixelClass == kClassDisoccluded ||
+                          res.pixelClass == kClassOffscreenFG ||
+                          res.pixelClass == kClassReset) ? 1.0 : 0.0;
+        OutReactive[pixCoord] = reactive;
     }
 }
 

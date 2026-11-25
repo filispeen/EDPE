@@ -386,6 +386,63 @@ public:
         return val;
     }
 
+    struct EliteGraphicsWarnings {
+        int aaMode = 0;                 // 0 = Off, >0 = FXAA/SMAA active in Elite .fxcfg
+        bool terrainCheckerboard = false;
+    };
+
+    static int parseEliteAaModeXml(const std::string& content) {
+        constexpr char kOpenTag[] = "<AAMode>";
+        constexpr char kCloseTag[] = "</AAMode>";
+        const size_t start = content.find(kOpenTag);
+        if (start == std::string::npos) return 0;
+        const size_t valStart = start + sizeof(kOpenTag) - 1;
+        const size_t end = content.find(kCloseTag, valStart);
+        if (end == std::string::npos || end <= valStart) return 0;
+        const std::string numStr = content.substr(valStart, end - valStart);
+        char* parseEnd = nullptr;
+        const long val = std::strtol(numStr.c_str(), &parseEnd, 10);
+        if (parseEnd == numStr.c_str() || val < 0 || val > 16) return 0;
+        return static_cast<int>(val);
+    }
+
+    static bool parseEliteTerrainCheckerboardXml(const std::string& content) {
+        constexpr char kOpenTag[] = "<TerrainCheckerboardRenderingEnabled>";
+        constexpr char kCloseTag[] = "</TerrainCheckerboardRenderingEnabled>";
+        const size_t start = content.find(kOpenTag);
+        if (start == std::string::npos) return false;
+        const size_t valStart = start + sizeof(kOpenTag) - 1;
+        const size_t end = content.find(kCloseTag, valStart);
+        if (end == std::string::npos || end <= valStart) return false;
+        std::string val = content.substr(valStart, end - valStart);
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t' || val.front() == '\r' || val.front() == '\n')) val.erase(val.begin());
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r' || val.back() == '\n')) val.pop_back();
+        for (char& ch : val) {
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        return (val == "true" || val == "1");
+    }
+
+    static EliteGraphicsWarnings readEliteGraphicsWarnings() {
+        static ULONGLONG s_lastCheckTick = 0;
+        static EliteGraphicsWarnings s_cached{};
+        const ULONGLONG now = GetTickCount64();
+        if (s_lastCheckTick != 0 && (now - s_lastCheckTick) < 5000ull) {
+            return s_cached;
+        }
+        s_lastCheckTick = now;
+        s_cached = {};
+        if (!edpe::isRunningInEliteProcess()) return s_cached;
+        const std::filesystem::path cfgPath = resolveEliteGraphicsConfigPath();
+        if (cfgPath.empty()) return s_cached;
+        std::ifstream inFile(cfgPath, std::ios::binary);
+        if (!inFile) return s_cached;
+        std::string content((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
+        s_cached.aaMode = parseEliteAaModeXml(content);
+        s_cached.terrainCheckerboard = parseEliteTerrainCheckerboardXml(content);
+        return s_cached;
+    }
+
     static float readEliteSsaaMultiplier() {
         if (!edpe::isRunningInEliteProcess()) return 0.0f;
         const std::filesystem::path cfgPath = resolveEliteGraphicsConfigPath();

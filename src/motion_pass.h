@@ -39,7 +39,9 @@ public:
         ID3D11ShaderResourceView* sceneStencil = nullptr,
         ID3D11ShaderResourceView* celestialRecords = nullptr,
         uint32_t celestialCount = 0,
-        bool clampCockpit = true);
+        bool clampCockpit = true,
+        bool enableReactiveOutput = false,
+        bool inSrv = false);
     bool renderGpuCameras(ID3D11ShaderResourceView* depth, ID3D11Buffer* now,
         ID3D11Buffer* previous, UINT width, UINT height,
         float jitterX = 0.0f, float jitterY = 0.0f,
@@ -54,10 +56,12 @@ public:
     ID3D11Texture2D* canonicalDepthTexture() const { return depth_output_texture_.Get(); }
     ID3D11ShaderResourceView* pixelClass() const { return class_output_srv_.Get(); }
     ID3D11Texture2D* pixelClassTexture() const { return class_output_texture_.Get(); }
+    ID3D11ShaderResourceView* reactiveMask() const { return reactive_output_srv_.Get(); }
+    ID3D11Texture2D* reactiveMaskTexture() const { return reactive_output_texture_.Get(); }
     void clear(ID3D11DeviceContext* context);
 
 private:
-    bool ensureOutputs(UINT width, UINT height, bool needClassOutput);
+    bool ensureOutputs(UINT width, UINT height, bool needClassOutput, bool needReactiveOutput);
     bool ensureCockpitTileTexture(UINT width, UINT height);
     bool renderInternal(ID3D11ShaderResourceView* depth,
         ID3D11ShaderResourceView* prevDepth,
@@ -66,7 +70,7 @@ private:
         ID3D11ShaderResourceView* celestialRecords,
         const float (&values)[36],
         ID3D11Buffer* now, ID3D11Buffer* previous, UINT width, UINT height,
-        bool preserveContextState, bool enableClassOutput);
+        bool preserveContextState, bool enableClassOutput, bool enableReactiveOutput);
 
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context_;
@@ -95,6 +99,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> class_output_texture_;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> class_output_uav_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> class_output_srv_;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> reactive_output_texture_;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> reactive_output_uav_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> reactive_output_srv_;
 
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cached_stencil_srv_[2];
     int cached_stencil_next_ = 0;

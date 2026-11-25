@@ -34,7 +34,8 @@ public:
         float prevJitterY = 0.0f,
         float depthB = 0.025f,
         ID3D11ShaderResourceView* prevDepthSrv = nullptr,
-        DXGI_FORMAT preferredFormat = DXGI_FORMAT_UNKNOWN);
+        DXGI_FORMAT preferredFormat = DXGI_FORMAT_UNKNOWN,
+        ID3D11ShaderResourceView* reactiveMaskSrv = nullptr);
 
     void resetHistory() { resetRequested_ = true; }
     bool isInitialized() const { return device_ != nullptr; }

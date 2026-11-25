@@ -11706,7 +11706,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     (s_visor_diverted_frame != ~0ull && rendered >= s_visor_diverted_frame &&
                      (rendered - s_visor_diverted_frame) <= 300ull);
                 const bool onFootActive = edpe::cobra_camera::MapFocusPoller::isOnFootActive() || recentOnFootVisor;
+                const bool inSrvActive = !onFootActive && edpe::cobra_camera::MapFocusPoller::isInSrvActive();
                 const bool clampCockpit = !onFootActive;
+                const bool wantReactiveMask = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
                 ID3D11ShaderResourceView* weaponMotionSrv = nullptr;
                 if (!eval_reset &&
                     s_weapon_motion.isInitialized() &&
@@ -11735,7 +11737,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     /*sceneStencil=*/nullptr,
                     /*celestialRecords=*/nullptr,
                     /*celestialCount=*/0u,
-                    /*clampCockpit=*/clampCockpit);
+                    /*clampCockpit=*/clampCockpit,
+                    /*enableReactiveOutput=*/wantReactiveMask,
+                    /*inSrv=*/inSrvActive);
             }
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::MotionPass);
         }
@@ -11786,7 +11790,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                              srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
     inputs.colorIsHdr = isHdrColor;
 
-    // Reactive mask removed: HUD and UI are composited via separate native layer.
+    inputs.reactiveMaskSrv = (motion_pass && need_motion) ? motion_pass->reactiveMask() : nullptr;
 
     s_last_temporal_inputs = inputs;
     s_last_temporal_inputs_frame = rendered;
@@ -11905,9 +11909,27 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         bool compOk = false;
         bool upscalerEvalOk = false;
         const bool preAllowBackbufferWrite = (s_diag_eval_stage == 1) || chosenIsBackbuffer;
+        if (activeBackend == edpe::UpscalerBackend::Taa) {
+            const auto gfxWarn = edpe::Config::readEliteGraphicsWarnings();
+            static bool s_logged_ldr_aa_warn = false;
+            if (!isHdrColor && gfxWarn.aaMode > 0 && !s_logged_ldr_aa_warn) {
+                s_logged_ldr_aa_warn = true;
+                wchar_t warnMsg[256];
+                swprintf_s(warnMsg,
+                    L"EDPE: Warning: TAA is running on the LDR Pass 53 route while Elite in-game AA (AAMode=%d) is active; disable in-game FXAA/SMAA to avoid shimmering.",
+                    gfxWarn.aaMode);
+                EdpeLog(warnMsg);
+            }
+            static bool s_logged_checkerboard_warn = false;
+            if (gfxWarn.terrainCheckerboard && !s_logged_checkerboard_warn) {
+                s_logged_checkerboard_warn = true;
+                EdpeLog(L"EDPE: Warning: TerrainCheckerboardRenderingEnabled is active in Elite graphics config; disable it to prevent planetary terrain shimmer with TAA.");
+            }
+        }
         const bool useTaaZeroCopy =
             (activeBackend == edpe::UpscalerBackend::Taa) &&
             !isHdrColor &&
+            (outFormat == edpe::TaaPass::kHistoryFormat) &&
             !s_cmp_seq.active &&
             !s_hud_debug_view.load(std::memory_order_relaxed) &&
             (inputs.sharpness <= 0.0f ||

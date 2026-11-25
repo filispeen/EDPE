@@ -752,6 +752,38 @@ int main() {
         if (fr > 65024.0f || fg > 65024.0f || fb > 64512.0f) return 1228;
     }
 
+    // Status.json Flags bit 26 (InSRV), Flags2 (OnFoot), and GuiFocus (6..9) parsing + cockpit clamp limits
+    {
+        // Ship cockpit (neither OnFoot nor InSRV)
+        const auto ship = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":16777224,"Flags2":0,"GuiFocus":0})");
+        if (ship.mapGuiFocus || ship.onFoot || ship.inSrv) return 1230;
+        if (edpe::computeCockpitClampMaxMeters(ship.onFoot, ship.inSrv) != 150.0f) return 1231;
+
+        // InSRV (Flags bit 26 = 67108864 = 0x04000000) -> caps near-field split to 3.5 m
+        const auto srv = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":67108864,"Flags2":0,"GuiFocus":0})");
+        if (srv.mapGuiFocus || srv.onFoot || !srv.inSrv) return 1232;
+        if (edpe::computeCockpitClampMaxMeters(srv.onFoot, srv.inSrv) != 3.5f) return 1233;
+
+        // OnFoot (Flags2 bit 0 = 1) -> disables cockpit clamping (0.0 m)
+        const auto foot = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":0,"Flags2":1,"GuiFocus":0})");
+        if (foot.mapGuiFocus || !foot.onFoot || foot.inSrv) return 1234;
+        if (edpe::computeCockpitClampMaxMeters(foot.onFoot, foot.inSrv) != 0.0f) return 1235;
+
+        // Map/FSS modes (GuiFocus 6..9)
+        for (int gf = 6; gf <= 9; ++gf) {
+            char json[96]{};
+            std::snprintf(json, sizeof(json), R"({"Flags":0,"Flags2":0,"GuiFocus":%d})", gf);
+            const auto mapState = edpe::parseEliteStatusJsonFlags(json);
+            if (!mapState.mapGuiFocus) return 1236;
+        }
+        const auto cockpitPanel = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":0,"Flags2":0,"GuiFocus":1})");
+        if (cockpitPanel.mapGuiFocus) return 1237;
+    }
+
     // -------------------------------------------------------------------------
     // Stage 3: Per-frame phase consistency audit (checkRowPair & PhasePairAuditor)
     // -------------------------------------------------------------------------

@@ -2000,7 +2000,18 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ImGui::EndDisabled();
                 ImGui::TextDisabled("Sharpening requires an active upscaler backend");
             } else if (taa_active) {
-                TextDisabledWrapped("(TAA uses Catmull-Rom reconstruction; vendor sharpening applies to DLSS and FSR)");
+                TextDisabledWrapped("(TAA uses Gaussian de-jitter + fp16 Catmull-Rom history; sharpening applies post-TAA to the output target)");
+                const auto gfxWarn = edpe::Config::readEliteGraphicsWarnings();
+                if (!cfg.hdrInput && gfxWarn.aaMode > 0) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.80f, 0.25f, 1.0f));
+                    ImGui::TextWrapped("Warning: Elite in-game FXAA/SMAA (AAMode=%d) is active on the LDR route. Disable in-game AA to prevent TAA shimmering.", gfxWarn.aaMode);
+                    ImGui::PopStyleColor();
+                }
+                if (gfxWarn.terrainCheckerboard) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.80f, 0.25f, 1.0f));
+                    ImGui::TextWrapped("Warning: TerrainCheckerboardRenderingEnabled is on in Elite's graphics config. Disable it to prevent planetary terrain shimmer.");
+                    ImGui::PopStyleColor();
+                }
             }
 
             if (!backend_active) ImGui::BeginDisabled();

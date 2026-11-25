@@ -1251,6 +1251,12 @@ public:
         return poller.m_cachedOnFoot;
     }
 
+    static bool isInSrvActive() {
+        auto& poller = instance();
+        poller.poll();
+        return poller.m_cachedInSrv;
+    }
+
 private:
     static MapFocusPoller& instance() {
         static MapFocusPoller s_poller;
@@ -1292,23 +1298,10 @@ private:
         DWORD bytesRead = 0;
         if (ReadFile(h, buf, sizeof(buf) - 1, &bytesRead, nullptr) && bytesRead > 0) {
             buf[bytesRead] = '\0';
-            if (const char* p = std::strstr(buf, "\"GuiFocus\"")) {
-                p += 10;
-                while (*p == ' ' || *p == '\t' || *p == ':') ++p;
-                const int guiFocus = std::atoi(p);
-                // GuiFocus: 6 = GalaxyMap, 7 = SystemMap, 8 = Orrery, 9 = FSS
-                m_cachedMapOpen = (guiFocus >= 6 && guiFocus <= 9);
-            }
-            if (const char* f2 = std::strstr(buf, "\"Flags2\"")) {
-                f2 += 8;
-                while (*f2 == ' ' || *f2 == '\t' || *f2 == ':') ++f2;
-                const unsigned long flags2 = std::strtoul(f2, nullptr, 10);
-                // Flags2 bits: 0x1=OnFoot, 0x8=OnFootInHangar, 0x10=OnFootInStation,
-                // 0x20=OnFootOnPlanet, 0x1000=OnFootSocialSpace, 0x2000=OnFootExterior
-                m_cachedOnFoot = (flags2 & 0x3039u) != 0;
-            } else {
-                m_cachedOnFoot = false;
-            }
+            const edpe::EliteStatusFlags parsed = edpe::parseEliteStatusJsonFlags(buf);
+            m_cachedMapOpen = parsed.mapGuiFocus;
+            m_cachedOnFoot = parsed.onFoot;
+            m_cachedInSrv = parsed.inSrv;
         }
         CloseHandle(h);
     }
@@ -1318,6 +1311,7 @@ private:
     FILETIME m_lastWriteTime{};
     bool m_cachedMapOpen = false;
     bool m_cachedOnFoot = false;
+    bool m_cachedInSrv = false;
 };
 
 // ============================================================================

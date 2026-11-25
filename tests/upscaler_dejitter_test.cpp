@@ -1917,6 +1917,78 @@ int main(int argc, char** argv) {
                 }
             }
         }
+
+        // Verify UpscalerManager::evaluate NEVER sharpens TaaPass history in-place when destinationTexture == nullptr
+        {
+            constexpr uint32_t kSw = 32;
+            constexpr uint32_t kSh = 32;
+            FrameBuffers fb;
+            fb.resize(kSw, kSh);
+            for (uint32_t y = 0; y < kSh; ++y) {
+                for (uint32_t x = 0; x < kSw; ++x) {
+                    const float v = ((x + y) & 1u) ? 0.90f : 0.10f;
+                    fb.color[static_cast<size_t>(y) * kSw + x] = packRgba8(v, v, v);
+                }
+            }
+            if (gpu.allocateSurfaces(kSw, kSh, kSw, kSh)) {
+                gpu.uploadFrame(fb);
+                edpe::UpscalerManager& mgr = edpe::UpscalerManager::instance();
+                if (mgr.initialize(gpu.device.Get(), gpu.context.Get()) &&
+                    mgr.setBackend(edpe::UpscalerBackend::Taa) &&
+                    mgr.setMode(edpe::UpscaleMode::NativeAA)) {
+                    edpe::TemporalFrameInputs in{};
+                    in.color = gpu.colorTex.Get();
+                    in.colorSrv = gpu.colorSrv.Get();
+                    in.depth = gpu.depthTex[gpu.currDepthIdx].Get();
+                    in.depthSrv = gpu.depthSrv[gpu.currDepthIdx].Get();
+                    in.motionVectors = gpu.motionTex.Get();
+                    in.motionSrv = gpu.motionSrv.Get();
+                    in.renderWidth = kSw;
+                    in.renderHeight = kSh;
+                    in.outputWidth = kSw;
+                    in.outputHeight = kSh;
+                    in.reset = true;
+                    in.colorIsHdr = false;
+
+                    auto readBackFp16 = [&](ID3D11Texture2D* tex, std::vector<uint16_t>& out) -> bool {
+                        if (!tex) return false;
+                        D3D11_TEXTURE2D_DESC d{};
+                        tex->GetDesc(&d);
+                        d.Usage = D3D11_USAGE_STAGING;
+                        d.BindFlags = 0;
+                        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        ComPtr<ID3D11Texture2D> stg;
+                        if (FAILED(gpu.device->CreateTexture2D(&d, nullptr, &stg))) return false;
+                        gpu.context->CopyResource(stg.Get(), tex);
+                        D3D11_MAPPED_SUBRESOURCE m{};
+                        if (FAILED(gpu.context->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+                        out.resize(static_cast<size_t>(d.Width) * d.Height * 4u);
+                        for (uint32_t row = 0; row < d.Height; ++row) {
+                            std::memcpy(out.data() + static_cast<size_t>(row) * d.Width * 4u,
+                                static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(row) * m.RowPitch,
+                                static_cast<size_t>(d.Width) * 8u);
+                        }
+                        gpu.context->Unmap(stg.Get(), 0);
+                        return true;
+                    };
+
+                    in.sharpness = 0.0f;
+                    std::vector<uint16_t> histNoSharp, histWithSharp;
+                    const bool ok0 = mgr.evaluate(gpu.context.Get(), in, nullptr, nullptr, false);
+                    const bool rb0 = ok0 && readBackFp16(mgr.getTaaLatestOutputTexture(), histNoSharp);
+
+                    in.sharpness = 0.85f;
+                    const bool ok1 = mgr.evaluate(gpu.context.Get(), in, nullptr, nullptr, false);
+                    const bool rb1 = ok1 && readBackFp16(mgr.getTaaLatestOutputTexture(), histWithSharp);
+
+                    if (!rb0 || !rb1 || histNoSharp != histWithSharp) {
+                        std::printf("  -> FAIL: UpscalerManager::evaluate modified TAA history in-place when destinationTexture == nullptr\n");
+                        allOk = false;
+                    }
+                    mgr.shutdown();
+                }
+            }
+        }
         taaBackend.shutdown();
     }
 

@@ -14,6 +14,7 @@ struct TaaConstantBufferData {
     float renderResolution[4]; // renderWidth, renderHeight, 1/renderWidth, 1/renderHeight
     float params[4];           // jitterX, jitterY, blendWeight, resetFlag
     float jitterHistory[4];    // prevJitterX, prevJitterY, depthB, hasPrevDepth
+    float reactiveInfo[4];     // hasReactiveMask, 0, 0, 0
 };
 
 } // namespace
@@ -180,7 +181,8 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     float prevJitterY,
     float depthB,
     ID3D11ShaderResourceView* prevDepthSrv,
-    DXGI_FORMAT /*preferredFormat*/) {
+    DXGI_FORMAT /*preferredFormat*/,
+    ID3D11ShaderResourceView* reactiveMaskSrv) {
     if (!device_ || !context || !currentFrameSrv || width == 0 || height == 0) {
         return false;
     }
@@ -232,6 +234,7 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     cb.jitterHistory[1] = prevJitterY;
     cb.jitterHistory[2] = (depthB > 0.0f) ? depthB : 0.025f;
     cb.jitterHistory[3] = (!performReset && prevDepthSrv && depthSrv) ? 1.0f : 0.0f;
+    cb.reactiveInfo[0] = (!performReset && reactiveMaskSrv) ? 1.0f : 0.0f;
 
     context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cb, 0, 0);
 
@@ -254,14 +257,15 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     context->PSSetShader(pixelShader_.Get(), nullptr, 0);
     context->GSSetShader(nullptr, nullptr, 0);
 
-    ID3D11ShaderResourceView* srvs[5] = {
+    ID3D11ShaderResourceView* srvs[6] = {
         currentFrameSrv,
         historySrv_[readIdx].Get(),
         motionVectorsSrv,
         depthSrv,
-        (!performReset) ? prevDepthSrv : nullptr
+        (!performReset) ? prevDepthSrv : nullptr,
+        (!performReset) ? reactiveMaskSrv : nullptr
     };
-    context->PSSetShaderResources(0, 5, srvs);
+    context->PSSetShaderResources(0, 6, srvs);
 
     ID3D11SamplerState* samplers[2] = { linearSampler_.Get(), pointSampler_.Get() };
     context->PSSetSamplers(0, 2, samplers);
@@ -272,8 +276,8 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     context->Draw(3, 0);
 
     // Unbind resources before next use to prevent pipeline hazards
-    ID3D11ShaderResourceView* nullSrvs[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
-    context->PSSetShaderResources(0, 5, nullSrvs);
+    ID3D11ShaderResourceView* nullSrvs[6] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+    context->PSSetShaderResources(0, 6, nullSrvs);
     ID3D11RenderTargetView* nullRtvs[2] = { nullptr, nullptr };
     context->OMSetRenderTargets(2, nullRtvs, nullptr);
 
