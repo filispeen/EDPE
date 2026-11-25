@@ -168,9 +168,13 @@ public:
     // The provider that actually runs now, e.g. "FSR 4.1.2", "FSR 3.1.2", or "FSR 3.1.2 (FSR 4 unavailable)".
     std::string describeProvider() const;
     const wchar_t* fsr4LastError() const;
+    // The adapter is not an AMD GPU, so FSR 4 was not probed (fsr4LastError() says which GPU).
+    bool isFsr4VendorBlocked() const;
 
 private:
     bool tryInitFsr4();
+    // Shuts the FSR 4 engine and its D3D12 device down while FSR 4 is not selected; selecting it initializes it again.
+    void releaseFsr4Engine();
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

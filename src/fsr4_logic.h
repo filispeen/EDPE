@@ -85,6 +85,10 @@ public:
         capable_ = false;
     }
 
+    // The engine was shut down to free its D3D12 device while FSR 4 is not selected. The capability result stays,
+    // so the menu still offers FSR 4; selecting it again initializes the engine again.
+    void onEngineReleased() { engineReady_ = false; }
+
     void onEvaluateSuccess() { gate_.reset(); }
 
     // FSR 4 does not support HDR (linear) color input yet, so those frames use FSR 3.1.2. This is an unsupported input, not

@@ -4,7 +4,9 @@
 #include "ngx_context.h"
 #include "temporal_math.h"
 #include "amd_fsr4_engine.h"
+#include "config.h"
 #include "fsr4_logic.h"
+#include "gpu_vendor.h"
 
 std::atomic<bool> g_is_evaluating_upscaler{false};
 std::atomic<int> g_evaluating_upscaler_depth{0};
@@ -235,6 +237,27 @@ void NvidiaUpscalerBackend::resetHistory() {
 // AmdUpscalerBackend
 // -------------------------------------------------------------------------
 
+namespace {
+
+// FSR 4 runs only on AMD GPUs. Returns false and writes the reason when the adapter behind `device` is a known
+// vendor other than AMD. An adapter that cannot be identified is allowed, so the engine's own probe decides.
+bool adapterAllowsFsr4(ID3D11Device* device, wchar_t* reason, size_t reasonCount) {
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC desc{};
+    if (!device || FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) ||
+        FAILED(dxgiDevice->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc))) {
+        return true;
+    }
+    const GpuVendor vendor = classifyGpuVendor(desc.VendorId, desc.DeviceId, desc.Description, isRunningUnderWine());
+    if (vendor == GpuVendor::Amd || vendor == GpuVendor::Unknown) return true;
+    swprintf_s(reason, reasonCount, L"FSR 4 needs an AMD GPU (detected %ls: %ls)", gpuVendorNameW(vendor),
+               desc.Description);
+    return false;
+}
+
+} // namespace
+
 struct AmdUpscalerBackend::Impl {
     bool initialized = false;
     bool contextCreated = false;
@@ -264,6 +287,7 @@ struct AmdUpscalerBackend::Impl {
     std::unique_ptr<Fsr4Engine> fsr4;
     ID3D11Device* fsr4Device = nullptr;
     fsr4::ProviderState fsr4State;  // selection, init and failure-gate state (pure logic, see fsr4_logic.h)
+    wchar_t fsr4SkipReason[192]{};  // why FSR 4 was not probed (not an AMD GPU); empty otherwise
 
     void applyVelocityFactorIfNeeded() {
 #if defined(EDPE_ENABLE_FSR)
@@ -591,9 +615,18 @@ bool AmdUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* /
     impl_->fsr4 = std::make_unique<Fsr4Engine>();
     impl_->fsr4Device = device;
     impl_->fsr4State.onBackendInitialize();
-    // Probe FSR 4 once at startup when its files are present, so the menu can show it as unavailable (with the
-    // reason) the way DLSS is, instead of discovering a refusal only after it was selected.
-    if (Fsr4Engine::filesPresent()) tryInitFsr4();
+    impl_->fsr4SkipReason[0] = L'\0';
+    if (!adapterAllowsFsr4(device, impl_->fsr4SkipReason, std::size(impl_->fsr4SkipReason))) {
+        wchar_t buf[256];
+        swprintf_s(buf, L"EDPE: FSR 4 not probed: %ls", impl_->fsr4SkipReason);
+        EdpeLog(buf);
+    } else if (Fsr4Engine::filesPresent()) {
+        // Probe FSR 4 once at startup so the menu can show it as unavailable (with the reason) the way DLSS is,
+        // instead of discovering a refusal only after it was selected. The probe creates the D3D12 device, so it
+        // is released again unless FSR 4 is selected.
+        tryInitFsr4();
+        if (!impl_->fsr4State.isSelected()) releaseFsr4Engine();
+    }
     return true;
 #else
     return false;
@@ -603,21 +636,36 @@ bool AmdUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* /
 bool AmdUpscalerBackend::tryInitFsr4() {
     if (impl_->fsr4State.isEngineReady()) return true;
     if (!impl_->fsr4 || !impl_->fsr4Device) return false;
-    const bool ok = impl_->fsr4->initialize(impl_->fsr4Device);
+    const bool ok = impl_->fsr4SkipReason[0] == L'\0' && impl_->fsr4->initialize(impl_->fsr4Device);
     impl_->fsr4State.onInitResult(ok);
     if (ok) {
         EdpeLog(L"EDPE: FSR 4 available; the D3D11 FSR 3.1.2 path stays the fallback");
         return true;
     }
     wchar_t buf[320];
-    swprintf_s(buf, L"EDPE: FSR 4 unavailable: %ls; using FSR 3.1.2", impl_->fsr4->lastError());
+    swprintf_s(buf, L"EDPE: FSR 4 unavailable: %ls; using FSR 3.1.2", fsr4LastError());
     EdpeLog(buf);
     return false;
+}
+
+void AmdUpscalerBackend::releaseFsr4Engine() {
+    if (!impl_->fsr4) return;
+    const bool wasReady = impl_->fsr4State.isEngineReady();
+    impl_->fsr4->shutdown();  // also frees the device of an engine that FSR 4 failures disabled
+    impl_->fsr4State.onEngineReleased();
+    if (wasReady) {
+        EdpeLog(L"EDPE: FSR 4 engine released while FSR 4 is not selected; it initializes again when selected");
+    }
 }
 
 void AmdUpscalerBackend::setFsr4Selected(bool selected) {
     if (!impl_->fsr4State.setSelected(selected)) return;  // a fresh selection of FSR 4 retries a failed initialization
     EdpeLog(selected ? L"EDPE: AMD FSR provider switched to FSR 4" : L"EDPE: AMD FSR provider switched to FSR 3.1.2");
+    if (selected) {
+        if (impl_->fsr4State.needsInit()) tryInitFsr4();
+    } else {
+        releaseFsr4Engine();
+    }
     resetHistory();  // the two providers keep separate histories
 }
 
@@ -638,7 +686,10 @@ bool AmdUpscalerBackend::isFsr4Running() const { return impl_->fsr4State.running
 
 bool AmdUpscalerBackend::isFsr4Capable() const { return impl_->fsr4State.isCapable(); }
 
+bool AmdUpscalerBackend::isFsr4VendorBlocked() const { return impl_->fsr4SkipReason[0] != L'\0'; }
+
 const wchar_t* AmdUpscalerBackend::fsr4LastError() const {
+    if (impl_->fsr4SkipReason[0] != L'\0') return impl_->fsr4SkipReason;
     return impl_->fsr4 ? impl_->fsr4->lastError() : L"";
 }
 
@@ -647,6 +698,7 @@ void AmdUpscalerBackend::shutdown() {
     if (impl_->fsr4) impl_->fsr4->shutdown();
     impl_->fsr4State.onShutdown();
     impl_->fsr4Device = nullptr;
+    impl_->fsr4SkipReason[0] = L'\0';
     impl_->destroyFsrContext();
     impl_->outputTexture.Reset();
     impl_->outputUav.Reset();
@@ -1034,6 +1086,7 @@ bool UpscalerManager::isFsr4Available() const {
 
 const wchar_t* UpscalerManager::getFsr4UnavailableReason() const {
     if (!amdBackend_.isAvailable()) return amdBackend_.unavailableReason();
+    if (amdBackend_.isFsr4VendorBlocked()) return amdBackend_.fsr4LastError();
     if (!Fsr4Engine::filesPresent()) {
         return L"amd_fidelityfx_loader_dx12.dll / amd_fidelityfx_upscaler_dx12.dll not found beside dxgi.dll (or FSR 4 not compiled in)";
     }

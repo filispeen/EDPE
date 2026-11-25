@@ -79,6 +79,17 @@ void testProviderState() {
     CHECK(s.running());          // still active from before
     CHECK(!s.needsInit());
 
+    // Releasing the engine while FSR 4 is not selected keeps the capability; selecting FSR 4 again needs a new init.
+    CHECK(s.setSelected(false));
+    s.onEngineReleased();
+    CHECK(!s.isEngineReady() && s.isCapable());
+    CHECK(s.label() == ProviderLabel::Fsr31);
+    CHECK(s.setSelected(true));
+    CHECK(s.needsInit());
+    CHECK(!s.running());
+    s.onInitResult(true);
+    CHECK(s.running());
+
     // Backend re-initialization forgets the previous engine.
     s.onBackendInitialize();
     CHECK(!s.isEngineReady() && !s.initTried());
