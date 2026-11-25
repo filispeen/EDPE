@@ -314,11 +314,15 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
                     // 2. Interior hangar floor pixels (exclude 1px grating transitions to measure temporal smearing)
                     if (refUnjittered.surface[idx] == SurfaceKind::Floor) {
                         const float refL = refUnjittered.luma[idx];
-                        const bool uniformPatch =
-                            std::fabs(refUnjittered.luma[idx - 1] - refL) < 0.02f &&
-                            std::fabs(refUnjittered.luma[idx + 1] - refL) < 0.02f &&
-                            std::fabs(refUnjittered.luma[idx - kWidth] - refL) < 0.02f &&
-                            std::fabs(refUnjittered.luma[idx + kWidth] - refL) < 0.02f;
+                        bool uniformPatch = true;
+                        for (int oy = -1; oy <= 1 && uniformPatch; ++oy) {
+                            for (int ox = -1; ox <= 1; ++ox) {
+                                if (std::fabs(refUnjittered.luma[static_cast<size_t>(y + oy) * kWidth + (x + ox)] - refL) >= 0.02f) {
+                                    uniformPatch = false;
+                                    break;
+                                }
+                            }
+                        }
                         if (uniformPatch) {
                             floorErrSum += std::fabs(outL - refL);
                             ++floorPixelCount;

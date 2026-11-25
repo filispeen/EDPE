@@ -432,10 +432,18 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
         }
 #endif
         if (dot(worldMv, worldMv) > 0.0625) {
+            int2 sc = clamp(int2(floor(rawPixel + jitterInfo.zw)), 0, maxCoord);
+            float pdCenter = prevSceneDepth.Load(int3(sc, 0));
+            // If a closer foreground occluder occupied this screen pixel in the previous frame,
+            // this pixel is newly disoccluded background and must NEVER be classified as CockpitStatic.
+            bool wasOccludedByCloser = (z >= 1.5) && (pdCenter > depth * 1.05 + 1e-4);
             float staticErr = 1e30;
-            bool staticMatches = prevDepthMatches(rawPixel + jitterInfo.zw, depth, maxCoord, staticErr);
-            if (!staticMatches) {
-                int2 sc = clamp(int2(floor(rawPixel + jitterInfo.zw)), 0, maxCoord);
+            bool staticMatches = !wasOccludedByCloser &&
+                prevDepthMatches(rawPixel + jitterInfo.zw, depth, maxCoord, staticErr);
+            // Only expand staticMatches across a 3x3 / +-2px neighborhood inside the close cockpit
+            // (z < 1.5m); at z >= 1.5m, a 3x3 search falsely catches adjacent background pixels
+            // behind moving foreground silhouettes and turns disoccluded background into mv=(0,0).
+            if (!staticMatches && !wasOccludedByCloser && z < 1.5) {
                 float staticTol = max(1e-5, 0.0175 * depth);
                 [unroll]
                 for (int oy = -1; oy <= 1; ++oy) {
@@ -449,7 +457,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
                 }
                 // Inside close cockpit (z < 1.5m), also check +-2px cardinal neighbors to survive
                 // 1-2px cockpit jolt / head-sway at elevator start/stop without leaking world MVs.
-                if (z < 1.5 && staticErr > staticTol) {
+                if (staticErr > staticTol) {
                     float dL = prevSceneDepth.Load(int3(clamp(sc + int2(-2, 0), 0, maxCoord), 0));
                     float dR = prevSceneDepth.Load(int3(clamp(sc + int2(2, 0), 0, maxCoord), 0));
                     float dU = prevSceneDepth.Load(int3(clamp(sc + int2(0, -2), 0, maxCoord), 0));

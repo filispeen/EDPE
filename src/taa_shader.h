@@ -145,8 +145,9 @@ PSOutput ps_main(VSOutput pin) {
     float nearestDepth = centerDepth;
     float minDepth = centerDepth;
     float2 nearestUv = centerUv;
-    float3 centerKaris = 0.0;
-    float3 nearestKaris = 0.0;
+    float4 centerRaw = currentFrame.SampleLevel(pointSampler, centerUv, 0);
+    float3 centerKaris = TonemapKaris(centerRaw.rgb);
+    float3 nearestKaris = centerKaris;
 
     [unroll]
     for (int y = -1; y <= 1; ++y) {
@@ -157,8 +158,6 @@ PSOutput ps_main(VSOutput pin) {
             float3 cKaris = TonemapKaris(rawSample.rgb);
             if (x == 0 && y == 0) {
                 centerAlpha = rawSample.a;
-                centerKaris = cKaris;
-                nearestKaris = cKaris;
             }
 
             float2 d = float2(x, y) - fracOffset;
@@ -281,7 +280,7 @@ PSOutput ps_main(VSOutput pin) {
     //    Retains static sub-pixel thin lines (< 1 px) across missed Halton jitter phases using
     //    symmetric +-1 px history neighbors (mathematically zero on monotonic step edges and blobs).
     float3 clampedHistY = ClipToAABB(histY, currentY, finalMin, finalMax);
-    float stationaryWeight = saturate(1.0 - speed * 4.0) * depthConfidence;
+    float stationaryWeight = saturate(1.0 - speed * 4.0) * depthConfidence * (isDepthSilhouette ? 0.0 : 1.0);
     if (stationaryWeight > 0.0) {
         float hL = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(-resolution.z, 0.0), 0.0, 1.0), 0).rgb)).x;
         float hR = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2( resolution.z, 0.0), 0.0, 1.0), 0).rgb)).x;
