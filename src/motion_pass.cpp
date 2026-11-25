@@ -43,8 +43,7 @@ bool compileMotionComputeShader(ID3D11Device* device,
             const int rawLen = static_cast<int>(err->GetBufferSize() > 240 ? 240 : err->GetBufferSize());
             MultiByteToWideChar(CP_UTF8, 0, raw, rawLen, errWide, 255);
             for (wchar_t& ch : errWide) {
-                if (ch == L'' || ch == L'
-') ch = L' ';
+                if (ch == L'\r' || ch == L'\n') ch = L' ';
             }
         }
         wchar_t msg[512]{};
