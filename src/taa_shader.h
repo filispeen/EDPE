@@ -199,7 +199,7 @@ PSOutput ps_main(VSOutput pin) {
     float speed = length(mvPixels);
 
     // Smooth variance-clip gamma: active even at speed == 0 so un-tracked movers do not ghost.
-    float gamma = lerp(1.35, 0.85, saturate(speed * 0.20));
+    float gamma = lerp(1.50, 0.95, saturate(speed * 0.15));
     float3 finalMin = max(boxMin, mean - gamma * sigma);
     float3 finalMax = min(boxMax, mean + gamma * sigma);
 
@@ -281,7 +281,9 @@ PSOutput ps_main(VSOutput pin) {
     //    symmetric +-1 px history neighbors (mathematically zero on monotonic step edges and blobs).
     float3 clampedHistY = ClipToAABB(histY, currentY, finalMin, finalMax);
     float stationaryWeight = saturate(1.0 - speed * 4.0) * depthConfidence;
-    if (stationaryWeight > 0.0) {
+    float slowPanWeight = saturate(1.0 - speed / 1.5) * (1.0 - stationaryWeight) * depthConfidence;
+    float ridgeWeight = max(0.98 * stationaryWeight, 0.65 * slowPanWeight);
+    if (ridgeWeight > 0.0) {
         float hL = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(-resolution.z, 0.0), 0.0, 1.0), 0).rgb)).x;
         float hR = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2( resolution.z, 0.0), 0.0, 1.0), 0).rgb)).x;
         float hU = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(0.0, -resolution.w), 0.0, 1.0), 0).rgb)).x;
@@ -289,7 +291,7 @@ PSOutput ps_main(VSOutput pin) {
         float ridgeX = max(0.0, abs(histY.x - 0.5 * (hL + hR)) - 0.5 * abs(hL - hR));
         float ridgeY = max(0.0, abs(histY.x - 0.5 * (hU + hD)) - 0.5 * abs(hU - hD));
         float thinRidge = saturate((max(ridgeX, ridgeY) - 0.005) * 32.0);
-        clampedHistY = lerp(clampedHistY, histY, 0.98 * stationaryWeight * thinRidge);
+        clampedHistY = lerp(clampedHistY, histY, ridgeWeight * thinRidge);
     }
 
     // 6. Velocity / Disocclusion Confidence:
@@ -298,10 +300,10 @@ PSOutput ps_main(VSOutput pin) {
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
     float normClamp = clampDistance / max(length(sigma), 0.02);
     float speedFactor = saturate(speed * 0.35);
-    float historyConfidence = lerp(1.0, 1.0 / (1.0 + normClamp * 0.85), speedFactor) * depthConfidence;
+    float historyConfidence = lerp(1.0, 1.0 / (1.0 + normClamp * 0.50), speedFactor) * depthConfidence;
 
     float blendWeight = clamp(params.z, 0.0, 0.95);
-    blendWeight = lerp(blendWeight, 0.78, saturate(speed * 0.08));
+    blendWeight = lerp(blendWeight, 0.82, saturate(speed * 0.06));
 
     float dynamicBlend = blendWeight * historyConfidence;
 

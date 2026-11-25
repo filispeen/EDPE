@@ -27,6 +27,11 @@ constexpr float kPillarZ = 6.0f;
 constexpr float kPillarHalfW = 0.65f;
 constexpr float kPillarMinY = -2.0f;
 constexpr float kPillarMaxY = 2.5f;
+// Distant thin vertical railing bars at z = 21.5m (~2.5 px wide at 3840x2160)
+constexpr float kRailZ = 21.5f;
+constexpr float kRailHalfW = 0.015f; // ~2.4 px wide on 4K screen at z=21.5m
+constexpr float kRailMinY = -2.0f;
+constexpr float kRailMaxY = 1.6f;
 
 struct MotionProfile {
     const char* name;
@@ -66,6 +71,7 @@ enum class SurfaceKind : uint8_t {
     BackWall = 0,
     Floor = 1,
     Pillar = 2,
+    DistantRail = 3,
 };
 
 struct RenderedScene {
@@ -154,6 +160,24 @@ RenderedScene renderScene(const edpe::CameraProjection& cam, float jitterX, floa
                 }
             }
 
+            // 2b. Distant thin 2-3px vertical railing bars at z = kRailZ (x = -4.5..-2.0m, 0.45m spacing)
+            if (std::fabs(dz) > 1e-6f) {
+                const float t = (kRailZ - cz) / dz;
+                if (t > 0.25f && t < bestZ) {
+                    const float wx = cx + dx * t;
+                    const float wy = cy + dy * t;
+                    if (wx >= -4.8f && wx <= -1.8f && wy >= kRailMinY && wy <= kRailMaxY) {
+                        const float cell = std::fmod(std::fabs(wx + 10.0f), 0.45f);
+                        const float distToBar = (std::min)(cell, 0.45f - cell);
+                        if (distToBar <= kRailHalfW) {
+                            bestZ = t;
+                            kind = SurfaceKind::DistantRail;
+                            r = 0.88f; g = 0.82f; b = 0.45f;
+                        }
+                    }
+                }
+            }
+
             // 3. Bright foreground pillar/hull slab at z = kPillarZ
             if (std::fabs(dz) > 1e-6f) {
                 const float t = (kPillarZ - cz) / dz;
@@ -221,6 +245,11 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
     double floorErrSum = 0.0;
     uint64_t floorPixelCount = 0;
     uint64_t disocclPixelCount = 0;
+    double railPeakSum = 0.0;
+    uint64_t railRowCount = 0;
+    std::vector<float> railPrevRowPeaks;
+    double railDeltaSqSum = 0.0;
+    uint64_t railDeltaCount = 0;
     int curIdx = 0;
 
     for (int t = 0; t < kFrames; ++t) {
@@ -333,6 +362,36 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
                     }
                 }
             }
+            // 3. Distant 2-3px thin railing visibility & temporal flicker stability
+            std::vector<float> curRowPeaks;
+            curRowPeaks.reserve(kHeight / 2);
+            for (uint32_t y = kHeight / 4; y < (kHeight * 5) / 8; y += 2) {
+                const auto* row = reinterpret_cast<const uint32_t*>(base + static_cast<size_t>(y) * mapped.RowPitch);
+                float rowMaxRail = 0.0f;
+                bool hasRail = false;
+                for (uint32_t x = 4; x < kWidth / 2; ++x) {
+                    if (refUnjittered.surface[static_cast<size_t>(y) * kWidth + x] == SurfaceKind::DistantRail) {
+                        hasRail = true;
+                        for (int ox = -1; ox <= 1; ++ox) {
+                            rowMaxRail = (std::max)(rowMaxRail, unpackLuma(row[x + ox]));
+                        }
+                    }
+                }
+                if (hasRail) {
+                    railPeakSum += rowMaxRail;
+                    ++railRowCount;
+                    curRowPeaks.push_back(rowMaxRail);
+                }
+            }
+            if (!railPrevRowPeaks.empty() && railPrevRowPeaks.size() == curRowPeaks.size()) {
+                for (size_t ri = 0; ri < curRowPeaks.size(); ++ri) {
+                    const double d = static_cast<double>(curRowPeaks[ri] - railPrevRowPeaks[ri]);
+                    railDeltaSqSum += d * d;
+                    ++railDeltaCount;
+                }
+            }
+            railPrevRowPeaks = std::move(curRowPeaks);
+
             ctx->Unmap(readbackStaging, 0);
         }
 
@@ -346,9 +405,17 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
         ? static_cast<float>(floorErrSum / static_cast<double>(floorPixelCount))
         : 0.0f;
 
-    std::printf("  [%-14s] disocclMaxGhost=%.4f (n=%llu) | floorMeanSmear=%.4f (n=%llu)\n",
+    const float railMeanPeak = (railRowCount > 0)
+        ? static_cast<float>(railPeakSum / static_cast<double>(railRowCount))
+        : 0.0f;
+    const float railFlickerRms = (railDeltaCount > 0)
+        ? static_cast<float>(std::sqrt(railDeltaSqSum / static_cast<double>(railDeltaCount)))
+        : 0.0f;
+
+    std::printf("  [%-14s] disocclMaxGhost=%.4f (n=%llu) | floorMeanSmear=%.4f (n=%llu) | distRail2px peak=%.4f flickerRms=%.4f\n",
         prof.name, worstDisocclGhost, static_cast<unsigned long long>(disocclPixelCount),
-        meanFloorSmear, static_cast<unsigned long long>(floorPixelCount));
+        meanFloorSmear, static_cast<unsigned long long>(floorPixelCount),
+        railMeanPeak, railFlickerRms);
 
     bool ok = true;
     if (worstDisocclGhost > 0.12f) {
@@ -357,6 +424,14 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
     }
     if (meanFloorSmear > 0.06f) {
         std::printf("    -> FAIL: hangar floor smearing exceeded 0.06 (got %.4f)\n", meanFloorSmear);
+        ok = false;
+    }
+    if (railRowCount > 0 && railMeanPeak < 0.45f) {
+        std::printf("    -> FAIL: distant 2-3px rail visibility too low (peak=%.4f < 0.45)\n", railMeanPeak);
+        ok = false;
+    }
+    if (railDeltaCount > 0 && railFlickerRms > 0.06f) {
+        std::printf("    -> FAIL: distant 2-3px rail flickered/jittered (rms=%.4f > 0.06)\n", railFlickerRms);
         ok = false;
     }
     return ok;
@@ -427,6 +502,8 @@ int main() {
     }
 
     const MotionProfile profiles[] = {
+        // Stationary distant thin-geometry AA stability baseline
+        {"Stationary",    0.00f,  0.00f,  0.00f,  0.000f,  0.000f,  0.000f},
         // Individual translations
         {"TranslateX",    0.16f,  0.00f,  0.00f,  0.000f,  0.000f,  0.000f},
         {"TranslateY",    0.00f,  0.12f,  0.00f,  0.000f,  0.000f,  0.000f},

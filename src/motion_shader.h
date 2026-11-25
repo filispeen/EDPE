@@ -362,11 +362,11 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
     if (hasPrevDepth && !priorOffscreen) {
         float2 prevSamplePx = priorPixel + jitterInfo.zw;
         worldMatches = prevDepthMatches(prevSamplePx, expectedPriorDepth, maxCoord, worldErr);
-        if (worldMatches && expectedPriorDepth > 0.0 && dot(worldMv, worldMv) >= 0.5625) {
+        if (worldMatches && expectedPriorDepth > 0.0 && dot(worldMv, worldMv) >= 1.5625) {
             int2 occBase = clamp(int2(floor(prevSamplePx - 0.5)), int2(-1, -1), maxCoord);
             float4 occQuad = prevSceneDepth.GatherRed(pointSampler, (float2(occBase) + 1.0) * rcp(info.yz));
             float maxPrevD = max(max(occQuad.x, occQuad.y), max(occQuad.z, occQuad.w));
-            prevFootprintHasOccluder = (maxPrevD > expectedPriorDepth * 1.15 + 1e-4);
+            prevFootprintHasOccluder = (maxPrevD > expectedPriorDepth * 1.35 + 3e-4);
         }
     }
 
@@ -500,6 +500,11 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
         res.pixelClass = kClassOffscreenFG;
     } else if (hasPrevDepth && !worldMatches) {
         res.pixelClass = kClassDisoccluded;
+        // Grazing-angle distant floors and thin 2-3px rails routinely exceed prevDepthMatches's
+        // strict 1% tolerance (2-6% depth gradient per pixel). Only flag TAA reactive reset on
+        // genuine large depth jumps (>8% relative error) so distant thin geometry keeps AA active.
+        float taaDisocclTol = max(5e-4, 0.08 * expectedPriorDepth);
+        res.reactive = (worldErr > taaDisocclTol) ? 1.0 : 0.0;
     } else {
         res.pixelClass = kClassWorld;
         if (prevFootprintHasOccluder) {
@@ -717,8 +722,7 @@ void writeOutputs(int2 pixCoord, MotionResult res) {
         OutClass[pixCoord] = res.pixelClass;
     }
     if ((modeFlags & 512) != 0) {
-        float reactive = (res.pixelClass == kClassDisoccluded ||
-                          res.pixelClass == kClassOffscreenFG ||
+        float reactive = (res.pixelClass == kClassOffscreenFG ||
                           res.pixelClass == kClassReset) ? 1.0 : res.reactive;
         OutReactive[pixCoord] = reactive;
     }
