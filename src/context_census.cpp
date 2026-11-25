@@ -13848,7 +13848,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                                                                     edpe::UpscalerBackend::Taa;
             if (upscaler.isBackendAvailable(targetBackend)) {
                 if (targetBackend == edpe::UpscalerBackend::AmdFsr) {
-                    upscaler.setFsr4Selected(cfg.upscalerBackend == 4 || cfg.fsr4);
+                    upscaler.setFsr4Selected(cfg.upscalerBackend == 4);
                 }
                 upscaler.setBackend(targetBackend);
                 const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;

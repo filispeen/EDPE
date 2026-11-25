@@ -499,9 +499,7 @@ struct AmdUpscalerBackend::Impl {
 };
 
 AmdUpscalerBackend::AmdUpscalerBackend()
-    : impl_(std::make_unique<Impl>()) {
-    impl_->fsr4State.setSelected(Fsr4Engine::selectedByConfig());
-}
+    : impl_(std::make_unique<Impl>()) {}
 
 AmdUpscalerBackend::~AmdUpscalerBackend() {
     shutdown();

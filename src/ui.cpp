@@ -1509,8 +1509,8 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             edpe::UpscalerManager::instance().setMode(static_cast<edpe::UpscaleMode>(m));
         } else if ((cfg.upscalerBackend == 2 || cfg.upscalerBackend == 4) &&
             edpe::UpscalerManager::instance().isBackendAvailable(edpe::UpscalerBackend::AmdFsr)) {
-            // Backend=4 is "AMD FSR 4.1.2"; Backend=2 with Fsr4=1 also selects FSR 4.
-            edpe::UpscalerManager::instance().setFsr4Selected(cfg.upscalerBackend == 4 || cfg.fsr4);
+            // Backend=4 is "AMD FSR 4.1.2"; Backend=2 is "AMD FSR 3.1.2".
+            edpe::UpscalerManager::instance().setFsr4Selected(cfg.upscalerBackend == 4);
             edpe::UpscalerManager::instance().setBackend(edpe::UpscalerBackend::AmdFsr);
             const int m = (cfg.upscaleMode >= 1 && cfg.upscaleMode <= 5) ? cfg.upscaleMode : 1;
             edpe::UpscalerManager::instance().setMode(static_cast<edpe::UpscaleMode>(m));
@@ -1889,11 +1889,11 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                         upscaler.setBackend(edpe::UpscalerBackend::AmdFsr);
                         if (!was_fsr) upscaler.setMode(edpe::UpscaleMode::NativeAA);
                         cfg.upscalerBackend = 4;
-                        cfg.fsr4 = true;
                         cfg.save();
                     }
                 } else if (current_backend_idx == 1) {
                     if (nvidia_available) {
+                        upscaler.setFsr4Selected(false);
                         upscaler.setBackend(edpe::UpscalerBackend::NvidiaDlss);
                         upscaler.setMode(edpe::UpscaleMode::NativeAA);
                         cfg.upscalerBackend = 1;
@@ -1906,15 +1906,16 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                         upscaler.setBackend(edpe::UpscalerBackend::AmdFsr);
                         if (!was_fsr) upscaler.setMode(edpe::UpscaleMode::NativeAA);
                         cfg.upscalerBackend = 2;
-                        cfg.fsr4 = false;
                         cfg.save();
                     }
                 } else if (current_backend_idx == 3) {
+                    upscaler.setFsr4Selected(false);
                     upscaler.setBackend(edpe::UpscalerBackend::Taa);
                     upscaler.setMode(edpe::UpscaleMode::NativeAA);
                     cfg.upscalerBackend = 3;
                     cfg.save();
                 } else {
+                    upscaler.setFsr4Selected(false);
                     upscaler.setBackend(edpe::UpscalerBackend::None);
                     upscaler.setMode(edpe::UpscaleMode::Native);
                     cfg.upscalerBackend = 0;

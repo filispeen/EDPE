@@ -29,13 +29,6 @@ namespace edpe {
 
 namespace {
 
-std::wstring iniPathNextToExecutable() {
-    wchar_t modulePath[MAX_PATH]{};
-    const DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
-    if (!len || len >= MAX_PATH) return L"edpe.ini";
-    return (std::filesystem::path(modulePath).parent_path() / L"edpe.ini").wstring();
-}
-
 // Directory of the module that contains this code (dxgi.dll in the game, the test exe in tests).
 std::filesystem::path moduleDirectory() {
     wchar_t path[MAX_PATH]{};
@@ -562,10 +555,6 @@ struct Fsr4Engine::Impl {
 Fsr4Engine::Fsr4Engine() : impl_(std::make_unique<Impl>()) {}
 Fsr4Engine::~Fsr4Engine() { shutdown(); }
 
-bool Fsr4Engine::selectedByConfig() {
-    return GetPrivateProfileIntW(L"Upscaler", L"Fsr4", 0, iniPathNextToExecutable().c_str()) != 0;
-}
-
 bool Fsr4Engine::filesPresent() {
     const auto dir = moduleDirectory();
     std::error_code ec;
@@ -640,7 +629,6 @@ struct Fsr4Engine::Impl {
 };
 Fsr4Engine::Fsr4Engine() : impl_(std::make_unique<Impl>()) {}
 Fsr4Engine::~Fsr4Engine() = default;
-bool Fsr4Engine::selectedByConfig() { return false; }
 bool Fsr4Engine::filesPresent() { return false; }
 bool Fsr4Engine::initialize(ID3D11Device*) { return false; }
 void Fsr4Engine::shutdown() {}

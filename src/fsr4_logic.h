@@ -119,7 +119,7 @@ public:
     }
 
 private:
-    bool selected_ = false;     // chosen: ini Fsr4=1 at startup, or the menu
+    bool selected_ = false;     // chosen: Backend=4 at startup, or the menu
     bool engineReady_ = false;  // the FSR 4 engine initialized and has not been disabled by failures
     bool initTried_ = false;    // initialization attempted since the last selection or retry
     bool failLogged_ = false;   // the first fallback has been logged
