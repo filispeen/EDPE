@@ -574,8 +574,7 @@ static bool s_last_committed_scene_cut = false;
 static bool s_last_committed_origin_reanchor = false;
 static bool s_last_committed_teleport_hold = false;
 static bool s_last_fg_reset = false;
-static unsigned s_teleport_rejection_streak = 0;
-static unsigned long long s_last_teleport_rejection_frame = ~0ull;
+static edpe::TeleportHoldState s_teleport_hold_state{};
 static unsigned s_cut_rejection_streak = 0;
 static unsigned long long s_last_cut_rejection_frame = ~0ull;
 struct UnmapFrameStats {
@@ -791,7 +790,8 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         haveNormalStaged &&
         s_staged_was_teleport_hold &&
         !s_staged_was_probe_vs_committed &&
-        s_camera_now.scaleX > 0.0f;
+        s_camera_now.scaleX > 0.0f &&
+        s_teleport_hold_state.canCommitHold();
     const bool useOrientationOnlyHold = useProbePositionHold || useTeleportPositionHold;
     const bool useWorldZoomFallback =
         !haveNormalStaged &&
@@ -900,9 +900,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
             : (useWorldZoomFallback ? s_world_zoom_fallback_parse_ok : s_probe_fallback_parse_ok);
         s_consecutive_fallback_frames = 0;
         s_cut_rejection_streak = 0;
-        if (!useTeleportPositionHold) {
-            s_teleport_rejection_streak = 0;
-        }
+        s_teleport_hold_state.onCommit(useTeleportPositionHold);
         s_anchor_camera = committedCam;
         s_anchor_valid = true;
         s_anchor_frame = rendered_frame;
@@ -963,7 +961,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                 wchar_t msg[192];
                 swprintf_s(msg,
                     L"EDPE DIAG: commitMainCamera teleportPositionHold frame=%llu deg=%.2f streak=%u parseOk=%d",
-                    rendered_frame, orientDeg, s_teleport_rejection_streak, committedFromParseOk ? 1 : 0);
+                    rendered_frame, orientDeg, s_teleport_hold_state.consecutiveHoldFrames, committedFromParseOk ? 1 : 0);
                 EdpeLog(msg);
             }
         }
@@ -1020,6 +1018,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
         if (s_consecutive_fallback_frames > 2) {
             s_anchor_valid = false;
             s_camera_reset = true;
+            s_teleport_hold_state.reset();
         }
         s_prev_valid_velocity = s_last_valid_velocity;
         s_camera_previous = s_camera_now;
@@ -8405,7 +8404,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const float curVpH = words[1329];
                     const bool fltHit =
                         (parse_ok && memoSameCamProj &&
-                         s_cut_rejection_streak == 0 && s_teleport_rejection_streak == 0 &&
+                         s_cut_rejection_streak == 0 &&
+                         s_teleport_hold_state.rejectionStreak == 0 &&
+                         s_teleport_hold_state.consecutiveHoldFrames == 0 &&
                          s_cb1_flt_frame == cur_frame &&
                          s_cb1_flt_in_scene == in_main_scene &&
                          s_cb1_flt_had_staged == hasStagedNow &&
@@ -8647,30 +8648,26 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             jumpResidual =
                                 edpe::length(edpe::cameraPosition(parsed_camera) - predicted);
                             if (jumpResidual > 15.0f && jumpResidual < 2000.0f) {
-                                if (!(s_has_staged_camera && s_staged_camera_frame == cur_frame &&
-                                      s_staged_from_in_scene) &&
-                                    s_last_teleport_rejection_frame != cur_frame) {
-                                    s_last_teleport_rejection_frame = cur_frame;
-                                    ++s_teleport_rejection_streak;
-                                }
+                                s_teleport_hold_state.noteJumpCandidate(
+                                    cur_frame,
+                                    s_has_staged_camera && s_staged_camera_frame == cur_frame && s_staged_from_in_scene);
+                                const unsigned effectiveTeleportStreak = s_teleport_hold_state.effectiveStreak();
                                 if (edpe::isTransientOriginRebaseHoldEligible(
                                         parsed_camera, s_camera_now, jumpResidual,
-                                        s_teleport_rejection_streak, allowPreSceneMainEye, cut_streak_satisfied,
+                                        effectiveTeleportStreak, allowPreSceneMainEye, cut_streak_satisfied,
                                         edpe::length(s_last_valid_velocity))) {
                                     is_teleport_hold_candidate = true;
                                 } else {
                                     const bool persistentInSceneTeleport =
-                                        allowPreSceneMainEye && s_teleport_rejection_streak >= 5;
+                                        allowPreSceneMainEye && effectiveTeleportStreak >= 5;
                                     if (!cut_streak_satisfied &&
                                         !persistentInSceneTeleport &&
-                                        (s_teleport_rejection_streak < 2 || s_consecutive_fallback_frames < 1)) {
+                                        (effectiveTeleportStreak < 2 || s_consecutive_fallback_frames < 1)) {
                                         allow_stage = false;
                                     } else {
                                         s_anchor_valid = false;
                                     }
                                 }
-                            } else if (jumpResidual <= 15.0f) {
-                                s_teleport_rejection_streak = 0;
                             }
                         }
 
@@ -8723,10 +8720,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             }
                             if (in_main_scene) {
                                 s_cut_rejection_streak = 0;
-                                if (!is_teleport_hold_candidate) {
-                                    s_teleport_rejection_streak = 0;
-                                }
                             }
+                            s_teleport_hold_state.onStagedWin(in_main_scene, is_teleport_hold_candidate);
                             s_staged_camera = parsed_camera;
                             s_has_staged_camera = true;
                             s_staged_camera_frame = cur_frame;
@@ -8895,7 +8890,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             EdpeLog(diagMsg);
                         }
                     }
-                    if (parse_ok && s_cut_rejection_streak == 0 && s_teleport_rejection_streak == 0) {
+                    if (parse_ok && s_cut_rejection_streak == 0 &&
+                        s_teleport_hold_state.rejectionStreak == 0 &&
+                        s_teleport_hold_state.consecutiveHoldFrames == 0) {
                         s_cb1_flt_frame = cur_frame;
                         s_cb1_flt_in_scene = in_main_scene;
                         s_cb1_flt_had_staged = hasStagedNow;
@@ -10927,7 +10924,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
                     s_anchor_valid = false;
                     s_cut_rejection_streak = 0;
-                    s_teleport_rejection_streak = 0;
+                    s_teleport_hold_state.reset();
                 }
             }
             if (upscale_active && (s_consecutive_skipped_frames == 10 || s_consecutive_skipped_frames % 600 == 0)) {
@@ -15179,7 +15176,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_consecutive_fallback_frames = 0;
         s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
         s_prev_valid_velocity = {0.0f, 0.0f, 0.0f};
-        s_teleport_rejection_streak = 0;
+        s_teleport_hold_state.reset();
         s_cut_rejection_streak = 0;
         s_gbuffer_resources = {};
         s_observed_scene_width.store(0, std::memory_order_relaxed);

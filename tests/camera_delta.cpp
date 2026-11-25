@@ -641,5 +641,47 @@ int main() {
     rot180.depthB = 0.025f;
     if (edpe::isSmoothWorldFovTransitionCandidate(rot180, adsBase21x9, 0.7250f, 0.025f)) return 131;
 
+    // 38. TeleportHoldState: rejected mid-frame passes with jumpResidual <= 15m must never
+    // wipe the streak to 0, and consecutive holds are capped at 4 frames so frame 5 commits
+    // the new camera position and resets the streak cleanly.
+    {
+        edpe::CameraProjection committedCam = cam21x9;
+        edpe::CameraProjection rebasedCam = cam21x9;
+        rebasedCam.worldFromView[3] = 221.4f;
+
+        edpe::TeleportHoldState hold;
+        for (uint64_t f = 16170; f <= 16173; ++f) {
+            hold.noteJumpCandidate(f, false);
+            const unsigned eff = hold.effectiveStreak();
+            if (!edpe::isTransientOriginRebaseHoldEligible(rebasedCam, committedCam, 221.4f, eff, true, false, 0.0f)) {
+                return 136;
+            }
+            hold.onStagedWin(true, true);
+            // Simulate a later non-scene or intra-frame pass with jumpResidual <= 15m being rejected:
+            // onStagedWin is NOT called for rejected passes, so streak stays intact.
+            if (!hold.canCommitHold()) return 137;
+            hold.onCommit(true);
+            if (hold.consecutiveHoldFrames != static_cast<unsigned>(f - 16169)) return 138;
+        }
+        // Frame 5 (16174): both effectiveStreak() >= 5 and !canCommitHold() force acceptance of new position.
+        hold.noteJumpCandidate(16174, false);
+        const unsigned eff5 = hold.effectiveStreak();
+        if (eff5 < 5) return 139;
+        if (edpe::isTransientOriginRebaseHoldEligible(rebasedCam, committedCam, 221.4f, eff5, true, false, 0.0f)) {
+            return 140;
+        }
+        if (hold.canCommitHold()) return 141;
+        hold.onCommit(false);
+        if (hold.rejectionStreak != 0 || hold.consecutiveHoldFrames != 0) return 142;
+
+        // A winning non-teleport in_main_scene pass within the same frame resets rejectionStreak.
+        hold.noteJumpCandidate(16200, false);
+        hold.onStagedWin(true, true);
+        hold.onStagedWin(true, false);
+        if (hold.rejectionStreak != 0) return 143;
+        hold.onCommit(false);
+        if (hold.consecutiveHoldFrames != 0) return 144;
+    }
+
     return 0;
 }

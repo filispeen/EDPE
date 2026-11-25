@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace edpe {
 
@@ -286,6 +287,53 @@ inline bool isTransientOriginRebaseHoldEligible(
     if (isCameraProjectionCut(candidate, committed)) return false;
     return cameraRotationTrace(candidate, committed) > 2.414f;
 }
+
+// Tracks per-frame transient origin-rebase/teleport hold streak with a hard cap of
+// 4 consecutive held frames so rejected mid-frame passes cannot wipe the streak to 0.
+struct TeleportHoldState {
+    static constexpr unsigned kMaxConsecutiveHoldFrames = 4;
+
+    unsigned rejectionStreak = 0;
+    unsigned consecutiveHoldFrames = 0;
+    uint64_t lastRejectionFrame = ~0ull;
+
+    void noteJumpCandidate(uint64_t frame, bool alreadyStagedInScene) noexcept {
+        if (!alreadyStagedInScene && lastRejectionFrame != frame) {
+            lastRejectionFrame = frame;
+            ++rejectionStreak;
+        }
+    }
+
+    unsigned effectiveStreak() const noexcept {
+        return std::max(rejectionStreak, consecutiveHoldFrames + 1);
+    }
+
+    void onStagedWin(bool inMainScene, bool isTeleportHoldCandidate) noexcept {
+        if (inMainScene && !isTeleportHoldCandidate) {
+            rejectionStreak = 0;
+        }
+    }
+
+    bool canCommitHold() const noexcept {
+        return consecutiveHoldFrames < kMaxConsecutiveHoldFrames;
+    }
+
+    void onCommit(bool usedTeleportHold) noexcept {
+        if (usedTeleportHold) {
+            ++consecutiveHoldFrames;
+            rejectionStreak = std::max(rejectionStreak, consecutiveHoldFrames);
+        } else {
+            rejectionStreak = 0;
+            consecutiveHoldFrames = 0;
+        }
+    }
+
+    void reset() noexcept {
+        rejectionStreak = 0;
+        consecutiveHoldFrames = 0;
+        lastRejectionFrame = ~0ull;
+    }
+};
 
 // True when a committed translation step exceeds normal camera bounds (>50m)
 // or jumps >15m beyond linear velocity prediction (persistent teleport/cut).
