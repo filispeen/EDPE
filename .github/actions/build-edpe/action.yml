@@ -145,4 +145,4 @@ runs:
       if: inputs.run-tests == 'true'
       shell: pwsh
       run: |
-        ctest --test-dir build --output-on-failure
+        ctest --test-dir build --verbose --output-on-failure
