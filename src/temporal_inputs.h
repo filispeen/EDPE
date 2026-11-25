@@ -282,4 +282,28 @@ inline bool translateToAmd(const TemporalFrameInputs& inputs,
     return true;
 }
 
+// Copies a sub-native scene color texture into an upscaler input texture while clamping
+// the 1 px right column (x = w - 1) and bottom row (y = h - 1) from their interior neighbors.
+// Prevents Cobra's 1 px unpopulated black atmosphere edge from causing edge ringing/flicker.
+inline void copyWithSubNativeEdgeClamp(ID3D11DeviceContext* ctx,
+                                       ID3D11Texture2D* dst,
+                                       ID3D11Texture2D* src,
+                                       UINT w,
+                                       UINT h) {
+    if (!ctx || !dst || !src || w == 0 || h == 0) return;
+    ctx->CopyResource(dst, src);
+    if (w >= 2) {
+        const D3D11_BOX rightBox{w - 2, 0, 0, w - 1, h, 1};
+        ctx->CopySubresourceRegion(dst, 0, w - 1, 0, 0, src, 0, &rightBox);
+    }
+    if (h >= 2) {
+        const D3D11_BOX botBox{0, h - 2, 0, w, h - 1, 1};
+        ctx->CopySubresourceRegion(dst, 0, 0, h - 1, 0, src, 0, &botBox);
+    }
+    if (w >= 2 && h >= 2) {
+        const D3D11_BOX cornerBox{w - 2, h - 2, 0, w - 1, h - 1, 1};
+        ctx->CopySubresourceRegion(dst, 0, w - 1, h - 1, 0, src, 0, &cornerBox);
+    }
+}
+
 } // namespace edpe

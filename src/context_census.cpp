@@ -11289,7 +11289,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
          srcColorDesc.Width == depthDesc.Width &&
          srcColorDesc.Height == depthDesc.Height);
     bool useDirectColorSrv = false;
-    if (colorSource != backbuffer &&
+    if (!isSubNative &&
+        colorSource != backbuffer &&
         backendSupportsDirectColor &&
         !debug_view_active && !s_cmp_seq.active &&
         (srcColorDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
@@ -11340,7 +11341,12 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         {
             edpe::ScopedRenderDocEvent rdocEvent(context, L"EDPE: ColorPrep");
             s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::ColorPrep);
-            context->CopyResource(s_dlaa_input.Get(), colorSource);
+            if (isSubNative) {
+                edpe::copyWithSubNativeEdgeClamp(
+                    context, s_dlaa_input.Get(), colorSource, depthDesc.Width, depthDesc.Height);
+            } else {
+                context->CopyResource(s_dlaa_input.Get(), colorSource);
+            }
             s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::ColorPrep);
         }
     }
