@@ -260,8 +260,21 @@ PSOutput ps_main(VSOutput pin) {
         }
     }
 
-    // 5. Brian Karis Ray-to-AABB Clipping
+    // 5. Brian Karis Ray-to-AABB Clipping + symmetric +-1 px stationary sub-pixel ridge retention
+    //    Retains static sub-pixel thin lines (< 1 px) across missed Halton jitter phases using
+    //    symmetric +-1 px history neighbors (mathematically zero on monotonic step edges and blobs).
     float3 clampedHistY = ClipToAABB(histY, currentY, finalMin, finalMax);
+    float stationaryWeight = saturate(1.0 - speed * 4.0) * depthConfidence;
+    if (stationaryWeight > 0.0) {
+        float hL = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(-resolution.z, 0.0), 0.0, 1.0), 0).rgb)).x;
+        float hR = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2( resolution.z, 0.0), 0.0, 1.0), 0).rgb)).x;
+        float hU = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(0.0, -resolution.w), 0.0, 1.0), 0).rgb)).x;
+        float hD = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(0.0,  resolution.w), 0.0, 1.0), 0).rgb)).x;
+        float ridgeX = max(0.0, abs(histY.x - 0.5 * (hL + hR)) - 0.5 * abs(hL - hR));
+        float ridgeY = max(0.0, abs(histY.x - 0.5 * (hU + hD)) - 0.5 * abs(hU - hD));
+        float thinRidge = saturate((max(ridgeX, ridgeY) - 0.005) * 32.0);
+        clampedHistY = lerp(clampedHistY, histY, 0.98 * stationaryWeight * thinRidge);
+    }
 
     // 6. Velocity / Disocclusion Confidence
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
