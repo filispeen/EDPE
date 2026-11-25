@@ -228,7 +228,7 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     cb.renderResolution[3] = 1.0f / static_cast<float>(rH);
     cb.params[0] = jitterX;
     cb.params[1] = jitterY;
-    cb.params[2] = 0.90f; // 90% history weight
+    cb.params[2] = 0.92f; // 92% history weight for smoother 8-phase Halton AA
     cb.params[3] = performReset ? 1.0f : 0.0f;
     cb.jitterHistory[0] = prevJitterX;
     cb.jitterHistory[1] = prevJitterY;

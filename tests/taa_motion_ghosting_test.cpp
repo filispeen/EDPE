@@ -16,9 +16,9 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr uint32_t kWidth = 128;
-constexpr uint32_t kHeight = 96;
-constexpr float kScaleX = 1.2f;
+constexpr uint32_t kWidth = 1600;
+constexpr uint32_t kHeight = 900;
+constexpr float kScaleX = 0.9f;
 constexpr float kScaleY = 1.6f;
 constexpr float kDepthB = 0.025f;
 constexpr float kFloorY = -2.0f;
@@ -205,8 +205,8 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
                       ID3D11Texture2D* outTex, ID3D11RenderTargetView* outRtv,
                       ID3D11Texture2D* readbackStaging,
                       const MotionProfile& prof) {
-    constexpr int kFrames = 14;
-    constexpr int kEvalStart = 6;
+    constexpr int kFrames = 10;
+    constexpr int kEvalStart = 7;
 
     taaPass.resetHistory();
 
@@ -236,7 +236,10 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
         const auto camNow = buildCamera(px, py, pz, yaw, pitch, roll);
         const auto jit = edpe::projectionJitter(static_cast<uint64_t>(t), kWidth, kHeight, 8u);
         const auto scene = renderScene(camNow, jit.pixelX, jit.pixelY);
-        const auto refUnjittered = renderScene(camNow, 0.0f, 0.0f);
+        RenderedScene refUnjittered;
+        if (t >= kEvalStart - 1) {
+            refUnjittered = renderScene(camNow, 0.0f, 0.0f);
+        }
 
         ctx->UpdateSubresource(colorTex, 0, nullptr, scene.color.data(), kWidth * sizeof(uint32_t), 0);
         if (!uploadDepth32G8(ctx, depthTex[curIdx], depthStaging, scene.depth)) {
@@ -335,7 +338,7 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
 
         prevCam = camNow;
         prevJ = jit;
-        prevScene = refUnjittered;
+        if (t >= kEvalStart - 1) prevScene = std::move(refUnjittered);
         curIdx ^= 1;
     }
 
@@ -436,7 +439,7 @@ int main() {
         {"Combined6DOF",  0.12f,  0.06f,  0.15f,  0.024f,  0.015f,  0.020f},
     };
 
-    std::printf("[TAA_Motion_Ghosting_And_Smearing_Suite 128x96]\n");
+    std::printf("[TAA_Motion_Ghosting_And_Smearing_Suite 1600x900]\n");
     ID3D11Texture2D* dTexRaw[2] = { depthTex[0].Get(), depthTex[1].Get() };
     ID3D11ShaderResourceView* dSrvRaw[2] = { depthSrv[0].Get(), depthSrv[1].Get() };
 

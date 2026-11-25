@@ -362,7 +362,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
     if (hasPrevDepth && !priorOffscreen) {
         float2 prevSamplePx = priorPixel + jitterInfo.zw;
         worldMatches = prevDepthMatches(prevSamplePx, expectedPriorDepth, maxCoord, worldErr);
-        if (worldMatches && expectedPriorDepth > 0.0) {
+        if (worldMatches && expectedPriorDepth > 0.0 && dot(worldMv, worldMv) >= 0.5625) {
             int2 occBase = clamp(int2(floor(prevSamplePx - 0.5)), int2(-1, -1), maxCoord);
             float4 occQuad = prevSceneDepth.GatherRed(pointSampler, (float2(occBase) + 1.0) * rcp(info.yz));
             float maxPrevD = max(max(occQuad.x, occQuad.y), max(occQuad.z, occQuad.w));
