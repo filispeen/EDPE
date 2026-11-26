@@ -45,6 +45,24 @@ void logFfxError(const wchar_t* stage, uint32_t rc) {
     EdpeLog(buf);
 }
 
+#if defined(EDPE_ENABLE_FFX_FG) && EDPE_ENABLE_FFX_FG
+// The provider reports some failures (for example after a GPU reset) by throwing a C++ exception instead of
+// returning a code. An escape would abort the game, so a throw is turned into an error code the caller handles.
+// Table-based x64 exception handling costs nothing while nothing throws.
+template <typename Call>
+ffxReturnCode_t callFfxGuarded(const wchar_t* stage, bool* threw, Call&& call) {
+    try {
+        return call();
+    } catch (...) {
+        if (threw) *threw = true;
+        wchar_t buf[256]{};
+        std::swprintf(buf, 256, L"EDPE AmdFsrFg: %ls threw an exception", stage);
+        EdpeLog(buf);
+        return FFX_API_RETURN_ERROR;
+    }
+}
+#endif
+
 } // namespace
 
 struct AmdFsrFgBackend::Impl {
@@ -72,6 +90,10 @@ struct AmdFsrFgBackend::Impl {
     ffxContext swapChainCtx = nullptr;
     ffxContext fgCtx = nullptr;
     bool swapChainWrapped = false;
+    // Set when a provider call threw: the contexts are in an unknown state, so they are never called again
+    // (and never destroyed, which would throw again). Frame generation stays off until the backend is
+    // initialized again.
+    bool faulted = false;
 
     bool ensureLoaderLoaded() {
         if (ffx.CreateContext && ffx.DestroyContext && ffx.Configure && ffx.Query && ffx.Dispatch) {
@@ -110,11 +132,19 @@ struct AmdFsrFgBackend::Impl {
         if (!self || !params || !self->ffx.Dispatch || !self->fgCtx) {
             return FFX_API_RETURN_ERROR_PARAMETER;
         }
-        return self->ffx.Dispatch(&self->fgCtx, &params->header);
+        return callFfxGuarded(L"ffxDispatch(FrameGeneration callback)", &self->faulted,
+                              [&] { return self->ffx.Dispatch(&self->fgCtx, &params->header); });
     }
 
     void destroyFgContextOnly() {
         if (!fgCtx) return;
+        if (faulted) {
+            fgCtx = nullptr;
+            activeWidth = 0;
+            activeHeight = 0;
+            activeHudlessFmt = DXGI_FORMAT_UNKNOWN;
+            return;
+        }
         // Disable FG first so FrameInterpolationSwapChain flushes any in-flight GPU work
         // before destroying resources (avoids D3D12 OBJECT_DELETED_WHILE_STILL_IN_USE).
         ffxConfigureDescFrameGeneration cfg{};
@@ -124,17 +154,22 @@ struct AmdFsrFgBackend::Impl {
         cfg.presentCallback = nullptr;
         cfg.frameGenerationCallback = nullptr;
         cfg.HUDLessColor = FfxApiResource{};
-        ffx.Configure(&fgCtx, &cfg.header);
+        callFfxGuarded(L"ffxConfigure(FrameGeneration disable)", &faulted,
+                       [&] { return ffx.Configure(&fgCtx, &cfg.header); });
 
-        if (swapChainCtx) {
+        if (swapChainCtx && !faulted) {
             ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 uiCfg{};
             uiCfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12;
             uiCfg.uiResource = FfxApiResource{};
             uiCfg.flags = 0;
-            ffx.Configure(&swapChainCtx, &uiCfg.header);
+            callFfxGuarded(L"ffxConfigure(RegisterUiResourceDX12 clear)", &faulted,
+                           [&] { return ffx.Configure(&swapChainCtx, &uiCfg.header); });
         }
 
-        ffx.DestroyContext(&fgCtx, nullptr);
+        if (!faulted) {
+            callFfxGuarded(L"ffxDestroyContext(FrameGeneration)", &faulted,
+                           [&] { return ffx.DestroyContext(&fgCtx, nullptr); });
+        }
         fgCtx = nullptr;
         activeWidth = 0;
         activeHeight = 0;
@@ -186,7 +221,9 @@ struct AmdFsrFgBackend::Impl {
             fgDesc.flags |= FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE;
         }
 
-        const ffxReturnCode_t rc = ffx.CreateContext(&fgCtx, &fgDesc.header, nullptr);
+        if (faulted) return false;
+        const ffxReturnCode_t rc = callFfxGuarded(L"ffxCreateContext(FrameGeneration)", &faulted,
+                                                  [&] { return ffx.CreateContext(&fgCtx, &fgDesc.header, nullptr); });
         if (rc != FFX_API_RETURN_OK || !fgCtx) {
             logFfxError(L"ffxCreateContext(FrameGeneration)", rc);
             fgCtx = nullptr;
@@ -241,6 +278,7 @@ bool AmdFsrFgBackend::initialize(D3D12ProxyPresenter* presenter) {
 #if defined(EDPE_ENABLE_FFX_FG) && EDPE_ENABLE_FFX_FG
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->initialized && impl_->presenter == presenter) return true;
+    impl_->faulted = false;
     if (!presenter || !presenter->isInitialized() || !presenter->swapChain() ||
         !presenter->bridge().commandQueue()) {
         return false;
@@ -303,7 +341,10 @@ void AmdFsrFgBackend::shutdown() {
         if (impl_->presenter) {
             impl_->presenter->bridge().waitGpuIdle();
         }
-        impl_->ffx.DestroyContext(&impl_->swapChainCtx, nullptr);
+        if (!impl_->faulted) {
+            callFfxGuarded(L"ffxDestroyContext(SwapChain)", &impl_->faulted,
+                           [&] { return impl_->ffx.DestroyContext(&impl_->swapChainCtx, nullptr); });
+        }
         impl_->swapChainCtx = nullptr;
     }
 
@@ -325,7 +366,7 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     if (outGeneratedFrames) *outGeneratedFrames = 0;
 #if defined(EDPE_ENABLE_FFX_FG) && EDPE_ENABLE_FFX_FG
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (!impl_->initialized || !impl_->presenter || !cmdList) return false;
+    if (!impl_->initialized || !impl_->presenter || !cmdList || impl_->faulted) return false;
     if (!impl_->ensureFgContext(inputs)) return false;
 
     // HUDLessColor and RegisterUiResourceDX12 are mutually exclusive UI paths in FSR FG.
@@ -343,7 +384,8 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
         uiCfg.uiResource = FfxApiResource{};
         uiCfg.flags = 0;
     }
-    const ffxReturnCode_t uiRc = impl_->ffx.Configure(&impl_->swapChainCtx, &uiCfg.header);
+    const ffxReturnCode_t uiRc = callFfxGuarded(L"ffxConfigure(RegisterUiResourceDX12)", &impl_->faulted,
+                                                [&] { return impl_->ffx.Configure(&impl_->swapChainCtx, &uiCfg.header); });
     if (uiRc != FFX_API_RETURN_OK) {
         logFfxError(L"ffxConfigure(RegisterUiResourceDX12)", uiRc);
         return false;
@@ -372,7 +414,8 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     cfg.generationRect = {0, 0, static_cast<int32_t>(inputs.outputWidth), static_cast<int32_t>(inputs.outputHeight)};
     cfg.frameID = inputs.frameIndex;
 
-    const ffxReturnCode_t cfgRc = impl_->ffx.Configure(&impl_->fgCtx, &cfg.header);
+    const ffxReturnCode_t cfgRc = callFfxGuarded(L"ffxConfigure(FrameGeneration)", &impl_->faulted,
+                                                 [&] { return impl_->ffx.Configure(&impl_->fgCtx, &cfg.header); });
     if (cfgRc != FFX_API_RETURN_OK) {
         logFfxError(L"ffxConfigure(FrameGeneration)", cfgRc);
         return false;
@@ -428,7 +471,8 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     prep.cameraForward[1] = camMats.forward.y;
     prep.cameraForward[2] = camMats.forward.z;
 
-    const ffxReturnCode_t prepRc = impl_->ffx.Dispatch(&impl_->fgCtx, &prep.header);
+    const ffxReturnCode_t prepRc = callFfxGuarded(L"ffxDispatch(PrepareV2)", &impl_->faulted,
+                                                  [&] { return impl_->ffx.Dispatch(&impl_->fgCtx, &prep.header); });
 
     D3D11D3D12Bridge::transitionResource(
         cmdList, inputs.depth,
