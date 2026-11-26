@@ -782,6 +782,15 @@ int main() {
         const auto cockpitPanel = edpe::parseEliteStatusJsonFlags(
             R"({"Flags":0,"Flags2":0,"GuiFocus":1})");
         if (cockpitPanel.mapGuiFocus) return 1237;
+
+        // Seated flags (InMainShip / InSRV / InTaxi) must suppress stale Flags2 on-foot bits
+        const auto seatedShipStale = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":16777216,"Flags2":8192,"GuiFocus":0})");
+        if (seatedShipStale.onFoot || seatedShipStale.inSrv) return 1238;
+
+        const auto seatedTaxiStale = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":0,"Flags2":8194,"GuiFocus":0})");
+        if (seatedTaxiStale.onFoot) return 1239;
     }
 
     // 6-DOF cameraDepthMotion accuracy across individual & simultaneous translations and rotations

@@ -351,20 +351,24 @@ inline EliteStatusFlags parseEliteStatusJsonFlags(const char* buf) {
         const int guiFocus = std::atoi(p);
         out.mapGuiFocus = (guiFocus >= 6 && guiFocus <= 9);
     }
+    unsigned long flags1 = 0;
     if (const char* f1 = std::strstr(buf, "\"Flags\"")) {
         f1 += 7;
         while (*f1 == ' ' || *f1 == '\t' || *f1 == ':') ++f1;
-        const unsigned long flags = std::strtoul(f1, nullptr, 10);
+        flags1 = std::strtoul(f1, nullptr, 10);
         // Flags bit 26 (0x04000000): InSRV
-        out.inSrv = (flags & (1ul << 26)) != 0;
+        out.inSrv = (flags1 & (1ul << 26)) != 0ul;
     }
     if (const char* f2 = std::strstr(buf, "\"Flags2\"")) {
         f2 += 8;
         while (*f2 == ' ' || *f2 == '\t' || *f2 == ':') ++f2;
         const unsigned long flags2 = std::strtoul(f2, nullptr, 10);
-        // Flags2 bits: 0x1=OnFoot, 0x8=OnFootInHangar, 0x10=OnFootInStation,
-        // 0x20=OnFootOnPlanet, 0x1000=OnFootSocialSpace, 0x2000=OnFootExterior
-        out.onFoot = (flags2 & 0x3039ul) != 0;
+        // Flags bits 24-26 (0x07000000): InMainShip, InFighter, InSRV.
+        // Flags2 bits 1-2 (0x0006): InTaxi, InMulticrew.
+        // Flags2 on-foot bits (0x3039): OnFoot, OnFootInHangar, OnFootInStation,
+        // OnFootOnPlanet, OnFootSocialSpace, OnFootExterior.
+        const bool seated = ((flags1 & 0x07000000ul) != 0ul) || ((flags2 & 0x0006ul) != 0ul);
+        out.onFoot = !seated && ((flags2 & 0x3039ul) != 0ul);
     }
     return out;
 }

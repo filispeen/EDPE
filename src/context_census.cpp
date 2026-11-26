@@ -861,7 +861,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                 if (edpe::isFloatingOriginReanchor(s_last_true_camera, committedCam)) {
                     out_scene_cut = false;
                     s_last_committed_origin_reanchor = true;
-                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                    s_last_valid_velocity = s_prev_valid_velocity;
                 } else if (edpe::isUnpredictedPositionCut(trueDelta, predictedTrueDelta)) {
                     out_scene_cut = true;
                     s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
@@ -879,7 +879,7 @@ inline void commitMainCamera(unsigned long long rendered_frame, bool& out_scene_
                 if (edpe::isFloatingOriginReanchor(s_camera_now, committedCam)) {
                     out_scene_cut = false;
                     s_last_committed_origin_reanchor = true;
-                    s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
+                    s_last_valid_velocity = s_prev_valid_velocity;
                 } else if (edpe::isUnpredictedPositionCut(newDelta, s_prev_valid_velocity)) {
                     out_scene_cut = true;
                     s_last_valid_velocity = {0.0f, 0.0f, 0.0f};
@@ -8790,24 +8790,34 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             jumpResidual =
                                 edpe::length(edpe::cameraPosition(parsed_camera) - predicted);
                             if (jumpResidual > 15.0f && jumpResidual < 2000.0f) {
-                                s_teleport_hold_state.noteJumpCandidate(
-                                    cur_frame,
-                                    s_has_staged_camera && s_staged_camera_frame == cur_frame && s_staged_from_in_scene);
-                                const unsigned effectiveTeleportStreak = s_teleport_hold_state.effectiveStreak();
-                                if (edpe::isTransientOriginRebaseHoldEligible(
-                                        parsed_camera, s_camera_now, jumpResidual,
-                                        effectiveTeleportStreak, allowPreSceneMainEye, cut_streak_satisfied,
-                                        edpe::length(s_last_valid_velocity))) {
-                                    is_teleport_hold_candidate = true;
+                                const bool onFootNow = edpe::cobra_camera::MapFocusPoller::isOnFootActive();
+                                const bool isOriginReanchor =
+                                    edpe::isFloatingOriginReanchor(s_camera_now, parsed_camera);
+                                const bool isHighSpeedFlight =
+                                    edpe::isContinuousHighSpeedFlightStep(
+                                        parsed_camera, s_camera_now, jumpResidual, allowPreSceneMainEye, onFootNow);
+                                if (isOriginReanchor || isHighSpeedFlight) {
+                                    s_anchor_valid = false;
                                 } else {
-                                    const bool persistentInSceneTeleport =
-                                        allowPreSceneMainEye && effectiveTeleportStreak >= 5;
-                                    if (!cut_streak_satisfied &&
-                                        !persistentInSceneTeleport &&
-                                        (effectiveTeleportStreak < 2 || s_consecutive_fallback_frames < 1)) {
-                                        allow_stage = false;
+                                    s_teleport_hold_state.noteJumpCandidate(
+                                        cur_frame,
+                                        s_has_staged_camera && s_staged_camera_frame == cur_frame && s_staged_from_in_scene);
+                                    const unsigned effectiveTeleportStreak = s_teleport_hold_state.effectiveStreak();
+                                    if (edpe::isTransientOriginRebaseHoldEligible(
+                                            parsed_camera, s_camera_now, jumpResidual,
+                                            effectiveTeleportStreak, allowPreSceneMainEye, cut_streak_satisfied,
+                                            edpe::length(s_last_valid_velocity))) {
+                                        is_teleport_hold_candidate = true;
                                     } else {
-                                        s_anchor_valid = false;
+                                        const bool persistentInSceneTeleport =
+                                            allowPreSceneMainEye && effectiveTeleportStreak >= 5;
+                                        if (!cut_streak_satisfied &&
+                                            !persistentInSceneTeleport &&
+                                            (effectiveTeleportStreak < 2 || s_consecutive_fallback_frames < 1)) {
+                                            allow_stage = false;
+                                        } else {
+                                            s_anchor_valid = false;
+                                        }
                                     }
                                 }
                             }
@@ -11823,7 +11833,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.frameTimeMs = dt_ms;
     inputs.reset = eval_reset;
     inputs.cameraNow = s_camera_now;
-    inputs.cameraPrevious = s_camera_previous;
+    inputs.cameraPrevious = origin_reanchor
+        ? edpe::preservePositionWithOrientation(s_camera_previous, edpe::cameraPosition(s_camera_now))
+        : s_camera_previous;
     inputs.sharpness = s_sharpness.load(std::memory_order_relaxed);
     inputs.depthInverted = true;
     inputs.motionIsLowRes = true;
