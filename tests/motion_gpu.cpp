@@ -1115,5 +1115,75 @@ int main() {
     context->Unmap(cls16_rb.Get(), 0);
     if (seam_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 168;
 
+    // Issue #36 regression test: On-foot world character/corpse pixel with stencil 0x10
+    // at world distance (z = 2.5m >= 0.60m) must use world camera-depth reprojection
+    // (World class) rather than clamping to (0,0) Weapon or taking stale WeaponMotion.
+    std::array<std::uint64_t, 16> corpse_depths{};
+    corpse_depths.fill(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.01f)) |
+                       (static_cast<std::uint64_t>(0x04u) << 32)); // ground at z=2.5m
+    corpse_depths[5] = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.01f)) |
+                       (static_cast<std::uint64_t>(0x14u) << 32); // Flight Suit corpse at z=2.5m (stencil 0x10)
+    D3D11_SUBRESOURCE_DATA corpse_init{corpse_depths.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> corpse_tex;
+    ComPtr<ID3D11ShaderResourceView> corpse_srv;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &corpse_init, &corpse_tex)) ||
+        FAILED(device->CreateShaderResourceView(corpse_tex.Get(), &view_desc, &corpse_srv))) {
+        return 169;
+    }
+    float corpse_expected_x = 0.0f, corpse_expected_y = 0.0f;
+    if (!edpe::cameraDepthMotion(walkNow, walkPrev, 4, 4, 1, 1, 0.01f,
+            &corpse_expected_x, &corpse_expected_y)) {
+        return 170;
+    }
+    // Case A: without WeaponMotion (on-foot stencil fallback must NOT clamp z>=0.60m to (0,0)).
+    if (!pass.render(corpse_srv.Get(), walkNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, nullptr, nullptr, nullptr, 0u,
+            /*clampCockpit=*/false)) {
+        return 171;
+    }
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 172;
+    const auto* corpse_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float corpse_a_x = DirectX::PackedVector::XMConvertHalfToFloat(corpse_row1[2]);
+    const float corpse_a_y = DirectX::PackedVector::XMConvertHalfToFloat(corpse_row1[3]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(corpse_a_x - corpse_expected_x) >= 0.05f ||
+        std::fabs(corpse_a_y - corpse_expected_y) >= 0.05f) {
+        return 173;
+    }
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 174;
+    const std::uint8_t corpse_a_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (corpse_a_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::World)) return 175;
+
+    // Case B: with non-zero WeaponMotion (tryWeaponOverride must NOT override z>=0.60m on foot).
+    if (!pass.render(corpse_srv.Get(), walkNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, srv_wm_view.Get(), nullptr, nullptr, 0u,
+            /*clampCockpit=*/false)) {
+        return 176;
+    }
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 177;
+    const auto* corpse_b_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float corpse_b_x = DirectX::PackedVector::XMConvertHalfToFloat(corpse_b_row1[2]);
+    const float corpse_b_y = DirectX::PackedVector::XMConvertHalfToFloat(corpse_b_row1[3]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(corpse_b_x - corpse_expected_x) >= 0.05f ||
+        std::fabs(corpse_b_y - corpse_expected_y) >= 0.05f) {
+        return 178;
+    }
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 179;
+    const std::uint8_t corpse_b_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (corpse_b_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::World)) return 180;
+
     return 0;
 }
