@@ -5,6 +5,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <filesystem>
+#include <atomic>
 #include <mutex>
 #include <string>
 
@@ -50,11 +51,11 @@ void logFfxError(const wchar_t* stage, uint32_t rc) {
 // returning a code. An escape would abort the game, so a throw is turned into an error code the caller handles.
 // Table-based x64 exception handling costs nothing while nothing throws.
 template <typename Call>
-ffxReturnCode_t callFfxGuarded(const wchar_t* stage, bool* threw, Call&& call) {
+ffxReturnCode_t callFfxGuarded(const wchar_t* stage, std::atomic<bool>* threw, Call&& call) {
     try {
         return call();
     } catch (...) {
-        if (threw) *threw = true;
+        if (threw) threw->store(true);
         wchar_t buf[256]{};
         std::swprintf(buf, 256, L"EDPE AmdFsrFg: %ls threw an exception", stage);
         EdpeLog(buf);
@@ -92,8 +93,8 @@ struct AmdFsrFgBackend::Impl {
     bool swapChainWrapped = false;
     // Set when a provider call threw: the contexts are in an unknown state, so they are never called again
     // (and never destroyed, which would throw again). Frame generation stays off until the backend is
-    // initialized again.
-    bool faulted = false;
+    // initialized again. Atomic because fgDispatchCallback can run on the swap chain's present thread.
+    std::atomic<bool> faulted{false};
 
     bool ensureLoaderLoaded() {
         if (ffx.CreateContext && ffx.DestroyContext && ffx.Configure && ffx.Query && ffx.Dispatch) {
