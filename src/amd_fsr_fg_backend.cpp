@@ -58,10 +58,15 @@ struct AmdFsrFgBackend::Impl {
 
     uint32_t activeWidth = 0;
     uint32_t activeHeight = 0;
+    uint32_t fgMaxRenderW = 0;
+    uint32_t fgMaxRenderH = 0;
     DXGI_FORMAT activeBackbufferFmt = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT activeHudlessFmt = DXGI_FORMAT_UNKNOWN;
     bool activeIsHdr = false;
     bool activeLowResMv = false;
+    bool asyncWorkloadsSupported = false;
+    bool hasRegisteredUiState = false;
+    ID3D12Resource* lastRegisteredUiRes = nullptr;
     std::string providerVersion = "unavailable";
     wchar_t unavailableMsg[256] = L"";
 
@@ -138,7 +143,12 @@ struct AmdFsrFgBackend::Impl {
         fgCtx = nullptr;
         activeWidth = 0;
         activeHeight = 0;
+        fgMaxRenderW = 0;
+        fgMaxRenderH = 0;
         activeHudlessFmt = DXGI_FORMAT_UNKNOWN;
+        asyncWorkloadsSupported = false;
+        hasRegisteredUiState = false;
+        lastRegisteredUiRes = nullptr;
     }
 
     bool ensureFgContext(const FrameGenerationInputs& inputs) {
@@ -150,6 +160,7 @@ struct AmdFsrFgBackend::Impl {
                               (inputs.renderHeight < inputs.outputHeight);
 
         if (fgCtx && activeWidth == inputs.outputWidth && activeHeight == inputs.outputHeight &&
+            inputs.renderWidth <= fgMaxRenderW && inputs.renderHeight <= fgMaxRenderH &&
             activeBackbufferFmt == bbFmt && activeHudlessFmt == hudlessFmt &&
             activeIsHdr == inputs.isHdr && activeLowResMv == lowResMv) {
             return true;
@@ -171,22 +182,30 @@ struct AmdFsrFgBackend::Impl {
         hudlessDesc.header.pNext = &verDesc.header;
         hudlessDesc.hudlessBackBufferFormat = ffxApiGetSurfaceFormatDX12(hudlessFmt);
 
+        const uint32_t maxRenW = (inputs.renderWidth > 0) ? inputs.renderWidth : inputs.outputWidth;
+        const uint32_t maxRenH = (inputs.renderHeight > 0) ? inputs.renderHeight : inputs.outputHeight;
+
         ffxCreateContextDescFrameGeneration fgDesc{};
         fgDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
         fgDesc.header.pNext = (hudlessFmt != bbFmt) ? &hudlessDesc.header : &verDesc.header;
         fgDesc.displaySize = {inputs.outputWidth, inputs.outputHeight};
-        fgDesc.maxRenderSize = {inputs.outputWidth, inputs.outputHeight};
+        fgDesc.maxRenderSize = {maxRenW, maxRenH};
         fgDesc.backBufferFormat = ffxApiGetSurfaceFormatDX12(bbFmt);
-        fgDesc.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
-                       FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE;
-        if (!lowResMv) {
-            fgDesc.flags |= FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
-        }
-        if (inputs.isHdr) {
-            fgDesc.flags |= FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE;
-        }
+        const uint32_t baseFlags =
+            FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
+            FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE |
+            (!lowResMv ? FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS : 0u) |
+            (inputs.isHdr ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0u);
 
-        const ffxReturnCode_t rc = ffx.CreateContext(&fgCtx, &fgDesc.header, nullptr);
+        bool tryAsync = true;
+        fgDesc.flags = baseFlags | FFX_FRAMEGENERATION_ENABLE_ASYNC_WORKLOAD_SUPPORT;
+        ffxReturnCode_t rc = ffx.CreateContext(&fgCtx, &fgDesc.header, nullptr);
+        if (rc != FFX_API_RETURN_OK || !fgCtx) {
+            fgCtx = nullptr;
+            tryAsync = false;
+            fgDesc.flags = baseFlags;
+            rc = ffx.CreateContext(&fgCtx, &fgDesc.header, nullptr);
+        }
         if (rc != FFX_API_RETURN_OK || !fgCtx) {
             logFfxError(L"ffxCreateContext(FrameGeneration)", rc);
             fgCtx = nullptr;
@@ -201,10 +220,13 @@ struct AmdFsrFgBackend::Impl {
 
         activeWidth = inputs.outputWidth;
         activeHeight = inputs.outputHeight;
+        fgMaxRenderW = maxRenW;
+        fgMaxRenderH = maxRenH;
         activeBackbufferFmt = bbFmt;
         activeHudlessFmt = hudlessFmt;
         activeIsHdr = inputs.isHdr;
         activeLowResMv = lowResMv;
+        asyncWorkloadsSupported = tryAsync;
         return true;
     }
 #endif
@@ -285,6 +307,8 @@ bool AmdFsrFgBackend::initialize(D3D12ProxyPresenter* presenter) {
     impl_->swapChainWrapped = true;
     impl_->initialized = true;
     impl_->forceResetNext = true;
+    impl_->hasRegisteredUiState = false;
+    impl_->lastRegisteredUiRes = nullptr;
     return true;
 #else
     (void)presenter;
@@ -298,6 +322,8 @@ void AmdFsrFgBackend::shutdown() {
     if (!impl_->initialized) return;
 
     impl_->destroyFgContextOnly();
+    impl_->hasRegisteredUiState = false;
+    impl_->lastRegisteredUiRes = nullptr;
 
     if (impl_->swapChainCtx) {
         if (impl_->presenter) {
@@ -332,21 +358,26 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     // When HUDLessColor is supplied, the backbuffer already carries composited game UI + ImGui,
     // so let FSR FG extract UI via (backbuffer - HUDLessColor) and avoid double-compositing UI.
     const bool usePackedUi = (!inputs.hudlessColor && inputs.packedUiColorAndAlpha != nullptr);
-    ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 uiCfg{};
-    uiCfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12;
-    if (usePackedUi) {
-        uiCfg.uiResource = ffxApiGetResourceDX12(
-            inputs.packedUiColorAndAlpha, FFX_API_RESOURCE_STATE_COMMON);
-        uiCfg.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
-                      FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
-    } else {
-        uiCfg.uiResource = FfxApiResource{};
-        uiCfg.flags = 0;
-    }
-    const ffxReturnCode_t uiRc = impl_->ffx.Configure(&impl_->swapChainCtx, &uiCfg.header);
-    if (uiRc != FFX_API_RETURN_OK) {
-        logFfxError(L"ffxConfigure(RegisterUiResourceDX12)", uiRc);
-        return false;
+    ID3D12Resource* desiredUiRes = usePackedUi ? inputs.packedUiColorAndAlpha : nullptr;
+    if (!impl_->hasRegisteredUiState || impl_->lastRegisteredUiRes != desiredUiRes) {
+        ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 uiCfg{};
+        uiCfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12;
+        if (usePackedUi) {
+            uiCfg.uiResource = ffxApiGetResourceDX12(
+                inputs.packedUiColorAndAlpha, FFX_API_RESOURCE_STATE_COMMON);
+            uiCfg.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
+                          FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
+        } else {
+            uiCfg.uiResource = FfxApiResource{};
+            uiCfg.flags = 0;
+        }
+        const ffxReturnCode_t uiRc = impl_->ffx.Configure(&impl_->swapChainCtx, &uiCfg.header);
+        if (uiRc != FFX_API_RETURN_OK) {
+            logFfxError(L"ffxConfigure(RegisterUiResourceDX12)", uiRc);
+            return false;
+        }
+        impl_->hasRegisteredUiState = true;
+        impl_->lastRegisteredUiRes = desiredUiRes;
     }
 
     uint32_t dispatchFlags = 0;
@@ -363,7 +394,7 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
     cfg.frameGenerationCallback = enabled ? &Impl::fgDispatchCallback : nullptr;
     cfg.frameGenerationCallbackUserContext = enabled ? impl_.get() : nullptr;
     cfg.frameGenerationEnabled = enabled;
-    cfg.allowAsyncWorkloads = false;
+    cfg.allowAsyncWorkloads = impl_->asyncWorkloadsSupported;
     cfg.HUDLessColor = inputs.hudlessColor
                            ? ffxApiGetResourceDX12(inputs.hudlessColor, FFX_API_RESOURCE_STATE_COMMON)
                            : FfxApiResource{};
@@ -389,12 +420,10 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
 
     // Transition shared inputs from COMMON -> NON_PIXEL_SHADER_RESOURCE for PrepareV2 compute,
     // then back to COMMON before cmdList ends.
-    D3D11D3D12Bridge::transitionResource(
-        cmdList, inputs.depth,
-        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    D3D11D3D12Bridge::transitionResource(
-        cmdList, inputs.motionVectors,
-        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D11D3D12Bridge::transitionResources2(
+        cmdList,
+        inputs.depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        inputs.motionVectors, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     ffxDispatchDescFrameGenerationPrepareV2 prep{};
     prep.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
@@ -430,12 +459,10 @@ bool AmdFsrFgBackend::evaluate(ID3D12GraphicsCommandList* cmdList,
 
     const ffxReturnCode_t prepRc = impl_->ffx.Dispatch(&impl_->fgCtx, &prep.header);
 
-    D3D11D3D12Bridge::transitionResource(
-        cmdList, inputs.depth,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    D3D11D3D12Bridge::transitionResource(
-        cmdList, inputs.motionVectors,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    D3D11D3D12Bridge::transitionResources2(
+        cmdList,
+        inputs.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON,
+        inputs.motionVectors, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 
     if (prepRc != FFX_API_RETURN_OK) {
         logFfxError(L"ffxDispatch(PrepareV2)", prepRc);

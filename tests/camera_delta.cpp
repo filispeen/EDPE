@@ -409,16 +409,43 @@ int main() {
             planetaryTurningRebase, worldBase, 2500.0f, 1, true, false)) {
         return 101;
     }
+    // Ship glide / fast flight (prevSpeed > 5.0 m/frame) MUST NOT hold old position:
+    if (edpe::isTransientOriginRebaseHoldEligible(
+            planetaryTurningRebase, worldBase, 519.124f, 1, true, false, 12.0f)) {
+        return 136;
+    }
+    if (!edpe::isTransientOriginRebaseHoldEligible(
+            planetaryTurningRebase, worldBase, 519.124f, 1, true, false, 0.1f)) {
+        return 137;
+    }
 
     // 31. Persistent unpredicted teleport (>15m beyond velocity prediction) triggers scene cut,
-    // while smooth high-speed continuous flight (residual <= 15m, step <= 50m) does not.
+    // while smooth high-speed continuous flight / Orbital Glide (residual <= 15m, step <= 150m) does not.
     const edpe::Vec3 teleportDelta{-0.0741f, -4.1486f, -22.5333f};
     const edpe::Vec3 walkingVel{0.0f, 0.0f, 0.08f};
     if (!edpe::isUnpredictedPositionCut(teleportDelta, walkingVel)) return 93;
     const edpe::Vec3 flightStep{0.0f, 0.0f, 30.0f};
     if (edpe::isUnpredictedPositionCut(flightStep, flightStep)) return 94;
-    const edpe::Vec3 over50Step{0.0f, 0.0f, 55.0f};
-    if (!edpe::isUnpredictedPositionCut(over50Step, over50Step)) return 95;
+    const edpe::Vec3 glideStep{0.0f, 0.0f, 80.0f};
+    if (edpe::isUnpredictedPositionCut(glideStep, glideStep)) return 95;
+    if (!edpe::isUnpredictedPositionCut(glideStep, walkingVel)) return 138;
+    const edpe::Vec3 over150Step{0.0f, 0.0f, 160.0f};
+    if (!edpe::isUnpredictedPositionCut(over150Step, over150Step)) return 139;
+
+    // 31b. Seated ship/SRV Orbital Glide steps (15..150 m/frame, continuous orientation)
+    // must bypass the on-foot transient origin-rebase hold, while on-foot / pre-scene / >150m do not.
+    auto glideCam = worldBase;
+    glideCam.worldFromView[11] += 65.0f;
+    if (!edpe::isContinuousHighSpeedFlightStep(glideCam, worldBase, 65.0f, true, false)) return 140;
+    if (edpe::isContinuousHighSpeedFlightStep(glideCam, worldBase, 65.0f, true, true)) return 141;
+    if (edpe::isContinuousHighSpeedFlightStep(glideCam, worldBase, 65.0f, false, false)) return 142;
+    if (edpe::isContinuousHighSpeedFlightStep(glideCam, worldBase, 160.0f, true, false)) return 143;
+    auto rotatedGlide = yawed(20.0f);
+    rotatedGlide.scaleX = worldBase.scaleX;
+    rotatedGlide.scaleY = worldBase.scaleY;
+    rotatedGlide.depthB = worldBase.depthB;
+    rotatedGlide.worldFromView[11] += 65.0f;
+    if (edpe::isContinuousHighSpeedFlightStep(rotatedGlide, worldBase, 65.0f, true, false)) return 144;
 
     // 32. Viewmodel sub-pass during fast camera turn (>12.8 deg, <=45 deg) and
     // planetary origin-rebased sub-pass (cb1[35..38] verified, ~460m offset, same orientation).
@@ -544,6 +571,22 @@ int main() {
     const float degenerateProj1080[16]{};
     if (edpe::isMainCameraGeometryValid(cam21x9, degenerateProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 119;
 
+    // Relative 5% aspect tolerance on ultrawide (21:9 & 32:9):
+    // 21:9 (3440x1440 => 2.3889) accepts camAspect=2.3333 (|diff|=0.0556 > 0.05 absolute, <= 5% relative).
+    edpe::CameraProjection cam21x9SlightlyNarrow = cam21x9;
+    cam21x9SlightlyNarrow.scaleX = 0.8000f;
+    cam21x9SlightlyNarrow.scaleY = 0.8000f * (21.0f / 9.0f);
+    if (!edpe::isMainCameraGeometryValid(cam21x9SlightlyNarrow, validProj1080, 3440.0f, 1440.0f, 3440, 1440)) return 132;
+
+    // 32:9 (5120x1440 => 3.5556) accepts camAspect=3.42 (|diff|=0.1356 > 0.05 absolute, <= 5% relative),
+    // while still rejecting 16:9 (1.7778) and 1:1 square spotlights.
+    edpe::CameraProjection cam32x9 = cam21x9;
+    cam32x9.scaleX = 0.5500f;
+    cam32x9.scaleY = 0.5500f * 3.42f;
+    if (!edpe::isMainCameraGeometryValid(cam32x9, validProj1080, 5120.0f, 1440.0f, 5120, 1440)) return 133;
+    if (edpe::isMainCameraGeometryValid(cam16x9, validProj1080, 5120.0f, 1440.0f, 5120, 1440)) return 134;
+    if (edpe::isMainCameraGeometryValid(squareSpotlight, validProj1080, 5120.0f, 1440.0f, 5120, 1440)) return 135;
+
     // 37. isSmoothWorldFovTransitionCandidate: accepts smooth ADS zoom-in/zoom-out ramps
     // (including turning and movement) while rejecting ADS viewmodels (~2.5x scale),
     // hip-fire viewmodels (depthB=0.0675), settlement beacons (depthB=0.1002 / distant),
@@ -615,6 +658,48 @@ int main() {
     rot180.scaleY = 0.7605f * (3440.0f / 1440.0f);
     rot180.depthB = 0.025f;
     if (edpe::isSmoothWorldFovTransitionCandidate(rot180, adsBase21x9, 0.7250f, 0.025f)) return 131;
+
+    // 38. TeleportHoldState: rejected mid-frame passes with jumpResidual <= 15m must never
+    // wipe the streak to 0, and consecutive holds are capped at 4 frames so frame 5 commits
+    // the new camera position and resets the streak cleanly.
+    {
+        edpe::CameraProjection committedCam = cam21x9;
+        edpe::CameraProjection rebasedCam = cam21x9;
+        rebasedCam.worldFromView[3] = 221.4f;
+
+        edpe::TeleportHoldState hold;
+        for (uint64_t f = 16170; f <= 16173; ++f) {
+            hold.noteJumpCandidate(f, false);
+            const unsigned eff = hold.effectiveStreak();
+            if (!edpe::isTransientOriginRebaseHoldEligible(rebasedCam, committedCam, 221.4f, eff, true, false, 0.0f)) {
+                return 136;
+            }
+            hold.onStagedWin(true, true);
+            // Simulate a later non-scene or intra-frame pass with jumpResidual <= 15m being rejected:
+            // onStagedWin is NOT called for rejected passes, so streak stays intact.
+            if (!hold.canCommitHold()) return 137;
+            hold.onCommit(true);
+            if (hold.consecutiveHoldFrames != static_cast<unsigned>(f - 16169)) return 138;
+        }
+        // Frame 5 (16174): both effectiveStreak() >= 5 and !canCommitHold() force acceptance of new position.
+        hold.noteJumpCandidate(16174, false);
+        const unsigned eff5 = hold.effectiveStreak();
+        if (eff5 < 5) return 139;
+        if (edpe::isTransientOriginRebaseHoldEligible(rebasedCam, committedCam, 221.4f, eff5, true, false, 0.0f)) {
+            return 140;
+        }
+        if (hold.canCommitHold()) return 141;
+        hold.onCommit(false);
+        if (hold.rejectionStreak != 0 || hold.consecutiveHoldFrames != 0) return 142;
+
+        // A winning non-teleport in_main_scene pass within the same frame resets rejectionStreak.
+        hold.noteJumpCandidate(16200, false);
+        hold.onStagedWin(true, true);
+        hold.onStagedWin(true, false);
+        if (hold.rejectionStreak != 0) return 143;
+        hold.onCommit(false);
+        if (hold.consecutiveHoldFrames != 0) return 144;
+    }
 
     return 0;
 }

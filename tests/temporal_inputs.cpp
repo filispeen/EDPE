@@ -5,6 +5,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <vector>
+#include <wrl/client.h>
 
 namespace {
 
@@ -345,6 +347,77 @@ int main() {
         if (!edpe::parseNgxLogLineForOverrides("[NGXInitLog:12] Build v310.9.16", &ov3) ||
             std::strcmp(ov3.dlssVersion, "310.9.16") != 0) {
             return 98;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 14: copyWithSubNativeEdgeClamp clamps 1 px black right/bottom edge
+    // -------------------------------------------------------------------------
+    {
+        using Microsoft::WRL::ComPtr;
+        ComPtr<ID3D11Device> dev;
+        ComPtr<ID3D11DeviceContext> ctx;
+        D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1,
+                                       D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+        if (FAILED(hr)) {
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1,
+                                   D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+        }
+        if (SUCCEEDED(hr) && dev && ctx) {
+            constexpr UINT W = 8;
+            constexpr UINT H = 8;
+            const uint32_t kInterior = (255u << 24) | (200u << 16) | (150u << 8) | 100u;
+            const uint32_t kBlack = (255u << 24); // RGB=(0,0,0), A=255
+            std::vector<uint32_t> srcPixels(W * H, kInterior);
+            for (UINT y = 0; y < H; ++y) {
+                srcPixels[y * W + (W - 1)] = kBlack;
+            }
+            for (UINT x = 0; x < W; ++x) {
+                srcPixels[(H - 1) * W + x] = kBlack;
+            }
+
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = W;
+            td.Height = H;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA init{srcPixels.data(), W * 4, 0};
+
+            ComPtr<ID3D11Texture2D> srcTex, dstTex, stagingTex;
+            if (FAILED(dev->CreateTexture2D(&td, &init, &srcTex)) ||
+                FAILED(dev->CreateTexture2D(&td, nullptr, &dstTex))) {
+                return 99;
+            }
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(dev->CreateTexture2D(&td, nullptr, &stagingTex))) {
+                return 100;
+            }
+
+            edpe::copyWithSubNativeEdgeClamp(ctx.Get(), dstTex.Get(), srcTex.Get(), W, H);
+            ctx->CopyResource(stagingTex.Get(), dstTex.Get());
+
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (FAILED(ctx->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                return 101;
+            }
+            const auto* base = static_cast<const uint8_t*>(mapped.pData);
+            for (UINT y = 0; y < H; ++y) {
+                const auto* row = reinterpret_cast<const uint32_t*>(base + y * mapped.RowPitch);
+                for (UINT x = 0; x < W; ++x) {
+                    if (row[x] != kInterior) {
+                        ctx->Unmap(stagingTex.Get(), 0);
+                        return 102;
+                    }
+                }
+            }
+            ctx->Unmap(stagingTex.Get(), 0);
         }
     }
 

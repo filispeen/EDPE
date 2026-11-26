@@ -9,6 +9,8 @@ namespace edpe {
 
 class TaaPass {
 public:
+    static constexpr DXGI_FORMAT kHistoryFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
     TaaPass() = default;
     ~TaaPass() = default;
 
@@ -31,10 +33,19 @@ public:
         float prevJitterX = 0.0f,
         float prevJitterY = 0.0f,
         float depthB = 0.025f,
-        ID3D11ShaderResourceView* prevDepthSrv = nullptr);
+        ID3D11ShaderResourceView* prevDepthSrv = nullptr,
+        DXGI_FORMAT preferredFormat = DXGI_FORMAT_UNKNOWN,
+        ID3D11ShaderResourceView* reactiveMaskSrv = nullptr);
 
-    void resetHistory() { resetRequested_ = true; }
+    void resetHistory() {
+        resetRequested_ = true;
+        framesSinceReset_ = 0;
+    }
     bool isInitialized() const { return device_ != nullptr; }
+
+    ID3D11Texture2D* latestOutputTexture() const { return historyTexture_[historyReadIdx_].Get(); }
+    ID3D11ShaderResourceView* latestOutputSrv() const { return historySrv_[historyReadIdx_].Get(); }
+    DXGI_FORMAT historyFormat() const { return historyFormat_; }
 
 private:
     bool ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT format);
@@ -49,8 +60,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D11SamplerState> pointSampler_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constantBuffer_;
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> historyTexture_;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> historySrv_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> historyTexture_[2];
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> historySrv_[2];
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> historyRtv_[2];
+    uint32_t historyReadIdx_ = 0;
     uint32_t historyWidth_ = 0;
     uint32_t historyHeight_ = 0;
     DXGI_FORMAT historyFormat_ = DXGI_FORMAT_UNKNOWN;
@@ -59,6 +72,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> cachedDestRtv_;
 
     bool resetRequested_ = true;
+    uint32_t framesSinceReset_ = 0;
 };
 
 } // namespace edpe

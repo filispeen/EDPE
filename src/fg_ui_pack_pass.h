@@ -36,7 +36,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context_;
     Microsoft::WRL::ComPtr<ID3DDeviceContextState> state_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> compute_;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> blackFloorCs_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constants_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> blackFloorTex_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> blackFloorSrv_;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> blackFloorUav_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> outputTex_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> outputSrv_;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> outputUav_;

@@ -271,6 +271,12 @@ int runCorrectnessTest(ID3D11Device* d3d11Dev, ID3D11DeviceContext* d3d11Ctx) {
 
     edpe::D3D11D3D12Bridge bridge;
     if (!bridge.initialize(d3d11Dev)) return 13;
+    if (!bridge.d11ToD12Fence12() || !bridge.d11ToD12Fence11() ||
+        !bridge.d12ToD11Fence12() || !bridge.d12ToD11Fence11() ||
+        bridge.d11ToD12Fence12() == bridge.d12ToD11Fence12() ||
+        bridge.d11ToD12Fence11() == bridge.d12ToD11Fence11()) {
+        return 27;
+    }
 
     constexpr uint32_t W = 16;
     constexpr uint32_t H = 16;
@@ -435,8 +441,21 @@ int runCorrectnessTest(ID3D11Device* d3d11Dev, ID3D11DeviceContext* d3d11Ctx) {
         return 25;
     }
 
+    // Verify rapid multi-frame back-to-back submission completes monotonically without deadlock.
+    uint64_t prevDone = d12Done;
+    for (int iter = 0; iter < 12; ++iter) {
+        uint32_t iterSlot = 0;
+        auto* iterCmd = bridge.beginCommandList(iterSlot);
+        if (!iterCmd) return 28;
+        const uint64_t iterDone = bridge.submitAfterD3D11Signal(ctx4.Get(), iterSlot, true);
+        if (iterDone <= prevDone) return 29;
+        if (!bridge.waitOnD3D11(ctx4.Get(), iterDone)) return 30;
+        prevDone = iterDone;
+    }
+
     // Verify clean resize/recreation without leaking handles.
     bridge.waitGpuIdle();
+    if (bridge.completedFenceValue() < prevDone) return 31;
     shared.reset();
     if (!shared.create(bridge, 32, 32)) return 26;
     shared.reset();

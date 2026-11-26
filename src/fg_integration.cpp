@@ -126,6 +126,12 @@ FgRuntime::~FgRuntime() {
     shutdown();
 }
 
+void FgRuntime::joinProbeThread() {
+    if (probeThread_.joinable() && probeThread_.get_id() != std::this_thread::get_id()) {
+        probeThread_.join();
+    }
+}
+
 void FgRuntime::applyConfig(int backendInt,
                             int multiplier,
                             bool dynamicMfg,
@@ -146,14 +152,13 @@ void FgRuntime::applyConfig(int backendInt,
     telemetry_.configuredBackend = configuredBackend_;
 
     if (auto* b = manager_.getBackend(FrameGenerationBackend::NvidiaDlssG)) {
-        auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
+        auto* sl = static_cast<NvidiaStreamlineFgBackend*>(b);
         sl->setLowLatencyBoost(reflexBoost_);
         sl->setDynamicMfgMode(dynamicMfg_, dynamicTargetFps_);
-        sl->setDebugView(fgDebugView_);
+        b->setDebugView(fgDebugView_);
     }
     if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
-        auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-        amd->setDebugFlags(false, false, fgDebugView_);
+        b->setDebugView(fgDebugView_);
     }
 }
 
@@ -161,12 +166,10 @@ void FgRuntime::setFgDebugView(bool enabled) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     fgDebugView_ = enabled;
     if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
-        auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-        amd->setDebugFlags(false, false, fgDebugView_);
+        b->setDebugView(fgDebugView_);
     }
     if (auto* b = manager_.getBackend(FrameGenerationBackend::NvidiaDlssG)) {
-        auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-        sl->setDebugView(fgDebugView_);
+        b->setDebugView(fgDebugView_);
     }
 }
 
@@ -180,6 +183,39 @@ bool FgRuntime::isMotionNeeded() const {
     return configuredBackend_ != FrameGenerationBackend::Off &&
            configuredBackend_ != failedBackend_ &&
            !D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc();
+}
+
+void FgRuntime::setTelemetryTimingEnabled(bool enabled) {
+    presenter_.setTelemetryTimingEnabled(enabled);
+}
+
+void FgRuntime::setFrameLimitFps(float maxFps) {
+    const float clamped = (maxFps > 0.0f) ? maxFps : 0.0f;
+    if (frameLimitFps_.load(std::memory_order_relaxed) == clamped) return;
+    frameLimitFps_.store(clamped, std::memory_order_relaxed);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (auto* b = manager_.getBackend(FrameGenerationBackend::NvidiaDlssG)) {
+        auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
+        sl->setFrameLimitFps(clamped);
+        reflexLimiterActive_.store(
+            manager_.selectedBackend() == FrameGenerationBackend::NvidiaDlssG &&
+                sl->isReflexFrameLimiterActive(),
+            std::memory_order_relaxed);
+    }
+}
+
+bool FgRuntime::isReflexFrameLimiterActive() const {
+    return reflexLimiterActive_.load(std::memory_order_relaxed);
+}
+
+void FgRuntime::onMainSceneRenderStart() {
+    if (!nvidiaFgActive_.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (manager_.selectedBackend() != FrameGenerationBackend::NvidiaDlssG) return;
+    if (auto* b = manager_.getBackend(FrameGenerationBackend::NvidiaDlssG)) {
+        static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b))
+            ->markRenderSubmitStart();
+    }
 }
 
 bool FgRuntime::handleWindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* outResult) {
@@ -349,67 +385,85 @@ bool FgRuntime::ensureBridgeResources(ID3D11Device* dev11,
     auto& bridge = presenter_.bridge();
     const DXGI_FORMAT cleanOutFmt = canonicalNonSrgbFormat(bbFormat);
 
-    if (!sharedHudless_.isValid() || sharedHudless_.width != outW ||
-        sharedHudless_.height != outH || sharedHudless_.format != cleanOutFmt) {
-        sharedHudless_.reset();
-        if (!bridge.createSharedTexture(
-                outW, outH, cleanOutFmt,
-                D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
-                sharedHudless_)) {
-            return false;
+    for (uint32_t i = 0; i < kSharedSlotCount; ++i) {
+        if (!sharedHudless_[i].isValid() || sharedHudless_[i].width != outW ||
+            sharedHudless_[i].height != outH || sharedHudless_[i].format != cleanOutFmt) {
+            sharedHudless_[i].reset();
+            if (!bridge.createSharedTexture(
+                    outW, outH, cleanOutFmt,
+                    D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+                    sharedHudless_[i])) {
+                return false;
+            }
+            char n11[64]{};
+            char n12[64]{};
+            std::snprintf(n11, sizeof(n11), "EDPE_FgSharedHudless_%u_D3D11", i);
+            std::snprintf(n12, sizeof(n12), "EDPE_FgSharedHudless_%u_D3D12", i);
+            SetD3D11DebugName(sharedHudless_[i].d3d11.Get(), n11);
+            SetD3D12DebugName(sharedHudless_[i].d3d12.Get(), n12);
         }
-        SetD3D11DebugName(sharedHudless_.d3d11.Get(), "EDPE_FgSharedHudless_D3D11");
-        SetD3D12DebugName(sharedHudless_.d3d12.Get(), "EDPE_FgSharedHudless_D3D12");
-    }
 
-    if (!sharedUi_.isValid() || sharedUi_.width != outW || sharedUi_.height != outH) {
-        sharedUiUav_.Reset();
-        sharedUi_.reset();
-        if (!bridge.createSharedTexture(
-                outW, outH, DXGI_FORMAT_R8G8B8A8_UNORM,
-                D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
-                sharedUi_)) {
-            return false;
+        if (!sharedUi_[i].isValid() || sharedUi_[i].width != outW || sharedUi_[i].height != outH) {
+            sharedUiUav_[i].Reset();
+            sharedUi_[i].reset();
+            if (!bridge.createSharedTexture(
+                    outW, outH, DXGI_FORMAT_R8G8B8A8_UNORM,
+                    D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+                    sharedUi_[i])) {
+                return false;
+            }
+            D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+            uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+            if (FAILED(dev11->CreateUnorderedAccessView(sharedUi_[i].d3d11.Get(), &uavDesc, &sharedUiUav_[i]))) {
+                return false;
+            }
+            char n11[64]{};
+            char n12[64]{};
+            std::snprintf(n11, sizeof(n11), "EDPE_FgSharedUi_%u_D3D11", i);
+            std::snprintf(n12, sizeof(n12), "EDPE_FgSharedUi_%u_D3D12", i);
+            SetD3D11DebugName(sharedUi_[i].d3d11.Get(), n11);
+            SetD3D12DebugName(sharedUi_[i].d3d12.Get(), n12);
         }
-        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-        uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-        if (FAILED(dev11->CreateUnorderedAccessView(sharedUi_.d3d11.Get(), &uavDesc, &sharedUiUav_))) {
-            return false;
-        }
-        SetD3D11DebugName(sharedUi_.d3d11.Get(), "EDPE_FgSharedUi_D3D11");
-        SetD3D12DebugName(sharedUi_.d3d12.Get(), "EDPE_FgSharedUi_D3D12");
-    }
 
-    if (!sharedDepth_.isValid() || sharedDepth_.width != renderW || sharedDepth_.height != renderH) {
-        sharedDepthUav_.Reset();
-        sharedDepth_.reset();
-        if (!bridge.createSharedTexture(
-                renderW, renderH, DXGI_FORMAT_R32_FLOAT,
-                D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
-                sharedDepth_)) {
-            return false;
+        if (!sharedDepth_[i].isValid() || sharedDepth_[i].width != renderW || sharedDepth_[i].height != renderH) {
+            sharedDepthUav_[i].Reset();
+            sharedDepth_[i].reset();
+            if (!bridge.createSharedTexture(
+                    renderW, renderH, DXGI_FORMAT_R32_FLOAT,
+                    D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+                    sharedDepth_[i])) {
+                return false;
+            }
+            D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+            uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+            uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+            if (FAILED(dev11->CreateUnorderedAccessView(sharedDepth_[i].d3d11.Get(), &uavDesc, &sharedDepthUav_[i]))) {
+                return false;
+            }
+            char n11[64]{};
+            char n12[64]{};
+            std::snprintf(n11, sizeof(n11), "EDPE_FgSharedDepth_%u_D3D11", i);
+            std::snprintf(n12, sizeof(n12), "EDPE_FgSharedDepth_%u_D3D12", i);
+            SetD3D11DebugName(sharedDepth_[i].d3d11.Get(), n11);
+            SetD3D12DebugName(sharedDepth_[i].d3d12.Get(), n12);
         }
-        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-        uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
-        uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-        if (FAILED(dev11->CreateUnorderedAccessView(sharedDepth_.d3d11.Get(), &uavDesc, &sharedDepthUav_))) {
-            return false;
-        }
-        SetD3D11DebugName(sharedDepth_.d3d11.Get(), "EDPE_FgSharedDepth_D3D11");
-        SetD3D12DebugName(sharedDepth_.d3d12.Get(), "EDPE_FgSharedDepth_D3D12");
-    }
 
-    if (!sharedMvec_.isValid() || sharedMvec_.width != renderW || sharedMvec_.height != renderH) {
-        sharedMvec_.reset();
-        if (!bridge.createSharedTexture(
-                renderW, renderH, DXGI_FORMAT_R16G16_FLOAT,
-                D3D11_BIND_SHADER_RESOURCE,
-                sharedMvec_)) {
-            return false;
+        if (!sharedMvec_[i].isValid() || sharedMvec_[i].width != renderW || sharedMvec_[i].height != renderH) {
+            sharedMvec_[i].reset();
+            if (!bridge.createSharedTexture(
+                    renderW, renderH, DXGI_FORMAT_R16G16_FLOAT,
+                    D3D11_BIND_SHADER_RESOURCE,
+                    sharedMvec_[i])) {
+                return false;
+            }
+            char n11[64]{};
+            char n12[64]{};
+            std::snprintf(n11, sizeof(n11), "EDPE_FgSharedMvec_%u_D3D11", i);
+            std::snprintf(n12, sizeof(n12), "EDPE_FgSharedMvec_%u_D3D12", i);
+            SetD3D11DebugName(sharedMvec_[i].d3d11.Get(), n11);
+            SetD3D12DebugName(sharedMvec_[i].d3d12.Get(), n12);
         }
-        SetD3D11DebugName(sharedMvec_.d3d11.Get(), "EDPE_FgSharedMvec_D3D11");
-        SetD3D12DebugName(sharedMvec_.d3d12.Get(), "EDPE_FgSharedMvec_D3D12");
     }
 
     if (!uiPackPassInitialized_) {
@@ -421,11 +475,14 @@ bool FgRuntime::ensureBridgeResources(ID3D11Device* dev11,
 bool FgRuntime::extractDepthToShared(ID3D11DeviceContext* ctx,
                                      ID3D11ShaderResourceView* depthSrv,
                                      uint32_t renderW,
-                                     uint32_t renderH) {
-    if (!ctx || !depthSrv || !depthExtractCs_ || !sharedDepthUav_) return false;
+                                     uint32_t renderH,
+                                     uint32_t slot) {
+    if (!ctx || !depthSrv || !depthExtractCs_ || slot >= kSharedSlotCount || !sharedDepthUav_[slot]) {
+        return false;
+    }
     ctx->CSSetShader(depthExtractCs_.Get(), nullptr, 0);
     ID3D11ShaderResourceView* srvs[1] = {depthSrv};
-    ID3D11UnorderedAccessView* uavs[1] = {sharedDepthUav_.Get()};
+    ID3D11UnorderedAccessView* uavs[1] = {sharedDepthUav_[slot].Get()};
     ctx->CSSetShaderResources(0, 1, srvs);
     ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
     ctx->Dispatch((renderW + 7u) / 8u, (renderH + 7u) / 8u, 1u);
@@ -439,18 +496,20 @@ bool FgRuntime::extractDepthToShared(ID3D11DeviceContext* ctx,
 }
 
 void FgRuntime::releaseBridgeResources() {
-    sharedUiUav_.Reset();
-    sharedDepthUav_.Reset();
-    sharedHudless_.reset();
-    sharedUi_.reset();
-    sharedDepth_.reset();
-    sharedMvec_.reset();
+    for (auto& u : sharedUiUav_) u.Reset();
+    for (auto& u : sharedDepthUav_) u.Reset();
+    for (auto& s : sharedHudless_) s.reset();
+    for (auto& s : sharedUi_) s.reset();
+    for (auto& s : sharedDepth_) s.reset();
+    for (auto& s : sharedMvec_) s.reset();
     depthExtractCs_.Reset();
     uiPackPass_.shutdown();
     uiPackPassInitialized_ = false;
 }
 
-void FgRuntime::shutdownLocked(bool keepBridge) {
+void FgRuntime::shutdownLocked() {
+    nvidiaFgActive_.store(false, std::memory_order_relaxed);
+    reflexLimiterActive_.store(false, std::memory_order_relaxed);
     presenter_.setPrePresentCallback(nullptr, nullptr);
     if (presenter_.isInitialized()) {
         presenter_.bridge().waitGpuIdle();
@@ -461,17 +520,23 @@ void FgRuntime::shutdownLocked(bool keepBridge) {
     destroyOverlayWindow();
     trackedSwapChain_ = nullptr;
     gameHwnd_ = nullptr;
+    cachedDev11_.Reset();
+    cachedCtx11_.Reset();
+    cachedCtx4_.Reset();
+    cachedScHwnd_ = nullptr;
     monotonicFrameIndex_ = 0;
 
     telemetry_.active = false;
     telemetry_.activeBackend = FrameGenerationBackend::Off;
     telemetry_.generatedFramesThisCycle = 0;
+    telemetry_.presentedFramesThisCycle = 1;
     telemetry_.renderedFps = 0.0f;
     telemetry_.presentedFps = 0.0f;
     telemetry_.fgGpuTimeMs = 0.0f;
 }
 
 void FgRuntime::shutdown() {
+    joinProbeThread();
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     shutdownLocked(false);
 }
@@ -492,13 +557,9 @@ void FgRuntime::onSwapChainRelease(IUnknown* object) {
     }
 }
 
-void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
-    {
-        std::lock_guard<std::recursive_mutex> lock(mutex_);
-        if (capabilitiesProbed_ || !d3d11Device) return;
-        // Mark probed immediately under lock so concurrent/re-entrant calls cannot double-probe.
-        capabilitiesProbed_ = true;
-    }
+void FgRuntime::startCapabilitiesProbeAsync(ID3D11Device* d3d11Device) {
+    if (!d3d11Device) return;
+    if (probeStarted_.exchange(true, std::memory_order_acq_rel)) return;
 
     if (D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc()) {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -506,6 +567,7 @@ void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
         dlssgCapAvailable_ = false;
         std::wcsncpy(amdUnavailableReason_, L"Blocked while Windows renderdoc.dll is active.", 255);
         std::wcsncpy(dlssgUnavailableReason_, L"Blocked while Windows renderdoc.dll is active.", 255);
+        capabilitiesProbed_ = true;
         return;
     }
 
@@ -529,42 +591,76 @@ void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
         adapter->GetDesc(&desc);
     }
 
-    bool localDlssgAvail = false;
-    wchar_t localDlssgReason[256]{};
     if (desc.VendorId != 0x10DE) {
-        std::wcsncpy(localDlssgReason,
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        amdDllAvailable_ = localAmdAvail;
+        if (!amdDllAvailable_ && localAmdReason[0]) {
+            std::wcsncpy(amdUnavailableReason_, localAmdReason, 255);
+        }
+        dlssgCapAvailable_ = false;
+        std::wcsncpy(dlssgUnavailableReason_,
                      L"Requires an NVIDIA GeForce RTX 40+ / 50+ GPU.", 255);
-    } else {
-#if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
+        capabilitiesProbed_ = true;
+        return;
+    }
+
+#if !(defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE)
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        amdDllAvailable_ = localAmdAvail;
+        if (!amdDllAvailable_ && localAmdReason[0]) {
+            std::wcsncpy(amdUnavailableReason_, localAmdReason, 255);
+        }
+        dlssgCapAvailable_ = false;
+        std::wcsncpy(dlssgUnavailableReason_,
+                     L"Built without NVIDIA Streamline SDK headers.", 255);
+        capabilitiesProbed_ = true;
+    }
+#else
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        amdDllAvailable_ = localAmdAvail;
+        if (!amdDllAvailable_ && localAmdReason[0]) {
+            std::wcsncpy(amdUnavailableReason_, localAmdReason, 255);
+        }
+        std::wcsncpy(dlssgUnavailableReason_,
+                     L"Probing NVIDIA DLSS-G capabilities...", 255);
+    }
+
+    const LUID adapterLuid = desc.AdapterLuid;
+    probeInProgress_.store(true, std::memory_order_release);
+    probeThread_ = std::thread([this, adapterLuid]() {
         // Perform LUID-only Streamline capability probe WITHOUT holding mutex_ and without
         // creating a temporary D3D12 device or calling slSetD3DDevice (Streamline DLSS-G §3.0).
         StreamlineStatusSnapshot snap{};
-        localDlssgAvail = NvidiaStreamlineFgBackend::probeCapabilitiesForLuid(
-            desc.AdapterLuid, &snap);
-        if (!localDlssgAvail && snap.unavailableReason[0] != L'\0') {
-            std::wcsncpy(localDlssgReason, snap.unavailableReason, 255);
-        }
-#else
-        std::wcsncpy(localDlssgReason,
-                     L"Built without NVIDIA Streamline SDK headers.", 255);
-#endif
-    }
+        const bool localDlssgAvail =
+            NvidiaStreamlineFgBackend::probeCapabilitiesForLuid(adapterLuid, &snap);
 
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    amdDllAvailable_ = localAmdAvail;
-    if (!amdDllAvailable_ && localAmdReason[0]) {
-        std::wcsncpy(amdUnavailableReason_, localAmdReason, 255);
-    }
-    dlssgCapAvailable_ = localDlssgAvail;
-    if (!dlssgCapAvailable_ && localDlssgReason[0]) {
-        std::wcsncpy(dlssgUnavailableReason_, localDlssgReason, 255);
-    }
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        dlssgCapAvailable_ = localDlssgAvail;
+        if (!dlssgCapAvailable_ && snap.unavailableReason[0] != L'\0') {
+            std::wcsncpy(dlssgUnavailableReason_, snap.unavailableReason, 255);
+        }
+        capabilitiesProbed_ = true;
+        probeInProgress_.store(false, std::memory_order_release);
+    });
+#endif
+}
+
+bool FgRuntime::isCapabilitiesProbeInProgress() const {
+    return probeInProgress_.load(std::memory_order_acquire);
+}
+
+void FgRuntime::ensureCapabilitiesProbed(ID3D11Device* d3d11Device) {
+    startCapabilitiesProbeAsync(d3d11Device);
+    joinProbeThread();
 }
 
 void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
                           UINT syncInterval,
                           UINT flags,
-                          bool* outPresentedViaProxy) {
+                          bool* outPresentedViaProxy,
+                          bool overlayMenuVisible) {
     if (outPresentedViaProxy) *outPresentedViaProxy = false;
     if (!gameSwapChain || (flags & DXGI_PRESENT_TEST)) return;
 
@@ -591,6 +687,12 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
         return;
     }
 
+    if (configuredBackend_ == FrameGenerationBackend::NvidiaDlssG &&
+        probeInProgress_.load(std::memory_order_acquire)) {
+        std::wcsncpy(telemetry_.statusMessage, L"Probing NVIDIA DLSS-G capabilities...", 255);
+        return;
+    }
+
     BOOL isFullscreen = FALSE;
     if (SUCCEEDED(gameSwapChain->GetFullscreenState(&isFullscreen, nullptr)) && isFullscreen) {
         if (presenter_.isInitialized()) {
@@ -603,20 +705,23 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
         return;
     }
 
-    DXGI_SWAP_CHAIN_DESC scDesc{};
-    if (FAILED(gameSwapChain->GetDesc(&scDesc)) || !scDesc.OutputWindow) {
-        return;
-    }
-
-    Microsoft::WRL::ComPtr<ID3D11Device> dev11;
-    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx11;
-    Microsoft::WRL::ComPtr<ID3D11DeviceContext4> ctx4;
-    if (FAILED(gameSwapChain->GetDevice(IID_PPV_ARGS(&dev11))) || !dev11) {
-        return;
-    }
-    dev11->GetImmediateContext(&ctx11);
-    if (!ctx11 || FAILED(ctx11.As(&ctx4))) {
-        return;
+    Microsoft::WRL::ComPtr<ID3D11Device> dev11 = cachedDev11_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx11 = cachedCtx11_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext4> ctx4 = cachedCtx4_;
+    HWND scHwnd = cachedScHwnd_;
+    if (trackedSwapChain_ != gameSwapChain || !dev11 || !ctx11 || !ctx4 || !scHwnd) {
+        DXGI_SWAP_CHAIN_DESC scDesc{};
+        if (FAILED(gameSwapChain->GetDesc(&scDesc)) || !scDesc.OutputWindow) {
+            return;
+        }
+        scHwnd = scDesc.OutputWindow;
+        if (FAILED(gameSwapChain->GetDevice(IID_PPV_ARGS(&dev11))) || !dev11) {
+            return;
+        }
+        dev11->GetImmediateContext(&ctx11);
+        if (!ctx11 || FAILED(ctx11.As(&ctx4))) {
+            return;
+        }
     }
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> gameBackbuffer;
@@ -629,7 +734,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
 
     if (presenter_.isInitialized() &&
         (trackedSwapChain_ != gameSwapChain ||
-         gameHwnd_ != scDesc.OutputWindow ||
+         gameHwnd_ != scHwnd ||
          presenter_.width() != bbDesc.Width ||
          presenter_.height() != bbDesc.Height ||
          presenter_.format() != cleanFormat)) {
@@ -637,7 +742,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     }
 
     if (!presenter_.isInitialized()) {
-        if (!ensureOverlayWindow(scDesc.OutputWindow, bbDesc.Width, bbDesc.Height)) {
+        if (!ensureOverlayWindow(scHwnd, bbDesc.Width, bbDesc.Height)) {
             failedBackend_ = configuredBackend_;
             telemetry_.initFailed = true;
             std::wcsncpy(telemetry_.statusMessage, L"Failed to create child overlay HWND", 255);
@@ -654,16 +759,21 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
         trackedSwapChain_ = gameSwapChain;
     }
 
+    cachedDev11_ = dev11;
+    cachedCtx11_ = ctx11;
+    cachedCtx4_ = ctx4;
+    cachedScHwnd_ = scHwnd;
+
     if (manager_.selectedBackend() != configuredBackend_) {
         if (auto* b = manager_.getBackend(FrameGenerationBackend::NvidiaDlssG)) {
-            auto* sl = static_cast<NvidiaStreamlineFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
+            auto* sl = static_cast<NvidiaStreamlineFgBackend*>(b);
             sl->setLowLatencyBoost(reflexBoost_);
             sl->setDynamicMfgMode(dynamicMfg_, dynamicTargetFps_);
-            sl->setDebugView(fgDebugView_);
+            sl->setFrameLimitFps(frameLimitFps_.load(std::memory_order_relaxed));
+            b->setDebugView(fgDebugView_);
         }
         if (auto* b = manager_.getBackend(FrameGenerationBackend::AmdFsrFg)) {
-            auto* amd = static_cast<AmdFsrFgBackend*>(const_cast<IFrameGenerationBackend*>(b));
-            amd->setDebugFlags(false, false, fgDebugView_);
+            b->setDebugView(fgDebugView_);
         }
         if (!manager_.selectBackend(configuredBackend_, &presenter_)) {
             const wchar_t* reason = backendUnavailableReasonLocked(configuredBackend_);
@@ -707,49 +817,73 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     in.renderHeight = renderH;
     in.outputWidth = bbDesc.Width;
     in.outputHeight = bbDesc.Height;
+    in.overlayMenuVisible = overlayMenuVisible;
     in.frameTimeMs = (hasSnap && snap.frameTimeMs > 0.0f) ? snap.frameTimeMs : 16.6667f;
     in.frameIndex = monotonicFrameIndex_;
     in.reset = !hasSnap || snap.reset || (monotonicFrameIndex_ == 1);
     in.isHdr = hasSnap ? snap.colorIsHdr : false;
     in.isPauseOrMenu = !canGenerateThisFrame;
 
+    const uint32_t slot = presenter_.nextSharedSlot();
     if (canGenerateThisFrame) {
-        // Ensure D3D12 (PrepareV2 + FG Present) from the previous frame has finished reading
-        // shared bridge textures before D3D11 overwrites them for the current frame.
-        presenter_.waitForLastPresentOnD3D11(ctx4.Get());
+        // Ensure D3D12 (PrepareV2 + FG Present) from the previous use of this ring slot
+        // has finished reading shared bridge textures before D3D11 overwrites them.
+        presenter_.waitForSharedSlotOnD3D11(ctx4.Get(), slot);
 
         D3D11_TEXTURE2D_DESC mvDesc{};
         snap.motionVectorsTex->GetDesc(&mvDesc);
         if (mvDesc.Width == renderW && mvDesc.Height == renderH &&
             mvDesc.Format == DXGI_FORMAT_R16G16_FLOAT) {
-            ctx11->CopyResource(sharedMvec_.d3d11.Get(), snap.motionVectorsTex);
-            in.motionVectors = sharedMvec_.d3d12.Get();
+            ctx11->CopyResource(sharedMvec_[slot].d3d11.Get(), snap.motionVectorsTex);
+            in.motionVectors = sharedMvec_[slot].d3d12.Get();
         }
-        if (extractDepthToShared(ctx11.Get(), snap.depthSrv, renderW, renderH)) {
-            in.depth = sharedDepth_.d3d12.Get();
+        bool depthCopied = false;
+        if (snap.depthTex) {
+            D3D11_TEXTURE2D_DESC dDesc{};
+            snap.depthTex->GetDesc(&dDesc);
+            if (dDesc.Width == renderW && dDesc.Height == renderH &&
+                dDesc.MipLevels == 1 && dDesc.ArraySize == 1 &&
+                dDesc.SampleDesc.Count == 1 &&
+                (dDesc.Format == DXGI_FORMAT_R32_FLOAT ||
+                 dDesc.Format == DXGI_FORMAT_R32_TYPELESS ||
+                 dDesc.Format == DXGI_FORMAT_D32_FLOAT)) {
+                ctx11->CopyResource(sharedDepth_[slot].d3d11.Get(), snap.depthTex);
+                in.depth = sharedDepth_[slot].d3d12.Get();
+                depthCopied = true;
+            }
+        }
+        if (!depthCopied && extractDepthToShared(ctx11.Get(), snap.depthSrv, renderW, renderH, slot)) {
+            in.depth = sharedDepth_[slot].d3d12.Get();
         }
         if (snap.hudlessColorTex) {
             D3D11_TEXTURE2D_DESC hlDesc{};
             snap.hudlessColorTex->GetDesc(&hlDesc);
             if (hlDesc.Width == bbDesc.Width && hlDesc.Height == bbDesc.Height &&
                 areCopyCompatible(hlDesc.Format, cleanFormat)) {
-                ctx11->CopyResource(sharedHudless_.d3d11.Get(), snap.hudlessColorTex);
-                in.hudlessColor = sharedHudless_.d3d12.Get();
+                ctx11->CopyResource(sharedHudless_[slot].d3d11.Get(), snap.hudlessColorTex);
+                in.hudlessColor = sharedHudless_[slot].d3d12.Get();
             }
         }
-        if (snap.uiHdrSrv || snap.uiLdrSrv || snap.uiMultSrv) {
-            const float clearZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            ctx11->ClearUnorderedAccessViewFloat(sharedUiUav_.Get(), clearZero);
+        const bool skipUiPackForAmd =
+            (manager_.selectedBackend() == FrameGenerationBackend::AmdFsrFg &&
+             in.hudlessColor != nullptr);
+        if (!skipUiPackForAmd && (snap.uiHdrSrv || snap.uiLdrSrv || snap.uiMultSrv)) {
             if (uiPackPass_.pack(snap.uiHdrSrv,
                                   snap.uiLdrSrv,
                                   snap.uiMultSrv,
                                   snap.uiMultSrv != nullptr,
                                   bbDesc.Width,
                                   bbDesc.Height,
-                                  sharedUi_.d3d11.Get(),
-                                  sharedUiUav_.Get())) {
-                in.packedUiColorAndAlpha = sharedUi_.d3d12.Get();
+                                  sharedUi_[slot].d3d11.Get(),
+                                  sharedUiUav_[slot].Get())) {
+                in.packedUiColorAndAlpha = sharedUi_[slot].d3d12.Get();
             }
+        } else if (manager_.selectedBackend() == FrameGenerationBackend::NvidiaDlssG &&
+                   in.hudlessColor != nullptr &&
+                   sharedUi_[slot].isValid() && sharedUiUav_[slot]) {
+            static constexpr FLOAT kZeroUi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            ctx11->ClearUnorderedAccessViewFloat(sharedUiUav_[slot].Get(), kZeroUi);
+            in.packedUiColorAndAlpha = sharedUi_[slot].d3d12.Get();
         }
         in.finalBackbuffer = presenter_.currentBackBuffer();
         in.jitterX = snap.jitterX;
@@ -782,8 +916,18 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     HRESULT presentHr = E_FAIL;
     double copyMs = 0.0;
     const bool presentedOk = presenter_.presentFromD3D11Texture(
-        ctx4.Get(), gameBackbuffer.Get(), syncInterval, flags, &presentHr, &copyMs);
+        ctx4.Get(), gameBackbuffer.Get(), syncInterval, flags, &presentHr, &copyMs, canGenerateThisFrame);
     presenter_.setPrePresentCallback(nullptr, nullptr);
+
+    const bool isNv = (manager_.selectedBackend() == FrameGenerationBackend::NvidiaDlssG);
+    nvidiaFgActive_.store(presentedOk && isNv, std::memory_order_relaxed);
+    bool rlActive = false;
+    if (presentedOk && isNv) {
+        if (const auto* b = manager_.activeBackend()) {
+            rlActive = static_cast<const NvidiaStreamlineFgBackend*>(b)->isReflexFrameLimiterActive();
+        }
+    }
+    reflexLimiterActive_.store(rlActive, std::memory_order_relaxed);
 
     lastCopyMs_ = copyMs;
 
@@ -792,6 +936,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     telemetry_.activeBackend = manager_.selectedBackend();
     telemetry_.pausedForMenu = in.isPauseOrMenu;
     telemetry_.generatedFramesThisCycle = mgrDiag.generatedFramesThisCycle;
+    telemetry_.presentedFramesThisCycle = mgrDiag.presentedFramesThisCycle;
     telemetry_.totalGeneratedFrames = mgrDiag.totalGeneratedFrames;
     telemetry_.renderedFps = mgrDiag.renderedFps;
     telemetry_.presentedFps = mgrDiag.presentedFps;

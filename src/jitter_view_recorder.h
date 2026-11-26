@@ -111,6 +111,7 @@ private:
     std::atomic<bool> hasSavedLog_{false};
 
     bool restoreDebugView_ = false;
+    bool restoreFgDebugView_ = false;
     LARGE_INTEGER qpcStart_{};
     LARGE_INTEGER qpcFreq_{};
     uint32_t drainingFramesLeft_ = 0;

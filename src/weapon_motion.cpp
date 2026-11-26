@@ -59,9 +59,9 @@ bool WeaponMotionTracker::initialize(ID3D11Device* device) {
 
     Microsoft::WRL::ComPtr<ID3DBlob> vsBlob, psBlob;
     if (FAILED(D3DCompile(kWeaponMotionRasterShader, sizeof(kWeaponMotionRasterShader) - 1,
-            nullptr, nullptr, nullptr, "vs_main", "vs_5_0", 0, 0, &vsBlob, nullptr)) ||
+            nullptr, nullptr, nullptr, "vs_main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, nullptr)) ||
         FAILED(D3DCompile(kWeaponMotionRasterShader, sizeof(kWeaponMotionRasterShader) - 1,
-            nullptr, nullptr, nullptr, "ps_main", "ps_5_0", 0, 0, &psBlob, nullptr)) ||
+            nullptr, nullptr, nullptr, "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, nullptr)) ||
         FAILED(device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
             nullptr, &rasterVs_)) ||
         FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(),

@@ -700,6 +700,167 @@ int main() {
     if (edpe::computeEffectiveJitterPhaseCount(4, 2560, 1440, 2560, 1440) != 8u) return 121;
     if (edpe::computeEffectiveJitterPhaseCount(128, 2560, 1440, 2560, 1440) != 64u) return 122;
 
+    // Default (basePhases == 0) defaults to 8 at NativeAA (1.0x) and scales via ceil(8 * scale^2)
+    if (edpe::computeEffectiveJitterPhaseCount(0, 2560, 1440, 2560, 1440) != 8u) return 1221;
+    if (edpe::computeEffectiveJitterPhaseCount(0, 1707, 960, 2560, 1440) != 18u) return 1222;
+    if (edpe::computeEffectiveJitterPhaseCount(0, 1280, 720, 2560, 1440) != 32u) return 1223;
+    if (edpe::computeEffectiveJitterPhaseCount(0, 1280, 720, 3840, 2160) != 72u) return 1224;
+
+    // Karis reversible tone compression + YCoCg round-trip & R11G11B10_FLOAT safe clamp verification
+    {
+        auto tonemapKaris = [](float r, float g, float b, float& outR, float& outG, float& outB) {
+            r = (r > 0.0f) ? r : 0.0f;
+            g = (g > 0.0f) ? g : 0.0f;
+            b = (b > 0.0f) ? b : 0.0f;
+            const float peak = (std::max)(r, (std::max)(g, b));
+            const float inv = 1.0f / (1.0f + peak);
+            outR = r * inv; outG = g * inv; outB = b * inv;
+        };
+        auto rgbToYCoCg = [](float r, float g, float b, float& y, float& co, float& cg) {
+            y  =  0.25f * r + 0.5f * g + 0.25f * b;
+            co =  0.5f  * r            - 0.5f  * b;
+            cg = -0.25f * r + 0.5f * g - 0.25f * b;
+        };
+        auto yCoCgToRgb = [](float y, float co, float cg, float& r, float& g, float& b) {
+            r = (std::max)(y + co - cg, 0.0f);
+            g = (std::max)(y + cg,      0.0f);
+            b = (std::max)(y - co - cg, 0.0f);
+        };
+        auto invTonemapKaris = [](float r, float g, float b, float& outR, float& outG, float& outB) {
+            r = (r > 0.0f) ? r : 0.0f;
+            g = (g > 0.0f) ? g : 0.0f;
+            b = (b > 0.0f) ? b : 0.0f;
+            const float peak = (std::max)(r, (std::max)(g, b));
+            const float denom = (std::max)(1.0f - peak, 1.0f / 65504.0f);
+            outR = (std::min)(r / denom, 65024.0f);
+            outG = (std::min)(g / denom, 65024.0f);
+            outB = (std::min)(b / denom, 64512.0f);
+        };
+
+        // HDR value > 1.0 must round-trip without clipping to 1.0
+        float kr, kg, kb, y, co, cg, ur, ug, ub, fr, fg, fb;
+        tonemapKaris(12.5f, 3.25f, 0.75f, kr, kg, kb);
+        rgbToYCoCg(kr, kg, kb, y, co, cg);
+        yCoCgToRgb(y, co, cg, ur, ug, ub);
+        invTonemapKaris(ur, ug, ub, fr, fg, fb);
+        if (!std::isfinite(fr) || !std::isfinite(fg) || !std::isfinite(fb)) return 1225;
+        if (std::fabs(fr - 12.5f) > 1e-3f || std::fabs(fg - 3.25f) > 1e-3f || std::fabs(fb - 0.75f) > 1e-3f) return 1226;
+
+        // Extreme HDR / saturated compressed value must clamp below R11G11B10_FLOAT max with no NaN/Inf
+        invTonemapKaris(1.0f, 1.0f, 1.0f, fr, fg, fb);
+        if (!std::isfinite(fr) || !std::isfinite(fg) || !std::isfinite(fb)) return 1227;
+        if (fr > 65024.0f || fg > 65024.0f || fb > 64512.0f) return 1228;
+    }
+
+    // Status.json Flags bit 26 (InSRV), Flags2 (OnFoot), and GuiFocus (6..9) parsing + cockpit clamp limits
+    {
+        // Ship cockpit (neither OnFoot nor InSRV)
+        const auto ship = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":16777224,"Flags2":0,"GuiFocus":0})");
+        if (ship.mapGuiFocus || ship.onFoot || ship.inSrv) return 1230;
+        if (edpe::computeCockpitClampMaxMeters(ship.onFoot, ship.inSrv) != 150.0f) return 1231;
+
+        // InSRV (Flags bit 26 = 67108864 = 0x04000000) -> caps near-field split to 3.5 m
+        const auto srv = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":67108864,"Flags2":0,"GuiFocus":0})");
+        if (srv.mapGuiFocus || srv.onFoot || !srv.inSrv) return 1232;
+        if (edpe::computeCockpitClampMaxMeters(srv.onFoot, srv.inSrv) != 3.5f) return 1233;
+
+        // OnFoot (Flags2 bit 0 = 1) -> disables cockpit clamping (0.0 m)
+        const auto foot = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":0,"Flags2":1,"GuiFocus":0})");
+        if (foot.mapGuiFocus || !foot.onFoot || foot.inSrv) return 1234;
+        if (edpe::computeCockpitClampMaxMeters(foot.onFoot, foot.inSrv) != 0.0f) return 1235;
+
+        // Map/FSS modes (GuiFocus 6..9)
+        for (int gf = 6; gf <= 9; ++gf) {
+            char json[96]{};
+            std::snprintf(json, sizeof(json), R"({"Flags":0,"Flags2":0,"GuiFocus":%d})", gf);
+            const auto mapState = edpe::parseEliteStatusJsonFlags(json);
+            if (!mapState.mapGuiFocus) return 1236;
+        }
+        const auto cockpitPanel = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":0,"Flags2":0,"GuiFocus":1})");
+        if (cockpitPanel.mapGuiFocus) return 1237;
+
+        // Seated flags (InMainShip / InSRV / InTaxi) must suppress stale Flags2 on-foot bits
+        const auto seatedShipStale = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":16777216,"Flags2":8192,"GuiFocus":0})");
+        if (seatedShipStale.onFoot || seatedShipStale.inSrv) return 1238;
+
+        const auto seatedTaxiStale = edpe::parseEliteStatusJsonFlags(
+            R"({"Flags":0,"Flags2":8194,"GuiFocus":0})");
+        if (seatedTaxiStale.onFoot) return 1239;
+    }
+
+    // 6-DOF cameraDepthMotion accuracy across individual & simultaneous translations and rotations
+    {
+        auto makeCam = [](float px, float py, float pz, float yaw, float pitch, float roll) {
+            const float cy = std::cos(yaw), sy = std::sin(yaw);
+            const float cp = std::cos(pitch), sp = std::sin(pitch);
+            const float cr = std::cos(roll), sr = std::sin(roll);
+            edpe::CameraProjection c{};
+            c.worldFromView[0] = cy * cr + sy * sp * sr;
+            c.worldFromView[1] = -cy * sr + sy * sp * cr;
+            c.worldFromView[2] = sy * cp;
+            c.worldFromView[3] = px;
+            c.worldFromView[4] = cp * sr;
+            c.worldFromView[5] = cp * cr;
+            c.worldFromView[6] = -sp;
+            c.worldFromView[7] = py;
+            c.worldFromView[8] = -sy * cr + cy * sp * sr;
+            c.worldFromView[9] = sy * sr + cy * sp * cr;
+            c.worldFromView[10] = cy * cp;
+            c.worldFromView[11] = pz;
+            c.scaleX = 1.2f;
+            c.scaleY = 1.6f;
+            c.depthB = 0.025f;
+            return c;
+        };
+        struct Case { float vx, vy, vz, yaw, pitch, roll; };
+        const Case cases[] = {
+            {0.16f, 0.0f,  0.0f,  0.0f,   0.0f,   0.0f},   // TranslateX
+            {0.0f,  0.12f, 0.0f,  0.0f,   0.0f,   0.0f},   // TranslateY
+            {0.0f,  0.0f,  0.22f, 0.0f,   0.0f,   0.0f},   // TranslateZ
+            {0.0f,  0.0f,  0.0f,  0.032f, 0.0f,   0.0f},   // RotateYaw
+            {0.0f,  0.0f,  0.0f,  0.0f,   0.025f, 0.0f},   // RotatePitch
+            {0.0f,  0.0f,  0.0f,  0.0f,   0.0f,   0.035f}, // RotateRoll
+            {0.12f, 0.06f, 0.15f, 0.024f, 0.015f, 0.020f}, // Combined6DOF
+        };
+        const auto prevCam = makeCam(0.0f, 0.0f, 0.0f, 0.0f, -0.10f, 0.0f);
+        const float wx = 1.25f, wy = -1.5f, wz = 8.0f;
+        // Project world point into prevCam
+        const auto projectPoint = [](const edpe::CameraProjection& c, float x, float y, float z,
+                                     float& outPx, float& outPy, float& outDepth) -> bool {
+            const float dx = x - c.worldFromView[3];
+            const float dy = y - c.worldFromView[7];
+            const float dz = z - c.worldFromView[11];
+            const float vx = c.worldFromView[0] * dx + c.worldFromView[4] * dy + c.worldFromView[8] * dz;
+            const float vy = c.worldFromView[1] * dx + c.worldFromView[5] * dy + c.worldFromView[9] * dz;
+            const float vz = c.worldFromView[2] * dx + c.worldFromView[6] * dy + c.worldFromView[10] * dz;
+            if (vz <= 0.1f) return false;
+            outPx = (c.scaleX * vx / vz + 1.0f) * 128.0f * 0.5f - 0.5f;
+            outPy = (1.0f - c.scaleY * vy / vz) * 96.0f * 0.5f - 0.5f;
+            outDepth = c.depthB / vz;
+            return true;
+        };
+        float prevPx = 0.0f, prevPy = 0.0f, prevDepth = 0.0f;
+        if (!projectPoint(prevCam, wx, wy, wz, prevPx, prevPy, prevDepth)) return 1240;
+        for (int ci = 0; ci < 7; ++ci) {
+            const auto& cs = cases[ci];
+            const auto nowCam = makeCam(cs.vx, cs.vy, cs.vz, cs.yaw, -0.10f + cs.pitch, cs.roll);
+            float curPx = 0.0f, curPy = 0.0f, curDepth = 0.0f;
+            if (!projectPoint(nowCam, wx, wy, wz, curPx, curPy, curDepth)) return 1241 + ci;
+            float mvX = 0.0f, mvY = 0.0f;
+            if (!edpe::cameraDepthMotion(nowCam, prevCam, 128u, 96u, curPx, curPy, curDepth, &mvX, &mvY)) {
+                return 1250 + ci;
+            }
+            if (std::fabs((curPx + mvX) - prevPx) > 1e-3f || std::fabs((curPy + mvY) - prevPy) > 1e-3f) {
+                return 1260 + ci;
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Stage 3: Per-frame phase consistency audit (checkRowPair & PhasePairAuditor)
     // -------------------------------------------------------------------------
@@ -817,6 +978,27 @@ int main() {
         std::memcpy(badPrologue + 16, &offFlags, sizeof(offFlags));
         std::memcpy(badPrologue + 32, &offBound, sizeof(offBound));
         if (edpe::cobra_camera::verifyRefreshFunctionBytes(badPrologue, sizeof(badPrologue))) return 152;
+
+        // Exact .pdata RUNTIME_FUNCTION entry checks
+        size_t funcBytes = 0;
+        constexpr uintptr_t kFakeBase = 0x140000000ull;
+        if (!edpe::cobra_camera::isExactFunctionEntry(
+                kFakeBase + 0x05921F0u, kFakeBase, 0x05921F0u, 0x0592490u, &funcBytes) ||
+            funcBytes != 0x2A0u) {
+            return 153;
+        }
+        if (edpe::cobra_camera::isExactFunctionEntry(
+                kFakeBase + 0x0592200u, kFakeBase, 0x05921F0u, 0x0592490u, &funcBytes)) {
+            return 154;
+        }
+        if (edpe::cobra_camera::isExactFunctionEntry(
+                kFakeBase + 0x05921F0u, kFakeBase, 0x05921F0u, 0x05921F0u, &funcBytes)) {
+            return 155;
+        }
+        if (edpe::cobra_camera::isExactFunctionEntry(
+                kFakeBase + 0x05921F0u, kFakeBase, 0x0592490u, 0x05921F0u, &funcBytes)) {
+            return 156;
+        }
     }
 
     // -------------------------------------------------------------------------

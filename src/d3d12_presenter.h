@@ -7,6 +7,8 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <shared_mutex>
 #include <vector>
@@ -121,7 +123,8 @@ public:
                                  UINT syncInterval,
                                  UINT flags,
                                  HRESULT* outPresentHr = nullptr,
-                                 double* outGpuCopyMs = nullptr);
+                                 double* outGpuCopyMs = nullptr,
+                                 bool callerWaitedForSlot = false);
 
     // Returns true when Windows renderdoc.dll is in-process, where cross-API shared-handle
     // swapchains are unsupported by RenderDoc and EDPE should fail-open to D3D11 Present.
@@ -143,6 +146,19 @@ public:
     // Queues a GPU-side D3D11 wait for the previous D3D12 Present + FG workload to finish
     // reading shared bridge textures before D3D11 overwrites them on the next frame.
     bool waitForLastPresentOnD3D11(ID3D11DeviceContext4* ctx4) const;
+
+    // Returns the shared ring slot that the next presentFromD3D11Texture() call will use.
+    uint32_t nextSharedSlot() const { return bridge_.nextAllocatorSlot(); }
+
+    // Queues a GPU-side D3D11 wait for the prior D3D12 Present + FG workload on `slot`.
+    void waitForSharedSlotOnD3D11(ID3D11DeviceContext4* ctx4, uint32_t slot) const;
+
+    void setTelemetryTimingEnabled(bool enabled) {
+        telemetryTimingEnabled_.store(enabled, std::memory_order_relaxed);
+    }
+    bool isTelemetryTimingEnabled() const {
+        return telemetryTimingEnabled_.load(std::memory_order_relaxed);
+    }
 
     // Releases backbuffer refs and detaches swapChain_ ownership before an FG library
     // (e.g., FidelityFX WrapDX12) consumes and replaces the swapchain pointer.
@@ -196,11 +212,14 @@ private:
     Microsoft::WRL::ComPtr<IDXGIFactory4> factory_;
     Microsoft::WRL::ComPtr<IDXGISwapChain4> swapChain_;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> backBuffers_;
-    SharedBridgeTexture sharedInput_;
+    std::array<SharedBridgeTexture, D3D11D3D12Bridge::kAllocatorCount> sharedInputs_{};
+    std::array<uint64_t, D3D11D3D12Bridge::kAllocatorCount> slotPresentFence_{};
 
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> queryHeap_;
     Microsoft::WRL::ComPtr<ID3D12Resource> queryReadback_;
+    uint64_t* mappedTimestamps_ = nullptr;
     std::array<bool, D3D11D3D12Bridge::kAllocatorCount> slotHasTimestamp_{};
+    std::atomic<bool> telemetryTimingEnabled_{true};
     PrePresentCmdCallback prePresentCb_ = nullptr;
     void* prePresentUserCtx_ = nullptr;
     PresentMarkerCallback prePresentMarkerCb_ = nullptr;

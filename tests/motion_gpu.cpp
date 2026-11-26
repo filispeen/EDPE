@@ -1115,56 +1115,75 @@ int main() {
     context->Unmap(cls16_rb.Get(), 0);
     if (seam_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 168;
 
-    // Issue #30: WeaponMotionTracker captures D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP with 0xFFFF
-    // strip-cut restart, zeroes unwritten SO tail vertices, and resolves non-zero pixel motion.
-    const std::uint16_t strip_indices[9] = {
-        0, 1, 2, 0xFFFFu, 0, 1, 2, 0, 1
-    };
-    D3D11_BUFFER_DESC strip_ib_desc{};
-    strip_ib_desc.ByteWidth = sizeof(strip_indices);
-    strip_ib_desc.Usage = D3D11_USAGE_IMMUTABLE;
-    strip_ib_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    D3D11_SUBRESOURCE_DATA strip_ib_init{strip_indices, 0, 0};
-    ComPtr<ID3D11Buffer> strip_ib;
-    if (FAILED(device->CreateBuffer(&strip_ib_desc, &strip_ib_init, &strip_ib))) return 169;
-
-    auto bindWeaponStripState = [&]() {
-        bindWeaponDrawState();
-        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        context->IASetIndexBuffer(strip_ib.Get(), DXGI_FORMAT_R16_UINT, 0);
-    };
-
-    bindWeaponStripState();
-    wm_tracker.beginFrame(context.Get(), 4, 4, 0.0f, 0.0f);
-    const float strip_prev_cb[4] = {0.50f, -0.25f, 0.20000f, 0.0f};
-    context->UpdateSubresource(test_cb.Get(), 0, nullptr, strip_prev_cb, 0, 0);
-    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 9u, 0u, 0, invokeDrawIndexed, true)) {
+    // Issue #36 regression test: On-foot world character/corpse pixel with stencil 0x10
+    // at world distance (z = 2.5m >= 0.60m) must use world camera-depth reprojection
+    // (World class) rather than clamping to (0,0) Weapon or taking stale WeaponMotion.
+    std::array<std::uint64_t, 16> corpse_depths{};
+    corpse_depths.fill(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.01f)) |
+                       (static_cast<std::uint64_t>(0x04u) << 32)); // ground at z=2.5m
+    corpse_depths[5] = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.01f)) |
+                       (static_cast<std::uint64_t>(0x14u) << 32); // Flight Suit corpse at z=2.5m (stencil 0x10)
+    D3D11_SUBRESOURCE_DATA corpse_init{corpse_depths.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> corpse_tex;
+    ComPtr<ID3D11ShaderResourceView> corpse_srv;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &corpse_init, &corpse_tex)) ||
+        FAILED(device->CreateShaderResourceView(corpse_tex.Get(), &view_desc, &corpse_srv))) {
+        return 169;
+    }
+    float corpse_expected_x = 0.0f, corpse_expected_y = 0.0f;
+    if (!edpe::cameraDepthMotion(walkNow, walkPrev, 4, 4, 1, 1, 0.01f,
+            &corpse_expected_x, &corpse_expected_y)) {
         return 170;
     }
-    context->OMSetRenderTargets(0, nullptr, nullptr);
-    // First frame of a new strip draw has no matching previous-frame strip entry yet.
-    if (wm_tracker.resolve(context.Get(), 0.0f, 0.0f, 0.0f, 0.0f, false, gate_depth_srv.Get())) {
+    // Case A: without WeaponMotion (on-foot stencil fallback must NOT clamp z>=0.60m to (0,0)).
+    if (!pass.render(corpse_srv.Get(), walkNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, nullptr, nullptr, nullptr, 0u,
+            /*clampCockpit=*/false)) {
         return 171;
     }
-
-    bindWeaponStripState();
-    wm_tracker.beginFrame(context.Get(), 4, 4, 0.0f, 0.0f);
-    const float strip_cur_cb[4] = {0.0f, 0.0f, 0.20000f, 0.0f};
-    context->UpdateSubresource(test_cb.Get(), 0, nullptr, strip_cur_cb, 0, 0);
-    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 9u, 0u, 0, invokeDrawIndexed, true)) {
-        return 172;
-    }
-    context->OMSetRenderTargets(0, nullptr, nullptr);
-    if (!wm_tracker.resolve(context.Get(), 0.0f, 0.0f, 0.0f, 0.0f, false, gate_depth_srv.Get())) {
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 172;
+    const auto* corpse_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float corpse_a_x = DirectX::PackedVector::XMConvertHalfToFloat(corpse_row1[2]);
+    const float corpse_a_y = DirectX::PackedVector::XMConvertHalfToFloat(corpse_row1[3]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(corpse_a_x - corpse_expected_x) >= 0.05f ||
+        std::fabs(corpse_a_y - corpse_expected_y) >= 0.05f) {
         return 173;
     }
-    if (!readWeaponMotionAt11(tie_x, tie_y, tie_d, tie_w)) return 174;
-    if (std::fabs(tie_w - 1.0f) >= 0.02f ||
-        std::fabs(tie_x - 1.00f) >= 0.05f ||
-        std::fabs(tie_y - 0.50f) >= 0.05f ||
-        std::fabs(tie_d - 0.20f) >= 0.02f) {
-        return 175;
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 174;
+    const std::uint8_t corpse_a_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (corpse_a_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::World)) return 175;
+
+    // Case B: with non-zero WeaponMotion (tryWeaponOverride must NOT override z>=0.60m on foot).
+    if (!pass.render(corpse_srv.Get(), walkNow, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, srv_wm_view.Get(), nullptr, nullptr, 0u,
+            /*clampCockpit=*/false)) {
+        return 176;
     }
+    context->CopyResource(readback.Get(), pass.outputTexture());
+    context->CopyResource(cls_rb.Get(), pass.pixelClassTexture());
+    if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 177;
+    const auto* corpse_b_row1 = reinterpret_cast<const std::uint16_t*>(
+        static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch);
+    const float corpse_b_x = DirectX::PackedVector::XMConvertHalfToFloat(corpse_b_row1[2]);
+    const float corpse_b_y = DirectX::PackedVector::XMConvertHalfToFloat(corpse_b_row1[3]);
+    context->Unmap(readback.Get(), 0);
+    if (std::fabs(corpse_b_x - corpse_expected_x) >= 0.05f ||
+        std::fabs(corpse_b_y - corpse_expected_y) >= 0.05f) {
+        return 178;
+    }
+    if (FAILED(context->Map(cls_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 179;
+    const std::uint8_t corpse_b_cls = (static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch)[1];
+    context->Unmap(cls_rb.Get(), 0);
+    if (corpse_b_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::World)) return 180;
 
     return 0;
 }

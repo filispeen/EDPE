@@ -1,8 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string>
+#include <vector>
 #include <filesystem>
 #include <fstream>
 #include <cmath>
@@ -61,10 +64,10 @@ public:
         if (sharpness < 0.0f || sharpness > 1.0f) sharpness = 0.0f;
 
         wchar_t fsrVelBuf[64]{};
-        GetPrivateProfileStringW(L"Upscaler", L"FsrVelocityFactor", L"0.00", fsrVelBuf, 64, path.c_str());
+        GetPrivateProfileStringW(L"Upscaler", L"FsrVelocityFactor", L"0.50", fsrVelBuf, 64, path.c_str());
         fsrVelocityFactor = static_cast<float>(_wtof(fsrVelBuf));
         if (!std::isfinite(fsrVelocityFactor) || fsrVelocityFactor < 0.0f || fsrVelocityFactor > 1.0f) {
-            fsrVelocityFactor = 0.00f;
+            fsrVelocityFactor = 0.50f;
         }
 
         wchar_t mipBuf[64]{};
@@ -104,7 +107,7 @@ public:
         jitterScale = static_cast<float>(_wtof(buf));
         if (jitterScale < 0.0f || jitterScale > 2.0f) jitterScale = 1.0f;
 
-        jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 32, path.c_str());
+        jitterPhaseCount = GetPrivateProfileIntW(L"Jitter", L"PhaseCount", 8, path.c_str());
         wchar_t modeBuf[64]{};
         GetPrivateProfileStringW(L"Jitter", L"Mode", L"auto", modeBuf, 64, path.c_str());
         jitterMode = parseJitterModeString(modeBuf);
@@ -202,6 +205,15 @@ public:
         while (!chainVal.empty() && std::iswspace(chainVal.front())) chainVal.erase(chainVal.begin());
         while (!chainVal.empty() && std::iswspace(chainVal.back())) chainVal.pop_back();
         chainDxgiDll = std::move(chainVal);
+
+        loadingScreenDancer = GetPrivateProfileIntW(L"LoadingScreen", L"DancerEnabled", 1, path.c_str()) != 0;
+        loadingScreenDancerSpin = GetPrivateProfileIntW(L"LoadingScreen", L"DancerSpin", 1, path.c_str()) != 0;
+        loadingScreenDancerAllHolograms = GetPrivateProfileIntW(L"LoadingScreen", L"DancerAllHolograms", 0, path.c_str()) != 0;
+        GetPrivateProfileStringW(L"LoadingScreen", L"DancerSpeed", L"1.0", buf, 64, path.c_str());
+        loadingScreenDancerSpeed = static_cast<float>(_wtof(buf));
+        if (!std::isfinite(loadingScreenDancerSpeed) || loadingScreenDancerSpeed < 0.1f || loadingScreenDancerSpeed > 5.0f) {
+            loadingScreenDancerSpeed = 1.0f;
+        }
     }
 
     void save() {
@@ -332,6 +344,12 @@ public:
         appendSection("Proxy");
         appendWide("ChainDxgiDll", chainDxgiDll.c_str());
 
+        appendSection("LoadingScreen");
+        appendBool("DancerEnabled", loadingScreenDancer);
+        appendBool("DancerSpin", loadingScreenDancerSpin);
+        appendBool("DancerAllHolograms", loadingScreenDancerAllHolograms);
+        appendFloat("DancerSpeed", "%.2f", loadingScreenDancerSpeed);
+
         return out;
     }
 
@@ -353,6 +371,92 @@ public:
         }
     }
 
+    static bool parseEliteCustomConfigVersion(const std::wstring& filename, std::vector<uint32_t>& outVersion) {
+        outVersion.clear();
+        std::wstring lower = filename;
+        for (auto& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
+
+        constexpr wchar_t kPrefix[] = L"custom.";
+        constexpr wchar_t kSuffix[] = L".fxcfg";
+        constexpr size_t kPrefixLen = (sizeof(kPrefix) / sizeof(kPrefix[0])) - 1;
+        constexpr size_t kSuffixLen = (sizeof(kSuffix) / sizeof(kSuffix[0])) - 1;
+        if (lower.size() <= kPrefixLen + kSuffixLen) return false;
+        if (lower.compare(0, kPrefixLen, kPrefix) != 0) return false;
+        if (lower.compare(lower.size() - kSuffixLen, kSuffixLen, kSuffix) != 0) return false;
+
+        const std::wstring verStr = lower.substr(kPrefixLen, lower.size() - kPrefixLen - kSuffixLen);
+        size_t pos = 0;
+        while (pos <= verStr.size()) {
+            const size_t dot = verStr.find(L'.', pos);
+            const size_t end = (dot == std::wstring::npos) ? verStr.size() : dot;
+            if (end == pos) {
+                outVersion.clear();
+                return false;
+            }
+            uint64_t val = 0;
+            for (size_t i = pos; i < end; ++i) {
+                const wchar_t ch = verStr[i];
+                if (ch < L'0' || ch > L'9') {
+                    outVersion.clear();
+                    return false;
+                }
+                val = val * 10u + static_cast<uint64_t>(ch - L'0');
+                if (val > (std::numeric_limits<uint32_t>::max)()) {
+                    outVersion.clear();
+                    return false;
+                }
+            }
+            outVersion.push_back(static_cast<uint32_t>(val));
+            if (dot == std::wstring::npos) break;
+            pos = dot + 1;
+        }
+        return !outVersion.empty();
+    }
+
+    static std::filesystem::path resolveEliteGraphicsConfigPathInDir(const std::filesystem::path& gfxDir) {
+        std::error_code ec;
+        if (!std::filesystem::exists(gfxDir, ec) || !std::filesystem::is_directory(gfxDir, ec)) {
+            return {};
+        }
+
+        auto isVersionGreater = [](const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+            const size_t n = (std::max)(a.size(), b.size());
+            for (size_t i = 0; i < n; ++i) {
+                const uint32_t va = (i < a.size()) ? a[i] : 0u;
+                const uint32_t vb = (i < b.size()) ? b[i] : 0u;
+                if (va != vb) return va > vb;
+            }
+            return a.size() > b.size();
+        };
+
+        std::filesystem::path bestVersionedPath;
+        std::vector<uint32_t> bestVersion;
+        std::filesystem::path unversionedPath;
+
+        for (const auto& entry : std::filesystem::directory_iterator(gfxDir, ec)) {
+            if (ec) break;
+            std::error_code fileEc;
+            if (!entry.is_regular_file(fileEc)) continue;
+            const std::wstring name = entry.path().filename().wstring();
+            std::vector<uint32_t> ver;
+            if (parseEliteCustomConfigVersion(name, ver)) {
+                if (bestVersionedPath.empty() || isVersionGreater(ver, bestVersion)) {
+                    bestVersion = std::move(ver);
+                    bestVersionedPath = entry.path();
+                }
+                continue;
+            }
+            std::wstring lower = name;
+            for (auto& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
+            if (lower == L"custom.fxcfg" && unversionedPath.empty()) {
+                unversionedPath = entry.path();
+            }
+        }
+
+        if (!bestVersionedPath.empty()) return bestVersionedPath;
+        return unversionedPath;
+    }
+
     static std::filesystem::path resolveEliteGraphicsConfigPath() {
         wchar_t localAppData[MAX_PATH]{};
         const DWORD envLen = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
@@ -360,13 +464,7 @@ public:
 
         std::filesystem::path gfxDir = std::filesystem::path(localAppData) /
             L"Frontier Developments" / L"Elite Dangerous" / L"Options" / L"Graphics";
-        std::filesystem::path cfgPath = gfxDir / L"Custom.4.4.fxcfg";
-        std::error_code ec;
-        if (!std::filesystem::exists(cfgPath, ec)) {
-            cfgPath = gfxDir / L"Custom.4.0.fxcfg";
-            if (!std::filesystem::exists(cfgPath, ec)) return {};
-        }
-        return cfgPath;
+        return resolveEliteGraphicsConfigPathInDir(gfxDir);
     }
 
     static float parseEliteSsaaMultiplierXml(const std::string& content) {
@@ -384,6 +482,63 @@ public:
             return 0.0f;
         }
         return val;
+    }
+
+    struct EliteGraphicsWarnings {
+        int aaMode = 0;                 // 0 = Off, >0 = FXAA/SMAA active in Elite .fxcfg
+        bool terrainCheckerboard = false;
+    };
+
+    static int parseEliteAaModeXml(const std::string& content) {
+        constexpr char kOpenTag[] = "<AAMode>";
+        constexpr char kCloseTag[] = "</AAMode>";
+        const size_t start = content.find(kOpenTag);
+        if (start == std::string::npos) return 0;
+        const size_t valStart = start + sizeof(kOpenTag) - 1;
+        const size_t end = content.find(kCloseTag, valStart);
+        if (end == std::string::npos || end <= valStart) return 0;
+        const std::string numStr = content.substr(valStart, end - valStart);
+        char* parseEnd = nullptr;
+        const long val = std::strtol(numStr.c_str(), &parseEnd, 10);
+        if (parseEnd == numStr.c_str() || val < 0 || val > 16) return 0;
+        return static_cast<int>(val);
+    }
+
+    static bool parseEliteTerrainCheckerboardXml(const std::string& content) {
+        constexpr char kOpenTag[] = "<TerrainCheckerboardRenderingEnabled>";
+        constexpr char kCloseTag[] = "</TerrainCheckerboardRenderingEnabled>";
+        const size_t start = content.find(kOpenTag);
+        if (start == std::string::npos) return false;
+        const size_t valStart = start + sizeof(kOpenTag) - 1;
+        const size_t end = content.find(kCloseTag, valStart);
+        if (end == std::string::npos || end <= valStart) return false;
+        std::string val = content.substr(valStart, end - valStart);
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t' || val.front() == '\r' || val.front() == '\n')) val.erase(val.begin());
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r' || val.back() == '\n')) val.pop_back();
+        for (char& ch : val) {
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        return (val == "true" || val == "1");
+    }
+
+    static EliteGraphicsWarnings readEliteGraphicsWarnings() {
+        static ULONGLONG s_lastCheckTick = 0;
+        static EliteGraphicsWarnings s_cached{};
+        const ULONGLONG now = GetTickCount64();
+        if (s_lastCheckTick != 0 && (now - s_lastCheckTick) < 5000ull) {
+            return s_cached;
+        }
+        s_lastCheckTick = now;
+        s_cached = {};
+        if (!edpe::isRunningInEliteProcess()) return s_cached;
+        const std::filesystem::path cfgPath = resolveEliteGraphicsConfigPath();
+        if (cfgPath.empty()) return s_cached;
+        std::ifstream inFile(cfgPath, std::ios::binary);
+        if (!inFile) return s_cached;
+        std::string content((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
+        s_cached.aaMode = parseEliteAaModeXml(content);
+        s_cached.terrainCheckerboard = parseEliteTerrainCheckerboardXml(content);
+        return s_cached;
     }
 
     static float readEliteSsaaMultiplier() {
@@ -410,7 +565,7 @@ public:
         return edpe::isRunningInEliteProcess();
     }
 
-    // Synchronizes Elite Dangerous's Custom.4.4.fxcfg <SSAAMultiplier> with the selected
+    // Synchronizes Elite Dangerous's Custom.*.fxcfg <SSAAMultiplier> with the selected
     // EDPE UpscaleMode so Cobra renders the 3D scene at true lower internal resolution.
     bool syncEliteGraphicsConfig() const {
         if (!autoSyncEliteConfig || !isRunningInEliteProcess()) return false;
@@ -465,7 +620,7 @@ public:
     int upscaleMode = 0;
     int dlssPreset = 0; // 0=Auto(K), 5=E(CNN Fast), 10=J, 11=K, 12=L, 13=M
     float sharpness = 0.0f;
-    float fsrVelocityFactor = 0.00f;
+    float fsrVelocityFactor = 0.50f;
     float mipLodBiasOffset = 0.0f;
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;
@@ -499,7 +654,7 @@ public:
     bool jitterInvertY = false;
     bool jitterSwapXY = false;
     float jitterScale = 1.0f;
-    unsigned jitterPhaseCount = 32;
+    unsigned jitterPhaseCount = 8;
     int jitterMode = 0; // 0=auto (upstream->d3d11 fallback), 1=d3d11, 2=upstream
     bool jitterLogEnabled = false;
     unsigned jitterLogInterval = 10;
@@ -559,6 +714,11 @@ public:
     bool wrapDirectInputKeyboard = !isRunningUnderWine();
 
     std::wstring chainDxgiDll;
+
+    bool loadingScreenDancer = true;
+    bool loadingScreenDancerSpin = true;
+    bool loadingScreenDancerAllHolograms = false;
+    float loadingScreenDancerSpeed = 1.0f;
 };
 
 } // namespace edpe

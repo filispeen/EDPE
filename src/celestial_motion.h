@@ -109,6 +109,7 @@ inline CelestialRecord buildCelestialRecord(
 class CelestialMotionTracker {
 public:
     bool initialize(ID3D11Device* device);
+    bool isInitialized() const { return device_ != nullptr; }
     void shutdown();
 
     // Non-blocking throttled poll of Elite Dangerous Status.json for Supercruise flag.

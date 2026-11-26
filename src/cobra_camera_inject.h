@@ -25,10 +25,8 @@ namespace edpe::cobra_camera {
 // RVA constants in EliteDangerous64.exe (Odyssey 4.3.1.1):
 //   0x05921F0 : view-constant refresh entry (FUN_1405921f0)
 //   0x0592300 : mid-function tangent / matrix finalizer site
-//   0x1096640 : ICameraTargetShip::SetTarget (cockpit vehicle rig attach)
 constexpr uintptr_t kViewConstRefreshEntryRva = 0x05921F0;
 constexpr uintptr_t kViewConstRefreshSiteRva  = 0x0592300;
-constexpr uintptr_t kShipSetTargetRva         = 0x1096640;
 
 // Deferred lighting shader hashes (Pass 35 / Deferred lighting CB2 slot 2):
 constexpr uint64_t kDeferredLightingVsHash = 0x7E38A6AA1269C901ull;
@@ -153,6 +151,22 @@ private:
     size_t m_count = 0;
     std::atomic<uint32_t> m_pendingAtomic{0};
 };
+
+// Verifies that targetAddr matches the exact PE .pdata function start (imageBase + beginRva)
+// and computes the function byte span so witness scanning cannot cross into adjacent functions.
+inline bool isExactFunctionEntry(
+    uintptr_t targetAddr,
+    uintptr_t imageBase,
+    uint32_t beginRva,
+    uint32_t endRva,
+    size_t* outFuncBytes = nullptr) noexcept {
+    if (!targetAddr || !imageBase || endRva <= beginRva) return false;
+    if (imageBase + static_cast<uintptr_t>(beginRva) != targetAddr) return false;
+    if (outFuncBytes) {
+        *outFuncBytes = static_cast<size_t>(endRva - beginRva);
+    }
+    return true;
+}
 
 // Verifies x64 prologue bytes AND camera field offset witnesses (+0x250 dirty flags
 // and at least one frustum/camera bound offset witness: +0x28C/+0x290/+0x228/+0x22C/+0x264)
@@ -900,7 +914,7 @@ struct RefreshTls {
     float savedBoundX = 0.0f;      // offset 16
     float savedBoundY = 0.0f;      // offset 20
     uint32_t savedFlags = 0;       // offset 24
-    uint32_t layoutVariant = 0;    // offset 28 (1 = +0x28C/+0x290, 2 = +0x228/+0x22C)
+    uint32_t layoutVariant = 0;    // offset 28 (0 = none, 1 = +0x28C/+0x290)
 };
 
 inline __declspec(thread) RefreshTls t_refreshTls{};
@@ -921,6 +935,7 @@ struct FrameJitterWindow {
     std::atomic<uint64_t> readFaultsTotal{0};
     std::atomic<uint64_t> writeFaultsTotal{0};
     std::atomic<uint64_t> rollbacksTotal{0};
+    std::atomic<uint64_t> rejectedKindTotal{0};
 };
 
 inline FrameJitterWindow& frameWindow() noexcept {
@@ -973,19 +988,12 @@ inline bool applyTransientCameraBoundJitter(uint8_t* camera, RefreshTls& tls) no
     const float jy = win.jitterPxY.load(std::memory_order_relaxed);
     if (std::fabs(jx) < 1e-6f && std::fabs(jy) < 1e-6f) return false;
 
-    // SEH-protected reads for layout variant 1 (+0x264 kind, +0x28C/+0x290 bounds, +0x250 flags)
-    // and layout variant 2 (+0x240/+0x244 kind, +0x228/+0x22C bounds, +0x250 flags).
+    // SEH-protected reads for verified camera layout (+0x264 kind, +0x28C/+0x290 bounds, +0x250 flags).
     uint32_t kind1 = 0;
     float bx1 = 0.0f, by1 = 0.0f;
-    uint32_t kind2a = 0, kind2b = 0;
-    float bx2 = 0.0f, by2 = 0.0f;
     if (!sehReadU32(camera + 0x264, &kind1) ||
         !sehReadF32(camera + 0x28C, &bx1) ||
-        !sehReadF32(camera + 0x290, &by1) ||
-        !sehReadU32(camera + 0x240, &kind2a) ||
-        !sehReadU32(camera + 0x244, &kind2b) ||
-        !sehReadF32(camera + 0x228, &bx2) ||
-        !sehReadF32(camera + 0x22C, &by2)) {
+        !sehReadF32(camera + 0x290, &by1)) {
         win.readFaultsTotal.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -999,23 +1007,19 @@ inline bool applyTransientCameraBoundJitter(uint8_t* camera, RefreshTls& tls) no
         return std::fabs(camAspect - targetAspect) <= 0.12f * targetAspect;
     };
 
-    size_t offBx = 0, offBy = 0;
-    uint32_t variant = 0;
-    if (kind1 == 3 && validBounds(bx1, by1)) {
-        offBx = 0x28C;
-        offBy = 0x290;
-        variant = 1;
-        tls.savedBoundX = bx1;
-        tls.savedBoundY = by1;
-    } else if ((kind2a == 3 || kind2b == 3) && validBounds(bx2, by2)) {
-        offBx = 0x228;
-        offBy = 0x22C;
-        variant = 2;
-        tls.savedBoundX = bx2;
-        tls.savedBoundY = by2;
-    } else {
+    if (kind1 != 3) {
+        win.rejectedKindTotal.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    if (!validBounds(bx1, by1)) {
+        return false;
+    }
+
+    const size_t offBx = 0x28C;
+    const size_t offBy = 0x290;
+    const uint32_t variant = 1;
+    tls.savedBoundX = bx1;
+    tls.savedBoundY = by1;
 
     uint32_t flags = 0;
     if (!sehReadU32(camera + 0x250, &flags)) {
@@ -1057,11 +1061,9 @@ inline bool applyTransientCameraBoundJitter(uint8_t* camera, RefreshTls& tls) no
 
 inline void __fastcall refreshPost() noexcept {
     RefreshTls& tls = t_refreshTls;
-    if (tls.camera && tls.layoutVariant != 0) {
-        const size_t offBx = (tls.layoutVariant == 1) ? 0x28Cu : 0x228u;
-        const size_t offBy = (tls.layoutVariant == 1) ? 0x290u : 0x22Cu;
-        const bool okX = sehWriteF32(tls.camera + offBx, tls.savedBoundX);
-        const bool okY = sehWriteF32(tls.camera + offBy, tls.savedBoundY);
+    if (tls.camera && tls.layoutVariant == 1) {
+        const bool okX = sehWriteF32(tls.camera + 0x28Cu, tls.savedBoundX);
+        const bool okY = sehWriteF32(tls.camera + 0x290u, tls.savedBoundY);
         const bool okF = sehWriteU32(tls.camera + 0x250, tls.savedFlags);
         if (!okX || !okY || !okF) {
             recordHookWriteFault();
@@ -1222,31 +1224,6 @@ inline bool buildRefreshStubs(
 }
 
 // ============================================================================
-// Cockpit Vehicle Rig Tracker (ICameraTargetShip::SetTarget RVA 0x1096640)
-// ============================================================================
-struct VehicleRigState {
-    std::atomic<const void*> activeShipTarget{nullptr};
-    float prevShipWorld[12]{};
-    float currShipWorld[12]{};
-    bool hasValidRig = false;
-};
-
-inline VehicleRigState& vehicleRig() {
-    static VehicleRigState s;
-    return s;
-}
-
-using ShipSetTargetFn = void*(__fastcall*)(void* thisPtr, const void* targetEntity);
-inline ShipSetTargetFn g_origShipSetTarget = nullptr;
-
-inline void* __fastcall detourShipSetTarget(void* thisPtr, const void* targetEntity) {
-    if (targetEntity) {
-        vehicleRig().activeShipTarget.store(targetEntity, std::memory_order_relaxed);
-    }
-    return g_origShipSetTarget ? g_origShipSetTarget(thisPtr, targetEntity) : nullptr;
-}
-
-// ============================================================================
 // Status.json GuiFocus 6..9 Map Mode Detector (Galaxy Map, System Map, Orrery, FSS)
 // ============================================================================
 class MapFocusPoller {
@@ -1261,6 +1238,12 @@ public:
         auto& poller = instance();
         poller.poll();
         return poller.m_cachedOnFoot;
+    }
+
+    static bool isInSrvActive() {
+        auto& poller = instance();
+        poller.poll();
+        return poller.m_cachedInSrv;
     }
 
 private:
@@ -1304,22 +1287,10 @@ private:
         DWORD bytesRead = 0;
         if (ReadFile(h, buf, sizeof(buf) - 1, &bytesRead, nullptr) && bytesRead > 0) {
             buf[bytesRead] = '\0';
-            if (const char* p = std::strstr(buf, "\"GuiFocus\"")) {
-                p += 10;
-                while (*p == ' ' || *p == '\t' || *p == ':') ++p;
-                const int guiFocus = std::atoi(p);
-                // GuiFocus: 6 = GalaxyMap, 7 = SystemMap, 8 = Orrery, 9 = FSS
-                m_cachedMapOpen = (guiFocus >= 6 && guiFocus <= 9);
-            }
-            if (const char* f2 = std::strstr(buf, "\"Flags2\"")) {
-                f2 += 8;
-                while (*f2 == ' ' || *f2 == '\t' || *f2 == ':') ++f2;
-                const unsigned long flags2 = std::strtoul(f2, nullptr, 10);
-                // Flags2 bit 0 (0x1) = OnFoot
-                m_cachedOnFoot = (flags2 & 0x1u) != 0;
-            } else {
-                m_cachedOnFoot = false;
-            }
+            const edpe::EliteStatusFlags parsed = edpe::parseEliteStatusJsonFlags(buf);
+            m_cachedMapOpen = parsed.mapGuiFocus;
+            m_cachedOnFoot = parsed.onFoot;
+            m_cachedInSrv = parsed.inSrv;
         }
         CloseHandle(h);
     }
@@ -1329,6 +1300,7 @@ private:
     FILETIME m_lastWriteTime{};
     bool m_cachedMapOpen = false;
     bool m_cachedOnFoot = false;
+    bool m_cachedInSrv = false;
 };
 
 // ============================================================================
@@ -1358,7 +1330,8 @@ public:
         if (!exeMod) return false;
         const auto baseAddr = reinterpret_cast<uintptr_t>(exeMod);
 
-        // 1. Verify prologue AND camera field offset witnesses before touching executable memory.
+        // 1. Verify exact .pdata function entry, prologue, AND camera field offset witnesses
+        //    bounded by the function's own RUNTIME_FUNCTION span before touching executable memory.
         auto* refreshTarget = reinterpret_cast<uint8_t*>(baseAddr + kViewConstRefreshEntryRva);
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(refreshTarget, &mbi, sizeof(mbi)) &&
@@ -1368,7 +1341,18 @@ public:
             const size_t availBytes = (regionEnd > reinterpret_cast<uintptr_t>(refreshTarget))
                 ? static_cast<size_t>(regionEnd - reinterpret_cast<uintptr_t>(refreshTarget))
                 : 0;
-            if (verifyRefreshFunctionBytes(refreshTarget, availBytes)) {
+            DWORD64 pdataImageBase = 0;
+            PRUNTIME_FUNCTION rtFn = RtlLookupFunctionEntry(
+                reinterpret_cast<DWORD64>(refreshTarget), &pdataImageBase, nullptr);
+            size_t funcBytes = 0;
+            const bool exactEntry = (rtFn != nullptr) && isExactFunctionEntry(
+                reinterpret_cast<uintptr_t>(refreshTarget),
+                static_cast<uintptr_t>(pdataImageBase),
+                rtFn->BeginAddress,
+                rtFn->EndAddress,
+                &funcBytes);
+            const size_t scanBytes = exactEntry ? (std::min)(availBytes, funcBytes) : 0;
+            if (exactEntry && verifyRefreshFunctionBytes(refreshTarget, scanBytes)) {
                 g_gate.store(0, std::memory_order_release);
                 constexpr size_t kStubPageSize = 512;
                 m_stubPage = static_cast<uint8_t*>(CodeHook::allocateNear(refreshTarget, kStubPageSize));
@@ -1395,29 +1379,7 @@ public:
                     }
                 }
             } else {
-                EdpeLog(L"EDPE: Cobra view-constant refresh prologue/witness mismatch; using D3D11 CB fallback");
-            }
-        }
-
-        // 2. Optional vehicle rig hook at RVA 0x1096640 (hold-open for process lifetime).
-        auto* rigTarget = reinterpret_cast<uint8_t*>(baseAddr + kShipSetTargetRva);
-        if (VirtualQuery(rigTarget, &mbi, sizeof(mbi)) &&
-            mbi.State == MEM_COMMIT &&
-            (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
-            const uint8_t b0 = rigTarget[0];
-            const uint8_t b1 = rigTarget[1];
-            if ((b0 == 0x48 && (b1 == 0x89 || b1 == 0x83 || b1 == 0x8B)) ||
-                (b0 == 0x40 && (b1 >= 0x50 && b1 <= 0x57))) {
-                void* origRig = nullptr;
-                m_rigHook.setHoldOpen(true);
-                if (m_rigHook.prepareTrampoline(rigTarget, &origRig)) {
-                    g_origShipSetTarget = reinterpret_cast<ShipSetTargetFn>(origRig);
-                    if (m_rigHook.commitPatch(reinterpret_cast<void*>(&detourShipSetTarget))) {
-                        EdpeLog(L"EDPE: Cockpit vehicle rig target hook installed (RVA 0x1096640)");
-                    } else {
-                        g_origShipSetTarget = nullptr;
-                    }
-                }
+                EdpeLog(L"EDPE: Cobra view-constant refresh entry/witness mismatch; using D3D11 CB fallback");
             }
         }
 
@@ -1450,7 +1412,6 @@ private:
     std::atomic<bool> m_attempted{false};
     std::atomic<bool> m_viewRefreshHooked{false};
     CodeHook m_refreshHook;
-    CodeHook m_rigHook;
     uint8_t* m_stubPage = nullptr;
 };
 

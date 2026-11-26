@@ -136,11 +136,20 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     if (hPeak > 1e-5 && uPeak > 1e-5) {
         float3 uiChromaLin = hdrPos * (uPeak / hPeak);
         float  uiRawPeak   = max(uiRaw.r, max(uiRaw.g, uiRaw.b));
-        float  toeMix      = 1.0 - smoothstep(0.25, 0.65, uiRawPeak);
-        uiLin = lerp(uiLin, max(uiLin, uiChromaLin), toeMix);
+        // Only recover LUT shadow-toe chromaticity crush on very dim glow pixels;
+        // midtone and bright HUD (>= 0.32) preserve 100% of Cobra's Pass 52 LUT hue.
+        float  toeMix      = 1.0 - smoothstep(0.15, 0.32, uiRawPeak);
+        uiLin = lerp(uiLin, uiChromaLin, toeMix);
     }
     float3 worldAndBackdropLin = pow(max(worldAndBackdrop, 0.0), 2.2);
-    float3 finalSrgb = pow(max(uiLin + worldAndBackdropLin, 0.0), 1.0 / 2.2);
+    float3 sumLin = uiLin + worldAndBackdropLin;
+    float  sumPeak = max(sumLin.r, max(sumLin.g, sumLin.b));
+    if (sumPeak > 1.0) {
+        // Soft filmic highlight roll-off toward warm white instead of per-channel hard clipping.
+        float excess = sumPeak - 1.0;
+        sumLin = lerp(sumLin / sumPeak, float3(1.0, 1.0, 1.0), saturate(excess / (1.0 + excess)));
+    }
+    float3 finalSrgb = pow(max(sumLin, 0.0), 1.0 / 2.2);
     float3 finalRgb = finalSrgb + visorDelta * atten;
     uOut[id.xy] = float4(saturate(finalRgb), world.a);
 }

@@ -56,7 +56,11 @@ bool NvidiaUpscalerBackend::isModeSupported(UpscaleMode mode) const {
 }
 
 bool NvidiaUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
+    device_ = device;
     initialized_ = NgxContext::initialize(device, context);
+    if (!initialized_) {
+        device_ = nullptr;
+    }
     return initialized_;
 }
 
@@ -105,6 +109,7 @@ void NvidiaUpscalerBackend::shutdown() {
     outputTexture_.Reset();
     outputUav_.Reset();
     outputDevice_ = nullptr;
+    device_ = nullptr;
     outputWidth_ = 0;
     outputHeight_ = 0;
     outputFormat_ = DXGI_FORMAT_UNKNOWN;
@@ -193,9 +198,13 @@ bool NvidiaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         outDesc, inputs.outputWidth, inputs.outputHeight, destinationTexture, inputs.color, uavFormat);
 
     if (!directDest) {
-        Microsoft::WRL::ComPtr<ID3D11Device> device;
-        context->GetDevice(&device);
-        if (!ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
+        ID3D11Device* dev = device_;
+        Microsoft::WRL::ComPtr<ID3D11Device> localDevice;
+        if (!dev) {
+            context->GetDevice(&localDevice);
+            dev = localDevice.Get();
+        }
+        if (!ensureOutputTexture(dev, inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
             return false;
         }
     }
@@ -237,6 +246,7 @@ struct AmdUpscalerBackend::Impl {
     bool initialized = false;
     bool contextCreated = false;
     bool resetRequested = false;
+    ID3D11Device* device = nullptr;
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> outputTexture;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> outputUav;
@@ -253,6 +263,7 @@ struct AmdUpscalerBackend::Impl {
     uint32_t maxOutputWidth = 0;
     uint32_t maxOutputHeight = 0;
     bool currentIsHdr = false;
+    bool currentDepthInfinite = false;
     std::atomic<float> velocityFactor{AmdUpscalerBackend::kDefaultVelocityFactor};
     float appliedVelocityFactor = -1.0f;
     wchar_t lastErrorReason[256]{};
@@ -413,12 +424,12 @@ struct AmdUpscalerBackend::Impl {
     }
 
     bool ensureFsrContext(ID3D11Device* device, uint32_t renderW, uint32_t renderH,
-                          uint32_t outputW, uint32_t outputH, bool isHdr) {
+                          uint32_t outputW, uint32_t outputH, bool isHdr, bool depthInfinite) {
 #if defined(EDPE_ENABLE_FSR)
         if (!device) return false;
         if (contextCreated && renderW <= maxRenderWidth && renderH <= maxRenderHeight &&
             outputW == maxOutputWidth && outputH == maxOutputHeight &&
-            currentIsHdr == isHdr &&
+            currentIsHdr == isHdr && currentDepthInfinite == depthInfinite &&
             dilatedDepthTexture && dilatedMotionVectorsTexture && reconstructedPrevNearestDepthTexture) {
             return true;
         }
@@ -430,10 +441,13 @@ struct AmdUpscalerBackend::Impl {
         maxOutputWidth = outputW;
         maxOutputHeight = outputH;
         currentIsHdr = isHdr;
+        currentDepthInfinite = depthInfinite;
 
         FfxFsr3UpscalerContextDescription desc{};
-        desc.flags = FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED |
-                     FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE;
+        desc.flags = FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED;
+        if (depthInfinite) {
+            desc.flags |= FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE;
+        }
         if (isHdr) {
             desc.flags |= FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE |
                           FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE;
@@ -576,6 +590,7 @@ bool AmdUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* /
         return false;
     }
     impl_->initialized = true;
+    impl_->device = device;
     impl_->lastErrorReason[0] = L'\0';
     EdpeLog(L"EDPE: AMD FSR 3.1 D3D11 backend initialized successfully");
     return true;
@@ -592,6 +607,7 @@ void AmdUpscalerBackend::shutdown() {
 #if defined(EDPE_ENABLE_FSR)
     impl_->scratchBuffer.clear();
 #endif
+    impl_->device = nullptr;
     impl_->initialized = false;
     impl_->lastErrorReason[0] = L'\0';
 }
@@ -612,8 +628,12 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         return false;
     }
 
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
+    ID3D11Device* device = impl_->device;
+    Microsoft::WRL::ComPtr<ID3D11Device> localDevice;
+    if (!device) {
+        context->GetDevice(&localDevice);
+        device = localDevice.Get();
+    }
     if (!device) return false;
 
     D3D11_TEXTURE2D_DESC outDesc{};
@@ -628,12 +648,12 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         outDesc, inputs.outputWidth, inputs.outputHeight, destinationTexture, inputs.color, uavFormat);
 
     if (!directDest &&
-        !impl_->ensureOutputTexture(device.Get(), inputs.outputWidth, inputs.outputHeight, outDesc.Format)) {
+        !impl_->ensureOutputTexture(device, inputs.outputWidth, inputs.outputHeight, uavFormat)) {
         return false;
     }
 
-    if (!impl_->ensureFsrContext(device.Get(), inputs.renderWidth, inputs.renderHeight,
-                                 inputs.outputWidth, inputs.outputHeight, inputs.colorIsHdr)) {
+    if (!impl_->ensureFsrContext(device, inputs.renderWidth, inputs.renderHeight,
+                                 inputs.outputWidth, inputs.outputHeight, inputs.colorIsHdr, params.depthInfinite)) {
         return false;
     }
     impl_->applyVelocityFactorIfNeeded();
@@ -661,9 +681,10 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.reconstructedPrevNearestDepth = ffxGetResourceDX11_Fsr31(impl_->reconstructedPrevNearestDepthTexture.Get(),
         GetFfxResourceDescriptionDX11(impl_->reconstructedPrevNearestDepthTexture.Get()), L"FSR3_ReconstructedPrevNearestDepth", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    // Leave dispatchDesc.reactive null (FSR binds 0.0 default) so its built-in de-jittered
-    // ShadingChangePyramid, ComputeThinFeatureConfidence, and LumaInstability handle
-    // un-vectored effects without wiping accumulation/locks on sub-pixel thin lines.
+    if (inputs.reactiveMask) {
+        dispatchDesc.reactive = ffxGetResourceDX11_Fsr31(inputs.reactiveMask,
+            GetFfxResourceDescriptionDX11(inputs.reactiveMask), L"FSR3_Reactive", FFX_RESOURCE_STATE_COMPUTE_READ);
+    }
 
     ID3D11Texture2D* evalOut = directDest ? destinationTexture : impl_->outputTexture.Get();
     dispatchDesc.output = ffxGetResourceDX11_Fsr31(evalOut,
@@ -679,8 +700,10 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.upscaleSize.width = inputs.outputWidth;
     dispatchDesc.upscaleSize.height = inputs.outputHeight;
 
-    dispatchDesc.enableSharpening = params.sharpness > 0.0f;
-    dispatchDesc.sharpness = std::clamp(params.sharpness, 0.0f, 1.0f);
+    // Keep FSR 3.1.2's internal RCAS disabled (known negative-output bug in 3.1.2);
+    // sharpening is applied safely via EDPE's SharpenPass / UiLayer deferred sharpen.
+    dispatchDesc.enableSharpening = false;
+    dispatchDesc.sharpness = 0.0f;
     dispatchDesc.frameTimeDelta = params.frameTimeDeltaMs > 0.0f ? params.frameTimeDeltaMs : 16.6f;
     dispatchDesc.preExposure = 1.0f;
     dispatchDesc.reset = params.reset || impl_->resetRequested;
@@ -692,12 +715,14 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     const float nearPlane = (inputs.cameraNow.depthB > 0.0f)
         ? inputs.cameraNow.depthB
         : 0.025f;
+    constexpr float kEliteSceneFarPlane = 50000.0f;
+    const float farPlane = params.depthInfinite ? FLT_MAX : kEliteSceneFarPlane;
     if (params.depthInverted) {
-        dispatchDesc.cameraNear = FLT_MAX;
+        dispatchDesc.cameraNear = farPlane;
         dispatchDesc.cameraFar = nearPlane;
     } else {
         dispatchDesc.cameraNear = nearPlane;
-        dispatchDesc.cameraFar = FLT_MAX;
+        dispatchDesc.cameraFar = farPlane;
     }
     dispatchDesc.viewSpaceToMetersFactor = 1.0f;
 
@@ -745,10 +770,21 @@ const wchar_t* TaaUpscalerBackend::unavailableReason() const {
 }
 
 bool TaaUpscalerBackend::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
+    device_ = device;
     return pass_.initialize(device, context);
 }
 
 void TaaUpscalerBackend::shutdown() {
+    cachedColorSrv_.Reset();
+    cachedColorTex_ = nullptr;
+    cachedColorW_ = cachedColorH_ = 0;
+    cachedMotionSrv_.Reset();
+    cachedMotionTex_ = nullptr;
+    cachedMotionW_ = cachedMotionH_ = 0;
+    cachedDepthSrv_.Reset();
+    cachedDepthTex_ = nullptr;
+    cachedDepthW_ = cachedDepthH_ = 0;
+    device_ = nullptr;
     pass_.shutdown();
 }
 
@@ -756,42 +792,69 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     const TemporalFrameInputs& inputs,
     ID3D11RenderTargetView* destinationRtv,
     ID3D11Texture2D* destinationTexture) {
-    if (!pass_.isInitialized() || !context || !inputs.color || !destinationTexture) {
+    if (!pass_.isInitialized() || !context || !inputs.color) {
         return false;
     }
 
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    context->GetDevice(&device);
+    ID3D11Device* device = device_;
+    Microsoft::WRL::ComPtr<ID3D11Device> localDevice;
+    if (!device) {
+        context->GetDevice(&localDevice);
+        device = localDevice.Get();
+    }
     if (!device) return false;
 
     // Resolve color SRV
     ID3D11ShaderResourceView* colorSrv = inputs.colorSrv;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> localColorSrv;
     if (!colorSrv && inputs.color) {
-        if (FAILED(device->CreateShaderResourceView(inputs.color, nullptr, &localColorSrv))) {
-            return false;
+        if (cachedColorTex_ != inputs.color || cachedColorW_ != inputs.renderWidth ||
+            cachedColorH_ != inputs.renderHeight || !cachedColorSrv_) {
+            cachedColorSrv_.Reset();
+            cachedColorTex_ = nullptr;
+            if (FAILED(device->CreateShaderResourceView(inputs.color, nullptr, &cachedColorSrv_))) {
+                return false;
+            }
+            cachedColorTex_ = inputs.color;
+            cachedColorW_ = inputs.renderWidth;
+            cachedColorH_ = inputs.renderHeight;
         }
-        colorSrv = localColorSrv.Get();
+        colorSrv = cachedColorSrv_.Get();
     }
 
     // Resolve motion SRV
     ID3D11ShaderResourceView* motionSrv = inputs.motionSrv;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> localMotionSrv;
     if (!motionSrv && inputs.motionVectors) {
-        device->CreateShaderResourceView(inputs.motionVectors, nullptr, &localMotionSrv);
-        motionSrv = localMotionSrv.Get();
+        if (cachedMotionTex_ != inputs.motionVectors || cachedMotionW_ != inputs.renderWidth ||
+            cachedMotionH_ != inputs.renderHeight || !cachedMotionSrv_) {
+            cachedMotionSrv_.Reset();
+            cachedMotionTex_ = nullptr;
+            if (SUCCEEDED(device->CreateShaderResourceView(inputs.motionVectors, nullptr, &cachedMotionSrv_))) {
+                cachedMotionTex_ = inputs.motionVectors;
+                cachedMotionW_ = inputs.renderWidth;
+                cachedMotionH_ = inputs.renderHeight;
+            }
+        }
+        motionSrv = cachedMotionSrv_.Get();
     }
 
     // Resolve depth SRV
     ID3D11ShaderResourceView* depthSrv = inputs.depthSrv;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> localDepthSrv;
     if (!depthSrv && inputs.depth) {
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-        srvDesc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-        device->CreateShaderResourceView(inputs.depth, &srvDesc, &localDepthSrv);
-        depthSrv = localDepthSrv.Get();
+        if (cachedDepthTex_ != inputs.depth || cachedDepthW_ != inputs.renderWidth ||
+            cachedDepthH_ != inputs.renderHeight || !cachedDepthSrv_) {
+            cachedDepthSrv_.Reset();
+            cachedDepthTex_ = nullptr;
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+            if (SUCCEEDED(device->CreateShaderResourceView(inputs.depth, &srvDesc, &cachedDepthSrv_))) {
+                cachedDepthTex_ = inputs.depth;
+                cachedDepthW_ = inputs.renderWidth;
+                cachedDepthH_ = inputs.renderHeight;
+            }
+        }
+        depthSrv = cachedDepthSrv_.Get();
     }
 
     return pass_.render(context,
@@ -810,7 +873,9 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.prevJitterX,
         inputs.prevJitterY,
         inputs.cameraNow.depthB,
-        inputs.prevDepthSrv);
+        inputs.prevDepthSrv,
+        preferredOutputFormat_,
+        inputs.reactiveMaskSrv);
 }
 
 void TaaUpscalerBackend::resetHistory() {
@@ -988,7 +1053,8 @@ bool UpscalerManager::setMode(UpscaleMode mode) {
 bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     const TemporalFrameInputs& inputs,
     ID3D11RenderTargetView* destinationRtv,
-    ID3D11Texture2D* destinationTexture) {
+    ID3D11Texture2D* destinationTexture,
+    bool callerRestoresState) {
     if (context) {
         Microsoft::WRL::ComPtr<ID3D11Device> evalDevice;
         context->GetDevice(&evalDevice);
@@ -1078,9 +1144,14 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     {
         EvaluatingUpscalerGuard evalGuard;
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
-        if (evalSuccess && currentBackendType_ != UpscalerBackend::AmdFsr && inputs.sharpness > 0.0f) {
-            ID3D11Texture2D* sharpenTarget = destinationTexture ? destinationTexture : inputs.color;
-            if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr)) {
+        if (evalSuccess && inputs.sharpness > 0.0f) {
+            // Never sharpen TAA's internal ping-pong history texture in-place when destinationTexture == nullptr;
+            // mutating historyTexture_[historyReadIdx_] creates recursive sharpening halos/shimmer on subsequent frames.
+            ID3D11Texture2D* sharpenTarget = destinationTexture
+                ? destinationTexture
+                : ((currentBackendType_ == UpscalerBackend::Taa) ? nullptr : inputs.color);
+            if (sharpenTarget &&
+                !sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr, callerRestoresState)) {
                 static bool s_sharpenFailLogged = false;
                 if (!s_sharpenFailLogged) {
                     s_sharpenFailLogged = true;
@@ -1194,7 +1265,7 @@ bool UpscalerManager::evaluateBackend(UpscalerBackend backendType,
     {
         EvaluatingUpscalerGuard evalGuard;
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
-        if (evalSuccess && backendType != UpscalerBackend::AmdFsr && inputs.sharpness > 0.0f) {
+        if (evalSuccess && inputs.sharpness > 0.0f) {
             ID3D11Texture2D* sharpenTarget = destinationTexture ? destinationTexture : inputs.color;
             if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr)) {
                 static bool s_sharpenFailLogged = false;

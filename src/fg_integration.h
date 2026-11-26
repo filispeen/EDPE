@@ -6,8 +6,11 @@
 
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <thread>
 
 namespace edpe {
 
@@ -15,6 +18,7 @@ namespace edpe {
 struct FgSceneSnapshot {
     bool valid = false;
     ID3D11Texture2D* hudlessColorTex = nullptr;
+    ID3D11Texture2D* depthTex = nullptr;
     ID3D11ShaderResourceView* depthSrv = nullptr;
     ID3D11Texture2D* motionVectorsTex = nullptr;
     ID3D11ShaderResourceView* uiHdrSrv = nullptr;
@@ -48,6 +52,7 @@ struct FgRuntimeTelemetry {
     uint32_t maxFramesToGenerate = 0;
     bool dynamicMfgSupported = false;
     uint32_t generatedFramesThisCycle = 0;
+    uint32_t presentedFramesThisCycle = 1;
     uint64_t totalGeneratedFrames = 0;
     float renderedFps = 0.0f;
     float presentedFps = 0.0f;
@@ -82,7 +87,8 @@ public:
     void onPresent(IDXGISwapChain* gameSwapChain,
                    UINT syncInterval,
                    UINT flags,
-                   bool* outPresentedViaProxy);
+                   bool* outPresentedViaProxy,
+                   bool overlayMenuVisible = false);
 
     // Called from observedResizeBuffers before native ResizeBuffers executes.
     void onResize(IDXGISwapChain* gameSwapChain);
@@ -96,11 +102,20 @@ public:
     // without disrupting the active swapchain.
     void ensureCapabilitiesProbed(ID3D11Device* d3d11Device);
 
+    // Launches capability detection on a background thread so Present/UI never stalls.
+    void startCapabilitiesProbeAsync(ID3D11Device* d3d11Device);
+    bool isCapabilitiesProbeInProgress() const;
+
     FgRuntimeTelemetry telemetry() const;
     bool isBackendAvailable(FrameGenerationBackend backend) const;
     void setFgDebugView(bool enabled);
     bool fgDebugView() const;
     const wchar_t* backendUnavailableReason(FrameGenerationBackend backend) const;
+
+    void setTelemetryTimingEnabled(bool enabled);
+    void setFrameLimitFps(float maxFps);
+    bool isReflexFrameLimiterActive() const;
+    void onMainSceneRenderStart();
 
     // Custom window message dispatcher invoked from edpeWndProc on gameHwnd's UI thread
     // so the WS_CHILD overlay HWND is created/resized/destroyed on the owning thread.
@@ -125,10 +140,16 @@ private:
     bool extractDepthToShared(ID3D11DeviceContext* ctx,
                               ID3D11ShaderResourceView* depthSrv,
                               uint32_t renderW,
-                              uint32_t renderH);
+                              uint32_t renderH,
+                              uint32_t slot);
     void releaseBridgeResources();
-    void shutdownLocked(bool keepBridge = false);
+    void shutdownLocked();
+    void joinProbeThread();
     const wchar_t* backendUnavailableReasonLocked(FrameGenerationBackend backend) const;
+
+    std::thread probeThread_;
+    std::atomic<bool> probeStarted_{false};
+    std::atomic<bool> probeInProgress_{false};
 
     mutable std::recursive_mutex mutex_;
     FrameGenerationBackend configuredBackend_ = FrameGenerationBackend::Off;
@@ -144,17 +165,27 @@ private:
     HWND overlayHwnd_ = nullptr;
     ATOM overlayClassAtom_ = 0;
 
+    Microsoft::WRL::ComPtr<ID3D11Device> cachedDev11_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> cachedCtx11_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext4> cachedCtx4_;
+    HWND cachedScHwnd_ = nullptr;
+
     D3D12ProxyPresenter presenter_;
     FrameGenerationManager manager_;
     FgUiPackPass uiPackPass_;
 
-    SharedBridgeTexture sharedHudless_;
-    SharedBridgeTexture sharedUi_;
-    SharedBridgeTexture sharedDepth_;
-    SharedBridgeTexture sharedMvec_;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> sharedUiUav_;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> sharedDepthUav_;
+    static constexpr uint32_t kSharedSlotCount = D3D11D3D12Bridge::kAllocatorCount;
+    std::array<SharedBridgeTexture, kSharedSlotCount> sharedHudless_{};
+    std::array<SharedBridgeTexture, kSharedSlotCount> sharedUi_{};
+    std::array<SharedBridgeTexture, kSharedSlotCount> sharedDepth_{};
+    std::array<SharedBridgeTexture, kSharedSlotCount> sharedMvec_{};
+    std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>, kSharedSlotCount> sharedUiUav_{};
+    std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>, kSharedSlotCount> sharedDepthUav_{};
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> depthExtractCs_;
+
+    std::atomic<bool> nvidiaFgActive_{false};
+    std::atomic<bool> reflexLimiterActive_{false};
+    std::atomic<float> frameLimitFps_{0.0f};
 
     uint64_t monotonicFrameIndex_ = 0;
     double lastCopyMs_ = 0.0;

@@ -15,3 +15,4 @@ ngx_probe_log.txt
 *.bat
 tag-msg.md
 *.obj
+src/assets/loading_dancer.bin

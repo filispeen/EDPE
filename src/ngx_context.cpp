@@ -57,6 +57,7 @@ static std::atomic<bool> s_ngx_has_evaluated{false};
 static std::mutex g_override_mutex;
 static NgxOverrideInfo g_override_info{};
 static std::atomic<bool> g_ngx_verbose_stdout{false};
+static std::atomic<bool> g_ngx_capture_overrides{true};
 
 static const char* findInsensitive(const char* hay, const char* needle) {
     if (!hay || !needle || !*needle) return nullptr;
@@ -185,6 +186,8 @@ struct NgxFeatureSlot {
     uint32_t output_height = 0;
     uint32_t active_perf_quality = 0;
     uint32_t active_preset = 0;
+    UpscaleMode requested_mode = UpscaleMode::Native;
+    uint32_t requested_preset = 0;
     bool reset_requested = false;
 };
 
@@ -197,11 +200,15 @@ static void NVSDK_CONV ngxLogCallback(const char* message,
     NVSDK_NGX_Logging_Level /*loggingLevel*/,
     NVSDK_NGX_Feature /*sourceComponent*/) {
     if (!message) return;
-    {
+    const bool verboseStdout = g_ngx_verbose_stdout.load(std::memory_order_relaxed);
+    if (!g_ngx_capture_overrides.load(std::memory_order_relaxed) && !verboseStdout) {
+        return;
+    }
+    if (g_ngx_capture_overrides.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lock(g_override_mutex);
         parseNgxLogLineForOverrides(message, &g_override_info);
     }
-    if (!g_ngx_verbose_stdout.load(std::memory_order_relaxed)) return;
+    if (!verboseStdout) return;
 
     static std::mutex s_ngx_log_mutex;
     static uint32_t s_ngx_log_count = 0;
@@ -365,6 +372,7 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
     common.LoggingInfo.DisableOtherLoggingSinks = true;
 
+    g_ngx_capture_overrides.store(true, std::memory_order_release);
     NVSDK_NGX_Result r = NVSDK_NGX_D3D11_Init_with_ProjectID(
         kNgxProjectId,
         NVSDK_NGX_ENGINE_TYPE_CUSTOM,
@@ -375,6 +383,7 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
         NVSDK_NGX_Version_API);
 
     if (r != NVSDK_NGX_Result_Success) {
+        g_ngx_capture_overrides.store(false, std::memory_order_release);
         if (GetModuleHandleW(L"renderdoc.dll") != nullptr) {
             swprintf_s(g_status_msg,
                 L"NVSDK_NGX_D3D11_Init failed: 0x%08X (blocked under RenderDoc; use FSR or TAA while capturing)",
@@ -429,6 +438,7 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
     }
 
     g_ngx_state.initialized = true;
+    g_ngx_capture_overrides.store(false, std::memory_order_release);
     EdpeLog(g_status_msg);
     return true;
 #else
@@ -439,6 +449,7 @@ bool NgxContext::initialize(ID3D11Device* device, ID3D11DeviceContext* context) 
 
 void NgxContext::shutdown() {
     s_ngx_has_evaluated.store(false, std::memory_order_release);
+    g_ngx_capture_overrides.store(true, std::memory_order_relaxed);
 #if defined(EDPE_ENABLE_NGX) && EDPE_ENABLE_NGX
     releaseFeature();
     if (g_exposure_one) {
@@ -550,6 +561,24 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     if (!renderWidth || !renderHeight || !outputWidth || !outputHeight) return false;
     if (renderWidth > outputWidth || renderHeight > outputHeight) return false;
 
+    NgxFeatureSlot& slot = g_feature_slots[isHdr ? 1 : 0];
+    if (slot.handle &&
+        slot.render_width == renderWidth &&
+        slot.render_height == renderHeight &&
+        slot.output_width == outputWidth &&
+        slot.output_height == outputHeight &&
+        slot.requested_mode == mode &&
+        slot.requested_preset == preset) {
+        g_ngx_state.render_width = renderWidth;
+        g_ngx_state.render_height = renderHeight;
+        g_ngx_state.output_width = outputWidth;
+        g_ngx_state.output_height = outputHeight;
+        g_ngx_state.active_perf_quality = slot.active_perf_quality;
+        g_ngx_state.active_preset = slot.active_preset;
+        g_ngx_state.is_hdr = isHdr;
+        return true;
+    }
+
     NVSDK_NGX_PerfQuality_Value perfQuality = NVSDK_NGX_PerfQuality_Value_DLAA;
     if (renderWidth < outputWidth || renderHeight < outputHeight) {
         perfQuality = mapModeToNgxPerfQuality(mode);
@@ -573,7 +602,6 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
 
     const uint32_t effectivePreset = dlaaSafePreset(preset, perfQuality);
     const uint32_t perfQualityInt = static_cast<uint32_t>(perfQuality);
-    NgxFeatureSlot& slot = g_feature_slots[isHdr ? 1 : 0];
 
     if (slot.handle &&
         slot.render_width == renderWidth &&
@@ -582,6 +610,8 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
         slot.output_height == outputHeight &&
         slot.active_perf_quality == perfQualityInt &&
         slot.active_preset == effectivePreset) {
+        slot.requested_mode = mode;
+        slot.requested_preset = preset;
         g_ngx_state.render_width = renderWidth;
         g_ngx_state.render_height = renderHeight;
         g_ngx_state.output_width = outputWidth;
@@ -590,6 +620,12 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
         g_ngx_state.active_preset = effectivePreset;
         g_ngx_state.is_hdr = isHdr;
         return true;
+    }
+
+    NgxFeatureSlot& otherSlot = g_feature_slots[isHdr ? 0 : 1];
+    if (otherSlot.handle) {
+        NVSDK_NGX_D3D11_ReleaseFeature(otherSlot.handle);
+        otherSlot = {};
     }
 
     if (slot.handle) {
@@ -629,7 +665,9 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
         g_override_info.overriddenPresetValue = 0u;
     }
 
+    g_ngx_capture_overrides.store(true, std::memory_order_release);
     NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(context, &slot.handle, g_ngx_params, &cp);
+    g_ngx_capture_overrides.store(false, std::memory_order_release);
     if (r != NVSDK_NGX_Result_Success || !slot.handle) {
         slot.handle = nullptr;
         swprintf_s(g_status_msg, L"NGX_D3D11_CREATE_DLSS_EXT (%ux%u -> %ux%u) failed: 0x%08X",
@@ -644,6 +682,8 @@ bool NgxContext::ensureDlssFeature(ID3D11DeviceContext* context,
     slot.output_height = outputHeight;
     slot.active_perf_quality = perfQualityInt;
     slot.active_preset = effectivePreset;
+    slot.requested_mode = mode;
+    slot.requested_preset = preset;
     slot.reset_requested = true;
 
     g_ngx_state.render_width = renderWidth;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace edpe {
 
@@ -277,22 +278,87 @@ inline bool isTransientOriginRebaseHoldEligible(
     float jumpResidual,
     unsigned teleportStreak,
     bool inMainScene,
-    bool cutStreakSatisfied)
+    bool cutStreakSatisfied,
+    float prevSpeed = 0.0f)
 {
     if (!inMainScene || cutStreakSatisfied || teleportStreak >= 5) return false;
+    if (prevSpeed > 5.0f) return false;
     if (jumpResidual <= 15.0f || jumpResidual >= 2000.0f) return false;
     if (isCameraProjectionCut(candidate, committed)) return false;
     return cameraRotationTrace(candidate, committed) > 2.414f;
 }
 
-// True when a committed translation step exceeds normal camera bounds (>50m)
+// Tracks per-frame transient origin-rebase/teleport hold streak with a hard cap of
+// 4 consecutive held frames so rejected mid-frame passes cannot wipe the streak to 0.
+struct TeleportHoldState {
+    static constexpr unsigned kMaxConsecutiveHoldFrames = 4;
+
+    unsigned rejectionStreak = 0;
+    unsigned consecutiveHoldFrames = 0;
+    uint64_t lastRejectionFrame = ~0ull;
+
+    void noteJumpCandidate(uint64_t frame, bool alreadyStagedInScene) noexcept {
+        if (!alreadyStagedInScene && lastRejectionFrame != frame) {
+            lastRejectionFrame = frame;
+            ++rejectionStreak;
+        }
+    }
+
+    unsigned effectiveStreak() const noexcept {
+        return std::max(rejectionStreak, consecutiveHoldFrames + 1);
+    }
+
+    void onStagedWin(bool inMainScene, bool isTeleportHoldCandidate) noexcept {
+        if (inMainScene && !isTeleportHoldCandidate) {
+            rejectionStreak = 0;
+        }
+    }
+
+    bool canCommitHold() const noexcept {
+        return consecutiveHoldFrames < kMaxConsecutiveHoldFrames;
+    }
+
+    void onCommit(bool usedTeleportHold) noexcept {
+        if (usedTeleportHold) {
+            ++consecutiveHoldFrames;
+            rejectionStreak = std::max(rejectionStreak, consecutiveHoldFrames);
+        } else {
+            rejectionStreak = 0;
+            consecutiveHoldFrames = 0;
+        }
+    }
+
+    void reset() noexcept {
+        rejectionStreak = 0;
+        consecutiveHoldFrames = 0;
+        lastRejectionFrame = ~0ull;
+    }
+};
+
+// True when a seated ship/SRV camera enters or sustains high-speed normal-space
+// flight (e.g. Orbital Glide at 2,500 m/s -> 15..150 m/frame) inside the main
+// scene with continuous orientation and unchanged projection.
+inline bool isContinuousHighSpeedFlightStep(
+    const CameraProjection& candidate,
+    const CameraProjection& committed,
+    float jumpResidual,
+    bool inMainScene,
+    bool onFoot)
+{
+    if (onFoot || !inMainScene) return false;
+    if (jumpResidual <= 15.0f || jumpResidual > 150.0f) return false;
+    if (isCameraProjectionCut(candidate, committed)) return false;
+    return cameraRotationTrace(candidate, committed) > 2.95f;
+}
+
+// True when a committed translation step exceeds high-speed flight bounds (>150m/frame)
 // or jumps >15m beyond linear velocity prediction (persistent teleport/cut).
 inline bool isUnpredictedPositionCut(
     const Vec3& stepDelta,
     const Vec3& predictedDelta)
 {
     const float dist = length(stepDelta);
-    if (dist > 50.0f) return true;
+    if (dist > 150.0f) return true;
     if (dist <= 15.0f) return false;
     return length(stepDelta - predictedDelta) > 15.0f;
 }
@@ -572,7 +638,7 @@ inline bool isMainCameraGeometryValid(
     if (outW > outH && std::fabs(camAspect - 1.0f) < 0.03f) return false;
     if (outW > 0 && outH > 0) {
         const float screenAspect = static_cast<float>(outW) / static_cast<float>(outH);
-        if (std::fabs(camAspect - screenAspect) > 0.05f) return false;
+        if (std::fabs(camAspect - screenAspect) > 0.05f * screenAspect) return false;
     }
     return true;
 }

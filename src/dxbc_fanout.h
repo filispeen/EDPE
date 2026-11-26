@@ -840,4 +840,215 @@ inline VsProjectionCb classifyVsProjectionCb(const void* bytecode, size_t size) 
     if (readsCb1Proj) return VsProjectionCb::Cb1Proj270To273;
     return VsProjectionCb::None;
 }
+
+namespace dxbc_fanout_detail {
+inline bool parsePsFrostedOperand(const BYTE* chunkBase, size_t chunkWords,
+                                  size_t& q, size_t end, int depth,
+                                  uint32_t svPosReg,
+                                  bool& refsSvPos, bool& refsCb1_332, bool& refsT0) noexcept {
+    if (depth > 3 || q >= end || end > chunkWords) return false;
+    const uint32_t tok = readU32Unaligned(chunkBase + q * 4);
+    ++q;
+    const uint32_t numComp = tok & 3u;
+    const uint32_t opType = (tok >> 12) & 0xFFu;
+    const uint32_t idxDim = (tok >> 20) & 3u;
+    bool ext = (tok & 0x80000000u) != 0;
+    while (ext) {
+        if (q >= end) return false;
+        const uint32_t extTok = readU32Unaligned(chunkBase + q * 4);
+        ++q;
+        ext = (extTok & 0x80000000u) != 0;
+    }
+    if (idxDim == 0u) {
+        if (opType == 4u) { // D3D10_SB_OPERAND_TYPE_IMMEDIATE32
+            const size_t immWords = (numComp == 2u) ? 4u : 1u;
+            if (q + immWords > end) return false;
+            q += immWords;
+            return true;
+        }
+        if (opType == 5u) { // D3D10_SB_OPERAND_TYPE_IMMEDIATE64
+            const size_t immWords = (numComp == 2u) ? 4u : 2u;
+            if (q + immWords > end) return false;
+            q += immWords;
+            return true;
+        }
+        return true;
+    }
+    uint32_t imm[3]{};
+    uint32_t reps[3]{};
+    for (uint32_t d = 0; d < idxDim; ++d) {
+        const uint32_t rep = (tok >> (22u + d * 3u)) & 7u;
+        reps[d] = rep;
+        if (rep == 0u) { // IMMEDIATE32
+            if (q >= end) return false;
+            imm[d] = readU32Unaligned(chunkBase + q * 4);
+            ++q;
+        } else if (rep == 1u) { // IMMEDIATE64
+            if (q + 2 > end) return false;
+            imm[d] = readU32Unaligned(chunkBase + q * 4);
+            q += 2;
+        } else if (rep == 2u) { // RELATIVE
+            if (!parsePsFrostedOperand(chunkBase, chunkWords, q, end, depth + 1, svPosReg,
+                                       refsSvPos, refsCb1_332, refsT0)) {
+                return false;
+            }
+        } else if (rep == 3u) { // IMMEDIATE32_PLUS_RELATIVE
+            if (q >= end) return false;
+            imm[d] = readU32Unaligned(chunkBase + q * 4);
+            ++q;
+            if (!parsePsFrostedOperand(chunkBase, chunkWords, q, end, depth + 1, svPosReg,
+                                       refsSvPos, refsCb1_332, refsT0)) {
+                return false;
+            }
+        } else if (rep == 4u) { // IMMEDIATE64_PLUS_RELATIVE
+            if (q + 2 > end) return false;
+            imm[d] = readU32Unaligned(chunkBase + q * 4);
+            q += 2;
+            if (!parsePsFrostedOperand(chunkBase, chunkWords, q, end, depth + 1, svPosReg,
+                                       refsSvPos, refsCb1_332, refsT0)) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    if (opType == 1u && idxDim == 1u && reps[0] == 0u && imm[0] == svPosReg) {
+        refsSvPos = true;
+    } else if (opType == 8u && idxDim == 2u && reps[0] == 0u && reps[1] == 0u &&
+               imm[0] == 1u && imm[1] == 332u) {
+        refsCb1_332 = true;
+    } else if (opType == 7u && idxDim == 1u && reps[0] == 0u && imm[0] == 0u) {
+        refsT0 = true;
+    }
+    return true;
+}
+} // namespace dxbc_fanout_detail
+
+// Inspects an SM4/SM5 pixel shader DXBC container to detect frosted-glass HUD panel
+// backdrops that sample the blurred HDR scene (t0) at SV_Position.xy * cb1[332].zw.
+inline bool isFrostedBackdropPixelShader(const void* bytecode, size_t size) noexcept {
+    if (!bytecode || size < 32u || size > 1024u * 1024u) {
+        return false;
+    }
+    const auto* bytes = static_cast<const BYTE*>(bytecode);
+    if (std::memcmp(bytes, "DXBC", 4) != 0) {
+        return false;
+    }
+    const uint32_t totalSize = dxbc_fanout_detail::readU32Unaligned(bytes + 24u);
+    const uint32_t chunkCount = dxbc_fanout_detail::readU32Unaligned(bytes + 28u);
+    if (totalSize != size || chunkCount == 0u || chunkCount > 128u) {
+        return false;
+    }
+    if (32u + static_cast<size_t>(chunkCount) * 4u > size) {
+        return false;
+    }
+
+    const BYTE* progBase = nullptr;
+    size_t progWords = 0;
+    for (uint32_t i = 0; i < chunkCount; ++i) {
+        const uint32_t off = dxbc_fanout_detail::readU32Unaligned(bytes + 32u + static_cast<size_t>(i) * 4u);
+        if (off > size || size - off < 8u) return false;
+        const uint32_t tag = dxbc_fanout_detail::readU32Unaligned(bytes + off);
+        const uint32_t chunkSize = dxbc_fanout_detail::readU32Unaligned(bytes + off + 4u);
+        if (chunkSize > size - off - 8u) return false;
+        if (tag == 0x58454853u || tag == 0x52444853u) { // SHEX or SHDR
+            if (chunkSize < 8u || (chunkSize % 4u) != 0u) return false;
+            progBase = bytes + off + 8u;
+            progWords = chunkSize / 4u;
+            break;
+        }
+    }
+    if (!progBase || progWords < 2u) {
+        return false;
+    }
+
+    const uint32_t version = dxbc_fanout_detail::readU32Unaligned(progBase);
+    const uint32_t declaredWords = dxbc_fanout_detail::readU32Unaligned(progBase + 4u);
+    if ((version >> 16u) != 0u || declaredWords != progWords) {
+        return false;
+    }
+
+    bool hasCb1_333 = false;
+    bool hasSvPos = false;
+    uint32_t svPosReg = UINT32_MAX;
+    uint32_t outCount = 0u;
+    bool hasSvPosCb332Mul = false;
+    bool samplesT0 = false;
+
+    for (size_t p = 2; p < progWords;) {
+        const uint32_t opTok = dxbc_fanout_detail::readU32Unaligned(progBase + p * 4u);
+        const uint32_t op = opTok & 0x7FFu;
+        uint32_t len = 0u;
+        if (op == 53u) { // CUSTOMDATA
+            if (p + 1u >= progWords) return false;
+            len = dxbc_fanout_detail::readU32Unaligned(progBase + (p + 1u) * 4u);
+            if (len < 2u || len > progWords - p) return false;
+            p += len;
+            continue;
+        }
+        len = (opTok >> 24u) & 127u;
+        if (len == 0u || len > progWords - p) {
+            return false;
+        }
+        const bool isDecl = (op >= 88u && op <= 107u) || (op >= 143u && op <= 160u);
+        if (isDecl) {
+            if (op == 89u && len == 4u) { // dcl_constantbuffer
+                const uint32_t opnd = dxbc_fanout_detail::readU32Unaligned(progBase + (p + 1u) * 4u);
+                const uint32_t slot = dxbc_fanout_detail::readU32Unaligned(progBase + (p + 2u) * 4u);
+                const uint32_t vecs = dxbc_fanout_detail::readU32Unaligned(progBase + (p + 3u) * 4u);
+                if ((opnd & 0x003FF000u) == 0x00208000u && slot == 1u && vecs >= 333u) {
+                    hasCb1_333 = true;
+                }
+            } else if (op == 101u) { // dcl_output
+                ++outCount;
+            } else if (op == 100u && len >= 4u) { // dcl_input_ps_siv
+                const uint32_t tok = dxbc_fanout_detail::readU32Unaligned(progBase + (p + 1u) * 4u);
+                const uint32_t reg = dxbc_fanout_detail::readU32Unaligned(progBase + (p + 2u) * 4u);
+                const uint32_t sysVal = dxbc_fanout_detail::readU32Unaligned(progBase + (p + len - 1u) * 4u);
+                if ((tok & 0x80000000u) == 0u &&
+                    ((tok >> 12u) & 0xFFu) == 1u &&
+                    ((tok >> 20u) & 3u) == 1u &&
+                    ((tok >> 22u) & 7u) == 0u &&
+                    sysVal == 1u) { // D3D10_SB_NAME_POSITION
+                    hasSvPos = true;
+                    svPosReg = reg;
+                }
+            }
+        } else if (hasSvPos && (op == 56u || (op >= 69u && op <= 74u))) {
+            const size_t instrEnd = p + len;
+            size_t q = p + 1u;
+            while (q < instrEnd &&
+                   (dxbc_fanout_detail::readU32Unaligned(progBase + (q - 1u) * 4u) & 0x80000000u) != 0u) {
+                ++q;
+            }
+            bool refsSvPos = false;
+            bool refsCb1_332 = false;
+            bool refsT0 = false;
+            uint32_t opIdx = 0u;
+            while (q < instrEnd) {
+                bool opSvPos = false, opCb1_332 = false, opT0 = false;
+                if (!dxbc_fanout_detail::parsePsFrostedOperand(
+                        progBase, progWords, q, instrEnd, 0, svPosReg,
+                        opSvPos, opCb1_332, opT0)) {
+                    return false;
+                }
+                if (opIdx >= 1u) {
+                    refsSvPos |= opSvPos;
+                    refsCb1_332 |= opCb1_332;
+                    refsT0 |= opT0;
+                }
+                ++opIdx;
+            }
+            if (op == 56u && refsSvPos && refsCb1_332) {
+                hasSvPosCb332Mul = true;
+            }
+            if (op >= 69u && op <= 74u && refsT0) {
+                samplesT0 = true;
+            }
+        }
+        p += len;
+    }
+
+    return hasCb1_333 && outCount == 1u && hasSvPos && hasSvPosCb332Mul && samplesT0;
+}
 } // namespace edpe

@@ -48,14 +48,20 @@ HRESULT STDMETHODCALLTYPE observedCreateVertexShader(ID3D11Device* device,
     ID3D11VertexShader** shader) {
     const HRESULT result = original_create_vertex_shader.load(std::memory_order_acquire)(
         device, bytecode, size, linkage, shader);
-    if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
-        // Always retain VS bytecode (<= 64 KiB, same as PS) so WeaponMotionTracker can
-        // lazily build Stream-Output geometry shaders for stencil-0x10 weapon draws.
-        (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
-        const auto hash = EdpeShaderHash(bytecode, size);
-        (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
-        const auto projCb = edpe::classifyVsProjectionCb(bytecode, size);
-        (*shader)->SetPrivateData(kEdpeVsProjCbGuid, sizeof(projCb), &projCb);
+    if (SUCCEEDED(result) && shader && *shader && bytecode && size) {
+        if (EdpeMatchesDxbcHash(bytecode, size, 0x85c510eeu, 0xeee8af00u, 0x72ea964bu, 0x915a7889u)) {
+            const uint8_t tag = 1u;
+            (*shader)->SetPrivateData(kEdpeLoadingHoloVsGuid, sizeof(tag), &tag);
+        }
+        if (size <= 65536) {
+            // Always retain VS bytecode (<= 64 KiB, same as PS) so WeaponMotionTracker can
+            // lazily build Stream-Output geometry shaders for stencil-0x10 weapon draws.
+            (*shader)->SetPrivateData(kEdpeVertexBytecodeGuid, static_cast<UINT>(size), bytecode);
+            const auto hash = EdpeShaderHash(bytecode, size);
+            (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
+            const auto projCb = edpe::classifyVsProjectionCb(bytecode, size);
+            (*shader)->SetPrivateData(kEdpeVsProjCbGuid, sizeof(projCb), &projCb);
+        }
     }
     return result;
 }
@@ -65,10 +71,18 @@ HRESULT STDMETHODCALLTYPE observedCreatePixelShader(ID3D11Device* device,
     ID3D11PixelShader** shader) {
     const HRESULT result = original_create_pixel_shader.load(std::memory_order_acquire)(
         device, bytecode, size, linkage, shader);
-    if (SUCCEEDED(result) && shader && *shader && bytecode && size && size <= 65536) {
-        const auto hash = EdpeShaderHash(bytecode, size);
-        (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
-        (*shader)->SetPrivateData(kEdpePixelBytecodeGuid, static_cast<UINT>(size), bytecode);
+    if (SUCCEEDED(result) && shader && *shader && bytecode && size) {
+        if (EdpeMatchesDxbcHash(bytecode, size, 0xcdb8de4cu, 0x3ba248aau, 0xbf32bb26u, 0x864a5b22u)) {
+            const uint8_t tag = 1u;
+            (*shader)->SetPrivateData(kEdpeLoadingHoloPsGuid, sizeof(tag), &tag);
+        }
+        if (size <= 65536) {
+            const auto hash = EdpeShaderHash(bytecode, size);
+            (*shader)->SetPrivateData(kEdpeShaderHashGuid, sizeof(hash), &hash);
+            (*shader)->SetPrivateData(kEdpePixelBytecodeGuid, static_cast<UINT>(size), bytecode);
+            const uint8_t frostedBackdrop = edpe::isFrostedBackdropPixelShader(bytecode, size) ? 1u : 0u;
+            (*shader)->SetPrivateData(kEdpePsFrostedBackdropGuid, sizeof(frostedBackdrop), &frostedBackdrop);
+        }
     }
     return result;
 }

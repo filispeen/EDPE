@@ -111,6 +111,7 @@ public:
 
 private:
     bool initialized_ = false;
+    ID3D11Device* device_ = nullptr;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> outputTexture_;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> outputUav_;
     ID3D11Device* outputDevice_ = nullptr;
@@ -150,7 +151,7 @@ public:
         uint32_t renderWidth, uint32_t renderHeight,
         uint32_t outputWidth, uint32_t outputHeight) const override;
 
-    static constexpr float kDefaultVelocityFactor = 0.00f;
+    static constexpr float kDefaultVelocityFactor = 0.50f;
     void setVelocityFactor(float factor);
     float getVelocityFactor() const;
 
@@ -184,8 +185,26 @@ public:
 
     void resetHistory() override;
 
+    void setPreferredOutputFormat(DXGI_FORMAT fmt) { preferredOutputFormat_ = fmt; }
+    ID3D11Texture2D* latestOutputTexture() const { return pass_.latestOutputTexture(); }
+    ID3D11ShaderResourceView* latestOutputSrv() const { return pass_.latestOutputSrv(); }
+
 private:
     TaaPass pass_;
+    ID3D11Device* device_ = nullptr;
+    DXGI_FORMAT preferredOutputFormat_ = DXGI_FORMAT_UNKNOWN;
+    ID3D11Texture2D* cachedColorTex_ = nullptr;
+    uint32_t cachedColorW_ = 0;
+    uint32_t cachedColorH_ = 0;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cachedColorSrv_;
+    ID3D11Texture2D* cachedMotionTex_ = nullptr;
+    uint32_t cachedMotionW_ = 0;
+    uint32_t cachedMotionH_ = 0;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cachedMotionSrv_;
+    ID3D11Texture2D* cachedDepthTex_ = nullptr;
+    uint32_t cachedDepthW_ = 0;
+    uint32_t cachedDepthH_ = 0;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> cachedDepthSrv_;
 };
 
 // Central coordinator for temporal upscaling in EDPE.
@@ -216,7 +235,8 @@ public:
     bool evaluate(ID3D11DeviceContext* context,
         const TemporalFrameInputs& inputs,
         ID3D11RenderTargetView* destinationRtv,
-        ID3D11Texture2D* destinationTexture);
+        ID3D11Texture2D* destinationTexture,
+        bool callerRestoresState = false);
 
     bool evaluateBackend(UpscalerBackend backendType,
         ID3D11DeviceContext* context,
@@ -239,6 +259,10 @@ public:
 
     void setFsrVelocityFactor(float factor);
     float getFsrVelocityFactor() const;
+
+    void setTaaOutputFormat(DXGI_FORMAT fmt) { taaBackend_.setPreferredOutputFormat(fmt); }
+    ID3D11Texture2D* getTaaLatestOutputTexture() const { return taaBackend_.latestOutputTexture(); }
+    ID3D11ShaderResourceView* getTaaLatestOutputSrv() const { return taaBackend_.latestOutputSrv(); }
 
     void requestReset() { pendingReset_ = true; }
 

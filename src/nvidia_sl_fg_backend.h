@@ -70,9 +70,17 @@ public:
 
     void setDebugView(bool enabled) override;
     bool isDebugViewEnabled() const override;
+    bool presentsRealFrame() const override;
 
     // Invokes slReflexSleep for the current frame token when Reflex is active.
     bool reflexSleepCurrentFrame();
+
+    // Configures Reflex frame-rate cap (microseconds) via sl::ReflexOptions::frameLimitUs.
+    void setFrameLimitFps(float fps);
+    bool isReflexFrameLimiterActive() const;
+
+    // Emits early eSimulationEnd + eRenderSubmitStart PCL markers for the in-flight frame token.
+    void markRenderSubmitStart();
 
     StreamlineStatusSnapshot statusSnapshot() const;
 

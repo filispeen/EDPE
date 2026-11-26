@@ -47,7 +47,7 @@ As of November 2026 (`v0.8.0`), the working pipeline covers:
 | 12 | Native-resolution HUD separation | Verified | Redirected cockpit HUD draws to `s_hud_mask_texture` (`UiLayer`) and composited native UI over the upscaled scene (`UiCompositePass`). |
 | 13 | D3D11/D3D12 interoperability | Verified | Implemented shared NT handle texture/fence bridge (`D3D11D3D12Bridge`) and Flip-model D3D12 child overlay swapchain (`D3D12ProxyPresenter`). |
 | 14 | AMD FSR Frame Generation | Verified | Integrated official FidelityFX Frame Generation DX12 via `AmdFsrFgBackend`; verified in-game with UI packing and automatic menu stand-down. |
-| 15 | NVIDIA Streamline / DLSS-G | Prototype / Capability-gated | Integrated official Streamline v2.14.16 (`NvidiaStreamlineFgBackend`, Reflex/PCL/DLSS-G) with hardware capability gating and fail-open fallback. |
+| 15 | NVIDIA Streamline / DLSS-G | Verified | Integrated official Streamline v2.14.16 (`NvidiaStreamlineFgBackend`, Reflex/PCL/DLSS-G) with hardware capability gating and fail-open fallback. |
 | 16 | Intel XeSS, AMD FSR 4 & DittoSR | Planned | Planned Intel XeSS (XMX on Arc, DP4a fallback), AMD FSR 4 (4.1.2 for RX 7000/9000, [#27](https://github.com/filispeen/EDPE/issues/27)), and [DittoSR](https://github.com/Vancete/DittoSR) (lightweight MIT-licensed alternative compared with FSR 3.1.2) Native AA and Super Resolution via D3D11/D3D12 interop. |
 | 17 | Low-latency integration | Planned | Planned standalone and FG-coupled latency pacing via NVIDIA Reflex and AMD Anti-Lag / Anti-Lag 2. |
 | 18 | NVIDIA DLSS-NR | Research | Investigating NGX Neural Rendering for reflections and lighting. |
@@ -93,6 +93,32 @@ flowchart TD
 ```
 
 If an upscaler or Frame Generation backend fails to initialize or evaluate (or runs on unsupported hardware), EDPE disables the failing stage and presents normally without black screens.
+
+## Installation
+
+1. Build the project or download a release archive from [Releases](https://github.com/filispeen/EDPE/releases/latest).
+2. Open the folder containing `EliteDangerous64.exe` (for example `Products\elite-dangerous-odyssey-64` or `Products\elite-dangerous-64`).
+3. Copy `build/stage/dxgi.dll` (and `build/stage/nvngx_dlss.dll` for NVIDIA DLAA/DLSS) next to `EliteDangerous64.exe`. Remove any legacy `d3d11.dll` from older versions.
+4. Launch Elite Dangerous through the Frontier Launcher or Steam.
+5. Press `F5` in-game to open the menu and select an upscaler backend. Check `edpe.log` next to `EliteDangerous64.exe` if something fails to initialize.
+
+To uninstall, delete or rename `dxgi.dll` and `nvngx_dlss.dll` in the game folder.
+
+### Linux / SteamOS (Proton)
+
+1. Copy `dxgi.dll` (and `nvngx_dlss.dll` if using NVIDIA DLSS/DLAA) next to `EliteDangerous64.exe` inside your Steam library (`.../steamapps/common/Elite Dangerous/Products/elite-dangerous-odyssey-64/`).
+2. Set the Steam launch options for Elite Dangerous:
+   * **Standard (AMD FSR / TAA):**
+     ```bash
+     WINEDLLOVERRIDES="dxgi=n,b" %command%
+     ```
+   * **NVIDIA DLSS / DLAA:**
+     ```bash
+     PROTON_ENABLE_NVAPI=1 WINEDLLOVERRIDES="dxgi=n,b" %command%
+     ```
+3. **DXVK constant-buffer performance:** EDPE automatically enables its cached RAM constant-buffer map-bounce pool (`[Pipeline] MapBounceMode=auto`) under Wine/Proton to avoid slow CPU reads from DXVK write-combined BAR memory. For diagnostic comparison, you can set `MapBounceMode=off` in `edpe.ini` and test `d3d11.cachedDynamicResources = c` in a `dxvk.conf` file next to `EliteDangerous64.exe`.
+4. **Input & logs:** `[Input] WrapDirectInputKeyboard` defaults to `0` under Wine/Proton so remapped and virtual keys work reliably. Diagnostic logs (`edpe.log`) are written directly next to `EliteDangerous64.exe`.
+5. **Optional `dxgi.dll` chaining:** To chain EDPE with another `dxgi.dll` wrapper (such as ReShade or a custom DXVK build), rename the other DLL (for example `dxgi_reshade.dll`) and set `[Proxy] ChainDxgiDll=dxgi_reshade.dll` in `edpe.ini`.
 
 ## Controls and hotkeys
 
@@ -246,32 +272,6 @@ Test targets in `CMakeLists.txt`:
 * `proxy_smoke`: DLL load, Present hook, and input pass-through
 * `proxy_shader_probe`: shader bytecode interception smoke test
 * `proxy_alias_smoke`: staged `dxgi.dll` loading smoke test
-
-## Installation
-
-1. Build the project or download a release archive from [Releases](https://github.com/filispeen/EDPE/releases/latest).
-2. Open the folder containing `EliteDangerous64.exe` (for example `Products\elite-dangerous-odyssey-64` or `Products\elite-dangerous-64`).
-3. Copy `build/stage/dxgi.dll` (and `build/stage/nvngx_dlss.dll` for NVIDIA DLAA/DLSS) next to `EliteDangerous64.exe`. Remove any legacy `d3d11.dll` from older versions.
-4. Launch Elite Dangerous through the Frontier Launcher or Steam.
-5. Press `F5` in-game to open the menu and select an upscaler backend. Check `edpe.log` next to `EliteDangerous64.exe` if something fails to initialize.
-
-To uninstall, delete or rename `dxgi.dll` and `nvngx_dlss.dll` in the game folder.
-
-### Linux / SteamOS (Proton)
-
-1. Copy `dxgi.dll` (and `nvngx_dlss.dll` if using NVIDIA DLSS/DLAA) next to `EliteDangerous64.exe` inside your Steam library (`.../steamapps/common/Elite Dangerous/Products/elite-dangerous-odyssey-64/`).
-2. Set the Steam launch options for Elite Dangerous:
-   * **Standard (AMD FSR / TAA):**
-     ```bash
-     WINEDLLOVERRIDES="dxgi=n,b" %command%
-     ```
-   * **NVIDIA DLSS / DLAA:**
-     ```bash
-     PROTON_ENABLE_NVAPI=1 WINEDLLOVERRIDES="dxgi=n,b" %command%
-     ```
-3. **DXVK constant-buffer performance:** EDPE automatically enables its cached RAM constant-buffer map-bounce pool (`[Pipeline] MapBounceMode=auto`) under Wine/Proton to avoid slow CPU reads from DXVK write-combined BAR memory. For diagnostic comparison, you can set `MapBounceMode=off` in `edpe.ini` and test `d3d11.cachedDynamicResources = c` in a `dxvk.conf` file next to `EliteDangerous64.exe`.
-4. **Input & logs:** `[Input] WrapDirectInputKeyboard` defaults to `0` under Wine/Proton so remapped and virtual keys work reliably. Diagnostic logs (`edpe.log`) are written directly next to `EliteDangerous64.exe`.
-5. **Optional `dxgi.dll` chaining:** To chain EDPE with another `dxgi.dll` wrapper (such as ReShade or a custom DXVK build), rename the other DLL (for example `dxgi_reshade.dll`) and set `[Proxy] ChainDxgiDll=dxgi_reshade.dll` in `edpe.ini`.
 
 ## Project structure
 

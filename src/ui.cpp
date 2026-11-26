@@ -5,6 +5,7 @@
 #include "upscaler_backend.h"
 #include "fg_integration.h"
 #include "frame_limiter.h"
+#include "loading_mesh.h"
 #include "ngx_context.h"
 #include "capture_format.h"
 #include "config.h"
@@ -1499,6 +1500,13 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
         auto& cfg = edpe::Config::instance();
         cfg.load();
         edpe::FrameLimiter::instance().configure(cfg.gameFpsLimit);
+        {
+            auto& dancer = edpe::LoadingMeshReplacer::instance();
+            dancer.setEnabled(cfg.loadingScreenDancer);
+            dancer.setUseGameSpin(cfg.loadingScreenDancerSpin);
+            dancer.setReplaceAllHolograms(cfg.loadingScreenDancerAllHolograms);
+            dancer.setAnimSpeed(cfg.loadingScreenDancerSpeed);
+        }
         applyUiScale(cfg.uiScale);
         ContextCensusSetSharpness(cfg.sharpness);
         edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
@@ -1518,6 +1526,19 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
             edpe::UpscalerManager::instance().setMode(edpe::UpscaleMode::NativeAA);
         }
         ContextCensusRefreshMipLodBias();
+        edpe::FgRuntime::instance().startCapabilitiesProbeAsync(ui.device);
+        if (ui.font_proggy_forever && ui.font_proggy_forever->OwnerAtlas &&
+            ui.font_proggy_forever->OwnerAtlas->Builder) {
+            ImGui::SetCurrentContext(ui.imgui);
+            const float baseSize = ImGui::GetStyle().FontSizeBase > 0.0f
+                ? ImGui::GetStyle().FontSizeBase
+                : 13.0f;
+            ui.font_proggy_forever->GetFontBaked(
+                baseSize * std::clamp(cfg.perfOverlayScale, 0.5f, 2.5f), 1.0f);
+            ui.font_proggy_forever->GetFontBaked(
+                baseSize * std::clamp(cfg.uiScale, 0.5f, 2.5f), 1.0f);
+            ImGui::SetCurrentContext(previous);
+        }
     }
     if (ui.font_proggy_forever) {
         wchar_t fontMsg[128];
@@ -1965,7 +1986,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 }
             }
             if (!amd_active) ImGui::EndDisabled();
-            ImGui::SetItemTooltip("Controls FSR history weight drop during camera motion. 0.00 (default) keeps temporal supersampling active during motion; higher values drop history faster (1.00 = FSR SDK default).");
+            ImGui::SetItemTooltip("Controls FSR history weight drop during camera motion. 0.50 (default) balances stability and foliage anti-ghosting; 0.00 keeps maximum history, 1.00 = FSR SDK default.");
 
             // Sharpening
             if (!backend_active) ImGui::BeginDisabled();
@@ -1987,7 +2008,18 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 ImGui::EndDisabled();
                 ImGui::TextDisabled("Sharpening requires an active upscaler backend");
             } else if (taa_active) {
-                TextDisabledWrapped("(TAA uses Catmull-Rom reconstruction; vendor sharpening applies to DLSS and FSR)");
+                TextDisabledWrapped("(TAA uses Gaussian de-jitter + fp16 Catmull-Rom history; sharpening applies post-TAA to the output target)");
+                const auto gfxWarn = edpe::Config::readEliteGraphicsWarnings();
+                if (!cfg.hdrInput && gfxWarn.aaMode > 0) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.80f, 0.25f, 1.0f));
+                    ImGui::TextWrapped("Warning: Elite in-game FXAA/SMAA (AAMode=%d) is active on the LDR route. Disable in-game AA to prevent TAA shimmering.", gfxWarn.aaMode);
+                    ImGui::PopStyleColor();
+                }
+                if (gfxWarn.terrainCheckerboard) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.80f, 0.25f, 1.0f));
+                    ImGui::TextWrapped("Warning: TerrainCheckerboardRenderingEnabled is on in Elite's graphics config. Disable it to prevent planetary terrain shimmer.");
+                    ImGui::PopStyleColor();
+                }
             }
 
             if (!backend_active) ImGui::BeginDisabled();
@@ -2033,7 +2065,10 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
         // 2b. Frame Generation (Independent subsystem: Phases 13-15)
         if (ImGui::CollapsingHeader("Frame Generation", ImGuiTreeNodeFlags_DefaultOpen)) {
             auto& fgRt = edpe::FgRuntime::instance();
-            fgRt.ensureCapabilitiesProbed(ui.device);
+            fgRt.startCapabilitiesProbeAsync(ui.device);
+            if (fgRt.isCapabilitiesProbeInProgress()) {
+                ImGui::TextDisabled("Probing FG capabilities...");
+            }
 
             const bool amdFgAvail = fgRt.isBackendAvailable(edpe::FrameGenerationBackend::AmdFsrFg);
             const bool nvFgAvail = fgRt.isBackendAvailable(edpe::FrameGenerationBackend::NvidiaDlssG);
@@ -2185,7 +2220,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 }
                 const auto fgNow = edpe::FgRuntime::instance().telemetry();
                 if (fgNow.active && !fgNow.pausedForMenu && fgNow.generatedFramesThisCycle > 0) {
-                    const uint32_t mult = 1u + fgNow.generatedFramesThisCycle;
+                    const uint32_t mult = (fgNow.presentedFramesThisCycle > 0)
+                                              ? fgNow.presentedFramesThisCycle
+                                              : (1u + fgNow.generatedFramesThisCycle);
                     ImGui::TextDisabled("Target Presented (+FG x%u): ~%.1f FPS",
                         mult, stats.targetFps * static_cast<float>(mult));
                 }
@@ -2580,6 +2617,37 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             } else {
                 TextDisabledWrapped("Dims and desaturates the game view while highlighting subpixel jitter pixels in green.");
             }
+        }
+
+        if (ImGui::CollapsingHeader("Loading Screen Dancer")) {
+            auto& dancer = edpe::LoadingMeshReplacer::instance();
+            bool dancerEnabled = cfg.loadingScreenDancer;
+            if (ImGui::Checkbox("Enable Gangnam Style Loading Character", &dancerEnabled)) {
+                cfg.loadingScreenDancer = dancerEnabled;
+                dancer.setEnabled(dancerEnabled);
+                cfg.save();
+            }
+            bool dancerSpin = cfg.loadingScreenDancerSpin;
+            if (ImGui::Checkbox("Keep Native Turntable Spin", &dancerSpin)) {
+                cfg.loadingScreenDancerSpin = dancerSpin;
+                dancer.setUseGameSpin(dancerSpin);
+                cfg.save();
+            }
+            bool allHolo = cfg.loadingScreenDancerAllHolograms;
+            if (ImGui::Checkbox("Replace All Holograms (Ships / Suits)", &allHolo)) {
+                cfg.loadingScreenDancerAllHolograms = allHolo;
+                dancer.setReplaceAllHolograms(allHolo);
+                cfg.save();
+            }
+            float speed = cfg.loadingScreenDancerSpeed;
+            if (ImGui::SliderFloat("Animation Speed", &speed, 0.25f, 2.50f, "%.2fx")) {
+                cfg.loadingScreenDancerSpeed = speed;
+                dancer.setAnimSpeed(speed);
+                cfg.save();
+            }
+            ImGui::TextDisabled("Replaced draws: %llu (asset: %s)",
+                static_cast<unsigned long long>(dancer.replacedDrawCount()),
+                dancer.isAssetReady() ? "loaded" : "idle");
         }
 
         ImGui::Spacing();

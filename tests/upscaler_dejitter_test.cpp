@@ -185,6 +185,16 @@ struct GpuHarness {
         return true;
     }
 
+    bool ensureSurfaces(uint32_t renderW, uint32_t renderH, uint32_t outputW, uint32_t outputH,
+                        DXGI_FORMAT cFmt = DXGI_FORMAT_R8G8B8A8_UNORM,
+                        DXGI_FORMAT dFmt = DXGI_FORMAT_R32_FLOAT) {
+        if (colorTex && rw == renderW && rh == renderH && ow == outputW && oh == outputH &&
+            colorFormat == cFmt && depthFormat == dFmt) {
+            return true;
+        }
+        return allocateSurfaces(renderW, renderH, outputW, outputH, cFmt, dFmt);
+    }
+
     bool uploadDepth(const std::vector<float>& depthData) {
         if (depthFormat == DXGI_FORMAT_R32_FLOAT) {
             context->UpdateSubresource(depthTex[currDepthIdx].Get(), 0, nullptr, depthData.data(), rw * sizeof(float), 0);
@@ -254,6 +264,9 @@ struct GpuHarness {
     bool uploadAndEvaluateLuma(edpe::IUpscalerBackend& backend, const FrameBuffers& fb,
                                float jitterX, float jitterY, float prevJitterX, float prevJitterY,
                                bool reset, std::vector<float>& outLuma) {
+        if (fb.renderW != rw || fb.renderH != rh) {
+            return false;
+        }
         if (reset) {
             backend.resetHistory();
             hasPrevDepth = false;
@@ -322,7 +335,10 @@ struct GpuHarness {
 
     bool uploadAndEvaluate(edpe::IUpscalerBackend& backend, const FrameBuffers& fb,
                            float jitterX, float jitterY, float prevJitterX, float prevJitterY,
-                           bool reset, std::vector<uint32_t>& outPixels) {
+                           bool reset, std::vector<uint32_t>& outPixels, float sharpness = 0.0f) {
+        if (fb.renderW != rw || fb.renderH != rh) {
+            return false;
+        }
         if (reset) {
             backend.resetHistory();
             hasPrevDepth = false;
@@ -336,7 +352,7 @@ struct GpuHarness {
         }
         context->UpdateSubresource(motionTex.Get(), 0, nullptr, fb.motion.data(), rw * sizeof(uint32_t), 0);
 
-        const auto inputs = makeInputs(jitterX, jitterY, prevJitterX, prevJitterY, reset, 0.0f);
+        const auto inputs = makeInputs(jitterX, jitterY, prevJitterX, prevJitterY, reset, sharpness);
         if (!backend.evaluate(context.Get(), inputs, outputRtv.Get(), outputTex.Get())) {
             return false;
         }
@@ -374,7 +390,12 @@ struct StepEdgeMetrics {
 StepEdgeMetrics measureStepEdgeXY(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                   uint32_t renderW, uint32_t renderH,
                                   uint32_t outputW, uint32_t outputH,
-                                  float signX, float signY) {
+                                  float signX, float signY,
+                                  unsigned overridePhaseCount = 0,
+                                  float sharpness = 0.0f) {
+    if (!gpu.ensureSurfaces(renderW, renderH, outputW, outputH)) {
+        return {999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f};
+    }
     constexpr int kFrames = 48;
     constexpr int kWarmup = 16;
 
@@ -416,7 +437,8 @@ StepEdgeMetrics measureStepEdgeXY(GpuHarness& gpu, edpe::IUpscalerBackend& backe
     FrameBuffers fb;
     std::vector<uint32_t> outPixels;
     edpe::ProjectionJitter prevJ{};
-    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+    const unsigned phaseCount = overridePhaseCount ? overridePhaseCount
+                                                 : backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
 
     for (int t = 0; t < kFrames; ++t) {
         const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
@@ -448,7 +470,7 @@ StepEdgeMetrics measureStepEdgeXY(GpuHarness& gpu, edpe::IUpscalerBackend& backe
         const float passPrevJx = (t > 0) ? (prevJ.pixelX * signX) : 0.0f;
         const float passPrevJy = (t > 0) ? (prevJ.pixelY * signY) : 0.0f;
 
-        if (!gpu.uploadAndEvaluate(backend, fb, passJx, passJy, passPrevJx, passPrevJy, t == 0, outPixels)) {
+        if (!gpu.uploadAndEvaluate(backend, fb, passJx, passJy, passPrevJx, passPrevJy, t == 0, outPixels, sharpness)) {
             return {999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f, 999.0f};
         }
         prevJ = j;
@@ -560,7 +582,12 @@ struct ThinLineMetrics {
 ThinLineMetrics measureStaticThinLines(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                        uint32_t renderW, uint32_t renderH,
                                        uint32_t outputW, uint32_t outputH,
-                                       float signX = 1.0f, float signY = 1.0f) {
+                                       float signX = 1.0f, float signY = 1.0f,
+                                       unsigned overridePhaseCount = 0,
+                                       float sharpness = 0.0f) {
+    if (!gpu.ensureSurfaces(renderW, renderH, outputW, outputH)) {
+        return {999.0f, 999.0f, 0.0f, 999.0f, 999.0f};
+    }
     constexpr int kFrames = 48;
     constexpr int kWarmup = 16;
 
@@ -581,7 +608,8 @@ ThinLineMetrics measureStaticThinLines(GpuHarness& gpu, edpe::IUpscalerBackend& 
     FrameBuffers fb;
     std::vector<uint32_t> outPixels;
     edpe::ProjectionJitter prevJ{};
-    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+    const unsigned phaseCount = overridePhaseCount ? overridePhaseCount
+                                                 : backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
 
     for (int t = 0; t < kFrames; ++t) {
         const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
@@ -612,7 +640,7 @@ ThinLineMetrics measureStaticThinLines(GpuHarness& gpu, edpe::IUpscalerBackend& 
         if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX * signX, j.pixelY * signY,
                                    t > 0 ? prevJ.pixelX * signX : 0.0f,
                                    t > 0 ? prevJ.pixelY * signY : 0.0f,
-                                   t == 0, outPixels)) {
+                                   t == 0, outPixels, sharpness)) {
             return {999.0f, 999.0f, 0.0f, 999.0f, 999.0f};
         }
         prevJ = j;
@@ -697,7 +725,12 @@ struct PanningThinLineMetrics {
 PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                                   uint32_t renderW, uint32_t renderH,
                                                   uint32_t outputW, uint32_t outputH,
-                                                  float signX = 1.0f, float signY = 1.0f) {
+                                                  float signX = 1.0f, float signY = 1.0f,
+                                                  unsigned overridePhaseCount = 0,
+                                                  float sharpness = 0.0f) {
+    if (!gpu.ensureSurfaces(renderW, renderH, outputW, outputH)) {
+        return {999.0f, 999.0f, 0.0f};
+    }
     constexpr int kFrames = 64;
     constexpr int kWarmup = 32;
 
@@ -713,7 +746,8 @@ PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscal
     FrameBuffers fb;
     std::vector<uint32_t> outPixels;
     edpe::ProjectionJitter prevJ{};
-    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+    const unsigned phaseCount = overridePhaseCount ? overridePhaseCount
+                                                 : backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
 
     for (int t = 0; t < kFrames; ++t) {
         const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
@@ -738,7 +772,7 @@ PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscal
         if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
                                    t > 0 ? prevJ.pixelX : 0.0f,
                                    t > 0 ? prevJ.pixelY : 0.0f,
-                                   t == 0, outPixels)) {
+                                   t == 0, outPixels, sharpness)) {
             return {999.0f, 999.0f, 0.0f};
         }
         prevJ = j;
@@ -783,7 +817,12 @@ PanningThinLineMetrics measureSlowPanningThinLine(GpuHarness& gpu, edpe::IUpscal
 float measureUnvectoredBlobGhostResidual(GpuHarness& gpu, edpe::IUpscalerBackend& backend,
                                          uint32_t renderW, uint32_t renderH,
                                          uint32_t outputW, uint32_t outputH,
-                                         float signX = 1.0f, float signY = 1.0f) {
+                                         float signX = 1.0f, float signY = 1.0f,
+                                         unsigned overridePhaseCount = 0,
+                                         float sharpness = 0.0f) {
+    if (!gpu.ensureSurfaces(renderW, renderH, outputW, outputH)) {
+        return 999.0f;
+    }
     constexpr int kTotalFrames = 36;
     constexpr int kDisappearFrame = 20;
     constexpr int kMeasureFrame = 30;
@@ -795,7 +834,8 @@ float measureUnvectoredBlobGhostResidual(GpuHarness& gpu, edpe::IUpscalerBackend
     std::vector<uint32_t> outPixels;
     edpe::ProjectionJitter prevJ{};
     float residualAtFrame30 = 999.0f;
-    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
+    const unsigned phaseCount = overridePhaseCount ? overridePhaseCount
+                                                 : backend.recommendedJitterPhaseCount(32u, renderW, renderH, outputW, outputH);
 
     for (int t = 0; t < kTotalFrames; ++t) {
         const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
@@ -817,7 +857,7 @@ float measureUnvectoredBlobGhostResidual(GpuHarness& gpu, edpe::IUpscalerBackend
         if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX * signX, j.pixelY * signY,
                                    t > 0 ? prevJ.pixelX * signX : 0.0f,
                                    t > 0 ? prevJ.pixelY * signY : 0.0f,
-                                   t == 0, outPixels)) {
+                                   t == 0, outPixels, sharpness)) {
             return 999.0f;
         }
         prevJ = j;
@@ -1714,6 +1754,185 @@ int runDlssDiag(GpuHarness& gpu) {
 #endif
 }
 
+struct VerticalLineWidthMetrics {
+    float peakSpan = 0.0f;
+    float rmsDelta = 0.0f;
+    float maxPixDelta = 0.0f;
+    float meanPeak = 0.0f;
+};
+
+VerticalLineWidthMetrics measureVerticalThinLineWidth(
+    GpuHarness& gpu, edpe::IUpscalerBackend& backend,
+    uint32_t renderW, uint32_t renderH,
+    uint32_t outputW, uint32_t outputH,
+    float lineWidthPx, bool depthDiscontinuity,
+    unsigned phaseCount, float sharpness) {
+    if (!gpu.ensureSurfaces(renderW, renderH, outputW, outputH)) {
+        return {999.0f, 999.0f, 999.0f, 0.0f};
+    }
+    constexpr int kFrames = 64;
+    constexpr int kWarmup = 32;
+    constexpr float kCenterX = 64.25f;
+    const float halfW = lineWidthPx * 0.5f;
+    const float lineDepth = depthDiscontinuity ? (kDepthB / 20.0f) : (kDepthB / 40.0f);
+    const float bgDepth = kDepthB / 40.0f;
+    const float scaleX = static_cast<float>(outputW) / static_cast<float>(renderW);
+    const float scaleY = static_cast<float>(outputH) / static_cast<float>(renderH);
+
+    std::vector<float> peakSeries;
+    std::vector<std::vector<float>> windowFrames;
+    FrameBuffers fb;
+    std::vector<uint32_t> outPixels;
+    edpe::ProjectionJitter prevJ{};
+
+    for (int t = 0; t < kFrames; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), renderW, renderH, phaseCount);
+        fb.resize(renderW, renderH);
+        std::fill(fb.depth.begin(), fb.depth.end(), bgDepth);
+
+        for (uint32_t iy = 16; iy < renderH - 16; ++iy) {
+            for (uint32_t ix = 0; ix < renderW; ++ix) {
+                const float sx = static_cast<float>(ix) + 0.5f;
+                const float ux = sx - j.pixelX;
+                if (std::fabs(ux - kCenterX) <= halfW) {
+                    const size_t idx = static_cast<size_t>(iy) * renderW + ix;
+                    fb.color[idx] = packRgba8(0.85f, 0.85f, 0.85f);
+                    fb.depth[idx] = lineDepth;
+                }
+            }
+        }
+
+        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
+                                   t > 0 ? prevJ.pixelX : 0.0f,
+                                   t > 0 ? prevJ.pixelY : 0.0f,
+                                   t == 0, outPixels, sharpness)) {
+            return {999.0f, 999.0f, 999.0f, 0.0f};
+        }
+        prevJ = j;
+
+        if (t >= kWarmup) {
+            const uint32_t y0 = static_cast<uint32_t>(std::round(32 * scaleY));
+            const uint32_t y1 = static_cast<uint32_t>(std::round((renderH - 32) * scaleY));
+            const uint32_t x0 = static_cast<uint32_t>(std::round((kCenterX - 3.0f) * scaleX));
+            const uint32_t x1 = static_cast<uint32_t>(std::round((kCenterX + 3.0f) * scaleX));
+            float peakSum = 0.0f;
+            std::vector<float> win;
+            for (uint32_t y = y0; y < y1; ++y) {
+                float rmax = 0.0f;
+                for (uint32_t x = x0; x <= x1; ++x) {
+                    const float l = pixelLuma(outPixels[static_cast<size_t>(y) * outputW + x]);
+                    rmax = std::max(rmax, l);
+                    win.push_back(l);
+                }
+                peakSum += rmax;
+            }
+            peakSeries.push_back(peakSum / static_cast<float>(y1 - y0));
+            windowFrames.push_back(std::move(win));
+        }
+    }
+
+    VerticalLineWidthMetrics m{};
+    auto [mn, mx] = std::minmax_element(peakSeries.begin(), peakSeries.end());
+    m.peakSpan = *mx - *mn;
+    double peakMean = 0.0;
+    for (float v : peakSeries) peakMean += v;
+    m.meanPeak = static_cast<float>(peakMean / peakSeries.size());
+
+    double sqSum = 0.0;
+    size_t cnt = 0;
+    float maxD = 0.0f;
+    for (size_t i = 1; i < windowFrames.size(); ++i) {
+        for (size_t k = 0; k < windowFrames[i].size(); ++k) {
+            const float d = std::fabs(windowFrames[i][k] - windowFrames[i - 1][k]);
+            sqSum += static_cast<double>(d) * d;
+            maxD = std::max(maxD, d);
+            ++cnt;
+        }
+    }
+    m.rmsDelta = cnt > 0 ? static_cast<float>(std::sqrt(sqSum / cnt)) : 0.0f;
+    m.maxPixDelta = maxD;
+    return m;
+}
+
+int runFsrDiag(GpuHarness& gpu) {
+    if (!gpu.allocateSurfaces(128, 128, 128, 128)) {
+        std::printf("Failed to allocate surfaces\n");
+        return 1;
+    }
+    const float widths[] = { 0.45f, 0.85f, 1.25f, 1.75f };
+
+#if defined(EDPE_ENABLE_FSR)
+    {
+        edpe::AmdUpscalerBackend fsrBackend;
+        if (!fsrBackend.initialize(gpu.device.Get(), gpu.context.Get())) {
+            std::printf("FSR init failed\n");
+            return 2;
+        }
+        const unsigned phaseList[] = { 8u, 15u, 16u, 32u };
+        const float sharpList[] = { 0.0f, 0.50f };
+        for (float sharp : sharpList) {
+            std::printf("\n=== AMD FSR NativeAA 128x128 (vf=0.00, sharpness=%.2f) ===\n", sharp);
+            for (unsigned phases : phaseList) {
+                const StepEdgeMetrics edge = measureStepEdgeXY(gpu, fsrBackend, 128, 128, 128, 128, +1.0f, +1.0f, phases, sharp);
+                const PanningThinLineMetrics pan = measureSlowPanningThinLine(gpu, fsrBackend, 128, 128, 128, 128, +1.0f, +1.0f, phases, sharp);
+                const float ghost = measureUnvectoredBlobGhostResidual(gpu, fsrBackend, 128, 128, 128, 128, +1.0f, +1.0f, phases, sharp);
+                std::printf("  [phases=%2u] StepEdge span=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f) | SlowPan span=%.4f rms=%.4f | Ghost=%.4f\n",
+                            phases, edge.spanX, edge.spanY, edge.errX, edge.errY, edge.rmsX, edge.rmsY,
+                            pan.peakSpan, pan.rmsStepDelta, ghost);
+                for (float w : widths) {
+                    const auto flat = measureVerticalThinLineWidth(gpu, fsrBackend, 128, 128, 128, 128, w, false, phases, sharp);
+                    const auto disc = measureVerticalThinLineWidth(gpu, fsrBackend, 128, 128, 128, 128, w, true, phases, sharp);
+                    std::printf("    w=%.2fpx flat:(span=%.4f rms=%.4f maxD=%.4f pk=%.3f) depthEdge:(span=%.4f rms=%.4f maxD=%.4f pk=%.3f)\n",
+                                w, flat.peakSpan, flat.rmsDelta, flat.maxPixDelta, flat.meanPeak,
+                                disc.peakSpan, disc.rmsDelta, disc.maxPixDelta, disc.meanPeak);
+                }
+            }
+        }
+        fsrBackend.shutdown();
+    }
+#endif
+
+    {
+        edpe::TaaUpscalerBackend taaBackend;
+        if (!taaBackend.initialize(gpu.device.Get(), gpu.context.Get())) {
+            std::printf("TAA init failed\n");
+            return 3;
+        }
+        std::printf("\n=== Native D3D11 TAA 128x128 (phases=32, sharpness=0.00) ===\n");
+        const StepEdgeMetrics edge = measureStepEdgeXY(gpu, taaBackend, 128, 128, 128, 128, +1.0f, +1.0f, 32u, 0.0f);
+        const PanningThinLineMetrics pan = measureSlowPanningThinLine(gpu, taaBackend, 128, 128, 128, 128, +1.0f, +1.0f, 32u, 0.0f);
+        const float ghost = measureUnvectoredBlobGhostResidual(gpu, taaBackend, 128, 128, 128, 128, +1.0f, +1.0f, 32u, 0.0f);
+        std::printf("  [phases=32] StepEdge span=(%.4f, %.4f) err=(%.4f, %.4f) rms=(%.4f, %.4f) | SlowPan span=%.4f rms=%.4f | Ghost=%.4f\n",
+                    edge.spanX, edge.spanY, edge.errX, edge.errY, edge.rmsX, edge.rmsY,
+                    pan.peakSpan, pan.rmsStepDelta, ghost);
+        for (float w : widths) {
+            const auto flat = measureVerticalThinLineWidth(gpu, taaBackend, 128, 128, 128, 128, w, false, 32u, 0.0f);
+            const auto disc = measureVerticalThinLineWidth(gpu, taaBackend, 128, 128, 128, 128, w, true, 32u, 0.0f);
+            std::printf("    w=%.2fpx flat:(span=%.4f rms=%.4f maxD=%.4f pk=%.3f) depthEdge:(span=%.4f rms=%.4f maxD=%.4f pk=%.3f)\n",
+                        w, flat.peakSpan, flat.rmsDelta, flat.maxPixDelta, flat.meanPeak,
+                        disc.peakSpan, disc.rmsDelta, disc.maxPixDelta, disc.meanPeak);
+        }
+        taaBackend.shutdown();
+    }
+    return 0;
+}
+
+bool verifyVerticalThinLines(const char* label, GpuHarness& gpu, edpe::IUpscalerBackend& backend, unsigned phases) {
+    bool ok = true;
+    const float testWidths[] = { 0.85f, 1.75f };
+    for (float w : testWidths) {
+        const auto m = measureVerticalThinLineWidth(gpu, backend, 128, 128, 128, 128, w, true, phases, 0.0f);
+        std::printf("  [%s] VertThinLine(w=%.2fpx, depthEdge): span=%.4f rms=%.4f maxD=%.4f pk=%.3f\n",
+                    label, w, m.peakSpan, m.rmsDelta, m.maxPixDelta, m.meanPeak);
+        if (!(m.rmsDelta < 0.008f && m.maxPixDelta < 0.040f)) {
+            std::printf("  -> FAIL: %s w=%.2fpx vertical line flickered (rms=%.4f, maxD=%.4f)\n",
+                        label, w, m.rmsDelta, m.maxPixDelta);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1726,6 +1945,9 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dlss-diag") == 0) {
             return runDlssDiag(gpu);
+        }
+        if (std::strcmp(argv[i], "--fsr-diag") == 0) {
+            return runFsrDiag(gpu);
         }
     }
 
@@ -1768,6 +1990,9 @@ int main(int argc, char** argv) {
             return 2;
         }
         allOk &= runSuiteForBackend("AMD_FSR_NativeAA", gpu, fsrBackend, 128, 128, 128, 128);
+        allOk &= verifyVerticalThinLines(
+            "AMD_FSR_NativeAA", gpu, fsrBackend,
+            fsrBackend.recommendedJitterPhaseCount(32u, 128, 128, 128, 128));
         allOk &= runSuiteForBackend("AMD_FSR_QualitySR", gpu, fsrBackend, 128, 128, 192, 192);
 
         const PanningThinLineMetrics panVf100 = measureRealisticSlowPan(gpu, fsrBackend, 1.00f);
@@ -1809,8 +2034,10 @@ int main(int argc, char** argv) {
 
     {
         edpe::TaaUpscalerBackend taaBackend;
-        if (taaBackend.recommendedJitterPhaseCount(32u, 2560, 1440, 2560, 1440) != 32u) {
-            std::printf("  -> FAIL: TaaUpscalerBackend recommendedJitterPhaseCount != 32\n");
+        if (taaBackend.recommendedJitterPhaseCount(0u, 2560, 1440, 2560, 1440) != 8u ||
+            taaBackend.recommendedJitterPhaseCount(0u, 1707, 960, 2560, 1440) != 18u ||
+            taaBackend.recommendedJitterPhaseCount(32u, 2560, 1440, 2560, 1440) != 32u) {
+            std::printf("  -> FAIL: TaaUpscalerBackend recommendedJitterPhaseCount mismatch\n");
             allOk = false;
         }
         if (!taaBackend.initialize(gpu.device.Get(), gpu.context.Get())) {
@@ -1818,6 +2045,176 @@ int main(int argc, char** argv) {
             return 3;
         }
         allOk &= runSuiteForBackend("Native_D3D11_TAA", gpu, taaBackend, 128, 128, 128, 128);
+        {
+            const StepEdgeMetrics taaEdge = measureStepEdge(gpu, taaBackend, 128, 128, 128, 128, +1.0f);
+            if (!(taaEdge.rmsX < 0.007f && taaEdge.rmsY < 0.007f)) {
+                std::printf("  -> FAIL: Native_D3D11_TAA StepEdge(+jit) rms (%.4f, %.4f) >= 0.007\n",
+                            taaEdge.rmsX, taaEdge.rmsY);
+                allOk = false;
+            }
+            allOk &= verifyVerticalThinLines(
+                "Native_D3D11_TAA", gpu, taaBackend,
+                taaBackend.recommendedJitterPhaseCount(32u, 128, 128, 128, 128));
+        }
+
+        // Verify TaaPass allocates DXGI_FORMAT_R16G16B16A16_FLOAT history buffers even for 8-bit LDR output
+        ID3D11Texture2D* taaHist = taaBackend.latestOutputTexture();
+        if (!taaHist) {
+            std::printf("  -> FAIL: TaaUpscalerBackend latestOutputTexture is null\n");
+            allOk = false;
+        } else {
+            D3D11_TEXTURE2D_DESC histDesc{};
+            taaHist->GetDesc(&histDesc);
+            if (histDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                std::printf("  -> FAIL: TaaPass history format %u != DXGI_FORMAT_R16G16B16A16_FLOAT\n",
+                            static_cast<unsigned>(histDesc.Format));
+                allOk = false;
+            }
+        }
+
+        // Verify HDR > 1.0 round-trip and R11G11B10_FLOAT safe upper clamp (no NaN/Inf)
+        {
+            constexpr uint32_t kHdrW = 16;
+            constexpr uint32_t kHdrH = 16;
+            std::vector<float> hdrPixels(static_cast<size_t>(kHdrW) * kHdrH * 4u, 0.0f);
+            for (uint32_t y = 0; y < kHdrH; ++y) {
+                for (uint32_t x = 0; x < kHdrW; ++x) {
+                    const size_t idx = (static_cast<size_t>(y) * kHdrW + x) * 4u;
+                    if (x < kHdrW / 2) {
+                        hdrPixels[idx + 0] = 8.0f;
+                        hdrPixels[idx + 1] = 2.5f;
+                        hdrPixels[idx + 2] = 0.5f;
+                        hdrPixels[idx + 3] = 1.0f;
+                    } else {
+                        hdrPixels[idx + 0] = 100000.0f;
+                        hdrPixels[idx + 1] = 100000.0f;
+                        hdrPixels[idx + 2] = 100000.0f;
+                        hdrPixels[idx + 3] = 1.0f;
+                    }
+                }
+            }
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = kHdrW;
+            td.Height = kHdrH;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            D3D11_SUBRESOURCE_DATA initData{ hdrPixels.data(), kHdrW * 16u, 0 };
+            ComPtr<ID3D11Texture2D> hdrInTex, hdrOutTex, hdrStageTex;
+            ComPtr<ID3D11ShaderResourceView> hdrInSrv;
+            ComPtr<ID3D11RenderTargetView> hdrOutRtv;
+            D3D11_TEXTURE2D_DESC outDesc = td;
+            D3D11_TEXTURE2D_DESC stageDesc = td;
+            stageDesc.Usage = D3D11_USAGE_STAGING;
+            stageDesc.BindFlags = 0;
+            stageDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+            if (SUCCEEDED(gpu.device->CreateTexture2D(&td, &initData, &hdrInTex)) &&
+                SUCCEEDED(gpu.device->CreateShaderResourceView(hdrInTex.Get(), nullptr, &hdrInSrv)) &&
+                SUCCEEDED(gpu.device->CreateTexture2D(&outDesc, nullptr, &hdrOutTex)) &&
+                SUCCEEDED(gpu.device->CreateRenderTargetView(hdrOutTex.Get(), nullptr, &hdrOutRtv)) &&
+                SUCCEEDED(gpu.device->CreateTexture2D(&stageDesc, nullptr, &hdrStageTex))) {
+                edpe::TaaPass hdrPass;
+                if (hdrPass.initialize(gpu.device.Get(), gpu.context.Get())) {
+                    const bool ok = hdrPass.render(gpu.context.Get(), hdrInSrv.Get(), nullptr, nullptr,
+                        hdrOutRtv.Get(), hdrOutTex.Get(), kHdrW, kHdrH, 0.0f, 0.0f, true);
+                    if (!ok || hdrPass.historyFormat() != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                        std::printf("  -> FAIL: TaaPass HDR render or fp16 history format check failed\n");
+                        allOk = false;
+                    } else {
+                        gpu.context->CopyResource(hdrStageTex.Get(), hdrOutTex.Get());
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        if (SUCCEEDED(gpu.context->Map(hdrStageTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                            const auto* row = reinterpret_cast<const float*>(
+                                static_cast<const uint8_t*>(mapped.pData) + (kHdrH / 2) * mapped.RowPitch);
+                            const float rLo = row[2 * 4 + 0];
+                            const float gLo = row[2 * 4 + 1];
+                            const float bLo = row[2 * 4 + 2];
+                            const float rHi = row[(kHdrW - 2) * 4 + 0];
+                            const float gHi = row[(kHdrW - 2) * 4 + 1];
+                            const float bHi = row[(kHdrW - 2) * 4 + 2];
+                            gpu.context->Unmap(hdrStageTex.Get(), 0);
+                            if (!std::isfinite(rLo) || !std::isfinite(gLo) || !std::isfinite(bLo) ||
+                                std::fabs(rLo - 8.0f) > 0.1f || std::fabs(gLo - 2.5f) > 0.1f || std::fabs(bLo - 0.5f) > 0.05f) {
+                                std::printf("  -> FAIL: TaaPass HDR > 1.0 round-trip clipped (%.3f, %.3f, %.3f)\n", rLo, gLo, bLo);
+                                allOk = false;
+                            }
+                            if (!std::isfinite(rHi) || !std::isfinite(gHi) || !std::isfinite(bHi) ||
+                                rHi > 65024.0f || gHi > 65024.0f || bHi > 64512.0f) {
+                                std::printf("  -> FAIL: TaaPass extreme HDR not safely clamped (%.1f, %.1f, %.1f)\n", rHi, gHi, bHi);
+                                allOk = false;
+                            }
+                        }
+                    }
+                    hdrPass.shutdown();
+                }
+            }
+        }
+
+        // Verify UpscalerManager::evaluate NEVER sharpens TaaPass history in-place when destinationTexture == nullptr
+        {
+            constexpr uint32_t kSw = 32;
+            constexpr uint32_t kSh = 32;
+            FrameBuffers fb;
+            fb.resize(kSw, kSh);
+            for (uint32_t y = 0; y < kSh; ++y) {
+                for (uint32_t x = 0; x < kSw; ++x) {
+                    const float v = ((x + y) & 1u) ? 0.90f : 0.10f;
+                    fb.color[static_cast<size_t>(y) * kSw + x] = packRgba8(v, v, v);
+                }
+            }
+            if (gpu.allocateSurfaces(kSw, kSh, kSw, kSh)) {
+                gpu.context->UpdateSubresource(gpu.colorTex.Get(), 0, nullptr, fb.color.data(), kSw * sizeof(uint32_t), 0);
+                gpu.uploadDepth(fb.depth);
+                gpu.context->UpdateSubresource(gpu.motionTex.Get(), 0, nullptr, fb.motion.data(), kSw * sizeof(uint32_t), 0);
+                edpe::UpscalerManager& mgr = edpe::UpscalerManager::instance();
+                if (mgr.initialize(gpu.device.Get(), gpu.context.Get()) &&
+                    mgr.setBackend(edpe::UpscalerBackend::Taa) &&
+                    mgr.setMode(edpe::UpscaleMode::NativeAA)) {
+                    edpe::TemporalFrameInputs in = gpu.makeInputs(0.0f, 0.0f, 0.0f, 0.0f, true, 0.0f);
+
+                    auto readBackFp16 = [&](ID3D11Texture2D* tex, std::vector<uint16_t>& out) -> bool {
+                        if (!tex) return false;
+                        D3D11_TEXTURE2D_DESC d{};
+                        tex->GetDesc(&d);
+                        d.Usage = D3D11_USAGE_STAGING;
+                        d.BindFlags = 0;
+                        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        ComPtr<ID3D11Texture2D> stg;
+                        if (FAILED(gpu.device->CreateTexture2D(&d, nullptr, &stg))) return false;
+                        gpu.context->CopyResource(stg.Get(), tex);
+                        D3D11_MAPPED_SUBRESOURCE m{};
+                        if (FAILED(gpu.context->Map(stg.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+                        out.resize(static_cast<size_t>(d.Width) * d.Height * 4u);
+                        for (uint32_t row = 0; row < d.Height; ++row) {
+                            std::memcpy(out.data() + static_cast<size_t>(row) * d.Width * 4u,
+                                static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(row) * m.RowPitch,
+                                static_cast<size_t>(d.Width) * 8u);
+                        }
+                        gpu.context->Unmap(stg.Get(), 0);
+                        return true;
+                    };
+
+                    in.sharpness = 0.0f;
+                    std::vector<uint16_t> histNoSharp, histWithSharp;
+                    const bool ok0 = mgr.evaluate(gpu.context.Get(), in, nullptr, nullptr, false);
+                    const bool rb0 = ok0 && readBackFp16(mgr.getTaaLatestOutputTexture(), histNoSharp);
+
+                    in.sharpness = 0.85f;
+                    const bool ok1 = mgr.evaluate(gpu.context.Get(), in, nullptr, nullptr, false);
+                    const bool rb1 = ok1 && readBackFp16(mgr.getTaaLatestOutputTexture(), histWithSharp);
+
+                    if (!rb0 || !rb1 || histNoSharp != histWithSharp) {
+                        std::printf("  -> FAIL: UpscalerManager::evaluate modified TAA history in-place when destinationTexture == nullptr\n");
+                        allOk = false;
+                    }
+                    mgr.shutdown();
+                }
+            }
+        }
         taaBackend.shutdown();
     }
 
