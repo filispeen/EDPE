@@ -7309,6 +7309,8 @@ struct RejectedResourceSet {
     std::atomic<unsigned> nextVictim{0};
 };
 
+// A way is valid only while ways[w] holds the resource. bytes[w] is written before ways[w] is published and is
+// never cleared on eviction, because another thread may already have claimed the slot and written its own width.
 struct DotCbResourceSet {
     std::atomic<ID3D11Resource*> ways[kResourceCacheWays]{};
     std::atomic<UINT> bytes[kResourceCacheWays]{};
@@ -7362,9 +7364,7 @@ inline void evictDotCbResource(ID3D11Resource* res) {
     auto& set = s_accepted_dot_cb_cache[resourceCacheSetIndex(res)];
     for (size_t w = 0; w < kResourceCacheWays; ++w) {
         ID3D11Resource* expected = res;
-        if (set.ways[w].compare_exchange_strong(expected, nullptr, std::memory_order_relaxed)) {
-            set.bytes[w].store(0, std::memory_order_relaxed);
-        }
+        set.ways[w].compare_exchange_strong(expected, nullptr, std::memory_order_relaxed);
     }
 }
 
@@ -7403,7 +7403,6 @@ inline void clearRejectedResourceCache() {
         for (size_t w = 0; w < kResourceCacheWays; ++w) {
             s_rejected_map_cache[i].ways[w].store(nullptr, std::memory_order_relaxed);
             s_accepted_dot_cb_cache[i].ways[w].store(nullptr, std::memory_order_relaxed);
-            s_accepted_dot_cb_cache[i].bytes[w].store(0, std::memory_order_relaxed);
         }
     }
 }
