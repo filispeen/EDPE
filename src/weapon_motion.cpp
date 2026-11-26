@@ -8,6 +8,27 @@
 
 namespace edpe {
 
+namespace {
+
+constexpr uint32_t kWeaponZeroChunkBytes = 1024u * 1024u;
+
+void zeroClearSoRange(ID3D11DeviceContext* ctx,
+                      ID3D11Buffer* zeroChunk,
+                      ID3D11Buffer* dst,
+                      uint32_t byteOffset,
+                      uint32_t byteCount) {
+    if (!ctx || !zeroChunk || !dst || byteCount == 0u) return;
+    uint32_t written = 0u;
+    while (written < byteCount) {
+        const uint32_t chunk = (std::min)(kWeaponZeroChunkBytes, byteCount - written);
+        const D3D11_BOX srcBox{0u, 0u, 0u, chunk, 1u, 1u};
+        ctx->CopySubresourceRegion(dst, 0u, byteOffset + written, 0u, 0u, zeroChunk, 0u, &srcBox);
+        written += chunk;
+    }
+}
+
+} // namespace
+
 bool WeaponMotionTracker::initialize(ID3D11Device* device) {
     if (!device || device_) return false;
 
@@ -17,6 +38,20 @@ bool WeaponMotionTracker::initialize(ID3D11Device* device) {
     soDesc.BindFlags = D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_VERTEX_BUFFER;
     for (int i = 0; i < 2; ++i) {
         if (FAILED(device->CreateBuffer(&soDesc, nullptr, &soBuffers_[i]))) {
+            shutdown();
+            return false;
+        }
+    }
+
+    {
+        std::vector<uint8_t> zeros(kWeaponZeroChunkBytes, 0u);
+        D3D11_BUFFER_DESC zDesc{};
+        zDesc.ByteWidth = kWeaponZeroChunkBytes;
+        zDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        zDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA zInit{};
+        zInit.pSysMem = zeros.data();
+        if (FAILED(device->CreateBuffer(&zDesc, &zInit, &zeroSoChunk_))) {
             shutdown();
             return false;
         }
@@ -87,6 +122,7 @@ bool WeaponMotionTracker::initialize(ID3D11Device* device) {
 void WeaponMotionTracker::shutdown() {
     soBuffers_[0].Reset();
     soBuffers_[1].Reset();
+    zeroSoChunk_.Reset();
     rasterVs_.Reset();
     rasterPs_.Reset();
     inputLayout_.Reset();
@@ -319,6 +355,7 @@ static bool captureDrawCommon(
     ID3D11DeviceContext* context,
     ID3D11Texture2D* expectedDepthTex,
     ID3D11Buffer* soBuffer,
+    ID3D11Buffer* zeroSoChunk,
     std::vector<WeaponMotionTracker::CapturedDraw>& curDraws,
     UINT indexCount,
     UINT startIndex,
@@ -329,14 +366,18 @@ static bool captureDrawCommon(
     void* tracker,
     DrawFn&& invokeDraw) {
     if (!device || !context || !soBuffer) return false;
-    if (indexCount < 3u || indexCount > 250000u) return false;
+    if (indexCount < 3u || indexCount > kWeaponMaxSoVerticesPerDraw) return false;
     if (!WeaponMotionTracker::isOpaqueVisibleViewmodelDraw(context, expectedDepthTex, onFoot)) {
         return false;
     }
 
     D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     context->IAGetPrimitiveTopology(&topo);
-    if (topo != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) return false;
+    const bool isTriangleStrip = (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    if (topo != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST && !isTriangleStrip) return false;
+
+    const uint32_t soVertexCount = computeWeaponSoVertexCapacity(isTriangleStrip, indexCount);
+    if (soVertexCount == 0u) return false;
 
     Microsoft::WRL::ComPtr<ID3D11GeometryShader> origGs;
     context->GSGetShader(&origGs, nullptr, nullptr);
@@ -371,7 +412,12 @@ static bool captureDrawCommon(
     id.instanceCount = ordinal;
 
     uint32_t byteOffset = 0;
-    if (!recordDraw(tracker, id, indexCount, &byteOffset)) return false;
+    if (!recordDraw(tracker, id, soVertexCount, &byteOffset)) return false;
+
+    // Zero tail SO slots before strip capture so strip-cut restarts never leave stale w != 0 vertices.
+    if (isTriangleStrip) {
+        zeroClearSoRange(context, zeroSoChunk, soBuffer, byteOffset, soVertexCount * 16u);
+    }
 
     Microsoft::WRL::ComPtr<ID3D11PixelShader> origPs;
     context->PSGetShader(&origPs, nullptr, nullptr);
@@ -403,8 +449,8 @@ bool WeaponMotionTracker::captureDrawIndexedInstanced(
     bool onFoot) {
     if (!origDraw || instanceCount != 1u) return false;
     return captureDrawCommon(
-        device_.Get(), context, expectedDepthTex, soBuffers_[curSlot_].Get(), draws_[curSlot_],
-        indexCount, startIndex, baseVertex, onFoot,
+        device_.Get(), context, expectedDepthTex, soBuffers_[curSlot_].Get(), zeroSoChunk_.Get(),
+        draws_[curSlot_], indexCount, startIndex, baseVertex, onFoot,
         [](void* t, ID3D11VertexShader* vs, uint64_t h) {
             return static_cast<WeaponMotionTracker*>(t)->getOrCreateStreamOutGs(vs, h);
         },
@@ -425,8 +471,8 @@ bool WeaponMotionTracker::captureDrawIndexed(
     bool onFoot) {
     if (!origDraw) return false;
     return captureDrawCommon(
-        device_.Get(), context, expectedDepthTex, soBuffers_[curSlot_].Get(), draws_[curSlot_],
-        indexCount, startIndex, baseVertex, onFoot,
+        device_.Get(), context, expectedDepthTex, soBuffers_[curSlot_].Get(), zeroSoChunk_.Get(),
+        draws_[curSlot_], indexCount, startIndex, baseVertex, onFoot,
         [](void* t, ID3D11VertexShader* vs, uint64_t h) {
             return static_cast<WeaponMotionTracker*>(t)->getOrCreateStreamOutGs(vs, h);
         },

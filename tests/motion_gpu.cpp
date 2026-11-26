@@ -1115,5 +1115,56 @@ int main() {
     context->Unmap(cls16_rb.Get(), 0);
     if (seam_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::Weapon)) return 168;
 
+    // Issue #30: WeaponMotionTracker captures D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP with 0xFFFF
+    // strip-cut restart, zeroes unwritten SO tail vertices, and resolves non-zero pixel motion.
+    const std::uint16_t strip_indices[9] = {
+        0, 1, 2, 0xFFFFu, 0, 1, 2, 0, 1
+    };
+    D3D11_BUFFER_DESC strip_ib_desc{};
+    strip_ib_desc.ByteWidth = sizeof(strip_indices);
+    strip_ib_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    strip_ib_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA strip_ib_init{strip_indices, 0, 0};
+    ComPtr<ID3D11Buffer> strip_ib;
+    if (FAILED(device->CreateBuffer(&strip_ib_desc, &strip_ib_init, &strip_ib))) return 169;
+
+    auto bindWeaponStripState = [&]() {
+        bindWeaponDrawState();
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        context->IASetIndexBuffer(strip_ib.Get(), DXGI_FORMAT_R16_UINT, 0);
+    };
+
+    bindWeaponStripState();
+    wm_tracker.beginFrame(context.Get(), 4, 4, 0.0f, 0.0f);
+    const float strip_prev_cb[4] = {0.50f, -0.25f, 0.20000f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, strip_prev_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 9u, 0u, 0, invokeDrawIndexed, true)) {
+        return 170;
+    }
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    // First frame of a new strip draw has no matching previous-frame strip entry yet.
+    if (wm_tracker.resolve(context.Get(), 0.0f, 0.0f, 0.0f, 0.0f, false, gate_depth_srv.Get())) {
+        return 171;
+    }
+
+    bindWeaponStripState();
+    wm_tracker.beginFrame(context.Get(), 4, 4, 0.0f, 0.0f);
+    const float strip_cur_cb[4] = {0.0f, 0.0f, 0.20000f, 0.0f};
+    context->UpdateSubresource(test_cb.Get(), 0, nullptr, strip_cur_cb, 0, 0);
+    if (!wm_tracker.captureDrawIndexed(context.Get(), gate_depth_tex.Get(), 9u, 0u, 0, invokeDrawIndexed, true)) {
+        return 172;
+    }
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    if (!wm_tracker.resolve(context.Get(), 0.0f, 0.0f, 0.0f, 0.0f, false, gate_depth_srv.Get())) {
+        return 173;
+    }
+    if (!readWeaponMotionAt11(tie_x, tie_y, tie_d, tie_w)) return 174;
+    if (std::fabs(tie_w - 1.0f) >= 0.02f ||
+        std::fabs(tie_x - 1.00f) >= 0.05f ||
+        std::fabs(tie_y - 0.50f) >= 0.05f ||
+        std::fabs(tie_d - 0.20f) >= 0.02f) {
+        return 175;
+    }
+
     return 0;
 }

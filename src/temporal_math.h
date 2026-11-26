@@ -334,4 +334,15 @@ private:
     uint64_t m_mismatched = 0;
 };
 
+// Deferred CB0 viewport jitter must only shift full-resolution scene viewports; shifting
+// sub-resolution passes (such as 1/8-res atmosphere) clips edge columns and blurs a dark band.
+inline bool shouldApplyDeferredViewportJitter(float vpWidth, float vpHeight,
+                                              uint32_t renderW, uint32_t renderH) noexcept {
+    if (renderW == 0u || renderH == 0u) return false;
+    if (!std::isfinite(vpWidth) || !std::isfinite(vpHeight)) return false;
+    if (vpWidth < 64.0f || vpHeight < 64.0f) return false;
+    return std::fabs(vpWidth - static_cast<float>(renderW)) <= 1.0f &&
+           std::fabs(vpHeight - static_cast<float>(renderH)) <= 1.0f;
+}
+
 } // namespace edpe

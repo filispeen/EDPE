@@ -30,6 +30,18 @@ inline constexpr uint32_t kDynamicViewmodelStencilMask = kWeaponStencilBit | kCo
 inline constexpr float kDefaultWorldNearM = 0.025f;
 inline constexpr float kDefaultWeaponNearM = 0.0675f;
 inline constexpr uint32_t kWeaponSoPoolBytes = 24u * 1024u * 1024u; // 24 MiB bounded pool (16-32 MiB range)
+inline constexpr uint32_t kWeaponMaxSoVerticesPerDraw = 250000u;
+
+// Computes Stream-Output vertex storage required for an indexed draw.
+// D3D11 Stream-Output expands TRIANGLESTRIP to a TRIANGLELIST with up to (indexCount - 2) * 3 vertices.
+inline uint32_t computeWeaponSoVertexCapacity(bool isTriangleStrip, uint32_t indexCount) noexcept {
+    if (indexCount < 3u) return 0u;
+    if (!isTriangleStrip) {
+        return (indexCount <= kWeaponMaxSoVerticesPerDraw) ? indexCount : 0u;
+    }
+    const uint64_t expanded = static_cast<uint64_t>(indexCount - 2u) * 3ull;
+    return (expanded <= kWeaponMaxSoVerticesPerDraw) ? static_cast<uint32_t>(expanded) : 0u;
+}
 
 inline bool sameWeaponIdentity(const WeaponDrawIdentity& a, const WeaponDrawIdentity& b) {
     return a.boneBase == b.boneBase &&
@@ -145,6 +157,7 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> soBuffers_[2];
+    Microsoft::WRL::ComPtr<ID3D11Buffer> zeroSoChunk_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> rasterVs_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> rasterPs_;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> inputLayout_;
