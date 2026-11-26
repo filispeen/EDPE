@@ -15,6 +15,7 @@
 #include "jitter_view_recorder.h"
 #include "renderdoc_support.h"
 #include "sampler_bias_manager.h"
+#include "profiler.h"
 
 
 #include <d3d11_1.h>
@@ -2042,6 +2043,17 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             }
 
             if (!backend_active) ImGui::BeginDisabled();
+            {
+                bool rflow = ContextCensusGetResidualFlowEnabled();
+                if (ImGui::Checkbox("Object Motion Anti-Smearing (Residual Flow)", &rflow)) {
+                    ContextCensusSetResidualFlowEnabled(rflow);
+                    cfg.save();
+                }
+                ImGui::SetItemTooltip("Refines camera motion vectors with sparse GPU residual optical flow to prevent smearing on moving ships, NPCs, and station rings across TAA/DLSS/FSR.");
+            }
+            if (!backend_active) ImGui::EndDisabled();
+
+            if (!backend_active) ImGui::BeginDisabled();
             float curMipOffset = cfg.mipLodBiasOffset;
             if (ImGui::SliderFloat("Texture MIP Bias Offset", &curMipOffset, -2.0f, 2.0f, "%.2f")) {
                 cfg.mipLodBiasOffset = curMipOffset;
@@ -2551,6 +2563,40 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 }
                 if (ImGui::IsItemDeactivatedAfterEdit()) {
                     edpe::Config::instance().save();
+                }
+
+                ImGui::Separator();
+                bool rflow_en = ContextCensusGetResidualFlowEnabled();
+                if (ImGui::Checkbox("Residual Optical Flow (Unvectored Objects)", &rflow_en)) {
+                    ContextCensusSetResidualFlowEnabled(rflow_en);
+                    edpe::Config::instance().save();
+                }
+                bool rtv3_en = ContextCensusGetEmissiveReactiveEnabled();
+                if (ImGui::Checkbox("RTV3 Emissive Reactive Mask (Thrusters/Lasers)", &rtv3_en)) {
+                    ContextCensusSetEmissiveReactiveEnabled(rtv3_en);
+                    edpe::Config::instance().save();
+                }
+                if (!rtv3_en) ImGui::BeginDisabled();
+                float rtv3_scale = ContextCensusGetEmissiveReactiveScale();
+                if (ImGui::SliderFloat("Emissive Reactive Strength", &rtv3_scale, 0.0f, 1.0f, "%.2f")) {
+                    ContextCensusSetEmissiveReactiveScale(rtv3_scale);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    edpe::Config::instance().save();
+                }
+                if (!rtv3_en) ImGui::EndDisabled();
+
+                bool flowRan = false;
+                bool rtv3Active = false;
+                uint32_t celCount = 0;
+                ContextCensusGetMotionEnhancementStatus(&flowRan, &rtv3Active, &celCount);
+                if (edpe::Profiler::instance().isEnabled()) {
+                    const float flowMs = edpe::Profiler::instance().getGpuAvgMs(edpe::GpuProfileZone::ResidualFlow);
+                    ImGui::TextDisabled("Active: Flow=%s (%.3f ms) | RTV3=%s | Celestial=%u",
+                        flowRan ? "ON" : "OFF", flowMs, rtv3Active ? "ON" : "OFF", celCount);
+                } else {
+                    ImGui::TextDisabled("Active: Flow=%s | RTV3=%s | Celestial=%u",
+                        flowRan ? "ON" : "OFF", rtv3Active ? "ON" : "OFF", celCount);
                 }
 
                 if (ImGui::Button("Save Tuning to edpe.ini")) {

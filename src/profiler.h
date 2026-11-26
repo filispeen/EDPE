@@ -18,6 +18,7 @@ enum class ProfileZone : uint32_t {
 enum class GpuProfileZone : uint32_t {
     DepthCopy = 0,
     MotionPass,
+    ResidualFlow,
     ColorPrep,
     UpscaleEval,
     UiComposite,

@@ -173,6 +173,13 @@ public:
         GetPrivateProfileStringW(L"Motion", L"Scale", L"1.0", buf, 64, path.c_str());
         motionScale = static_cast<float>(_wtof(buf));
         if (motionScale < 0.0f || motionScale > 2.0f) motionScale = 1.0f;
+        residualFlowEnabled = GetPrivateProfileIntW(L"Motion", L"ResidualFlow", 1, path.c_str()) != 0;
+        emissiveReactiveEnabled = GetPrivateProfileIntW(L"Motion", L"EmissiveReactive", 1, path.c_str()) != 0;
+        GetPrivateProfileStringW(L"Motion", L"EmissiveReactiveScale", L"0.85", buf, 64, path.c_str());
+        emissiveReactiveScale = static_cast<float>(_wtof(buf));
+        if (!std::isfinite(emissiveReactiveScale) || emissiveReactiveScale < 0.0f || emissiveReactiveScale > 1.0f) {
+            emissiveReactiveScale = 0.85f;
+        }
 
         showPerfOverlay = GetPrivateProfileIntW(L"Overlay", L"ShowPerfOverlay", 0, path.c_str()) != 0;
         captureOverlayInComparison = GetPrivateProfileIntW(L"Overlay", L"CaptureOverlayInComparison", 0, path.c_str()) != 0;
@@ -351,6 +358,9 @@ public:
         appendBool("InvertX", motionInvertX);
         appendBool("InvertY", motionInvertY);
         appendFloat("Scale", "%.2f", motionScale);
+        appendBool("ResidualFlow", residualFlowEnabled);
+        appendBool("EmissiveReactive", emissiveReactiveEnabled);
+        appendFloat("EmissiveReactiveScale", "%.2f", emissiveReactiveScale);
 
         appendSection("Overlay");
         appendBool("ShowPerfOverlay", showPerfOverlay);
@@ -719,6 +729,9 @@ public:
     bool motionInvertX = false;
     bool motionInvertY = false;
     float motionScale = 1.0f;
+    bool residualFlowEnabled = true;
+    bool emissiveReactiveEnabled = true;
+    float emissiveReactiveScale = 0.85f;
 
     bool showPerfOverlay = false;
     bool captureOverlayInComparison = false;

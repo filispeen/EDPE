@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -313,7 +314,8 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     bool clampCockpit,
     bool enableReactiveOutput,
     bool inSrv,
-    ID3D11ShaderResourceView* emissiveColor) {
+    ID3D11ShaderResourceView* emissiveColor,
+    float emissiveReactiveScale) {
     if (!device_ || !depth || !width || !height ||
         !(now.scaleX > 0 && now.scaleY > 0 && now.depthB > 0 &&
           previous.scaleX > 0 && previous.scaleY > 0) ||
@@ -324,9 +326,11 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
         !std::isfinite(prevJitterX) || !std::isfinite(prevJitterY)) return false;
     for (float value : now.worldFromView) if (!std::isfinite(value)) return false;
     for (float value : previous.worldFromView) if (!std::isfinite(value)) return false;
+    const float emScale = std::isfinite(emissiveReactiveScale)
+        ? std::clamp(emissiveReactiveScale, 0.0f, 1.0f) : 0.85f;
     const bool useWeapon = (weaponMotion != nullptr && !reset);
     const bool useCelestial = (celestialRecords != nullptr && celestialCount > 0u && !reset);
-    const bool useEmissive = (emissiveColor != nullptr && enableReactiveOutput && !reset);
+    const bool useEmissive = (emissiveColor != nullptr && enableReactiveOutput && !reset && emScale > 0.0f);
     const int modeFlags =
         ((prevDepth && !reset) ? 1 : 0) |
         (enableClassOutput ? 4 : 0) |
@@ -364,6 +368,7 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     values[12] = static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz)); // prev0.x = translationStep
     values[13] = (now.depthB > 0.0f) ? (now.depthB / 50000.0f) : 1e-6f; // prev0.y = celestialDepthThresh
     values[14] = static_cast<float>(useCelestial ? (celestialCount > 16u ? 16u : celestialCount) : 0u); // prev0.z
+    values[15] = emScale; // prev0.w = emissiveReactiveScale
     values[16] = 2.0f / wf;          // prev1.x
     values[17] = -2.0f / hf;         // prev1.y
     values[18] = 1.0f / now.scaleX;  // prev1.z

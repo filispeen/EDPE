@@ -42,7 +42,8 @@ public:
         bool clampCockpit = true,
         bool enableReactiveOutput = false,
         bool inSrv = false,
-        ID3D11ShaderResourceView* emissiveColor = nullptr);
+        ID3D11ShaderResourceView* emissiveColor = nullptr,
+        float emissiveReactiveScale = 0.85f);
     bool renderGpuCameras(ID3D11ShaderResourceView* depth, ID3D11Buffer* now,
         ID3D11Buffer* previous, UINT width, UINT height,
         float jitterX = 0.0f, float jitterY = 0.0f,

@@ -46,7 +46,7 @@ struct CelestialRecord {
 
 cbuffer Camera : register(b0) {
     float4 now0, now1, now2;
-    float4 prev0, prev1, prev2; // prev0.x=translationStep, prev0.y=celestialDepthThresh, prev0.z=celestialCount
+    float4 prev0, prev1, prev2; // prev0.x=translationStep, prev0.y=celestialDepthThresh, prev0.z=celestialCount, prev0.w=emissiveReactiveScale
     float4 scales;     // current X/Y, previous X/Y
     float4 info;       // depthB, width, height, flags (bit0=hasPrevDepth, bit2=writeClass, bit3=reset, bit4=hasWeapon, bit5=hasCelestial, bit6=clampCockpit, bit8=hasCockpitTiles, bit9=writeReactive, bit10=inSrv, bit11=hasEmissive)
     float4 jitterInfo; // jitterX, jitterY, prevJitterX, prevJitterY (render pixels)
@@ -747,7 +747,7 @@ void writeOutputs(int2 pixCoord, MotionResult res) {
             float ePeak = max(em.r, max(em.g, em.b));
             float eLuma = dot(em, float3(0.2126, 0.7152, 0.0722));
             float eSignal = max(ePeak, eLuma);
-            float emScale = (res.pixelClass == kClassCockpitStatic) ? 0.0 : 0.85;
+            float emScale = (res.pixelClass == kClassCockpitStatic) ? 0.0 : saturate(prev0.w);
             float emReactive = smoothstep(0.15, 1.50, eSignal) * emScale;
             reactive = max(reactive, emReactive);
         }

@@ -120,6 +120,7 @@ private:
         float unaccountedMs = 0.0f;
         float gpuDepthCopyMs = 0.0f;
         float gpuMotionMs = 0.0f;
+        float gpuResidualFlowMs = 0.0f;
         float gpuColorPrepMs = 0.0f;
         float gpuUpscaleEvalMs = 0.0f;
         float gpuUiCompositeMs = 0.0f;

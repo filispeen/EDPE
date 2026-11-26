@@ -444,12 +444,14 @@ void PerfTracker::updateCachedStats() {
 
         profilerDisplay_.gpuDepthCopyMs = prof.getGpuAvgMs(GpuProfileZone::DepthCopy);
         profilerDisplay_.gpuMotionMs = prof.getGpuAvgMs(GpuProfileZone::MotionPass);
+        profilerDisplay_.gpuResidualFlowMs = prof.getGpuAvgMs(GpuProfileZone::ResidualFlow);
         profilerDisplay_.gpuColorPrepMs = prof.getGpuAvgMs(GpuProfileZone::ColorPrep);
         profilerDisplay_.gpuUpscaleEvalMs = prof.getGpuAvgMs(GpuProfileZone::UpscaleEval);
         profilerDisplay_.gpuUiCompositeMs = prof.getGpuAvgMs(GpuProfileZone::UiComposite);
         profilerDisplay_.gpuHudBloomMs = prof.getGpuAvgMs(GpuProfileZone::HudBloom);
         profilerDisplay_.gpuEdpeTotalMs =
             profilerDisplay_.gpuDepthCopyMs + profilerDisplay_.gpuMotionMs +
+            profilerDisplay_.gpuResidualFlowMs +
             profilerDisplay_.gpuColorPrepMs + profilerDisplay_.gpuUpscaleEvalMs +
             profilerDisplay_.gpuUiCompositeMs + profilerDisplay_.gpuHudBloomMs;
         profilerDisplay_.directColorActive = prof.isDirectColorActive();
@@ -857,7 +859,8 @@ void PerfTracker::renderOverlay(bool isMenuOpen, int corner, float scale, const 
             ImGui::Text("  Upscale Prep & Eval:   %6.3f ms", profilerDisplay_.upscaleMs);
             ImGui::Text("  Unaccounted (Game):    %6.3f ms", profilerDisplay_.unaccountedMs);
             ImGui::TextColored(ImVec4(0.5f, 0.9f, 1.0f, 1.0f), "GPU Passes (120f avg -> edpe.log):");
-            ImGui::Text("  DepthCopy / Motion:    %6.3f / %6.3f ms", profilerDisplay_.gpuDepthCopyMs, profilerDisplay_.gpuMotionMs);
+            ImGui::Text("  Depth / Motion / Flow: %6.3f / %6.3f / %6.3f ms",
+                profilerDisplay_.gpuDepthCopyMs, profilerDisplay_.gpuMotionMs, profilerDisplay_.gpuResidualFlowMs);
             ImGui::Text("  ColorPrep (%s):   %6.3f ms", profilerDisplay_.directColorActive ? "Direct" : "Copy  ", profilerDisplay_.gpuColorPrepMs);
             ImGui::Text("  UpscaleEval / UI Comp: %6.3f / %6.3f ms", profilerDisplay_.gpuUpscaleEvalMs, profilerDisplay_.gpuUiCompositeMs);
             ImGui::Text("  HudBloom / EDPE Total: %6.3f / %6.3f ms", profilerDisplay_.gpuHudBloomMs, profilerDisplay_.gpuEdpeTotalMs);

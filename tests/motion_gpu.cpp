@@ -1252,5 +1252,27 @@ int main() {
         return 186;
     }
 
+    // Dynamic emissiveReactiveScale (prev0.w = 0.50f) scales world emissive reactive weight
+    // proportionally (~0.50) while preserving zero reactive response on bg and static cockpit.
+    if (!pass.render(em_depth_srv.Get(), walkPrev, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, nullptr, nullptr, nullptr, 0u,
+            /*clampCockpit=*/true, /*enableReactiveOutput=*/true, /*inSrv=*/false,
+            rtv3_srv.Get(), /*emissiveReactiveScale=*/0.50f) ||
+        !pass.reactiveMaskTexture()) {
+        return 187;
+    }
+    context->CopyResource(react_rb.Get(), pass.reactiveMaskTexture());
+    if (FAILED(context->Map(react_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 188;
+    const auto* r2_row1 = static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch;
+    const float r2_bg = static_cast<float>(r2_row1[0]) / 255.0f;
+    const float r2_world_em = static_cast<float>(r2_row1[1]) / 255.0f;
+    const float r2_cockpit_em = static_cast<float>(r2_row1[2]) / 255.0f;
+    context->Unmap(react_rb.Get(), 0);
+    if (r2_bg > 0.02f || r2_world_em < 0.45f || r2_world_em > 0.55f || r2_cockpit_em > 0.02f) {
+        return 189;
+    }
+
     return 0;
 }

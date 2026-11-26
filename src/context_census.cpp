@@ -1797,6 +1797,13 @@ std::atomic<unsigned> s_hud_mask_latest_draws{0};
 
 
 std::atomic<bool> s_zero_motion_vectors{false};
+static std::atomic<bool> s_residual_flow_enabled{true};
+static std::atomic<bool> s_residual_flow_reset_pending{false};
+static std::atomic<bool> s_emissive_reactive_enabled{true};
+static std::atomic<float> s_emissive_reactive_scale{0.85f};
+static std::atomic<bool> s_last_residual_flow_ran{false};
+static std::atomic<bool> s_last_emissive_reactive_active{false};
+static std::atomic<uint32_t> s_last_celestial_count{0};
 
 static std::atomic<bool> s_scene_jitter_consumed{true};
 static std::atomic<unsigned> s_scene_writes_since_eval{0};
@@ -10184,6 +10191,7 @@ void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
 }
 
 static void captureEmissiveRtv3ForReactive(ID3D11DeviceContext* context, unsigned long long current_frame) {
+    if (!s_emissive_reactive_enabled.load(std::memory_order_relaxed)) return;
     if (!context || !motion_color_source || motion_color_frame != current_frame) return;
     if (s_emissive_rtv3_frame == current_frame || s_hdr_slot0_seen_frame == current_frame) return;
 
@@ -11856,6 +11864,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::MotionPass);
             if (s_zero_motion_vectors.load(std::memory_order_relaxed)) {
                 motion_pass->clear(context);
+                s_last_emissive_reactive_active.store(false, std::memory_order_relaxed);
+                s_last_celestial_count.store(0u, std::memory_order_relaxed);
             } else {
                 // Render motion vectors at render resolution using current and previous camera projections and jitter phases
                 const bool recentOnFootVisor =
@@ -11902,14 +11912,18 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                         celestialCount = s_celestial_motion.recordCount();
                     }
                 }
+                const float emScale = s_emissive_reactive_scale.load(std::memory_order_relaxed);
+                const bool emEnabled = s_emissive_reactive_enabled.load(std::memory_order_relaxed) && (emScale > 0.0f);
                 ID3D11ShaderResourceView* emissiveSrv =
-                    (wantReactiveMask && !eval_reset && s_emissive_rtv3_srv &&
+                    (wantReactiveMask && emEnabled && !eval_reset && s_emissive_rtv3_srv &&
                      s_emissive_rtv3_frame == rendered &&
                      s_emissive_rtv3_width == depthDesc.Width &&
                      s_emissive_rtv3_height == depthDesc.Height &&
                      sameD3D11Device(s_emissive_rtv3_tex.Get(), device.Get()))
                     ? s_emissive_rtv3_srv.Get()
                     : nullptr;
+                s_last_emissive_reactive_active.store(emissiveSrv != nullptr, std::memory_order_relaxed);
+                s_last_celestial_count.store(celestialCount, std::memory_order_relaxed);
                 motion_pass->render(motion_depth_view.Get(),
                     s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
                     jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv,
@@ -11923,7 +11937,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     /*clampCockpit=*/clampCockpit,
                     /*enableReactiveOutput=*/wantReactiveMask,
                     /*inSrv=*/inSrvActive,
-                    /*emissiveColor=*/emissiveSrv);
+                    /*emissiveColor=*/emissiveSrv,
+                    /*emissiveReactiveScale=*/emScale);
                 if (s_celestial_motion.isInitialized()) {
                     s_celestial_motion.beginFrame();
                 }
@@ -11939,7 +11954,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         if (!motion_pass->output()) return;
 
         activeMotionSrv = motion_pass->output();
-        if (!s_zero_motion_vectors.load(std::memory_order_relaxed)) {
+        bool residualFlowRan = false;
+        if (!s_zero_motion_vectors.load(std::memory_order_relaxed) &&
+            s_residual_flow_enabled.load(std::memory_order_relaxed)) {
             if (!s_residual_flow_pass && s_residual_flow_failed_device != device.Get()) {
                 auto candidate = std::make_unique<edpe::ResidualFlowPass>();
                 if (candidate->initialize(device.Get())) {
@@ -11951,6 +11968,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             }
             if (s_residual_flow_pass && s_residual_flow_pass->isInitialized()) {
                 edpe::ScopedRenderDocEvent rdocRFlow(context, L"EDPE: ResidualFlowPass");
+                s_gpu_pass_timer.beginZone(context, device.Get(), edpe::GpuProfileZone::ResidualFlow);
+                const bool rflowReset = eval_reset || s_residual_flow_reset_pending.exchange(false, std::memory_order_acq_rel);
                 ID3D11ShaderResourceView* depthForFlow =
                     (motion_pass->canonicalDepth() != nullptr) ? motion_pass->canonicalDepth() : motion_depth_view.Get();
                 if (s_residual_flow_pass->render(
@@ -11961,11 +11980,14 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                         motion_pass->pixelClass(),
                         depthDesc.Width, depthDesc.Height,
                         jx, jy, prev_jx, prev_jy,
-                        eval_reset)) {
+                        rflowReset)) {
                     activeMotionSrv = s_residual_flow_pass->output();
+                    residualFlowRan = true;
                 }
+                s_gpu_pass_timer.endZone(context, edpe::GpuProfileZone::ResidualFlow);
             }
         }
+        s_last_residual_flow_ran.store(residualFlowRan, std::memory_order_relaxed);
         if (!activeMotionSrv) return;
 
         Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
@@ -14354,6 +14376,9 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         s_motion_invert_x.store(cfg.motionInvertX, std::memory_order_relaxed);
         s_motion_invert_y.store(cfg.motionInvertY, std::memory_order_relaxed);
         s_motion_scale.store(cfg.motionScale, std::memory_order_relaxed);
+        s_residual_flow_enabled.store(cfg.residualFlowEnabled, std::memory_order_relaxed);
+        s_emissive_reactive_enabled.store(cfg.emissiveReactiveEnabled, std::memory_order_relaxed);
+        s_emissive_reactive_scale.store(cfg.emissiveReactiveScale, std::memory_order_relaxed);
         s_cb_map_bounce.configure(
             static_cast<edpe::MapBounceMode>(cfg.mapBounceMode),
             edpe::isRunningUnderWine());
@@ -15104,16 +15129,17 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             const float cpuUpscale = prof.getAvgMs(edpe::ProfileZone::TemporalUpscale);
             const float gpuDepth = prof.getGpuAvgMs(edpe::GpuProfileZone::DepthCopy);
             const float gpuMotion = prof.getGpuAvgMs(edpe::GpuProfileZone::MotionPass);
+            const float gpuFlow = prof.getGpuAvgMs(edpe::GpuProfileZone::ResidualFlow);
             const float gpuColor = prof.getGpuAvgMs(edpe::GpuProfileZone::ColorPrep);
             const float gpuEval = prof.getGpuAvgMs(edpe::GpuProfileZone::UpscaleEval);
             const float gpuUi = prof.getGpuAvgMs(edpe::GpuProfileZone::UiComposite);
             const float gpuBloom = prof.getGpuAvgMs(edpe::GpuProfileZone::HudBloom);
-            const float gpuTotal = gpuDepth + gpuMotion + gpuColor + gpuEval + gpuUi + gpuBloom;
-            wchar_t profMsg[384];
+            const float gpuTotal = gpuDepth + gpuMotion + gpuFlow + gpuColor + gpuEval + gpuUi + gpuBloom;
+            wchar_t profMsg[448];
             swprintf_s(profMsg,
-                L"EDPE PROFILE (120f avg) frame=%llu | CPU map=%.3f om=%.3f delta=%.3f draw=%.3f upscaleHook=%.3f ms | GPU total=%.3f (depthCopy=%.3f motion=%.3f colorPrep=%.3f eval=%.3f uiComp=%.3f hudBloom=%.3f) directColor=%u fmt=%u",
+                L"EDPE PROFILE (120f avg) frame=%llu | CPU map=%.3f om=%.3f delta=%.3f draw=%.3f upscaleHook=%.3f ms | GPU total=%.3f (depthCopy=%.3f motion=%.3f flow=%.3f colorPrep=%.3f eval=%.3f uiComp=%.3f hudBloom=%.3f) directColor=%u fmt=%u",
                 frame, cpuMap, cpuOm, cpuDelta, cpuDraw, cpuUpscale,
-                gpuTotal, gpuDepth, gpuMotion, gpuColor, gpuEval, gpuUi, gpuBloom,
+                gpuTotal, gpuDepth, gpuMotion, gpuFlow, gpuColor, gpuEval, gpuUi, gpuBloom,
                 prof.isDirectColorActive() ? 1u : 0u, prof.getDirectColorFormat());
             EdpeLog(profMsg);
 
@@ -15992,6 +16018,36 @@ void ContextCensusSetMotionScale(float scale) {
 }
 float ContextCensusGetMotionScale() {
     return s_motion_scale.load(std::memory_order_relaxed);
+}
+void ContextCensusSetResidualFlowEnabled(bool enabled) {
+    s_residual_flow_enabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) {
+        s_residual_flow_reset_pending.store(true, std::memory_order_release);
+    }
+    edpe::Config::instance().residualFlowEnabled = enabled;
+}
+bool ContextCensusGetResidualFlowEnabled() {
+    return s_residual_flow_enabled.load(std::memory_order_relaxed);
+}
+void ContextCensusSetEmissiveReactiveEnabled(bool enabled) {
+    s_emissive_reactive_enabled.store(enabled, std::memory_order_relaxed);
+    edpe::Config::instance().emissiveReactiveEnabled = enabled;
+}
+bool ContextCensusGetEmissiveReactiveEnabled() {
+    return s_emissive_reactive_enabled.load(std::memory_order_relaxed);
+}
+void ContextCensusSetEmissiveReactiveScale(float scale) {
+    const float clamped = std::isfinite(scale) ? std::clamp(scale, 0.0f, 1.0f) : 0.85f;
+    s_emissive_reactive_scale.store(clamped, std::memory_order_relaxed);
+    edpe::Config::instance().emissiveReactiveScale = clamped;
+}
+float ContextCensusGetEmissiveReactiveScale() {
+    return s_emissive_reactive_scale.load(std::memory_order_relaxed);
+}
+void ContextCensusGetMotionEnhancementStatus(bool* outResidualFlowRan, bool* outEmissiveCaptured, uint32_t* outCelestialCount) {
+    if (outResidualFlowRan) *outResidualFlowRan = s_last_residual_flow_ran.load(std::memory_order_relaxed);
+    if (outEmissiveCaptured) *outEmissiveCaptured = s_last_emissive_reactive_active.load(std::memory_order_relaxed);
+    if (outCelestialCount) *outCelestialCount = s_last_celestial_count.load(std::memory_order_relaxed);
 }
 
 void ContextCensusGetSceneRenderSize(UINT* outWidth, UINT* outHeight) {
