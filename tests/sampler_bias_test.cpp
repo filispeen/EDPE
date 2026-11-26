@@ -47,6 +47,10 @@ bool testEligibilityAndMath() {
     if (std::fabs(SBM::computeLiveMipLodBias(1, 2, 1707, 2560, 0.0f) - expectedQuality) > 1e-4f) return false;
     if (SBM::computeLiveMipLodBias(1, 1, 2560, 2560, 0.0f) != 0.0f) return false;
     if (SBM::computeLiveMipLodBias(1, 5, 640, 2560, -2.0f) != -3.0f) return false;
+    // Native TAA (backend=3) clamps MipLODBias >= -0.25f to prevent grazing-angle mip flicker
+    if (SBM::computeLiveMipLodBias(3, 1, 2560, 2560, 0.0f) != 0.0f) return false;
+    if (std::fabs(SBM::computeLiveMipLodBias(3, 1, 2560, 2560, -1.0f) - (-0.25f)) > 1e-4f) return false;
+    if (std::fabs(SBM::computeLiveMipLodBias(3, 1, 2560, 2560, 0.50f) - 0.50f) > 1e-4f) return false;
     return true;
 }
 
@@ -152,6 +156,50 @@ bool testLiveRemapping() {
     out[0]->GetDesc(&gotDesc);
     if (gotDesc.Filter != D3D11_FILTER_MIN_MAG_MIP_LINEAR || std::fabs(gotDesc.MipLODBias - (-1.0f)) > 1e-3f) {
         std::printf("  -> FAIL: changed desc variant properties incorrect\n");
+        mgr.resetForTests();
+        return false;
+    }
+
+    // Native TAA: ForceAniso16x upgrades MIN_MAG_MIP_LINEAR -> 16x ANISOTROPIC even at bias=0.0f,
+    // and NativeTaaBiasGuard lifts negative game-authored MipLODBias to >= 0.0f (or >= -0.25f with offset).
+    mgr.resetForTests();
+    mgr.setOriginalCreateSampler(&rawCreateSampler);
+    const auto linearMipDesc = makeDefaultSampler(D3D11_FILTER_MIN_MAG_MIP_LINEAR, 12.0f, -0.75f);
+    ComPtr<ID3D11SamplerState> origLinearNeg;
+    if (FAILED(dev->CreateSamplerState(&linearMipDesc, &origLinearNeg))) {
+        mgr.resetForTests();
+        return false;
+    }
+    mgr.registerSampler(dev.Get(), linearMipDesc, origLinearNeg.Get());
+    mgr.registerSampler(dev.Get(), pointDesc, origPoint.Get());
+    ID3D11SamplerState* taaIn[2] = { origLinearNeg.Get(), origPoint.Get() };
+    ID3D11SamplerState* taaOut[2] = {};
+    mgr.setTargetBias(0.0f);
+    mgr.setForceAniso16x(true);
+    mgr.setNativeTaaBiasGuard(true);
+    if (!mgr.remapSamplers(2, taaIn, taaOut) || taaOut[0] == origLinearNeg.Get() || taaOut[1] != origPoint.Get()) {
+        std::printf("  -> FAIL: TAA ForceAniso16x / NativeTaaBiasGuard remap failed\n");
+        mgr.resetForTests();
+        return false;
+    }
+    taaOut[0]->GetDesc(&gotDesc);
+    if (gotDesc.Filter != D3D11_FILTER_ANISOTROPIC || gotDesc.MaxAnisotropy != 16u ||
+        std::fabs(gotDesc.MipLODBias - 0.0f) > 1e-3f) {
+        std::printf("  -> FAIL: expected 16x AF and MipLODBias=0.0, got filter=%u aniso=%u bias=%.3f\n",
+                    gotDesc.Filter, gotDesc.MaxAnisotropy, gotDesc.MipLODBias);
+        mgr.resetForTests();
+        return false;
+    }
+    mgr.setTargetBias(-0.25f);
+    if (!mgr.remapSamplers(2, taaIn, taaOut)) {
+        std::printf("  -> FAIL: TAA -0.25 bias remap failed\n");
+        mgr.resetForTests();
+        return false;
+    }
+    taaOut[0]->GetDesc(&gotDesc);
+    if (gotDesc.Filter != D3D11_FILTER_ANISOTROPIC || gotDesc.MaxAnisotropy != 16u ||
+        std::fabs(gotDesc.MipLODBias - (-0.25f)) > 1e-3f) {
+        std::printf("  -> FAIL: expected 16x AF and MipLODBias=-0.25, got bias=%.3f\n", gotDesc.MipLODBias);
         mgr.resetForTests();
         return false;
     }

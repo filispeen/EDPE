@@ -1155,5 +1155,15 @@ int main() {
         if (!edpe::isEliteSubpassVersusWorldCb1(edo2Cb1.data(), edo2Cb1.size(), adsRifleCam)) return 162;
     }
 
+    // Native TAA phase floor (minPhaseFloor = 16): ensures >= 16 phases at 1.0x while scaling upward for SR.
+    if (edpe::computeEffectiveJitterPhaseCount(0, 2560, 1440, 2560, 1440, 16u) != 16u) return 165;
+    if (edpe::computeEffectiveJitterPhaseCount(8, 2560, 1440, 2560, 1440, 16u) != 16u) return 166;
+    if (edpe::computeEffectiveJitterPhaseCount(16, 2560, 1440, 2560, 1440, 16u) != 16u) return 167;
+    if (edpe::computeEffectiveJitterPhaseCount(32, 2560, 1440, 2560, 1440, 16u) != 32u) return 168;
+    if (edpe::computeEffectiveJitterPhaseCount(128, 2560, 1440, 2560, 1440, 16u) != 64u) return 169;
+    if (edpe::computeEffectiveJitterPhaseCount(8, 1707, 960, 2560, 1440, 16u) != 18u) return 170;
+    if (edpe::computeEffectiveJitterPhaseCount(8, 1280, 720, 2560, 1440, 16u) != 32u) return 171;
+    if (edpe::computeEffectiveJitterPhaseCount(8, 1280, 720, 3840, 2160, 16u) != 72u) return 172;
+
     return 0; // All temporal math tests passed
 }

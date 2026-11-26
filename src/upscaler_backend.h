@@ -185,6 +185,10 @@ public:
 
     void resetHistory() override;
 
+    unsigned recommendedJitterPhaseCount(unsigned configuredBasePhases,
+        uint32_t renderWidth, uint32_t renderHeight,
+        uint32_t outputWidth, uint32_t outputHeight) const override;
+
     void setPreferredOutputFormat(DXGI_FORMAT fmt) { preferredOutputFormat_ = fmt; }
     ID3D11Texture2D* latestOutputTexture() const { return pass_.latestOutputTexture(); }
     ID3D11ShaderResourceView* latestOutputSrv() const { return pass_.latestOutputSrv(); }

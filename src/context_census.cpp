@@ -11163,15 +11163,25 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         : edpe::UpscaleMode::NativeAA;
     upscaler.setMode(desiredMode);
     {
+        const auto activeBackend = upscaler.getBackend();
         const float liveBias = upscale_active
             ? edpe::SamplerBiasManager::computeLiveMipLodBias(
-                static_cast<int>(upscaler.getBackend()),
+                static_cast<int>(activeBackend),
                 static_cast<int>(desiredMode),
                 depthDesc.Width,
                 backbufferDesc.Width,
                 edpe::Config::instance().mipLodBiasOffset)
             : 0.0f;
-        edpe::SamplerBiasManager::instance().setTargetBias(liveBias);
+        auto& samplerMgr = edpe::SamplerBiasManager::instance();
+        samplerMgr.setTargetBias(liveBias);
+        if (upscale_active && activeBackend == edpe::UpscalerBackend::Taa) {
+            const bool nativeTaa = (depthDesc.Width == 0 || backbufferDesc.Width == 0 || depthDesc.Width >= backbufferDesc.Width);
+            samplerMgr.setForceAniso16x(edpe::Config::instance().taaForceAniso16x);
+            samplerMgr.setNativeTaaBiasGuard(nativeTaa);
+        } else {
+            samplerMgr.setForceAniso16x(false);
+            samplerMgr.setNativeTaaBiasGuard(false);
+        }
     }
     const bool hdrInput = edpe::Config::instance().hdrInput;
 
@@ -15779,8 +15789,11 @@ void ContextCensusRefreshMipLodBias() {
     auto& upscaler = edpe::UpscalerManager::instance();
     const auto& cfg = edpe::Config::instance();
     const auto backend = upscaler.getBackend();
+    auto& samplerMgr = edpe::SamplerBiasManager::instance();
     if (backend == edpe::UpscalerBackend::None) {
-        edpe::SamplerBiasManager::instance().setTargetBias(0.0f);
+        samplerMgr.setTargetBias(0.0f);
+        samplerMgr.setForceAniso16x(false);
+        samplerMgr.setNativeTaaBiasGuard(false);
         return;
     }
     const UINT rW = s_observed_scene_width.load(std::memory_order_relaxed);
@@ -15797,7 +15810,15 @@ void ContextCensusRefreshMipLodBias() {
         rW,
         oW,
         cfg.mipLodBiasOffset);
-    edpe::SamplerBiasManager::instance().setTargetBias(bias);
+    samplerMgr.setTargetBias(bias);
+    if (backend == edpe::UpscalerBackend::Taa) {
+        const bool nativeTaa = (rW == 0 || oW == 0 || rW >= oW);
+        samplerMgr.setForceAniso16x(cfg.taaForceAniso16x);
+        samplerMgr.setNativeTaaBiasGuard(nativeTaa);
+    } else {
+        samplerMgr.setForceAniso16x(false);
+        samplerMgr.setNativeTaaBiasGuard(false);
+    }
 }
 
 void ContextCensusSetZeroMotion(bool zero) {

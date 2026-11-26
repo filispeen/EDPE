@@ -2034,7 +2034,8 @@ int main(int argc, char** argv) {
 
     {
         edpe::TaaUpscalerBackend taaBackend;
-        if (taaBackend.recommendedJitterPhaseCount(0u, 2560, 1440, 2560, 1440) != 8u ||
+        if (taaBackend.recommendedJitterPhaseCount(0u, 2560, 1440, 2560, 1440) != 16u ||
+            taaBackend.recommendedJitterPhaseCount(8u, 2560, 1440, 2560, 1440) != 16u ||
             taaBackend.recommendedJitterPhaseCount(0u, 1707, 960, 2560, 1440) != 18u ||
             taaBackend.recommendedJitterPhaseCount(32u, 2560, 1440, 2560, 1440) != 32u) {
             std::printf("  -> FAIL: TaaUpscalerBackend recommendedJitterPhaseCount mismatch\n");

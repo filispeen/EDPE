@@ -77,6 +77,8 @@ public:
             mipLodBiasOffset = 0.0f;
         }
 
+        taaForceAniso16x = GetPrivateProfileIntW(L"TAA", L"ForceAniso16x", 1, path.c_str()) != 0;
+
         frameGenBackend = GetPrivateProfileIntW(L"FrameGeneration", L"Backend", 0, path.c_str());
         if (frameGenBackend < 0 || frameGenBackend > 2) frameGenBackend = 0;
         frameGenMultiplier = GetPrivateProfileIntW(L"FrameGeneration", L"Multiplier", 2, path.c_str());
@@ -275,6 +277,9 @@ public:
         appendFloat("Sharpness", "%.2f", sharpness);
         appendFloat("FsrVelocityFactor", "%.2f", fsrVelocityFactor);
         appendFloat("MipLodBiasOffset", "%.2f", mipLodBiasOffset);
+
+        appendSection("TAA");
+        appendBool("ForceAniso16x", taaForceAniso16x);
 
         appendSection("FrameGeneration");
         appendInt("Backend", frameGenBackend);
@@ -622,6 +627,7 @@ public:
     float sharpness = 0.0f;
     float fsrVelocityFactor = 0.50f;
     float mipLodBiasOffset = 0.0f;
+    bool taaForceAniso16x = true;
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;
     bool hdrInput = false;

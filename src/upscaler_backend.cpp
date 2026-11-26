@@ -882,6 +882,13 @@ void TaaUpscalerBackend::resetHistory() {
     pass_.resetHistory();
 }
 
+unsigned TaaUpscalerBackend::recommendedJitterPhaseCount(unsigned configuredBasePhases,
+    uint32_t renderWidth, uint32_t renderHeight,
+    uint32_t outputWidth, uint32_t outputHeight) const {
+    return computeEffectiveJitterPhaseCount(
+        configuredBasePhases, renderWidth, renderHeight, outputWidth, outputHeight, 16u);
+}
+
 // -------------------------------------------------------------------------
 // UpscalerManager
 // -------------------------------------------------------------------------

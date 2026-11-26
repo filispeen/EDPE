@@ -138,21 +138,26 @@ inline unsigned computeEffectiveJitterPhaseCount(
     unsigned renderWidth,
     unsigned renderHeight,
     unsigned outputWidth,
-    unsigned outputHeight) {
-    const unsigned base = basePhases ? basePhases : 8u;
-    unsigned minPhases = 8u;
+    unsigned outputHeight,
+    unsigned minPhaseFloor = 8u) {
+    const unsigned floorPhases = (minPhaseFloor > 8u) ? minPhaseFloor : 8u;
+    const unsigned base = basePhases ? basePhases : floorPhases;
+    unsigned minPhases = floorPhases;
     if (renderWidth > 0 && renderHeight > 0 &&
         outputWidth > 0 && outputHeight > 0) {
         const double ratioX = static_cast<double>(outputWidth) / static_cast<double>(renderWidth);
         const double ratioY = static_cast<double>(outputHeight) / static_cast<double>(renderHeight);
         const double upscaleRatio = (ratioX > ratioY) ? ratioX : ratioY;
         if (upscaleRatio > 1.0) {
-            minPhases = static_cast<unsigned>(std::ceil(8.0 * upscaleRatio * upscaleRatio));
+            const unsigned scaled = static_cast<unsigned>(std::ceil(8.0 * upscaleRatio * upscaleRatio));
+            if (scaled > minPhases) {
+                minPhases = scaled;
+            }
         }
     }
     const unsigned upperBound = (minPhases > 64u) ? minPhases : 64u;
     const unsigned raw = (base > minPhases) ? base : minPhases;
-    return std::clamp(raw, 8u, upperBound);
+    return std::clamp(raw, floorPhases, upperBound);
 }
 
 // Halton 2,3 in pixel units; D3D viewport maps positive NDC Y upward.
