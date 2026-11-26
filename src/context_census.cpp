@@ -9794,7 +9794,11 @@ void takeCameraDeltaSource(ID3D11DeviceContext* context, unsigned long long fram
 void copyCameraDeltaSource(ID3D11DeviceContext* context) {
     if (!camera_delta_source) return;
     ID3D11DeviceContext* srcCtx = camera_delta_source_context ? camera_delta_source_context : context;
-    if (!srcCtx) return;
+    if (!srcCtx) {
+        camera_delta_source.Reset(); // Do not keep the second reference to the scene buffer.
+        camera_delta_source_context = nullptr;
+        return;
+    }
     edpe::ScopedProfileTimer profTimer(edpe::ProfileZone::CameraDeltaCopy);
     const auto source = std::move(camera_delta_source);
     camera_delta_source_context = nullptr;
