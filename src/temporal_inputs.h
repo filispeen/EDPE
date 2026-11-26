@@ -123,6 +123,10 @@ struct TemporalFrameInputs {
     ID3D11Texture2D* reactiveMask = nullptr;
     ID3D11ShaderResourceView* reactiveMaskSrv = nullptr;
 
+    // Optional pixel motion class (R8_UINT, render resolution) from MotionPass (used by TAAv2).
+    ID3D11Texture2D* motionClass = nullptr;
+    ID3D11ShaderResourceView* motionClassSrv = nullptr;
+
     ID3D11Texture2D* transparencyMask = nullptr;
     ID3D11ShaderResourceView* transparencyMaskSrv = nullptr;
 

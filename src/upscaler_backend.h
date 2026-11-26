@@ -190,11 +190,16 @@ public:
         uint32_t outputWidth, uint32_t outputHeight) const override;
 
     void setPreferredOutputFormat(DXGI_FORMAT fmt) { preferredOutputFormat_ = fmt; }
+    void setSettings(const TaaSettings& settings) { settings_ = settings; }
+    const TaaSettings& getSettings() const { return settings_; }
     ID3D11Texture2D* latestOutputTexture() const { return pass_.latestOutputTexture(); }
     ID3D11ShaderResourceView* latestOutputSrv() const { return pass_.latestOutputSrv(); }
+    ID3D11Texture2D* latestDisplayTexture() const { return pass_.latestDisplayTexture(); }
+    ID3D11ShaderResourceView* latestDisplaySrv() const { return pass_.latestDisplaySrv(); }
 
 private:
     TaaPass pass_;
+    TaaSettings settings_{};
     ID3D11Device* device_ = nullptr;
     DXGI_FORMAT preferredOutputFormat_ = DXGI_FORMAT_UNKNOWN;
     ID3D11Texture2D* cachedColorTex_ = nullptr;
@@ -265,8 +270,12 @@ public:
     float getFsrVelocityFactor() const;
 
     void setTaaOutputFormat(DXGI_FORMAT fmt) { taaBackend_.setPreferredOutputFormat(fmt); }
+    void setTaaSettings(const TaaSettings& settings) { taaBackend_.setSettings(settings); }
+    const TaaSettings& getTaaSettings() const { return taaBackend_.getSettings(); }
     ID3D11Texture2D* getTaaLatestOutputTexture() const { return taaBackend_.latestOutputTexture(); }
     ID3D11ShaderResourceView* getTaaLatestOutputSrv() const { return taaBackend_.latestOutputSrv(); }
+    ID3D11Texture2D* getTaaLatestDisplayTexture() const { return taaBackend_.latestDisplayTexture(); }
+    ID3D11ShaderResourceView* getTaaLatestDisplaySrv() const { return taaBackend_.latestDisplaySrv(); }
 
     void requestReset() { pendingReset_ = true; }
 

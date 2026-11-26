@@ -1,21 +1,68 @@
 #include "taa_pass.h"
 #include "taa_shader.h"
+#include "log.h"
+#include "renderdoc_support.h"
 
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace edpe {
 
 namespace {
 
-struct TaaConstantBufferData {
-    float resolution[4];       // outputWidth, outputHeight, 1/outputWidth, 1/outputHeight
-    float renderResolution[4]; // renderWidth, renderHeight, 1/renderWidth, 1/renderHeight
-    float params[4];           // jitterX, jitterY, blendWeight, resetFlag
-    float jitterHistory[4];    // prevJitterX, prevJitterY, depthB, hasPrevDepth
-    float reactiveInfo[4];     // hasReactiveMask, maxBlendCap, 0, 0
+struct TaaPrepassCB {
+    float renderRes[4];
+    float jitterParams[4];
+    float depthParams[4];
+    uint32_t flags[4];
 };
+
+struct TaaResolveCB {
+    float outputRes[4];
+    float renderRes[4];
+    float jitterAndAlpha[4];
+    float gammaAndReset[4];
+};
+
+struct TaaPostRcasCB {
+    float resolution[2];
+    float sharpness;
+    float pad0;
+};
+
+struct TaaBlitCB {
+    float outputRes[4];
+    uint32_t debugInfo[4];
+};
+
+bool compileTaaShaderBlob(const char* source, size_t sourceLen,
+                          const char* entryPoint, const char* profile,
+                          Microsoft::WRL::ComPtr<ID3DBlob>& outBlob) {
+    Microsoft::WRL::ComPtr<ID3DBlob> errBlob;
+    // Compile with -O1 for Wine/Proton d3dcompiler_47 (vkd3d-shader) compatibility.
+    const HRESULT hr = D3DCompile(source, sourceLen, nullptr, nullptr, nullptr,
+        entryPoint, profile, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &outBlob, &errBlob);
+    if (FAILED(hr) || !outBlob) {
+        wchar_t errWide[256]{};
+        if (errBlob && errBlob->GetBufferPointer() && errBlob->GetBufferSize() > 0) {
+            const char* raw = static_cast<const char*>(errBlob->GetBufferPointer());
+            const int len = static_cast<int>((std::min<size_t>)(errBlob->GetBufferSize(), 240u));
+            MultiByteToWideChar(CP_UTF8, 0, raw, len, errWide, 255);
+            for (wchar_t& ch : errWide) {
+                if (ch == L'\r' || ch == L'\n') ch = L' ';
+            }
+        }
+        wchar_t msg[512]{};
+        swprintf_s(msg, L"EDPE: TaaPass D3DCompile(%hs/%hs) failed hr=0x%08X%ls%ls",
+            entryPoint, profile, static_cast<unsigned>(hr),
+            errWide[0] ? L" err=" : L"", errWide);
+        EdpeLog(msg);
+        return false;
+    }
+    return true;
+}
 
 } // namespace
 
@@ -37,24 +84,25 @@ bool TaaPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
         ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED : 0;
     if (FAILED(device1->CreateDeviceContextState(flags, &level, 1, D3D11_SDK_VERSION,
             __uuidof(ID3D11Device1), nullptr, &state_))) {
-        // Fall back gracefully if device context state cannot be created
         state_.Reset();
     }
 
-    Microsoft::WRL::ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
-    if (FAILED(D3DCompile(kTaaShader, sizeof(kTaaShader) - 1, nullptr, nullptr,
-            nullptr, "vs_main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob))) {
-        return false;
-    }
-    if (FAILED(D3DCompile(kTaaShader, sizeof(kTaaShader) - 1, nullptr, nullptr,
-            nullptr, "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob))) {
+    Microsoft::WRL::ComPtr<ID3DBlob> preBlob, resBlob, rcasBlob, dbgBlob, vsBlob, psBlob;
+    if (!compileTaaShaderBlob(kTaaPrepassShader, sizeof(kTaaPrepassShader) - 1, "cs_taa_prepass", "cs_5_0", preBlob) ||
+        !compileTaaShaderBlob(kTaaResolveShader, sizeof(kTaaResolveShader) - 1, "cs_taa_resolve", "cs_5_0", resBlob) ||
+        !compileTaaShaderBlob(kTaaPostRcasShader, sizeof(kTaaPostRcasShader) - 1, "cs_taa_post_rcas", "cs_5_0", rcasBlob) ||
+        !compileTaaShaderBlob(kTaaBlitShader, sizeof(kTaaBlitShader) - 1, "cs_taa_debug", "cs_5_0", dbgBlob) ||
+        !compileTaaShaderBlob(kTaaBlitShader, sizeof(kTaaBlitShader) - 1, "vs_taa_blit", "vs_5_0", vsBlob) ||
+        !compileTaaShaderBlob(kTaaBlitShader, sizeof(kTaaBlitShader) - 1, "ps_taa_blit", "ps_5_0", psBlob)) {
         return false;
     }
 
-    if (FAILED(device->CreateVertexShader(vsBlob->GetBufferPointer(),
-            vsBlob->GetBufferSize(), nullptr, &vertexShader_)) ||
-        FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(),
-            psBlob->GetBufferSize(), nullptr, &pixelShader_))) {
+    if (FAILED(device->CreateComputeShader(preBlob->GetBufferPointer(), preBlob->GetBufferSize(), nullptr, &prepassCs_)) ||
+        FAILED(device->CreateComputeShader(resBlob->GetBufferPointer(), resBlob->GetBufferSize(), nullptr, &resolveCs_)) ||
+        FAILED(device->CreateComputeShader(rcasBlob->GetBufferPointer(), rcasBlob->GetBufferSize(), nullptr, &postRcasCs_)) ||
+        FAILED(device->CreateComputeShader(dbgBlob->GetBufferPointer(), dbgBlob->GetBufferSize(), nullptr, &debugCs_)) ||
+        FAILED(device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &blitVs_)) ||
+        FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &blitPs_))) {
         return false;
     }
 
@@ -75,37 +123,73 @@ bool TaaPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
         return false;
     }
 
-    D3D11_BUFFER_DESC bufDesc{};
-    bufDesc.ByteWidth = sizeof(TaaConstantBufferData);
-    bufDesc.Usage = D3D11_USAGE_DEFAULT;
-    bufDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    if (FAILED(device->CreateBuffer(&bufDesc, nullptr, &constantBuffer_))) {
+    auto makeCb = [&](UINT byteWidth, Microsoft::WRL::ComPtr<ID3D11Buffer>& outBuf) {
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = byteWidth;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        return SUCCEEDED(device->CreateBuffer(&bd, nullptr, &outBuf));
+    };
+
+    if (!makeCb(sizeof(TaaPrepassCB), prepassCb_) ||
+        !makeCb(sizeof(TaaResolveCB), resolveCb_) ||
+        !makeCb(sizeof(TaaPostRcasCB), postRcasCb_) ||
+        !makeCb(sizeof(TaaBlitCB), blitCb_)) {
         return false;
     }
 
     device_ = device;
     resetRequested_ = true;
+    hasPrevDepthCopy_ = false;
     framesSinceReset_ = 0;
     return true;
 }
 
 void TaaPass::shutdown() {
     state_.Reset();
-    vertexShader_.Reset();
-    pixelShader_.Reset();
+    prepassCs_.Reset();
+    resolveCs_.Reset();
+    postRcasCs_.Reset();
+    debugCs_.Reset();
+    blitVs_.Reset();
+    blitPs_.Reset();
     linearSampler_.Reset();
     pointSampler_.Reset();
-    constantBuffer_.Reset();
+    prepassCb_.Reset();
+    resolveCb_.Reset();
+    postRcasCb_.Reset();
+    blitCb_.Reset();
+
+    prepassTex_.Reset();
+    prepassSrv_.Reset();
+    prepassUav_.Reset();
+    prevDepthTex_.Reset();
+    prevDepthSrv_.Reset();
+
     for (int i = 0; i < 2; ++i) {
         historyTexture_[i].Reset();
         historySrv_[i].Reset();
-        historyRtv_[i].Reset();
+        historyUav_[i].Reset();
+        historyAuxTex_[i].Reset();
+        historyAuxSrv_[i].Reset();
+        historyAuxUav_[i].Reset();
     }
+    postTex_.Reset();
+    postSrv_.Reset();
+    postUav_.Reset();
+
+    displayTexture_ = nullptr;
+    displaySrv_ = nullptr;
     historyReadIdx_ = 0;
     cachedDestRtv_.Reset();
     cachedDestTexture_ = nullptr;
     context_.Reset();
     device_ = nullptr;
+    renderWidth_ = 0;
+    renderHeight_ = 0;
+    prevDepthWidth_ = 0;
+    prevDepthHeight_ = 0;
+    hasPrevDepthCopy_ = false;
     historyWidth_ = 0;
     historyHeight_ = 0;
     historyFormat_ = DXGI_FORMAT_UNKNOWN;
@@ -113,7 +197,76 @@ void TaaPass::shutdown() {
     framesSinceReset_ = 0;
 }
 
-bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT format) {
+bool TaaPass::ensureRenderResources(uint32_t renderWidth, uint32_t renderHeight) {
+    if (!device_ || renderWidth == 0 || renderHeight == 0) return false;
+    if (prepassTex_ && renderWidth_ == renderWidth && renderHeight_ == renderHeight) {
+        return true;
+    }
+    prepassTex_.Reset();
+    prepassSrv_.Reset();
+    prepassUav_.Reset();
+    renderWidth_ = 0;
+    renderHeight_ = 0;
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = renderWidth;
+    td.Height = renderHeight;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+    if (FAILED(device_->CreateTexture2D(&td, nullptr, &prepassTex_)) ||
+        FAILED(device_->CreateShaderResourceView(prepassTex_.Get(), nullptr, &prepassSrv_)) ||
+        FAILED(device_->CreateUnorderedAccessView(prepassTex_.Get(), nullptr, &prepassUav_))) {
+        prepassTex_.Reset();
+        prepassSrv_.Reset();
+        prepassUav_.Reset();
+        return false;
+    }
+
+    SetD3D11DebugName(prepassTex_.Get(), "EDPE_TaaPrepass");
+    renderWidth_ = renderWidth;
+    renderHeight_ = renderHeight;
+    return true;
+}
+
+bool TaaPass::ensurePrevDepthTexture(uint32_t renderWidth, uint32_t renderHeight) {
+    if (!device_ || renderWidth == 0 || renderHeight == 0) return false;
+    if (prevDepthTex_ && prevDepthSrv_ && prevDepthWidth_ == renderWidth && prevDepthHeight_ == renderHeight) {
+        return true;
+    }
+    prevDepthTex_.Reset();
+    prevDepthSrv_.Reset();
+    prevDepthWidth_ = 0;
+    prevDepthHeight_ = 0;
+    hasPrevDepthCopy_ = false;
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = renderWidth;
+    td.Height = renderHeight;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    if (FAILED(device_->CreateTexture2D(&td, nullptr, &prevDepthTex_)) ||
+        FAILED(device_->CreateShaderResourceView(prevDepthTex_.Get(), nullptr, &prevDepthSrv_))) {
+        prevDepthTex_.Reset();
+        prevDepthSrv_.Reset();
+        return false;
+    }
+    SetD3D11DebugName(prevDepthTex_.Get(), "EDPE_TaaPrevDepth");
+    prevDepthWidth_ = renderWidth;
+    prevDepthHeight_ = renderHeight;
+    return true;
+}
+
+bool TaaPass::ensureOutputResources(uint32_t width, uint32_t height, DXGI_FORMAT format) {
     if (!device_ || width == 0 || height == 0 || format == DXGI_FORMAT_UNKNOWN) return false;
 
     if (historyTexture_[0] || historyTexture_[1]) {
@@ -121,18 +274,27 @@ bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT forma
             for (int i = 0; i < 2; ++i) {
                 historyTexture_[i].Reset();
                 historySrv_[i].Reset();
-                historyRtv_[i].Reset();
+                historyUav_[i].Reset();
+                historyAuxTex_[i].Reset();
+                historyAuxSrv_[i].Reset();
+                historyAuxUav_[i].Reset();
             }
+            postTex_.Reset();
+            postSrv_.Reset();
+            postUav_.Reset();
+            displayTexture_ = nullptr;
+            displaySrv_ = nullptr;
             historyReadIdx_ = 0;
             historyWidth_ = 0;
             historyHeight_ = 0;
             historyFormat_ = DXGI_FORMAT_UNKNOWN;
             resetRequested_ = true;
+            hasPrevDepthCopy_ = false;
             framesSinceReset_ = 0;
         }
     }
 
-    if (!historyTexture_[0] || !historyTexture_[1]) {
+    if (!historyTexture_[0] || !historyTexture_[1] || !historyAuxTex_[0] || !historyAuxTex_[1]) {
         D3D11_TEXTURE2D_DESC td{};
         td.Width = width;
         td.Height = height;
@@ -140,21 +302,28 @@ bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT forma
         td.ArraySize = 1;
         td.Format = format;
         td.SampleDesc.Count = 1;
-        td.SampleDesc.Quality = 0;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET;
 
         for (int i = 0; i < 2; ++i) {
             if (FAILED(device_->CreateTexture2D(&td, nullptr, &historyTexture_[i])) ||
                 FAILED(device_->CreateShaderResourceView(historyTexture_[i].Get(), nullptr, &historySrv_[i])) ||
-                FAILED(device_->CreateRenderTargetView(historyTexture_[i].Get(), nullptr, &historyRtv_[i]))) {
+                FAILED(device_->CreateUnorderedAccessView(historyTexture_[i].Get(), nullptr, &historyUav_[i])) ||
+                FAILED(device_->CreateTexture2D(&td, nullptr, &historyAuxTex_[i])) ||
+                FAILED(device_->CreateShaderResourceView(historyAuxTex_[i].Get(), nullptr, &historyAuxSrv_[i])) ||
+                FAILED(device_->CreateUnorderedAccessView(historyAuxTex_[i].Get(), nullptr, &historyAuxUav_[i]))) {
                 for (int j = 0; j < 2; ++j) {
                     historyTexture_[j].Reset();
                     historySrv_[j].Reset();
-                    historyRtv_[j].Reset();
+                    historyUav_[j].Reset();
+                    historyAuxTex_[j].Reset();
+                    historyAuxSrv_[j].Reset();
+                    historyAuxUav_[j].Reset();
                 }
                 return false;
             }
+            SetD3D11DebugName(historyTexture_[i].Get(), i == 0 ? "EDPE_TaaHistory0" : "EDPE_TaaHistory1");
+            SetD3D11DebugName(historyAuxTex_[i].Get(), i == 0 ? "EDPE_TaaHistoryAux0" : "EDPE_TaaHistoryAux1");
         }
 
         historyReadIdx_ = 0;
@@ -162,9 +331,37 @@ bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT forma
         historyHeight_ = height;
         historyFormat_ = format;
         resetRequested_ = true;
+        hasPrevDepthCopy_ = false;
         framesSinceReset_ = 0;
     }
 
+    return true;
+}
+
+bool TaaPass::ensurePostTexture(bool needPost) {
+    if (!needPost) return true;
+    if (postTex_ && postSrv_ && postUav_) return true;
+    if (!device_ || historyWidth_ == 0 || historyHeight_ == 0) return false;
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = historyWidth_;
+    td.Height = historyHeight_;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = kHistoryFormat;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+    if (FAILED(device_->CreateTexture2D(&td, nullptr, &postTex_)) ||
+        FAILED(device_->CreateShaderResourceView(postTex_.Get(), nullptr, &postSrv_)) ||
+        FAILED(device_->CreateUnorderedAccessView(postTex_.Get(), nullptr, &postUav_))) {
+        postTex_.Reset();
+        postSrv_.Reset();
+        postUav_.Reset();
+        return false;
+    }
+    SetD3D11DebugName(postTex_.Get(), "EDPE_TaaPostOut");
     return true;
 }
 
@@ -186,7 +383,10 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     float depthB,
     ID3D11ShaderResourceView* prevDepthSrv,
     DXGI_FORMAT /*preferredFormat*/,
-    ID3D11ShaderResourceView* reactiveMaskSrv) {
+    ID3D11ShaderResourceView* reactiveMaskSrv,
+    ID3D11ShaderResourceView* motionClassSrv,
+    const TaaSettings* settings,
+    bool /*colorIsHdr*/) {
     if (!device_ || !context || !currentFrameSrv || width == 0 || height == 0) {
         return false;
     }
@@ -194,16 +394,20 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     const uint32_t rW = (renderWidth > 0) ? renderWidth : width;
     const uint32_t rH = (renderHeight > 0) ? renderHeight : height;
 
-    // Always allocate fp16 history buffers for both LDR and HDR so 8-bit UNORM
-    // quantization never stalls temporal convergence at high blend weights or bands dark space.
-    if (!ensureResources(width, height, kHistoryFormat)) {
+    if (!ensureRenderResources(rW, rH) ||
+        !ensureOutputResources(width, height, kHistoryFormat)) {
         return false;
     }
 
-    const uint32_t readIdx = historyReadIdx_;
-    const uint32_t writeIdx = readIdx ^ 1u;
-    const bool zeroCopyPingPong = (destinationTexture == nullptr && destinationRtv == nullptr);
+    const TaaSettings cfg = settings ? *settings : TaaSettings{};
+    const float minAlpha = std::clamp(cfg.minAlpha, 0.01f, 0.25f);
+    const float maxAlpha = std::clamp(cfg.maxAlpha, minAlpha, 0.60f);
+    const float baseGamma = std::clamp(cfg.baseGamma, 0.50f, 2.50f);
+    const float lockMaxGamma = std::clamp(cfg.lockMaxGamma, baseGamma, 3.50f);
+    const float rcasSharpness = std::clamp(cfg.rcasSharpness, 0.0f, 1.0f);
+    const int debugView = (cfg.debugView >= 0 && cfg.debugView <= 4) ? cfg.debugView : 0;
 
+    const bool zeroCopyPingPong = (destinationTexture == nullptr && destinationRtv == nullptr);
     ID3D11RenderTargetView* targetRtv = destinationRtv;
     if (!zeroCopyPingPong && !targetRtv && destinationTexture) {
         if (cachedDestTexture_ != destinationTexture || !cachedDestRtv_) {
@@ -222,78 +426,268 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     resetRequested_ = false;
     if (performReset) {
         framesSinceReset_ = 0;
+        hasPrevDepthCopy_ = false;
     }
 
-    const float warmupCap = (framesSinceReset_ > 0u)
-        ? (static_cast<float>(framesSinceReset_) / static_cast<float>(framesSinceReset_ + 1u))
-        : 0.0f;
+    const uint32_t readIdx = historyReadIdx_;
+    const uint32_t writeIdx = readIdx ^ 1u;
 
-    TaaConstantBufferData cb{};
-    cb.resolution[0] = static_cast<float>(width);
-    cb.resolution[1] = static_cast<float>(height);
-    cb.resolution[2] = 1.0f / static_cast<float>(width);
-    cb.resolution[3] = 1.0f / static_cast<float>(height);
-    cb.renderResolution[0] = static_cast<float>(rW);
-    cb.renderResolution[1] = static_cast<float>(rH);
-    cb.renderResolution[2] = 1.0f / static_cast<float>(rW);
-    cb.renderResolution[3] = 1.0f / static_cast<float>(rH);
-    cb.params[0] = jitterX;
-    cb.params[1] = jitterY;
-    cb.params[2] = 0.92f; // 92% history weight for smoother 8-phase Halton AA
-    cb.params[3] = performReset ? 1.0f : 0.0f;
-    cb.jitterHistory[0] = prevJitterX;
-    cb.jitterHistory[1] = prevJitterY;
-    cb.jitterHistory[2] = (depthB > 0.0f) ? depthB : 0.025f;
-    cb.jitterHistory[3] = (!performReset && prevDepthSrv && depthSrv) ? 1.0f : 0.0f;
-    cb.reactiveInfo[0] = (!performReset && reactiveMaskSrv) ? 1.0f : 0.0f;
-    cb.reactiveInfo[1] = warmupCap;
+    ID3D11ShaderResourceView* activePrevDepthSrv =
+        (!performReset)
+            ? ((hasPrevDepthCopy_ && prevDepthSrv_) ? prevDepthSrv_.Get() : prevDepthSrv)
+            : nullptr;
 
-    context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cb, 0, 0);
+    // -------------------------------------------------------------------------
+    // Pass 1: cs_taa_prepass (renderWidth x renderHeight)
+    // -------------------------------------------------------------------------
+    {
+        TaaPrepassCB pcb{};
+        pcb.renderRes[0] = static_cast<float>(rW);
+        pcb.renderRes[1] = static_cast<float>(rH);
+        pcb.renderRes[2] = 1.0f / static_cast<float>(rW);
+        pcb.renderRes[3] = 1.0f / static_cast<float>(rH);
+        pcb.jitterParams[0] = jitterX;
+        pcb.jitterParams[1] = jitterY;
+        pcb.jitterParams[2] = prevJitterX;
+        pcb.jitterParams[3] = prevJitterY;
+        pcb.depthParams[0] = (depthB > 0.0f) ? depthB : 0.025f;
 
-    const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
-    context->RSSetViewports(1, &vp);
-    context->RSSetState(nullptr);
-    context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
-    context->OMSetDepthStencilState(nullptr, 0);
-    if (zeroCopyPingPong) {
-        ID3D11RenderTargetView* rtv = historyRtv_[writeIdx].Get();
-        context->OMSetRenderTargets(1, &rtv, nullptr);
-    } else {
-        // Write fp16 history (SV_Target0) and hardware-converted destination (SV_Target1) in one pass.
-        ID3D11RenderTargetView* rtvs[2] = { historyRtv_[writeIdx].Get(), targetRtv };
-        context->OMSetRenderTargets(2, rtvs, nullptr);
+        uint32_t pFlags = 0u;
+        if (!performReset && activePrevDepthSrv && depthSrv) pFlags |= 1u;
+        if (motionClassSrv) pFlags |= 2u;
+        if (!performReset && reactiveMaskSrv) pFlags |= 4u;
+        if (motionVectorsSrv) pFlags |= 8u;
+        if (depthSrv) pFlags |= 16u;
+        pcb.flags[0] = pFlags;
+
+        context->UpdateSubresource(prepassCb_.Get(), 0, nullptr, &pcb, 0, 0);
+
+        ID3D11Buffer* cb = prepassCb_.Get();
+        ID3D11SamplerState* smp = pointSampler_.Get();
+        ID3D11ShaderResourceView* srvs[6] = {
+            currentFrameSrv,
+            depthSrv,
+            activePrevDepthSrv,
+            motionVectorsSrv,
+            motionClassSrv,
+            (!performReset) ? reactiveMaskSrv : nullptr
+        };
+        ID3D11UnorderedAccessView* uav = prepassUav_.Get();
+
+        context->CSSetShader(prepassCs_.Get(), nullptr, 0);
+        context->CSSetConstantBuffers(0, 1, &cb);
+        context->CSSetSamplers(0, 1, &smp);
+        context->CSSetShaderResources(0, 6, srvs);
+        context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        context->Dispatch((rW + 7u) / 8u, (rH + 7u) / 8u, 1u);
+
+        ID3D11UnorderedAccessView* nullUav = nullptr;
+        ID3D11ShaderResourceView* nullSrvs[6]{};
+        context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+        context->CSSetShaderResources(0, 6, nullSrvs);
     }
-    context->IASetInputLayout(nullptr);
-    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    context->VSSetShader(vertexShader_.Get(), nullptr, 0);
-    context->PSSetShader(pixelShader_.Get(), nullptr, 0);
-    context->GSSetShader(nullptr, nullptr, 0);
 
-    ID3D11ShaderResourceView* srvs[6] = {
-        currentFrameSrv,
-        historySrv_[readIdx].Get(),
-        motionVectorsSrv,
-        depthSrv,
-        (!performReset) ? prevDepthSrv : nullptr,
-        (!performReset) ? reactiveMaskSrv : nullptr
-    };
-    context->PSSetShaderResources(0, 6, srvs);
+    // -------------------------------------------------------------------------
+    // Pass 2: cs_taa_resolve (outputWidth x outputHeight)
+    // -------------------------------------------------------------------------
+    {
+        TaaResolveCB rcb{};
+        rcb.outputRes[0] = static_cast<float>(width);
+        rcb.outputRes[1] = static_cast<float>(height);
+        rcb.outputRes[2] = 1.0f / static_cast<float>(width);
+        rcb.outputRes[3] = 1.0f / static_cast<float>(height);
+        rcb.renderRes[0] = static_cast<float>(rW);
+        rcb.renderRes[1] = static_cast<float>(rH);
+        rcb.renderRes[2] = 1.0f / static_cast<float>(rW);
+        rcb.renderRes[3] = 1.0f / static_cast<float>(rH);
+        rcb.jitterAndAlpha[0] = jitterX;
+        rcb.jitterAndAlpha[1] = jitterY;
+        rcb.jitterAndAlpha[2] = minAlpha;
+        rcb.jitterAndAlpha[3] = maxAlpha;
+        rcb.gammaAndReset[0] = baseGamma;
+        rcb.gammaAndReset[1] = lockMaxGamma;
+        rcb.gammaAndReset[2] = performReset ? 1.0f : 0.0f;
+        uint32_t rFlags = 0u;
+        if (motionClassSrv) rFlags |= 1u;
+        if (!performReset && reactiveMaskSrv) rFlags |= 2u;
+        rcb.gammaAndReset[3] = static_cast<float>(rFlags);
 
-    ID3D11SamplerState* samplers[2] = { linearSampler_.Get(), pointSampler_.Get() };
-    context->PSSetSamplers(0, 2, samplers);
+        context->UpdateSubresource(resolveCb_.Get(), 0, nullptr, &rcb, 0, 0);
 
-    ID3D11Buffer* cbs[1] = { constantBuffer_.Get() };
-    context->PSSetConstantBuffers(0, 1, cbs);
+        ID3D11Buffer* cb = resolveCb_.Get();
+        ID3D11SamplerState* smps[2] = { linearSampler_.Get(), pointSampler_.Get() };
+        ID3D11ShaderResourceView* srvs[6] = {
+            currentFrameSrv,
+            historySrv_[readIdx].Get(),
+            historyAuxSrv_[readIdx].Get(),
+            prepassSrv_.Get(),
+            motionClassSrv,
+            (!performReset) ? reactiveMaskSrv : nullptr
+        };
+        ID3D11UnorderedAccessView* uavs[2] = {
+            historyUav_[writeIdx].Get(),
+            historyAuxUav_[writeIdx].Get()
+        };
 
-    context->Draw(3, 0);
+        context->CSSetShader(resolveCs_.Get(), nullptr, 0);
+        context->CSSetConstantBuffers(0, 1, &cb);
+        context->CSSetSamplers(0, 2, smps);
+        context->CSSetShaderResources(0, 6, srvs);
+        context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+        context->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
 
-    // Unbind resources before next use to prevent pipeline hazards
-    ID3D11ShaderResourceView* nullSrvs[6] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
-    context->PSSetShaderResources(0, 6, nullSrvs);
-    ID3D11RenderTargetView* nullRtvs[2] = { nullptr, nullptr };
-    context->OMSetRenderTargets(2, nullRtvs, nullptr);
+        ID3D11UnorderedAccessView* nullUavs[2]{};
+        ID3D11ShaderResourceView* nullSrvs[6]{};
+        ID3D11SamplerState* nullSmps[2]{};
+        ID3D11Buffer* nullCb = nullptr;
+        context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+        context->CSSetShaderResources(0, 6, nullSrvs);
+        context->CSSetSamplers(0, 2, nullSmps);
+        context->CSSetConstantBuffers(0, 1, &nullCb);
+        context->CSSetShader(nullptr, nullptr, 0);
+    }
 
     historyReadIdx_ = writeIdx;
+    displayTexture_ = historyTexture_[historyReadIdx_].Get();
+    displaySrv_ = historySrv_[historyReadIdx_].Get();
+
+    // Update prevDepthTex_ from current R32_FLOAT depth when compatible (zero-touch fallback when R32G8X24).
+    if (depthSrv) {
+        Microsoft::WRL::ComPtr<ID3D11Resource> depthRes;
+        depthSrv->GetResource(&depthRes);
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> depthTex;
+        if (depthRes && SUCCEEDED(depthRes.As(&depthTex))) {
+            D3D11_TEXTURE2D_DESC dd{};
+            depthTex->GetDesc(&dd);
+            if ((dd.Format == DXGI_FORMAT_R32_FLOAT || dd.Format == DXGI_FORMAT_R32_TYPELESS) &&
+                dd.Width == rW && dd.Height == rH && dd.SampleDesc.Count == 1 &&
+                ensurePrevDepthTexture(rW, rH)) {
+                context->CopyResource(prevDepthTex_.Get(), depthTex.Get());
+                hasPrevDepthCopy_ = true;
+            } else {
+                hasPrevDepthCopy_ = false;
+            }
+        }
+    } else {
+        hasPrevDepthCopy_ = false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Pass 3 (optional, strictly outside history loop): PostRCAS & DebugView
+    // -------------------------------------------------------------------------
+    const bool runRcas = (debugView == 0) && (rcasSharpness > 1e-4f) && ensurePostTexture(true);
+    if (runRcas) {
+        TaaPostRcasCB rcasCb{};
+        rcasCb.resolution[0] = static_cast<float>(width);
+        rcasCb.resolution[1] = static_cast<float>(height);
+        rcasCb.sharpness = rcasSharpness;
+        context->UpdateSubresource(postRcasCb_.Get(), 0, nullptr, &rcasCb, 0, 0);
+
+        ID3D11Buffer* cb = postRcasCb_.Get();
+        ID3D11ShaderResourceView* srvs[2] = {
+            historySrv_[historyReadIdx_].Get(),
+            historyAuxSrv_[historyReadIdx_].Get()
+        };
+        ID3D11UnorderedAccessView* uav = postUav_.Get();
+
+        context->CSSetShader(postRcasCs_.Get(), nullptr, 0);
+        context->CSSetConstantBuffers(0, 1, &cb);
+        context->CSSetShaderResources(0, 2, srvs);
+        context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        context->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
+
+        ID3D11UnorderedAccessView* nullUav = nullptr;
+        ID3D11ShaderResourceView* nullSrvs[2]{};
+        ID3D11Buffer* nullCb = nullptr;
+        context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+        context->CSSetShaderResources(0, 2, nullSrvs);
+        context->CSSetConstantBuffers(0, 1, &nullCb);
+        context->CSSetShader(nullptr, nullptr, 0);
+
+        displayTexture_ = postTex_.Get();
+        displaySrv_ = postSrv_.Get();
+    }
+
+    if (zeroCopyPingPong) {
+        if (debugView != 0 && ensurePostTexture(true)) {
+            TaaBlitCB bcb{};
+            bcb.outputRes[0] = static_cast<float>(width);
+            bcb.outputRes[1] = static_cast<float>(height);
+            bcb.outputRes[2] = 1.0f / static_cast<float>(width);
+            bcb.outputRes[3] = 1.0f / static_cast<float>(height);
+            bcb.debugInfo[0] = static_cast<uint32_t>(debugView);
+            context->UpdateSubresource(blitCb_.Get(), 0, nullptr, &bcb, 0, 0);
+
+            ID3D11Buffer* cb = blitCb_.Get();
+            ID3D11SamplerState* smp = pointSampler_.Get();
+            ID3D11ShaderResourceView* srvs[3] = {
+                historySrv_[historyReadIdx_].Get(),
+                historyAuxSrv_[historyReadIdx_].Get(),
+                prepassSrv_.Get()
+            };
+            ID3D11UnorderedAccessView* uav = postUav_.Get();
+
+            context->CSSetShader(debugCs_.Get(), nullptr, 0);
+            context->CSSetConstantBuffers(0, 1, &cb);
+            context->CSSetSamplers(0, 1, &smp);
+            context->CSSetShaderResources(0, 3, srvs);
+            context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            context->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
+
+            ID3D11UnorderedAccessView* nullUav = nullptr;
+            ID3D11ShaderResourceView* nullSrvs[3]{};
+            ID3D11SamplerState* nullSmp = nullptr;
+            ID3D11Buffer* nullCb = nullptr;
+            context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+            context->CSSetShaderResources(0, 3, nullSrvs);
+            context->CSSetSamplers(0, 1, &nullSmp);
+            context->CSSetConstantBuffers(0, 1, &nullCb);
+            context->CSSetShader(nullptr, nullptr, 0);
+
+            displayTexture_ = postTex_.Get();
+            displaySrv_ = postSrv_.Get();
+        }
+    } else {
+        // Blit final display image (or DebugView) to caller's destinationRtv (supports any RTV format).
+        TaaBlitCB bcb{};
+        bcb.outputRes[0] = static_cast<float>(width);
+        bcb.outputRes[1] = static_cast<float>(height);
+        bcb.outputRes[2] = 1.0f / static_cast<float>(width);
+        bcb.outputRes[3] = 1.0f / static_cast<float>(height);
+        bcb.debugInfo[0] = static_cast<uint32_t>(debugView);
+        context->UpdateSubresource(blitCb_.Get(), 0, nullptr, &bcb, 0, 0);
+
+        const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+        context->RSSetViewports(1, &vp);
+        context->RSSetState(nullptr);
+        context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+        context->OMSetDepthStencilState(nullptr, 0);
+        context->OMSetRenderTargets(1, &targetRtv, nullptr);
+        context->IASetInputLayout(nullptr);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(blitVs_.Get(), nullptr, 0);
+        context->PSSetShader(blitPs_.Get(), nullptr, 0);
+        context->GSSetShader(nullptr, nullptr, 0);
+
+        ID3D11Buffer* cb = blitCb_.Get();
+        ID3D11SamplerState* smp = pointSampler_.Get();
+        ID3D11ShaderResourceView* srvs[3] = {
+            displaySrv_,
+            historyAuxSrv_[historyReadIdx_].Get(),
+            prepassSrv_.Get()
+        };
+        context->PSSetConstantBuffers(0, 1, &cb);
+        context->PSSetSamplers(0, 1, &smp);
+        context->PSSetShaderResources(0, 3, srvs);
+
+        context->Draw(3, 0);
+
+        ID3D11ShaderResourceView* nullSrvs[3]{};
+        ID3D11RenderTargetView* nullRtv = nullptr;
+        context->PSSetShaderResources(0, 3, nullSrvs);
+        context->OMSetRenderTargets(1, &nullRtv, nullptr);
+    }
+
     if (framesSinceReset_ < 1000u) {
         ++framesSinceReset_;
     }

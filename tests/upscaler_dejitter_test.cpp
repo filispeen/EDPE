@@ -1,11 +1,13 @@
 #include "ngx_context.h"
 #include "sharpen_pass.h"
+#include "taa_shader.h"
 #include "temporal_inputs.h"
 #include "temporal_math.h"
 #include "upscaler_backend.h"
 
 #include <DirectXPackedVector.h>
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -2217,6 +2219,35 @@ int main(int argc, char** argv) {
             }
         }
         taaBackend.shutdown();
+    }
+
+    // Verify all TAAv2 HLSL shaders compile cleanly with -O1 (Wine/Proton d3dcompiler_47 compatibility)
+    {
+        struct ShaderCase {
+            const char* src;
+            size_t len;
+            const char* entry;
+            const char* profile;
+        };
+        const ShaderCase cases[] = {
+            { edpe::kTaaPrepassShader,  sizeof(edpe::kTaaPrepassShader) - 1,  "cs_taa_prepass",   "cs_5_0" },
+            { edpe::kTaaResolveShader,  sizeof(edpe::kTaaResolveShader) - 1,  "cs_taa_resolve",   "cs_5_0" },
+            { edpe::kTaaPostRcasShader, sizeof(edpe::kTaaPostRcasShader) - 1, "cs_taa_post_rcas", "cs_5_0" },
+            { edpe::kTaaBlitShader,     sizeof(edpe::kTaaBlitShader) - 1,     "cs_taa_debug",     "cs_5_0" },
+            { edpe::kTaaBlitShader,     sizeof(edpe::kTaaBlitShader) - 1,     "vs_taa_blit",      "vs_5_0" },
+            { edpe::kTaaBlitShader,     sizeof(edpe::kTaaBlitShader) - 1,     "ps_taa_blit",      "ps_5_0" },
+        };
+        for (const auto& sc : cases) {
+            ComPtr<ID3DBlob> code, err;
+            const HRESULT hr = D3DCompile(sc.src, sc.len, nullptr, nullptr, nullptr,
+                sc.entry, sc.profile, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
+            if (FAILED(hr) || !code) {
+                std::printf("  -> FAIL: TAAv2 D3DCompile(%s/%s, -O1) failed hr=0x%08X: %s\n",
+                    sc.entry, sc.profile, static_cast<unsigned>(hr),
+                    (err && err->GetBufferPointer()) ? static_cast<const char*>(err->GetBufferPointer()) : "");
+                allOk = false;
+            }
+        }
     }
 
     return allOk ? 0 : 10;

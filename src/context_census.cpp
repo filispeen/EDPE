@@ -11790,6 +11790,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 const bool wantReactiveMask =
                     (activeBackend == edpe::UpscalerBackend::Taa) ||
                     (activeBackend == edpe::UpscalerBackend::AmdFsr);
+                const bool wantMotionClass =
+                    want_motion_class_debug ||
+                    (activeBackend == edpe::UpscalerBackend::Taa);
                 ID3D11ShaderResourceView* weaponMotionSrv = nullptr;
                 if (!eval_reset &&
                     s_weapon_motion.isInitialized() &&
@@ -11827,7 +11830,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv,
                     /*preserveContextState=*/false,
                     /*zeroTranslation=*/origin_reanchor,
-                    /*enableClassOutput=*/want_motion_class_debug,
+                    /*enableClassOutput=*/wantMotionClass,
                     /*weaponMotion=*/weaponMotionSrv,
                     /*sceneStencil=*/nullptr,
                     /*celestialRecords=*/celestialRecordsSrv,
@@ -11859,8 +11862,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         !s_zero_motion_vectors.load(std::memory_order_relaxed) &&
         motion_pass &&
         motion_pass->canonicalDepthTexture() &&
-        motion_pass->canonicalDepth() &&
-        upscaler.getBackend() != edpe::UpscalerBackend::Taa;
+        motion_pass->canonicalDepth();
 
     edpe::TemporalFrameInputs inputs{};
     inputs.color = activeColorInputTex;
@@ -11900,6 +11902,10 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         motion_pass && need_motion) {
         inputs.reactiveMask = motion_pass->reactiveMaskTexture();
         inputs.reactiveMaskSrv = motion_pass->reactiveMask();
+    }
+    if (activeBackend == edpe::UpscalerBackend::Taa && motion_pass && need_motion) {
+        inputs.motionClass = motion_pass->pixelClassTexture();
+        inputs.motionClassSrv = motion_pass->pixelClass();
     }
 
     s_last_temporal_inputs = inputs;

@@ -875,7 +875,10 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.cameraNow.depthB,
         inputs.prevDepthSrv,
         preferredOutputFormat_,
-        inputs.reactiveMaskSrv);
+        inputs.reactiveMaskSrv,
+        inputs.motionClassSrv,
+        &settings_,
+        inputs.colorIsHdr);
 }
 
 void TaaUpscalerBackend::resetHistory() {
@@ -1151,12 +1154,8 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     {
         EvaluatingUpscalerGuard evalGuard;
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
-        if (evalSuccess && inputs.sharpness > 0.0f) {
-            // Never sharpen TAA's internal ping-pong history texture in-place when destinationTexture == nullptr;
-            // mutating historyTexture_[historyReadIdx_] creates recursive sharpening halos/shimmer on subsequent frames.
-            ID3D11Texture2D* sharpenTarget = destinationTexture
-                ? destinationTexture
-                : ((currentBackendType_ == UpscalerBackend::Taa) ? nullptr : inputs.color);
+        if (evalSuccess && inputs.sharpness > 0.0f && currentBackendType_ != UpscalerBackend::Taa) {
+            ID3D11Texture2D* sharpenTarget = destinationTexture ? destinationTexture : inputs.color;
             if (sharpenTarget &&
                 !sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr, callerRestoresState)) {
                 static bool s_sharpenFailLogged = false;
@@ -1272,7 +1271,7 @@ bool UpscalerManager::evaluateBackend(UpscalerBackend backendType,
     {
         EvaluatingUpscalerGuard evalGuard;
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
-        if (evalSuccess && inputs.sharpness > 0.0f) {
+        if (evalSuccess && inputs.sharpness > 0.0f && backendType != UpscalerBackend::Taa) {
             ID3D11Texture2D* sharpenTarget = destinationTexture ? destinationTexture : inputs.color;
             if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr)) {
                 static bool s_sharpenFailLogged = false;
