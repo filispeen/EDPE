@@ -202,6 +202,15 @@ public:
         while (!chainVal.empty() && std::iswspace(chainVal.front())) chainVal.erase(chainVal.begin());
         while (!chainVal.empty() && std::iswspace(chainVal.back())) chainVal.pop_back();
         chainDxgiDll = std::move(chainVal);
+
+        loadingScreenDancer = GetPrivateProfileIntW(L"LoadingScreen", L"DancerEnabled", 1, path.c_str()) != 0;
+        loadingScreenDancerSpin = GetPrivateProfileIntW(L"LoadingScreen", L"DancerSpin", 1, path.c_str()) != 0;
+        loadingScreenDancerAllHolograms = GetPrivateProfileIntW(L"LoadingScreen", L"DancerAllHolograms", 0, path.c_str()) != 0;
+        GetPrivateProfileStringW(L"LoadingScreen", L"DancerSpeed", L"1.0", buf, 64, path.c_str());
+        loadingScreenDancerSpeed = static_cast<float>(_wtof(buf));
+        if (!std::isfinite(loadingScreenDancerSpeed) || loadingScreenDancerSpeed < 0.1f || loadingScreenDancerSpeed > 5.0f) {
+            loadingScreenDancerSpeed = 1.0f;
+        }
     }
 
     void save() {
@@ -331,6 +340,12 @@ public:
 
         appendSection("Proxy");
         appendWide("ChainDxgiDll", chainDxgiDll.c_str());
+
+        appendSection("LoadingScreen");
+        appendBool("DancerEnabled", loadingScreenDancer);
+        appendBool("DancerSpin", loadingScreenDancerSpin);
+        appendBool("DancerAllHolograms", loadingScreenDancerAllHolograms);
+        appendFloat("DancerSpeed", "%.2f", loadingScreenDancerSpeed);
 
         return out;
     }
@@ -616,6 +631,11 @@ public:
     bool wrapDirectInputKeyboard = !isRunningUnderWine();
 
     std::wstring chainDxgiDll;
+
+    bool loadingScreenDancer = true;
+    bool loadingScreenDancerSpin = true;
+    bool loadingScreenDancerAllHolograms = false;
+    float loadingScreenDancerSpeed = 1.0f;
 };
 
 } // namespace edpe

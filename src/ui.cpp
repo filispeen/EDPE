@@ -5,6 +5,7 @@
 #include "upscaler_backend.h"
 #include "fg_integration.h"
 #include "frame_limiter.h"
+#include "loading_mesh.h"
 #include "ngx_context.h"
 #include "capture_format.h"
 #include "config.h"
@@ -1499,6 +1500,13 @@ bool initializeUi(IDXGISwapChain* swap_chain) {
         auto& cfg = edpe::Config::instance();
         cfg.load();
         edpe::FrameLimiter::instance().configure(cfg.gameFpsLimit);
+        {
+            auto& dancer = edpe::LoadingMeshReplacer::instance();
+            dancer.setEnabled(cfg.loadingScreenDancer);
+            dancer.setUseGameSpin(cfg.loadingScreenDancerSpin);
+            dancer.setReplaceAllHolograms(cfg.loadingScreenDancerAllHolograms);
+            dancer.setAnimSpeed(cfg.loadingScreenDancerSpeed);
+        }
         applyUiScale(cfg.uiScale);
         ContextCensusSetSharpness(cfg.sharpness);
         edpe::NgxContext::set_preset(static_cast<uint32_t>(cfg.dlssPreset));
@@ -2609,6 +2617,37 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
             } else {
                 TextDisabledWrapped("Dims and desaturates the game view while highlighting subpixel jitter pixels in green.");
             }
+        }
+
+        if (ImGui::CollapsingHeader("Loading Screen Dancer")) {
+            auto& dancer = edpe::LoadingMeshReplacer::instance();
+            bool dancerEnabled = cfg.loadingScreenDancer;
+            if (ImGui::Checkbox("Enable Gangnam Style Loading Character", &dancerEnabled)) {
+                cfg.loadingScreenDancer = dancerEnabled;
+                dancer.setEnabled(dancerEnabled);
+                cfg.save();
+            }
+            bool dancerSpin = cfg.loadingScreenDancerSpin;
+            if (ImGui::Checkbox("Keep Native Turntable Spin", &dancerSpin)) {
+                cfg.loadingScreenDancerSpin = dancerSpin;
+                dancer.setUseGameSpin(dancerSpin);
+                cfg.save();
+            }
+            bool allHolo = cfg.loadingScreenDancerAllHolograms;
+            if (ImGui::Checkbox("Replace All Holograms (Ships / Suits)", &allHolo)) {
+                cfg.loadingScreenDancerAllHolograms = allHolo;
+                dancer.setReplaceAllHolograms(allHolo);
+                cfg.save();
+            }
+            float speed = cfg.loadingScreenDancerSpeed;
+            if (ImGui::SliderFloat("Animation Speed", &speed, 0.25f, 2.50f, "%.2fx")) {
+                cfg.loadingScreenDancerSpeed = speed;
+                dancer.setAnimSpeed(speed);
+                cfg.save();
+            }
+            ImGui::TextDisabled("Replaced draws: %llu (asset: %s)",
+                static_cast<unsigned long long>(dancer.replacedDrawCount()),
+                dancer.isAssetReady() ? "loaded" : "idle");
         }
 
         ImGui::Spacing();

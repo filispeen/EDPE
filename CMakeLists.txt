@@ -61,6 +61,35 @@ else()
     set(EDPE_HAVE_STREAMLINE FALSE)
 endif()
 
+set(LOADING_CHAR_FBX "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/loading_character.fbx")
+set(LOADING_DANCER_BIN "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/loading_dancer.bin")
+if(EXISTS "${LOADING_CHAR_FBX}")
+    set(_need_bake FALSE)
+    if(NOT EXISTS "${LOADING_DANCER_BIN}")
+        set(_need_bake TRUE)
+    elseif("${LOADING_CHAR_FBX}" IS_NEWER_THAN "${LOADING_DANCER_BIN}" OR
+           "${CMAKE_CURRENT_SOURCE_DIR}/tools/bake_loading_mesh.py" IS_NEWER_THAN "${LOADING_DANCER_BIN}")
+        set(_need_bake TRUE)
+    endif()
+    if(_need_bake)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            message(STATUS "Baking loading screen character mesh...")
+            execute_process(
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/bake_loading_mesh.py"
+                    --input "${LOADING_CHAR_FBX}" --output "${LOADING_DANCER_BIN}"
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                RESULT_VARIABLE BAKE_RES
+            )
+            if(NOT BAKE_RES EQUAL 0)
+                message(FATAL_ERROR "Failed to bake loading_character.fbx (exit ${BAKE_RES})")
+            endif()
+        else()
+            message(WARNING "Python3 not found: cannot bake loading_character.fbx")
+        endif()
+    endif()
+endif()
+
 add_library(EDPE_DXGI SHARED
     src/dllmain.cpp
     src/crash_logger.cpp
@@ -99,9 +128,16 @@ add_library(EDPE_DXGI SHARED
     src/nvidia_sl_fg_backend.cpp
     src/fg_integration.cpp
     src/frame_limiter.cpp
+    src/loading_mesh.cpp
     src/version.cpp
     src/dxgi_proxy.def
 )
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/loading_dancer.bin")
+    target_sources(EDPE_DXGI PRIVATE src/loading_mesh.rc)
+    set_source_files_properties(src/loading_mesh.rc PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/loading_dancer.bin")
+    target_compile_definitions(EDPE_DXGI PRIVATE EDPE_HAVE_EMBEDDED_LOADING_MESH=1)
+endif()
 if(NOT EDPE_BUILD_VERSION STREQUAL "dev")
     set_source_files_properties(src/version.cpp PROPERTIES
         COMPILE_DEFINITIONS EDPE_VERSION="${EDPE_BUILD_VERSION}")
@@ -320,6 +356,13 @@ target_compile_features(ui_menu_size_test PRIVATE cxx_std_20)
 target_include_directories(ui_menu_size_test PRIVATE external/imgui)
 target_link_libraries(ui_menu_size_test PRIVATE EDPE_IMGUI)
 add_test(NAME ui_menu_size COMMAND ui_menu_size_test)
+
+add_executable(loading_mesh_test tests/loading_mesh_test.cpp src/loading_mesh.cpp src/log.cpp)
+target_compile_features(loading_mesh_test PRIVATE cxx_std_20)
+target_compile_definitions(loading_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX EDPE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(loading_mesh_test PRIVATE src)
+target_link_libraries(loading_mesh_test PRIVATE d3d11 d3dcompiler)
+add_test(NAME loading_mesh COMMAND loading_mesh_test)
 
 add_executable(vtable_hook_test tests/vtable_hook_test.cpp)
 target_compile_features(vtable_hook_test PRIVATE cxx_std_20)

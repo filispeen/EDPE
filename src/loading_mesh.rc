@@ -1,0 +1,3 @@
+#include "loading_mesh_res.h"
+
+IDR_EDPE_LOADING_DANCER RCDATA "assets/loading_dancer.bin"

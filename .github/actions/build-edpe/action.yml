@@ -123,6 +123,12 @@ runs:
           sccache-${{ runner.os }}-sccache-
         max-size: 2G
 
+    - name: Bake Loading Screen Character Mesh
+      if: hashFiles('src/assets/loading_character.fbx') != ''
+      shell: pwsh
+      run: |
+        python tools/bake_loading_mesh.py --input src/assets/loading_character.fbx --output src/assets/loading_dancer.bin
+
     - name: Configure CMake
       shell: pwsh
       env:

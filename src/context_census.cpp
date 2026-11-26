@@ -14,6 +14,7 @@
 #include "upscaler_backend.h"
 #include "fg_integration.h"
 #include "frame_limiter.h"
+#include "loading_mesh.h"
 #include "ngx_context.h"
 #include "config.h"
 #include "cb_map_bounce.h"
@@ -6747,6 +6748,12 @@ static void tryCaptureDynamicViewmodelDrawIndexed(ID3D11DeviceContext* context,
 void STDMETHODCALLTYPE observedDrawIndexedInstanced(ID3D11DeviceContext* context,
     UINT index_count, UINT instance_count, UINT start_index, INT base_vertex,
     UINT start_instance) {
+    if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
+        if (edpe::LoadingMeshReplacer::instance().tryReplaceDrawIndexedInstanced(
+                context, index_count, instance_count, start_index, base_vertex, start_instance, forward)) {
+            return;
+        }
+    }
     const bool immediate = isObservedImmediateContext(context);
     if (immediate) {
         if (const auto forward = resolveOriginalDrawIndexedInstanced(context)) {
@@ -7208,6 +7215,10 @@ void beginHudDrawProbe() {
     EdpeLog(L"  VS=0xE508648660A352B2 PS=0x63ABD86359B57D01 (target reticle sprite)");
 }
 
+static inline bool keepPersistentDrawIndexedInstancedHook() {
+    return edpe::isRunningInEliteProcess();
+}
+
 static inline bool areDrawAndOmHooksIntact(void** tbl, bool checkVsCb) {
     if (!tbl) return false;
     if (tbl[kOMSetRenderTargets] != reinterpret_cast<void*>(&observedOMSetRenderTargets) ||
@@ -7216,6 +7227,10 @@ static inline bool areDrawAndOmHooksIntact(void** tbl, bool checkVsCb) {
         return false;
     }
     if (checkVsCb && tbl[kVSSetConstantBuffers] != reinterpret_cast<void*>(&observedVSSetConstantBuffers)) {
+        return false;
+    }
+    if (keepPersistentDrawIndexedInstancedHook() &&
+        tbl[kDrawIndexedInstanced] != reinterpret_cast<void*>(&observedDrawIndexedInstanced)) {
         return false;
     }
     if (hud_draw_probe_active.load(std::memory_order_relaxed)) {
@@ -7305,6 +7320,8 @@ void rearmHudDrawProbe(ID3D11DeviceContext* activeCtx) {
                 rearmSlotOnEntry(i, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), 4u);
             if (hud_draw_hook_mask & 8u)
                 rearmSlotOnEntry(i, kDrawInstanced, reinterpret_cast<void*>(&observedDrawInstanced), 8u);
+        } else if (keepPersistentDrawIndexedInstancedHook()) {
+            rearmSlotOnEntry(i, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), 0);
         }
     }
 }
@@ -7337,7 +7354,9 @@ void endHudDrawProbe() {
     };
     restore(kDrawIndexed, &observedDrawIndexed, 1);
     restore(kDraw, &observedDraw, 2);
-    restore(kDrawIndexedInstanced, &observedDrawIndexedInstanced, 4);
+    if (!keepPersistentDrawIndexedInstancedHook()) {
+        restore(kDrawIndexedInstanced, &observedDrawIndexedInstanced, 4);
+    }
     restore(kDrawInstanced, &observedDrawInstanced, 8);
     wchar_t message[320];
     swprintf_s(message,
@@ -9449,7 +9468,9 @@ void endDrawProbe() {
         patched_table, kDraw, reinterpret_cast<void*>(&observedDraw),
         reinterpret_cast<void*>(original_draw.load(std::memory_order_acquire)));
     const bool indexed_instanced_restored =
-        !draw_indexed_instanced_hook_active.exchange(false) || patchSlot(
+        !draw_indexed_instanced_hook_active.exchange(false) ||
+        keepPersistentDrawIndexedInstancedHook() ||
+        patchSlot(
             patched_table, kDrawIndexedInstanced,
             reinterpret_cast<void*>(&observedDrawIndexedInstanced),
             reinterpret_cast<void*>(original_draw_indexed_instanced.load(std::memory_order_acquire)));
@@ -9542,13 +9563,16 @@ void beginDrawProbe() {
             patched_table[kDrawIndexedInstanced]);
         auto instanced_forward = reinterpret_cast<DrawInstancedFn>(patched_table[kDrawInstanced]);
         original_draw.store(draw_forward, std::memory_order_release);
-        original_draw_indexed_instanced.store(indexed_instanced_forward,
-            std::memory_order_release);
+        if (indexed_instanced_forward && indexed_instanced_forward != &observedDrawIndexedInstanced) {
+            original_draw_indexed_instanced.store(indexed_instanced_forward,
+                std::memory_order_release);
+        }
         original_draw_instanced.store(instanced_forward, std::memory_order_release);
         if (draw_forward && patchSlot(patched_table, kDraw,
                 reinterpret_cast<void*>(draw_forward), reinterpret_cast<void*>(&observedDraw)))
             draw_hook_active.store(true, std::memory_order_release);
-        if (indexed_instanced_forward && patchSlot(patched_table, kDrawIndexedInstanced,
+        if (indexed_instanced_forward && indexed_instanced_forward != &observedDrawIndexedInstanced &&
+            patchSlot(patched_table, kDrawIndexedInstanced,
                 reinterpret_cast<void*>(indexed_instanced_forward),
                 reinterpret_cast<void*>(&observedDrawIndexedInstanced)))
             draw_indexed_instanced_hook_active.store(true, std::memory_order_release);
@@ -14224,6 +14248,11 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
             cfg.frameGenDynamicTargetFps,
             cfg.frameGenReflexBoost);
         edpe::FrameLimiter::instance().configure(cfg.gameFpsLimit);
+        auto& dancer = edpe::LoadingMeshReplacer::instance();
+        dancer.setEnabled(cfg.loadingScreenDancer);
+        dancer.setUseGameSpin(cfg.loadingScreenDancerSpin);
+        dancer.setReplaceAllHolograms(cfg.loadingScreenDancerAllHolograms);
+        dancer.setAnimSpeed(cfg.loadingScreenDancerSpeed);
     }
     s_inside_main_scene.store(false, std::memory_order_release);
     if (!(flags & DXGI_PRESENT_TEST)) {
@@ -16048,7 +16077,14 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
         entry.orig_vs_cb = reinterpret_cast<VSSetConstantBuffersFn>(vtHook->liveStubForSlot(kVSSetConstantBuffers));
         entry.orig_draw_indexed = reinterpret_cast<DrawIndexedFn>(vtHook->liveStubForSlot(kDrawIndexed));
         entry.orig_draw = reinterpret_cast<DrawFn>(vtHook->liveStubForSlot(kDraw));
-        entry.orig_draw_indexed_instanced = reinterpret_cast<DrawIndexedInstancedFn>(vtHook->liveStubForSlot(kDrawIndexedInstanced));
+        if (keepPersistentDrawIndexedInstancedHook()) {
+            void* fwdDrawIndexedInstanced = nullptr;
+            vtHook->hook(context, kDrawIndexedInstanced,
+                reinterpret_cast<void*>(&observedDrawIndexedInstanced), &fwdDrawIndexedInstanced, mode);
+            entry.orig_draw_indexed_instanced = reinterpret_cast<DrawIndexedInstancedFn>(fwdDrawIndexedInstanced);
+        } else {
+            entry.orig_draw_indexed_instanced = reinterpret_cast<DrawIndexedInstancedFn>(vtHook->liveStubForSlot(kDrawIndexedInstanced));
+        }
         entry.orig_draw_instanced = reinterpret_cast<DrawInstancedFn>(vtHook->liveStubForSlot(kDrawInstanced));
         if (!original_map.load(std::memory_order_relaxed)) {
             original_map.store(entry.orig_map, std::memory_order_release);
@@ -16093,7 +16129,9 @@ void ContextCensusHookContext(ID3D11DeviceContext* context) {
             }
             vtHook->hook(context, kDrawIndexed, reinterpret_cast<void*>(&observedDrawIndexed), &ignoredOut, mode);
             vtHook->hook(context, kDraw, reinterpret_cast<void*>(&observedDraw), &ignoredOut, mode);
-            vtHook->hook(context, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), &ignoredOut, mode);
+            if (!keepPersistentDrawIndexedInstancedHook()) {
+                vtHook->hook(context, kDrawIndexedInstanced, reinterpret_cast<void*>(&observedDrawIndexedInstanced), &ignoredOut, mode);
+            }
             vtHook->hook(context, kDrawInstanced, reinterpret_cast<void*>(&observedDrawInstanced), &ignoredOut, mode);
         }
     }

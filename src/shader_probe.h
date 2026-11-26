@@ -3,6 +3,7 @@
 #include <guiddef.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 // Full bytecode is attached only during an explicitly armed diagnostic run.
 constexpr GUID kEdpeVertexBytecodeGuid =
@@ -31,3 +32,33 @@ constexpr GUID kEdpeVsProjCbGuid =
 // Cached flag (uint8_t: 1 = frosted backdrop PS sampling blurred scene t0 via SV_Position * cb1[332].zw).
 constexpr GUID kEdpePsFrostedBackdropGuid =
     {0x6c42d91f, 0x8e3a, 0x4b12, {0xa5, 0x71, 0x2d, 0x90, 0x4e, 0xc8, 0x3b, 0x54}};
+
+// Cached tag (uint8_t: 1) for the Elite Dangerous loading-screen character hologram shaders.
+constexpr GUID kEdpeLoadingHoloVsGuid =
+    {0xd4a9e312, 0x7b4c, 0x4c9a, {0x91, 0x33, 0x5f, 0x82, 0xa1, 0x0b, 0x66, 0xe7}};
+
+constexpr GUID kEdpeLoadingHoloPsGuid =
+    {0xe8c1f504, 0x2d6e, 0x471b, {0x88, 0x42, 0x19, 0xbc, 0x7d, 0x45, 0x9a, 0x03}};
+
+inline std::uint32_t EdpeByteSwap32(std::uint32_t v) {
+    return ((v & 0x000000FFu) << 24) |
+           ((v & 0x0000FF00u) << 8) |
+           ((v & 0x00FF0000u) >> 8) |
+           ((v & 0xFF000000u) >> 24);
+}
+
+// Matches the 16-byte DXBC header digest (bytes 4..19) against 4 uint32 words in either endianness.
+inline bool EdpeMatchesDxbcHash(const void* bytecode, std::size_t size,
+                                std::uint32_t h0, std::uint32_t h1,
+                                std::uint32_t h2, std::uint32_t h3) {
+    if (!bytecode || size < 20) return false;
+    const auto* bytes = static_cast<const std::uint8_t*>(bytecode);
+    if (std::memcmp(bytes, "DXBC", 4) != 0) return false;
+    std::uint32_t d[4]{};
+    std::memcpy(d, bytes + 4, sizeof(d));
+    if (d[0] == h0 && d[1] == h1 && d[2] == h2 && d[3] == h3) return true;
+    return d[0] == EdpeByteSwap32(h0) &&
+           d[1] == EdpeByteSwap32(h1) &&
+           d[2] == EdpeByteSwap32(h2) &&
+           d[3] == EdpeByteSwap32(h3);
+}
