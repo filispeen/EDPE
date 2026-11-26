@@ -1185,5 +1185,72 @@ int main() {
     context->Unmap(cls_rb.Get(), 0);
     if (corpse_b_cls != static_cast<std::uint8_t>(edpe::MotionPixelClass::World)) return 180;
 
+    // RTV3 emissive reactive mask test: bright HDR emissive on world pixels triggers
+    // high OutReactive (>= 0.78), non-emissive world pixels stay ~0, and static cockpit
+    // emissive lamps (stencil 0x80 -> kClassCockpitStatic) stay ~0.
+    std::array<std::uint64_t, 16> em_depths{};
+    em_depths.fill(static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.01f)) |
+                   (static_cast<std::uint64_t>(0x04u) << 32)); // World pixels
+    em_depths[1 * 4 + 2] = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(0.25f)) |
+                           (static_cast<std::uint64_t>(0x80u) << 32); // Cockpit lamp
+    D3D11_SUBRESOURCE_DATA em_depth_init{em_depths.data(), 4 * sizeof(std::uint64_t), 0};
+    ComPtr<ID3D11Texture2D> em_depth_tex;
+    ComPtr<ID3D11ShaderResourceView> em_depth_srv;
+    if (FAILED(device->CreateTexture2D(&vm_depth_desc, &em_depth_init, &em_depth_tex)) ||
+        FAILED(device->CreateShaderResourceView(em_depth_tex.Get(), &view_desc, &em_depth_srv))) {
+        return 181;
+    }
+
+    std::array<DirectX::PackedVector::XMFLOAT3PK, 16> em_pixels{};
+    for (auto& px : em_pixels) px = DirectX::PackedVector::XMFLOAT3PK(0.0f, 0.0f, 0.0f);
+    em_pixels[1 * 4 + 1] = DirectX::PackedVector::XMFLOAT3PK(3.0f, 1.5f, 0.2f); // World emissive thruster
+    em_pixels[1 * 4 + 2] = DirectX::PackedVector::XMFLOAT3PK(3.0f, 1.5f, 0.2f); // Static cockpit lamp
+    D3D11_TEXTURE2D_DESC rtv3_desc{};
+    rtv3_desc.Width = 4;
+    rtv3_desc.Height = 4;
+    rtv3_desc.MipLevels = rtv3_desc.ArraySize = 1;
+    rtv3_desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    rtv3_desc.SampleDesc.Count = 1;
+    rtv3_desc.Usage = D3D11_USAGE_DEFAULT;
+    rtv3_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA rtv3_init{em_pixels.data(), 4 * sizeof(DirectX::PackedVector::XMFLOAT3PK), 0};
+    ComPtr<ID3D11Texture2D> rtv3_tex;
+    ComPtr<ID3D11ShaderResourceView> rtv3_srv;
+    if (FAILED(device->CreateTexture2D(&rtv3_desc, &rtv3_init, &rtv3_tex)) ||
+        FAILED(device->CreateShaderResourceView(rtv3_tex.Get(), nullptr, &rtv3_srv))) {
+        return 182;
+    }
+
+    if (!pass.render(em_depth_srv.Get(), walkPrev, walkPrev, 4, 4,
+            0.0f, 0.0f, 0.0f, 0.0f, false, nullptr,
+            /*preserveContextState=*/true, /*zeroTranslation=*/false,
+            /*enableClassOutput=*/true, nullptr, nullptr, nullptr, 0u,
+            /*clampCockpit=*/true, /*enableReactiveOutput=*/true, /*inSrv=*/false,
+            rtv3_srv.Get()) ||
+        !pass.reactiveMaskTexture()) {
+        return 183;
+    }
+
+    D3D11_TEXTURE2D_DESC react_rb_desc{};
+    react_rb_desc.Width = 4;
+    react_rb_desc.Height = 4;
+    react_rb_desc.MipLevels = react_rb_desc.ArraySize = 1;
+    react_rb_desc.Format = DXGI_FORMAT_R8_UNORM;
+    react_rb_desc.SampleDesc.Count = 1;
+    react_rb_desc.Usage = D3D11_USAGE_STAGING;
+    react_rb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> react_rb;
+    if (FAILED(device->CreateTexture2D(&react_rb_desc, nullptr, &react_rb))) return 184;
+    context->CopyResource(react_rb.Get(), pass.reactiveMaskTexture());
+    if (FAILED(context->Map(react_rb.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return 185;
+    const auto* r_row1 = static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch;
+    const float r_bg = static_cast<float>(r_row1[0]) / 255.0f;
+    const float r_world_em = static_cast<float>(r_row1[1]) / 255.0f;
+    const float r_cockpit_em = static_cast<float>(r_row1[2]) / 255.0f;
+    context->Unmap(react_rb.Get(), 0);
+    if (r_bg > 0.02f || r_world_em < 0.78f || r_cockpit_em > 0.02f) {
+        return 186;
+    }
+
     return 0;
 }

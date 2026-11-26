@@ -7,6 +7,7 @@
 #include "cobra_camera_inject.h"
 #include "log.h"
 #include "motion_pass.h"
+#include "residual_flow_pass.h"
 #include "weapon_motion.h"
 #include "celestial_motion.h"
 #include "shader_probe.h"
@@ -1281,6 +1282,13 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> motion_grid_readback;
 ID3D11DeviceContext* motion_grid_context = nullptr;
 std::unique_ptr<edpe::MotionPass> motion_pass;
 static ID3D11Device* s_motion_pass_failed_device = nullptr;
+static std::unique_ptr<edpe::ResidualFlowPass> s_residual_flow_pass;
+static ID3D11Device* s_residual_flow_failed_device = nullptr;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_emissive_rtv3_tex;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> s_emissive_rtv3_srv;
+static UINT s_emissive_rtv3_width = 0;
+static UINT s_emissive_rtv3_height = 0;
+static unsigned long long s_emissive_rtv3_frame = ~0ull;
 Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_snapshot;
 UINT motion_snapshot_width = 0;
 UINT motion_snapshot_height = 0;
@@ -10175,6 +10183,62 @@ void queueMotionColor(ID3D11DeviceContext* context, unsigned long long frame) {
     EdpeLog(message);
 }
 
+static void captureEmissiveRtv3ForReactive(ID3D11DeviceContext* context, unsigned long long current_frame) {
+    if (!context || !motion_color_source || motion_color_frame != current_frame) return;
+    if (s_emissive_rtv3_frame == current_frame || s_hdr_slot0_seen_frame == current_frame) return;
+
+    auto& upscaler = edpe::UpscalerManager::instance();
+    if (!upscaler.isReconstructionActive()) return;
+    const auto backend = upscaler.getBackend();
+    if (backend != edpe::UpscalerBackend::Taa && backend != edpe::UpscalerBackend::AmdFsr) return;
+
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+    motion_color_source->GetDesc(&rtvDesc);
+    Microsoft::WRL::ComPtr<ID3D11Resource> res;
+    motion_color_source->GetResource(&res);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> srcTex;
+    if (!res || FAILED(res.As(&srcTex))) return;
+
+    D3D11_TEXTURE2D_DESC td{};
+    srcTex->GetDesc(&td);
+    if (td.Format != DXGI_FORMAT_R11G11B10_FLOAT || rtvDesc.Format != td.Format ||
+        !td.Width || !td.Height || td.MipLevels != 1 || td.ArraySize != 1 || td.SampleDesc.Count != 1 ||
+        static_cast<unsigned long long>(td.Width) * td.Height > 3840ull * 2160ull) {
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (!device || !sameD3D11Device(srcTex.Get(), device.Get())) return;
+
+    if (!s_emissive_rtv3_tex || !s_emissive_rtv3_srv ||
+        s_emissive_rtv3_width != td.Width || s_emissive_rtv3_height != td.Height ||
+        !sameD3D11Device(s_emissive_rtv3_tex.Get(), device.Get())) {
+        s_emissive_rtv3_tex.Reset();
+        s_emissive_rtv3_srv.Reset();
+        s_emissive_rtv3_width = 0;
+        s_emissive_rtv3_height = 0;
+
+        D3D11_TEXTURE2D_DESC copyDesc = td;
+        copyDesc.Usage = D3D11_USAGE_DEFAULT;
+        copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        copyDesc.CPUAccessFlags = 0;
+        copyDesc.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, &s_emissive_rtv3_tex)) ||
+            FAILED(device->CreateShaderResourceView(s_emissive_rtv3_tex.Get(), nullptr, &s_emissive_rtv3_srv))) {
+            s_emissive_rtv3_tex.Reset();
+            s_emissive_rtv3_srv.Reset();
+            return;
+        }
+        edpe::SetD3D11DebugName(s_emissive_rtv3_tex.Get(), "EDPE_EmissiveRTV3");
+        s_emissive_rtv3_width = td.Width;
+        s_emissive_rtv3_height = td.Height;
+    }
+
+    context->CopyResource(s_emissive_rtv3_tex.Get(), srcTex.Get());
+    s_emissive_rtv3_frame = current_frame;
+}
+
 void captureEarlyMotionColor(ID3D11DeviceContext* context, bool from_hud) {
     if (!motion_color_source) return;
     if (s_clean_hdr_scene_texture && s_clean_hdr_scene_frame == motion_color_frame &&
@@ -10439,6 +10503,12 @@ void tryMotionPair(ID3D11DeviceContext* fallback_context, unsigned long long fra
     static ID3D11Device* s_motion_pass_device = nullptr;
     if (motion_pass && s_motion_pass_device != device.Get()) {
         motion_pass.reset();
+        s_residual_flow_pass.reset();
+        s_residual_flow_failed_device = nullptr;
+        s_emissive_rtv3_tex.Reset();
+        s_emissive_rtv3_srv.Reset();
+        s_emissive_rtv3_width = s_emissive_rtv3_height = 0;
+        s_emissive_rtv3_frame = ~0ull;
         s_weapon_motion.shutdown();
         s_celestial_motion.shutdown();
         s_weapon_motion_frame = ~0ull;
@@ -11406,6 +11476,12 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         s_cached_hdr_rtv0 = nullptr;
         motion_pass.reset();
         s_motion_pass_failed_device = nullptr;
+        s_residual_flow_pass.reset();
+        s_residual_flow_failed_device = nullptr;
+        s_emissive_rtv3_tex.Reset();
+        s_emissive_rtv3_srv.Reset();
+        s_emissive_rtv3_width = s_emissive_rtv3_height = 0;
+        s_emissive_rtv3_frame = ~0ull;
         s_weapon_motion.shutdown();
         s_celestial_motion.shutdown();
         s_weapon_motion_frame = ~0ull;
@@ -11741,6 +11817,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                              want_motion_class_debug ||
                              edpe::FgRuntime::instance().isMotionNeeded();
     Microsoft::WRL::ComPtr<ID3D11Texture2D> motionTexture;
+    ID3D11ShaderResourceView* activeMotionSrv = nullptr;
     ID3D11ShaderResourceView* prevDepthSrv = nullptr;
     if (need_motion) {
         if (s_motion_prev_depth && s_motion_prev_depth_view) {
@@ -11792,7 +11869,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     (activeBackend == edpe::UpscalerBackend::AmdFsr);
                 const bool wantMotionClass =
                     want_motion_class_debug ||
-                    (activeBackend == edpe::UpscalerBackend::Taa);
+                    upscale_active;
                 ID3D11ShaderResourceView* weaponMotionSrv = nullptr;
                 if (!eval_reset &&
                     s_weapon_motion.isInitialized() &&
@@ -11825,6 +11902,14 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                         celestialCount = s_celestial_motion.recordCount();
                     }
                 }
+                ID3D11ShaderResourceView* emissiveSrv =
+                    (wantReactiveMask && !eval_reset && s_emissive_rtv3_srv &&
+                     s_emissive_rtv3_frame == rendered &&
+                     s_emissive_rtv3_width == depthDesc.Width &&
+                     s_emissive_rtv3_height == depthDesc.Height &&
+                     sameD3D11Device(s_emissive_rtv3_tex.Get(), device.Get()))
+                    ? s_emissive_rtv3_srv.Get()
+                    : nullptr;
                 motion_pass->render(motion_depth_view.Get(),
                     s_camera_now, s_camera_previous, depthDesc.Width, depthDesc.Height,
                     jx, jy, prev_jx, prev_jy, eval_reset, prevDepthSrv,
@@ -11837,7 +11922,8 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                     /*celestialCount=*/celestialCount,
                     /*clampCockpit=*/clampCockpit,
                     /*enableReactiveOutput=*/wantReactiveMask,
-                    /*inSrv=*/inSrvActive);
+                    /*inSrv=*/inSrvActive,
+                    /*emissiveColor=*/emissiveSrv);
                 if (s_celestial_motion.isInitialized()) {
                     s_celestial_motion.beginFrame();
                 }
@@ -11852,8 +11938,38 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         }
         if (!motion_pass->output()) return;
 
+        activeMotionSrv = motion_pass->output();
+        if (!s_zero_motion_vectors.load(std::memory_order_relaxed)) {
+            if (!s_residual_flow_pass && s_residual_flow_failed_device != device.Get()) {
+                auto candidate = std::make_unique<edpe::ResidualFlowPass>();
+                if (candidate->initialize(device.Get())) {
+                    s_residual_flow_pass = std::move(candidate);
+                    s_residual_flow_failed_device = nullptr;
+                } else {
+                    s_residual_flow_failed_device = device.Get();
+                }
+            }
+            if (s_residual_flow_pass && s_residual_flow_pass->isInitialized()) {
+                edpe::ScopedRenderDocEvent rdocRFlow(context, L"EDPE: ResidualFlowPass");
+                ID3D11ShaderResourceView* depthForFlow =
+                    (motion_pass->canonicalDepth() != nullptr) ? motion_pass->canonicalDepth() : motion_depth_view.Get();
+                if (s_residual_flow_pass->render(
+                        context,
+                        activeColorInputSrv,
+                        motion_pass->output(),
+                        depthForFlow,
+                        motion_pass->pixelClass(),
+                        depthDesc.Width, depthDesc.Height,
+                        jx, jy, prev_jx, prev_jy,
+                        eval_reset)) {
+                    activeMotionSrv = s_residual_flow_pass->output();
+                }
+            }
+        }
+        if (!activeMotionSrv) return;
+
         Microsoft::WRL::ComPtr<ID3D11Resource> motionRes;
-        motion_pass->output()->GetResource(&motionRes);
+        activeMotionSrv->GetResource(&motionRes);
         if (!motionRes || FAILED(motionRes.As(&motionTexture))) return;
     }
 
@@ -11871,7 +11987,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     inputs.depthSrv = useCanonicalDepth ? motion_pass->canonicalDepth() : motion_depth_view.Get();
     inputs.prevDepthSrv = prevDepthSrv;
     inputs.motionVectors = motionTexture ? motionTexture.Get() : nullptr;
-    inputs.motionSrv = (motion_pass && need_motion) ? motion_pass->output() : nullptr;
+    inputs.motionSrv = (motion_pass && need_motion) ? activeMotionSrv : nullptr;
     inputs.renderWidth = depthDesc.Width;
     inputs.renderHeight = depthDesc.Height;
     inputs.outputWidth = backbufferDesc.Width;
@@ -13074,6 +13190,7 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             // Main scene G-buffer or Pass 35 HDR pass has completed and unbound!
             s_inside_main_scene.store(false, std::memory_order_release);
             s_hud_mask_active_pass = false;
+            captureEmissiveRtv3ForReactive(context, current_frame);
             if (motion_pair_active && !motion_color_first_exit_logged) {
                 motion_color_first_exit_logged = true;
                 wchar_t message[160];
@@ -13085,6 +13202,9 @@ void observeDepthStencilView(ID3D11DeviceContext* context, UINT count,
             }
 
         } else if (is_hdr_slot0) {
+            if (motion_color_bound) {
+                captureEmissiveRtv3ForReactive(context, current_frame);
+            }
             // Transitioned from 4-MRT G-buffer (Binds 1-3) to RTV0 deferred lighting/HUD (Binds 4-7)
             s_inside_main_scene.store(false, std::memory_order_release);
             if (motion_color_frame == current_frame) {
@@ -15488,6 +15608,12 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         resetVisorJitterAlign();
         motion_pass.reset();
         s_motion_pass_failed_device = nullptr;
+        s_residual_flow_pass.reset();
+        s_residual_flow_failed_device = nullptr;
+        s_emissive_rtv3_tex.Reset();
+        s_emissive_rtv3_srv.Reset();
+        s_emissive_rtv3_width = s_emissive_rtv3_height = 0;
+        s_emissive_rtv3_frame = ~0ull;
         s_weapon_motion.shutdown();
         s_celestial_motion.shutdown();
         s_weapon_motion_frame = ~0ull;

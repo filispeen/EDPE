@@ -104,6 +104,7 @@ add_library(EDPE_DXGI SHARED
     src/sampler_bias_manager.cpp
     src/input_hook.cpp
     src/motion_pass.cpp
+    src/residual_flow_pass.cpp
     src/weapon_motion.cpp
     src/celestial_motion.cpp
     src/ui_layer.cpp
@@ -313,6 +314,12 @@ target_compile_definitions(taa_motion_ghosting_test PRIVATE WIN32_LEAN_AND_MEAN 
 target_include_directories(taa_motion_ghosting_test PRIVATE src)
 target_link_libraries(taa_motion_ghosting_test PRIVATE d3d11 d3dcompiler)
 add_test(NAME taa_motion_ghosting COMMAND taa_motion_ghosting_test)
+add_executable(residual_flow_test tests/residual_flow_test.cpp src/residual_flow_pass.cpp src/taa_pass.cpp src/renderdoc_support.cpp src/log.cpp)
+target_compile_features(residual_flow_test PRIVATE cxx_std_20)
+target_compile_definitions(residual_flow_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(residual_flow_test PRIVATE src)
+target_link_libraries(residual_flow_test PRIVATE d3d11 d3dcompiler)
+add_test(NAME residual_flow COMMAND residual_flow_test)
 add_executable(ui_composite_test tests/ui_composite_test.cpp src/ui_composite_pass.cpp)
 target_compile_features(ui_composite_test PRIVATE cxx_std_20)
 target_compile_definitions(ui_composite_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX EDPE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")

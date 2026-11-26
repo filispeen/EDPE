@@ -41,7 +41,8 @@ public:
         uint32_t celestialCount = 0,
         bool clampCockpit = true,
         bool enableReactiveOutput = false,
-        bool inSrv = false);
+        bool inSrv = false,
+        ID3D11ShaderResourceView* emissiveColor = nullptr);
     bool renderGpuCameras(ID3D11ShaderResourceView* depth, ID3D11Buffer* now,
         ID3D11Buffer* previous, UINT width, UINT height,
         float jitterX = 0.0f, float jitterY = 0.0f,
@@ -71,6 +72,7 @@ private:
         ID3D11ShaderResourceView* weaponMotion,
         ID3D11ShaderResourceView* sceneStencil,
         ID3D11ShaderResourceView* celestialRecords,
+        ID3D11ShaderResourceView* emissiveColor,
         const float (&values)[36],
         ID3D11Buffer* now, ID3D11Buffer* previous, UINT width, UINT height,
         bool preserveContextState, bool enableClassOutput, bool enableReactiveOutput);

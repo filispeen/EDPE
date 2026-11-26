@@ -312,7 +312,8 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     uint32_t celestialCount,
     bool clampCockpit,
     bool enableReactiveOutput,
-    bool inSrv) {
+    bool inSrv,
+    ID3D11ShaderResourceView* emissiveColor) {
     if (!device_ || !depth || !width || !height ||
         !(now.scaleX > 0 && now.scaleY > 0 && now.depthB > 0 &&
           previous.scaleX > 0 && previous.scaleY > 0) ||
@@ -325,6 +326,7 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
     for (float value : previous.worldFromView) if (!std::isfinite(value)) return false;
     const bool useWeapon = (weaponMotion != nullptr && !reset);
     const bool useCelestial = (celestialRecords != nullptr && celestialCount > 0u && !reset);
+    const bool useEmissive = (emissiveColor != nullptr && enableReactiveOutput && !reset);
     const int modeFlags =
         ((prevDepth && !reset) ? 1 : 0) |
         (enableClassOutput ? 4 : 0) |
@@ -333,7 +335,8 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
         (useCelestial ? 32 : 0) |
         (clampCockpit ? 64 : 0) |
         (enableReactiveOutput ? 512 : 0) |
-        (inSrv ? 1024 : 0);
+        (inSrv ? 1024 : 0) |
+        (useEmissive ? 2048 : 0);
     // Precompute relative view-space transform M_rel = R_prev^T * R_now,
     // t_rel = R_prev^T * (t_now - t_prev) in double precision on CPU to avoid
     // float32 cancellation during translation and halve per-pixel ALU.
@@ -386,6 +389,7 @@ bool MotionPass::render(ID3D11ShaderResourceView* depth, const CameraProjection&
         useWeapon ? weaponMotion : nullptr,
         useWeapon ? sceneStencil : nullptr,
         useCelestial ? celestialRecords : nullptr,
+        useEmissive ? emissiveColor : nullptr,
         values, nullptr, nullptr, width, height, preserveContextState, enableClassOutput, enableReactiveOutput);
 }
 
@@ -420,7 +424,7 @@ bool MotionPass::renderGpuCameras(ID3D11ShaderResourceView* depth,
     values[35] = prevJitterY;
     return renderInternal(depth,
         (prevDepth && !reset) ? prevDepth : nullptr,
-        nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr,
         values, now, previous, width, height, true, enableClassOutput, false);
 }
 
@@ -429,6 +433,7 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     ID3D11ShaderResourceView* weaponMotion,
     ID3D11ShaderResourceView* sceneStencil,
     ID3D11ShaderResourceView* celestialRecords,
+    ID3D11ShaderResourceView* emissiveColor,
     const float (&values)[36], ID3D11Buffer* now, ID3D11Buffer* previous,
     UINT width, UINT height, bool preserveContextState, bool enableClassOutput, bool enableReactiveOutput) {
     if (!device_ || !depth || !width || !height) return false;
@@ -492,6 +497,7 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
 
     if (enableClassOutput && !class_output_uav_) flags &= ~4;
     if (enableReactiveOutput && !reactive_output_uav_) flags &= ~512;
+    if (!emissiveColor || !enableReactiveOutput || !reactive_output_uav_) flags &= ~2048;
     if (!weaponMotion || !activeStencilSrv) flags &= ~16;
     if (!celestialRecords) flags &= ~32;
     if (activeStencilSrv) flags |= 128;
@@ -545,9 +551,10 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
         context_->CSSetShaderResources(2, 2, nullTileSrvs);
     }
 
-    ID3D11ShaderResourceView* srvs[6] = {
+    ID3D11ShaderResourceView* srvs[7] = {
         depth, prevDepth, weaponMotion, activeStencilSrv, celestialRecords,
-        useCockpitTiles ? cockpit_tile_srv_.Get() : nullptr
+        useCockpitTiles ? cockpit_tile_srv_.Get() : nullptr,
+        ((flags & 2048) != 0) ? emissiveColor : nullptr
     };
     ID3D11UnorderedAccessView* uavs[4] = {
         output_uav_.Get(),
@@ -570,15 +577,15 @@ bool MotionPass::renderInternal(ID3D11ShaderResourceView* depth,
     context_->CSSetShader(activeCs, nullptr, 0);
     context_->CSSetSamplers(0, 1, &smp);
     context_->CSSetConstantBuffers(0, now ? 3 : 1, buffers);
-    context_->CSSetShaderResources(0, 6, srvs);
+    context_->CSSetShaderResources(0, 7, srvs);
     context_->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
     context_->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
 
     ID3D11UnorderedAccessView* empty_uavs[4] = {nullptr, nullptr, nullptr, nullptr};
-    ID3D11ShaderResourceView* empty_srvs[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    ID3D11ShaderResourceView* empty_srvs[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     ID3D11SamplerState* null_smp = nullptr;
     context_->CSSetUnorderedAccessViews(0, 4, empty_uavs, nullptr);
-    context_->CSSetShaderResources(0, 6, empty_srvs);
+    context_->CSSetShaderResources(0, 7, empty_srvs);
     context_->CSSetSamplers(0, 1, &null_smp);
     context_->CSSetShader(nullptr, nullptr, 0);
 
