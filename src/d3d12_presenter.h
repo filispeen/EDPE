@@ -100,7 +100,7 @@ public:
                     uint32_t bufferCount = 3,
                     UINT flags = 0);
 
-    void shutdown();
+    void shutdown(bool keepBridge = false);
 
     bool isInitialized() const { return initialized_; }
     bool isTearingSupported() const { return tearingSupported_; }
@@ -175,6 +175,7 @@ public:
     }
 
 private:
+    void shutdownInternal(bool keepBridge);
     bool acquireBackBuffers();
     void releaseBackBuffers();
     bool ensureSharedInput(uint32_t width, uint32_t height, DXGI_FORMAT format);

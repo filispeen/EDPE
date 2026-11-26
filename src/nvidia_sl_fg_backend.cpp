@@ -257,7 +257,7 @@ struct SlApiTable {
         return (slReflexSetOptions != nullptr);
     }
 
-    void unload() {
+    void resetNonOwning() {
         slDLSSGGetState = nullptr;
         slDLSSGSetOptions = nullptr;
         slReflexGetState = nullptr;
@@ -280,12 +280,220 @@ struct SlApiTable {
         slSetD3DDevice = nullptr;
         slSetConstants = nullptr;
         slSetTagForFrame = nullptr;
+        interposer = nullptr;
+    }
 
-        if (interposer) {
-            FreeLibrary(interposer);
-            interposer = nullptr;
+    void unload() {
+        HMODULE mod = interposer;
+        resetNonOwning();
+        if (mod) {
+            FreeLibrary(mod);
         }
     }
+};
+
+sl::Preferences buildBaseSlPreferences(const wchar_t* const* pluginPaths,
+                                       uint32_t numPaths,
+                                       const sl::Feature* features,
+                                       uint32_t numFeatures) {
+    sl::Preferences pref{};
+    pref.showConsole = false;
+    // CRITICAL: pref.logLevel MUST remain eOff with logMessageCallback = nullptr.
+    // Streamline's sl.common.dll installs its own ngxLog function pointer into _nvngx.dll's
+    // process-global logging hook whenever logLevel != eOff and NGX initializes during
+    // slSetD3DDevice(). Unloading sl.common.dll in slShutdown() leaves _nvngx.dll with a
+    // dangling callback pointer and crashes (0xC0000005) on subsequent D3D11 NGX calls (#19).
+    pref.logLevel = sl::LogLevel::eOff;
+    pref.pathsToPlugins = const_cast<const wchar_t**>(pluginPaths);
+    pref.numPathsToPlugins = numPaths;
+    pref.pathToLogsAndData = nullptr;
+    pref.logMessageCallback = nullptr;
+    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
+                 sl::PreferenceFlags::eDisableDebugText |
+                 sl::PreferenceFlags::eUseManualHooking |
+                 sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+    pref.featuresToLoad = features;
+    pref.numFeaturesToLoad = numFeatures;
+    pref.engine = sl::EngineType::eCustom;
+    pref.engineVersion = "1.0";
+    pref.projectId = kEdpeProjectId;
+    pref.renderAPI = sl::RenderAPI::eD3D12;
+    return pref;
+}
+
+void queryAdapterCapabilitiesWithApi(const SlApiTable& sl,
+                                     LUID adapterLuid,
+                                     StreamlineStatusSnapshot& snapshot) {
+    sl::AdapterInfo adapterInfo{};
+    adapterInfo.deviceLUID = reinterpret_cast<uint8_t*>(&adapterLuid);
+    adapterInfo.deviceLUIDSizeInBytes = sizeof(adapterLuid);
+
+    const sl::Result reflexRc = sl.slIsFeatureSupported(sl::kFeatureReflex, adapterInfo);
+    const sl::Result pclRc = sl.slIsFeatureSupported(sl::kFeaturePCL, adapterInfo);
+    const sl::Result dlssgRc = sl.slIsFeatureSupported(sl::kFeatureDLSS_G, adapterInfo);
+
+    snapshot.lastReflexSupportCode = static_cast<int32_t>(reflexRc);
+    snapshot.lastDlssgSupportCode = static_cast<int32_t>(dlssgRc);
+    snapshot.reflexSupported = (reflexRc == sl::Result::eOk);
+    snapshot.pclSupported = (pclRc == sl::Result::eOk);
+    snapshot.dlssgSupported = (dlssgRc == sl::Result::eOk);
+
+    sl::FeatureVersion fv{};
+    if (sl.slGetFeatureVersion(sl::kFeatureDLSS_G, fv) == sl::Result::eOk && fv.versionSL) {
+        std::snprintf(snapshot.dlssgVersion, sizeof(snapshot.dlssgVersion), "%u.%u.%u",
+                      fv.versionSL.major, fv.versionSL.minor, fv.versionSL.build);
+    }
+    fv = {};
+    if (sl.slGetFeatureVersion(sl::kFeatureReflex, fv) == sl::Result::eOk && fv.versionSL) {
+        std::snprintf(snapshot.reflexVersion, sizeof(snapshot.reflexVersion), "%u.%u.%u",
+                      fv.versionSL.major, fv.versionSL.minor, fv.versionSL.build);
+    }
+
+    if (!snapshot.dlssgSupported) {
+        std::swprintf(snapshot.unavailableReason, 255,
+                      L"DLSS-G unsupported on active GPU/OS (%S; Reflex=%S).",
+                      slResultToString(dlssgRc), slResultToString(reflexRc));
+    } else if (!snapshot.reflexSupported) {
+        std::wcsncpy(snapshot.unavailableReason,
+                     L"Mandatory sl.reflex unavailable for DLSS-G.",
+                     255);
+    } else {
+        snapshot.unavailableReason[0] = L'\0';
+    }
+}
+
+// Streamline's DLSS-G plugin forbids re-calling slInit() after slShutdown() in the same process
+// (eErrorInitNotCalled). Keep sl.interposer.dll and slInit() alive for the process lifetime
+// once DLSS-G runtime initialization has started, while startup LUID probes remain transient.
+struct SlPersistentCore {
+    static SlPersistentCore& instance() {
+        static SlPersistentCore s_core;
+        return s_core;
+    }
+
+    bool ensureInitialized(StreamlineStatusSnapshot& outSnap, SlApiTable& outApi) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!slInitialized) {
+            std::wstring pluginDir;
+            findInterposerPath(&pluginDir);
+            if (!sl.loadInterposer(outSnap)) {
+                return false;
+            }
+            interposerFound = outSnap.interposerFound;
+            signatureVerified = outSnap.signatureVerified;
+
+            const wchar_t* pluginPaths[] = {pluginDir.c_str()};
+            const sl::Feature features[] = {
+                sl::kFeatureDLSS_G,
+                sl::kFeatureReflex,
+                sl::kFeaturePCL,
+            };
+            const sl::Preferences pref = buildBaseSlPreferences(
+                pluginPaths, pluginDir.empty() ? 0u : 1u,
+                features, static_cast<uint32_t>(std::size(features)));
+
+            const sl::Result res = sl.slInit(pref, sl::kSDKVersion);
+            lastSlResult = static_cast<int32_t>(res);
+            outSnap.lastSlResult = lastSlResult;
+            if (res != sl::Result::eOk) {
+                std::swprintf(outSnap.unavailableReason, 255,
+                              L"slInit failed: %S", slResultToString(res));
+                sl.unload();
+                return false;
+            }
+            slInitialized = true;
+            std::snprintf(slVersion, sizeof(slVersion), "%u.%u.%u",
+                          SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
+        }
+
+        outSnap.interposerFound = interposerFound;
+        outSnap.signatureVerified = signatureVerified;
+        outSnap.slInitialized = slInitialized;
+        outSnap.lastSlResult = lastSlResult;
+        std::memcpy(outSnap.slVersion, slVersion, sizeof(slVersion));
+        outApi = sl;
+        outApi.interposer = nullptr; // SlPersistentCore retains process-lifetime ownership.
+        return true;
+    }
+
+    bool ensureDeviceBound(ID3D12Device* d3d12Device, StreamlineStatusSnapshot& outSnap) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!slInitialized || !sl.slSetD3DDevice || !d3d12Device) {
+            return false;
+        }
+        if (boundDevice == d3d12Device) {
+            outSnap.lastSlResult = static_cast<int32_t>(sl::Result::eOk);
+            return true;
+        }
+        const sl::Result res = sl.slSetD3DDevice(d3d12Device);
+        lastSlResult = static_cast<int32_t>(res);
+        outSnap.lastSlResult = lastSlResult;
+        if (res != sl::Result::eOk) {
+            std::swprintf(outSnap.unavailableReason, 255,
+                          L"slSetD3DDevice failed: %S", slResultToString(res));
+            return false;
+        }
+        boundDevice = d3d12Device;
+        return true;
+    }
+
+    bool probeCapabilitiesForLuid(LUID adapterLuid, StreamlineStatusSnapshot& outSnap) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (slInitialized) {
+            outSnap.interposerFound = interposerFound;
+            outSnap.signatureVerified = signatureVerified;
+            outSnap.slInitialized = true;
+            outSnap.lastSlResult = lastSlResult;
+            std::memcpy(outSnap.slVersion, slVersion, sizeof(slVersion));
+            queryAdapterCapabilitiesWithApi(sl, adapterLuid, outSnap);
+            return outSnap.dlssgSupported && outSnap.reflexSupported;
+        }
+
+        std::wstring pluginDir;
+        findInterposerPath(&pluginDir);
+        SlApiTable localSl;
+        if (!localSl.loadInterposer(outSnap)) {
+            return false;
+        }
+
+        const wchar_t* pluginPaths[] = {pluginDir.c_str()};
+        const sl::Feature features[] = {
+            sl::kFeatureDLSS_G,
+            sl::kFeatureReflex,
+            sl::kFeaturePCL,
+        };
+        const sl::Preferences pref = buildBaseSlPreferences(
+            pluginPaths, pluginDir.empty() ? 0u : 1u,
+            features, static_cast<uint32_t>(std::size(features)));
+
+        const sl::Result res = localSl.slInit(pref, sl::kSDKVersion);
+        outSnap.lastSlResult = static_cast<int32_t>(res);
+        if (res != sl::Result::eOk) {
+            std::swprintf(outSnap.unavailableReason, 255,
+                          L"slInit failed: %S", slResultToString(res));
+            localSl.unload();
+            return false;
+        }
+        outSnap.slInitialized = true;
+        std::snprintf(outSnap.slVersion, sizeof(outSnap.slVersion), "%u.%u.%u",
+                      SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
+
+        queryAdapterCapabilitiesWithApi(localSl, adapterLuid, outSnap);
+
+        localSl.slShutdown();
+        outSnap.slInitialized = false;
+        localSl.unload();
+        return outSnap.dlssgSupported && outSnap.reflexSupported;
+    }
+
+    std::mutex mutex;
+    SlApiTable sl;
+    bool slInitialized = false;
+    bool interposerFound = false;
+    bool signatureVerified = false;
+    ID3D12Device* boundDevice = nullptr;
+    char slVersion[32]{};
+    int32_t lastSlResult = 0;
 };
 
 #endif // EDPE_ENABLE_STREAMLINE
@@ -395,121 +603,7 @@ struct NvidiaStreamlineFgBackend::Impl {
         self->currentToken = nullptr;
     }
 
-    static sl::Preferences buildBasePreferences(const wchar_t* const* pluginPaths,
-                                              uint32_t numPaths,
-                                              const sl::Feature* features,
-                                              uint32_t numFeatures) {
-        sl::Preferences pref{};
-        pref.showConsole = false;
-        // CRITICAL: pref.logLevel MUST remain eOff with logMessageCallback = nullptr.
-        // Streamline's sl.common.dll installs its own ngxLog function pointer into _nvngx.dll's
-        // process-global logging hook whenever logLevel != eOff and NGX initializes during
-        // slSetD3DDevice(). Unloading sl.common.dll in slShutdown() leaves _nvngx.dll with a
-        // dangling callback pointer and crashes (0xC0000005) on subsequent D3D11 NGX calls (#19).
-        pref.logLevel = sl::LogLevel::eOff;
-        pref.pathsToPlugins = const_cast<const wchar_t**>(pluginPaths);
-        pref.numPathsToPlugins = numPaths;
-        pref.pathToLogsAndData = nullptr;
-        pref.logMessageCallback = nullptr;
-        pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
-                     sl::PreferenceFlags::eDisableDebugText |
-                     sl::PreferenceFlags::eUseManualHooking |
-                     sl::PreferenceFlags::eUseFrameBasedResourceTagging;
-        pref.featuresToLoad = features;
-        pref.numFeaturesToLoad = numFeatures;
-        pref.engine = sl::EngineType::eCustom;
-        pref.engineVersion = "1.0";
-        pref.projectId = kEdpeProjectId;
-        pref.renderAPI = sl::RenderAPI::eD3D12;
-        return pref;
-    }
-
-    void queryAdapterFeatureCapabilities(LUID adapterLuid) {
-        sl::AdapterInfo adapterInfo{};
-        adapterInfo.deviceLUID = reinterpret_cast<uint8_t*>(&adapterLuid);
-        adapterInfo.deviceLUIDSizeInBytes = sizeof(adapterLuid);
-
-        const sl::Result reflexRc = sl.slIsFeatureSupported(sl::kFeatureReflex, adapterInfo);
-        const sl::Result pclRc = sl.slIsFeatureSupported(sl::kFeaturePCL, adapterInfo);
-        const sl::Result dlssgRc = sl.slIsFeatureSupported(sl::kFeatureDLSS_G, adapterInfo);
-
-        snapshot.lastReflexSupportCode = static_cast<int32_t>(reflexRc);
-        snapshot.lastDlssgSupportCode = static_cast<int32_t>(dlssgRc);
-        snapshot.reflexSupported = (reflexRc == sl::Result::eOk);
-        snapshot.pclSupported = (pclRc == sl::Result::eOk);
-        snapshot.dlssgSupported = (dlssgRc == sl::Result::eOk);
-
-        sl::FeatureVersion fv{};
-        if (sl.slGetFeatureVersion(sl::kFeatureDLSS_G, fv) == sl::Result::eOk && fv.versionSL) {
-            std::snprintf(snapshot.dlssgVersion, sizeof(snapshot.dlssgVersion), "%u.%u.%u",
-                          fv.versionSL.major, fv.versionSL.minor, fv.versionSL.build);
-        }
-        fv = {};
-        if (sl.slGetFeatureVersion(sl::kFeatureReflex, fv) == sl::Result::eOk && fv.versionSL) {
-            std::snprintf(snapshot.reflexVersion, sizeof(snapshot.reflexVersion), "%u.%u.%u",
-                          fv.versionSL.major, fv.versionSL.minor, fv.versionSL.build);
-        }
-    }
-
-    bool probeAdapterLuid(LUID adapterLuid) {
-        if (D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc()) {
-            std::wcsncpy(snapshot.unavailableReason,
-                         L"Blocked: Windows renderdoc.dll in-process.",
-                         255);
-            return false;
-        }
-
-        std::wstring pluginDir;
-        findInterposerPath(&pluginDir);
-        if (!sl.loadInterposer(snapshot)) {
-            return false;
-        }
-
-        const wchar_t* pluginPaths[] = {pluginDir.c_str()};
-        const sl::Feature features[] = {
-            sl::kFeatureDLSS_G,
-            sl::kFeatureReflex,
-            sl::kFeaturePCL,
-        };
-        const sl::Preferences pref = buildBasePreferences(
-            pluginPaths, pluginDir.empty() ? 0u : 1u,
-            features, static_cast<uint32_t>(std::size(features)));
-
-        const sl::Result res = sl.slInit(pref, sl::kSDKVersion);
-        snapshot.lastSlResult = static_cast<int32_t>(res);
-        if (res != sl::Result::eOk) {
-            std::swprintf(snapshot.unavailableReason, 255,
-                          L"slInit failed: %S", slResultToString(res));
-            sl.unload();
-            return false;
-        }
-        snapshot.slInitialized = true;
-
-        std::snprintf(snapshot.slVersion, sizeof(snapshot.slVersion), "%u.%u.%u",
-                      SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
-
-        queryAdapterFeatureCapabilities(adapterLuid);
-
-        const sl::Result dlssgRc = static_cast<sl::Result>(snapshot.lastDlssgSupportCode);
-        const sl::Result reflexRc = static_cast<sl::Result>(snapshot.lastReflexSupportCode);
-        if (!snapshot.dlssgSupported) {
-            std::swprintf(snapshot.unavailableReason, 255,
-                          L"DLSS-G unsupported on active GPU/OS (%S; Reflex=%S).",
-                          slResultToString(dlssgRc), slResultToString(reflexRc));
-        } else if (!snapshot.reflexSupported) {
-            std::wcsncpy(snapshot.unavailableReason,
-                         L"Mandatory sl.reflex unavailable for DLSS-G.",
-                         255);
-        }
-
-        sl.slShutdown();
-        snapshot.slInitialized = false;
-        sl.unload();
-
-        return snapshot.dlssgSupported && snapshot.reflexSupported;
-    }
-
-    bool initAndProbe(ID3D12Device* d3d12Device, bool keepActive) {
+    bool initAndProbe(ID3D12Device* d3d12Device) {
         if (!d3d12Device) {
             std::wcsncpy(snapshot.unavailableReason, L"Null ID3D12Device.", 255);
             return false;
@@ -521,59 +615,34 @@ struct NvidiaStreamlineFgBackend::Impl {
             return false;
         }
 
-        std::wstring pluginDir;
-        findInterposerPath(&pluginDir);
-        if (!sl.loadInterposer(snapshot)) {
+        if (!SlPersistentCore::instance().ensureInitialized(snapshot, sl)) {
             return false;
         }
 
-        const wchar_t* pluginPaths[] = {pluginDir.c_str()};
-        const sl::Feature features[] = {
-            sl::kFeatureDLSS_G,
-            sl::kFeatureReflex,
-            sl::kFeaturePCL,
-        };
-        const sl::Preferences pref = buildBasePreferences(
-            pluginPaths, pluginDir.empty() ? 0u : 1u,
-            features, static_cast<uint32_t>(std::size(features)));
-
-        sl::Result res = sl.slInit(pref, sl::kSDKVersion);
-        snapshot.lastSlResult = static_cast<int32_t>(res);
-        if (res != sl::Result::eOk) {
-            std::swprintf(snapshot.unavailableReason, 255,
-                          L"slInit failed: %S", slResultToString(res));
-            sl.unload();
-            return false;
-        }
-        snapshot.slInitialized = true;
-
-        std::snprintf(snapshot.slVersion, sizeof(snapshot.slVersion), "%u.%u.%u",
-                      SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
-
-        res = sl.slSetD3DDevice(d3d12Device);
-        snapshot.lastSlResult = static_cast<int32_t>(res);
-        if (res != sl::Result::eOk) {
-            std::swprintf(snapshot.unavailableReason, 255,
-                          L"slSetD3DDevice failed: %S", slResultToString(res));
-            sl.slShutdown();
-            snapshot.slInitialized = false;
-            sl.unload();
+        if (!SlPersistentCore::instance().ensureDeviceBound(d3d12Device, snapshot)) {
+            sl.resetNonOwning();
             return false;
         }
 
-        queryAdapterFeatureCapabilities(d3d12Device->GetAdapterLuid());
+        if (sl.slIsFeatureLoaded && sl.slSetFeatureLoaded) {
+            bool isLoaded = false;
+            if (sl.slIsFeatureLoaded(sl::kFeatureDLSS_G, isLoaded) == sl::Result::eOk && !isLoaded) {
+                (void)sl.slSetFeatureLoaded(sl::kFeatureDLSS_G, true);
+            }
+        }
+
+        queryAdapterCapabilitiesWithApi(sl, d3d12Device->GetAdapterLuid(), snapshot);
         sl.resolveFeatureFunctions();
 
-        if (!snapshot.dlssgSupported) {
-            std::swprintf(snapshot.unavailableReason, 255,
-                          L"DLSS-G unsupported on active GPU/OS (%S; Reflex=%S).",
-                          slResultToString(static_cast<sl::Result>(snapshot.lastDlssgSupportCode)),
-                          slResultToString(static_cast<sl::Result>(snapshot.lastReflexSupportCode)));
-            if (!keepActive) {
-                sl.slShutdown();
-                snapshot.slInitialized = false;
-                sl.unload();
+        auto rollbackDlssgFeature = [&]() {
+            if (sl.slSetFeatureLoaded) {
+                (void)sl.slSetFeatureLoaded(sl::kFeatureDLSS_G, false);
             }
+            sl.resetNonOwning();
+        };
+
+        if (!snapshot.dlssgSupported) {
+            rollbackDlssgFeature();
             return false;
         }
 
@@ -581,11 +650,7 @@ struct NvidiaStreamlineFgBackend::Impl {
             std::wcsncpy(snapshot.unavailableReason,
                          L"slDLSSGGetState/SetOptions unavailable after slInit.",
                          255);
-            if (!keepActive) {
-                sl.slShutdown();
-                snapshot.slInitialized = false;
-                sl.unload();
-            }
+            rollbackDlssgFeature();
             return false;
         }
 
@@ -593,11 +658,7 @@ struct NvidiaStreamlineFgBackend::Impl {
             std::wcsncpy(snapshot.unavailableReason,
                          L"Mandatory sl.reflex unavailable for DLSS-G.",
                          255);
-            if (!keepActive) {
-                sl.slShutdown();
-                snapshot.slInitialized = false;
-                sl.unload();
-            }
+            rollbackDlssgFeature();
             return false;
         }
 
@@ -685,13 +746,7 @@ bool NvidiaStreamlineFgBackend::initialize(D3D12ProxyPresenter* presenter) {
     }
 
     impl_->probeAttempted = true;
-    if (!impl_->initAndProbe(presenter->bridge().d3d12Device(), true)) {
-        // Ensure clean teardown when probe fails or DLSS-G is unsupported.
-        if (impl_->snapshot.slInitialized && impl_->sl.slShutdown) {
-            impl_->sl.slShutdown();
-            impl_->snapshot.slInitialized = false;
-        }
-        impl_->sl.unload();
+    if (!impl_->initAndProbe(presenter->bridge().d3d12Device())) {
         return false;
     }
 
@@ -704,11 +759,10 @@ bool NvidiaStreamlineFgBackend::initialize(D3D12ProxyPresenter* presenter) {
         impl_->slProxyQueue.Reset();
         impl_->slProxyDevice.Reset();
         impl_->slProxyFactory.Reset();
-        if (impl_->snapshot.slInitialized && impl_->sl.slShutdown) {
-            impl_->sl.slShutdown();
-            impl_->snapshot.slInitialized = false;
+        if (impl_->sl.slSetFeatureLoaded) {
+            (void)impl_->sl.slSetFeatureLoaded(sl::kFeatureDLSS_G, false);
         }
-        impl_->sl.unload();
+        impl_->sl.resetNonOwning();
         if (restorePlainSwapChain) {
             presenter->recreatePlainSwapChain();
         }
@@ -847,10 +901,10 @@ void NvidiaStreamlineFgBackend::shutdown() {
         impl_->sl.slReflexSetOptions(offReflex);
     }
 
-    // Strict Streamline ManualHooking teardown:
-    // 1) Release SL proxy swapchain BEFORE slShutdown() so eIDXGISwapChain_Destroyed runs while SL is live.
-    // 2) Clear bridge override queue, then release slProxyQueue BEFORE slProxyDevice (raw m_device ref).
-    // 3) Call slShutdown() + unload, then recreate plain D3D12 swapchain on the restored native queue.
+    // Strict Streamline ManualHooking teardown (DLSS-G Programming Guide §18.0):
+    // 1) Release SL proxy swapchain BEFORE slSetFeatureLoaded(false) so eIDXGISwapChain_Destroyed runs while SL is live.
+    // 2) Clear bridge override queue, then release slProxyQueue before slProxyDevice/slProxyFactory.
+    // 3) Unload only kFeatureDLSS_G (never slShutdown()/FreeLibrary), then recreate plain swapchain.
     const bool needRestorePlainSwapChain =
         impl_->swapChainWrapped && impl_->presenter && impl_->presenter->isInitialized();
     if (needRestorePlainSwapChain) {
@@ -864,11 +918,10 @@ void NvidiaStreamlineFgBackend::shutdown() {
     impl_->slProxyQueue.Reset();
     impl_->slProxyDevice.Reset();
     impl_->slProxyFactory.Reset();
-    if (impl_->snapshot.slInitialized && impl_->sl.slShutdown) {
-        impl_->sl.slShutdown();
-        impl_->snapshot.slInitialized = false;
+    if (impl_->sl.slSetFeatureLoaded) {
+        (void)impl_->sl.slSetFeatureLoaded(sl::kFeatureDLSS_G, false);
     }
-    impl_->sl.unload();
+    impl_->sl.resetNonOwning();
 
     if (needRestorePlainSwapChain) {
         impl_->presenter->recreatePlainSwapChain();
@@ -1173,10 +1226,13 @@ bool NvidiaStreamlineFgBackend::probeCapabilitiesForLuid(LUID adapterLuid,
     if (!outSnapshot) return false;
     *outSnapshot = {};
 #if defined(EDPE_ENABLE_STREAMLINE) && EDPE_ENABLE_STREAMLINE
-    Impl probeImpl;
-    const bool dlssgOk = probeImpl.probeAdapterLuid(adapterLuid);
-    *outSnapshot = probeImpl.snapshot;
-    return dlssgOk;
+    if (D3D12ProxyPresenter::isCrossApiPresentBlockedByRenderDoc()) {
+        std::wcsncpy(outSnapshot->unavailableReason,
+                     L"Blocked: Windows renderdoc.dll in-process.",
+                     255);
+        return false;
+    }
+    return SlPersistentCore::instance().probeCapabilitiesForLuid(adapterLuid, *outSnapshot);
 #else
     (void)adapterLuid;
     std::wcsncpy(outSnapshot->unavailableReason,

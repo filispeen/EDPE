@@ -164,107 +164,178 @@ int runManualHookingProxyTest(ID3D11Device* dev,
         REQUIRE(slReflexSetOptions(ro) == sl::Result::eOk);
     }
 
-    // Regression check for GitHub Issue #23: slUpgradeInterface does not accept ID3D12CommandQueue*.
-    void* rawQueuePtr = presenter.bridge().commandQueue();
-    REQUIRE(slUpgradeInterface(&rawQueuePtr) == sl::Result::eErrorUnsupportedInterface);
-
-    // Correct ManualHooking path: upgrade ID3D12Device + IDXGIFactory, then CreateCommandQueue.
-    void* devPtr = presenter.bridge().d3d12Device();
-    REQUIRE(slUpgradeInterface(&devPtr) == sl::Result::eOk);
-    REQUIRE(devPtr != nullptr);
-    ComPtr<ID3D12Device> slProxyDevice;
-    slProxyDevice.Attach(static_cast<ID3D12Device*>(devPtr));
-
-    void* factoryPtr = presenter.dxgiFactory();
-    REQUIRE(slUpgradeInterface(&factoryPtr) == sl::Result::eOk);
-    REQUIRE(factoryPtr != nullptr);
-    ComPtr<IDXGIFactory4> slProxyFactory;
-    slProxyFactory.Attach(static_cast<IDXGIFactory4*>(factoryPtr));
-
-    D3D12_COMMAND_QUEUE_DESC qDesc{};
-    qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    qDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-    ComPtr<ID3D12CommandQueue> slProxyQueue;
-    REQUIRE(SUCCEEDED(slProxyDevice->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&slProxyQueue))));
-    REQUIRE(slProxyQueue != nullptr);
-
-    IDXGISwapChain4* rawSc = presenter.detachSwapChainForWrap();
-    if (rawSc) rawSc->Release();
-    REQUIRE(presenter.bridge().setOverrideCommandQueue(slProxyQueue.Get()));
-
-    const UINT cleanFlags =
-        presenter.swapChainFlags() & ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-    const DXGI_SWAP_CHAIN_DESC1 scDesc = edpe::sanitizeFlipSwapChainDesc(
-        presenter.width(), presenter.height(),
-        presenter.format(), presenter.bufferCount(),
-        cleanFlags, presenter.isTearingSupported());
-    ComPtr<IDXGISwapChain1> proxySc1;
-    REQUIRE(SUCCEEDED(slProxyFactory->CreateSwapChainForHwnd(
-        slProxyQueue.Get(), presenter.targetHwnd(), &scDesc, nullptr, nullptr, &proxySc1)));
-    ComPtr<IDXGISwapChain4> proxySc4;
-    REQUIRE(SUCCEEDED(proxySc1.As(&proxySc4)));
-    proxySc1.Reset();
-    REQUIRE(presenter.attachWrappedSwapChain(proxySc4.Detach()));
-
     ComPtr<ID3D11Texture2D> colorTex;
     REQUIRE(createTestTexture2D(dev, presenter.width(), presenter.height(),
                                 DXGI_FORMAT_R8G8B8A8_UNORM,
                                 D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
                                 nullptr, 0, &colorTex));
 
-    struct MarkerCtx {
-        PFun_slPCLSetMarker* setMarker = nullptr;
-        sl::FrameToken* token = nullptr;
-    } markerCtx{slPCLSetMarker, nullptr};
-
-    presenter.setPresentMarkerHooks(
-        [](void* p) {
-            auto* mc = static_cast<MarkerCtx*>(p);
-            if (mc && mc->setMarker && mc->token) {
-                mc->setMarker(sl::PCLMarker::ePresentStart, *mc->token);
+    auto runCycle = [&](uint32_t frameBase, bool callSetDevice, bool expectShutdownRestore) -> bool {
+        if (callSetDevice) {
+            const sl::Result devRc = slSetD3DDevice(presenter.bridge().d3d12Device());
+            if (devRc != sl::Result::eOk) {
+                std::fprintf(stderr, "runCycle(frameBase=%u): slSetD3DDevice failed rc=%d\n",
+                             frameBase, static_cast<int>(devRc));
+                return false;
             }
-        },
-        [](void* p) {
-            auto* mc = static_cast<MarkerCtx*>(p);
-            if (mc && mc->setMarker && mc->token) {
-                mc->setMarker(sl::PCLMarker::ePresentEnd, *mc->token);
-            }
-        },
-        &markerCtx);
-
-    for (uint32_t frameIdx = 1; frameIdx <= 3; ++frameIdx) {
-        sl::FrameToken* token = nullptr;
-        REQUIRE(slGetNewFrameToken(token, &frameIdx) == sl::Result::eOk);
-        REQUIRE(token != nullptr);
-        markerCtx.token = token;
-        if (slReflexSleep) REQUIRE(slReflexSleep(*token) == sl::Result::eOk);
-        if (slPCLSetMarker) {
-            slPCLSetMarker(sl::PCLMarker::eSimulationStart, *token);
-            slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *token);
-            slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *token);
-            slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *token);
         }
-        HRESULT phr = S_OK;
-        REQUIRE(presenter.presentFromD3D11Texture(ctx4, colorTex.Get(), 0, 0, &phr));
-        REQUIRE(SUCCEEDED(phr));
-    }
 
-    presenter.setPresentMarkerHooks(nullptr, nullptr, nullptr);
-    presenter.bridge().waitGpuIdle();
-    if (slReflexSetOptions) {
-        sl::ReflexOptions offOpts{};
-        offOpts.mode = sl::ReflexMode::eOff;
-        slReflexSetOptions(offOpts);
-    }
-    IDXGISwapChain4* proxySc = presenter.detachSwapChainForWrap();
-    if (proxySc) proxySc->Release();
-    REQUIRE(presenter.bridge().setOverrideCommandQueue(nullptr));
-    slProxyQueue.Reset();
-    slProxyDevice.Reset();
-    slProxyFactory.Reset();
+        if (slReflexSetOptions) {
+            sl::ReflexOptions ro{};
+            ro.mode = sl::ReflexMode::eLowLatency;
+            const sl::Result roRc = slReflexSetOptions(ro);
+            if (roRc != sl::Result::eOk) {
+                std::fprintf(stderr, "runCycle(frameBase=%u): slReflexSetOptions failed rc=%d\n",
+                             frameBase, static_cast<int>(roRc));
+                return false;
+            }
+        }
+
+        // Regression check for GitHub Issue #23: slUpgradeInterface does not accept ID3D12CommandQueue*.
+        void* rawQueuePtr = presenter.bridge().commandQueue();
+        if (slUpgradeInterface(&rawQueuePtr) != sl::Result::eErrorUnsupportedInterface) {
+            std::fprintf(stderr, "runCycle(frameBase=%u): rawQueue check failed\n", frameBase);
+            return false;
+        }
+
+        // Correct ManualHooking path: upgrade ID3D12Device + IDXGIFactory, then CreateCommandQueue.
+        void* devPtr = presenter.bridge().d3d12Device();
+        const sl::Result upDevRc = slUpgradeInterface(&devPtr);
+        if (upDevRc != sl::Result::eOk || !devPtr) {
+            std::fprintf(stderr, "runCycle(frameBase=%u): slUpgradeInterface(dev) failed rc=%d\n",
+                         frameBase, static_cast<int>(upDevRc));
+            return false;
+        }
+        ComPtr<ID3D12Device> slProxyDevice;
+        slProxyDevice.Attach(static_cast<ID3D12Device*>(devPtr));
+
+        void* factoryPtr = presenter.dxgiFactory();
+        const sl::Result upFacRc = slUpgradeInterface(&factoryPtr);
+        if (upFacRc != sl::Result::eOk || !factoryPtr) {
+            std::fprintf(stderr, "runCycle(frameBase=%u): slUpgradeInterface(factory) failed rc=%d\n",
+                         frameBase, static_cast<int>(upFacRc));
+            return false;
+        }
+        ComPtr<IDXGIFactory4> slProxyFactory;
+        slProxyFactory.Attach(static_cast<IDXGIFactory4*>(factoryPtr));
+
+        D3D12_COMMAND_QUEUE_DESC qDesc{};
+        qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        qDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        ComPtr<ID3D12CommandQueue> slProxyQueue;
+        HRESULT hr = slProxyDevice->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&slProxyQueue));
+        if (FAILED(hr) || !slProxyQueue) {
+            std::fprintf(stderr, "runCycle(frameBase=%u): CreateCommandQueue failed hr=0x%08X\n",
+                         frameBase, static_cast<unsigned>(hr));
+            return false;
+        }
+
+        IDXGISwapChain4* rawSc = presenter.detachSwapChainForWrap();
+        if (rawSc) rawSc->Release();
+        if (!presenter.bridge().setOverrideCommandQueue(slProxyQueue.Get())) {
+            std::fprintf(stderr, "runCycle(frameBase=%u): setOverrideCommandQueue failed\n", frameBase);
+            return false;
+        }
+
+        const UINT cleanFlags =
+            presenter.swapChainFlags() & ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        const DXGI_SWAP_CHAIN_DESC1 scDesc = edpe::sanitizeFlipSwapChainDesc(
+            presenter.width(), presenter.height(),
+            presenter.format(), presenter.bufferCount(),
+            cleanFlags, presenter.isTearingSupported());
+        ComPtr<IDXGISwapChain1> proxySc1;
+        hr = slProxyFactory->CreateSwapChainForHwnd(
+            slProxyQueue.Get(), presenter.targetHwnd(), &scDesc, nullptr, nullptr, &proxySc1);
+        if (FAILED(hr)) {
+            std::fprintf(stderr, "runCycle(frameBase=%u): CreateSwapChainForHwnd failed hr=0x%08X\n",
+                         frameBase, static_cast<unsigned>(hr));
+            return false;
+        }
+        ComPtr<IDXGISwapChain4> proxySc4;
+        if (FAILED(proxySc1.As(&proxySc4))) return false;
+        proxySc1.Reset();
+        if (!presenter.attachWrappedSwapChain(proxySc4.Detach())) return false;
+
+        struct MarkerCtx {
+            PFun_slPCLSetMarker* setMarker = nullptr;
+            sl::FrameToken* token = nullptr;
+        } markerCtx{slPCLSetMarker, nullptr};
+
+        presenter.setPresentMarkerHooks(
+            [](void* p) {
+                auto* mc = static_cast<MarkerCtx*>(p);
+                if (mc && mc->setMarker && mc->token) {
+                    mc->setMarker(sl::PCLMarker::ePresentStart, *mc->token);
+                }
+            },
+            [](void* p) {
+                auto* mc = static_cast<MarkerCtx*>(p);
+                if (mc && mc->setMarker && mc->token) {
+                    mc->setMarker(sl::PCLMarker::ePresentEnd, *mc->token);
+                }
+            },
+            &markerCtx);
+
+        for (uint32_t i = 0; i < 3; ++i) {
+            const uint32_t frameIdx = frameBase + i;
+            sl::FrameToken* token = nullptr;
+            if (slGetNewFrameToken(token, &frameIdx) != sl::Result::eOk || !token) {
+                std::fprintf(stderr, "runCycle(frameBase=%u): slGetNewFrameToken failed\n", frameBase);
+                return false;
+            }
+            markerCtx.token = token;
+            if (slReflexSleep && slReflexSleep(*token) != sl::Result::eOk) {
+                std::fprintf(stderr, "runCycle(frameBase=%u): slReflexSleep failed\n", frameBase);
+                return false;
+            }
+            if (slPCLSetMarker) {
+                slPCLSetMarker(sl::PCLMarker::eSimulationStart, *token);
+                slPCLSetMarker(sl::PCLMarker::eSimulationEnd, *token);
+                slPCLSetMarker(sl::PCLMarker::eRenderSubmitStart, *token);
+                slPCLSetMarker(sl::PCLMarker::eRenderSubmitEnd, *token);
+            }
+            HRESULT phr = S_OK;
+            if (!presenter.presentFromD3D11Texture(ctx4, colorTex.Get(), 0, 0, &phr) ||
+                FAILED(phr)) {
+                std::fprintf(stderr, "runCycle(frameBase=%u): present failed phr=0x%08X\n",
+                             frameBase, static_cast<unsigned>(phr));
+                return false;
+            }
+        }
+
+        presenter.setPresentMarkerHooks(nullptr, nullptr, nullptr);
+        presenter.bridge().waitGpuIdle();
+        if (slReflexSetOptions) {
+            sl::ReflexOptions offOpts{};
+            offOpts.mode = sl::ReflexMode::eOff;
+            slReflexSetOptions(offOpts);
+        }
+        IDXGISwapChain4* proxySc = presenter.detachSwapChainForWrap();
+        if (proxySc) proxySc->Release();
+        if (!presenter.bridge().setOverrideCommandQueue(nullptr)) return false;
+        slProxyQueue.Reset();
+        slProxyDevice.Reset();
+        slProxyFactory.Reset();
+        if (expectShutdownRestore && !presenter.recreatePlainSwapChain()) return false;
+        return true;
+    };
+
+    // Simulate Issue #30 On -> Off -> On: keep slInit AND D3D11D3D12Bridge (ID3D12Device) alive
+    // while tearing down and recreating only the DXGI swapchain between Cycle 1 and Cycle 2.
+    ID3D12Device* const persistentD12Dev = presenter.bridge().d3d12Device();
+    const uint32_t savedW = presenter.width();
+    const uint32_t savedH = presenter.height();
+    const DXGI_FORMAT savedFmt = presenter.format();
+    const uint32_t savedBuf = presenter.bufferCount();
+    const HWND savedHwnd = presenter.targetHwnd();
+    REQUIRE(runCycle(1u, false, true));
+    presenter.shutdown(/*keepBridge=*/true);
+    REQUIRE(presenter.initialize(dev, savedHwnd, savedW, savedH, savedFmt, savedBuf, 0));
+    REQUIRE(presenter.bridge().d3d12Device() == persistentD12Dev);
+    REQUIRE(runCycle(4u, false, true));
+
     REQUIRE(slShutdown() == sl::Result::eOk);
     FreeLibrary(slMod);
-    REQUIRE(presenter.recreatePlainSwapChain());
 
     HRESULT plainHr = S_OK;
     REQUIRE(presenter.presentFromD3D11Texture(ctx4, colorTex.Get(), 0, 0, &plainHr));
@@ -272,7 +343,7 @@ int runManualHookingProxyTest(ID3D11Device* dev,
 
     std::printf(
         "Streamline ManualHooking proxy regression test PASSED "
-        "(rawQueue=eErrorUnsupportedInterface, slProxyDevice::CreateCommandQueue + 3 proxy presents + plain restore).\n");
+        "(2 cycles across new D3D12 device without re-slInit).\n");
     return 0;
 }
 #endif
@@ -448,9 +519,18 @@ int main() {
 
         presenter.setPrePresentCallback(nullptr, nullptr);
         backend.shutdown();
+
+        // Issue #30: Toggle Off -> On (re-initialize after shutdown reusing persistent D3D12 bridge).
+        presenter.shutdown(/*keepBridge=*/true);
+        REQUIRE(presenter.initialize(dev.Get(), window.hwnd(), kWidth, kHeight,
+                                     DXGI_FORMAT_R8G8B8A8_UNORM, 3, 0));
+        REQUIRE(backend.initialize(&presenter));
+        REQUIRE(backend.isAvailable());
+        REQUIRE(backend.maxFramesToGenerate() >= 1);
+        backend.shutdown();
     } else {
         // Capability-driven fail-open path (e.g., Ampere RTX 3060 where DLSS-G is unsupported):
-        // Verify initialize() rejects gracefully without breaking D3D12ProxyPresenter's plain swapchain.
+        // Verify repeated selectBackend calls fail cleanly with GPU-unsupported reason (never eErrorInitNotCalled).
         edpe::FrameGenerationManager manager;
         manager.registerBackend(std::make_unique<edpe::NvidiaStreamlineFgBackend>());
         REQUIRE(!manager.selectBackend(edpe::FrameGenerationBackend::NvidiaDlssG, &presenter));
@@ -460,7 +540,24 @@ int main() {
         REQUIRE(slBackend != nullptr);
         REQUIRE(!slBackend->isAvailable());
         REQUIRE(slBackend->unavailableReason()[0] != L'\0');
+        REQUIRE(std::wcsstr(slBackend->unavailableReason(), L"eErrorInitNotCalled") == nullptr);
         REQUIRE(slBackend->maxFramesToGenerate() == 0);
+
+        // Repeat with persistent-bridge swapchain teardown/re-init (simulates On -> Off -> On re-entry).
+        ID3D12Device* const d12Dev = presenter.bridge().d3d12Device();
+        presenter.shutdown(/*keepBridge=*/true);
+        REQUIRE(presenter.initialize(dev.Get(), window.hwnd(), kWidth, kHeight,
+                                     DXGI_FORMAT_R8G8B8A8_UNORM, 3, 0));
+        REQUIRE(presenter.bridge().d3d12Device() == d12Dev);
+
+        edpe::FrameGenerationManager manager2;
+        manager2.registerBackend(std::make_unique<edpe::NvidiaStreamlineFgBackend>());
+        REQUIRE(!manager2.selectBackend(edpe::FrameGenerationBackend::NvidiaDlssG, &presenter));
+        const auto* slBackend2 = manager2.getBackend(edpe::FrameGenerationBackend::NvidiaDlssG);
+        REQUIRE(slBackend2 != nullptr);
+        REQUIRE(slBackend2->unavailableReason()[0] != L'\0');
+        REQUIRE(std::wcsstr(slBackend2->unavailableReason(), L"eErrorInitNotCalled") == nullptr);
+        REQUIRE(std::wcsstr(slBackend2->unavailableReason(), L"eErrorInvalidIntegration") == nullptr);
 
         ComPtr<ID3D11Texture2D> colorTex;
         REQUIRE(createTestTexture2D(dev.Get(), kWidth, kHeight, DXGI_FORMAT_R8G8B8A8_UNORM,

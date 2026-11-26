@@ -127,7 +127,7 @@ private:
                               uint32_t renderW,
                               uint32_t renderH);
     void releaseBridgeResources();
-    void shutdownLocked();
+    void shutdownLocked(bool keepBridge = false);
     const wchar_t* backendUnavailableReasonLocked(FrameGenerationBackend backend) const;
 
     mutable std::recursive_mutex mutex_;
