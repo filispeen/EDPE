@@ -1575,12 +1575,17 @@ void clearSceneMapTarget() {
 
 // Called once per Present: when EDPE holds the last reference, the game has dropped the buffer.
 // Release it so scene buffer detection can pick up the game's new one.
+// The exchange takes ownership first, so a concurrent set or clear cannot free the buffer while it is inspected.
+// The target reads as null until it is restored below. If a wrapper or overlay reports a different count, the
+// target is simply kept and the no-camera watchdog in ContextCensusOnPresent clears it.
+// This runs inside the Present scope guard (s_in_edpe_present), where observedMap and observedUnmap return early,
+// so they never see the null target.
 void releaseOrphanedSceneMapTarget() {
     ID3D11Buffer* target = scene_map_target.exchange(nullptr, std::memory_order_acq_rel);
     if (!target) return;
     target->AddRef();
     const ULONG refs = target->Release();
-    if (refs <= 1) {
+    if (refs == 1) {
         target->Release();
         return;
     }
