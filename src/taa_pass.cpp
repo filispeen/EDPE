@@ -43,6 +43,7 @@ struct TaaPostRcasCB {
 struct TaaBlitCB {
     float outputRes[4];
     uint32_t debugInfo[4];
+    float rcasParams[4]; // x: rcasSharpness, y: effectiveHdr, z/w: unused
 };
 
 bool isFloatColorFormat(DXGI_FORMAT fmt) {
@@ -735,8 +736,10 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     displayTexture_ = historyTexture_[historyReadIdx_].Get();
     displaySrv_ = historySrv_[historyReadIdx_].Get();
 
-    // Update prevDepthTex_ from current R32_FLOAT depth when compatible (zero-touch fallback when R32G8X24).
-    if (depthSrv) {
+    // Update prevDepthTex_ only when caller did not already supply prevDepthSrv (saves full-screen CopyResource).
+    if (prevDepthSrv != nullptr) {
+        hasPrevDepthCopy_ = false;
+    } else if (depthSrv) {
         Microsoft::WRL::ComPtr<ID3D11Resource> depthRes;
         depthSrv->GetResource(&depthRes);
         Microsoft::WRL::ComPtr<ID3D11Texture2D> depthTex;
@@ -758,8 +761,10 @@ bool TaaPass::render(ID3D11DeviceContext* context,
 
     // -------------------------------------------------------------------------
     // Pass 3 (optional, strictly outside history loop): PostRCAS & DebugView
+    // When !zeroCopyPingPong, PostRCAS is folded into ps_taa_blit to save a full-screen pass.
     // -------------------------------------------------------------------------
-    const bool runRcas = (debugView == 0) && (rcasSharpness > 1e-4f) && ensurePostTexture(true);
+    const bool runRcas =
+        zeroCopyPingPong && (debugView == 0) && (rcasSharpness > 1e-4f) && ensurePostTexture(true);
     if (runRcas) {
         TaaPostRcasCB rcasCb{};
         rcasCb.resolution[0] = static_cast<float>(width);
@@ -833,13 +838,15 @@ bool TaaPass::render(ID3D11DeviceContext* context,
             displaySrv_ = postSrv_.Get();
         }
     } else {
-        // Blit final display image (or DebugView) to caller's destinationRtv (supports any RTV format).
+        // Blit final display image (with optional inline PostRCAS or DebugView) to caller's destinationRtv.
         TaaBlitCB bcb{};
         bcb.outputRes[0] = static_cast<float>(width);
         bcb.outputRes[1] = static_cast<float>(height);
         bcb.outputRes[2] = 1.0f / static_cast<float>(width);
         bcb.outputRes[3] = 1.0f / static_cast<float>(height);
         bcb.debugInfo[0] = static_cast<uint32_t>(debugView);
+        bcb.rcasParams[0] = (debugView == 0) ? rcasSharpness : 0.0f;
+        bcb.rcasParams[1] = effectiveHdr ? 1.0f : 0.0f;
         context->UpdateSubresource(blitCb_.Get(), 0, nullptr, &bcb, 0, 0);
 
         const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};

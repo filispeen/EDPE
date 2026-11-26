@@ -2396,7 +2396,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 if (ImGui::Button("Reset TAAv2 Defaults")) {
                     cfg.taaMinAlpha = 0.045f;
                     cfg.taaMaxAlpha = 0.25f;
-                    cfg.taaBaseGamma = 1.15f;
+                    cfg.taaBaseGamma = 1.25f;
                     cfg.taaLockMaxGamma = 2.25f;
                     cfg.taaRcasSharpness = 0.30f;
                     cfg.taaForceAniso16x = true;

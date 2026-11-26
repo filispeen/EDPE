@@ -76,6 +76,10 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
     // Works at all distances (> 250 m) and across high-contrast silhouettes without color gating.
     int2 bestOffset = int2(0, 0);
     float bestDepthRaw = centerDepthRaw;
+    float dL = centerDepthRaw;
+    float dR = centerDepthRaw;
+    float dU = centerDepthRaw;
+    float dD = centerDepthRaw;
 
     if (hasDepth && !isCockpitStatic) {
         [unroll]
@@ -84,13 +88,16 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
             for (int dx = -1; dx <= 1; ++dx) {
                 if (dx == 0 && dy == 0) continue;
                 int2 p = clamp(px + int2(dx, dy), int2(0, 0), maxPx);
-                if (hasClass && g_MotionClass.Load(int3(p, 0)) == kClassCockpitStatic) {
-                    continue;
-                }
                 float d = g_CurrDepth.Load(int3(p, 0));
+                if (dx == -1 && dy == 0) dL = d;
+                else if (dx == 1 && dy == 0) dR = d;
+                else if (dx == 0 && dy == -1) dU = d;
+                else if (dx == 0 && dy == 1) dD = d;
                 if (d > bestDepthRaw) {
-                    bestDepthRaw = d;
-                    bestOffset = int2(dx, dy);
+                    if (!hasClass || g_MotionClass.Load(int3(p, 0)) != kClassCockpitStatic) {
+                        bestDepthRaw = d;
+                        bestOffset = int2(dx, dy);
+                    }
                 }
             }
         }
@@ -117,6 +124,7 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
     float2 prevUV = currUV + dilatedMvUV;
     float2 prevDepthUV = prevUV + (jitterParams.zw - jitterParams.xy) * renderRes.zw;
     float reactive = hasReactive ? g_ReactiveMask.Load(int3(px, 0)) : 0.0f;
+    float mvMag = length(dilatedMvPx);
 
     float disocclusion = 0.0f;
     if (any(prevUV < 0.0f) || any(prevUV > 1.0f) ||
@@ -140,13 +148,9 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
         if (centerIsSky) {
             disocclusion = dilateMv ? (allPrevSky ? 0.0f : 1.0f) : (anyPrevSky ? 0.0f : 1.0f);
         } else if (!anyPrevGeo) {
-            float dL = g_CurrDepth.Load(int3(clamp(px + int2(-1, 0), int2(0, 0), maxPx), 0));
-            float dR = g_CurrDepth.Load(int3(clamp(px + int2( 1, 0), int2(0, 0), maxPx), 0));
-            float dU = g_CurrDepth.Load(int3(clamp(px + int2( 0,-1), int2(0, 0), maxPx), 0));
-            float dD = g_CurrDepth.Load(int3(clamp(px + int2( 0, 1), int2(0, 0), maxPx), 0));
             bool thinCurrDepth = ((centerDepthRaw > dL * 1.05f && centerDepthRaw > dR * 1.05f) ||
                                   (centerDepthRaw > dU * 1.05f && centerDepthRaw > dD * 1.05f));
-            disocclusion = (length(dilatedMvPx) < 0.35f && thinCurrDepth) ? 0.0f : 1.0f;
+            disocclusion = (mvMag < 0.35f && thinCurrDepth) ? 0.0f : 1.0f;
         } else {
             float depthB = (depthParams.x > 0.0f) ? depthParams.x : 0.025f;
             float centerZ = depthB / centerDepthRaw;
@@ -161,11 +165,6 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
             if (expectedPrevZ <= 1e-4f) {
                 disocclusion = 1.0f;
             } else {
-                float dL = g_CurrDepth.Load(int3(clamp(px + int2(-1, 0), int2(0, 0), maxPx), 0));
-                float dR = g_CurrDepth.Load(int3(clamp(px + int2( 1, 0), int2(0, 0), maxPx), 0));
-                float dU = g_CurrDepth.Load(int3(clamp(px + int2( 0,-1), int2(0, 0), maxPx), 0));
-                float dD = g_CurrDepth.Load(int3(clamp(px + int2( 0, 1), int2(0, 0), maxPx), 0));
-
                 float zL = (dL > 1e-6f) ? (depthB / dL) : 1e9f;
                 float zR = (dR > 1e-6f) ? (depthB / dR) : 1e9f;
                 float zU = (dU > 1e-6f) ? (depthB / dU) : 1e9f;
@@ -187,14 +186,24 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
 
                 float depthDisocc = saturate((minZDiff - zThreshold) / max(zThreshold * 1.5f, 1e-4f));
 
-                // Suppress false grazing-angle OutReactive resets only on steep slopes where plane explains minZDiff.
+                // Suppress false grazing-angle OutReactive resets only on steep slopes where plane explains minZDiff,
+                // and suppress stationary sub-1.0 emissive OutReactive so static hangar lights still anti-alias.
                 bool steepGrazing = (slopeTol > expectedPrevZ * 0.03f);
                 float planeExplain = steepGrazing ? (1.0f - saturate((minZDiff - zThreshold) / max(zThreshold * 0.5f, 1e-4f))) : 0.0f;
                 float effReactive = reactive * (1.0f - planeExplain);
+                bool allowStaticReactive = (reactive >= 0.96f) ||
+                                           (mvMag >= 0.25f) ||
+                                           (depthDisocc > 0.05f) ||
+                                           (hasClass && (centerClass == kClassDisoccluded ||
+                                                         centerClass == kClassOffscreenFG ||
+                                                         centerClass == kClassReset));
+                if (!allowStaticReactive) {
+                    effReactive = 0.0f;
+                }
                 disocclusion = max(depthDisocc, effReactive);
 
                 // Prevent false disocclusion on stationary <1px depth-jittered thin features (antennas/wires)
-                if (disocclusion > 0.05f && length(dilatedMvPx) < 0.35f) {
+                if (disocclusion > 0.05f && mvMag < 0.35f) {
                     int2 pCenter = clamp(int2(floor(prevRasterPx)), int2(0, 0), maxPrevPx);
                     float pdC = g_PrevDepth.Load(int3(pCenter, 0));
                     float pdL = g_PrevDepth.Load(int3(clamp(pCenter + int2(-1, 0), int2(0, 0), maxPrevPx), 0));
@@ -212,10 +221,15 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
             }
         }
     } else {
-        disocclusion = reactive;
+        bool allowStaticReactive = (reactive >= 0.96f) ||
+                                   (mvMag >= 0.25f) ||
+                                   (hasClass && (centerClass == kClassDisoccluded ||
+                                                 centerClass == kClassOffscreenFG ||
+                                                 centerClass == kClassReset));
+        disocclusion = allowStaticReactive ? reactive : 0.0f;
     }
 
-    // 3. Thin-Feature Detection (1px ridges/lines)
+    // 3. Thin-Feature Detection (isolated 1px ridges/wires, excluding monotonic step edges & bevels)
     float thinFeature = 0.0f;
     if (!centerIsSky) {
         float lC = TonemapLuma(centerRgb, effectiveHdr);
@@ -228,9 +242,11 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
         float vRidge = min(abs(lC - lU), abs(lC - lD));
         float hSameSign = ((lC - lL) * (lC - lR) > 0.0f) ? 1.0f : 0.0f;
         float vSameSign = ((lC - lU) * (lC - lD) > 0.0f) ? 1.0f : 0.0f;
+        float hSym = saturate(1.5f - abs(lL - lR) / max(hRidge, 1e-4f));
+        float vSym = saturate(1.5f - abs(lU - lD) / max(vRidge, 1e-4f));
 
-        float ridgeStrength = max(hRidge * hSameSign, vRidge * vSameSign);
-        thinFeature = saturate((ridgeStrength - 0.035f) * 8.0f) * (1.0f - disocclusion);
+        float ridgeStrength = max(hRidge * hSameSign * hSym, vRidge * vSameSign * vSym);
+        thinFeature = saturate((ridgeStrength - 0.070f) * 8.0f) * (1.0f - disocclusion);
     }
 
     g_OutPrepass[px] = float4(dilatedMvUV, disocclusion, thinFeature);
@@ -283,32 +299,65 @@ void cs_taa_patch_div(uint3 dtid : SV_DispatchThreadID) {
 
     float3 currSum = 0.0f;
     float3 histSum = 0.0f;
+    float minCurrY =  1e9f;
+    float maxCurrY = -1e9f;
+    float absDiffSum = 0.0f;
+    int changedCount = 0;
+    int validCount = 0;
 
     [unroll]
     for (int dy = 0; dy < 4; ++dy) {
         [unroll]
         for (int dx = 0; dx < 4; ++dx) {
             int2 rp = clamp(basePx + int2(dx, dy), int2(0, 0), maxRenderPx);
-            float3 cYcc = RGBToYCoCg(TonemapForward(g_CurrColor.Load(int3(rp, 0)).rgb, effectiveHdr));
             float4 pre = g_Prepass.Load(int3(rp, 0));
-
+            // Exclude disoccluded silhouette pixels so silhouette motion never poisons the 4x4 block.
+            if (pre.z >= 0.25f) {
+                continue;
+            }
             float2 unjitUV = (float2(rp) + 0.5f - patchRes.zw) * renderRes.zw;
             float2 prevUV = unjitUV + pre.xy;
-            float3 hYcc = cYcc;
-            if (!any(prevUV < 0.0f) && !any(prevUV > 1.0f)) {
-                hYcc = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, prevUV, 0.0f).rgb, effectiveHdr));
+            if (any(prevUV < 0.0f) || any(prevUV > 1.0f)) {
+                continue;
+            }
+            float3 cYcc = RGBToYCoCg(TonemapForward(g_CurrColor.Load(int3(rp, 0)).rgb, effectiveHdr));
+            float3 hYcc = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, prevUV, 0.0f).rgb, effectiveHdr));
+            float pxDiff = abs(cYcc.x - hYcc.x) + 0.5f * length(cYcc.yz - hYcc.yz);
+            absDiffSum += pxDiff;
+            if (pxDiff > 0.14f) {
+                ++changedCount;
             }
             currSum += cYcc;
             histSum += hYcc;
+            minCurrY = min(minCurrY, cYcc.x);
+            maxCurrY = max(maxCurrY, cYcc.x);
+            ++validCount;
         }
     }
 
-    float3 currMean = currSum * (1.0f / 16.0f);
-    float3 histMean = histSum * (1.0f / 16.0f);
+    if (validCount < 8) {
+        g_OutPatchDiv[hp] = float2(0.0f, 0.0f);
+        return;
+    }
+
+    float invN = 1.0f / float(validCount);
+    float3 currMean = currSum * invN;
+    float3 histMean = histSum * invN;
     float diffY = currMean.x - histMean.x;
     float diffMag = abs(diffY) + 0.6f * length(currMean.yz - histMean.yz);
 
-    g_OutPatchDiv[hp] = float2(diffMag, diffY);
+    // Subpixel jitter & silhouette sampling shift around high-contrast edges can perturb
+    // mean 1-spp luma; subtract an edge-contrast allowance so static railings/edges stay calm.
+    float spatialRange = max(maxCurrY - minCurrY, 0.0f);
+    float edgeAllowance = 0.16f * spatialRange;
+
+    // Detect moving periodic textures (where block mean is constant across opposite-phase stripes
+    // but >=38-55% of interior pixels differ strongly) without firing on isolated 1px edges.
+    float coverage = float(changedCount) * invN;
+    float meanAbsDiff = absDiffSum * invN;
+    float textureMoveScore = smoothstep(0.38f, 0.55f, coverage) * meanAbsDiff * 1.35f;
+
+    g_OutPatchDiv[hp] = float2(max(max(diffMag - edgeAllowance, 0.0f), textureMoveScore), diffY);
 }
 )";
 
@@ -496,7 +545,7 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
         float dD = g_PatchDiv.Load(int3(clamp(qp + int2( 0, 1), int2(0, 0), quarterMax), 0)).x;
         float patch2D = min(max(dL, dR), max(dU, dD));
         float patchScore = min(dC, patch2D);
-        patchDiv = smoothstep(0.055f, 0.16f, patchScore);
+        patchDiv = smoothstep(0.075f, 0.20f, patchScore);
     }
 
     // 1. 3x3 current-frame neighborhood in YCoCg + adaptive jitter-aware filter
@@ -576,18 +625,31 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     } else {
         histTm  = SampleHistoryCatmullRom(prevUV, effectiveHdr);
         prevAux = g_HistoryAux.SampleLevel(g_LinearClamp, prevUV, 0.0f);
-        // Point-min sampleCount across 2x2 footprint in faster motion (>0.85px) so high history counts
-        // never bleed across silhouettes, while sub-pixel (<0.85px) thin features keep their count.
-        int2 auxBase = int2(floor(prevUV * outputRes.xy - 0.5f));
-        float s00 = g_HistoryAux.Load(int3(clamp(auxBase + int2(0, 0), int2(0, 0), maxOutPx), 0)).x;
-        float s10 = g_HistoryAux.Load(int3(clamp(auxBase + int2(1, 0), int2(0, 0), maxOutPx), 0)).x;
-        float s01 = g_HistoryAux.Load(int3(clamp(auxBase + int2(0, 1), int2(0, 0), maxOutPx), 0)).x;
-        float s11 = g_HistoryAux.Load(int3(clamp(auxBase + int2(1, 1), int2(0, 0), maxOutPx), 0)).x;
-        float minSamples = min(min(s00, s10), min(s01, s11));
-        prevSamples = lerp(prevAux.x, minSamples, saturate((velMagPx - 0.85f) * 2.0f));
+        prevSamples = prevAux.x;
+        if (velMagPx > 0.85f) {
+            // Point-min sampleCount across 2x2 footprint in faster motion (>0.85px) so high history counts
+            // never bleed across silhouettes, while sub-pixel (<0.85px) thin features keep their count.
+            int2 auxBase = int2(floor(prevUV * outputRes.xy - 0.5f));
+            float s00 = g_HistoryAux.Load(int3(clamp(auxBase + int2(0, 0), int2(0, 0), maxOutPx), 0)).x;
+            float s10 = g_HistoryAux.Load(int3(clamp(auxBase + int2(1, 0), int2(0, 0), maxOutPx), 0)).x;
+            float s01 = g_HistoryAux.Load(int3(clamp(auxBase + int2(0, 1), int2(0, 0), maxOutPx), 0)).x;
+            float s11 = g_HistoryAux.Load(int3(clamp(auxBase + int2(1, 1), int2(0, 0), maxOutPx), 0)).x;
+            float minSamples = min(min(s00, s10), min(s01, s11));
+            prevSamples = lerp(prevAux.x, minSamples, saturate((velMagPx - 0.85f) * 2.0f));
+        }
     }
 
     float3 histYCoCg = RGBToYCoCg(histTm);
+
+    // Gate patchDiv by pixel mismatch and stationary emissive reactive by distance outside
+    // the 3x3 spatial envelope so static AA edges & slow edges in mixed blocks stay smooth.
+    float patchPixelDiff = abs(histYCoCg.x - centerYCoCg.x) + 0.5f * length(histYCoCg.yz - centerYCoCg.yz);
+    patchDiv *= smoothstep(0.045f, 0.14f, patchPixelDiff);
+    if (velMagPx < 0.25f && disocc < 0.05f && reactive < 0.96f &&
+        !(hasClass && (mClass == kClassOffscreenFG || mClass == kClassReset))) {
+        float outsideBox = length(max(0.0f, min3x3 - histYCoCg) + max(0.0f, histYCoCg - max3x3));
+        reactive *= smoothstep(0.025f, 0.10f, outsideBox);
+    }
 
     float prevLockLife    = prevAux.y;
     float prevOsc         = prevAux.z;
@@ -625,7 +687,7 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     }
 
     float killLock = saturate(disocc + reactive * 1.5f + velShock + patchDiv * 1.5f + neighborShifted * 1.5f);
-    float lockLife = max(prevLockLife * 0.88f, thin) * (1.0f - killLock);
+    float lockLife = max(prevLockLife * 0.86f, thin) * (1.0f - killLock);
 
     // 4. Variance Clipping + Clip-Toward-Curr + Motion-Gated Instability
 )" R"(
@@ -643,9 +705,14 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     float3 varMin  = mean - gammaVec * sigma;
     float3 varMax  = mean + gammaVec * sigma;
 
+    // Balance 3x3 diagonal corner retention in static scenes with cross-rounded clamping in motion.
+    float softBoxWeight = lerp(0.45f, 1.0f, saturate(velMagPx * 0.25f + patchDiv));
+    float3 boxMinEff = lerp(min3x3, softMin, softBoxWeight);
+    float3 boxMaxEff = lerp(max3x3, softMax, softBoxWeight);
+
     float lockBoxExpand = lockLife * (1.0f - saturate(patchDiv * 2.0f));
-    float3 clipMin = lerp(max(varMin, softMin), varMin, lockBoxExpand);
-    float3 clipMax = lerp(min(varMax, softMax), varMax, lockBoxExpand);
+    float3 clipMin = lerp(max(varMin, boxMinEff), varMin, lockBoxExpand);
+    float3 clipMax = lerp(min(varMax, boxMaxEff), varMax, lockBoxExpand);
     if (patchDiv > 0.10f || neighborShifted > 0.5f) {
         clipMin = max(clipMin, min3x3);
         clipMax = min(clipMax, max3x3);
@@ -656,9 +723,11 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     float3 clippedHist = ClipAABBToward(clipMin, clipMax, clipTarget, histYCoCg, maUnit);
 
     // Sub-pixel (<1px) stationary thin-ridge retention across missed Halton jitter phases.
+    // Gated by maUnit > 1.0 so unclipped pixels skip all 8 extra history loads.
     float statRidgeWeight = stationaryWeight * (1.0f - killLock);
     float histThinRidge = 0.0f;
-    if (statRidgeWeight > 0.0f && prevLockLife > 0.02f && neighborShifted < 0.5f && patchDiv < 0.10f) {
+    if (maUnit > 1.0f && statRidgeWeight > 0.0f && prevLockLife > 0.05f &&
+        neighborShifted < 0.5f && patchDiv < 0.10f) {
         float2 ht = outputRes.zw;
         float hL  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(-ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
         float hR  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2( ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
@@ -682,7 +751,7 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
             min(max(0.0f, abs(histYCoCg.x - 0.5f * (hU + hD2)) - 0.5f * abs(hU - hD2)),
                 max(0.0f, abs(hD - 0.5f * (hU + hD2)) - 0.5f * abs(hU - hD2))));
         float ridgeStr = max(max(ridgeX, ridgeY), 0.85f * max(ridge2X, ridge2Y));
-        histThinRidge = saturate((ridgeStr - 0.005f) * 32.0f);
+        histThinRidge = saturate((ridgeStr - 0.008f) * 28.0f);
         clippedHist = lerp(clippedHist, histYCoCg, 0.97f * statRidgeWeight * histThinRidge * saturate(prevLockLife * 2.0f));
     }
 
@@ -715,7 +784,7 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
 
     float flickerDamp = lerp(1.0f, 0.35f,
         max(oscillation, max(lockLife, histThinRidge)) * (1.0f - saturate(killLock + clipReject + unvectoredFlag)));
-    float alpha = max(convAlpha * lerp(1.0f, flickerDamp, saturate((newSamples - 2.0f) * 0.25f)),
+    float alpha = max(convAlpha * lerp(1.0f, flickerDamp, saturate((newSamples - 6.0f) * 0.20f)),
                       max(minAlphaEff * flickerDamp, resampleBlur * 0.16f));
 
     // Zero-fetch Edge-Aware Spatial AA fallback when history is thin (disocclusion / fast motion)
@@ -755,7 +824,7 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
 
 // ============================================================================
 // EDPE TAAv2 - Pass 3: Instability-Aware Post-RCAS (Outside History Loop)
-// Performs CAS weights in normalized space; suppresses only on real oscillation.
+// Performs CAS weights in Peak-Karis normalized space; reaches exact 0 at effSharp == 0.
 // ============================================================================
 inline constexpr char kTaaPostRcasShader[] = R"(
 cbuffer RcasCB : register(b0) {
@@ -765,7 +834,7 @@ cbuffer RcasCB : register(b0) {
 };
 
 Texture2D<float4>   g_TaaColor : register(t0);
-Texture2D<float4>   g_TaaAux   : register(t1); // R = sampleCount, B = oscillation
+Texture2D<float4>   g_TaaAux   : register(t1); // R = sampleCount, G = lockLife, B = oscillation
 RWTexture2D<float4> g_OutFinal : register(u0);
 
 float3 TonemapForward(float3 rgb, bool effectiveHdr) {
@@ -803,13 +872,13 @@ void cs_taa_post_rcas(uint3 dtid : SV_DispatchThreadID) {
     float3 eTm = TonemapForward(g_TaaColor.Load(int3(clamp(px + int2( 1, 0), int2(0, 0), maxPx), 0)).rgb, effectiveHdr);
 
     float4 aux = g_TaaAux.Load(int3(px, 0));
-    float sampleGate = saturate((aux.x - 1.0f) * 0.5f + 0.45f);
-    float effSharp = saturate(g_Sharpness) * (1.0f - saturate(aux.z * 1.15f)) * sampleGate;
+    float sampleGate = saturate((aux.x - 1.0f) * 0.25f + 0.20f);
+    float effSharp = saturate(g_Sharpness) * (1.0f - saturate(aux.z * 1.25f)) * sampleGate;
 
     float3 minRGB = min(cTm, min(min(nTm, sTm), min(wTm, eTm)));
     float3 maxRGB = max(cTm, max(max(nTm, sTm), max(wTm, eTm)));
     float3 amp    = saturate(min(minRGB, 2.0f - maxRGB) / max(maxRGB, 1e-4f));
-    float  peak   = -1.0f / lerp(8.0f, 5.0f, effSharp);
+    float  peak   = -0.20f * effSharp;
     float3 weight = sqrt(amp) * peak;
 
     float3 sharpenedTm = saturate((cTm + (nTm + sTm + wTm + eTm) * weight) / max(1.0f + 4.0f * weight, 1e-4f));
@@ -822,14 +891,15 @@ void cs_taa_post_rcas(uint3 dtid : SV_DispatchThreadID) {
 )";
 
 // ============================================================================
-// EDPE TAAv2 - Display Blit & Read-Only Debug Views (1..4)
+// EDPE TAAv2 - Display Blit (with Inline Post-RCAS) & Read-Only Debug Views (1..4)
 // Supports arbitrary destination RTV formats and DEV debug visualizations
 // without ever modifying historyTexture_ or historyAuxTex_.
 // ============================================================================
 inline constexpr char kTaaBlitShader[] = R"(
 cbuffer BlitCB : register(b0) {
-    float4 outputRes; // x: outW, y: outH, z: 1/outW, w: 1/outH
-    uint4  debugInfo; // x: debugView (0=Off, 1=Disocclusion, 2=ThinFeatureLock, 3=LumaInstability, 4=SampleCount)
+    float4 outputRes;  // x: outW, y: outH, z: 1/outW, w: 1/outH
+    uint4  debugInfo;  // x: debugView (0=Off, 1=Disocclusion, 2=ThinFeatureLock, 3=LumaInstability, 4=SampleCount)
+    float4 rcasParams; // x: rcasSharpness, y: effectiveHdr (0/1), zw: unused
 };
 
 Texture2D<float4>   g_DisplayColor : register(t0);
@@ -847,9 +917,48 @@ struct VSOut {
 VSOut vs_taa_blit(uint id : SV_VertexID) {
     VSOut o;
     float2 corner = float2((id << 1) & 2, id & 2);
-    o.pos = float4(corner * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+    o.pos = float4(corner * float2(2.0f, -2.0f) + float2(-1, 1), 0.0f, 1.0f);
     o.uv = corner;
     return o;
+}
+
+float3 TonemapForwardBlit(float3 rgb) {
+    rgb = max(rgb, 0.0f);
+    float peak = max(rgb.r, max(rgb.g, rgb.b));
+    return rgb / (1.0f + peak);
+}
+
+float3 TonemapInverseBlit(float3 tm) {
+    tm = max(tm, 0.0f);
+    float peak = max(tm.r, max(tm.g, tm.b));
+    float3 rgb = tm / max(1.0f - peak, 1.0f / 65504.0f);
+    return min(rgb, float3(65024.0f, 65024.0f, 64512.0f));
+}
+
+float4 applyInlinePostRcas(int2 px, int2 maxPx, float sharpness) {
+    float4 center = g_DisplayColor.Load(int3(px, 0));
+    float3 cTm = TonemapForwardBlit(center.rgb);
+    float3 nTm = TonemapForwardBlit(g_DisplayColor.Load(int3(clamp(px + int2( 0,-1), int2(0, 0), maxPx), 0)).rgb);
+    float3 sTm = TonemapForwardBlit(g_DisplayColor.Load(int3(clamp(px + int2( 0, 1), int2(0, 0), maxPx), 0)).rgb);
+    float3 wTm = TonemapForwardBlit(g_DisplayColor.Load(int3(clamp(px + int2(-1, 0), int2(0, 0), maxPx), 0)).rgb);
+    float3 eTm = TonemapForwardBlit(g_DisplayColor.Load(int3(clamp(px + int2( 1, 0), int2(0, 0), maxPx), 0)).rgb);
+
+    float4 aux = g_Aux.Load(int3(px, 0));
+    float sampleGate = saturate((aux.x - 1.0f) * 0.25f + 0.20f);
+    float effSharp = saturate(sharpness) * (1.0f - saturate(aux.z * 1.25f)) * sampleGate;
+
+    float3 minRGB = min(cTm, min(min(nTm, sTm), min(wTm, eTm)));
+    float3 maxRGB = max(cTm, max(max(nTm, sTm), max(wTm, eTm)));
+    float3 amp    = saturate(min(minRGB, 2.0f - maxRGB) / max(maxRGB, 1e-4f));
+    float  peak   = -0.20f * effSharp;
+    float3 weight = sqrt(amp) * peak;
+
+    float3 sharpenedTm = saturate((cTm + (nTm + sTm + wTm + eTm) * weight) / max(1.0f + 4.0f * weight, 1e-4f));
+    float3 outRgb = TonemapInverseBlit(sharpenedTm);
+    if (any(isnan(outRgb) || isinf(outRgb))) {
+        outRgb = max(center.rgb, 0.0f);
+    }
+    return float4(outRgb, center.a);
 }
 
 float3 computeDebugColor(int2 px, float2 uv) {
@@ -887,6 +996,9 @@ float4 ps_taa_blit(VSOut pin) : SV_Target {
     int2 maxPx = int2(outputRes.xy) - 1;
     int2 px = clamp(int2(pin.pos.xy), int2(0, 0), maxPx);
     if (debugInfo.x == 0u) {
+        if (rcasParams.x > 1e-4f) {
+            return applyInlinePostRcas(px, maxPx, rcasParams.x);
+        }
         return g_DisplayColor.Load(int3(px, 0));
     }
     return float4(computeDebugColor(px, pin.uv), 1.0f);

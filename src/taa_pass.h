@@ -12,7 +12,7 @@ namespace edpe {
 struct TaaSettings {
     float minAlpha = 0.045f;
     float maxAlpha = 0.25f;
-    float baseGamma = 1.15f;
+    float baseGamma = 1.25f;
     float lockMaxGamma = 2.25f;
     float rcasSharpness = 0.30f;
     int debugView = 0; // 0=Off, 1=Disocclusion, 2=ThinFeatureLock, 3=LumaInstability, 4=SampleCount

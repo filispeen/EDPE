@@ -277,8 +277,10 @@ void cs_rflow_coarse(uint3 dtid : SV_DispatchThreadID) {
         baseMv = float2(0.0f, 0.0f);
     }
 
-    float baseSad = evalSadE(ep, eMax, baseMv, float2(0.0f, 0.0f), currY, currD);
-    if (baseSad < 0.030f) {
+    float baseSadJ   = evalSadE(ep, eMax, baseMv, float2(0.0f, 0.0f), currY, currD);
+    float baseSadNoJ = evalSadE(ep, eMax, baseMv, -extraRes.zw,       currY, currD);
+    float baseSad    = min(baseSadJ, baseSadNoJ);
+    if (baseSad < 0.048f) {
         g_OutCoarseFlow[ep] = float4(0.0f, 0.0f, baseSad, baseSad);
         return;
     }
@@ -454,7 +456,9 @@ void cs_rflow_refine(uint3 dtid : SV_DispatchThreadID) {
         baseMv = float2(0.0f, 0.0f);
     }
 
-    float baseSad = evalSadQ(qp, qMax, baseMv, float2(0.0f, 0.0f), currY, currD);
+    float baseSadJ   = evalSadQ(qp, qMax, baseMv, float2(0.0f, 0.0f), currY, currD);
+    float baseSadNoJ = evalSadQ(qp, qMax, baseMv, -extraRes.zw,       currY, currD);
+    float baseSad    = min(baseSadJ, baseSadNoJ);
 
     // Gather starting candidates: (0,0) + center and 4 cardinal coarse neighbors
     int2 eDims = int2(extraRes.xy);
@@ -482,7 +486,7 @@ void cs_rflow_refine(uint3 dtid : SV_DispatchThreadID) {
         }
     }
 
-    if (baseSad < 0.028f && length(initDelta) < 0.5f) {
+    if (baseSad < 0.045f && length(initDelta) < 1.0f) {
         g_OutRefineFlow[qp] = float4(0.0f, 0.0f, 0.0f, centerQ.z);
         return;
     }
@@ -565,25 +569,25 @@ void cs_rflow_refine(uint3 dtid : SV_DispatchThreadID) {
     }
 
     // Strict Confidence Gate:
-    //   1) Meaningful SAD improvement (< 50% of baseSad) & low absolute residual error (< 0.060)
-    //   2) Residual speed in [0.75, 32.0] px
+    //   1) Meaningful SAD improvement (< 40% of baseSad) & low absolute residual error (< 0.055)
+    //   2) Residual speed in [1.75, 32.0] px (immune to <= +-0.5 px Halton jitter & 4x4 blur shift)
     //   3) Directional uniqueness (+-4 px along winner direction is noticeably worse)
     //   4) Target prev pixel must not map foreground onto sky
     float dMag = length(bestDelta);
     float conf = 0.0f;
-    if (bestSad < baseSad * 0.50f && bestSad < 0.060f && dMag >= 0.75f && dMag <= 32.0f) {
+    if (bestSad < baseSad * 0.40f && bestSad < 0.055f && dMag >= 1.75f && dMag <= 32.0f) {
         float2 dir = bestDelta / max(dMag, 1e-4f);
         float sadPlus  = evalSadQ(qp, qMax, baseMv, bestDelta + dir * 4.0f, currY, currD);
         float sadMinus = evalSadQ(qp, qMax, baseMv, bestDelta - dir * 4.0f, currY, currD);
-        if (max(sadPlus, sadMinus) > bestSad + 0.012f) {
+        if (max(sadPlus, sadMinus) > bestSad + 0.018f) {
             float2 prevCenterPx = float2(qp) * 4.0f + 2.0f + baseMv + bestDelta + extraRes.zw;
             float2 prevCenterUv = prevCenterPx * 0.25f * gridRes.zw;
             if (!any(prevCenterUv < 0.0f) && !any(prevCenterUv > 1.0f)) {
                 float4 prevCenter = g_PrevLumaQ.SampleLevel(g_LinearClamp, prevCenterUv, 0.0f);
                 if (prevCenter.z > 1e-6f &&
                     abs(prevCenter.z - centerQ.z) <= max(centerQ.z * 0.45f, 1e-5f)) {
-                    conf = saturate((0.50f - bestSad / max(baseSad, 1e-4f)) * 4.0f) *
-                           saturate((0.065f - bestSad) * 25.0f);
+                    conf = saturate((0.40f - bestSad / max(baseSad, 1e-4f)) * 4.5f) *
+                           saturate((0.058f - bestSad) * 25.0f);
                 }
             }
         }
@@ -650,18 +654,40 @@ void cs_rflow_apply(uint3 dtid : SV_DispatchThreadID) {
     int2 qp = clamp(px / 4, int2(0, 0), qMax);
     float depthTol = max(depth * 0.15f, 1e-5f);
 
-    float2 sumMv = float2(0.0f, 0.0f);
-    float  sumW  = 0.0f;
-    int    agreeCount = 0;
+    float4 cand[9];
+    float2 refMv = float2(0.0f, 0.0f);
+    float  bestConf = 0.0f;
 
     [unroll]
     for (int dy = -1; dy <= 1; ++dy) {
         [unroll]
         for (int dx = -1; dx <= 1; ++dx) {
+            int idx = (dy + 1) * 3 + (dx + 1);
             int2 nqp = clamp(qp + int2(dx, dy), int2(0, 0), qMax);
             float4 nb = g_RefineFlow.Load(int3(nqp, 0));
-            if (nb.z > 0.25f && all(isfinite(nb)) && abs(nb.w - depth) <= depthTol) {
-                float w = nb.z * ((dx == 0 && dy == 0) ? 2.0f : 1.0f);
+            cand[idx] = nb;
+            if (nb.z > 0.30f && all(isfinite(nb)) && abs(nb.w - depth) <= depthTol) {
+                float score = nb.z * ((dx == 0 && dy == 0) ? 1.5f : 1.0f);
+                if (score > bestConf) {
+                    bestConf = score;
+                    refMv = nb.xy;
+                }
+            }
+        }
+    }
+
+    float2 sumMv = float2(0.0f, 0.0f);
+    float  sumW  = 0.0f;
+    int    agreeCount = 0;
+
+    if (bestConf > 0.0f) {
+        float dirTol = max(1.5f, 0.35f * length(refMv));
+        [unroll]
+        for (int i = 0; i < 9; ++i) {
+            float4 nb = cand[i];
+            if (nb.z > 0.30f && all(isfinite(nb)) && abs(nb.w - depth) <= depthTol &&
+                length(nb.xy - refMv) <= dirTol) {
+                float w = nb.z * ((i == 4) ? 2.0f : 1.0f);
                 sumMv += nb.xy * w;
                 sumW += w;
                 ++agreeCount;
@@ -670,7 +696,7 @@ void cs_rflow_apply(uint3 dtid : SV_DispatchThreadID) {
     }
 
     float2 outMv = baseMv;
-    if (agreeCount >= 2 && sumW > 0.70f) {
+    if (agreeCount >= 3 && sumW > 1.0f) {
         float2 resMv = sumMv / sumW;
         outMv = baseMv + resMv;
     }

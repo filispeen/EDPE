@@ -88,9 +88,9 @@ public:
         if (!std::isfinite(taaMaxAlpha)) taaMaxAlpha = 0.25f;
         taaMaxAlpha = std::clamp(taaMaxAlpha, taaMinAlpha, 0.60f);
 
-        GetPrivateProfileStringW(L"TAA", L"BaseGamma", L"1.15", taaBuf, 64, path.c_str());
+        GetPrivateProfileStringW(L"TAA", L"BaseGamma", L"1.25", taaBuf, 64, path.c_str());
         taaBaseGamma = static_cast<float>(_wtof(taaBuf));
-        if (!std::isfinite(taaBaseGamma)) taaBaseGamma = 1.15f;
+        if (!std::isfinite(taaBaseGamma)) taaBaseGamma = 1.25f;
         taaBaseGamma = std::clamp(taaBaseGamma, 0.50f, 2.50f);
 
         GetPrivateProfileStringW(L"TAA", L"LockMaxGamma", L"2.25", taaBuf, 64, path.c_str());
@@ -672,7 +672,7 @@ public:
     float mipLodBiasOffset = 0.0f;
     float taaMinAlpha = 0.045f;
     float taaMaxAlpha = 0.25f;
-    float taaBaseGamma = 1.15f;
+    float taaBaseGamma = 1.25f;
     float taaLockMaxGamma = 2.25f;
     float taaRcasSharpness = 0.30f;
     bool taaForceAniso16x = true;

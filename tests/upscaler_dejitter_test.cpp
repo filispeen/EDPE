@@ -2259,9 +2259,209 @@ int main(int argc, char** argv) {
                             taaEdge.rmsX, taaEdge.rmsY);
                 allOk = false;
             }
+            if (!(taaEdge.errX < 0.035f && taaEdge.errY < 0.035f)) {
+                std::printf("  -> FAIL: Native_D3D11_TAA StepEdge(+jit) default-RCAS err (%.4f, %.4f) >= 0.035\n",
+                            taaEdge.errX, taaEdge.errY);
+                allOk = false;
+            }
             allOk &= verifyVerticalThinLines(
                 "Native_D3D11_TAA", gpu, taaBackend,
                 taaBackend.recommendedJitterPhaseCount(32u, 128, 128, 128, 128));
+
+            // Shallow-angle 1:6 slope AA quality test under default TAA settings (rcasSharpness = 0.30f)
+            {
+                constexpr uint32_t kSw = 192;
+                constexpr uint32_t kSh = 96;
+                if (!gpu.ensureSurfaces(kSw, kSh, kSw, kSh)) {
+                    allOk = false;
+                } else {
+                    constexpr int kFrames = 48;
+                    constexpr int kWarmup = 16;
+                    const unsigned phaseCount = taaBackend.recommendedJitterPhaseCount(32u, kSw, kSh, kSw, kSh);
+                    FrameBuffers fb;
+                    std::vector<uint32_t> outPixels;
+                    std::vector<std::vector<float>> bandFrames;
+                    edpe::ProjectionJitter prevJ{};
+                    double taaSqErr = 0.0;
+                    double rawSqErr = 0.0;
+                    size_t sampleCnt = 0;
+
+                    auto shallowGtLuma = [](uint32_t ix, uint32_t iy) {
+                        const float yEdge = 48.0f + (static_cast<float>(ix) + 0.5f - 96.0f) / 6.0f;
+                        const float cov = std::clamp((static_cast<float>(iy) + 1.0f) - yEdge, 0.0f, 1.0f);
+                        return kBgColor + cov * (0.90f - kBgColor);
+                    };
+
+                    for (int t = 0; t < kFrames; ++t) {
+                        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), kSw, kSh, phaseCount);
+                        fb.resize(kSw, kSh);
+                        for (uint32_t iy = 0; iy < kSh; ++iy) {
+                            const float uy = static_cast<float>(iy) + 0.5f - j.pixelY;
+                            for (uint32_t ix = 0; ix < kSw; ++ix) {
+                                const float ux = static_cast<float>(ix) + 0.5f - j.pixelX;
+                                const float yEdge = 48.0f + (ux - 96.0f) / 6.0f;
+                                if (uy >= yEdge) {
+                                    const size_t idx = static_cast<size_t>(iy) * kSw + ix;
+                                    fb.color[idx] = packRgba8(0.90f, 0.90f, 0.90f);
+                                    fb.depth[idx] = kFgDepth;
+                                }
+                            }
+                        }
+                        if (!gpu.uploadAndEvaluate(taaBackend, fb, j.pixelX, j.pixelY,
+                                                   t > 0 ? prevJ.pixelX : 0.0f,
+                                                   t > 0 ? prevJ.pixelY : 0.0f,
+                                                   t == 0, outPixels, 0.0f)) {
+                            allOk = false;
+                            break;
+                        }
+                        prevJ = j;
+
+                        if (t >= kWarmup) {
+                            std::vector<float> band;
+                            for (uint32_t ix = 16; ix < kSw - 16; ++ix) {
+                                const float yEdge = 48.0f + (static_cast<float>(ix) + 0.5f - 96.0f) / 6.0f;
+                                for (uint32_t iy = 24; iy < kSh - 24; ++iy) {
+                                    if (std::fabs(static_cast<float>(iy) + 0.5f - yEdge) <= 2.5f) {
+                                        const float gt = shallowGtLuma(ix, iy);
+                                        const float outL = pixelLuma(outPixels[static_cast<size_t>(iy) * kSw + ix]);
+                                        const float rawL = pixelLuma(fb.color[static_cast<size_t>(iy) * kSw + ix]);
+                                        const double dT = static_cast<double>(outL - gt);
+                                        const double dR = static_cast<double>(rawL - gt);
+                                        taaSqErr += dT * dT;
+                                        rawSqErr += dR * dR;
+                                        ++sampleCnt;
+                                        band.push_back(outL);
+                                    }
+                                }
+                            }
+                            bandFrames.push_back(std::move(band));
+                        }
+                    }
+                    const float taaRmse = sampleCnt > 0 ? static_cast<float>(std::sqrt(taaSqErr / sampleCnt)) : 999.0f;
+                    const float rawRmse = sampleCnt > 0 ? static_cast<float>(std::sqrt(rawSqErr / sampleCnt)) : 1.0f;
+                    double sqDelta = 0.0;
+                    size_t deltaCnt = 0;
+                    for (size_t f = 1; f < bandFrames.size(); ++f) {
+                        for (size_t k = 0; k < bandFrames[f].size(); ++k) {
+                            const double d = static_cast<double>(bandFrames[f][k] - bandFrames[f - 1][k]);
+                            sqDelta += d * d;
+                            ++deltaCnt;
+                        }
+                    }
+                    const float shallowRmsDelta = deltaCnt > 0 ? static_cast<float>(std::sqrt(sqDelta / deltaCnt)) : 999.0f;
+                    std::printf("  [Native_D3D11_TAA] ShallowSlope1_6(defaultRCAS): taaRmse=%.4f rawRmse=%.4f rmsDelta=%.4f\n",
+                                taaRmse, rawRmse, shallowRmsDelta);
+                    if (!(taaRmse < rawRmse * 0.45f && taaRmse < 0.08f && shallowRmsDelta < 0.012f)) {
+                        std::printf("  -> FAIL: Shallow 1:6 slope AA degraded (taaRmse=%.4f rawRmse=%.4f rmsDelta=%.4f)\n",
+                                    taaRmse, rawRmse, shallowRmsDelta);
+                        allOk = false;
+                    }
+                }
+            }
+
+            // Static Emissive Reactive (reactive = 0.85f) must preserve full TAA convergence on static edges
+            {
+                constexpr uint32_t kEw = 128;
+                constexpr uint32_t kEh = 128;
+                if (!gpu.ensureSurfaces(kEw, kEh, kEw, kEh)) {
+                    allOk = false;
+                } else {
+                    D3D11_TEXTURE2D_DESC rtd{};
+                    rtd.Width = kEw; rtd.Height = kEh; rtd.MipLevels = 1; rtd.ArraySize = 1;
+                    rtd.Format = DXGI_FORMAT_R8_UNORM; rtd.SampleDesc.Count = 1;
+                    rtd.Usage = D3D11_USAGE_DEFAULT; rtd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    std::vector<uint8_t> reactBytes(static_cast<size_t>(kEw) * kEh, 217u); // ~0.85f
+                    D3D11_SUBRESOURCE_DATA reactInit{ reactBytes.data(), kEw, 0 };
+                    ComPtr<ID3D11Texture2D> reactTex;
+                    ComPtr<ID3D11ShaderResourceView> reactSrv;
+                    if (FAILED(gpu.device->CreateTexture2D(&rtd, &reactInit, &reactTex)) ||
+                        FAILED(gpu.device->CreateShaderResourceView(reactTex.Get(), nullptr, &reactSrv))) {
+                        allOk = false;
+                    } else {
+                        constexpr int kFrames = 32;
+                        constexpr int kWarmup = 16;
+                        const unsigned phaseCount = taaBackend.recommendedJitterPhaseCount(32u, kEw, kEh, kEw, kEh);
+                        FrameBuffers fb;
+                        edpe::ProjectionJitter prevJ{};
+                        std::vector<std::vector<float>> bandX;
+                        double errSum = 0.0;
+                        size_t errCnt = 0;
+
+                        for (int t = 0; t < kFrames; ++t) {
+                            const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), kEw, kEh, phaseCount);
+                            fb.resize(kEw, kEh);
+                            for (uint32_t iy = 0; iy < kEh; ++iy) {
+                                for (uint32_t ix = 0; ix < kEw; ++ix) {
+                                    const float ux = static_cast<float>(ix) + 0.5f - j.pixelX;
+                                    if (ux >= 64.5f) {
+                                        const size_t idx = static_cast<size_t>(iy) * kEw + ix;
+                                        fb.color[idx] = packRgba8(0.90f, 0.90f, 0.90f);
+                                        fb.depth[idx] = kFgDepth;
+                                    }
+                                }
+                            }
+                            if (t == 0) {
+                                taaBackend.resetHistory();
+                                gpu.hasPrevDepth = false;
+                            } else {
+                                gpu.currDepthIdx ^= 1;
+                            }
+                            gpu.context->UpdateSubresource(gpu.colorTex.Get(), 0, nullptr, fb.color.data(), kEw * sizeof(uint32_t), 0);
+                            gpu.uploadDepth(fb.depth);
+                            gpu.context->UpdateSubresource(gpu.motionTex.Get(), 0, nullptr, fb.motion.data(), kEw * sizeof(uint32_t), 0);
+                            auto inputs = gpu.makeInputs(j.pixelX, j.pixelY, t > 0 ? prevJ.pixelX : 0.0f, t > 0 ? prevJ.pixelY : 0.0f, t == 0, 0.0f);
+                            inputs.reactiveMask = reactTex.Get();
+                            inputs.reactiveMaskSrv = reactSrv.Get();
+                            if (!taaBackend.evaluate(gpu.context.Get(), inputs, gpu.outputRtv.Get(), gpu.outputTex.Get())) {
+                                allOk = false;
+                                break;
+                            }
+                            gpu.hasPrevDepth = true;
+                            prevJ = j;
+
+                            if (t >= kWarmup) {
+                                gpu.context->CopyResource(gpu.stagingTex.Get(), gpu.outputTex.Get());
+                                D3D11_MAPPED_SUBRESOURCE mapped{};
+                                if (SUCCEEDED(gpu.context->Map(gpu.stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+                                    std::vector<float> band;
+                                    const auto* base = static_cast<const uint8_t*>(mapped.pData);
+                                    for (uint32_t y = 24; y < kEh - 24; ++y) {
+                                        const auto* row = reinterpret_cast<const uint32_t*>(base + static_cast<size_t>(y) * mapped.RowPitch);
+                                        for (uint32_t x = 62; x <= 66; ++x) {
+                                            const float l = pixelLuma(row[x]);
+                                            const float cov = std::clamp((static_cast<float>(x) + 1.0f) - 64.5f, 0.0f, 1.0f);
+                                            const float gt = kBgColor + cov * (0.90f - kBgColor);
+                                            errSum += std::fabs(l - gt);
+                                            ++errCnt;
+                                            band.push_back(l);
+                                        }
+                                    }
+                                    gpu.context->Unmap(gpu.stagingTex.Get(), 0);
+                                    bandX.push_back(std::move(band));
+                                }
+                            }
+                        }
+                        const float reactErr = errCnt > 0 ? static_cast<float>(errSum / errCnt) : 999.0f;
+                        double sqD = 0.0;
+                        size_t dCnt = 0;
+                        for (size_t f = 1; f < bandX.size(); ++f) {
+                            for (size_t k = 0; k < bandX[f].size(); ++k) {
+                                const double d = static_cast<double>(bandX[f][k] - bandX[f - 1][k]);
+                                sqD += d * d;
+                                ++dCnt;
+                            }
+                        }
+                        const float reactRms = dCnt > 0 ? static_cast<float>(std::sqrt(sqD / dCnt)) : 999.0f;
+                        std::printf("  [Native_D3D11_TAA] StaticEmissiveReactive(0.85): err=%.4f rms=%.4f\n",
+                                    reactErr, reactRms);
+                        if (!(reactErr < 0.032f && reactRms < 0.010f)) {
+                            std::printf("  -> FAIL: Static emissive reactive killed AA (err=%.4f, rms=%.4f)\n",
+                                        reactErr, reactRms);
+                            allOk = false;
+                        }
+                    }
+                }
+            }
 
             const auto boxM = measureUnvectoredMovingTexturedBox(gpu, taaBackend);
             std::printf("  [Native_D3D11_TAA] UnvectoredBox(+3px/f, mv=0): maxTrail=%.4f meanTrail=%.4f interiorContrast=%.4f\n",
@@ -2468,6 +2668,53 @@ int main(int argc, char** argv) {
                     if (!rb3a || !rb3b || histAfterRcas != histNoSharp || dispWithRcas == histNoSharp) {
                         std::printf("  -> FAIL: PostRCAS either mutated historyTexture_ or failed to sharpen displayTexture\n");
                         allOk = false;
+                    }
+
+                    // Verify inline ps_taa_blit PostRCAS (destinationTexture != nullptr) matches CS cs_taa_post_rcas
+                    {
+                        D3D11_TEXTURE2D_DESC itd{};
+                        itd.Width = kSw; itd.Height = kSh; itd.MipLevels = 1; itd.ArraySize = 1;
+                        itd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; itd.SampleDesc.Count = 1;
+                        itd.Usage = D3D11_USAGE_DEFAULT;
+                        itd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                        ComPtr<ID3D11Texture2D> inlineTex;
+                        ComPtr<ID3D11RenderTargetView> inlineRtv;
+                        std::vector<uint16_t> inlineWithRcas, inlineZeroRcas;
+                        if (FAILED(gpu.device->CreateTexture2D(&itd, nullptr, &inlineTex)) ||
+                            FAILED(gpu.device->CreateRenderTargetView(inlineTex.Get(), nullptr, &inlineRtv)) ||
+                            !mgr.evaluate(gpu.context.Get(), in, inlineRtv.Get(), inlineTex.Get(), false) ||
+                            !readBackFp16(inlineTex.Get(), inlineWithRcas)) {
+                            std::printf("  -> FAIL: Inline PostRCAS evaluate/readback failed\n");
+                            allOk = false;
+                        } else {
+                            float maxDiff = 0.0f;
+                            for (size_t i = 0; i < inlineWithRcas.size(); ++i) {
+                                const float a = DirectX::PackedVector::XMConvertHalfToFloat(inlineWithRcas[i]);
+                                const float b = DirectX::PackedVector::XMConvertHalfToFloat(dispWithRcas[i]);
+                                maxDiff = std::max(maxDiff, std::fabs(a - b));
+                            }
+                            if (maxDiff > 0.002f) {
+                                std::printf("  -> FAIL: Inline PostRCAS mismatch vs CS PostRCAS (maxDiff=%.5f > 0.002)\n", maxDiff);
+                                allOk = false;
+                            }
+                            ts.rcasSharpness = 0.0f;
+                            mgr.setTaaSettings(ts);
+                            if (!mgr.evaluate(gpu.context.Get(), in, inlineRtv.Get(), inlineTex.Get(), false) ||
+                                !readBackFp16(inlineTex.Get(), inlineZeroRcas)) {
+                                allOk = false;
+                            } else {
+                                float maxZeroDiff = 0.0f;
+                                for (size_t i = 0; i < inlineZeroRcas.size(); ++i) {
+                                    const float a = DirectX::PackedVector::XMConvertHalfToFloat(inlineZeroRcas[i]);
+                                    const float b = DirectX::PackedVector::XMConvertHalfToFloat(dispNoRcas[i]);
+                                    maxZeroDiff = std::max(maxZeroDiff, std::fabs(a - b));
+                                }
+                                if (maxZeroDiff > 0.002f) {
+                                    std::printf("  -> FAIL: Inline blit with RcasSharpness=0.0f modified output (maxDiff=%.5f)\n", maxZeroDiff);
+                                    allOk = false;
+                                }
+                            }
+                        }
                     }
 
                     // Verify DebugView 1..4 run cleanly without mutating historyTexture_

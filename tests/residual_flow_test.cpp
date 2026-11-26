@@ -452,5 +452,56 @@ int main() {
         maxTrail, interiorContrast);
     if (maxTrail > 0.015f || interiorContrast < 0.50f) return 14;
 
+    // Test 8: Static high-contrast 32x32 textured box (NOT a 1px spike) under 16-phase Halton jitter
+    // Must stay strictly < 0.05 px residual MV so Halton jitter & 4x4 blur never hallucinate motion.
+    float staticTexMaxMag = 0.0f;
+    prevJ = {};
+    for (int t = 0; t < 16; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), kW, kH, 16u);
+        drawTexturedBox(color, depth, kW, kH, 64.0f, 64.0f, 18.0f, 0.20f, 0.01f, j.pixelX, j.pixelY, 1u, &cls);
+        if (t == 0) prevDepth = depth;
+        gpu.upload(color, depth, prevDepth, baseMv, cls);
+        rflow.render(gpu.context.Get(), gpu.colorSrv.Get(), gpu.mvSrv.Get(),
+            gpu.depthSrv.Get(), gpu.clsSrv.Get(), kW, kH,
+            j.pixelX, j.pixelY, prevJ.pixelX, prevJ.pixelY, t == 0);
+        prevDepth = depth;
+        prevJ = j;
+        if (t >= 4) {
+            auto outMv = gpu.readMotion(rflow.outputTexture());
+            for (const auto& [mx, my] : outMv) {
+                staticTexMaxMag = std::max(staticTexMaxMag, std::hypot(mx, my));
+            }
+        }
+    }
+    std::printf("[ResidualFlow] StaticTexturedBox16Halton: maxMag=%.4f\n", staticTexMaxMag);
+    if (staticTexMaxMag > 0.05f) return 15;
+
+    // Test 9: Camera pan (+1.5, -0.75 screen px/f -> baseMv = (-1.5, +0.75)) over static textured box
+    // under 16-phase Halton jitter -> zero false residual added on top of accurate baseMv.
+    float panErrMax = 0.0f;
+    prevJ = {};
+    std::fill(baseMv.begin(), baseMv.end(), packHalf2(-1.5f, 0.75f));
+    for (int t = 0; t < 16; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), kW, kH, 16u);
+        const float cx = 48.0f + 1.5f * static_cast<float>(t);
+        const float cy = 70.0f - 0.75f * static_cast<float>(t);
+        drawTexturedBox(color, depth, kW, kH, cx, cy, 18.0f, 0.20f, 0.01f, j.pixelX, j.pixelY, 1u, &cls);
+        if (t == 0) prevDepth = depth;
+        gpu.upload(color, depth, prevDepth, baseMv, cls);
+        rflow.render(gpu.context.Get(), gpu.colorSrv.Get(), gpu.mvSrv.Get(),
+            gpu.depthSrv.Get(), gpu.clsSrv.Get(), kW, kH,
+            j.pixelX, j.pixelY, prevJ.pixelX, prevJ.pixelY, t == 0);
+        prevDepth = depth;
+        prevJ = j;
+        if (t >= 4) {
+            auto outMv = gpu.readMotion(rflow.outputTexture());
+            for (const auto& [mx, my] : outMv) {
+                panErrMax = std::max(panErrMax, std::hypot(mx - (-1.5f), my - 0.75f));
+            }
+        }
+    }
+    std::printf("[ResidualFlow] CameraPan16Halton(base=-1.5,+0.75): maxErr=%.4f\n", panErrMax);
+    if (panErrMax > 0.05f) return 16;
+
     return 0;
 }
