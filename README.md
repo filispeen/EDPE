@@ -47,7 +47,7 @@ As of November 2026 (`v0.8.0`), the working pipeline covers:
 | 12 | Native-resolution HUD separation | Verified | Redirected cockpit HUD draws to `s_hud_mask_texture` (`UiLayer`) and composited native UI over the upscaled scene (`UiCompositePass`). |
 | 13 | D3D11/D3D12 interoperability | Verified | Implemented shared NT handle texture/fence bridge (`D3D11D3D12Bridge`) and Flip-model D3D12 child overlay swapchain (`D3D12ProxyPresenter`). |
 | 14 | AMD FSR Frame Generation | Verified | Integrated official FidelityFX Frame Generation DX12 via `AmdFsrFgBackend`; verified in-game with UI packing and automatic menu stand-down. |
-| 15 | NVIDIA Streamline / DLSS-G | Prototype / Capability-gated | Integrated official Streamline v2.14.16 (`NvidiaStreamlineFgBackend`, Reflex/PCL/DLSS-G) with hardware capability gating and fail-open fallback. |
+| 15 | NVIDIA Streamline / DLSS-G | Verified | Integrated official Streamline v2.14.16 (`NvidiaStreamlineFgBackend`, Reflex/PCL/DLSS-G) with hardware capability gating and fail-open fallback. |
 | 16 | Intel XeSS, AMD FSR 4 & DittoSR | Planned | Planned Intel XeSS (XMX on Arc, DP4a fallback), AMD FSR 4 (4.1.2 for RX 7000/9000, [#27](https://github.com/filispeen/EDPE/issues/27)), and [DittoSR](https://github.com/Vancete/DittoSR) (lightweight MIT-licensed alternative compared with FSR 3.1.2) Native AA and Super Resolution via D3D11/D3D12 interop. |
 | 17 | Low-latency integration | Planned | Planned standalone and FG-coupled latency pacing via NVIDIA Reflex and AMD Anti-Lag / Anti-Lag 2. |
 | 18 | NVIDIA DLSS-NR | Research | Investigating NGX Neural Rendering for reflections and lighting. |
