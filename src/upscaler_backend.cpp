@@ -263,6 +263,7 @@ struct AmdUpscalerBackend::Impl {
     uint32_t maxOutputWidth = 0;
     uint32_t maxOutputHeight = 0;
     bool currentIsHdr = false;
+    bool currentDepthInfinite = false;
     std::atomic<float> velocityFactor{AmdUpscalerBackend::kDefaultVelocityFactor};
     float appliedVelocityFactor = -1.0f;
     wchar_t lastErrorReason[256]{};
@@ -423,12 +424,12 @@ struct AmdUpscalerBackend::Impl {
     }
 
     bool ensureFsrContext(ID3D11Device* device, uint32_t renderW, uint32_t renderH,
-                          uint32_t outputW, uint32_t outputH, bool isHdr) {
+                          uint32_t outputW, uint32_t outputH, bool isHdr, bool depthInfinite) {
 #if defined(EDPE_ENABLE_FSR)
         if (!device) return false;
         if (contextCreated && renderW <= maxRenderWidth && renderH <= maxRenderHeight &&
             outputW == maxOutputWidth && outputH == maxOutputHeight &&
-            currentIsHdr == isHdr &&
+            currentIsHdr == isHdr && currentDepthInfinite == depthInfinite &&
             dilatedDepthTexture && dilatedMotionVectorsTexture && reconstructedPrevNearestDepthTexture) {
             return true;
         }
@@ -440,10 +441,13 @@ struct AmdUpscalerBackend::Impl {
         maxOutputWidth = outputW;
         maxOutputHeight = outputH;
         currentIsHdr = isHdr;
+        currentDepthInfinite = depthInfinite;
 
         FfxFsr3UpscalerContextDescription desc{};
-        desc.flags = FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED |
-                     FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE;
+        desc.flags = FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED;
+        if (depthInfinite) {
+            desc.flags |= FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE;
+        }
         if (isHdr) {
             desc.flags |= FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE |
                           FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE;
@@ -649,7 +653,7 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     }
 
     if (!impl_->ensureFsrContext(device, inputs.renderWidth, inputs.renderHeight,
-                                 inputs.outputWidth, inputs.outputHeight, inputs.colorIsHdr)) {
+                                 inputs.outputWidth, inputs.outputHeight, inputs.colorIsHdr, params.depthInfinite)) {
         return false;
     }
     impl_->applyVelocityFactorIfNeeded();
@@ -677,9 +681,10 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.reconstructedPrevNearestDepth = ffxGetResourceDX11_Fsr31(impl_->reconstructedPrevNearestDepthTexture.Get(),
         GetFfxResourceDescriptionDX11(impl_->reconstructedPrevNearestDepthTexture.Get()), L"FSR3_ReconstructedPrevNearestDepth", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    // Leave dispatchDesc.reactive null (FSR binds 0.0 default) so its built-in de-jittered
-    // ShadingChangePyramid, ComputeThinFeatureConfidence, and LumaInstability handle
-    // un-vectored effects without wiping accumulation/locks on sub-pixel thin lines.
+    if (inputs.reactiveMask) {
+        dispatchDesc.reactive = ffxGetResourceDX11_Fsr31(inputs.reactiveMask,
+            GetFfxResourceDescriptionDX11(inputs.reactiveMask), L"FSR3_Reactive", FFX_RESOURCE_STATE_COMPUTE_READ);
+    }
 
     ID3D11Texture2D* evalOut = directDest ? destinationTexture : impl_->outputTexture.Get();
     dispatchDesc.output = ffxGetResourceDX11_Fsr31(evalOut,
@@ -695,8 +700,10 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     dispatchDesc.upscaleSize.width = inputs.outputWidth;
     dispatchDesc.upscaleSize.height = inputs.outputHeight;
 
-    dispatchDesc.enableSharpening = params.sharpness > 0.0f;
-    dispatchDesc.sharpness = std::clamp(params.sharpness, 0.0f, 1.0f);
+    // Keep FSR 3.1.2's internal RCAS disabled (known negative-output bug in 3.1.2);
+    // sharpening is applied safely via EDPE's SharpenPass / UiLayer deferred sharpen.
+    dispatchDesc.enableSharpening = false;
+    dispatchDesc.sharpness = 0.0f;
     dispatchDesc.frameTimeDelta = params.frameTimeDeltaMs > 0.0f ? params.frameTimeDeltaMs : 16.6f;
     dispatchDesc.preExposure = 1.0f;
     dispatchDesc.reset = params.reset || impl_->resetRequested;
@@ -708,12 +715,14 @@ bool AmdUpscalerBackend::evaluate(ID3D11DeviceContext* context,
     const float nearPlane = (inputs.cameraNow.depthB > 0.0f)
         ? inputs.cameraNow.depthB
         : 0.025f;
+    constexpr float kEliteSceneFarPlane = 50000.0f;
+    const float farPlane = params.depthInfinite ? FLT_MAX : kEliteSceneFarPlane;
     if (params.depthInverted) {
-        dispatchDesc.cameraNear = FLT_MAX;
+        dispatchDesc.cameraNear = farPlane;
         dispatchDesc.cameraFar = nearPlane;
     } else {
         dispatchDesc.cameraNear = nearPlane;
-        dispatchDesc.cameraFar = FLT_MAX;
+        dispatchDesc.cameraFar = farPlane;
     }
     dispatchDesc.viewSpaceToMetersFactor = 1.0f;
 
@@ -1135,7 +1144,7 @@ bool UpscalerManager::evaluate(ID3D11DeviceContext* context,
     {
         EvaluatingUpscalerGuard evalGuard;
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
-        if (evalSuccess && currentBackendType_ != UpscalerBackend::AmdFsr && inputs.sharpness > 0.0f) {
+        if (evalSuccess && inputs.sharpness > 0.0f) {
             // Never sharpen TAA's internal ping-pong history texture in-place when destinationTexture == nullptr;
             // mutating historyTexture_[historyReadIdx_] creates recursive sharpening halos/shimmer on subsequent frames.
             ID3D11Texture2D* sharpenTarget = destinationTexture
@@ -1256,7 +1265,7 @@ bool UpscalerManager::evaluateBackend(UpscalerBackend backendType,
     {
         EvaluatingUpscalerGuard evalGuard;
         evalSuccess = backend->evaluate(context, inputs, destinationRtv, destinationTexture);
-        if (evalSuccess && backendType != UpscalerBackend::AmdFsr && inputs.sharpness > 0.0f) {
+        if (evalSuccess && inputs.sharpness > 0.0f) {
             ID3D11Texture2D* sharpenTarget = destinationTexture ? destinationTexture : inputs.color;
             if (!sharpenPass_.apply(context, sharpenTarget, inputs.sharpness, inputs.colorIsHdr)) {
                 static bool s_sharpenFailLogged = false;

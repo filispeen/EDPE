@@ -13,7 +13,7 @@ cbuffer TaaConstants : register(b0) {
     float4 renderResolution; // x: renderWidth, y: renderHeight, z: 1/renderWidth, w: 1/renderHeight
     float4 params;           // x: jitterX, y: jitterY, z: blendWeight, w: resetFlag
     float4 jitterHistory;    // x: prevJitterX, y: prevJitterY, z: depthB, w: hasPrevDepth
-    float4 reactiveInfo;     // x: hasReactiveMask, yzw: unused
+    float4 reactiveInfo;     // x: hasReactiveMask, y: maxBlendCap, zw: unused
 };
 
 Texture2D<float4> currentFrame  : register(t0);
@@ -284,13 +284,29 @@ PSOutput ps_main(VSOutput pin) {
     // otherwise grazing-angle 1px floor decals and specular streaks below screen center smear/ghost.
     float stationaryWeight = saturate(1.0 - speed * 4.0) * depthConfidence;
     if (stationaryWeight > 0.0) {
-        float hL = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(-resolution.z, 0.0), 0.0, 1.0), 0).rgb)).x;
-        float hR = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2( resolution.z, 0.0), 0.0, 1.0), 0).rgb)).x;
-        float hU = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(0.0, -resolution.w), 0.0, 1.0), 0).rgb)).x;
-        float hD = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(0.0,  resolution.w), 0.0, 1.0), 0).rgb)).x;
+        float2 histTexel = resolution.zw;
+        float hL  = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(-histTexel.x, 0.0), 0.0, 1.0), 0).rgb)).x;
+        float hR  = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2( histTexel.x, 0.0), 0.0, 1.0), 0).rgb)).x;
+        float hU  = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(0.0, -histTexel.y), 0.0, 1.0), 0).rgb)).x;
+        float hD  = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(0.0,  histTexel.y), 0.0, 1.0), 0).rgb)).x;
+        float hL2 = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(-2.0 * histTexel.x, 0.0), 0.0, 1.0), 0).rgb)).x;
+        float hR2 = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2( 2.0 * histTexel.x, 0.0), 0.0, 1.0), 0).rgb)).x;
+        float hU2 = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(0.0, -2.0 * histTexel.y), 0.0, 1.0), 0).rgb)).x;
+        float hD2 = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(0.0,  2.0 * histTexel.y), 0.0, 1.0), 0).rgb)).x;
         float ridgeX = max(0.0, abs(histY.x - 0.5 * (hL + hR)) - 0.5 * abs(hL - hR));
         float ridgeY = max(0.0, abs(histY.x - 0.5 * (hU + hD)) - 0.5 * abs(hU - hD));
-        float thinRidge = saturate((max(ridgeX, ridgeY) - 0.005) * 32.0);
+        float ridgeX2L = max(0.0, abs(histY.x - 0.5 * (hL2 + hR)) - 0.5 * abs(hL2 - hR));
+        float ridgeX2R = max(0.0, abs(histY.x - 0.5 * (hL + hR2)) - 0.5 * abs(hL - hR2));
+        float ridgeY2U = max(0.0, abs(histY.x - 0.5 * (hU2 + hD)) - 0.5 * abs(hU2 - hD));
+        float ridgeY2D = max(0.0, abs(histY.x - 0.5 * (hU + hD2)) - 0.5 * abs(hU - hD2));
+        float ridge2X = max(
+            min(ridgeX2L, max(0.0, abs(hL - 0.5 * (hL2 + hR)) - 0.5 * abs(hL2 - hR))),
+            min(ridgeX2R, max(0.0, abs(hR - 0.5 * (hL + hR2)) - 0.5 * abs(hL - hR2))));
+        float ridge2Y = max(
+            min(ridgeY2U, max(0.0, abs(hU - 0.5 * (hU2 + hD)) - 0.5 * abs(hU2 - hD))),
+            min(ridgeY2D, max(0.0, abs(hD - 0.5 * (hU + hD2)) - 0.5 * abs(hU - hD2))));
+        float ridgeStrength = max(max(ridgeX, ridgeY), 0.85 * max(ridge2X, ridge2Y));
+        float thinRidge = saturate((ridgeStrength - 0.005) * 32.0);
         clampedHistY = lerp(clampedHistY, histY, 0.98 * stationaryWeight * thinRidge);
     }
 
@@ -304,6 +320,7 @@ PSOutput ps_main(VSOutput pin) {
 
     float blendWeight = clamp(params.z, 0.0, 0.95);
     blendWeight = lerp(blendWeight, 0.72, saturate(speed * 0.10));
+    blendWeight = min(blendWeight, reactiveInfo.y);
 
     float dynamicBlend = blendWeight * historyConfidence;
 

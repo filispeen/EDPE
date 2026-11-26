@@ -1978,7 +1978,7 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                 }
             }
             if (!amd_active) ImGui::EndDisabled();
-            ImGui::SetItemTooltip("Controls FSR history weight drop during camera motion. 0.00 (default) keeps temporal supersampling active during motion; higher values drop history faster (1.00 = FSR SDK default).");
+            ImGui::SetItemTooltip("Controls FSR history weight drop during camera motion. 0.50 (default) balances stability and foliage anti-ghosting; 0.00 keeps maximum history, 1.00 = FSR SDK default.");
 
             // Sharpening
             if (!backend_active) ImGui::BeginDisabled();

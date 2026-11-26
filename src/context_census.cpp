@@ -680,14 +680,16 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
                                            float dtRatio,
                                            const float* proj1080 = nullptr,
                                            bool checkStereoProbe = true,
-                                           const float* world140 = nullptr) {
+                                           const float* world140 = nullptr,
+                                           const float* skybox256 = nullptr) {
     if (!words || wordCount != 5376 / sizeof(float)) return false;
     if (parsed_camera.scaleX <= 0.0f || parsed_camera.scaleY <= 0.0f) return false;
 
+    const float* skyboxRot12 = skybox256 ? skybox256 : &words[256];
     const bool isCb1Subpass =
         !edpe::cobra_camera::frameWindow().mapModeActive.load(std::memory_order_relaxed) &&
         (world140
-            ? edpe::isEliteSubpassVersusWorldBlock16(world140, parsed_camera)
+            ? edpe::isEliteSubpassVersusWorldBlock16(world140, parsed_camera, skyboxRot12)
             : edpe::isEliteSubpassVersusWorldCb1(words, wordCount, parsed_camera));
     if (isCb1Subpass) {
         return false;
@@ -706,7 +708,7 @@ inline bool isAuthoritativeMainSceneCamera(const float* words, size_t wordCount,
     edpe::CameraProjection compareCam = committed_camera;
     if (committed_camera.scaleX > 0.0f && committed_camera.scaleY > 0.0f) {
         const bool matchesWorldCb1 = world140
-            ? edpe::matchesEliteWorldProjectionScalesFromBlock16(world140, parsed_camera)
+            ? edpe::matchesEliteWorldProjectionScalesFromBlock16(world140, parsed_camera, skyboxRot12)
             : edpe::matchesEliteWorldProjectionScales(words, wordCount, parsed_camera);
         const edpe::Vec3 predictedPos =
             edpe::cameraPosition(committed_camera) + last_velocity * std::clamp(dtRatio, 0.25f, 4.0f);
@@ -8221,6 +8223,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             alignas(16) static float s_cb1_memo_cam932[12]{};
             alignas(16) static float s_cb1_memo_proj1080[16]{};
             alignas(16) static float s_cb1_memo_world140[16]{};
+            alignas(16) static float s_cb1_memo_skybox256[12]{};
             alignas(16) static float s_cb1_memo_origin1100[4]{};
             static bool s_cb1_memo_parse_ok = false;
             static int s_cb1_memo_fail_reason = 0;
@@ -8231,10 +8234,12 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             alignas(16) float local_cam932[12];
             alignas(16) float local_proj1080[16];
             alignas(16) float local_world140[16];
+            alignas(16) float local_skybox256[12];
             alignas(16) float local_origin1100[4];
             std::memcpy(local_cam932, &mutable_unmap_words[932], sizeof(local_cam932));
             std::memcpy(local_proj1080, &mutable_unmap_words[1080], sizeof(local_proj1080));
             std::memcpy(local_world140, &mutable_unmap_words[140], sizeof(local_world140));
+            std::memcpy(local_skybox256, &mutable_unmap_words[256], sizeof(local_skybox256));
             std::memcpy(local_origin1100, &mutable_unmap_words[1100], sizeof(local_origin1100));
             const bool memoSameProj =
                 (s_cb1_memo_frame == cur_frame &&
@@ -8305,7 +8310,8 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                  std::memcmp(local_origin1100, s_cb1_memo_origin1100, 3 * sizeof(float)) == 0);
             const bool memoSameWorld140 =
                 (memoSameCamProj &&
-                 std::memcmp(local_world140, s_cb1_memo_world140, sizeof(local_world140)) == 0);
+                 std::memcmp(local_world140, s_cb1_memo_world140, sizeof(local_world140)) == 0 &&
+                 std::memcmp(local_skybox256, s_cb1_memo_skybox256, sizeof(local_skybox256)) == 0);
             bool parse_ok = false;
             if (memoSameCamProj) {
                 parse_ok = s_cb1_memo_parse_ok;
@@ -8319,14 +8325,15 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                 std::memcpy(s_cb1_memo_cam932, local_cam932, sizeof(local_cam932));
                 std::memcpy(s_cb1_memo_proj1080, local_proj1080, sizeof(local_proj1080));
                 std::memcpy(s_cb1_memo_world140, local_world140, sizeof(local_world140));
+                std::memcpy(s_cb1_memo_skybox256, local_skybox256, sizeof(local_skybox256));
                 std::memcpy(s_cb1_memo_origin1100, local_origin1100, sizeof(local_origin1100));
                 s_cb1_memo_parse_ok = parse_ok;
                 s_cb1_memo_fail_reason = parse_fail_reason;
                 s_cb1_memo_cam = parsed_camera;
                 s_cb1_memo_is_subpass = parse_ok &&
-                    edpe::isEliteSubpassVersusWorldBlock16(local_world140, parsed_camera);
+                    edpe::isEliteSubpassVersusWorldBlock16(local_world140, parsed_camera, local_skybox256);
                 s_cb1_memo_matches_world = parse_ok &&
-                    edpe::matchesEliteWorldProjectionScalesFromBlock16(local_world140, parsed_camera);
+                    edpe::matchesEliteWorldProjectionScalesFromBlock16(local_world140, parsed_camera, local_skybox256);
             }
             if (parsed_camera.scaleX > 0.0f && parsed_camera.scaleY > 0.0f) {
                 s_ustat.lastCandAspect = parsed_camera.scaleY / parsed_camera.scaleX;
@@ -8441,6 +8448,9 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         }
 
                         if ((hasRenderOrigin || row932ValidPos || hasStagedPos || s_consecutive_fallback_frames <= 2) &&
+                            (matchRefScale ||
+                             edpe::eliteWorldBlock16RotationTrace(
+                                 local_world140, worldSx, worldSy, bc, local_skybox256) >= 2.50f) &&
                             edpe::cameraRotationTrace(bc, blockRef) > 2.90f) {
                             parsed_camera = bc;
                             block_cam_ok = true;
@@ -8452,14 +8462,15 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
             if (parse_ok || block_cam_ok) {
                 const bool raw_cb1_subpass = (parse_ok && memoSameWorld140)
                     ? s_cb1_memo_is_subpass
-                    : edpe::isEliteSubpassVersusWorldBlock16(local_world140, parsed_camera);
+                    : edpe::isEliteSubpassVersusWorldBlock16(local_world140, parsed_camera, local_skybox256);
                 const bool is_cb1_subpass = raw_cb1_subpass &&
                     !edpe::cobra_camera::frameWindow().mapModeActive.load(std::memory_order_relaxed);
                 const bool matches_world_cb1 = (parse_ok && memoSameWorld140)
                     ? s_cb1_memo_matches_world
-                    : edpe::matchesEliteWorldProjectionScalesFromBlock16(local_world140, parsed_camera);
+                    : edpe::matchesEliteWorldProjectionScalesFromBlock16(local_world140, parsed_camera, local_skybox256);
                 if (parse_ok && !memoSameWorld140) {
                     std::memcpy(s_cb1_memo_world140, local_world140, sizeof(local_world140));
+                    std::memcpy(s_cb1_memo_skybox256, local_skybox256, sizeof(local_skybox256));
                     s_cb1_memo_is_subpass = raw_cb1_subpass;
                     s_cb1_memo_matches_world = matches_world_cb1;
                 }
@@ -8619,8 +8630,11 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                     const bool allowPreSceneMainEye =
                         in_main_scene || cb1HasLiveEyePos || matches_world_cb1;
                     float worldSx = 0.0f, worldSy = 0.0f, worldDepthB = 0.0f;
-                    const bool has_world_cb1 = edpe::extractEliteWorldProjectionScalesFromBlock16(
-                        local_world140, &worldSx, &worldSy, &worldDepthB);
+                    const bool has_world_cb1 =
+                        edpe::extractEliteWorldProjectionScalesFromBlock16(
+                            local_world140, &worldSx, &worldSy, &worldDepthB) &&
+                        edpe::eliteWorldBlock16RotationTrace(
+                            local_world140, worldSx, worldSy, parsed_camera, local_skybox256) >= 2.50f;
                     const bool valid_main_geom = edpe::isMainCameraGeometryValid(
                         parsed_camera, local_proj1080, curVpW, curVpH, outW, outH);
                     const bool matches_world_depthB =
@@ -8637,7 +8651,7 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                             edpe::cameraRotationTrace(parsed_camera, s_camera_now) > 2.985f &&
                             isAuthoritativeMainSceneCamera(
                                 words, 5376 / sizeof(float), parsed_camera,
-                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, false, local_world140)) {
+                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, false, local_world140, local_skybox256)) {
                             const bool haveProbeFb =
                                 (s_has_probe_fallback_camera && s_probe_fallback_frame == cur_frame);
                             const bool preferUpgrade =
@@ -8667,19 +8681,19 @@ void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resourc
                         ((!hasStagedForFrame &&
                           isAuthoritativeMainSceneCamera(
                               words, 5376 / sizeof(float), parsed_camera,
-                              outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, !allow_fallback_recovery, local_world140)) ||
+                              outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, !allow_fallback_recovery, local_world140, local_skybox256)) ||
                          (hasStagedForFrame &&
                           (isAuthoritativeMainSceneCamera(
                                words, 5376 / sizeof(float), parsed_camera,
-                               outW, outH, s_staged_camera, {0.0f, 0.0f, 0.0f}, 1.0f, local_proj1080, true, local_world140) ||
+                               outW, outH, s_staged_camera, {0.0f, 0.0f, 0.0f}, 1.0f, local_proj1080, true, local_world140, local_skybox256) ||
                            (promote_over_probe &&
                             isAuthoritativeMainSceneCamera(
                                 words, 5376 / sizeof(float), parsed_camera,
-                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, true, local_world140)) ||
+                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, true, local_world140, local_skybox256)) ||
                            (!s_staged_from_in_scene && in_main_scene &&
                             isAuthoritativeMainSceneCamera(
                                 words, 5376 / sizeof(float), parsed_camera,
-                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, false, local_world140))))));
+                                outW, outH, s_camera_now, s_last_valid_velocity, dtRatio, local_proj1080, false, local_world140, local_skybox256))))));
 
                     float spCheckDist = 0.0f;
                     float spCheckTrace = 0.0f;
@@ -10876,7 +10890,7 @@ struct ScopedD3D11PipelineState {
     ID3D11Buffer* csCbs[4]{};
     ID3D11ShaderResourceView* psSrvs[8]{};
     ID3D11ShaderResourceView* csSrvs[8]{};
-    ID3D11UnorderedAccessView* csUavs[2]{};
+    ID3D11UnorderedAccessView* csUavs[D3D11_PS_CS_UAV_REGISTER_COUNT]{};
     ID3D11SamplerState* psSamps[4]{};
     ID3D11SamplerState* csSamps[4]{};
     ID3D11InputLayout* inputLayout = nullptr;
@@ -10906,7 +10920,7 @@ struct ScopedD3D11PipelineState {
         ctx->CSGetConstantBuffers(0, 4, csCbs);
         ctx->PSGetShaderResources(0, 8, psSrvs);
         ctx->CSGetShaderResources(0, 8, csSrvs);
-        ctx->CSGetUnorderedAccessViews(0, 2, csUavs);
+        ctx->CSGetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, csUavs);
         ctx->PSGetSamplers(0, 4, psSamps);
         ctx->CSGetSamplers(0, 4, csSamps);
         ctx->IAGetInputLayout(&inputLayout);
@@ -10927,10 +10941,10 @@ struct ScopedD3D11PipelineState {
         if (!ctx) return;
         rearmContextHooks();
         ID3D11ShaderResourceView* nullSrvs[8]{};
-        ID3D11UnorderedAccessView* nullUavs[2]{};
+        ID3D11UnorderedAccessView* nullUavs[D3D11_PS_CS_UAV_REGISTER_COUNT]{};
         ctx->PSSetShaderResources(0, 8, nullSrvs);
         ctx->CSSetShaderResources(0, 8, nullSrvs);
-        ctx->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+        ctx->CSSetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, nullUavs, nullptr);
         if (rawSetOm) {
             ID3D11RenderTargetView* nullRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
             rawSetOm(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullRtvs, nullptr);
@@ -10949,7 +10963,7 @@ struct ScopedD3D11PipelineState {
         ctx->CSSetConstantBuffers(0, 4, csCbs);
         ctx->PSSetShaderResources(0, 8, psSrvs);
         ctx->CSSetShaderResources(0, 8, csSrvs);
-        ctx->CSSetUnorderedAccessViews(0, 2, csUavs, nullptr);
+        ctx->CSSetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, csUavs, nullptr);
         ctx->PSSetSamplers(0, 4, psSamps);
         ctx->CSSetSamplers(0, 4, csSamps);
         ctx->IASetInputLayout(inputLayout);
@@ -11739,7 +11753,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 const bool onFootActive = edpe::cobra_camera::MapFocusPoller::isOnFootActive() || recentOnFootVisor;
                 const bool inSrvActive = !onFootActive && edpe::cobra_camera::MapFocusPoller::isInSrvActive();
                 const bool clampCockpit = !onFootActive;
-                const bool wantReactiveMask = (upscaler.getBackend() == edpe::UpscalerBackend::Taa);
+                const bool wantReactiveMask =
+                    (activeBackend == edpe::UpscalerBackend::Taa) ||
+                    (activeBackend == edpe::UpscalerBackend::AmdFsr);
                 ID3D11ShaderResourceView* weaponMotionSrv = nullptr;
                 if (!eval_reset &&
                     s_weapon_motion.isInitialized() &&
@@ -11838,6 +11854,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
         : s_camera_previous;
     inputs.sharpness = s_sharpness.load(std::memory_order_relaxed);
     inputs.depthInverted = true;
+    inputs.depthInfinite = false;
     inputs.motionIsLowRes = true;
     const bool isHdrColor = (hdrInput || (preserveUi && rawColorChoice == s_clean_hdr_scene_texture.Get())) &&
                             (srcColorDesc.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
@@ -11845,7 +11862,11 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                              srcColorDesc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
     inputs.colorIsHdr = isHdrColor;
 
-    inputs.reactiveMaskSrv = (motion_pass && need_motion) ? motion_pass->reactiveMask() : nullptr;
+    if ((activeBackend == edpe::UpscalerBackend::Taa || activeBackend == edpe::UpscalerBackend::AmdFsr) &&
+        motion_pass && need_motion) {
+        inputs.reactiveMask = motion_pass->reactiveMaskTexture();
+        inputs.reactiveMaskSrv = motion_pass->reactiveMask();
+    }
 
     s_last_temporal_inputs = inputs;
     s_last_temporal_inputs_frame = rendered;
@@ -11993,7 +12014,6 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             upscaler.setTaaOutputFormat(outFormat);
         }
         const bool canDeferSharpen =
-            (activeBackend != edpe::UpscalerBackend::AmdFsr) &&
             (inputs.sharpness > 0.0f) &&
             !isHdrColor &&
             ((evalDestination == s_dlss_output_texture.Get() && s_dlss_output_srv != nullptr) || useTaaZeroCopy) &&

@@ -37,7 +37,10 @@ public:
         DXGI_FORMAT preferredFormat = DXGI_FORMAT_UNKNOWN,
         ID3D11ShaderResourceView* reactiveMaskSrv = nullptr);
 
-    void resetHistory() { resetRequested_ = true; }
+    void resetHistory() {
+        resetRequested_ = true;
+        framesSinceReset_ = 0;
+    }
     bool isInitialized() const { return device_ != nullptr; }
 
     ID3D11Texture2D* latestOutputTexture() const { return historyTexture_[historyReadIdx_].Get(); }
@@ -69,6 +72,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> cachedDestRtv_;
 
     bool resetRequested_ = true;
+    uint32_t framesSinceReset_ = 0;
 };
 
 } // namespace edpe

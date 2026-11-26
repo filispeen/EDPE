@@ -14,7 +14,7 @@ struct TaaConstantBufferData {
     float renderResolution[4]; // renderWidth, renderHeight, 1/renderWidth, 1/renderHeight
     float params[4];           // jitterX, jitterY, blendWeight, resetFlag
     float jitterHistory[4];    // prevJitterX, prevJitterY, depthB, hasPrevDepth
-    float reactiveInfo[4];     // hasReactiveMask, 0, 0, 0
+    float reactiveInfo[4];     // hasReactiveMask, maxBlendCap, 0, 0
 };
 
 } // namespace
@@ -85,6 +85,7 @@ bool TaaPass::initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
 
     device_ = device;
     resetRequested_ = true;
+    framesSinceReset_ = 0;
     return true;
 }
 
@@ -109,6 +110,7 @@ void TaaPass::shutdown() {
     historyHeight_ = 0;
     historyFormat_ = DXGI_FORMAT_UNKNOWN;
     resetRequested_ = true;
+    framesSinceReset_ = 0;
 }
 
 bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT format) {
@@ -126,6 +128,7 @@ bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT forma
             historyHeight_ = 0;
             historyFormat_ = DXGI_FORMAT_UNKNOWN;
             resetRequested_ = true;
+            framesSinceReset_ = 0;
         }
     }
 
@@ -159,6 +162,7 @@ bool TaaPass::ensureResources(uint32_t width, uint32_t height, DXGI_FORMAT forma
         historyHeight_ = height;
         historyFormat_ = format;
         resetRequested_ = true;
+        framesSinceReset_ = 0;
     }
 
     return true;
@@ -216,6 +220,13 @@ bool TaaPass::render(ID3D11DeviceContext* context,
 
     const bool performReset = reset || resetRequested_;
     resetRequested_ = false;
+    if (performReset) {
+        framesSinceReset_ = 0;
+    }
+
+    const float warmupCap = (framesSinceReset_ > 0u)
+        ? (static_cast<float>(framesSinceReset_) / static_cast<float>(framesSinceReset_ + 1u))
+        : 0.0f;
 
     TaaConstantBufferData cb{};
     cb.resolution[0] = static_cast<float>(width);
@@ -235,6 +246,7 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     cb.jitterHistory[2] = (depthB > 0.0f) ? depthB : 0.025f;
     cb.jitterHistory[3] = (!performReset && prevDepthSrv && depthSrv) ? 1.0f : 0.0f;
     cb.reactiveInfo[0] = (!performReset && reactiveMaskSrv) ? 1.0f : 0.0f;
+    cb.reactiveInfo[1] = warmupCap;
 
     context->UpdateSubresource(constantBuffer_.Get(), 0, nullptr, &cb, 0, 0);
 
@@ -282,6 +294,9 @@ bool TaaPass::render(ID3D11DeviceContext* context,
     context->OMSetRenderTargets(2, nullRtvs, nullptr);
 
     historyReadIdx_ = writeIdx;
+    if (framesSinceReset_ < 1000u) {
+        ++framesSinceReset_;
+    }
 
     return true;
 }

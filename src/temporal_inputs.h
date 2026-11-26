@@ -119,7 +119,8 @@ struct TemporalFrameInputs {
     ID3D11Texture2D* motionVectors = nullptr;
     ID3D11ShaderResourceView* motionSrv = nullptr;
 
-    // Lightweight R8_UNORM reactive/disocclusion signal from MotionPass (used by TAA).
+    // Optional reactive mask (R8_UNORM, render resolution) from MotionPass (used by FSR and TAA).
+    ID3D11Texture2D* reactiveMask = nullptr;
     ID3D11ShaderResourceView* reactiveMaskSrv = nullptr;
 
     ID3D11Texture2D* transparencyMask = nullptr;

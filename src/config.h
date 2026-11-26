@@ -61,10 +61,10 @@ public:
         if (sharpness < 0.0f || sharpness > 1.0f) sharpness = 0.0f;
 
         wchar_t fsrVelBuf[64]{};
-        GetPrivateProfileStringW(L"Upscaler", L"FsrVelocityFactor", L"0.00", fsrVelBuf, 64, path.c_str());
+        GetPrivateProfileStringW(L"Upscaler", L"FsrVelocityFactor", L"0.50", fsrVelBuf, 64, path.c_str());
         fsrVelocityFactor = static_cast<float>(_wtof(fsrVelBuf));
         if (!std::isfinite(fsrVelocityFactor) || fsrVelocityFactor < 0.0f || fsrVelocityFactor > 1.0f) {
-            fsrVelocityFactor = 0.00f;
+            fsrVelocityFactor = 0.50f;
         }
 
         wchar_t mipBuf[64]{};
@@ -522,7 +522,7 @@ public:
     int upscaleMode = 0;
     int dlssPreset = 0; // 0=Auto(K), 5=E(CNN Fast), 10=J, 11=K, 12=L, 13=M
     float sharpness = 0.0f;
-    float fsrVelocityFactor = 0.00f;
+    float fsrVelocityFactor = 0.50f;
     float mipLodBiasOffset = 0.0f;
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;

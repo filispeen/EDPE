@@ -599,6 +599,9 @@ void MotionPass::clear(ID3D11DeviceContext* context) {
         };
         context->ClearUnorderedAccessViewUint(class_output_uav_.Get(), resetCls);
     }
+    if (reactive_output_uav_) {
+        context->ClearUnorderedAccessViewFloat(reactive_output_uav_.Get(), zero);
+    }
 }
 
 } // namespace edpe

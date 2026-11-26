@@ -106,7 +106,7 @@ SamplerState pointSampler : register(s0);
 RWTexture2D<float2> OutMotion : register(u0);
 RWTexture2D<float> OutDepth : register(u1);
 RWTexture2D<uint> OutClass : register(u2);
-RWTexture2D<float> OutReactive : register(u3);
+RWTexture2D<unorm float> OutReactive : register(u3);
 #if EDPE_MOTION_GPU_CAMERAS
 cbuffer EliteNow : register(b1) { float4 currentWords[336]; };
 cbuffer ElitePrevious : register(b2) { float4 previousWords[336]; };
@@ -506,10 +506,14 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
 
     // Preserve real physical off-screen motion vectors for newly-revealed edges (FG policy).
     res.mv = worldMv;
+    bool movingPx = dot(worldMv, worldMv) > 0.25;
     if (isReset) {
         res.pixelClass = kClassReset;
     } else if (priorOffscreen) {
         res.pixelClass = kClassOffscreenFG;
+        if (hasPrevDepth && movingPx) {
+            res.reactive = 0.85;
+        }
     } else if (hasPrevDepth && !worldMatches) {
         res.pixelClass = kClassDisoccluded;
         // Grazing-angle distant floors and thin 2-3px rails routinely exceed prevDepthMatches's
@@ -737,7 +741,7 @@ void writeOutputs(int2 pixCoord, MotionResult res) {
     if ((modeFlags & 512) != 0) {
         float reactive = (res.pixelClass == kClassOffscreenFG ||
                           res.pixelClass == kClassReset) ? 1.0 : res.reactive;
-        OutReactive[pixCoord] = reactive;
+        OutReactive[pixCoord] = saturate(reactive);
     }
 }
 

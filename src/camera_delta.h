@@ -596,7 +596,7 @@ inline bool isSamePoseSceneSubpass(const CameraProjection& candidate,
     // Planetary origin-rebased sub-passes (verified by cb1[35..38] world scales,
     // e.g. (-0.30, 0.26, -0.40) vs planetary (-134.89, 331.26, 289.81), same orientation).
     const bool originRebase =
-        knownSubpassFromCb1 && rawDist > 15.0f && rawDist < 500.0f && trace > 2.95f;
+        knownSubpassFromCb1 && rawDist > 15.0f && rawDist < 2000.0f && trace > 2.95f;
     if (!originRebase && minDist > maxIntraDist) return false;
     // Allow rapid camera flicks up to ~45 deg/frame (trace > 2.40, matching
     // isAuthoritativeMainSceneCamera) while still rejecting 90/180 deg probes/cubemaps.
