@@ -283,6 +283,7 @@ PSOutput ps_main(VSOutput pin) {
     // Strictly stationary-only (< 0.25 px/f): never bypass ClipToAABB during motion,
     // otherwise grazing-angle 1px floor decals and specular streaks below screen center smear/ghost.
     float stationaryWeight = saturate(1.0 - speed * 4.0) * depthConfidence;
+    float thinRidge = 0.0;
     if (stationaryWeight > 0.0) {
         float2 histTexel = resolution.zw;
         float hL  = RGBToYCoCg(TonemapKaris(historyFrame.SampleLevel(linearSampler, clamp(priorUv + float2(-histTexel.x, 0.0), 0.0, 1.0), 0).rgb)).x;
@@ -306,7 +307,7 @@ PSOutput ps_main(VSOutput pin) {
             min(ridgeY2U, max(0.0, abs(hU - 0.5 * (hU2 + hD)) - 0.5 * abs(hU2 - hD))),
             min(ridgeY2D, max(0.0, abs(hD - 0.5 * (hU + hD2)) - 0.5 * abs(hU - hD2))));
         float ridgeStrength = max(max(ridgeX, ridgeY), 0.85 * max(ridge2X, ridge2Y));
-        float thinRidge = saturate((ridgeStrength - 0.005) * 32.0);
+        thinRidge = saturate((ridgeStrength - 0.005) * 32.0);
         clampedHistY = lerp(clampedHistY, histY, 0.98 * stationaryWeight * thinRidge);
     }
 
@@ -314,11 +315,15 @@ PSOutput ps_main(VSOutput pin) {
     //    Keep strong temporal accumulation when history fits inside the variance box (preserving AA),
     //    and only dampen confidence when history was clipped far outside or flagged disoccluded.
     float clampDistance = length(max(0.0, finalMin - histY) + max(0.0, histY - finalMax));
+    float staticVerified = stationaryWeight * (1.0 - saturate(clampDistance * 12.0));
+    float staticThinLock = stationaryWeight * thinRidge;
     float normClamp = clampDistance / max(length(sigma), 0.02);
     float speedFactor = saturate(speed * 0.35);
     float historyConfidence = lerp(1.0, 1.0 / (1.0 + normClamp * 0.85), speedFactor) * depthConfidence;
 
     float blendWeight = clamp(params.z, 0.0, 0.95);
+    blendWeight = lerp(blendWeight, 0.96, staticVerified);
+    blendWeight = lerp(blendWeight, 0.975, staticThinLock);
     blendWeight = lerp(blendWeight, 0.72, saturate(speed * 0.10));
     blendWeight = min(blendWeight, reactiveInfo.y);
 
