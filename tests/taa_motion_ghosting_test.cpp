@@ -306,7 +306,8 @@ bool runMotionProfile(ID3D11Device* device, ID3D11DeviceContext* ctx,
                             isReset ? 0.0f : prevJ.pixelX,
                             isReset ? 0.0f : prevJ.pixelY,
                             kDepthB, prevDepthSrv, DXGI_FORMAT_UNKNOWN,
-                            motionPass.reactiveMask())) {
+                            motionPass.reactiveMask(), nullptr, nullptr, false,
+                            &camNow, &camPrev)) {
             std::printf("  [FAIL] %s: TaaPass::render failed at frame %d\n", prof.name, t);
             return false;
         }
@@ -514,6 +515,148 @@ int main() {
         {"RotateRoll",    0.00f,  0.00f,  0.00f,  0.000f,  0.000f,  0.035f},
         // Simultaneous 6-DOF translation + rotation
         {"Combined6DOF",  0.12f,  0.06f,  0.15f,  0.024f,  0.015f,  0.020f},
+        // Fast forward Z flight (20% Z-change/frame at back wall, validates expectedPrevZ disocclusion)
+        {"FastFlightZ",   0.00f,  0.00f,  2.00f,  0.000f,  0.000f,  0.000f},
+    };
+
+    auto runFarSilhouette150mTest = [&]() -> bool {
+        constexpr uint32_t kFw = 1280;
+        constexpr uint32_t kFh = 720;
+        constexpr float kFarZ = 150.0f;
+        constexpr float kSlabHalfW = 12.0f;
+
+        ComPtr<ID3D11Texture2D> fColorTex, fDepthTex[2], fDepthStg, fOutTex, fReadback;
+        ComPtr<ID3D11ShaderResourceView> fColorSrv, fDepthSrv[2];
+        ComPtr<ID3D11RenderTargetView> fOutRtv;
+        auto mk = [&](DXGI_FORMAT fmt, UINT bind, D3D11_USAGE usage, UINT cpu, ComPtr<ID3D11Texture2D>& out) {
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = kFw; td.Height = kFh; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = fmt; td.SampleDesc.Count = 1; td.Usage = usage;
+            td.BindFlags = bind; td.CPUAccessFlags = cpu;
+            return SUCCEEDED(device->CreateTexture2D(&td, nullptr, &out));
+        };
+        if (!mk(DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, fColorTex) ||
+            FAILED(device->CreateShaderResourceView(fColorTex.Get(), nullptr, &fColorSrv)) ||
+            !mk(DXGI_FORMAT_R32G8X24_TYPELESS, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_WRITE, fDepthStg) ||
+            !mk(DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, fOutTex) ||
+            FAILED(device->CreateRenderTargetView(fOutTex.Get(), nullptr, &fOutRtv)) ||
+            !mk(DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ, fReadback)) {
+            return false;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (!mk(DXGI_FORMAT_R32G8X24_TYPELESS, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT, 0, fDepthTex[i])) return false;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd.Texture2D.MipLevels = 1;
+            if (FAILED(device->CreateShaderResourceView(fDepthTex[i].Get(), &sd, &fDepthSrv[i]))) return false;
+        }
+
+        edpe::TaaPass farTaa;
+        if (!farTaa.initialize(device.Get(), ctx.Get())) return false;
+
+        constexpr int kFarFrames = 8;
+        edpe::CameraProjection prevCam{};
+        edpe::ProjectionJitter prevJ{};
+        std::vector<uint8_t> prevIsSky;
+        float worstFarGhost = 0.0f;
+        uint64_t farDisocclCount = 0;
+        int cur = 0;
+
+        for (int t = 0; t < kFarFrames; ++t) {
+            const float camX = 1.5f * static_cast<float>(t); // ~5.76 px/frame at z = 150m
+            const auto camNow = buildCamera(camX, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+            const auto jit = edpe::projectionJitter(static_cast<uint64_t>(t), kFw, kFh, 16u);
+
+            std::vector<uint32_t> col(static_cast<size_t>(kFw) * kFh, packRgba(0.04f, 0.05f, 0.07f));
+            std::vector<float> dep(static_cast<size_t>(kFw) * kFh, 0.0f);
+            std::vector<uint8_t> isSky(static_cast<size_t>(kFw) * kFh, 1u);
+            for (uint32_t y = kFh / 4; y < (kFh * 3) / 4; ++y) {
+                for (uint32_t x = 0; x < kFw; ++x) {
+                    const float ux = (static_cast<float>(x) + 0.5f) - jit.pixelX;
+                    const float ndcX = 2.0f * ux / static_cast<float>(kFw) - 1.0f;
+                    const float wx = camX + (ndcX / kScaleX) * kFarZ;
+                    if (std::fabs(wx) <= kSlabHalfW) {
+                        const size_t idx = static_cast<size_t>(y) * kFw + x;
+                        col[idx] = packRgba(0.92f, 0.90f, 0.85f);
+                        dep[idx] = kDepthB / kFarZ;
+                        isSky[idx] = 0u;
+                    }
+                }
+            }
+
+            ctx->UpdateSubresource(fColorTex.Get(), 0, nullptr, col.data(), kFw * sizeof(uint32_t), 0);
+            D3D11_MAPPED_SUBRESOURCE dm{};
+            if (FAILED(ctx->Map(fDepthStg.Get(), 0, D3D11_MAP_WRITE, 0, &dm))) return false;
+            struct D32S32 { float d; uint32_t s; };
+            for (uint32_t y = 0; y < kFh; ++y) {
+                auto* row = reinterpret_cast<D32S32*>(static_cast<uint8_t*>(dm.pData) + static_cast<size_t>(y) * dm.RowPitch);
+                for (uint32_t x = 0; x < kFw; ++x) {
+                    row[x].d = dep[static_cast<size_t>(y) * kFw + x];
+                    row[x].s = 0u;
+                }
+            }
+            ctx->Unmap(fDepthStg.Get(), 0);
+            ctx->CopyResource(fDepthTex[cur].Get(), fDepthStg.Get());
+
+            const bool isReset = (t == 0);
+            const auto& camPrev = isReset ? camNow : prevCam;
+            ID3D11ShaderResourceView* pDepth = isReset ? nullptr : fDepthSrv[cur ^ 1].Get();
+            if (!motionPass.render(fDepthSrv[cur].Get(), camNow, camPrev, kFw, kFh,
+                                   jit.pixelX, jit.pixelY,
+                                   isReset ? 0.0f : prevJ.pixelX,
+                                   isReset ? 0.0f : prevJ.pixelY,
+                                   isReset, pDepth, true, false, false,
+                                   nullptr, nullptr, nullptr, 0u, true, true, false)) {
+                return false;
+            }
+            if (!farTaa.render(ctx.Get(), fColorSrv.Get(), motionPass.output(), fDepthSrv[cur].Get(),
+                               fOutRtv.Get(), fOutTex.Get(), kFw, kFh,
+                               jit.pixelX, jit.pixelY, isReset, kFw, kFh,
+                               isReset ? 0.0f : prevJ.pixelX,
+                               isReset ? 0.0f : prevJ.pixelY,
+                               kDepthB, pDepth, DXGI_FORMAT_UNKNOWN,
+                               motionPass.reactiveMask(), nullptr, nullptr, false,
+                               &camNow, &camPrev)) {
+                return false;
+            }
+
+            if (t == kFarFrames - 1) {
+                ctx->CopyResource(fReadback.Get(), fOutTex.Get());
+                D3D11_MAPPED_SUBRESOURCE rm{};
+                if (FAILED(ctx->Map(fReadback.Get(), 0, D3D11_MAP_READ, 0, &rm))) return false;
+                const float skyLuma = 0.2126f * 0.04f + 0.7152f * 0.05f + 0.0722f * 0.07f;
+                for (uint32_t y = kFh / 4 + 4; y < (kFh * 3) / 4 - 4; ++y) {
+                    const auto* row = reinterpret_cast<const uint32_t*>(
+                        static_cast<const uint8_t*>(rm.pData) + static_cast<size_t>(y) * rm.RowPitch);
+                    for (uint32_t x = 4; x < kFw - 4; ++x) {
+                        const size_t idx = static_cast<size_t>(y) * kFw + x;
+                        if (isSky[idx] && !prevIsSky[idx] &&
+                            isSky[idx - 1] && isSky[idx + 1] && isSky[idx - 2] && isSky[idx + 2]) {
+                            const float g = std::fabs(unpackLuma(row[x]) - skyLuma);
+                            worstFarGhost = std::max(worstFarGhost, g);
+                            ++farDisocclCount;
+                        }
+                    }
+                }
+                ctx->Unmap(fReadback.Get(), 0);
+            }
+
+            prevCam = camNow;
+            prevJ = jit;
+            prevIsSky = std::move(isSky);
+            cur ^= 1;
+        }
+        farTaa.shutdown();
+
+        std::printf("  [FarSilh150m  ] disocclMaxGhost=%.4f (n=%llu)\n",
+            worstFarGhost, static_cast<unsigned long long>(farDisocclCount));
+        if (farDisocclCount == 0 || worstFarGhost > 0.12f) {
+            std::printf("    -> FAIL: 150m silhouette over sky ghosted (max=%.4f, n=%llu)\n",
+                worstFarGhost, static_cast<unsigned long long>(farDisocclCount));
+            return false;
+        }
+        return true;
     };
 
     std::printf("[TAA_Motion_Ghosting_And_Smearing_Suite 3840x2160]\n");
@@ -526,6 +669,7 @@ int main() {
             colorTex.Get(), colorSrv.Get(), dTexRaw, dSrvRaw, depthStaging.Get(),
             outTex.Get(), outRtv.Get(), readbackStaging.Get(), prof);
     }
+    allOk &= runFarSilhouette150mTest();
 
     taaPass.shutdown();
     return allOk ? 0 : 10;

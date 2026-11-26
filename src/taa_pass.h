@@ -1,5 +1,7 @@
 #pragma once
 
+#include "temporal_math.h"
+
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <wrl/client.h>
@@ -47,11 +49,14 @@ public:
         ID3D11ShaderResourceView* reactiveMaskSrv = nullptr,
         ID3D11ShaderResourceView* motionClassSrv = nullptr,
         const TaaSettings* settings = nullptr,
-        bool colorIsHdr = false);
+        bool colorIsHdr = false,
+        const CameraProjection* cameraNow = nullptr,
+        const CameraProjection* cameraPrev = nullptr);
 
     void resetHistory() {
         resetRequested_ = true;
         hasPrevDepthCopy_ = false;
+        hasPrevPrepass_ = false;
         framesSinceReset_ = 0;
     }
     bool isInitialized() const { return device_ != nullptr; }
@@ -81,6 +86,7 @@ private:
     Microsoft::WRL::ComPtr<ID3DDeviceContextState> state_;
 
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> prepassCs_;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> patchDivCs_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> resolveCs_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> postRcasCs_;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> debugCs_;
@@ -90,18 +96,26 @@ private:
     Microsoft::WRL::ComPtr<ID3D11SamplerState> linearSampler_;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> pointSampler_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> prepassCb_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> patchDivCb_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> resolveCb_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> postRcasCb_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> blitCb_;
 
-    // Render-resolution buffers
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> prepassTex_;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> prepassSrv_;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> prepassUav_;
+    // Render-resolution buffers (ping-ponged prepass + half-res patch divergence)
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> prepassTex_[2];
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> prepassSrv_[2];
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> prepassUav_[2];
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> patchDivTex_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> patchDivSrv_;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> patchDivUav_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> prevDepthTex_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> prevDepthSrv_;
+    uint32_t prepassReadIdx_ = 0;
+    bool hasPrevPrepass_ = false;
     uint32_t renderWidth_ = 0;
     uint32_t renderHeight_ = 0;
+    uint32_t patchWidth_ = 0;
+    uint32_t patchHeight_ = 0;
     uint32_t prevDepthWidth_ = 0;
     uint32_t prevDepthHeight_ = 0;
     bool hasPrevDepthCopy_ = false;

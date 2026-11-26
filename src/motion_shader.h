@@ -372,7 +372,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
             int2 occBase = clamp(int2(floor(prevSamplePx - 0.5)), int2(-1, -1), maxCoord);
             float4 occQuad = prevSceneDepth.GatherRed(pointSampler, (float2(occBase) + 1.0) * rcp(info.yz));
             float maxPrevD = max(max(occQuad.x, occQuad.y), max(occQuad.z, occQuad.w));
-            prevFootprintHasOccluder = (maxPrevD > expectedPriorDepth * 1.35 + 3e-4);
+            prevFootprintHasOccluder = (maxPrevD > max(expectedPriorDepth * 1.35, 1e-5));
         }
     }
 
@@ -460,7 +460,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
             float pdCenter = prevSceneDepth.Load(int3(sc, 0));
             // If a closer foreground occluder occupied this screen pixel in the previous frame,
             // this pixel is newly disoccluded background and must NEVER be classified as CockpitStatic.
-            bool wasOccludedByCloser = (z >= 1.5) && (pdCenter > depth * 1.05 + 1e-4);
+            bool wasOccludedByCloser = (z >= 1.5) && (pdCenter > max(depth * 1.05, 1e-5));
             float staticErr = 1e30;
             bool staticMatches = !wasOccludedByCloser &&
                 prevDepthMatches(rawPixel + jitterInfo.zw, depth, maxCoord, staticErr);
@@ -519,7 +519,7 @@ MotionResult classifyAndFinishWorld(int2 pixCoord, float2 pixelCenter, float2 ra
         // Grazing-angle distant floors and thin 2-3px rails routinely exceed prevDepthMatches's
         // strict 1% tolerance (2-6% depth gradient per pixel). Only flag TAA reactive reset on
         // genuine large depth jumps (>8% relative error) so distant thin geometry keeps AA active.
-        float taaDisocclTol = max(5e-4, 0.08 * expectedPriorDepth);
+        float taaDisocclTol = max(1e-6, 0.15 * expectedPriorDepth);
         res.reactive = (worldErr > taaDisocclTol) ? 1.0 : 0.0;
     } else {
         res.pixelClass = kClassWorld;

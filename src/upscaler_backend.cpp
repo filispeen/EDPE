@@ -857,6 +857,10 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         depthSrv = cachedDepthSrv_.Get();
     }
 
+    const bool hasValidCams =
+        (inputs.cameraNow.scaleX > 0.0f && inputs.cameraNow.scaleY > 0.0f &&
+         inputs.cameraPrevious.scaleX > 0.0f && inputs.cameraPrevious.scaleY > 0.0f);
+
     return pass_.render(context,
         colorSrv,
         motionSrv,
@@ -878,7 +882,9 @@ bool TaaUpscalerBackend::evaluate(ID3D11DeviceContext* context,
         inputs.reactiveMaskSrv,
         inputs.motionClassSrv,
         &settings_,
-        inputs.colorIsHdr);
+        inputs.colorIsHdr,
+        hasValidCams ? &inputs.cameraNow : nullptr,
+        hasValidCams ? &inputs.cameraPrevious : nullptr);
 }
 
 void TaaUpscalerBackend::resetHistory() {

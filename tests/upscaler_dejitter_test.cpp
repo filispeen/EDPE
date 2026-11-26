@@ -1935,6 +1935,210 @@ bool verifyVerticalThinLines(const char* label, GpuHarness& gpu, edpe::IUpscaler
     return ok;
 }
 
+struct UnvectoredBoxMetrics {
+    float maxTrailGhost = 0.0f;
+    float meanTrailGhost = 0.0f;
+    float interiorContrast = 0.0f;
+};
+
+UnvectoredBoxMetrics measureUnvectoredMovingTexturedBox(
+    GpuHarness& gpu, edpe::IUpscalerBackend& backend) {
+    constexpr uint32_t kW = 128;
+    constexpr uint32_t kH = 128;
+    constexpr int kFrames = 28;
+    constexpr int kMeasureFrame = 24;
+    constexpr float kSpeedX = 3.0f;
+    constexpr float kBoxW = 16.0f;
+    constexpr float kBoxH = 24.0f;
+
+    if (!gpu.ensureSurfaces(kW, kH, kW, kH)) {
+        return {999.0f, 999.0f, 0.0f};
+    }
+
+    FrameBuffers fb;
+    std::vector<uint32_t> outPixels;
+    edpe::ProjectionJitter prevJ{};
+    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, kW, kH, kW, kH);
+    UnvectoredBoxMetrics m{};
+
+    for (int t = 0; t < kFrames; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), kW, kH, phaseCount);
+        const float boxX0 = 20.0f + kSpeedX * static_cast<float>(t);
+        const float boxX1 = boxX0 + kBoxW;
+        const float boxY0 = 52.0f;
+        const float boxY1 = boxY0 + kBoxH;
+
+        fb.resize(kW, kH);
+        std::fill(fb.depth.begin(), fb.depth.end(), kFgDepth);
+
+        for (uint32_t iy = 0; iy < kH; ++iy) {
+            const float uy = static_cast<float>(iy) + 0.5f - j.pixelY;
+            for (uint32_t ix = 0; ix < kW; ++ix) {
+                const float ux = static_cast<float>(ix) + 0.5f - j.pixelX;
+                if (ux >= boxX0 && ux <= boxX1 && uy >= boxY0 && uy <= boxY1) {
+                    const int stripePhase = static_cast<int>(std::floor((ux - boxX0) / 2.0f)) & 1;
+                    const float v = stripePhase ? 0.90f : 0.15f;
+                    fb.color[static_cast<size_t>(iy) * kW + ix] = packRgba8(v, v, v);
+                }
+            }
+        }
+
+        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
+                                   t > 0 ? prevJ.pixelX : 0.0f,
+                                   t > 0 ? prevJ.pixelY : 0.0f,
+                                   t == 0, outPixels, 0.0f)) {
+            return {999.0f, 999.0f, 0.0f};
+        }
+        prevJ = j;
+
+        if (t == kMeasureFrame) {
+            const int trailX0 = std::max(0, static_cast<int>(std::floor(boxX0)) - 6);
+            const int trailX1 = std::max(0, static_cast<int>(std::floor(boxX0)) - 4);
+            double trailSum = 0.0;
+            int trailCnt = 0;
+            for (uint32_t y = 56; y < 72; ++y) {
+                for (int x = trailX0; x <= trailX1; ++x) {
+                    const float g = std::fabs(pixelLuma(outPixels[static_cast<size_t>(y) * kW + x]) - kBgColor);
+                    m.maxTrailGhost = std::max(m.maxTrailGhost, g);
+                    trailSum += g;
+                    ++trailCnt;
+                }
+            }
+            m.meanTrailGhost = (trailCnt > 0) ? static_cast<float>(trailSum / trailCnt) : 999.0f;
+
+            float minIn = 1.0f, maxIn = 0.0f;
+            const int inX0 = static_cast<int>(std::ceil(boxX0)) + 2;
+            const int inX1 = static_cast<int>(std::floor(boxX1)) - 2;
+            for (uint32_t y = 58; y < 70; ++y) {
+                for (int x = inX0; x <= inX1; ++x) {
+                    const float l = pixelLuma(outPixels[static_cast<size_t>(y) * kW + x]);
+                    minIn = std::min(minIn, l);
+                    maxIn = std::max(maxIn, l);
+                }
+            }
+            m.interiorContrast = maxIn - minIn;
+        }
+    }
+    return m;
+}
+
+float measureUnvectoredMovingThinLineGhost(
+    GpuHarness& gpu, edpe::IUpscalerBackend& backend) {
+    constexpr uint32_t kW = 128;
+    constexpr uint32_t kH = 128;
+    constexpr int kFrames = 28;
+    constexpr int kMeasureFrame = 24;
+    constexpr float kSpeedX = 2.0f;
+
+    if (!gpu.ensureSurfaces(kW, kH, kW, kH)) {
+        return 999.0f;
+    }
+
+    FrameBuffers fb;
+    std::vector<uint32_t> outPixels;
+    edpe::ProjectionJitter prevJ{};
+    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, kW, kH, kW, kH);
+    float maxGhost = 0.0f;
+
+    for (int t = 0; t < kFrames; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), kW, kH, phaseCount);
+        const float lineX = 24.0f + kSpeedX * static_cast<float>(t);
+
+        fb.resize(kW, kH);
+        std::fill(fb.depth.begin(), fb.depth.end(), kFgDepth);
+
+        for (uint32_t iy = 16; iy < kH - 16; ++iy) {
+            for (uint32_t ix = 0; ix < kW; ++ix) {
+                const float ux = static_cast<float>(ix) + 0.5f - j.pixelX;
+                if (std::fabs(ux - lineX) <= 0.5f) {
+                    fb.color[static_cast<size_t>(iy) * kW + ix] = packRgba8(0.90f, 0.90f, 0.90f);
+                }
+            }
+        }
+
+        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
+                                   t > 0 ? prevJ.pixelX : 0.0f,
+                                   t > 0 ? prevJ.pixelY : 0.0f,
+                                   t == 0, outPixels, 0.0f)) {
+            return 999.0f;
+        }
+        prevJ = j;
+
+        if (t == kMeasureFrame) {
+            const int trailX0 = std::max(0, static_cast<int>(std::floor(lineX)) - 6);
+            const int trailX1 = std::max(0, static_cast<int>(std::floor(lineX)) - 4);
+            for (uint32_t y = 32; y < 96; ++y) {
+                for (int x = trailX0; x <= trailX1; ++x) {
+                    const float g = std::fabs(pixelLuma(outPixels[static_cast<size_t>(y) * kW + x]) - kBgColor);
+                    maxGhost = std::max(maxGhost, g);
+                }
+            }
+        }
+    }
+    return maxGhost;
+}
+
+float measureVectoredFractionalSharpness(
+    GpuHarness& gpu, edpe::IUpscalerBackend& backend, float speedPx) {
+    constexpr uint32_t kW = 128;
+    constexpr uint32_t kH = 128;
+    constexpr int kFrames = 24;
+
+    if (!gpu.ensureSurfaces(kW, kH, kW, kH)) {
+        return 0.0f;
+    }
+
+    FrameBuffers fb;
+    std::vector<uint32_t> outPixels;
+    edpe::ProjectionJitter prevJ{};
+    const unsigned phaseCount = backend.recommendedJitterPhaseCount(32u, kW, kH, kW, kH);
+    const uint32_t mvPacked = packHalf2(-speedPx, 0.0f);
+    float contrast = 0.0f;
+
+    for (int t = 0; t < kFrames; ++t) {
+        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), kW, kH, phaseCount);
+        fb.resize(kW, kH);
+        std::fill(fb.depth.begin(), fb.depth.end(), kFgDepth);
+        std::fill(fb.motion.begin(), fb.motion.end(), mvPacked);
+
+        for (uint32_t iy = 16; iy < kH - 16; ++iy) {
+            for (uint32_t ix = 0; ix < kW; ++ix) {
+                const float ux = static_cast<float>(ix) + 0.5f - j.pixelX;
+                const float wx = ux - speedPx * static_cast<float>(t);
+                const int cell = static_cast<int>(std::floor(wx * 0.5f)) & 1;
+                const float v = cell ? 0.90f : 0.10f;
+                fb.color[static_cast<size_t>(iy) * kW + ix] = packRgba8(v, v, v);
+            }
+        }
+
+        if (!gpu.uploadAndEvaluate(backend, fb, j.pixelX, j.pixelY,
+                                   t > 0 ? prevJ.pixelX : 0.0f,
+                                   t > 0 ? prevJ.pixelY : 0.0f,
+                                   t == 0, outPixels, 0.0f)) {
+            return 0.0f;
+        }
+        prevJ = j;
+
+        if (t == kFrames - 1) {
+            double rowMinSum = 0.0, rowMaxSum = 0.0;
+            int rows = 0;
+            for (uint32_t y = 32; y < 96; ++y) {
+                float rMin = 1.0f, rMax = 0.0f;
+                for (uint32_t x = 48; x < 96; ++x) {
+                    const float l = pixelLuma(outPixels[static_cast<size_t>(y) * kW + x]);
+                    rMin = std::min(rMin, l);
+                    rMax = std::max(rMax, l);
+                }
+                rowMinSum += rMin;
+                rowMaxSum += rMax;
+                ++rows;
+            }
+            contrast = static_cast<float>((rowMaxSum - rowMinSum) / rows);
+        }
+    }
+    return contrast;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2058,6 +2262,32 @@ int main(int argc, char** argv) {
             allOk &= verifyVerticalThinLines(
                 "Native_D3D11_TAA", gpu, taaBackend,
                 taaBackend.recommendedJitterPhaseCount(32u, 128, 128, 128, 128));
+
+            const auto boxM = measureUnvectoredMovingTexturedBox(gpu, taaBackend);
+            std::printf("  [Native_D3D11_TAA] UnvectoredBox(+3px/f, mv=0): maxTrail=%.4f meanTrail=%.4f interiorContrast=%.4f\n",
+                        boxM.maxTrailGhost, boxM.meanTrailGhost, boxM.interiorContrast);
+            if (!(boxM.maxTrailGhost < 0.05f && boxM.interiorContrast >= 0.45f)) {
+                std::printf("  -> FAIL: Unvectored moving textured box failed (maxTrail=%.4f >= 0.05 or contrast=%.4f < 0.45)\n",
+                            boxM.maxTrailGhost, boxM.interiorContrast);
+                allOk = false;
+            }
+
+            const float thinGhost = measureUnvectoredMovingThinLineGhost(gpu, taaBackend);
+            std::printf("  [Native_D3D11_TAA] UnvectoredThin1px(+2px/f, mv=0): maxTrail=%.4f\n", thinGhost);
+            if (!(thinGhost < 0.06f)) {
+                std::printf("  -> FAIL: Unvectored moving 1px line trailed (maxTrail=%.4f >= 0.06)\n", thinGhost);
+                allOk = false;
+            }
+
+            const float sharp05 = measureVectoredFractionalSharpness(gpu, taaBackend, 0.5f);
+            const float sharp15 = measureVectoredFractionalSharpness(gpu, taaBackend, 1.5f);
+            std::printf("  [Native_D3D11_TAA] VectoredGrating2px contrast: @0.5px/f=%.4f @1.5px/f=%.4f\n",
+                        sharp05, sharp15);
+            if (!(sharp05 >= 0.40f && sharp15 >= 0.40f)) {
+                std::printf("  -> FAIL: Vectored fractional-speed grating smeared (0.5=%.4f, 1.5=%.4f < 0.40)\n",
+                            sharp05, sharp15);
+                allOk = false;
+            }
         }
 
         // Verify TaaPass allocates DXGI_FORMAT_R16G16B16A16_FLOAT history buffers even for 8-bit LDR output
@@ -2272,6 +2502,7 @@ int main(int argc, char** argv) {
         };
         const ShaderCase cases[] = {
             { edpe::kTaaPrepassShader,  sizeof(edpe::kTaaPrepassShader) - 1,  "cs_taa_prepass",   "cs_5_0" },
+            { edpe::kTaaPatchDivShader, sizeof(edpe::kTaaPatchDivShader) - 1, "cs_taa_patch_div", "cs_5_0" },
             { edpe::kTaaResolveShader,  sizeof(edpe::kTaaResolveShader) - 1,  "cs_taa_resolve",   "cs_5_0" },
             { edpe::kTaaPostRcasShader, sizeof(edpe::kTaaPostRcasShader) - 1, "cs_taa_post_rcas", "cs_5_0" },
             { edpe::kTaaBlitShader,     sizeof(edpe::kTaaBlitShader) - 1,     "cs_taa_debug",     "cs_5_0" },
