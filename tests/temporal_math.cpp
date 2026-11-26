@@ -978,6 +978,27 @@ int main() {
         std::memcpy(badPrologue + 16, &offFlags, sizeof(offFlags));
         std::memcpy(badPrologue + 32, &offBound, sizeof(offBound));
         if (edpe::cobra_camera::verifyRefreshFunctionBytes(badPrologue, sizeof(badPrologue))) return 152;
+
+        // Exact .pdata RUNTIME_FUNCTION entry checks
+        size_t funcBytes = 0;
+        constexpr uintptr_t kFakeBase = 0x140000000ull;
+        if (!edpe::cobra_camera::isExactFunctionEntry(
+                kFakeBase + 0x05921F0u, kFakeBase, 0x05921F0u, 0x0592490u, &funcBytes) ||
+            funcBytes != 0x2A0u) {
+            return 153;
+        }
+        if (edpe::cobra_camera::isExactFunctionEntry(
+                kFakeBase + 0x0592200u, kFakeBase, 0x05921F0u, 0x0592490u, &funcBytes)) {
+            return 154;
+        }
+        if (edpe::cobra_camera::isExactFunctionEntry(
+                kFakeBase + 0x05921F0u, kFakeBase, 0x05921F0u, 0x05921F0u, &funcBytes)) {
+            return 155;
+        }
+        if (edpe::cobra_camera::isExactFunctionEntry(
+                kFakeBase + 0x05921F0u, kFakeBase, 0x0592490u, 0x05921F0u, &funcBytes)) {
+            return 156;
+        }
     }
 
     // -------------------------------------------------------------------------

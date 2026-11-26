@@ -1,8 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string>
+#include <vector>
 #include <filesystem>
 #include <fstream>
 #include <cmath>
@@ -368,6 +371,92 @@ public:
         }
     }
 
+    static bool parseEliteCustomConfigVersion(const std::wstring& filename, std::vector<uint32_t>& outVersion) {
+        outVersion.clear();
+        std::wstring lower = filename;
+        for (auto& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
+
+        constexpr wchar_t kPrefix[] = L"custom.";
+        constexpr wchar_t kSuffix[] = L".fxcfg";
+        constexpr size_t kPrefixLen = (sizeof(kPrefix) / sizeof(kPrefix[0])) - 1;
+        constexpr size_t kSuffixLen = (sizeof(kSuffix) / sizeof(kSuffix[0])) - 1;
+        if (lower.size() <= kPrefixLen + kSuffixLen) return false;
+        if (lower.compare(0, kPrefixLen, kPrefix) != 0) return false;
+        if (lower.compare(lower.size() - kSuffixLen, kSuffixLen, kSuffix) != 0) return false;
+
+        const std::wstring verStr = lower.substr(kPrefixLen, lower.size() - kPrefixLen - kSuffixLen);
+        size_t pos = 0;
+        while (pos <= verStr.size()) {
+            const size_t dot = verStr.find(L'.', pos);
+            const size_t end = (dot == std::wstring::npos) ? verStr.size() : dot;
+            if (end == pos) {
+                outVersion.clear();
+                return false;
+            }
+            uint64_t val = 0;
+            for (size_t i = pos; i < end; ++i) {
+                const wchar_t ch = verStr[i];
+                if (ch < L'0' || ch > L'9') {
+                    outVersion.clear();
+                    return false;
+                }
+                val = val * 10u + static_cast<uint64_t>(ch - L'0');
+                if (val > (std::numeric_limits<uint32_t>::max)()) {
+                    outVersion.clear();
+                    return false;
+                }
+            }
+            outVersion.push_back(static_cast<uint32_t>(val));
+            if (dot == std::wstring::npos) break;
+            pos = dot + 1;
+        }
+        return !outVersion.empty();
+    }
+
+    static std::filesystem::path resolveEliteGraphicsConfigPathInDir(const std::filesystem::path& gfxDir) {
+        std::error_code ec;
+        if (!std::filesystem::exists(gfxDir, ec) || !std::filesystem::is_directory(gfxDir, ec)) {
+            return {};
+        }
+
+        auto isVersionGreater = [](const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+            const size_t n = (std::max)(a.size(), b.size());
+            for (size_t i = 0; i < n; ++i) {
+                const uint32_t va = (i < a.size()) ? a[i] : 0u;
+                const uint32_t vb = (i < b.size()) ? b[i] : 0u;
+                if (va != vb) return va > vb;
+            }
+            return a.size() > b.size();
+        };
+
+        std::filesystem::path bestVersionedPath;
+        std::vector<uint32_t> bestVersion;
+        std::filesystem::path unversionedPath;
+
+        for (const auto& entry : std::filesystem::directory_iterator(gfxDir, ec)) {
+            if (ec) break;
+            std::error_code fileEc;
+            if (!entry.is_regular_file(fileEc)) continue;
+            const std::wstring name = entry.path().filename().wstring();
+            std::vector<uint32_t> ver;
+            if (parseEliteCustomConfigVersion(name, ver)) {
+                if (bestVersionedPath.empty() || isVersionGreater(ver, bestVersion)) {
+                    bestVersion = std::move(ver);
+                    bestVersionedPath = entry.path();
+                }
+                continue;
+            }
+            std::wstring lower = name;
+            for (auto& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
+            if (lower == L"custom.fxcfg" && unversionedPath.empty()) {
+                unversionedPath = entry.path();
+            }
+        }
+
+        if (!bestVersionedPath.empty()) return bestVersionedPath;
+        return unversionedPath;
+    }
+
     static std::filesystem::path resolveEliteGraphicsConfigPath() {
         wchar_t localAppData[MAX_PATH]{};
         const DWORD envLen = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
@@ -375,13 +464,7 @@ public:
 
         std::filesystem::path gfxDir = std::filesystem::path(localAppData) /
             L"Frontier Developments" / L"Elite Dangerous" / L"Options" / L"Graphics";
-        std::filesystem::path cfgPath = gfxDir / L"Custom.4.4.fxcfg";
-        std::error_code ec;
-        if (!std::filesystem::exists(cfgPath, ec)) {
-            cfgPath = gfxDir / L"Custom.4.0.fxcfg";
-            if (!std::filesystem::exists(cfgPath, ec)) return {};
-        }
-        return cfgPath;
+        return resolveEliteGraphicsConfigPathInDir(gfxDir);
     }
 
     static float parseEliteSsaaMultiplierXml(const std::string& content) {
@@ -482,7 +565,7 @@ public:
         return edpe::isRunningInEliteProcess();
     }
 
-    // Synchronizes Elite Dangerous's Custom.4.4.fxcfg <SSAAMultiplier> with the selected
+    // Synchronizes Elite Dangerous's Custom.*.fxcfg <SSAAMultiplier> with the selected
     // EDPE UpscaleMode so Cobra renders the 3D scene at true lower internal resolution.
     bool syncEliteGraphicsConfig() const {
         if (!autoSyncEliteConfig || !isRunningInEliteProcess()) return false;

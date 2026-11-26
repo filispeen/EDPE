@@ -252,6 +252,65 @@ int main() {
             return fail(46, "fallback mode=4 MipLODBias != -1.0");
         }
     }
+
+    // 8. Dynamic Custom.*.fxcfg discovery tests.
+    {
+        const std::filesystem::path gfxDir =
+            std::filesystem::temp_directory_path() / L"edpe_fxcfg_discovery_test";
+        std::error_code ec;
+        std::filesystem::remove_all(gfxDir, ec);
+
+        // Missing directory -> empty path
+        if (!Config::resolveEliteGraphicsConfigPathInDir(gfxDir).empty()) {
+            return fail(50, "nonexistent dir must return empty path");
+        }
+
+        std::filesystem::create_directories(gfxDir, ec);
+        if (!Config::resolveEliteGraphicsConfigPathInDir(gfxDir).empty()) {
+            std::filesystem::remove_all(gfxDir, ec);
+            return fail(51, "empty dir must return empty path");
+        }
+
+        auto touchFile = [&](const wchar_t* name) {
+            std::ofstream f(gfxDir / name, std::ios::binary);
+            f << "<Graphics/>";
+        };
+
+        // Malformed names only -> empty path
+        touchFile(L"Custom..fxcfg");
+        touchFile(L"Custom.abc.fxcfg");
+        touchFile(L"Custom.4.4.fxcfg.bak");
+        touchFile(L"GraphicsConfiguration.xml");
+        if (!Config::resolveEliteGraphicsConfigPathInDir(gfxDir).empty()) {
+            std::filesystem::remove_all(gfxDir, ec);
+            return fail(52, "malformed names must be ignored");
+        }
+
+        // Unversioned fallback when only Custom.fxcfg exists
+        touchFile(L"Custom.fxcfg");
+        if (Config::resolveEliteGraphicsConfigPathInDir(gfxDir).filename() != L"Custom.fxcfg") {
+            std::filesystem::remove_all(gfxDir, ec);
+            return fail(53, "expected Custom.fxcfg fallback");
+        }
+
+        // Numeric version ordering: 4.10 > 4.4 > 4.0 (must beat lexicographical string order)
+        touchFile(L"Custom.4.0.fxcfg");
+        touchFile(L"Custom.4.4.fxcfg");
+        touchFile(L"Custom.4.10.fxcfg");
+        if (Config::resolveEliteGraphicsConfigPathInDir(gfxDir).filename() != L"Custom.4.10.fxcfg") {
+            std::filesystem::remove_all(gfxDir, ec);
+            return fail(54, "expected Custom.4.10.fxcfg to beat Custom.4.4.fxcfg");
+        }
+
+        // Major bump: 5.0 > 4.10
+        touchFile(L"Custom.5.0.fxcfg");
+        if (Config::resolveEliteGraphicsConfigPathInDir(gfxDir).filename() != L"Custom.5.0.fxcfg") {
+            std::filesystem::remove_all(gfxDir, ec);
+            return fail(55, "expected Custom.5.0.fxcfg to beat Custom.4.10.fxcfg");
+        }
+
+        std::filesystem::remove_all(gfxDir, ec);
+    }
 #endif
 
     std::printf("atomic_file_test PASSED\n");

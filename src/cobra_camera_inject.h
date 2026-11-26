@@ -25,10 +25,8 @@ namespace edpe::cobra_camera {
 // RVA constants in EliteDangerous64.exe (Odyssey 4.3.1.1):
 //   0x05921F0 : view-constant refresh entry (FUN_1405921f0)
 //   0x0592300 : mid-function tangent / matrix finalizer site
-//   0x1096640 : ICameraTargetShip::SetTarget (cockpit vehicle rig attach)
 constexpr uintptr_t kViewConstRefreshEntryRva = 0x05921F0;
 constexpr uintptr_t kViewConstRefreshSiteRva  = 0x0592300;
-constexpr uintptr_t kShipSetTargetRva         = 0x1096640;
 
 // Deferred lighting shader hashes (Pass 35 / Deferred lighting CB2 slot 2):
 constexpr uint64_t kDeferredLightingVsHash = 0x7E38A6AA1269C901ull;
@@ -153,6 +151,22 @@ private:
     size_t m_count = 0;
     std::atomic<uint32_t> m_pendingAtomic{0};
 };
+
+// Verifies that targetAddr matches the exact PE .pdata function start (imageBase + beginRva)
+// and computes the function byte span so witness scanning cannot cross into adjacent functions.
+inline bool isExactFunctionEntry(
+    uintptr_t targetAddr,
+    uintptr_t imageBase,
+    uint32_t beginRva,
+    uint32_t endRva,
+    size_t* outFuncBytes = nullptr) noexcept {
+    if (!targetAddr || !imageBase || endRva <= beginRva) return false;
+    if (imageBase + static_cast<uintptr_t>(beginRva) != targetAddr) return false;
+    if (outFuncBytes) {
+        *outFuncBytes = static_cast<size_t>(endRva - beginRva);
+    }
+    return true;
+}
 
 // Verifies x64 prologue bytes AND camera field offset witnesses (+0x250 dirty flags
 // and at least one frustum/camera bound offset witness: +0x28C/+0x290/+0x228/+0x22C/+0x264)
@@ -1210,31 +1224,6 @@ inline bool buildRefreshStubs(
 }
 
 // ============================================================================
-// Cockpit Vehicle Rig Tracker (ICameraTargetShip::SetTarget RVA 0x1096640)
-// ============================================================================
-struct VehicleRigState {
-    std::atomic<const void*> activeShipTarget{nullptr};
-    float prevShipWorld[12]{};
-    float currShipWorld[12]{};
-    bool hasValidRig = false;
-};
-
-inline VehicleRigState& vehicleRig() {
-    static VehicleRigState s;
-    return s;
-}
-
-using ShipSetTargetFn = void*(__fastcall*)(void* thisPtr, const void* targetEntity);
-inline ShipSetTargetFn g_origShipSetTarget = nullptr;
-
-inline void* __fastcall detourShipSetTarget(void* thisPtr, const void* targetEntity) {
-    if (targetEntity) {
-        vehicleRig().activeShipTarget.store(targetEntity, std::memory_order_relaxed);
-    }
-    return g_origShipSetTarget ? g_origShipSetTarget(thisPtr, targetEntity) : nullptr;
-}
-
-// ============================================================================
 // Status.json GuiFocus 6..9 Map Mode Detector (Galaxy Map, System Map, Orrery, FSS)
 // ============================================================================
 class MapFocusPoller {
@@ -1341,7 +1330,8 @@ public:
         if (!exeMod) return false;
         const auto baseAddr = reinterpret_cast<uintptr_t>(exeMod);
 
-        // 1. Verify prologue AND camera field offset witnesses before touching executable memory.
+        // 1. Verify exact .pdata function entry, prologue, AND camera field offset witnesses
+        //    bounded by the function's own RUNTIME_FUNCTION span before touching executable memory.
         auto* refreshTarget = reinterpret_cast<uint8_t*>(baseAddr + kViewConstRefreshEntryRva);
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(refreshTarget, &mbi, sizeof(mbi)) &&
@@ -1351,7 +1341,18 @@ public:
             const size_t availBytes = (regionEnd > reinterpret_cast<uintptr_t>(refreshTarget))
                 ? static_cast<size_t>(regionEnd - reinterpret_cast<uintptr_t>(refreshTarget))
                 : 0;
-            if (verifyRefreshFunctionBytes(refreshTarget, availBytes)) {
+            DWORD64 pdataImageBase = 0;
+            PRUNTIME_FUNCTION rtFn = RtlLookupFunctionEntry(
+                reinterpret_cast<DWORD64>(refreshTarget), &pdataImageBase, nullptr);
+            size_t funcBytes = 0;
+            const bool exactEntry = (rtFn != nullptr) && isExactFunctionEntry(
+                reinterpret_cast<uintptr_t>(refreshTarget),
+                static_cast<uintptr_t>(pdataImageBase),
+                rtFn->BeginAddress,
+                rtFn->EndAddress,
+                &funcBytes);
+            const size_t scanBytes = exactEntry ? (std::min)(availBytes, funcBytes) : 0;
+            if (exactEntry && verifyRefreshFunctionBytes(refreshTarget, scanBytes)) {
                 g_gate.store(0, std::memory_order_release);
                 constexpr size_t kStubPageSize = 512;
                 m_stubPage = static_cast<uint8_t*>(CodeHook::allocateNear(refreshTarget, kStubPageSize));
@@ -1378,29 +1379,7 @@ public:
                     }
                 }
             } else {
-                EdpeLog(L"EDPE: Cobra view-constant refresh prologue/witness mismatch; using D3D11 CB fallback");
-            }
-        }
-
-        // 2. Optional vehicle rig hook at RVA 0x1096640 (hold-open for process lifetime).
-        auto* rigTarget = reinterpret_cast<uint8_t*>(baseAddr + kShipSetTargetRva);
-        if (VirtualQuery(rigTarget, &mbi, sizeof(mbi)) &&
-            mbi.State == MEM_COMMIT &&
-            (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
-            const uint8_t b0 = rigTarget[0];
-            const uint8_t b1 = rigTarget[1];
-            if ((b0 == 0x48 && (b1 == 0x89 || b1 == 0x83 || b1 == 0x8B)) ||
-                (b0 == 0x40 && (b1 >= 0x50 && b1 <= 0x57))) {
-                void* origRig = nullptr;
-                m_rigHook.setHoldOpen(true);
-                if (m_rigHook.prepareTrampoline(rigTarget, &origRig)) {
-                    g_origShipSetTarget = reinterpret_cast<ShipSetTargetFn>(origRig);
-                    if (m_rigHook.commitPatch(reinterpret_cast<void*>(&detourShipSetTarget))) {
-                        EdpeLog(L"EDPE: Cockpit vehicle rig target hook installed (RVA 0x1096640)");
-                    } else {
-                        g_origShipSetTarget = nullptr;
-                    }
-                }
+                EdpeLog(L"EDPE: Cobra view-constant refresh entry/witness mismatch; using D3D11 CB fallback");
             }
         }
 
@@ -1433,7 +1412,6 @@ private:
     std::atomic<bool> m_attempted{false};
     std::atomic<bool> m_viewRefreshHooked{false};
     CodeHook m_refreshHook;
-    CodeHook m_rigHook;
     uint8_t* m_stubPage = nullptr;
 };
 
