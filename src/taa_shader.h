@@ -229,7 +229,7 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
         disocclusion = allowStaticReactive ? reactive : 0.0f;
     }
 
-    // 3. Thin-Feature Detection (isolated 1px ridges/wires, excluding monotonic step edges & bevels)
+    // 3. Thin-Feature Detection (1px luma ridges across asymmetric horizon + 1px depth spikes)
     float thinFeature = 0.0f;
     if (!centerIsSky) {
         float lC = TonemapLuma(centerRgb, effectiveHdr);
@@ -242,11 +242,15 @@ void cs_taa_prepass(uint3 dtid : SV_DispatchThreadID) {
         float vRidge = min(abs(lC - lU), abs(lC - lD));
         float hSameSign = ((lC - lL) * (lC - lR) > 0.0f) ? 1.0f : 0.0f;
         float vSameSign = ((lC - lU) * (lC - lD) > 0.0f) ? 1.0f : 0.0f;
-        float hSym = saturate(1.5f - abs(lL - lR) / max(hRidge, 1e-4f));
-        float vSym = saturate(1.5f - abs(lU - lD) / max(vRidge, 1e-4f));
+        float hSym = saturate(3.5f - abs(lL - lR) / max(hRidge, 1e-4f));
+        float vSym = saturate(3.5f - abs(lU - lD) / max(vRidge, 1e-4f));
 
         float ridgeStrength = max(hRidge * hSameSign * hSym, vRidge * vSameSign * vSym);
-        thinFeature = saturate((ridgeStrength - 0.070f) * 8.0f) * (1.0f - disocclusion);
+        float lumaThin = saturate((ridgeStrength - 0.048f) * 10.0f);
+        float depthThin = (hasDepth && !isCockpitStatic &&
+            ((centerDepthRaw > dL * 1.04f && centerDepthRaw > dR * 1.04f) ||
+             (centerDepthRaw > dU * 1.04f && centerDepthRaw > dD * 1.04f))) ? 1.0f : 0.0f;
+        thinFeature = max(lumaThin, depthThin) * (1.0f - disocclusion);
     }
 
     g_OutPrepass[px] = float4(dilatedMvUV, disocclusion, thinFeature);
@@ -309,6 +313,7 @@ void cs_taa_patch_div(uint3 dtid : SV_DispatchThreadID) {
     for (int dy = 0; dy < 4; ++dy) {
         [unroll]
         for (int dx = 0; dx < 4; ++dx) {
+            if (((dx + dy) & 1) != 0) continue; // Checkerboard 8/16 subsample (50% fewer fetches)
             int2 rp = clamp(basePx + int2(dx, dy), int2(0, 0), maxRenderPx);
             float4 pre = g_Prepass.Load(int3(rp, 0));
             // Exclude disoccluded silhouette pixels so silhouette motion never poisons the 4x4 block.
@@ -335,7 +340,7 @@ void cs_taa_patch_div(uint3 dtid : SV_DispatchThreadID) {
         }
     }
 
-    if (validCount < 8) {
+    if (validCount < 4) {
         g_OutPatchDiv[hp] = float2(0.0f, 0.0f);
         return;
     }
@@ -561,7 +566,8 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     float3 centerYCoCg  = 0.0f;
     float  centerAlpha  = 1.0f;
 
-    float3 yccGrid[9];
+    float  yTL = 0.0f, yTR = 0.0f, yBL = 0.0f, yBR = 0.0f;
+    float3 cT  = 0.0f, cB  = 0.0f, cL  = 0.0f, cR  = 0.0f;
     float filterSigma = lerp(0.47f, 0.36f, saturate(velMagPx * 0.25f + disocc + patchDiv));
 
     [unroll]
@@ -574,7 +580,20 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
                 centerAlpha = rawSample.a;
             }
             float3 ycc = RGBToYCoCg(TonemapForward(rawSample.rgb, effectiveHdr));
-            yccGrid[(dy + 1) * 3 + (dx + 1)] = ycc;
+
+            if (dy == -1) {
+                if (dx == -1) yTL = ycc.x;
+                else if (dx == 0) cT = ycc;
+                else yTR = ycc.x;
+            } else if (dy == 0) {
+                if (dx == -1) cL = ycc;
+                else if (dx == 0) centerYCoCg = ycc;
+                else cR = ycc;
+            } else {
+                if (dx == -1) yBL = ycc.x;
+                else if (dx == 0) cB = ycc;
+                else yBR = ycc.x;
+            }
 
             m1 += ycc;
             m2 += ycc * ycc;
@@ -585,9 +604,6 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
             if (abs(dx) + abs(dy) <= 1) {
                 minCross = min(minCross, ycc);
                 maxCross = max(maxCross, ycc);
-            }
-            if (dx == 0 && dy == 0) {
-                centerYCoCg = ycc;
             }
 
             float w = FilterWeight(float2(dx, dy) - fracOffset, filterSigma);
@@ -613,12 +629,13 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     float3 histTm;
     float4 prevAux;
     float  prevSamples = 0.0f;
+    bool isExactStatHistory = !offscreen && ((hasClass && mClass == kClassCockpitStatic) || velMagPx < 0.05f);
     if (offscreen) {
         histTm  = YCoCgToRGB(filteredCurr);
         prevAux = float4(0.0f, 0.0f, 0.0f, 0.0f);
         prevSamples = 0.0f;
         disocc  = 1.0f;
-    } else if ((hasClass && mClass == kClassCockpitStatic) || velMagPx < 0.05f) {
+    } else if (isExactStatHistory) {
         histTm  = TonemapForward(g_HistoryColor.Load(int3(px, 0)).rgb, effectiveHdr);
         prevAux = g_HistoryAux.Load(int3(px, 0));
         prevSamples = prevAux.x;
@@ -655,7 +672,7 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     float prevOsc         = prevAux.z;
     float prevSignedDelta = prevAux.w;
 
-    // 3. 2D Vector velocity shock + Sign-alternating oscillation + Thin-feature lock update
+    // 3. 2D Vector velocity shock + Thin-feature lock update
     float velShock = 0.0f;
     if (!offscreen && hasPrevPrepass) {
         float2 prevMvUV = g_PrevPrepass.SampleLevel(g_PointClamp, clamp(prevUV, 0.0f, 1.0f), 0.0f).xy;
@@ -664,30 +681,8 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     }
 
     float stationaryWeight = saturate(1.0f - velMagPx * 4.0f);
-    float centerDrop = histYCoCg.x - centerYCoCg.x;
-    float neighborShifted = 0.0f;
-    if (stationaryWeight > 0.0f && prevLockLife > 0.05f && thin < 0.05f && abs(centerDrop) > 0.08f) {
-        // Probe +-2..3 px (beyond +-0.5 px Halton jitter excursion) to detect real thin-line
-        // translation without false-triggering on stationary sub-pixel jittered lines.
-        static const int2 kShiftOffs[8] = {
-            int2(-2, 0), int2(2, 0), int2(0, -2), int2(0, 2),
-            int2(-3, 0), int2(3, 0), int2(0, -3), int2(0, 3)
-        };
-        [unroll]
-        for (int si = 0; si < 8; ++si) {
-            int2 sp = clamp(baseRenderPx + kShiftOffs[si], int2(0, 0), maxRenderPx);
-            float cN = RGBToYCoCg(TonemapForward(g_CurrColor.Load(int3(sp, 0)).rgb, effectiveHdr)).x;
-            float2 hUv = clamp(prevUV + float2(kShiftOffs[si]) * outputRes.zw, 0.0f, 1.0f);
-            float hN = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, hUv, 0.0f).rgb, effectiveHdr)).x;
-            float nGain = cN - hN;
-            if (nGain * centerDrop > 0.015f && abs(hN - centerYCoCg.x) < 0.15f) {
-                neighborShifted = 1.0f;
-            }
-        }
-    }
-
-    float killLock = saturate(disocc + reactive * 1.5f + velShock + patchDiv * 1.5f + neighborShifted * 1.5f);
-    float lockLife = max(prevLockLife * 0.86f, thin) * (1.0f - killLock);
+    float killLock = saturate(disocc + reactive * 1.5f + velShock + patchDiv * 1.5f);
+    float lockLife = max(prevLockLife * 0.90f, thin) * (1.0f - killLock);
 
     // 4. Variance Clipping + Clip-Toward-Curr + Motion-Gated Instability
 )" R"(
@@ -713,62 +708,121 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     float lockBoxExpand = lockLife * (1.0f - saturate(patchDiv * 2.0f));
     float3 clipMin = lerp(max(varMin, boxMinEff), varMin, lockBoxExpand);
     float3 clipMax = lerp(min(varMax, boxMaxEff), varMax, lockBoxExpand);
-    if (patchDiv > 0.10f || neighborShifted > 0.5f) {
+    if (patchDiv > 0.10f) {
         clipMin = max(clipMin, min3x3);
         clipMax = min(clipMax, max3x3);
     }
 
-    float3 clipTarget = lerp(0.5f * (clipMin + clipMax), filteredCurr, saturate(patchDiv + neighborShifted));
+    float3 clipTarget = lerp(0.5f * (clipMin + clipMax), filteredCurr, saturate(patchDiv));
     float maUnit = 0.0f;
     float3 clippedHist = ClipAABBToward(clipMin, clipMax, clipTarget, histYCoCg, maUnit);
 
-    // Sub-pixel (<1px) stationary thin-ridge retention across missed Halton jitter phases.
-    // Gated by maUnit > 1.0 so unclipped pixels skip all 8 extra history loads.
+    // Gated by maUnit > 1.0 so unclipped pixels skip both neighbor shift probes and ridge loads.
     float statRidgeWeight = stationaryWeight * (1.0f - killLock);
+    float neighborShifted = 0.0f;
     float histThinRidge = 0.0f;
-    if (maUnit > 1.0f && statRidgeWeight > 0.0f && prevLockLife > 0.05f &&
-        neighborShifted < 0.5f && patchDiv < 0.10f) {
-        float2 ht = outputRes.zw;
-        float hL  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(-ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
-        float hR  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2( ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
-        float hU  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(0.0f, -ht.y), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
-        float hD  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(0.0f,  ht.y), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
-        float hL2 = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(-2.0f * ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
-        float hR2 = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2( 2.0f * ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
-        float hU2 = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(0.0f, -2.0f * ht.y), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
-        float hD2 = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(0.0f,  2.0f * ht.y), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
+    if (maUnit > 1.0f && statRidgeWeight > 0.0f && patchDiv < 0.10f) {
+        float centerDrop = histYCoCg.x - centerYCoCg.x;
+        if (thin < 0.05f && abs(centerDrop) > 0.08f) {
+            // Probe +-2..3 px only when neighbor lacked prior thin lock (nPrevLock < 0.05),
+            // preventing false firing on static parallel railings spaced 2-3 px apart.
+            static const int2 kShiftOffs[8] = {
+                int2(-2, 0), int2(2, 0), int2(0, -2), int2(0, 2),
+                int2(-3, 0), int2(3, 0), int2(0, -3), int2(0, 3)
+            };
+            [unroll]
+            for (int si = 0; si < 8; ++si) {
+                float nPrevLock = 0.0f;
+                float hN = 0.0f;
+                if (isExactStatHistory) {
+                    int2 hp = clamp(px + kShiftOffs[si], int2(0, 0), maxOutPx);
+                    nPrevLock = g_HistoryAux.Load(int3(hp, 0)).y;
+                    hN = RGBToYCoCg(TonemapForward(g_HistoryColor.Load(int3(hp, 0)).rgb, effectiveHdr)).x;
+                } else {
+                    float2 hUv = clamp(prevUV + float2(kShiftOffs[si]) * outputRes.zw, 0.0f, 1.0f);
+                    nPrevLock = g_HistoryAux.SampleLevel(g_LinearClamp, hUv, 0.0f).y;
+                    hN = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, hUv, 0.0f).rgb, effectiveHdr)).x;
+                }
+                if (nPrevLock < 0.05f) {
+                    int2 sp = clamp(baseRenderPx + kShiftOffs[si], int2(0, 0), maxRenderPx);
+                    float cN = RGBToYCoCg(TonemapForward(g_CurrColor.Load(int3(sp, 0)).rgb, effectiveHdr)).x;
+                    float nGain = cN - hN;
+                    if (nGain * centerDrop > 0.025f && abs(hN - centerYCoCg.x) < 0.06f) {
+                        neighborShifted = 1.0f;
+                    }
+                }
+            }
+        }
 
-        float ridgeX = max(0.0f, abs(histYCoCg.x - 0.5f * (hL + hR)) - 0.5f * abs(hL - hR));
-        float ridgeY = max(0.0f, abs(histYCoCg.x - 0.5f * (hU + hD)) - 0.5f * abs(hU - hD));
-        float ridge2X = max(
-            min(max(0.0f, abs(histYCoCg.x - 0.5f * (hL2 + hR)) - 0.5f * abs(hL2 - hR)),
-                max(0.0f, abs(hL - 0.5f * (hL2 + hR)) - 0.5f * abs(hL2 - hR))),
-            min(max(0.0f, abs(histYCoCg.x - 0.5f * (hL + hR2)) - 0.5f * abs(hL - hR2)),
-                max(0.0f, abs(hR - 0.5f * (hL + hR2)) - 0.5f * abs(hL - hR2))));
-        float ridge2Y = max(
-            min(max(0.0f, abs(histYCoCg.x - 0.5f * (hU2 + hD)) - 0.5f * abs(hU2 - hD)),
-                max(0.0f, abs(hU - 0.5f * (hU2 + hD)) - 0.5f * abs(hU2 - hD))),
-            min(max(0.0f, abs(histYCoCg.x - 0.5f * (hU + hD2)) - 0.5f * abs(hU - hD2)),
-                max(0.0f, abs(hD - 0.5f * (hU + hD2)) - 0.5f * abs(hU - hD2))));
-        float ridgeStr = max(max(ridgeX, ridgeY), 0.85f * max(ridge2X, ridge2Y));
-        histThinRidge = saturate((ridgeStr - 0.008f) * 28.0f);
-        clippedHist = lerp(clippedHist, histYCoCg, 0.97f * statRidgeWeight * histThinRidge * saturate(prevLockLife * 2.0f));
+        if (neighborShifted > 0.5f) {
+            killLock = 1.0f;
+            lockLife = 0.0f;
+            float3 tightMin = max(varMin, min3x3);
+            float3 tightMax = min(varMax, max3x3);
+            clippedHist = ClipAABBToward(tightMin, tightMax, filteredCurr, histYCoCg, maUnit);
+        } else if (prevLockLife > 0.05f) {
+            // Sub-pixel (<1px) stationary thin-ridge retention across missed Halton phases.
+            float hL, hR, hU, hD, hL2, hR2, hU2, hD2;
+            if (isExactStatHistory) {
+                hL  = RGBToYCoCg(TonemapForward(g_HistoryColor.Load(int3(clamp(px + int2(-1,  0), int2(0, 0), maxOutPx), 0)).rgb, effectiveHdr)).x;
+                hR  = RGBToYCoCg(TonemapForward(g_HistoryColor.Load(int3(clamp(px + int2( 1,  0), int2(0, 0), maxOutPx), 0)).rgb, effectiveHdr)).x;
+                hU  = RGBToYCoCg(TonemapForward(g_HistoryColor.Load(int3(clamp(px + int2( 0, -1), int2(0, 0), maxOutPx), 0)).rgb, effectiveHdr)).x;
+                hD  = RGBToYCoCg(TonemapForward(g_HistoryColor.Load(int3(clamp(px + int2( 0,  1), int2(0, 0), maxOutPx), 0)).rgb, effectiveHdr)).x;
+                hL2 = RGBToYCoCg(TonemapForward(g_HistoryColor.Load(int3(clamp(px + int2(-2,  0), int2(0, 0), maxOutPx), 0)).rgb, effectiveHdr)).x;
+                hR2 = RGBToYCoCg(TonemapForward(g_HistoryColor.Load(int3(clamp(px + int2( 2,  0), int2(0, 0), maxOutPx), 0)).rgb, effectiveHdr)).x;
+                hU2 = RGBToYCoCg(TonemapForward(g_HistoryColor.Load(int3(clamp(px + int2( 0, -2), int2(0, 0), maxOutPx), 0)).rgb, effectiveHdr)).x;
+                hD2 = RGBToYCoCg(TonemapForward(g_HistoryColor.Load(int3(clamp(px + int2( 0,  2), int2(0, 0), maxOutPx), 0)).rgb, effectiveHdr)).x;
+            } else {
+                float2 ht = outputRes.zw;
+                hL  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(-ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
+                hR  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2( ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
+                hU  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(0.0f, -ht.y), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
+                hD  = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(0.0f,  ht.y), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
+                hL2 = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(-2.0f * ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
+                hR2 = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2( 2.0f * ht.x, 0.0f), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
+                hU2 = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(0.0f, -2.0f * ht.y), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
+                hD2 = RGBToYCoCg(TonemapForward(g_HistoryColor.SampleLevel(g_LinearClamp, clamp(prevUV + float2(0.0f,  2.0f * ht.y), 0.0f, 1.0f), 0.0f).rgb, effectiveHdr)).x;
+            }
+
+            float ridgeX = max(0.0f, abs(histYCoCg.x - 0.5f * (hL + hR)) - 0.5f * abs(hL - hR));
+            float ridgeY = max(0.0f, abs(histYCoCg.x - 0.5f * (hU + hD)) - 0.5f * abs(hU - hD));
+            float ridge2X = max(
+                min(max(0.0f, abs(histYCoCg.x - 0.5f * (hL2 + hR)) - 0.5f * abs(hL2 - hR)),
+                    max(0.0f, abs(hL - 0.5f * (hL2 + hR)) - 0.5f * abs(hL2 - hR))),
+                min(max(0.0f, abs(histYCoCg.x - 0.5f * (hL + hR2)) - 0.5f * abs(hL - hR2)),
+                    max(0.0f, abs(hR - 0.5f * (hL + hR2)) - 0.5f * abs(hL - hR2))));
+            float ridge2Y = max(
+                min(max(0.0f, abs(histYCoCg.x - 0.5f * (hU2 + hD)) - 0.5f * abs(hU2 - hD)),
+                    max(0.0f, abs(hU - 0.5f * (hU2 + hD)) - 0.5f * abs(hU2 - hD))),
+                min(max(0.0f, abs(histYCoCg.x - 0.5f * (hU + hD2)) - 0.5f * abs(hU - hD2)),
+                    max(0.0f, abs(hD - 0.5f * (hU + hD2)) - 0.5f * abs(hU - hD2))));
+            float ridgeStr = max(max(ridgeX, ridgeY), 0.85f * max(ridge2X, ridge2Y));
+            histThinRidge = saturate((ridgeStr - 0.006f) * 30.0f);
+            clippedHist = lerp(clippedHist, histYCoCg, 0.98f * statRidgeWeight * histThinRidge);
+            lockLife = max(lockLife, prevLockLife * 0.94f * histThinRidge * statRidgeWeight);
+        }
     }
 
-    // Motion-gated instability: dampens stationary/slow-pan jitter shimmer while NEVER
-    // trapping trailing history behind unvectored moving objects (patchDiv / neighborShifted / large maUnit).
+    // Motion-gated instability & thin-feature protection (extends smoothly through slow pan < 1.25 px/f).
+    float slowThinWeight = saturate(1.0f - velMagPx * 0.8f);
+    float thinProtect = saturate(max(lockLife * slowThinWeight, histThinRidge * statRidgeWeight) * 2.0f);
+
     float lumaDiff = abs(histYCoCg.x - centerYCoCg.x);
-    float excThresh = (velMagPx > 0.05f && velMagPx < 0.75f) ? 2.40f : 1.65f;
+    bool quietStat = (velMagPx < 0.15f && patchDiv < 0.05f && neighborShifted < 0.5f);
+    float excThresh = quietStat ? 3.20f : ((velMagPx > 0.05f && velMagPx < 0.75f) ? 2.40f : 1.65f);
     float clipDist = abs(histYCoCg.x - clippedHist.x) + 0.5f * length(histYCoCg.yz - clippedHist.yz);
     float significantClip = smoothstep(0.045f, 0.12f, clipDist);
-    float clipExcursion = saturate((maUnit - excThresh) * 2.0f) * significantClip * (1.0f - lockLife * stationaryWeight) * (1.0f - histThinRidge * statRidgeWeight);
+    float clipExcursion = saturate((maUnit - excThresh) * 2.0f) * significantClip * (1.0f - thinProtect);
     float unvectoredFlag = saturate(patchDiv + neighborShifted + clipExcursion);
     float rawInstab = saturate((lumaDiff - 0.04f) * 6.0f) * (1.0f - disocc) * (1.0f - reactive) * (1.0f - unvectoredFlag);
     float oscillation = lerp(prevOsc * 0.85f, rawInstab, 0.35f) * (1.0f - unvectoredFlag);
     float currDelta = centerYCoCg.x - histYCoCg.x;
 
     // 5. Progressive convergence + Resample-Blur Compensation + Clip Rejection
-    float clipReject = saturate((maUnit - excThresh) * 0.45f) * significantClip * (1.0f - lockLife * stationaryWeight) * (1.0f - histThinRidge * statRidgeWeight);
+    float clipReject = saturate((maUnit - excThresh) * 0.45f) * significantClip * (1.0f - thinProtect);
+    if (quietStat) {
+        clipReject *= 0.25f;
+    }
     float sampleDecay = saturate(disocc + reactive * 0.85f + patchDiv * 0.85f + neighborShifted * 0.85f + clipReject * 0.65f + velShock * 0.50f);
     float validSamples = prevSamples * (1.0f - sampleDecay);
     float newSamples   = min(validSamples + 1.0f, 64.0f);
@@ -782,7 +836,7 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     float minAlphaEff = lerp(jitterAndAlpha.z, jitterAndAlpha.w, motionBoost);
     minAlphaEff = max(minAlphaEff, max(max(patchDiv * 0.65f, neighborShifted * 0.65f), clipReject * 0.45f));
 
-    float flickerDamp = lerp(1.0f, 0.35f,
+    float flickerDamp = lerp(1.0f, 0.25f,
         max(oscillation, max(lockLife, histThinRidge)) * (1.0f - saturate(killLock + clipReject + unvectoredFlag)));
     float alpha = max(convAlpha * lerp(1.0f, flickerDamp, saturate((newSamples - 6.0f) * 0.20f)),
                       max(minAlphaEff * flickerDamp, resampleBlur * 0.16f));
@@ -790,16 +844,13 @@ void cs_taa_resolve(uint3 dtid : SV_DispatchThreadID) {
     // Zero-fetch Edge-Aware Spatial AA fallback when history is thin (disocclusion / fast motion)
     float3 currForBlend = (newSamples < 2.0f) ? lerp(centerYCoCg, filteredCurr, 0.85f) : filteredCurr;
     if (newSamples < 2.5f) {
-        float yTL = yccGrid[0].x, yT = yccGrid[1].x, yTR = yccGrid[2].x;
-        float yL  = yccGrid[3].x,                    yR  = yccGrid[5].x;
-        float yBL = yccGrid[6].x, yB = yccGrid[7].x, yBR = yccGrid[8].x;
-        float gx = (yTR + 2.0f * yR + yBR) - (yTL + 2.0f * yL + yBL);
-        float gy = (yBL + 2.0f * yB + yBR) - (yTL + 2.0f * yT + yTR);
+        float gx = (yTR + 2.0f * cR.x + yBR) - (yTL + 2.0f * cL.x + yBL);
+        float gy = (yBL + 2.0f * cB.x + yBR) - (yTL + 2.0f * cT.x + yTR);
         float edgeMag = sqrt(gx * gx + gy * gy);
         if (edgeMag > 0.08f) {
             bool horizEdge = abs(gy) >= abs(gx);
-            float3 tA = horizEdge ? yccGrid[3] : yccGrid[1];
-            float3 tB = horizEdge ? yccGrid[5] : yccGrid[7];
+            float3 tA = horizEdge ? cL : cT;
+            float3 tB = horizEdge ? cR : cB;
             float3 tangentAvg = 0.5f * (tA + tB);
             float aaWeight = 0.28f * saturate((2.5f - newSamples) * 0.67f) * saturate((edgeMag - 0.08f) * 3.0f);
             currForBlend = lerp(currForBlend, tangentAvg, aaWeight);

@@ -59,13 +59,24 @@ bool isFloatColorFormat(DXGI_FORMAT fmt) {
     }
 }
 
+bool isWineRuntimeTaa() {
+    static const bool s_wine = []() {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+    }();
+    return s_wine;
+}
+
 bool compileTaaShaderBlob(const char* source, size_t sourceLen,
                           const char* entryPoint, const char* profile,
                           Microsoft::WRL::ComPtr<ID3DBlob>& outBlob) {
     Microsoft::WRL::ComPtr<ID3DBlob> errBlob;
-    // Compile with -O1 for Wine/Proton d3dcompiler_47 (vkd3d-shader) compatibility.
+    // Compile with -O1 on Wine/Proton for d3dcompiler_47 (vkd3d-shader) safety, -O3 on native Windows.
+    const UINT compileFlags = isWineRuntimeTaa()
+        ? D3DCOMPILE_OPTIMIZATION_LEVEL1
+        : D3DCOMPILE_OPTIMIZATION_LEVEL3;
     const HRESULT hr = D3DCompile(source, sourceLen, nullptr, nullptr, nullptr,
-        entryPoint, profile, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &outBlob, &errBlob);
+        entryPoint, profile, compileFlags, 0, &outBlob, &errBlob);
     if (FAILED(hr) || !outBlob) {
         wchar_t errWide[256]{};
         if (errBlob && errBlob->GetBufferPointer() && errBlob->GetBufferSize() > 0) {

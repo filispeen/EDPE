@@ -2463,6 +2463,99 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // Parallel Horizon Railings: two 0.75px bars spaced 2.5px apart straddling bright-wall/dark-floor horizon
+            {
+                constexpr uint32_t kPw = 128;
+                constexpr uint32_t kPh = 128;
+                if (!gpu.ensureSurfaces(kPw, kPh, kPw, kPh)) {
+                    allOk = false;
+                } else {
+                    constexpr int kFrames = 48;
+                    constexpr int kWarmup = 16;
+                    const unsigned phaseCount = taaBackend.recommendedJitterPhaseCount(32u, kPw, kPh, kPw, kPh);
+                    FrameBuffers fb;
+                    std::vector<uint32_t> outPixels;
+                    std::vector<float> peakSeries;
+                    std::vector<std::vector<float>> bandFrames;
+                    edpe::ProjectionJitter prevJ{};
+
+                    for (int t = 0; t < kFrames; ++t) {
+                        const auto j = edpe::projectionJitter(static_cast<uint64_t>(t), kPw, kPh, phaseCount);
+                        fb.resize(kPw, kPh);
+                        for (uint32_t iy = 0; iy < kPh; ++iy) {
+                            const float uy = static_cast<float>(iy) + 0.5f - j.pixelY;
+                            const bool inBar1 = std::fabs(uy - 62.25f) <= 0.375f;
+                            const bool inBar2 = std::fabs(uy - 64.75f) <= 0.375f;
+                            for (uint32_t ix = 0; ix < kPw; ++ix) {
+                                const size_t idx = static_cast<size_t>(iy) * kPw + ix;
+                                if (inBar1 || inBar2) {
+                                    fb.color[idx] = packRgba8(0.85f, 0.85f, 0.85f);
+                                    fb.depth[idx] = kFgDepth;
+                                } else if (uy < 64.0f) {
+                                    fb.color[idx] = packRgba8(0.35f, 0.35f, 0.35f);
+                                    fb.depth[idx] = kBgDepth;
+                                } else {
+                                    fb.color[idx] = packRgba8(0.05f, 0.05f, 0.05f);
+                                    fb.depth[idx] = kBgDepth;
+                                }
+                            }
+                        }
+                        if (!gpu.uploadAndEvaluate(taaBackend, fb, j.pixelX, j.pixelY,
+                                                   t > 0 ? prevJ.pixelX : 0.0f,
+                                                   t > 0 ? prevJ.pixelY : 0.0f,
+                                                   t == 0, outPixels, 0.0f)) {
+                            allOk = false;
+                            break;
+                        }
+                        prevJ = j;
+
+                        if (t >= kWarmup) {
+                            double colPeakSum = 0.0;
+                            std::vector<float> band;
+                            band.reserve(80u * 8u);
+                            for (uint32_t x = 24; x < 104; ++x) {
+                                float colMax = 0.0f;
+                                for (uint32_t y = 60; y <= 67; ++y) {
+                                    const float l = pixelLuma(outPixels[static_cast<size_t>(y) * kPw + x]);
+                                    colMax = std::max(colMax, l);
+                                    band.push_back(l);
+                                }
+                                colPeakSum += colMax;
+                            }
+                            peakSeries.push_back(static_cast<float>(colPeakSum / 80.0));
+                            bandFrames.push_back(std::move(band));
+                        }
+                    }
+
+                    if (peakSeries.size() >= 2 && bandFrames.size() >= 2) {
+                        auto [mn, mx] = std::minmax_element(peakSeries.begin(), peakSeries.end());
+                        const float peakSpan = *mx - *mn;
+                        double pkSum = 0.0;
+                        for (float v : peakSeries) pkSum += v;
+                        const float meanPeak = static_cast<float>(pkSum / peakSeries.size());
+                        double sqD = 0.0;
+                        size_t dCnt = 0;
+                        for (size_t f = 1; f < bandFrames.size(); ++f) {
+                            for (size_t k = 0; k < bandFrames[f].size(); ++k) {
+                                const double d = static_cast<double>(bandFrames[f][k] - bandFrames[f - 1][k]);
+                                sqD += d * d;
+                                ++dCnt;
+                            }
+                        }
+                        const float rmsDelta = dCnt > 0 ? static_cast<float>(std::sqrt(sqD / dCnt)) : 999.0f;
+                        std::printf("  [Native_D3D11_TAA] ParallelHorizonRailings(2.5px): span=%.4f rms=%.4f meanPeak=%.4f\n",
+                                    peakSpan, rmsDelta, meanPeak);
+                        if (!(rmsDelta < 0.008f && peakSpan < 0.06f && meanPeak >= 0.30f)) {
+                            std::printf("  -> FAIL: Parallel horizon railings flickered or faded (span=%.4f rms=%.4f pk=%.4f)\n",
+                                        peakSpan, rmsDelta, meanPeak);
+                            allOk = false;
+                        }
+                    } else {
+                        allOk = false;
+                    }
+                }
+            }
+
             const auto boxM = measureUnvectoredMovingTexturedBox(gpu, taaBackend);
             std::printf("  [Native_D3D11_TAA] UnvectoredBox(+3px/f, mv=0): maxTrail=%.4f meanTrail=%.4f interiorContrast=%.4f\n",
                         boxM.maxTrailGhost, boxM.meanTrailGhost, boxM.interiorContrast);
