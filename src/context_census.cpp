@@ -1555,9 +1555,12 @@ std::atomic<bool> draw_instanced_hook_active{false};
 // Only change it through the helpers below. observedMap/observedUnmap only compare the pointer.
 std::atomic<ID3D11Buffer*> scene_map_target{nullptr};
 
-void setSceneMapTarget(ID3D11Buffer* buffer) {
+// Returns the previous target. It has been released, so use it for logging or comparison only.
+ID3D11Buffer* setSceneMapTarget(ID3D11Buffer* buffer) {
     if (buffer) buffer->AddRef();
-    if (ID3D11Buffer* old = scene_map_target.exchange(buffer, std::memory_order_acq_rel)) old->Release();
+    ID3D11Buffer* old = scene_map_target.exchange(buffer, std::memory_order_acq_rel);
+    if (old) old->Release();
+    return old;
 }
 
 void setSceneMapTargetIfEmpty(ID3D11Buffer* buffer) {
@@ -1569,8 +1572,8 @@ void setSceneMapTargetIfEmpty(ID3D11Buffer* buffer) {
     }
 }
 
-void clearSceneMapTarget() {
-    setSceneMapTarget(nullptr);
+ID3D11Buffer* clearSceneMapTarget() {
+    return setSceneMapTarget(nullptr);
 }
 
 // Called once per Present: when EDPE holds the last reference, the game has dropped the buffer.
@@ -9327,9 +9330,8 @@ void endDrawProbe() {
     EdpeLog(message);
     dumpFirstSceneShader();
     dumpSceneShaders();
-    // Only the address is logged below; drop the reference first.
-    auto* map_target = scene_map_target.load(std::memory_order_acquire);
-    clearSceneMapTarget();
+    // The returned address is only logged below; the reference is already dropped.
+    auto* map_target = clearSceneMapTarget();
     scene_mapped_data.store(nullptr, std::memory_order_release);
     const bool map_restored = map_hook_active.load(std::memory_order_acquire);
     const bool unmap_restored = unmap_hook_active.load(std::memory_order_acquire);
