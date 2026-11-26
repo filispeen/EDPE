@@ -2214,6 +2214,47 @@ int main(int argc, char** argv) {
                         std::printf("  -> FAIL: UpscalerManager::evaluate modified TAA history in-place when destinationTexture == nullptr\n");
                         allOk = false;
                     }
+
+                    // Verify [TAA] RcasSharpness == 0.0f ignores Upscaler::Sharpness (0.85f),
+                    // while RcasSharpness > 0 writes to display texture without mutating historyTexture_.
+                    edpe::TaaSettings ts{};
+                    ts.rcasSharpness = 0.0f;
+                    ts.debugView = 0;
+                    mgr.setTaaSettings(ts);
+                    std::vector<uint16_t> dispNoRcas, histAfterRcas, dispWithRcas;
+                    const bool ok2 = mgr.evaluate(gpu.context.Get(), in, nullptr, nullptr, false);
+                    const bool rb2 = ok2 && readBackFp16(mgr.getTaaLatestDisplayTexture(), dispNoRcas);
+                    if (!rb2 || mgr.getTaaLatestDisplayTexture() != mgr.getTaaLatestOutputTexture()) {
+                        std::printf("  -> FAIL: RcasSharpness=0.0f should expose untouched history directly\n");
+                        allOk = false;
+                    }
+
+                    ts.rcasSharpness = 0.60f;
+                    mgr.setTaaSettings(ts);
+                    in.sharpness = 0.0f;
+                    const bool ok3 = mgr.evaluate(gpu.context.Get(), in, nullptr, nullptr, false);
+                    const bool rb3a = ok3 && readBackFp16(mgr.getTaaLatestOutputTexture(), histAfterRcas);
+                    const bool rb3b = ok3 && readBackFp16(mgr.getTaaLatestDisplayTexture(), dispWithRcas);
+                    if (!rb3a || !rb3b || histAfterRcas != histNoSharp || dispWithRcas == histNoSharp) {
+                        std::printf("  -> FAIL: PostRCAS either mutated historyTexture_ or failed to sharpen displayTexture\n");
+                        allOk = false;
+                    }
+
+                    // Verify DebugView 1..4 run cleanly without mutating historyTexture_
+                    for (int dv = 1; dv <= 4; ++dv) {
+                        ts.debugView = dv;
+                        mgr.setTaaSettings(ts);
+                        std::vector<uint16_t> histDv, dispDv;
+                        const bool okDv = mgr.evaluate(gpu.context.Get(), in, nullptr, nullptr, false);
+                        if (!okDv ||
+                            !readBackFp16(mgr.getTaaLatestOutputTexture(), histDv) ||
+                            !readBackFp16(mgr.getTaaLatestDisplayTexture(), dispDv) ||
+                            histDv != histNoSharp) {
+                            std::printf("  -> FAIL: TAA DebugView=%d failed or mutated history\n", dv);
+                            allOk = false;
+                        }
+                    }
+                    mgr.setTaaSettings(edpe::TaaSettings{});
                     mgr.shutdown();
                 }
             }

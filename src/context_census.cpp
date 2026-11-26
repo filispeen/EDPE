@@ -12047,16 +12047,15 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
             !isHdrColor &&
             (outFormat == edpe::TaaPass::kHistoryFormat) &&
             !s_cmp_seq.active &&
-            !s_hud_debug_view.load(std::memory_order_relaxed) &&
-            (inputs.sharpness <= 0.0f ||
-             (preAllowBackbufferWrite && (s_backbuffer_rtv != nullptr || s_backbuffer_uav != nullptr) && !fg_active));
+            !s_hud_debug_view.load(std::memory_order_relaxed);
         if (useTaaZeroCopy) {
             upscaler.setTaaOutputFormat(outFormat);
         }
         const bool canDeferSharpen =
+            (activeBackend != edpe::UpscalerBackend::Taa) &&
             (inputs.sharpness > 0.0f) &&
             !isHdrColor &&
-            ((evalDestination == s_dlss_output_texture.Get() && s_dlss_output_srv != nullptr) || useTaaZeroCopy) &&
+            (evalDestination == s_dlss_output_texture.Get() && s_dlss_output_srv != nullptr) &&
             preAllowBackbufferWrite &&
             (s_backbuffer_rtv != nullptr || s_backbuffer_uav != nullptr) &&
             !fg_active;
@@ -12138,9 +12137,9 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
                 s_hud_debug_view.load(std::memory_order_relaxed);
 
             ID3D11Texture2D* resolvedWorldTex =
-                useTaaZeroCopy ? upscaler.getTaaLatestOutputTexture() : evalDestination;
+                useTaaZeroCopy ? upscaler.getTaaLatestDisplayTexture() : evalDestination;
             ID3D11ShaderResourceView* resolvedWorldSrv =
-                useTaaZeroCopy ? upscaler.getTaaLatestOutputSrv() : s_dlss_output_srv.Get();
+                useTaaZeroCopy ? upscaler.getTaaLatestDisplaySrv() : s_dlss_output_srv.Get();
             const bool hasOffscreenWorldOutput =
                 (resolvedWorldTex != nullptr && resolvedWorldTex != backbuffer && resolvedWorldSrv != nullptr);
 
@@ -14256,7 +14255,7 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
                 upscaler.setMode(static_cast<edpe::UpscaleMode>(m));
             }
         }
-        ContextCensusRefreshMipLodBias();
+        ContextCensusApplyTaaSettings();
         edpe::FgRuntime::instance().applyConfig(
             cfg.frameGenBackend,
             cfg.frameGenMultiplier,
@@ -15825,6 +15824,19 @@ void ContextCensusRefreshMipLodBias() {
         samplerMgr.setForceAniso16x(false);
         samplerMgr.setNativeTaaBiasGuard(false);
     }
+}
+
+void ContextCensusApplyTaaSettings() {
+    const auto& cfg = edpe::Config::instance();
+    edpe::TaaSettings ts{};
+    ts.minAlpha = cfg.taaMinAlpha;
+    ts.maxAlpha = cfg.taaMaxAlpha;
+    ts.baseGamma = cfg.taaBaseGamma;
+    ts.lockMaxGamma = cfg.taaLockMaxGamma;
+    ts.rcasSharpness = cfg.taaRcasSharpness;
+    ts.debugView = cfg.devMode ? std::clamp(cfg.taaDebugView, 0, 4) : 0;
+    edpe::UpscalerManager::instance().setTaaSettings(ts);
+    ContextCensusRefreshMipLodBias();
 }
 
 void ContextCensusSetZeroMotion(bool zero) {

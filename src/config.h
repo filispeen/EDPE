@@ -77,7 +77,34 @@ public:
             mipLodBiasOffset = 0.0f;
         }
 
+        wchar_t taaBuf[64]{};
+        GetPrivateProfileStringW(L"TAA", L"MinAlpha", L"0.045", taaBuf, 64, path.c_str());
+        taaMinAlpha = static_cast<float>(_wtof(taaBuf));
+        if (!std::isfinite(taaMinAlpha)) taaMinAlpha = 0.045f;
+        taaMinAlpha = std::clamp(taaMinAlpha, 0.01f, 0.25f);
+
+        GetPrivateProfileStringW(L"TAA", L"MaxAlpha", L"0.25", taaBuf, 64, path.c_str());
+        taaMaxAlpha = static_cast<float>(_wtof(taaBuf));
+        if (!std::isfinite(taaMaxAlpha)) taaMaxAlpha = 0.25f;
+        taaMaxAlpha = std::clamp(taaMaxAlpha, taaMinAlpha, 0.60f);
+
+        GetPrivateProfileStringW(L"TAA", L"BaseGamma", L"1.15", taaBuf, 64, path.c_str());
+        taaBaseGamma = static_cast<float>(_wtof(taaBuf));
+        if (!std::isfinite(taaBaseGamma)) taaBaseGamma = 1.15f;
+        taaBaseGamma = std::clamp(taaBaseGamma, 0.50f, 2.50f);
+
+        GetPrivateProfileStringW(L"TAA", L"LockMaxGamma", L"2.25", taaBuf, 64, path.c_str());
+        taaLockMaxGamma = static_cast<float>(_wtof(taaBuf));
+        if (!std::isfinite(taaLockMaxGamma)) taaLockMaxGamma = 2.25f;
+        taaLockMaxGamma = std::clamp(taaLockMaxGamma, taaBaseGamma, 3.50f);
+
+        GetPrivateProfileStringW(L"TAA", L"RcasSharpness", L"0.30", taaBuf, 64, path.c_str());
+        taaRcasSharpness = static_cast<float>(_wtof(taaBuf));
+        if (!std::isfinite(taaRcasSharpness)) taaRcasSharpness = 0.30f;
+        taaRcasSharpness = std::clamp(taaRcasSharpness, 0.0f, 1.0f);
+
         taaForceAniso16x = GetPrivateProfileIntW(L"TAA", L"ForceAniso16x", 1, path.c_str()) != 0;
+        taaDebugView = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"TAA", L"DebugView", 0, path.c_str())), 0, 4);
 
         frameGenBackend = GetPrivateProfileIntW(L"FrameGeneration", L"Backend", 0, path.c_str());
         if (frameGenBackend < 0 || frameGenBackend > 2) frameGenBackend = 0;
@@ -279,7 +306,13 @@ public:
         appendFloat("MipLodBiasOffset", "%.2f", mipLodBiasOffset);
 
         appendSection("TAA");
+        appendFloat("MinAlpha", "%.3f", taaMinAlpha);
+        appendFloat("MaxAlpha", "%.2f", taaMaxAlpha);
+        appendFloat("BaseGamma", "%.2f", taaBaseGamma);
+        appendFloat("LockMaxGamma", "%.2f", taaLockMaxGamma);
+        appendFloat("RcasSharpness", "%.2f", taaRcasSharpness);
         appendBool("ForceAniso16x", taaForceAniso16x);
+        appendInt("DebugView", taaDebugView);
 
         appendSection("FrameGeneration");
         appendInt("Backend", frameGenBackend);
@@ -627,7 +660,13 @@ public:
     float sharpness = 0.0f;
     float fsrVelocityFactor = 0.50f;
     float mipLodBiasOffset = 0.0f;
+    float taaMinAlpha = 0.045f;
+    float taaMaxAlpha = 0.25f;
+    float taaBaseGamma = 1.15f;
+    float taaLockMaxGamma = 2.25f;
+    float taaRcasSharpness = 0.30f;
     bool taaForceAniso16x = true;
+    int taaDebugView = 0; // 0=Off, 1=Disocclusion, 2=ThinFeatureLock, 3=LumaInstability, 4=SampleCount
     bool autoSyncEliteConfig = true;
     bool preserveNativeUi = true;
     bool hdrInput = false;

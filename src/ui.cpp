@@ -1990,25 +1990,44 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
 
             // Sharpening
             if (!backend_active) ImGui::BeginDisabled();
-            float curSharpness = ContextCensusGetSharpness();
-            if (ImGui::SliderFloat("Sharpening", &curSharpness, 0.0f, 1.0f, "%.2f")) {
-                ContextCensusSetSharpness(curSharpness);
-            }
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                cfg.save();
-            }
-            if (backend_active && curSharpness > 0.0f) {
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Reset##Sharpness")) {
-                    ContextCensusSetSharpness(0.0f);
+            if (taa_active) {
+                float curRcas = cfg.taaRcasSharpness;
+                if (ImGui::SliderFloat("TAA RCAS Sharpness", &curRcas, 0.0f, 1.0f, "%.2f")) {
+                    cfg.taaRcasSharpness = std::clamp(curRcas, 0.0f, 1.0f);
+                    ContextCensusApplyTaaSettings();
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
                     cfg.save();
+                }
+                if (std::fabs(cfg.taaRcasSharpness - 0.30f) > 0.005f) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Reset##TaaRcas")) {
+                        cfg.taaRcasSharpness = 0.30f;
+                        ContextCensusApplyTaaSettings();
+                        cfg.save();
+                    }
+                }
+            } else {
+                float curSharpness = ContextCensusGetSharpness();
+                if (ImGui::SliderFloat("Sharpening", &curSharpness, 0.0f, 1.0f, "%.2f")) {
+                    ContextCensusSetSharpness(curSharpness);
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    cfg.save();
+                }
+                if (backend_active && curSharpness > 0.0f) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Reset##Sharpness")) {
+                        ContextCensusSetSharpness(0.0f);
+                        cfg.save();
+                    }
                 }
             }
             if (!backend_active) {
                 ImGui::EndDisabled();
                 ImGui::TextDisabled("Sharpening requires an active upscaler backend");
             } else if (taa_active) {
-                TextDisabledWrapped("(TAA uses Gaussian de-jitter + fp16 Catmull-Rom history; sharpening applies post-TAA to the output target)");
+                TextDisabledWrapped("(TAAv2 uses 5-tap Catmull-Rom, plane-predicted disocclusion, thin-feature lock, and instability-aware PostRCAS outside history)");
                 const auto gfxWarn = edpe::Config::readEliteGraphicsWarnings();
                 if (!cfg.hdrInput && gfxWarn.aaMode > 0) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.80f, 0.25f, 1.0f));
@@ -2329,6 +2348,61 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                         ui.hud_width, ui.hud_height);
                     if (!ui.hud_window_open && ImGui::Button("Show HUD snapshot"))
                         ui.hud_window_open = true;
+                }
+            }
+
+            // Section 1b: TAAv2 Tuning & Debug
+            if (ImGui::CollapsingHeader("TAAv2 Tuning & Debug")) {
+                bool taaChanged = false;
+                bool taaSaveNow = false;
+                taaChanged |= ImGui::SliderFloat("Min Alpha", &cfg.taaMinAlpha, 0.01f, 0.25f, "%.3f");
+                if (ImGui::IsItemDeactivatedAfterEdit()) taaSaveNow = true;
+                taaChanged |= ImGui::SliderFloat("Max Alpha", &cfg.taaMaxAlpha, 0.05f, 0.60f, "%.2f");
+                if (ImGui::IsItemDeactivatedAfterEdit()) taaSaveNow = true;
+                taaChanged |= ImGui::SliderFloat("Base Gamma", &cfg.taaBaseGamma, 0.50f, 2.50f, "%.2f");
+                if (ImGui::IsItemDeactivatedAfterEdit()) taaSaveNow = true;
+                taaChanged |= ImGui::SliderFloat("Lock Max Gamma", &cfg.taaLockMaxGamma, 1.00f, 3.50f, "%.2f");
+                if (ImGui::IsItemDeactivatedAfterEdit()) taaSaveNow = true;
+                taaChanged |= ImGui::SliderFloat("RCAS Sharpness", &cfg.taaRcasSharpness, 0.0f, 1.0f, "%.2f");
+                if (ImGui::IsItemDeactivatedAfterEdit()) taaSaveNow = true;
+
+                if (ImGui::Checkbox("Force 16x Anisotropic Filtering (TAA)", &cfg.taaForceAniso16x)) {
+                    taaChanged = true;
+                    taaSaveNow = true;
+                }
+                const char* taaDebugItems[] = {
+                    "0: Off",
+                    "1: Disocclusion",
+                    "2: ThinFeatureLock",
+                    "3: LumaInstability",
+                    "4: SampleCount"
+                };
+                if (ImGui::Combo("TAA Debug View", &cfg.taaDebugView, taaDebugItems, IM_ARRAYSIZE(taaDebugItems))) {
+                    taaChanged = true;
+                    taaSaveNow = true;
+                }
+                if (ImGui::Button("Reset TAAv2 Defaults")) {
+                    cfg.taaMinAlpha = 0.045f;
+                    cfg.taaMaxAlpha = 0.25f;
+                    cfg.taaBaseGamma = 1.15f;
+                    cfg.taaLockMaxGamma = 2.25f;
+                    cfg.taaRcasSharpness = 0.30f;
+                    cfg.taaForceAniso16x = true;
+                    cfg.taaDebugView = 0;
+                    taaChanged = true;
+                    taaSaveNow = true;
+                }
+                if (taaChanged) {
+                    cfg.taaMinAlpha = std::clamp(cfg.taaMinAlpha, 0.01f, 0.25f);
+                    cfg.taaMaxAlpha = std::clamp(cfg.taaMaxAlpha, cfg.taaMinAlpha, 0.60f);
+                    cfg.taaBaseGamma = std::clamp(cfg.taaBaseGamma, 0.50f, 2.50f);
+                    cfg.taaLockMaxGamma = std::clamp(cfg.taaLockMaxGamma, cfg.taaBaseGamma, 3.50f);
+                    cfg.taaRcasSharpness = std::clamp(cfg.taaRcasSharpness, 0.0f, 1.0f);
+                    cfg.taaDebugView = std::clamp(cfg.taaDebugView, 0, 4);
+                    ContextCensusApplyTaaSettings();
+                }
+                if (taaSaveNow) {
+                    cfg.save();
                 }
             }
 
