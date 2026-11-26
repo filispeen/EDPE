@@ -7674,6 +7674,13 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
     }
     ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
     bool is_scene_cb = (resource == target);
+    if (is_scene_cb && !isConstantBufferOfWidth(resource, 5376u, false)) {
+        // The map-bounce slots hold 64 KB and the width passed to onMap is not read from the buffer, so verify the
+        // real buffer here. A mismatch means the watched pointer is wrong: drop it and classify the resource normally.
+        if (scene_map_target.load(std::memory_order_acquire) == resource) clearSceneMapTarget();
+        is_scene_cb = false;
+        target = nullptr;
+    }
     const bool jitterActive = ContextCensusIsJitterActive();
     if (!is_scene_cb && !jitterActive && target != nullptr &&
         !vs_buffer_probe_active.load(std::memory_order_relaxed)) {
