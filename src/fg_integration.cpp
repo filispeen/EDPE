@@ -507,7 +507,7 @@ void FgRuntime::releaseBridgeResources() {
     uiPackPassInitialized_ = false;
 }
 
-void FgRuntime::shutdownLocked() {
+void FgRuntime::shutdownLocked(bool keepBridge) {
     nvidiaFgActive_.store(false, std::memory_order_relaxed);
     reflexLimiterActive_.store(false, std::memory_order_relaxed);
     presenter_.setPrePresentCallback(nullptr, nullptr);

@@ -143,7 +143,7 @@ private:
                               uint32_t renderH,
                               uint32_t slot);
     void releaseBridgeResources();
-    void shutdownLocked();
+    void shutdownLocked(bool keepBridge = false);
     void joinProbeThread();
     const wchar_t* backendUnavailableReasonLocked(FrameGenerationBackend backend) const;
 
