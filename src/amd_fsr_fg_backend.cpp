@@ -233,9 +233,12 @@ struct AmdFsrFgBackend::Impl {
 
         ffxQueryGetProviderVersion verQuery{};
         verQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-        if (ffx.Query(&fgCtx, &verQuery.header) == FFX_API_RETURN_OK && verQuery.versionName) {
+        const ffxReturnCode_t verRc = callFfxGuarded(L"ffxQuery(ProviderVersion)", &faulted,
+                                                     [&] { return ffx.Query(&fgCtx, &verQuery.header); });
+        if (verRc == FFX_API_RETURN_OK && verQuery.versionName) {
             providerVersion = verQuery.versionName;
         }
+        if (faulted) return false;
 
         activeWidth = inputs.outputWidth;
         activeHeight = inputs.outputHeight;
@@ -302,7 +305,8 @@ bool AmdFsrFgBackend::initialize(D3D12ProxyPresenter* presenter) {
     wrapDesc.swapchain = &wrappedSc;
     wrapDesc.gameQueue = presenter->bridge().commandQueue();
 
-    const ffxReturnCode_t rc = impl_->ffx.CreateContext(&impl_->swapChainCtx, &wrapDesc.header, nullptr);
+    const ffxReturnCode_t rc = callFfxGuarded(L"ffxCreateContext(SwapChainWrapDX12)", &impl_->faulted,
+                                              [&] { return impl_->ffx.CreateContext(&impl_->swapChainCtx, &wrapDesc.header, nullptr); });
     if (rc != FFX_API_RETURN_OK || !impl_->swapChainCtx || !wrappedSc) {
         logFfxError(L"ffxCreateContext(SwapChainWrapDX12)", rc);
         impl_->swapChainCtx = nullptr;
@@ -314,7 +318,8 @@ bool AmdFsrFgBackend::initialize(D3D12ProxyPresenter* presenter) {
     }
 
     if (!presenter->attachWrappedSwapChain(wrappedSc)) {
-        impl_->ffx.DestroyContext(&impl_->swapChainCtx, nullptr);
+        callFfxGuarded(L"ffxDestroyContext(SwapChain, attach failed)", &impl_->faulted,
+                       [&] { return impl_->ffx.DestroyContext(&impl_->swapChainCtx, nullptr); });
         impl_->swapChainCtx = nullptr;
         presenter->recreatePlainSwapChain();
         return false;
@@ -528,21 +533,25 @@ bool AmdFsrFgBackend::queryGpuMemoryUsage(uint64_t* outFgTotalBytes,
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (!impl_->initialized) return false;
 
-    if (outFgTotalBytes && impl_->fgCtx) {
+    if (outFgTotalBytes && impl_->fgCtx && !impl_->faulted) {
         FfxApiEffectMemoryUsage usage{};
         ffxQueryDescFrameGenerationGetGPUMemoryUsage q{};
         q.header.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE;
         q.gpuMemoryUsageFrameGeneration = &usage;
-        if (impl_->ffx.Query(&impl_->fgCtx, &q.header) == FFX_API_RETURN_OK) {
+        const ffxReturnCode_t queryRc = callFfxGuarded(L"ffxQuery(FrameGeneration memory usage)", &impl_->faulted,
+                                                       [&] { return impl_->ffx.Query(&impl_->fgCtx, &q.header); });
+        if (queryRc == FFX_API_RETURN_OK) {
             *outFgTotalBytes = usage.totalUsageInBytes;
         }
     }
-    if (outSwapChainTotalBytes && impl_->swapChainCtx) {
+    if (outSwapChainTotalBytes && impl_->swapChainCtx && !impl_->faulted) {
         FfxApiEffectMemoryUsage usage{};
         ffxQueryFrameGenerationSwapChainGetGPUMemoryUsageDX12 q{};
         q.header.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_GPU_MEMORY_USAGE_DX12;
         q.gpuMemoryUsageFrameGenerationSwapchain = &usage;
-        if (impl_->ffx.Query(&impl_->swapChainCtx, &q.header) == FFX_API_RETURN_OK) {
+        const ffxReturnCode_t queryRc = callFfxGuarded(L"ffxQuery(SwapChain memory usage)", &impl_->faulted,
+                                                       [&] { return impl_->ffx.Query(&impl_->swapChainCtx, &q.header); });
+        if (queryRc == FFX_API_RETURN_OK) {
             *outSwapChainTotalBytes = usage.totalUsageInBytes;
         }
     }
