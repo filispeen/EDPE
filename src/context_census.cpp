@@ -1579,6 +1579,7 @@ ID3D11Buffer* clearSceneMapTarget() {
 // Clears the target only while it is still `resource`, so a target installed by another thread is kept.
 // The target holds a reference, so an equal pointer is the same object.
 bool clearSceneMapTargetIf(ID3D11Resource* resource) {
+    if (!resource) return false;
     ID3D11Buffer* current = scene_map_target.load(std::memory_order_acquire);
     if (static_cast<ID3D11Resource*>(current) != resource) return false;
     if (!scene_map_target.compare_exchange_strong(current, nullptr, std::memory_order_acq_rel)) return false;
@@ -7369,6 +7370,7 @@ inline void cacheRejectedResource(ID3D11Resource* res) {
 }
 
 inline UINT getCachedDotCbByteWidth(ID3D11Resource* res) {
+    if (!res) return 0; // an empty way is nullptr, so a null resource would match it and read a stale width
     const auto& set = s_accepted_dot_cb_cache[resourceCacheSetIndex(res)];
     if (set.ways[0].load(std::memory_order_acquire) == res) {
         return set.bytes[0].load(std::memory_order_relaxed);
@@ -7380,6 +7382,7 @@ inline UINT getCachedDotCbByteWidth(ID3D11Resource* res) {
 }
 
 inline void evictDotCbResource(ID3D11Resource* res) {
+    if (!res) return;
     auto& set = s_accepted_dot_cb_cache[resourceCacheSetIndex(res)];
     for (size_t w = 0; w < kResourceCacheWays; ++w) {
         ID3D11Resource* expected = res;
@@ -7392,6 +7395,7 @@ inline void evictDotCbResource(ID3D11Resource* res) {
 // description before trusting a cached constant buffer width: bouncing a larger buffer into a 64 KB map-bounce slot
 // let the game overrun the pool and EDPE's static data. GetType plus GetDesc, no QueryInterface.
 inline bool isConstantBufferOfWidth(ID3D11Resource* res, UINT byteWidth, bool requireDynamic) {
+    if (!res) return false;
     D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     res->GetType(&dimension);
     if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER) return false;
@@ -7402,6 +7406,7 @@ inline bool isConstantBufferOfWidth(ID3D11Resource* res, UINT byteWidth, bool re
 }
 
 inline void cacheDotCbResource(ID3D11Resource* res, UINT byteWidth) {
+    if (!res) return;
     auto& set = s_accepted_dot_cb_cache[resourceCacheSetIndex(res)];
     size_t targetWay = kResourceCacheWays;
     if (set.ways[0].load(std::memory_order_relaxed) == res ||
