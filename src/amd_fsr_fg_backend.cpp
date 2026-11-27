@@ -130,7 +130,7 @@ struct AmdFsrFgBackend::Impl {
 
     static ffxReturnCode_t fgDispatchCallback(ffxDispatchDescFrameGeneration* params, void* pUserCtx) {
         auto* self = static_cast<Impl*>(pUserCtx);
-        if (!self || !params || !self->ffx.Dispatch || !self->fgCtx) {
+        if (!self || !params || !self->ffx.Dispatch || !self->fgCtx || self->faulted) {
             return FFX_API_RETURN_ERROR_PARAMETER;
         }
         return callFfxGuarded(L"ffxDispatch(FrameGeneration callback)", &self->faulted,
