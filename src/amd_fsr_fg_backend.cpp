@@ -282,7 +282,9 @@ bool AmdFsrFgBackend::initialize(D3D12ProxyPresenter* presenter) {
 #if defined(EDPE_ENABLE_FFX_FG) && EDPE_ENABLE_FFX_FG
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->initialized && impl_->presenter == presenter) return true;
-    impl_->faulted = false;
+    // A fault belongs to the contexts that threw. Clear it only once none is left, so a throw on a live context
+    // (for example from the present thread) is never discarded by this reset.
+    if (!impl_->fgCtx && !impl_->swapChainCtx) impl_->faulted = false;
     if (!presenter || !presenter->isInitialized() || !presenter->swapChain() ||
         !presenter->bridge().commandQueue()) {
         return false;
