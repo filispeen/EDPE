@@ -1880,6 +1880,9 @@ void UiOnPresent(IDXGISwapChain* swap_chain, UINT flags) {
                                       (upscaler.getBackend() == edpe::UpscalerBackend::Taa) ? 3 : 0;
 
             if (ImGui::Combo("Upscaler Backend", &current_backend_idx, upscaler_items, IM_ARRAYSIZE(upscaler_items))) {
+                // Frame generation goes off first (waiting for its GPU work) and starts again on the next frame,
+                // after the switch, the same as turning it off, switching and turning it back on by hand.
+                edpe::FgRuntime::instance().restartForUpscalerChange();
                 if (current_backend_idx == 4) {
                     if (fsr4_available) {
                         const bool was_fsr = (upscaler.getBackend() == edpe::UpscalerBackend::AmdFsr);

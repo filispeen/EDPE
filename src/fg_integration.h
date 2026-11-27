@@ -92,6 +92,11 @@ public:
 
     void shutdown();
 
+    // Turns frame generation off (waiting for its GPU work) so it starts again on the next frame. Called before an
+    // upscaler backend change, which can change the render size: frame generation must not have GPU work in flight
+    // that still reads the shared textures sized for the old render size.
+    void restartForUpscalerChange();
+
     // Runs lightweight once-per-process capability detection (e.g. DLSS-G adapter check on NVIDIA)
     // without disrupting the active swapchain.
     void ensureCapabilitiesProbed(ID3D11Device* d3d11Device);
@@ -128,6 +133,7 @@ private:
                               uint32_t renderH);
     void releaseBridgeResources();
     void shutdownLocked();
+    bool handleDeviceLostLocked();
     const wchar_t* backendUnavailableReasonLocked(FrameGenerationBackend backend) const;
 
     mutable std::recursive_mutex mutex_;

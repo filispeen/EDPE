@@ -425,6 +425,12 @@ target_include_directories(fsr4_logic_test PRIVATE src)
 target_link_libraries(fsr4_logic_test PRIVATE d3d11 dxgi)
 add_test(NAME fsr4_logic COMMAND fsr4_logic_test)
 
+# Guard that turns a throwing provider call into an error value: CPU only, no GPU or SDK needed.
+add_executable(guarded_call_test tests/guarded_call_test.cpp)
+target_compile_features(guarded_call_test PRIVATE cxx_std_20)
+target_include_directories(guarded_call_test PRIVATE src)
+add_test(NAME guarded_call COMMAND guarded_call_test)
+
 # FSR 4 engine smoke test (skips cleanly when the signed DLLs are not staged or the GPU does not offer FSR 4).
 add_executable(amd_fsr4_engine_test tests/amd_fsr4_engine_test.cpp src/amd_fsr4_engine.cpp src/d3d12_bridge.cpp src/renderdoc_support.cpp src/log.cpp)
 target_compile_features(amd_fsr4_engine_test PRIVATE cxx_std_20)

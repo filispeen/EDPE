@@ -349,8 +349,20 @@ bool FgRuntime::ensureBridgeResources(ID3D11Device* dev11,
     auto& bridge = presenter_.bridge();
     const DXGI_FORMAT cleanOutFmt = canonicalNonSrgbFormat(bbFormat);
 
+    // A size change (for example a new upscaler render size) frees shared textures that the previous frame's
+    // frame generation work on the D3D12 queue may still read. Wait for that queue once before the first one is
+    // freed; freeing them early made the GPU page fault and hung the frame generation device.
+    bool waitedForGpu = false;
+    auto waitBeforeFree = [&](bool exists) {
+        if (exists && !waitedForGpu) {
+            bridge.waitGpuIdle();
+            waitedForGpu = true;
+        }
+    };
+
     if (!sharedHudless_.isValid() || sharedHudless_.width != outW ||
         sharedHudless_.height != outH || sharedHudless_.format != cleanOutFmt) {
+        waitBeforeFree(sharedHudless_.isValid());
         sharedHudless_.reset();
         if (!bridge.createSharedTexture(
                 outW, outH, cleanOutFmt,
@@ -363,6 +375,7 @@ bool FgRuntime::ensureBridgeResources(ID3D11Device* dev11,
     }
 
     if (!sharedUi_.isValid() || sharedUi_.width != outW || sharedUi_.height != outH) {
+        waitBeforeFree(sharedUi_.isValid());
         sharedUiUav_.Reset();
         sharedUi_.reset();
         if (!bridge.createSharedTexture(
@@ -382,6 +395,7 @@ bool FgRuntime::ensureBridgeResources(ID3D11Device* dev11,
     }
 
     if (!sharedDepth_.isValid() || sharedDepth_.width != renderW || sharedDepth_.height != renderH) {
+        waitBeforeFree(sharedDepth_.isValid());
         sharedDepthUav_.Reset();
         sharedDepth_.reset();
         if (!bridge.createSharedTexture(
@@ -401,6 +415,7 @@ bool FgRuntime::ensureBridgeResources(ID3D11Device* dev11,
     }
 
     if (!sharedMvec_.isValid() || sharedMvec_.width != renderW || sharedMvec_.height != renderH) {
+        waitBeforeFree(sharedMvec_.isValid());
         sharedMvec_.reset();
         if (!bridge.createSharedTexture(
                 renderW, renderH, DXGI_FORMAT_R16G16_FLOAT,
@@ -474,6 +489,34 @@ void FgRuntime::shutdownLocked() {
 void FgRuntime::shutdown() {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     shutdownLocked();
+}
+
+void FgRuntime::restartForUpscalerChange() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!presenter_.isInitialized()) return;
+    EdpeLog(L"EDPE FG: frame generation off for the upscaler change; it starts again on the next frame");
+    shutdownLocked();
+}
+
+// When the frame generation D3D12 device is removed (GPU hang or reset), turn frame generation off and keep it off
+// until it is selected again. Without this, every frame reopened shared textures on the dead device and the game
+// eventually stopped responding.
+bool FgRuntime::handleDeviceLostLocked() {
+    if (!presenter_.isInitialized()) return false;
+    ID3D12Device* device = presenter_.bridge().d3d12Device();
+    const HRESULT reason = device ? device->GetDeviceRemovedReason() : S_OK;
+    if (SUCCEEDED(reason)) return false;
+    wchar_t message[256];
+    swprintf_s(message,
+        L"EDPE FG: frame generation D3D12 device lost (reason 0x%08X); frame generation is off until it is selected again",
+        static_cast<unsigned>(reason));
+    EdpeLog(message);
+    failedBackend_ = configuredBackend_;
+    telemetry_.initFailed = true;
+    std::wcsncpy(telemetry_.statusMessage,
+                 L"Off: the frame generation GPU device was lost. Select frame generation again to retry.", 255);
+    shutdownLocked();
+    return true;
 }
 
 void FgRuntime::onResize(IDXGISwapChain* gameSwapChain) {
@@ -651,6 +694,10 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
             return;
         }
         trackedSwapChain_ = gameSwapChain;
+    }
+
+    if (handleDeviceLostLocked()) {
+        return;
     }
 
     if (manager_.selectedBackend() != configuredBackend_) {
