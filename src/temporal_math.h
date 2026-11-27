@@ -181,6 +181,17 @@ inline ProjectionJitter projectionJitter(std::uint64_t frame, unsigned width, un
     };
 }
 
+// True when a viewport covers the full render target (within 1 px), i.e. it is
+// a scene-resolution viewport that should receive the deferred viewport jitter.
+inline bool shouldApplyDeferredViewportJitter(float vpWidth, float vpHeight,
+                                              unsigned renderW, unsigned renderH) {
+    if (renderW == 0u || renderH == 0u) return false;
+    if (!std::isfinite(vpWidth) || !std::isfinite(vpHeight)) return false;
+    const float dw = vpWidth - static_cast<float>(renderW);
+    const float dh = vpHeight - static_cast<float>(renderH);
+    return std::fabs(dw) <= 1.0f && std::fabs(dh) <= 1.0f;
+}
+
 // CPU-only: the observed vertex shaders form clip position as
 // position.x * block[0] + position.y * block[1] + position.z * block[2]
 // + block[3], with each block row containing four float components.
