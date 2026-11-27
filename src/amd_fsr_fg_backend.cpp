@@ -1,5 +1,6 @@
 #include "amd_fsr_fg_backend.h"
 
+#include "guarded_call.h"
 #include "log.h"
 
 #include <cfloat>
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <utility>
 
 #if defined(EDPE_ENABLE_FFX_FG) && EDPE_ENABLE_FFX_FG
 #include <ffx_api.h>
@@ -47,20 +49,14 @@ void logFfxError(const wchar_t* stage, uint32_t rc) {
 }
 
 #if defined(EDPE_ENABLE_FFX_FG) && EDPE_ENABLE_FFX_FG
-// The provider reports some failures (for example after a GPU reset) by throwing a C++ exception instead of
-// returning a code. An escape would abort the game, so a throw is turned into an error code the caller handles.
-// Table-based x64 exception handling costs nothing while nothing throws.
+// A provider call that throws is turned into an error code the caller handles (see guarded_call.h).
 template <typename Call>
 ffxReturnCode_t callFfxGuarded(const wchar_t* stage, std::atomic<bool>* threw, Call&& call) {
-    try {
-        return call();
-    } catch (...) {
-        if (threw) threw->store(true);
+    return callGuarded<ffxReturnCode_t>(FFX_API_RETURN_ERROR, threw, std::forward<Call>(call), [&] {
         wchar_t buf[256]{};
         std::swprintf(buf, 256, L"EDPE AmdFsrFg: %ls threw an exception", stage);
         EdpeLog(buf);
-        return FFX_API_RETURN_ERROR;
-    }
+    });
 }
 #endif
 
