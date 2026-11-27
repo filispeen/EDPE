@@ -27,9 +27,20 @@ constexpr UINT kWmEdpeFgDestroyChild = WM_APP + 0x4E3;
 // overlay teardown, on the window's own thread.
 void requestPresentationReevaluation(HWND parent) {
     if (!parent || !IsWindow(parent)) return;
-    SetWindowPos(parent, nullptr, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    RedrawWindow(parent, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    const BOOL moved = SetWindowPos(parent, nullptr, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    const DWORD moveError = moved ? ERROR_SUCCESS : GetLastError();
+    const BOOL redrawn = RedrawWindow(parent, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    const DWORD redrawError = redrawn ? ERROR_SUCCESS : GetLastError();
+    if (moved && redrawn) {
+        EdpeLog(L"EDPE FG: game window re-evaluated after the overlay window was destroyed");
+        return;
+    }
+    wchar_t message[192];
+    swprintf_s(message,
+        L"EDPE FG: game window re-evaluation failed (SetWindowPos error %lu, RedrawWindow error %lu)",
+        static_cast<unsigned long>(moveError), static_cast<unsigned long>(redrawError));
+    EdpeLog(message);
 }
 
 struct CreateChildParams {
