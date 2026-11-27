@@ -10,6 +10,8 @@ namespace edpe {
 //   u2 OutClass  (R8_UINT):      optional pixel class (when modeFlags bit 2 is set)
 //   u3 OutReactive (R8_UNORM):   optional disocclusion/reactive mask (when modeFlags bit 9 is set)
 inline constexpr char kMotionShader[] = R"(
+// vkd3d-shader (Wine/Proton) lacks SM4 isfinite; NaN/Inf fail this compare. Works for scalars and vectors.
+#define isfinite(x) (abs(x) <= 3.402823e38)
 #ifndef EDPE_MOTION_HAS_WEAPON
 #define EDPE_MOTION_HAS_WEAPON 1
 #endif

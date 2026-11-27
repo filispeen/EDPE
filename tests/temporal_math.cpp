@@ -1155,5 +1155,15 @@ int main() {
         if (!edpe::isEliteSubpassVersusWorldCb1(edo2Cb1.data(), edo2Cb1.size(), adsRifleCam)) return 162;
     }
 
+    // Issue #30: Deferred CB0 viewport jitter must apply only to full-resolution viewports.
+    if (!edpe::shouldApplyDeferredViewportJitter(2560.0f, 1080.0f, 2560u, 1080u)) return 165;
+    if (!edpe::shouldApplyDeferredViewportJitter(2559.5f, 1080.5f, 2560u, 1080u)) return 166;
+    if (edpe::shouldApplyDeferredViewportJitter(320.0f, 135.0f, 2560u, 1080u)) return 167;
+    if (edpe::shouldApplyDeferredViewportJitter(640.0f, 270.0f, 2560u, 1080u)) return 168;
+    if (edpe::shouldApplyDeferredViewportJitter(1280.0f, 540.0f, 2560u, 1080u)) return 169;
+    if (edpe::shouldApplyDeferredViewportJitter(32.0f, 32.0f, 2560u, 1080u)) return 170;
+    if (edpe::shouldApplyDeferredViewportJitter(2560.0f, 1080.0f, 0u, 1080u)) return 171;
+    if (edpe::shouldApplyDeferredViewportJitter(std::numeric_limits<float>::quiet_NaN(), 1080.0f, 2560u, 1080u)) return 172;
+
     return 0; // All temporal math tests passed
 }

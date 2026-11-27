@@ -6502,20 +6502,16 @@ struct DeferredCb0ViewportJitterScope {
             return;
         }
 
-        const float sceneAspect = static_cast<float>(renderW) / static_cast<float>(renderH);
         const float jPx = s_cb0_deferred_vp_jitter_px.load(std::memory_order_relaxed);
         const float jPy = s_cb0_deferred_vp_jitter_py.load(std::memory_order_relaxed);
         D3D11_VIEWPORT adjVps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
         bool anyShifted = false;
         for (UINT i = 0; i < origCount; ++i) {
             adjVps[i] = origVps[i];
-            if (adjVps[i].Width >= 64.0f && adjVps[i].Height >= 64.0f) {
-                const float vpAspect = adjVps[i].Width / adjVps[i].Height;
-                if (std::fabs(vpAspect - sceneAspect) <= 0.10f * sceneAspect) {
-                    adjVps[i].TopLeftX += jPx * (adjVps[i].Width / static_cast<float>(renderW));
-                    adjVps[i].TopLeftY += jPy * (adjVps[i].Height / static_cast<float>(renderH));
-                    anyShifted = true;
-                }
+            if (edpe::shouldApplyDeferredViewportJitter(adjVps[i].Width, adjVps[i].Height, renderW, renderH)) {
+                adjVps[i].TopLeftX += jPx;
+                adjVps[i].TopLeftY += jPy;
+                anyShifted = true;
             }
         }
         if (anyShifted) {
@@ -10702,6 +10698,7 @@ static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_last_fg_motion_tex;
 static unsigned long long s_last_fg_motion_frame = ~0ull;
 static bool s_last_fg_pause_menu = false;
 static int s_last_fg_composite_path = 0;
+static bool s_last_fg_has_hud_draws = false;
 
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_debounced_offscreen_color;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_pending_offscreen_color;
@@ -11899,6 +11896,7 @@ void tryTemporalUpscale(ID3D11DeviceContext* context, unsigned long long rendere
     s_last_fg_motion_frame = rendered;
     s_last_fg_pause_menu = isPauseOrModalMenuActive(rendered);
     s_last_fg_composite_path = 0;
+    s_last_fg_has_hud_draws = false;
     s_last_fg_hudless_texture = (!isHdrColor && colorSource != backbuffer) ? activeColorInputTex : nullptr;
 
     if (!upscale_active) {
@@ -15424,6 +15422,7 @@ void ContextCensusOnSwapChainRelease(IUnknown* object) {
         s_last_fg_pause_menu = false;
         s_last_fg_reset = false;
         s_last_fg_composite_path = 0;
+        s_last_fg_has_hud_draws = false;
         s_hdr_slot0_seen_frame = ~0ull;
         s_consecutive_skipped_frames = 0;
         s_last_skip_counted_frame = ~0ull;
@@ -16227,7 +16226,7 @@ bool ContextCensusGetFgSnapshot(edpe::FgSceneSnapshot* outSnapshot) {
     outSnapshot->depthTex = s_last_temporal_inputs.depth;
     outSnapshot->depthSrv = s_last_temporal_inputs.depthSrv;
     outSnapshot->motionVectorsTex = s_last_fg_motion_tex.Get();
-    if (s_last_fg_composite_path == 1) {
+    if (s_last_fg_composite_path == 1 && s_last_fg_has_hud_draws) {
         auto& uiLayer = edpe::UiLayer::instance();
         outSnapshot->uiHdrSrv = uiLayer.hdrLayerSrv();
         outSnapshot->uiLdrSrv = uiLayer.ldrLayerSrv();

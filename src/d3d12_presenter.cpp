@@ -91,13 +91,18 @@ bool D3D12ProxyPresenter::initialize(ID3D11Device* d3d11Device,
                                      uint32_t bufferCount,
                                      UINT flags) {
     std::unique_lock lock(presentResizeMutex_);
-    shutdown();
+    const bool reuseBridge =
+        (d3d11Device != nullptr) && bridge_.isInitialized() && (bridge_.d3d11Device() == d3d11Device);
+    shutdownInternal(reuseBridge);
 
     if (!d3d11Device || !targetHwnd || !IsWindow(targetHwnd) || !width || !height) {
+        if (reuseBridge) {
+            bridge_.shutdown();
+        }
         return false;
     }
 
-    if (!bridge_.initialize(d3d11Device)) {
+    if (!reuseBridge && !bridge_.initialize(d3d11Device)) {
         return false;
     }
 
@@ -106,7 +111,7 @@ bool D3D12ProxyPresenter::initialize(ID3D11Device* d3d11Device,
     HMODULE sysDxgi = LoadSystemDll(L"dxgi.dll");
     if (!sysDxgi) {
         logPresenterFailure(L"LoadSystemDll(dxgi.dll)", HRESULT_FROM_WIN32(GetLastError()));
-        bridge_.shutdown();
+        shutdownInternal(reuseBridge);
         return false;
     }
 
@@ -114,14 +119,14 @@ bool D3D12ProxyPresenter::initialize(ID3D11Device* d3d11Device,
         GetProcAddress(sysDxgi, "CreateDXGIFactory2"));
     if (!createFactory2) {
         logPresenterFailure(L"GetProcAddress(CreateDXGIFactory2)", HRESULT_FROM_WIN32(GetLastError()));
-        bridge_.shutdown();
+        shutdownInternal(reuseBridge);
         return false;
     }
 
     HRESULT hr = createFactory2(0, IID_PPV_ARGS(&factory_));
     if (FAILED(hr)) {
         logPresenterFailure(L"CreateDXGIFactory2", hr);
-        bridge_.shutdown();
+        shutdownInternal(reuseBridge);
         return false;
     }
 
@@ -148,8 +153,7 @@ bool D3D12ProxyPresenter::initialize(ID3D11Device* d3d11Device,
         &sc1);
     if (FAILED(hr)) {
         logPresenterFailure(L"CreateSwapChainForHwnd(D3D12)", hr);
-        factory_.Reset();
-        bridge_.shutdown();
+        shutdownInternal(reuseBridge);
         return false;
     }
 
@@ -160,8 +164,7 @@ bool D3D12ProxyPresenter::initialize(ID3D11Device* d3d11Device,
     if (FAILED(hr)) {
         logPresenterFailure(L"As(IDXGISwapChain4)", hr);
         sc1.Reset();
-        factory_.Reset();
-        bridge_.shutdown();
+        shutdownInternal(reuseBridge);
         return false;
     }
 
@@ -197,9 +200,9 @@ bool D3D12ProxyPresenter::initialize(ID3D11Device* d3d11Device,
     return true;
 }
 
-void D3D12ProxyPresenter::shutdown() {
-    // Caller may hold presentResizeMutex_ (initialize) or call externally; guard safely.
+void D3D12ProxyPresenter::shutdownInternal(bool keepBridge) {
     bridge_.waitGpuIdle();
+    bridge_.setOverrideCommandQueue(nullptr);
     releaseBackBuffers();
     for (auto& s : sharedInputs_) {
         s.reset();
@@ -215,7 +218,9 @@ void D3D12ProxyPresenter::shutdown() {
     slotHasTimestamp_.fill(false);
     swapChain_.Reset();
     factory_.Reset();
-    bridge_.shutdown();
+    if (!keepBridge) {
+        bridge_.shutdown();
+    }
     targetHwnd_ = nullptr;
     width_ = 0;
     height_ = 0;
@@ -225,6 +230,11 @@ void D3D12ProxyPresenter::shutdown() {
     tearingSupported_ = false;
     lastPresentDoneFence_ = 0;
     initialized_ = false;
+}
+
+void D3D12ProxyPresenter::shutdown(bool keepBridge) {
+    // Caller may hold presentResizeMutex_ or call externally; guard safely.
+    shutdownInternal(keepBridge);
 }
 
 bool D3D12ProxyPresenter::acquireBackBuffers() {

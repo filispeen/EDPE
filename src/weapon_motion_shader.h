@@ -10,6 +10,8 @@ namespace edpe {
 //       z  = canonicalDepth = saturate(rawDepth * worldNear / weaponNear)
 //       w  = 1.0 (valid coverage)
 inline constexpr char kWeaponMotionRasterShader[] = R"(
+// vkd3d-shader (Wine/Proton) lacks SM4 isfinite; NaN/Inf fail this compare. Works for scalars and vectors.
+#define isfinite(x) (abs(x) <= 3.402823e38)
 cbuffer WeaponMotionConstants : register(b0) {
     float4 viewport;      // x: width, y: height, z: worldNear, w: weaponNear
     float4 jitterDelta;   // x: jitterNowX - jitterPrevX, y: jitterNowY - jitterPrevY, z: stripJitter (0 or 1), w: hasSceneDepth (0 or 1)

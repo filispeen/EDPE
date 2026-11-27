@@ -63,5 +63,19 @@ int main() {
     if (std::fabs(rec.box[0] - 397.0f) > 1e-4f || std::fabs(rec.box[2] - 803.0f) > 1e-4f) return 13;
     if (std::fabs(rec.span[3] - 203.0f) > 1e-4f || rec.center[2] < 0.5f) return 14;
 
+    // 6. Issue #30: Stream-Output vertex capacity bounds for TRIANGLELIST and TRIANGLESTRIP.
+    if (edpe::computeWeaponSoVertexCapacity(false, 0u) != 0u) return 15;
+    if (edpe::computeWeaponSoVertexCapacity(false, 2u) != 0u) return 16;
+    if (edpe::computeWeaponSoVertexCapacity(false, 3u) != 3u) return 17;
+    if (edpe::computeWeaponSoVertexCapacity(false, 250000u) != 250000u) return 18;
+    if (edpe::computeWeaponSoVertexCapacity(false, 250001u) != 0u) return 19;
+    if (edpe::computeWeaponSoVertexCapacity(true, 0u) != 0u) return 20;
+    if (edpe::computeWeaponSoVertexCapacity(true, 2u) != 0u) return 21;
+    if (edpe::computeWeaponSoVertexCapacity(true, 3u) != 3u) return 22;
+    if (edpe::computeWeaponSoVertexCapacity(true, 4u) != 6u) return 23;
+    if (edpe::computeWeaponSoVertexCapacity(true, 100u) != 294u) return 24;
+    if (edpe::computeWeaponSoVertexCapacity(true, 83335u) != 249999u) return 25;
+    if (edpe::computeWeaponSoVertexCapacity(true, 83336u) != 0u) return 26;
+
     return 0;
 }

@@ -516,7 +516,7 @@ void FgRuntime::shutdownLocked() {
     }
     manager_.shutdown();
     releaseBridgeResources();
-    presenter_.shutdown();
+    presenter_.shutdown(keepBridge);
     destroyOverlayWindow();
     trackedSwapChain_ = nullptr;
     gameHwnd_ = nullptr;
@@ -538,21 +538,22 @@ void FgRuntime::shutdownLocked() {
 void FgRuntime::shutdown() {
     joinProbeThread();
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    shutdownLocked();
+    shutdownLocked(false);
 }
 
 void FgRuntime::onResize(IDXGISwapChain* gameSwapChain) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!trackedSwapChain_ || trackedSwapChain_ == gameSwapChain) {
         // Turn off & release FG + proxy swapchain before DXGI ResizeBuffers per SL/FSR docs.
-        shutdownLocked();
+        // Keep the D3D12 bridge device alive so Streamline never sees a second slSetD3DDevice().
+        shutdownLocked(true);
     }
 }
 
 void FgRuntime::onSwapChainRelease(IUnknown* object) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (trackedSwapChain_ && static_cast<IUnknown*>(trackedSwapChain_) == object) {
-        shutdownLocked();
+        shutdownLocked(false);
     }
 }
 
@@ -671,7 +672,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
 
     if (configuredBackend_ == FrameGenerationBackend::Off || telemetry_.renderDocBlocked) {
         if (presenter_.isInitialized()) {
-            shutdownLocked();
+            shutdownLocked(true);
         }
         if (telemetry_.renderDocBlocked && configuredBackend_ != FrameGenerationBackend::Off) {
             std::wcsncpy(telemetry_.statusMessage,
@@ -695,7 +696,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
     BOOL isFullscreen = FALSE;
     if (SUCCEEDED(gameSwapChain->GetFullscreenState(&isFullscreen, nullptr)) && isFullscreen) {
         if (presenter_.isInitialized()) {
-            shutdownLocked();
+            shutdownLocked(true);
         }
         telemetry_.exclusiveFullscreenBlocked = true;
         std::wcsncpy(telemetry_.statusMessage,
@@ -737,7 +738,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
          presenter_.width() != bbDesc.Width ||
          presenter_.height() != bbDesc.Height ||
          presenter_.format() != cleanFormat)) {
-        shutdownLocked();
+        shutdownLocked(true);
     }
 
     if (!presenter_.isInitialized()) {
@@ -787,7 +788,7 @@ void FgRuntime::onPresent(IDXGISwapChain* gameSwapChain,
             telemetry_.initFailed = true;
             std::wcsncpy(telemetry_.statusMessage,
                          (reason && reason[0]) ? reason : L"FG backend init failed", 255);
-            shutdownLocked();
+            shutdownLocked(true);
             return;
         }
     }
