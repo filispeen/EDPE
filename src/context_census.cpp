@@ -1576,6 +1576,16 @@ ID3D11Buffer* clearSceneMapTarget() {
     return setSceneMapTarget(nullptr);
 }
 
+// Clears the target only while it is still `resource`, so a target installed by another thread is kept.
+// The target holds a reference, so an equal pointer is the same object.
+bool clearSceneMapTargetIf(ID3D11Resource* resource) {
+    ID3D11Buffer* current = scene_map_target.load(std::memory_order_acquire);
+    if (static_cast<ID3D11Resource*>(current) != resource) return false;
+    if (!scene_map_target.compare_exchange_strong(current, nullptr, std::memory_order_acq_rel)) return false;
+    current->Release();
+    return true;
+}
+
 // Called once per Present: when EDPE holds the last reference, the game has dropped the buffer.
 // Release it so scene buffer detection can pick up the game's new one.
 // The exchange takes ownership first, so a concurrent set or clear cannot free the buffer while it is inspected.
@@ -7674,10 +7684,10 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
     }
     ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
     bool is_scene_cb = (resource == target);
-    if (is_scene_cb && !isConstantBufferOfWidth(resource, 5376u, false)) {
+    if (is_scene_cb && !isConstantBufferOfWidth(resource, 5376u, true)) {
         // The map-bounce slots hold 64 KB and the width passed to onMap is not read from the buffer, so verify the
         // real buffer here. A mismatch means the watched pointer is wrong: drop it and classify the resource normally.
-        if (scene_map_target.load(std::memory_order_acquire) == resource) clearSceneMapTarget();
+        clearSceneMapTargetIf(resource);
         is_scene_cb = false;
         target = nullptr;
     }
