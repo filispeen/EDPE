@@ -13891,6 +13891,8 @@ bool ContextCensusSelectSwapChain(IDXGISwapChain* swap_chain, UINT flags) {
         if (auto* prevCtx = observed_context.exchange(nullptr, std::memory_order_acq_rel)) {
             prevCtx->Release();
         }
+        // A scene buffer found on the previous device does not apply to the scene device. Detect it again.
+        clearSceneMapTarget();
         observed_swap_chain = swap_chain;
         s_present_device.store(candDev, std::memory_order_release);
         attempted = false;
