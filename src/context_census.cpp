@@ -7393,16 +7393,26 @@ inline void evictDotCbResource(ID3D11Resource* res) {
 // The resource caches hold raw pointers without a reference. After the game frees a buffer, a different resource
 // (for example a large dynamic vertex buffer) can be created at the same address and hit the cache. Check the real
 // description before trusting a cached constant buffer width: bouncing a larger buffer into a 64 KB map-bounce slot
-// let the game overrun the pool and EDPE's static data. GetType plus GetDesc, no QueryInterface.
+// let the game overrun the pool and EDPE's static data.
+// The buffer overload is for a pointer that is already an ID3D11Buffer (the scene target, which EDPE holds a
+// reference to). The resource overload asks for ID3D11Buffer with QueryInterface instead of a downcast, so a wrapper
+// or overlay that hands out a separate proxy object cannot make it read the wrong memory.
+inline bool isConstantBufferOfWidth(ID3D11Buffer* buffer, UINT byteWidth, bool requireDynamic) {
+    if (!buffer) return false;
+    D3D11_BUFFER_DESC desc{};
+    buffer->GetDesc(&desc);
+    return desc.ByteWidth == byteWidth && (!requireDynamic || desc.Usage == D3D11_USAGE_DYNAMIC) &&
+           (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0;
+}
+
 inline bool isConstantBufferOfWidth(ID3D11Resource* res, UINT byteWidth, bool requireDynamic) {
     if (!res) return false;
     D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     res->GetType(&dimension);
     if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER) return false;
-    D3D11_BUFFER_DESC desc{};
-    static_cast<ID3D11Buffer*>(res)->GetDesc(&desc);
-    return desc.ByteWidth == byteWidth && (!requireDynamic || desc.Usage == D3D11_USAGE_DYNAMIC) &&
-           (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
+    if (FAILED(res->QueryInterface(IID_PPV_ARGS(&buffer)))) return false;
+    return isConstantBufferOfWidth(buffer.Get(), byteWidth, requireDynamic);
 }
 
 inline void cacheDotCbResource(ID3D11Resource* res, UINT byteWidth) {
@@ -7688,9 +7698,9 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
         !isObservedImmediateContext(context)) {
         return result;
     }
-    ID3D11Resource* target = scene_map_target.load(std::memory_order_acquire);
+    ID3D11Buffer* target = scene_map_target.load(std::memory_order_acquire);
     bool is_scene_cb = (resource == target);
-    if (is_scene_cb && !isConstantBufferOfWidth(resource, 5376u, true)) {
+    if (is_scene_cb && !isConstantBufferOfWidth(target, 5376u, true)) {
         // The map-bounce slots hold 64 KB and the width passed to onMap is not read from the buffer, so verify the
         // real buffer here. A mismatch means the watched pointer is wrong: drop it and classify the resource normally.
         clearSceneMapTargetIf(resource);
