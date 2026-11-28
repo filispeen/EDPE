@@ -7809,6 +7809,8 @@ HRESULT STDMETHODCALLTYPE observedMap(ID3D11DeviceContext* context, ID3D11Resour
 void STDMETHODCALLTYPE observedUnmap(ID3D11DeviceContext* context, ID3D11Resource* resource,
     UINT subresource) {
     const UnmapFn forward = resolveOriginalUnmap(context);
+    // Every exit path calls this. It frees the map-bounce slot by resource and context and does not look at
+    // scene_map_target, so clearing the target while a buffer is mapped cannot leave a slot open.
     auto forwardUnmap = [&]() {
         if (resource) {
             s_cb_map_bounce.onUnmap(
@@ -14431,6 +14433,8 @@ void ContextCensusOnPresent(IDXGISwapChain* swap_chain, unsigned long long frame
         if ((last_present_frame.load(std::memory_order_relaxed) % 30ull) == 0ull) {
             clearRejectedResourceCache();
         }
+        // copyCameraDeltaSource ran earlier in this call under the same condition and dropped its reference, so the
+        // count seen here is the target's plus the game's.
         releaseOrphanedSceneMapTarget();
         static uint64_t s_watchdog_last_camera_seen = 0;
         static unsigned s_watchdog_no_camera_frames = 0;
