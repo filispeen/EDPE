@@ -7418,12 +7418,18 @@ inline bool isConstantBufferOfWidth(ID3D11Resource* res, UINT byteWidth, bool re
 inline void cacheDotCbResource(ID3D11Resource* res, UINT byteWidth) {
     if (!res) return;
     auto& set = s_accepted_dot_cb_cache[resourceCacheSetIndex(res)];
-    size_t targetWay = kResourceCacheWays;
-    if (set.ways[0].load(std::memory_order_relaxed) == res ||
-        set.ways[0].load(std::memory_order_relaxed) == nullptr) {
+    // Look for the resource in every way before using an empty one, as cacheRejectedResource does. Otherwise a
+    // resource held in way 1 with way 0 evicted would be inserted again into way 0 and waste a way.
+    ID3D11Resource* const way0 = set.ways[0].load(std::memory_order_relaxed);
+    ID3D11Resource* const way1 = set.ways[1].load(std::memory_order_relaxed);
+    size_t targetWay;
+    if (way0 == res) {
         targetWay = 0;
-    } else if (set.ways[1].load(std::memory_order_relaxed) == res ||
-               set.ways[1].load(std::memory_order_relaxed) == nullptr) {
+    } else if (way1 == res) {
+        targetWay = 1;
+    } else if (way0 == nullptr) {
+        targetWay = 0;
+    } else if (way1 == nullptr) {
         targetWay = 1;
     } else {
         targetWay = set.nextVictim.fetch_add(1, std::memory_order_relaxed) & 1u;
